@@ -1,5 +1,8 @@
 //! CUDA texture and surface object reads/writes for Rust device code compiled by cuda-oxide.
 //!
+//! **Generated** by `gen/gen.py` from its op table (`python gen/gen.py src/cuda_tex_device.rs gen/head.rs`, then
+//! `rustfmt --edition 2024`): edit the generator, not this file.
+//!
 //! **What.** The device half of CUDA's bindless textures and surfaces: every `tex*` fetch of
 //! `texture_indirect_functions.h` (`tex1D` .. `texCubemapLayeredGrad`, `tex1Dfetch`,
 //! `tex2Dgather`, and the sparse-residency `*_sparse` forms of the `bool* isResident` overloads)

@@ -12,6 +12,7 @@
 //! - [`coop_vec`] — cooperative vectors: [`coop_vec::CoopVec`], load, element-wise ops,
 //!   matrix-vector products with bias, reductions and outer products for neural shading;
 //! - [`exception`] — user exceptions, codes, details, line info.
+//! - [`footprint`] — texture footprint queries (`optixTexFootprint2D*`) for sparse texturing;
 //! - [`geometry`] — vertex data of the hit primitive (triangles, every curve kind, ribbons,
 //!   spheres), current hit, by GAS index or by handle, and hit-kind helpers;
 //! - [`hitobject`] — hit objects and shader execution reordering: traverse, make hit / miss /
@@ -28,6 +29,7 @@
 
 pub mod coop_vec;
 pub mod exception;
+pub mod footprint;
 pub mod geometry;
 pub mod hitobject;
 pub mod payload;

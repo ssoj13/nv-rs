@@ -1,0 +1,17 @@
+[package]
+name = "cuda-tex-device"
+description = "CUDA texture and surface object fetches/stores (tex1D..texCubemapLayeredGrad, tex1Dfetch, tex2Dgather, surf*read/write) for Rust device code compiled by cuda-oxide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cuda_tex_device.rs"
+
+[dependencies]
+cuda-device.workspace = true
+
+[lints]
+workspace = true

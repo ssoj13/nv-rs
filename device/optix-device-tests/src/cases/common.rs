@@ -51,6 +51,10 @@ impl Gpu {
         // `ODT_VALIDATION=1` turns on OptiX validation mode (every exception enabled, checked launches).
         let validation = std::env::var("ODT_VALIDATION").is_ok_and(|v| v == "1");
         let ctx = DeviceContext::new(&cuda, Some(Box::new(|l, t, m| eprintln!("[optix {l} {t}] {m}"))), if validation { 4 } else { 2 }, validation).ctx("OptiX context")?;
+        if let Some(v) = std::env::var("ODT_CUDA_STACK").ok().and_then(|s| s.parse().ok()) {
+            cuda.set_limit(cuda_core::ContextLimit::StackSize, v).ctx("stack limit")?;
+        }
+        eprintln!("CUDA stack limit {:?}", cuda.limit(cuda_core::ContextLimit::StackSize));
         Ok(Self { cuda, stream, ctx, ptx })
     }
 

@@ -419,6 +419,11 @@ pub fn run(g: &Gpu) -> R {
     let miss = ProgramGroup::miss(&module, "__miss__xf").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__xf")), ..Default::default() }).ctx("hit group")?;
     let pipeline = g.pipeline(&o, LinkOptions { max_graph_depth: 3, ..Default::default() }, &[raygen.clone(), miss.clone(), hit.clone()])?;
+    if let Some(css) = std::env::var("ODT_STACK").ok().and_then(|s| s.parse().ok()) {
+        pipeline.set_stack_size(0, 0, css, 3).ctx("stack")?;
+        let s = [&raygen, &miss, &hit].map(|g| g.stack_sizes(Some(&pipeline)).map(|s| format!("{s:?}")).unwrap_or_default());
+        eprintln!("stack sizes {s:?}");
+    }
     let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[SbtRecord::new(&miss, 0u32).ctx("ms")?], &[SbtRecord::new(&hit, 0u32).ctx("hg")?]).ctx("SBT")?;
 
     let mut scratch = Scratch::new(&g.stream);

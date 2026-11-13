@@ -36,10 +36,15 @@ pub(crate) fn to_words<P: Payload>(p: &P) -> [u32; 32] {
 #[inline(always)]
 pub(crate) fn from_words<P: Payload>(w: &[u32; 32]) -> P {
     let _ = P::WORDS;
-    let mut p = P::zeroed();
-    // SAFETY: as in `to_words`; every bit pattern is a valid `P` (Pod).
-    unsafe { core::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), (&mut p as *mut P).cast::<u8>(), size_of::<P>()) };
-    p
+    // `MaybeUninit` + full copy rather than `Zeroable::zeroed`, whose `assert_zero_valid`
+    // intrinsic cuda-oxide does not lower.
+    let mut p = core::mem::MaybeUninit::<P>::uninit();
+    // SAFETY: as in `to_words`; all `size_of::<P>()` bytes are written and every bit pattern is a
+    // valid `P` (Pod).
+    unsafe {
+        core::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), p.as_mut_ptr().cast::<u8>(), size_of::<P>());
+        p.assume_init()
+    }
 }
 
 macro_rules! each_word {

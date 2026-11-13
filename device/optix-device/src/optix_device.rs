@@ -43,3 +43,10 @@ pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/optix_device
 pub mod sys {
     include!(concat!(env!("OUT_DIR"), "/optix_types.rs"));
 }
+
+/// `direct_call!(sbt_index, fn(T, ...) -> R, (args...))`: calls a direct callable program
+/// (`optixDirectCall`) as an indirect PTX call; use inside `unsafe`.
+pub use optix_device_macros::direct_call;
+/// `continuation_call!(sbt_index, fn(T, ...) -> R, (args...))`: calls a continuation callable
+/// program (`optixContinuationCall`); use inside `unsafe`.
+pub use optix_device_macros::continuation_call;

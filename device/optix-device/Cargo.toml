@@ -13,6 +13,7 @@ path = "src/optix_device.rs"
 
 [dependencies]
 cuda-device.workspace = true
+optix-device-macros = { path = "../optix-device-macros" }
 bytemuck.workspace = true
 
 [build-dependencies]

@@ -57,6 +57,7 @@ pub unsafe fn code() -> i32 {
 /// Valid in exception programs.
 #[inline(always)]
 pub unsafe fn detail<const I: u32>() -> u32 {
+    const { assert!(I < 8, "OptiX has 8 exception detail words") };
     // SAFETY: forwarded contract; `I` is a constant.
     unsafe {
         match I {
@@ -67,8 +68,7 @@ pub unsafe fn detail<const I: u32>() -> u32 {
             4 => raw::get_exception_detail_4(),
             5 => raw::get_exception_detail_5(),
             6 => raw::get_exception_detail_6(),
-            7 => raw::get_exception_detail_7(),
-            _ => const { panic!("OptiX has 8 exception detail words") },
+            _ => raw::get_exception_detail_7(),
         }
     }
 }

@@ -171,6 +171,7 @@ pub unsafe fn is_back_face(hit_kind: u32) -> bool {
 /// Valid in any-hit and closest-hit programs; `I` below the pipeline's `numAttributeValues`.
 #[inline(always)]
 pub unsafe fn attribute<const I: u32>() -> u32 {
+    const { assert!(I < 8, "OptiX has 8 attribute registers") };
     // SAFETY: forwarded contract; `I` is a constant.
     unsafe {
         match I {
@@ -181,8 +182,7 @@ pub unsafe fn attribute<const I: u32>() -> u32 {
             4 => raw::get_attribute_4(),
             5 => raw::get_attribute_5(),
             6 => raw::get_attribute_6(),
-            7 => raw::get_attribute_7(),
-            _ => const { panic!("OptiX has 8 attribute registers") },
+            _ => raw::get_attribute_7(),
         }
     }
 }
@@ -209,10 +209,12 @@ pub unsafe fn attributes<A: bytemuck::Pod>() -> A {
         if n > 7 { w[7] = attribute::<7>(); }
         w
     };
-    let mut a = A::zeroed();
-    // SAFETY: `A` is Pod and at most 32 bytes.
-    unsafe { core::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), (&mut a as *mut A).cast::<u8>(), size_of::<A>()) };
-    a
+    let mut a = core::mem::MaybeUninit::<A>::uninit();
+    // SAFETY: `A` is Pod and at most 32 bytes; all its bytes are written.
+    unsafe {
+        core::ptr::copy_nonoverlapping(w.as_ptr().cast::<u8>(), a.as_mut_ptr().cast::<u8>(), size_of::<A>());
+        a.assume_init()
+    }
 }
 
 /// Reports an intersection at distance `t` with a user hit kind (0..=127) and attributes `A`

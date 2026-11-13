@@ -3,7 +3,7 @@
 # crates' toolchain.
 [workspace]
 resolver = "3"
-members = ["optix-device", "optix-device-tests"]
+members = ["optix-device", "optix-device-macros", "optix-device-tests"]
 
 [workspace.package]
 version = "0.0.0"

@@ -10,9 +10,9 @@
 use bytemuck::{Pod, Zeroable};
 use cuda_core::{Context, DeviceBuffer};
 use cuda_core::embedded::{ArtifactPayloadKind, embedded_modules_from_current_exe};
-use cuda_device::{ConstantMemory, constant, cuda_module, device, kernel, ptx_asm};
+use cuda_device::{ConstantMemory, constant, cuda_module, device, kernel};
 use optix_device::trace::{Ray, TraceOptions};
-use optix_device::{payload, raw, state, trace};
+use optix_device::{payload, state, trace};
 
 const W: u32 = 32;
 const H: u32 = 24;
@@ -44,25 +44,6 @@ pub struct Shade {
 pub struct Color {
     pub rgb: [f32; 3],
     pub _pad: f32,
-}
-
-/// Calls direct callable `index` as `fn(f32) -> f32` (PTX indirect call; cuda-oxide does not
-/// call through Rust function pointers).
-#[inline(always)]
-unsafe fn direct_call_f32(index: u32, x: f32) -> f32 {
-    // SAFETY: valid where `optixDirectCall` is; the callable at `index` has this signature.
-    let f = unsafe { raw::call_direct_callable(index) };
-    let r: f32;
-    // SAFETY: an indirect call through the address OptiX resolved, with the callee's prototype.
-    unsafe {
-        ptx_asm!(
-            "{\n\t.param .b32 nvrs_rv;\n\t.param .b32 nvrs_a0;\n\tst.param.b32 [nvrs_a0], %2;\n\tnvrs_proto: .callprototype (.param .b32 _) _ (.param .b32 _);\n\tcall (nvrs_rv), %1, (nvrs_a0), nvrs_proto;\n\tld.param.b32 %0, [nvrs_rv];\n}",
-            out("=f") r,
-            in("l") f,
-            in("f") x,
-        )
-    };
-    r
 }
 
 /// The direct callable: doubles its argument.
@@ -108,8 +89,10 @@ mod kernels {
         unsafe {
             let c = state::sbt_data::<Color>();
             let [u, v] = state::triangle_barycentrics();
-            let k = direct_call_f32(0, u);
-            let rgb = [c.rgb[0] * k, c.rgb[1] * v, c.rgb[2] * (1.0 - u - v)];
+            // Two call sites in one program: the PTX prototype labels must not collide.
+            let k = optix_device::direct_call!(0, fn(f32) -> f32, (u));
+            let k2 = optix_device::direct_call!(0, fn(f32) -> f32, (v));
+            let rgb = [c.rgb[0] * k, c.rgb[1] * k2 * 0.5, c.rgb[2] * (1.0 - u - v)];
             payload::set(&Shade { rgb, prim: state::primitive_index() as i32 });
         }
     }

@@ -1,0 +1,292 @@
+# optix_device.h -> Rust item map for the OptiX 9.1 device API.
+#
+# What: every public `optix*` function of the SDK's `optix_device.h` names the Rust item(s) that
+# implement it. `cargo xtask coverage optix` fails when a header function has no entry, when an entry
+# names a module or item that does not exist, or when an entry is stale (not in the header).
+# Value: one path or an array of paths (overloads and typed variants map to several items).
+# Path: `<module>::<item>`; a trailing `::<N>` generic argument is documentation only. Modules are
+# the files of `device/optix-device/src` plus two special names: `macros` is
+# `device/optix-device-macros/src/optix_device_macros.rs`, `cuda_tex` is
+# `device/cuda-tex-device/src/cuda_tex_device.rs`. The item must be a `pub fn`, a `macro_rules!`, a
+# `pub use`, or a row of a function-generating macro table (`name -> ty = raw;` or
+# `name = raw, conv -> ty;`) in that module's file.
+#
+# optixGetGASPointerFromHandle (raw::get_gas_ptr_from_handle) has no typed wrapper yet, so it is
+# deliberately absent: the gate reports it until one exists.
+
+# --- callable programs (proc macros)
+optixDirectCall = "macros::direct_call"
+optixContinuationCall = "macros::continuation_call"
+
+# --- trace and shader execution reordering
+optixTrace = ["trace::trace", "trace::trace_no_payload"]
+optixTraverse = "hitobject::traverse"
+optixReorder = ["hitobject::reorder", "hitobject::reorder_hint"]
+optixInvoke = ["hitobject::invoke", "hitobject::invoke_typed"]
+optixMakeHitObject = "hitobject::make_hit"
+optixMakeMissHitObject = "hitobject::make_miss"
+optixMakeNopHitObject = "hitobject::make_nop"
+
+# --- payload registers
+optixGetPayload_0 = "payload::word::<0>"
+optixGetPayload_1 = "payload::word::<1>"
+optixGetPayload_2 = "payload::word::<2>"
+optixGetPayload_3 = "payload::word::<3>"
+optixGetPayload_4 = "payload::word::<4>"
+optixGetPayload_5 = "payload::word::<5>"
+optixGetPayload_6 = "payload::word::<6>"
+optixGetPayload_7 = "payload::word::<7>"
+optixGetPayload_8 = "payload::word::<8>"
+optixGetPayload_9 = "payload::word::<9>"
+optixGetPayload_10 = "payload::word::<10>"
+optixGetPayload_11 = "payload::word::<11>"
+optixGetPayload_12 = "payload::word::<12>"
+optixGetPayload_13 = "payload::word::<13>"
+optixGetPayload_14 = "payload::word::<14>"
+optixGetPayload_15 = "payload::word::<15>"
+optixGetPayload_16 = "payload::word::<16>"
+optixGetPayload_17 = "payload::word::<17>"
+optixGetPayload_18 = "payload::word::<18>"
+optixGetPayload_19 = "payload::word::<19>"
+optixGetPayload_20 = "payload::word::<20>"
+optixGetPayload_21 = "payload::word::<21>"
+optixGetPayload_22 = "payload::word::<22>"
+optixGetPayload_23 = "payload::word::<23>"
+optixGetPayload_24 = "payload::word::<24>"
+optixGetPayload_25 = "payload::word::<25>"
+optixGetPayload_26 = "payload::word::<26>"
+optixGetPayload_27 = "payload::word::<27>"
+optixGetPayload_28 = "payload::word::<28>"
+optixGetPayload_29 = "payload::word::<29>"
+optixGetPayload_30 = "payload::word::<30>"
+optixGetPayload_31 = "payload::word::<31>"
+optixSetPayload_0 = "payload::set_word::<0>"
+optixSetPayload_1 = "payload::set_word::<1>"
+optixSetPayload_2 = "payload::set_word::<2>"
+optixSetPayload_3 = "payload::set_word::<3>"
+optixSetPayload_4 = "payload::set_word::<4>"
+optixSetPayload_5 = "payload::set_word::<5>"
+optixSetPayload_6 = "payload::set_word::<6>"
+optixSetPayload_7 = "payload::set_word::<7>"
+optixSetPayload_8 = "payload::set_word::<8>"
+optixSetPayload_9 = "payload::set_word::<9>"
+optixSetPayload_10 = "payload::set_word::<10>"
+optixSetPayload_11 = "payload::set_word::<11>"
+optixSetPayload_12 = "payload::set_word::<12>"
+optixSetPayload_13 = "payload::set_word::<13>"
+optixSetPayload_14 = "payload::set_word::<14>"
+optixSetPayload_15 = "payload::set_word::<15>"
+optixSetPayload_16 = "payload::set_word::<16>"
+optixSetPayload_17 = "payload::set_word::<17>"
+optixSetPayload_18 = "payload::set_word::<18>"
+optixSetPayload_19 = "payload::set_word::<19>"
+optixSetPayload_20 = "payload::set_word::<20>"
+optixSetPayload_21 = "payload::set_word::<21>"
+optixSetPayload_22 = "payload::set_word::<22>"
+optixSetPayload_23 = "payload::set_word::<23>"
+optixSetPayload_24 = "payload::set_word::<24>"
+optixSetPayload_25 = "payload::set_word::<25>"
+optixSetPayload_26 = "payload::set_word::<26>"
+optixSetPayload_27 = "payload::set_word::<27>"
+optixSetPayload_28 = "payload::set_word::<28>"
+optixSetPayload_29 = "payload::set_word::<29>"
+optixSetPayload_30 = "payload::set_word::<30>"
+optixSetPayload_31 = "payload::set_word::<31>"
+optixSetPayloadTypes = "payload::set_types"
+
+# --- program state
+optixGetLaunchIndex = "state::launch_index"
+optixGetLaunchDimensions = "state::launch_dimensions"
+optixGetWorldRayOrigin = "state::world_ray_origin"
+optixGetWorldRayDirection = "state::world_ray_direction"
+optixGetObjectRayOrigin = "state::object_ray_origin"
+optixGetObjectRayDirection = "state::object_ray_direction"
+optixGetRayTmin = "state::ray_tmin"
+optixGetRayTmax = "state::ray_tmax"
+optixGetRayTime = "state::ray_time"
+optixGetRayFlags = "state::ray_flags"
+optixGetRayVisibilityMask = "state::ray_visibility_mask"
+optixGetRemainingTraceDepth = "state::remaining_trace_depth"
+optixGetPrimitiveIndex = "state::primitive_index"
+optixGetSbtGASIndex = "state::sbt_gas_index"
+optixGetInstanceId = "state::instance_id"
+optixGetInstanceIndex = "state::instance_index"
+optixGetHitKind = "state::hit_kind"
+optixGetClusterId = "state::cluster_id"
+optixGetGASTraversableHandle = "state::gas_traversable_handle"
+optixGetCurveParameter = "state::curve_parameter"
+optixUndefinedValue = "state::undefined"
+optixGetTriangleBarycentrics = "state::triangle_barycentrics"
+optixGetRibbonParameters = "state::ribbon_parameters"
+optixGetSbtDataPointer = "state::sbt_data"
+optixReportIntersection = "state::report_intersection"
+optixIgnoreIntersection = "state::ignore_intersection"
+optixTerminateRay = "state::terminate_ray"
+# Overloads: by hit kind (state) and of the current hit (geometry).
+optixGetPrimitiveType = ["state::primitive_type", "geometry::hit_primitive_type"]
+optixIsBackFaceHit = ["geometry::is_back_face_hit", "state::is_back_face"]
+optixIsFrontFaceHit = ["geometry::is_front_face_hit", "geometry::is_front_face"]
+optixIsTriangleHit = "geometry::is_triangle_hit"
+optixIsTriangleFrontFaceHit = "geometry::is_triangle_front_face_hit"
+optixIsTriangleBackFaceHit = "geometry::is_triangle_back_face_hit"
+optixGetAttribute_0 = "state::attribute::<0>"
+optixGetAttribute_1 = "state::attribute::<1>"
+optixGetAttribute_2 = "state::attribute::<2>"
+optixGetAttribute_3 = "state::attribute::<3>"
+optixGetAttribute_4 = "state::attribute::<4>"
+optixGetAttribute_5 = "state::attribute::<5>"
+optixGetAttribute_6 = "state::attribute::<6>"
+optixGetAttribute_7 = "state::attribute::<7>"
+
+# --- exceptions
+optixThrowException = "exception::throw"
+optixGetExceptionCode = "exception::code"
+optixGetExceptionLineInfo = "exception::line_info"
+optixGetExceptionDetail_0 = "exception::detail::<0>"
+optixGetExceptionDetail_1 = "exception::detail::<1>"
+optixGetExceptionDetail_2 = "exception::detail::<2>"
+optixGetExceptionDetail_3 = "exception::detail::<3>"
+optixGetExceptionDetail_4 = "exception::detail::<4>"
+optixGetExceptionDetail_5 = "exception::detail::<5>"
+optixGetExceptionDetail_6 = "exception::detail::<6>"
+optixGetExceptionDetail_7 = "exception::detail::<7>"
+
+# --- geometry: vertex data (current hit + deprecated GAS-index overload, by handle, hit object)
+optixGetTriangleVertexData = ["geometry::triangle_vertices", "geometry::triangle_vertices_from"]
+optixGetTriangleVertexDataFromHandle = "geometry::triangle_vertices_from_handle"
+optixHitObjectGetTriangleVertexData = "geometry::hitobject_triangle_vertices"
+
+optixGetLinearCurveVertexData = ["geometry::linear_curve_vertices", "geometry::linear_curve_vertices_from"]
+optixGetLinearCurveVertexDataFromHandle = "geometry::linear_curve_vertices_from_handle"
+optixHitObjectGetLinearCurveVertexData = "geometry::hitobject_linear_curve_vertices"
+
+optixGetQuadraticBSplineVertexData = ["geometry::quadratic_bspline_vertices", "geometry::quadratic_bspline_vertices_from"]
+optixGetQuadraticBSplineVertexDataFromHandle = "geometry::quadratic_bspline_vertices_from_handle"
+optixHitObjectGetQuadraticBSplineVertexData = "geometry::hitobject_quadratic_bspline_vertices"
+optixGetQuadraticBSplineRocapsVertexData = "geometry::quadratic_bspline_rocaps_vertices"
+optixGetQuadraticBSplineRocapsVertexDataFromHandle = "geometry::quadratic_bspline_rocaps_vertices_from_handle"
+optixHitObjectGetQuadraticBSplineRocapsVertexData = "geometry::hitobject_quadratic_bspline_rocaps_vertices"
+
+optixGetCubicBSplineVertexData = ["geometry::cubic_bspline_vertices", "geometry::cubic_bspline_vertices_from"]
+optixGetCubicBSplineVertexDataFromHandle = "geometry::cubic_bspline_vertices_from_handle"
+optixHitObjectGetCubicBSplineVertexData = "geometry::hitobject_cubic_bspline_vertices"
+optixGetCubicBSplineRocapsVertexData = "geometry::cubic_bspline_rocaps_vertices"
+optixGetCubicBSplineRocapsVertexDataFromHandle = "geometry::cubic_bspline_rocaps_vertices_from_handle"
+optixHitObjectGetCubicBSplineRocapsVertexData = "geometry::hitobject_cubic_bspline_rocaps_vertices"
+
+optixGetCatmullRomVertexData = ["geometry::catmull_rom_vertices", "geometry::catmull_rom_vertices_from"]
+optixGetCatmullRomVertexDataFromHandle = "geometry::catmull_rom_vertices_from_handle"
+optixHitObjectGetCatmullRomVertexData = "geometry::hitobject_catmull_rom_vertices"
+optixGetCatmullRomRocapsVertexData = "geometry::catmull_rom_rocaps_vertices"
+optixGetCatmullRomRocapsVertexDataFromHandle = "geometry::catmull_rom_rocaps_vertices_from_handle"
+optixHitObjectGetCatmullRomRocapsVertexData = "geometry::hitobject_catmull_rom_rocaps_vertices"
+
+optixGetCubicBezierVertexData = ["geometry::cubic_bezier_vertices", "geometry::cubic_bezier_vertices_from"]
+optixGetCubicBezierVertexDataFromHandle = "geometry::cubic_bezier_vertices_from_handle"
+optixHitObjectGetCubicBezierVertexData = "geometry::hitobject_cubic_bezier_vertices"
+optixGetCubicBezierRocapsVertexData = "geometry::cubic_bezier_rocaps_vertices"
+optixGetCubicBezierRocapsVertexDataFromHandle = "geometry::cubic_bezier_rocaps_vertices_from_handle"
+optixHitObjectGetCubicBezierRocapsVertexData = "geometry::hitobject_cubic_bezier_rocaps_vertices"
+
+optixGetRibbonVertexData = ["geometry::ribbon_vertices", "geometry::ribbon_vertices_from"]
+optixGetRibbonVertexDataFromHandle = "geometry::ribbon_vertices_from_handle"
+optixHitObjectGetRibbonVertexData = "geometry::hitobject_ribbon_vertices"
+
+optixGetSphereData = ["geometry::sphere_data", "geometry::sphere_data_from"]
+optixGetSphereDataFromHandle = "geometry::sphere_data_from_handle"
+optixHitObjectGetSphereData = "geometry::hitobject_sphere_data"
+
+optixGetRibbonNormal = ["geometry::ribbon_normal", "geometry::ribbon_normal_from"]
+optixGetRibbonNormalFromHandle = "geometry::ribbon_normal_from_handle"
+optixHitObjectGetRibbonNormal = "geometry::hitobject_ribbon_normal"
+
+# --- transforms
+optixGetTransformListSize = "transform::transform_list_size"
+optixGetTransformListHandle = "transform::transform_list_handle"
+optixGetObjectToWorldTransformMatrix = "transform::object_to_world_matrix"
+optixGetWorldToObjectTransformMatrix = "transform::world_to_object_matrix"
+optixGetTransformTypeFromHandle = "transform::transform_type"
+optixGetStaticTransformFromHandle = ["transform::static_transform_ptr", "transform::static_transform"]
+optixGetSRTMotionTransformFromHandle = "transform::srt_motion_transform_ptr"
+optixGetMatrixMotionTransformFromHandle = "transform::matrix_motion_transform_ptr"
+optixGetInstanceIdFromHandle = "transform::instance_id"
+optixGetInstanceChildFromHandle = "transform::instance_child"
+optixGetInstanceTransformFromHandle = ["transform::instance_transform_ptr", "transform::instance_transform"]
+optixGetInstanceInverseTransformFromHandle = ["transform::instance_inverse_transform_ptr", "transform::instance_inverse_transform"]
+optixGetInstanceTraversableFromIAS = "transform::instance_traversable_from_ias"
+optixGetGASMotionTimeBegin = "transform::gas_motion_time_begin"
+optixGetGASMotionTimeEnd = "transform::gas_motion_time_end"
+optixGetGASMotionStepCount = "transform::gas_motion_step_count"
+optixGetGASPointerFromHandle = "transform::gas_pointer"
+optixTransformPointFromWorldToObjectSpace = "transform::transform_point_from_world_to_object"
+optixTransformVectorFromWorldToObjectSpace = "transform::transform_vector_from_world_to_object"
+optixTransformNormalFromWorldToObjectSpace = "transform::transform_normal_from_world_to_object"
+optixTransformPointFromObjectToWorldSpace = "transform::transform_point_from_object_to_world"
+optixTransformVectorFromObjectToWorldSpace = "transform::transform_vector_from_object_to_world"
+optixTransformNormalFromObjectToWorldSpace = "transform::transform_normal_from_object_to_world"
+
+# --- hit object
+optixHitObjectIsHit = "hitobject::is_hit"
+optixHitObjectIsMiss = "hitobject::is_miss"
+optixHitObjectIsNop = "hitobject::is_nop"
+optixHitObjectGetInstanceId = "hitobject::instance_id"
+optixHitObjectGetInstanceIndex = "hitobject::instance_index"
+optixHitObjectGetPrimitiveIndex = "hitobject::primitive_index"
+optixHitObjectGetTransformListSize = "hitobject::transform_list_size"
+optixHitObjectGetTransformListHandle = "hitobject::transform_list_handle"
+optixHitObjectGetSbtGASIndex = "hitobject::sbt_gas_index"
+optixHitObjectGetHitKind = "hitobject::hit_kind"
+optixHitObjectGetRayTmin = "hitobject::ray_tmin"
+optixHitObjectGetRayTmax = "hitobject::ray_tmax"
+optixHitObjectGetRayTime = "hitobject::ray_time"
+optixHitObjectGetRayFlags = "hitobject::ray_flags"
+optixHitObjectGetSbtRecordIndex = "hitobject::sbt_record_index"
+optixHitObjectSetSbtRecordIndex = "hitobject::set_sbt_record_index"
+optixHitObjectGetSbtDataPointer = "hitobject::sbt_data_ptr"
+optixHitObjectGetGASTraversableHandle = "hitobject::gas_traversable_handle"
+optixHitObjectGetClusterId = "hitobject::cluster_id"
+optixHitObjectGetTraverseData = "hitobject::traverse_data"
+optixHitObjectGetWorldRayOrigin = "hitobject::world_ray_origin"
+optixHitObjectGetWorldRayDirection = "hitobject::world_ray_direction"
+optixHitObjectGetTriangleBarycentrics = "hitobject::triangle_barycentrics"
+optixHitObjectGetCurveParameter = "hitobject::curve_parameter"
+optixHitObjectGetRibbonParameters = "hitobject::ribbon_parameters"
+optixHitObjectGetObjectToWorldTransformMatrix = "hitobject::object_to_world_matrix"
+optixHitObjectGetWorldToObjectTransformMatrix = "hitobject::world_to_object_matrix"
+optixHitObjectTransformPointFromWorldToObjectSpace = "hitobject::point_to_object"
+optixHitObjectTransformVectorFromWorldToObjectSpace = "hitobject::vector_to_object"
+optixHitObjectTransformNormalFromWorldToObjectSpace = "hitobject::normal_to_object"
+optixHitObjectTransformPointFromObjectToWorldSpace = "hitobject::point_to_world"
+optixHitObjectTransformVectorFromObjectToWorldSpace = "hitobject::vector_to_world"
+optixHitObjectTransformNormalFromObjectToWorldSpace = "hitobject::normal_to_world"
+optixHitObjectGetAttribute_0 = "hitobject::attribute::<0>"
+optixHitObjectGetAttribute_1 = "hitobject::attribute::<1>"
+optixHitObjectGetAttribute_2 = "hitobject::attribute::<2>"
+optixHitObjectGetAttribute_3 = "hitobject::attribute::<3>"
+optixHitObjectGetAttribute_4 = "hitobject::attribute::<4>"
+optixHitObjectGetAttribute_5 = "hitobject::attribute::<5>"
+optixHitObjectGetAttribute_6 = "hitobject::attribute::<6>"
+optixHitObjectGetAttribute_7 = "hitobject::attribute::<7>"
+
+# --- texture footprints
+optixTexFootprint2D = "footprint::tex_footprint_2d"
+optixTexFootprint2DGrad = "footprint::tex_footprint_2d_grad"
+optixTexFootprint2DLod = "footprint::tex_footprint_2d_lod"
+
+# --- cooperative vectors
+optixCoopVecLoad = ["coop_vec::load", "coop_vec::load_ptr"]
+optixCoopVecExp2 = "coop_vec::exp2"
+optixCoopVecLog2 = "coop_vec::log2"
+optixCoopVecTanh = "coop_vec::tanh"
+optixCoopVecCvt = "coop_vec::cvt"
+optixCoopVecMin = ["coop_vec::min", "coop_vec::min_scalar"]
+optixCoopVecMax = ["coop_vec::max", "coop_vec::max_scalar"]
+optixCoopVecMul = "coop_vec::mul"
+optixCoopVecAdd = "coop_vec::add"
+optixCoopVecSub = "coop_vec::sub"
+optixCoopVecStep = "coop_vec::step"
+optixCoopVecFFMA = "coop_vec::ffma"
+optixCoopVecMatMul = ["coop_vec::matmul", "coop_vec::matmul_bias"]
+optixCoopVecReduceSumAccumulate = "coop_vec::reduce_sum_acc"
+optixCoopVecOuterProductAccumulate = "coop_vec::outer_product_acc"
+optixCoopVecGetMatrixSize = "coop_vec::matrix_size"

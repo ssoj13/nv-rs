@@ -15,6 +15,14 @@
 //!
 //! **Why.** The matrix is the evidence shown to NVIDIA; a table edited by hand drifts from the
 //! code the first week. Modelled on cuda-oxide's intrinsics catalog + overlay + evidence.
+//!
+//! `cargo xtask coverage optix` is a separate gate (module `optix_cov`) proving the OptiX API is
+//! fully covered: every `optix_device.h` function is mapped in `device/optix-device/API_MAP.toml`
+//! to an existing Rust item, every `OptixFunctionTable` field is used by `crates/optix`, and every
+//! `_optix_*` intrinsic is used by the typed device layer. It prints counts and exits non-zero,
+//! listing the missing names, on any gap.
+
+mod optix_cov;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -29,7 +37,9 @@ enum Error {
     Parse { path: PathBuf, msg: String },
     #[error("coverage check failed:\n{0}")]
     Check(String),
-    #[error("usage: cargo xtask coverage <collect|generate|check>")]
+    #[error("optix coverage failed:\n{0}")]
+    Optix(String),
+    #[error("usage: cargo xtask coverage <collect|generate|check|optix>")]
     Usage,
 }
 
@@ -96,6 +106,7 @@ fn main() -> ExitCode {
         ["coverage", "generate"] => generate(&root),
         ["coverage", "check"] => check(&root),
         ["coverage", "collect"] => collect(&root),
+        ["coverage", "optix"] => optix_cov::run(&root).map_err(Error::Optix),
         _ => Err(Error::Usage),
     };
     match result {

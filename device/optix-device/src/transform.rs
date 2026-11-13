@@ -500,6 +500,18 @@ pub unsafe fn gas_motion_step_count(gas: u64) -> u32 {
     unsafe { raw::get_gas_motion_step_count(gas) }
 }
 
+/// `optixGetGASPointerFromHandle`: the device address of the geometry acceleration structure
+/// behind `handle`, or 0 if the traversable is not a GAS.
+///
+/// # Safety
+///
+/// Valid in every OptiX program type; `handle` must be a live traversable of this launch.
+#[inline(always)]
+pub unsafe fn gas_pointer(handle: u64) -> u64 {
+    // SAFETY: forwarded contract.
+    unsafe { raw::get_gas_ptr_from_handle(handle) }
+}
+
 /// `optixGetInterpolatedTransformationFromHandle`: the matrix of one transform-list entry at
 /// `time`, object-to-world if `o2w`, else world-to-object. Motion transforms are interpolated and,
 /// for world-to-object, inverted; instances and static transforms use their stored inverse;

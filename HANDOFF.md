@@ -12,7 +12,7 @@
     to `target/s1a.ptx`.
   - Build: `cd spikes/s1a-optix-ptx && OPTIX_ROOT=C:/projects/projects.rust.cg/nv/optix-dev cargo oxide build`
     then `cargo oxide run`.
-- **S2**: designed, no code. Build on gpu-info-rs: `gpu_info::shared_device()` (Vulkan device
+- **S2** (`spikes/s2-wgpu-cuda-share`): **PASS** (see PLAN.md §8). Original design: Build on gpu-info-rs: `gpu_info::shared_device()` (Vulkan device
   already has `VK_KHR_external_memory_win32` + `VK_KHR_external_semaphore_win32`),
   `gpu_info::external::SharedBuffer::export(&device, size)` -> `Export { handle, allocation,
   memory_type }`, `acquire`/`release` ownership command buffers, `device_uuid`. Steps:

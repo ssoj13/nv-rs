@@ -192,6 +192,15 @@ symbol is mangled to `cuda_oxide_const_<hash>_kernels_L<line>C<col>_PARAMS`, so 
 name from the PTX. Added to the fork patch list (alongside `ptx_asm!` input arity and
 `#[device(export_name)]`).
 
+**S2 result (2026-11-12): PASS.** `spikes/s2-wgpu-cuda-share`: gpu-info-rs shared Vulkan device +
+`SharedBuffer::export` (dedicated, `OPAQUE_WIN32`) imported by `cuImportExternalMemory` +
+`cuExternalMemoryGetMappedBuffer`; Vulkan timeline semaphore exported `OPAQUE_WIN32`, imported as
+`TIMELINE_SEMAPHORE_WIN32`. CUDA write -> signal 1 -> wgpu `add_wait_semaphore` + acquire + copy:
+0/4096 wrong (no lazy clear over CUDA data). wgpu copy + release + `add_signal_semaphore(2)` ->
+CUDA wait 2 -> read: 0/4096 wrong. Device UUIDs match. Note: the fork's `cuda-bindings` on `main`
+now ships committed generated bindings (`cuda-bindings/generated/<target>/`), so D6 must be
+reconciled with the fork's policy.
+
 If S1a fails (OptiX rejects LLVM-NVPTX PTX): stop and reassess. Fallback is post-processing PTX with
 the fork's `ptx-parse`; that changes M5.
 

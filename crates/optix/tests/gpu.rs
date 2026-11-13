@@ -8,7 +8,7 @@
 
 use cuda_core::{Context, DeviceBuffer, Stream};
 use optix::{
-    Accel, BuildOptions, Denoiser, DenoiserModel, DenoiserOptions, DeviceContext, Error, GeometryFlags, HitGroup, Image, Instance, LinkOptions, Module, ModuleOptions, Pipeline,
+    Accel, BuildOptions, Denoiser, DenoiserModel, DenoiserOptions, DeviceContext, Error, GeometryFlags, Guides, HitGroup, Image, Instance, Layer, LinkOptions, Module, ModuleOptions, Params, Pipeline,
     PipelineOptions, ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
 };
 use std::sync::Arc;
@@ -60,7 +60,7 @@ fn vertices(rig: &Rig, dx: f32) -> DeviceBuffer<[f32; 3]> {
 
 fn triangle(rig: &mut Rig, opts: BuildOptions) -> Arc<Accel> {
     let verts = vertices(rig, 0.0);
-    let mesh = TriangleMesh { vertices: &verts, indices: None, flags: GeometryFlags::DISABLE_ANYHIT };
+    let mesh = TriangleMesh { flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&verts) };
     Accel::triangles(&rig.ctx, &rig.stream, &mut rig.scratch, &[mesh], opts).expect("GAS")
 }
 
@@ -123,7 +123,7 @@ fn refits_moved_vertices_and_instances_in_place() {
 
     // Move the vertices, refit the GAS, then the IAS (its bounds are stale otherwise).
     let moved = vertices(&rig, DX);
-    let mesh = TriangleMesh { vertices: &moved, indices: None, flags: GeometryFlags::DISABLE_ANYHIT };
+    let mesh = TriangleMesh { flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&moved) };
     // SAFETY: no launch is in flight; launches below are ordered after the refits on this stream.
     unsafe { gas.refit_triangles(&rig.stream, &mut rig.scratch, &[mesh]) }.expect("refit GAS");
     // SAFETY: as above.
@@ -145,7 +145,7 @@ fn refit_rejects_static_structures_and_changed_topology() {
     let fixed = triangle(&mut rig, BuildOptions::default());
     let updatable = triangle(&mut rig, BuildOptions { allow_update: true, ..Default::default() });
     let verts = vertices(&rig, 0.0);
-    let mesh = || TriangleMesh { vertices: &verts, indices: None, flags: GeometryFlags::DISABLE_ANYHIT };
+    let mesh = || TriangleMesh { flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&verts) };
     // SAFETY: rejected before reaching OptiX.
     let err = unsafe { fixed.refit_triangles(&rig.stream, &mut rig.scratch, &[mesh()]) }.expect_err("static structure");
     assert!(matches!(err, Error::Invalid(_)), "{err}");
@@ -165,7 +165,7 @@ fn scratch_is_reused_across_builds() {
     assert_eq!(rig.scratch.capacity(), held, "an equal-sized build reuses the scratch");
     let other = rig.ctx.cuda().new_stream().expect("stream");
     let verts = vertices(&rig, 0.0);
-    let mesh = TriangleMesh { vertices: &verts, indices: None, flags: GeometryFlags::NONE };
+    let mesh = TriangleMesh { flags: &[GeometryFlags::NONE], ..TriangleMesh::new(&verts) };
     let Err(err) = Accel::triangles(&rig.ctx, &other, &mut rig.scratch, &[mesh], BuildOptions::default()) else {
         panic!("scratch is bound to its stream");
     };
@@ -177,7 +177,7 @@ fn scratch_is_reused_across_builds() {
 fn builds_over_budget_are_refused_before_allocating() {
     let mut rig = rig(true);
     let verts = vertices(&rig, 0.0);
-    let mesh = TriangleMesh { vertices: &verts, indices: None, flags: GeometryFlags::NONE };
+    let mesh = TriangleMesh { flags: &[GeometryFlags::NONE], ..TriangleMesh::new(&verts) };
     let opts = BuildOptions { budget: Some(64), ..Default::default() };
     let Err(Error::Budget { requested, available }) = Accel::triangles(&rig.ctx, &rig.stream, &mut rig.scratch, &[mesh], opts) else {
         panic!("a 64-byte budget cannot hold a GAS");
@@ -234,14 +234,15 @@ fn denoise(model: DenoiserModel, guided: bool) -> (f32, f32) {
     let input = DeviceBuffer::from_host(&rig.stream, &noisy).expect("input");
     let albedo = DeviceBuffer::from_host(&rig.stream, &vec![[0.5f32, 0.5, 0.5, 1.0]; n]).expect("albedo");
     let normal = DeviceBuffer::from_host(&rig.stream, &vec![[0.0f32, 0.0, 1.0, 0.0]; n]).expect("normal");
-    let mut output = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, n).expect("output");
-    let opts = DenoiserOptions { model, albedo: guided, normal: guided, budget: None };
+    let output = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, n).expect("output");
+    let opts = DenoiserOptions { model, albedo: guided, normal: guided, ..Default::default() };
     let mut den = Denoiser::new(&rig.ctx, &rig.stream, opts, S, S).expect("denoiser");
     assert!(den.memory_bytes() > 0);
     let img = |b| Image::new(b, S, S).expect("image");
-    let (a, nm) = if guided { (Some(img(&albedo)), Some(img(&normal))) } else { (None, None) };
+    let guides = if guided { Guides { albedo: Some(img(&albedo)), normal: Some(img(&normal)), ..Default::default() } } else { Guides::default() };
+    let layer = Layer::new(img(&input), img(&output));
     // SAFETY: every image outlives the synchronization below.
-    unsafe { den.invoke(&rig.stream, img(&input), a, nm, &mut output, 0.0) }.expect("invoke");
+    unsafe { den.invoke(&rig.stream, &guides, &[layer], Params::default()) }.expect("invoke");
     rig.stream.synchronize().expect("sync");
     let out = output.to_host_vec(&rig.stream).expect("read back");
     assert!(out.iter().flatten().all(|c| c.is_finite()), "finite output");
@@ -269,14 +270,15 @@ fn denoiser_rejects_mismatched_guides_and_sizes() {
     let mut den = Denoiser::new(&rig.ctx, &rig.stream, DenoiserOptions::default(), 32, 32).expect("denoiser");
     let input = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, 32 * 32).expect("input");
     let small = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, 16 * 16).expect("small");
-    let mut output = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, 32 * 32).expect("output");
+    let output = DeviceBuffer::<[f32; 4]>::zeroed(&rig.stream, 32 * 32).expect("output");
     let img = Image::new(&input, 32, 32).expect("image");
+    let out = Image::new(&output, 32, 32).expect("output image");
     // SAFETY: rejected before reaching OptiX.
-    let err = unsafe { den.invoke(&rig.stream, img, Some(img), None, &mut output, 0.0) }.expect_err("guide not configured");
+    let err = unsafe { den.invoke(&rig.stream, &Guides { albedo: Some(img), ..Default::default() }, &[Layer::new(img, out)], Params::default()) }.expect_err("guide not configured");
     assert!(matches!(err, Error::Invalid(_)), "{err}");
     let small_img = Image::new(&small, 16, 16).expect("small image");
     // SAFETY: rejected before reaching OptiX.
-    let err = unsafe { den.invoke(&rig.stream, small_img, None, None, &mut output, 0.0) }.expect_err("size mismatch");
+    let err = unsafe { den.invoke(&rig.stream, &Guides::default(), &[Layer::new(small_img, out)], Params::default()) }.expect_err("size mismatch");
     assert!(matches!(err, Error::Invalid(_)), "{err}");
     assert!(Image::new(&input, 31, 32).is_err(), "length checked");
     let budget = DenoiserOptions { budget: Some(16), ..Default::default() };

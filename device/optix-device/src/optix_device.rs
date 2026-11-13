@@ -9,6 +9,8 @@
 //!   attributes, SBT data), report / ignore / terminate;
 //! - [`payload`] — typed [`Payload`]s in payload registers;
 //! - [`trace`] — [`trace::trace`] with a [`trace::Ray`] and [`trace::TraceOptions`];
+//! - [`coop_vec`] — cooperative vectors: [`coop_vec::CoopVec`], load, element-wise ops,
+//!   matrix-vector products with bias, reductions and outer products for neural shading;
 //! - [`exception`] — user exceptions, codes, details, line info.
 //! - [`geometry`] — vertex data of the hit primitive (triangles, every curve kind, ribbons,
 //!   spheres), current hit, by GAS index or by handle, and hit-kind helpers;
@@ -24,6 +26,7 @@
 
 #![no_std]
 
+pub mod coop_vec;
 pub mod exception;
 pub mod geometry;
 pub mod hitobject;

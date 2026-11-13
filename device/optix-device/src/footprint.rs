@@ -2,8 +2,8 @@
 //! virtual texturing (decide which tiles to make resident before sampling).
 //!
 //! **What.** [`tex_footprint_2d`], [`tex_footprint_2d_grad`] and [`tex_footprint_2d_lod`] are
-//! `optixTexFootprint2D`, `optixTexFootprint2DGrad` and `optixTexFootprint2DLod`; each returns a
-//! [`Footprint2d`], the header's `Texture2DFootprint` (`uint4`), and writes the `singleMipLevel`
+//! `optixTexFootprint2D`, `optixTexFootprint2DGrad` and `optixTexFootprint2DLod`; each stores a
+//! [`Footprint2d`], the header's `Texture2DFootprint` (`uint4`), to caller memory and writes the `singleMipLevel`
 //! flag through an out parameter as the header does. [`TexInfo::pack`] builds their `texInfo`
 //! argument.
 //! **How.** Exactly `internal/optix_device_impl.h`: the float arguments go to the
@@ -13,7 +13,6 @@
 //! come from the host crate `cuda-ext` (`TextureObject::handle`).
 
 use crate::raw;
-use core::mem::MaybeUninit;
 
 /// The footprint of a 2D texture fetch at one mip level (`Texture2DFootprint` in
 /// `optix_device.h`, returned as a `uint4`).
@@ -149,57 +148,39 @@ impl TexInfo {
     }
 }
 
-/// Runs one footprint intrinsic that stores its `uint4` result through the address it is given.
-///
-/// # Safety
-///
-/// `call` must store a whole `Footprint2d` to that address.
-#[inline(always)]
-unsafe fn footprint(call: impl FnOnce(u64)) -> Footprint2d {
-    let mut r = MaybeUninit::<Footprint2d>::uninit();
-    call(r.as_mut_ptr() as u64);
-    // SAFETY: the caller's intrinsic wrote all 16 bytes; every bit pattern is a valid `Footprint2d`.
-    unsafe { r.assume_init() }
-}
-
-/// `optixTexFootprint2D`: the footprint of a non-mipmapped 2D fetch at `(x, y)`.
+/// `optixTexFootprint2D`: the footprint of a non-mipmapped 2D fetch at `(x, y)`, stored to `out`.
 ///
 /// `tex_info` packs the texture's layout (`optix_device.h`; build it with [`TexInfo::pack`]):
 /// bits 28..24 mip level count, 23..20 log2 tile width, 19..16 log2 tile height, 9..8 horizontal
 /// and 7..6 vertical `CUaddress_mode`, 5 mip filter (`CUfilter_mode`), 4..0 maximum anisotropy.
 /// `single_mip_level` receives non-zero when the footprint spans one mip level.
 ///
+/// The intrinsic stores through addresses, so the result goes to caller memory instead of a
+/// returned local: a local would sit in a `.local` depot, which cuda-oxide addresses through
+/// 32-bit registers and OptiX programs fault on. Point `out` and `single_mip_level` at global
+/// memory (or anything not stack-allocated in the program).
+///
 /// # Safety
 ///
 /// Valid in every program type (Turing and later). `tex` must be a live texture object over a 2D
 /// resource and `tex_info` must describe it.
 #[inline(always)]
-pub unsafe fn tex_footprint_2d(
-    tex: u64,
-    tex_info: u32,
-    x: f32,
-    y: f32,
-    single_mip_level: &mut u32,
-) -> Footprint2d {
-    let s = single_mip_level as *mut u32 as u64;
-    // SAFETY: forwarded contract; the intrinsic stores the 16-byte result to `r` and the flag to `s`.
-    unsafe {
-        footprint(|r| raw::tex_footprint_2d_v2(tex, tex_info, x.to_bits(), y.to_bits(), s, r))
-    }
+pub unsafe fn tex_footprint_2d(tex: u64, tex_info: u32, x: f32, y: f32, single_mip_level: &mut u32, out: &mut Footprint2d) {
+    let (s, r) = (single_mip_level as *mut u32 as u64, out as *mut Footprint2d as u64);
+    // SAFETY: forwarded contract; the intrinsic stores the 16-byte result to `r` (a whole,
+    // 16-byte aligned `Footprint2d`) and the flag to `s`.
+    unsafe { raw::tex_footprint_2d_v2(tex, tex_info, x.to_bits(), y.to_bits(), s, r) }
 }
 
 /// `optixTexFootprint2DGrad`: the footprint of `tex2DGrad` at `(x, y)` with derivatives `dpdx`
-/// (`dPdx_x`, `dPdx_y`) and `dpdy` (`dPdy_x`, `dPdy_y`); `coarse` asks for the coarser of two
-/// spanned mip levels.
+/// (`dPdx_x`, `dPdx_y`) and `dpdy` (`dPdy_x`, `dPdy_y`), stored to `out`; `coarse` asks for the
+/// coarser of two spanned mip levels.
 ///
 /// # Safety
 ///
 /// As [`tex_footprint_2d`] (`tex` mipmapped as `tex_info` says).
 #[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors optixTexFootprint2DGrad's parameter list"
-)]
+#[expect(clippy::too_many_arguments, reason = "mirrors optixTexFootprint2DGrad's parameter list plus the result")]
 pub unsafe fn tex_footprint_2d_grad(
     tex: u64,
     tex_info: u32,
@@ -209,60 +190,39 @@ pub unsafe fn tex_footprint_2d_grad(
     dpdy: [f32; 2],
     coarse: bool,
     single_mip_level: &mut u32,
-) -> Footprint2d {
-    let s = single_mip_level as *mut u32 as u64;
+    out: &mut Footprint2d,
+) {
+    let (s, r) = (single_mip_level as *mut u32 as u64, out as *mut Footprint2d as u64);
     let [dxx, dxy] = dpdx;
     let [dyx, dyy] = dpdy;
     // SAFETY: forwarded contract; the intrinsic stores the 16-byte result to `r` and the flag to `s`.
     unsafe {
-        footprint(|r| {
-            raw::tex_footprint_2d_grad_v2(
-                tex,
-                tex_info,
-                x.to_bits(),
-                y.to_bits(),
-                dxx.to_bits(),
-                dxy.to_bits(),
-                dyx.to_bits(),
-                dyy.to_bits(),
-                u32::from(coarse),
-                s,
-                r,
-            )
-        })
+        raw::tex_footprint_2d_grad_v2(
+            tex,
+            tex_info,
+            x.to_bits(),
+            y.to_bits(),
+            dxx.to_bits(),
+            dxy.to_bits(),
+            dyx.to_bits(),
+            dyy.to_bits(),
+            u32::from(coarse),
+            s,
+            r,
+        )
     }
 }
 
-/// `optixTexFootprint2DLod`: the footprint of `tex2DLod` at `(x, y)` and mip `level`; `coarse`
-/// asks for the coarser of two spanned mip levels.
+/// `optixTexFootprint2DLod`: the footprint of `tex2DLod` at `(x, y)` and mip `level`, stored to
+/// `out`; `coarse` asks for the coarser of two spanned mip levels.
 ///
 /// # Safety
 ///
 /// As [`tex_footprint_2d`] (`tex` mipmapped as `tex_info` says).
 #[inline(always)]
-pub unsafe fn tex_footprint_2d_lod(
-    tex: u64,
-    tex_info: u32,
-    x: f32,
-    y: f32,
-    level: f32,
-    coarse: bool,
-    single_mip_level: &mut u32,
-) -> Footprint2d {
-    let s = single_mip_level as *mut u32 as u64;
+#[expect(clippy::too_many_arguments, reason = "mirrors optixTexFootprint2DLod's parameter list plus the result")]
+pub unsafe fn tex_footprint_2d_lod(tex: u64, tex_info: u32, x: f32, y: f32, level: f32, coarse: bool, single_mip_level: &mut u32, out: &mut Footprint2d) {
+    let (s, r) = (single_mip_level as *mut u32 as u64, out as *mut Footprint2d as u64);
     // SAFETY: forwarded contract; the intrinsic stores the 16-byte result to `r` and the flag to `s`.
-    unsafe {
-        footprint(|r| {
-            raw::tex_footprint_2d_lod_v2(
-                tex,
-                tex_info,
-                x.to_bits(),
-                y.to_bits(),
-                level.to_bits(),
-                u32::from(coarse),
-                s,
-                r,
-            )
-        })
-    }
+    unsafe { raw::tex_footprint_2d_lod_v2(tex, tex_info, x.to_bits(), y.to_bits(), level.to_bits(), u32::from(coarse), s, r) }
 }

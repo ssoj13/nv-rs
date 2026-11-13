@@ -25,7 +25,7 @@ const LEVELS: u32 = 9;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Params {
-    /// 6 words per probe: mask lo, mask hi, word2, word3, single-mip-level flag, unused.
+    /// 8 words per probe: the `Footprint2d` (16 bytes), the single-mip-level flag, unused.
     pub out: u64,
     /// `[f32; 8]` per probe: kind (0 plain, 1 lod, 2 grad), u, v, lod, coarse, dpdx = dpdy scale.
     pub probes: u64,
@@ -49,27 +49,24 @@ mod kernels {
 
     #[kernel]
     pub fn __raygen__fp() {
-        // SAFETY: raygen; `params_fp` holds a live texture, its info word and one probe and six
-        // output words per launch index. The single-mip-level flag is written straight into the
-        // global output (no local copy).
+        // SAFETY: raygen; `params_fp` holds a live texture, its info word and one probe and eight
+        // output words (32 bytes, 16-byte aligned) per launch index. The footprint and the
+        // single-mip-level flag are stored straight into the global output, never to a local.
         unsafe {
             let i = state::launch_index()[0] as usize;
             let p = PARAMS.get();
             let q = (p.probes as *const [f32; 8]).add(i).read();
-            let o = (p.out as *mut u32).add(6 * i);
+            let o = (p.out as *mut u32).add(8 * i);
             let single = &mut *o.add(4);
+            let f = &mut *o.cast::<Footprint2d>();
             let coarse = q[4] != 0.0;
-            let f = if q[0] == 0.0 {
-                fp::tex_footprint_2d(p.tex, p.info, q[1], q[2], single)
+            if q[0] == 0.0 {
+                fp::tex_footprint_2d(p.tex, p.info, q[1], q[2], single, f);
             } else if q[0] == 1.0 {
-                fp::tex_footprint_2d_lod(p.tex, p.info, q[1], q[2], q[3], coarse, single)
+                fp::tex_footprint_2d_lod(p.tex, p.info, q[1], q[2], q[3], coarse, single, f);
             } else {
-                fp::tex_footprint_2d_grad(p.tex, p.info, q[1], q[2], [q[5], 0.0], [0.0, q[5]], coarse, single)
-            };
-            o.write(f.mask as u32);
-            o.add(1).write((f.mask >> 32) as u32);
-            o.add(2).write(f.word2);
-            o.add(3).write(f.word3);
+                fp::tex_footprint_2d_grad(p.tex, p.info, q[1], q[2], [q[5], 0.0], [0.0, q[5]], coarse, single, f);
+            }
         }
     }
 
@@ -111,13 +108,13 @@ pub fn run(g: &Gpu) -> R {
         probes.push(([2.0, 0.55, 0.72, 0.0, coarse, 2f32.powf(l) / SIZE as f32, 0.0, 0.0], level, 1));
     }
     let table = g.up(&probes.iter().map(|p| p.0).collect::<Vec<_>>())?;
-    let out = g.zeros::<u32>(6 * probes.len())?;
+    let out = g.zeros::<u32>(8 * probes.len())?;
     let params = Params { out: out.cu_deviceptr(), probes: table.cu_deviceptr(), tex: tex.handle(), info, _pad: 0 };
     // SAFETY: `params` matches the device struct; texture, table and output outlive the launch.
     unsafe { g.launch(&pipeline, &sbt, &params, [probes.len() as u32, 1, 1]) }?;
     let got = g.down(&out)?;
     for (i, (q, level, single)) in probes.iter().enumerate() {
-        let r = &got[6 * i..6 * i + 6];
+        let r = &got[8 * i..8 * i + 8];
         let f = Footprint2d { mask: u64::from(r[0]) | u64::from(r[1]) << 32, word2: r[2], word3: r[3] };
         let label = format!("probe {i} {q:?}");
         // The grad probes sit on exact powers of two: single level, `coarse` irrelevant.

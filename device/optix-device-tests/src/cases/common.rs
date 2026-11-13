@@ -48,7 +48,9 @@ impl Gpu {
     pub fn new(ptx: Vec<u8>) -> R<Self> {
         let cuda = Context::new(0).ctx("CUDA device 0")?;
         let stream = cuda.default_stream();
-        let ctx = DeviceContext::new(&cuda, Some(Box::new(|l, t, m| eprintln!("[optix {l} {t}] {m}"))), 2, false).ctx("OptiX context")?;
+        // `ODT_VALIDATION=1` turns on OptiX validation mode (every exception enabled, checked launches).
+        let validation = std::env::var("ODT_VALIDATION").is_ok_and(|v| v == "1");
+        let ctx = DeviceContext::new(&cuda, Some(Box::new(|l, t, m| eprintln!("[optix {l} {t}] {m}"))), if validation { 4 } else { 2 }, validation).ctx("OptiX context")?;
         Ok(Self { cuda, stream, ctx, ptx })
     }
 

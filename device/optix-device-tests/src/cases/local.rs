@@ -1,42 +1,58 @@
-//! Case `no_local`: no OptiX program of the embedded PTX keeps a `.local` depot.
+//! Case `ptr64`: every `.local` and `.const` access of the embedded PTX uses a 64-bit address.
 //!
-//! **Why.** cuda-oxide runs `llc --nvptx-short-ptr`, so a function that needs local memory
-//! (address-taken arrays, arrays indexed at run time, loops over arrays it does not unroll) gets
-//! a `__local_depot` addressed through 32-bit registers (`cvt.u32.u64` of `%SPL`, then
-//! `st.local [%r..]`). OptiX programs fault on that: a hand-written raygen with a 1 KiB depot
-//! runs correctly with 64-bit local addresses and raises `CUDA_ERROR_ILLEGAL_ADDRESS` with the
-//! same code using 32-bit ones; pipeline stack sizes and the CUDA stack limit do not change it.
-//! Small depots can pass by luck (they stay inside memory OptiX did map), which hides the bug
-//! until a program grows. Library code therefore indexes arrays with constants only, and this
-//! case scans the PTX every run and names any function with a depot.
+//! **Why.** OptiX programs fault (`CUDA_ERROR_ILLEGAL_ADDRESS`) on state-space addresses held in
+//! 32-bit registers, which is what cuda-oxide emits by default (`llc --nvptx-short-ptr`): a
+//! `__local_depot` addressed through `cvt.u32.u64` of `%SPL` then `st.local [%r..]`, or a
+//! `.const` address picked at run time into a 32-bit register. A hand-written raygen with the
+//! same depot runs with 64-bit addresses, and small depots can pass by luck; built with short
+//! pointers, case `const_index` and the coop_vec N = 80 pointer path fault. This crate is
+//! therefore built with 64-bit pointers in every address space (`CUDA_OXIDE_NO_SHORT_PTR`, set
+//! in `.cargo/cuda-oxide.toml`), and this case checks the PTX every run so a build without it
+//! fails here, by name, before a launch faults and poisons the context for later cases.
 //!
-//! [`BLOCKED`] lists the programs that need a depot by construction and are therefore not
-//! launched (each case that owns one fails with [`BLOCKED_WHY`]).
+//! The scan needs at least one depot to look at: the coop_vec N = 80 program (pointer path)
+//! hands OptiX the addresses of its operands, so it always has one.
 
 use super::common::{Gpu, R};
-
-/// Programs that need addressable local memory by construction.
-pub const BLOCKED: &[&str] = &[
-    // optixCoopVec* pointer path (N > 64): OptiX receives the addresses of the operands.
-    "__raygen__cv80",
-];
-
-/// Why the [`BLOCKED`] programs are not run.
-pub const BLOCKED_WHY: &str = "needs a .local depot, and OptiX faults on cuda-oxide's 32-bit (--nvptx-short-ptr) local addressing; fix: 64-bit local pointers in cuda-oxide for OptiX targets";
 
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let ptx = String::from_utf8_lossy(&g.ptx);
     let mut current = "";
+    let (mut depots, mut accesses) = (0usize, 0usize);
     let mut bad = Vec::new();
     for line in ptx.lines() {
         let t = line.trim_start();
         if t.starts_with(".visible .entry") || t.starts_with(".entry") || t.starts_with(".func") || t.starts_with(".visible .func") {
             current = t;
         }
-        if t.starts_with(".local") && t.contains("__local_depot") && !BLOCKED.iter().any(|b| current.contains(&format!(" {b}("))) {
+        if t.starts_with(".local") && t.contains("__local_depot") {
+            depots += 1;
+        }
+        // The depot pointer narrowed to 32 bits: the short-pointer form itself.
+        if t.starts_with("cvt.u32.u64") && t.contains("%SP") {
             bad.push(format!("{current} -> {t}"));
         }
+        if ["ld.local", "st.local", "ld.const"].iter().any(|op| t.starts_with(op)) {
+            accesses += 1;
+            if address_is_32_bit(t) {
+                bad.push(format!("{current} -> {t}"));
+            }
+        }
     }
-    if bad.is_empty() { Ok(()) } else { Err(format!("{} function(s) keep a .local depot ({BLOCKED_WHY}): {bad:?}", bad.len())) }
+    if !bad.is_empty() {
+        return Err(format!("{} state-space access(es) use 32-bit addresses (built without CUDA_OXIDE_NO_SHORT_PTR?): {bad:?}", bad.len()));
+    }
+    if depots == 0 || accesses == 0 {
+        return Err(format!("nothing to check ({depots} depots, {accesses} accesses); the coop_vec N = 80 program should have a depot"));
+    }
+    println!("ptr64: {depots} depot(s), {accesses} ld/st.local and ld.const, all 64-bit addressed");
+    Ok(())
+}
+
+/// Whether the `[...]` address of a load or store is a 32-bit register (`%r<n>`; 64-bit ones
+/// are `%rd<n>`, `%SP`, `%SPL`, or a symbol).
+fn address_is_32_bit(instruction: &str) -> bool {
+    let Some(start) = instruction.find('[') else { return false };
+    instruction[start + 1..].strip_prefix("%r").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }

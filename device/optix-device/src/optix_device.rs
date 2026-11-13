@@ -22,6 +22,15 @@
 //!
 //! Every function is `unsafe`: OptiX restricts each intrinsic to certain program types, which the
 //! type system cannot see; each documents where it is valid.
+//!
+//! **Build requirement: 64-bit pointers.** A crate whose OptiX programs use this API must be
+//! compiled with 64-bit pointers in every address space: `CUDA_OXIDE_NO_SHORT_PTR=1`, e.g. as
+//! `[env] CUDA_OXIDE_NO_SHORT_PTR = "1"` (or `short-pointers = false`) in the crate's
+//! `.cargo/cuda-oxide.toml`. cuda-oxide's default `llc --nvptx-short-ptr` addresses a program's
+//! `.local` depot through 32-bit registers, and OptiX faults (`CUDA_ERROR_ILLEGAL_ADDRESS`) on that
+//! as soon as a program needs local memory (address-taken or run-time-indexed arrays, the
+//! cooperative-vector pointer path for N > 64); nvcc never emits short pointers for OptiX code.
+//!
 //! **Used by** OptiX programs (`__raygen__*`, `__miss__*`, `__closesthit__*`, ...) written with
 //! `cuda_device::kernel`; the host side is the `optix` crate.
 

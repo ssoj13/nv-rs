@@ -5,6 +5,7 @@
 
 pub mod calls;
 pub mod common;
+pub mod const_index;
 pub mod coopvec;
 pub mod exception;
 pub mod footprint;
@@ -22,9 +23,9 @@ use common::{Gpu, R};
 /// A case: name and entry point.
 pub type Case = (&'static str, fn(&Gpu) -> R);
 
-/// Every case, in run order (`no_local` first: it only scans the PTX).
+/// Every case, in run order (`ptr64` first: it only scans the PTX).
 pub const ALL: &[Case] = &[
-    ("no_local", local::run),
+    ("ptr64", local::run),
     ("shade", shade::run),
     ("geometry", geometry::run),
     ("transform", transform::run),
@@ -34,6 +35,7 @@ pub const ALL: &[Case] = &[
     ("callables", calls::callables),
     ("payload_types", calls::payload_types),
     ("symbols", symbols::run),
+    ("const_index", const_index::run),
     ("coop_vec", coopvec::run),
     ("texture", texture::run),
     ("sparse", texture::sparse),

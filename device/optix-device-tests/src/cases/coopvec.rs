@@ -177,17 +177,16 @@ pub fn run(g: &Gpu) -> R {
     let module = g.module(&Default::default(), &o, &["__raygen__cv8", "__raygen__cv32", "__raygen__cv80", "__miss__cv"])?;
     let miss = ProgramGroup::miss(&module, "__miss__cv").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup::default()).ctx("empty hit group")?;
-    for (n, entry) in [(8usize, "__raygen__cv8"), (32, "__raygen__cv32")] {
+    // N = 80 is the pointer path: OptiX receives the addresses of operands in the program's
+    // `.local` depot, which needs 64-bit local pointers (case `ptr64`).
+    for (n, entry) in [(8usize, "__raygen__cv8"), (32, "__raygen__cv32"), (80, "__raygen__cv80")] {
         let raygen = ProgramGroup::raygen(&module, entry).ctx("raygen")?;
         let pipeline = g.pipeline(&o, LinkOptions { max_trace_depth: 0, ..Default::default() }, &[raygen.clone(), miss.clone(), hit.clone()])?;
         let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[SbtRecord::new(&miss, 0u32).ctx("ms")?], &[SbtRecord::new(&hit, 0u32).ctx("hg")?]).ctx("SBT")?;
         size(g, n, &pipeline, &sbt).map_err(|e| format!("N = {n}: {e}"))?;
     }
-    println!("coop_vec: N = 8, 32 x {THREADS} threads: element-wise ops, cvt, matmul+bias, exp2, tanh, reduce-sum, outer product");
-    // The pointer path hands OptiX the addresses of operands in a `.local` depot, which
-    // cuda-oxide addresses through 32-bit registers; OptiX faults on that (case `no_local`), and
-    // the illegal address would poison the context for every later case, so it is not launched.
-    Err(format!("N = 80 (pointer path) not run: {}", super::local::BLOCKED_WHY))
+    println!("coop_vec: N = 8, 32, 80 x {THREADS} threads: element-wise ops, cvt, matmul+bias, exp2, tanh, reduce-sum, outer product");
+    Ok(())
 }
 
 /// One size: inputs, conversion, launch, checks.

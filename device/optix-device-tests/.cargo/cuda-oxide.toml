@@ -1,0 +1,9 @@
+# cargo-oxide project config (read from the directory `cargo oxide` runs in).
+#
+# OptiX programs need 64-bit pointers in every address space: cuda-oxide's default
+# `llc --nvptx-short-ptr` addresses `.local` depots through 32-bit registers, and OptiX faults
+# on that (case `ptr64` checks the PTX). Equivalent to `short-pointers = false`, which only
+# cargo-oxide builds of ssoj13/cuda-rust_b `feat/optix-device` and later understand; the `[env]`
+# form works with every cargo-oxide.
+[env]
+CUDA_OXIDE_NO_SHORT_PTR = "1"

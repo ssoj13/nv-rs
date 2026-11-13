@@ -207,14 +207,20 @@ pixel centre at least 0.03 from an edge). Finding: other sessions keep the share
 `~/.cargo/cuda-oxide` backend DLL open, so a run that needs a rebuilt backend uses a private
 copy through `CUDA_OXIDE_BACKEND`.
 
-**M4 status (2026-11-13): first cut done.** `crates/optix`: `DeviceContext` (log sink behind
-`catch_unwind`, validation mode), `Accel` (triangle GAS, IAS holding its children, compaction,
-`BuildOptions::budget` checked before allocation), `Module` / `ProgramGroup` (raygen, miss,
-exception, hit group, callables), `Pipeline` (+ `unsafe launch`, params size checked),
-`SbtRecord<T: Pod>` / `ShaderBindingTable`. Gate: clippy `-D warnings` clean; 5/5 GPU tests on
-the PTX cuda-oxide produced for S1b (GAS mask, IAS with a translated instance, budget refusal,
-params size, compile log). Not yet: `optix-repr` (shared host/device types, with M5), caller-owned
-reusable scratch, denoiser, motion blur, opacity micromaps, AS update/refit.
+**M4 result (2026-11-13): DONE.** `crates/optix`: `DeviceContext` (log sink behind
+`catch_unwind`, validation mode); `Accel` (triangle GAS, IAS holding its children, compaction,
+`BuildOptions::budget` checked before any allocation, caller-owned `Scratch` reused across builds
+on one stream, `allow_update` + `unsafe refit_triangles` / `refit_instances` with the topology
+checked); `Module` / `ProgramGroup` (raygen, miss, exception, hit group, callables); `Pipeline`
+(+ `unsafe launch`, params size checked); `SbtRecord<T: Pod>` / `ShaderBindingTable`; `Denoiser`
+(HDR / AOV models, albedo + normal guides, state and scratch sized once per image size against a
+budget, HDR intensity per invoke). Gate: clippy `-D warnings` clean; 11/11 GPU tests on the PTX
+cuda-oxide produced for S1b (GAS and IAS masks, refit of vertices and instance transforms, refit
+rejections, scratch reuse, budget refusal, params size, compile log, HDR and guided-AOV
+denoising halve the noise of a flat grey image, denoiser argument checks). Moved to later
+milestones: `optix-repr` (shared host/device types) with M5; motion blur, opacity micromaps,
+curves/spheres, temporal and upscaling denoisers, AOV layers beyond beauty when render-rs needs
+them (M10).
 
 **S2 result (2026-11-12): PASS.** `spikes/s2-wgpu-cuda-share`: gpu-info-rs shared Vulkan device +
 `SharedBuffer::export` (dedicated, `OPAQUE_WIN32`) imported by `cuImportExternalMemory` +

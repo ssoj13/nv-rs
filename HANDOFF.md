@@ -6,9 +6,9 @@
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
   Details and findings in PLAN.md §8; code under `spikes/`.
 - **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`.
-- **S1b PASS** (Rust raygen calls `optixTrace`; fork branch `feat/optix-device`) and **M4 first cut**:
-  `crates/optix` (context, GAS/IAS + compaction + byte budget, modules, program groups, pipeline,
-  typed SBT, launch); 5 GPU tests on the S1b PTX. Details in PLAN.md §8.
+- **S1b PASS** (Rust raygen calls `optixTrace`) and **M4 done**: `crates/optix` (context, GAS/IAS +
+  compaction + byte budget + reusable scratch + refit, modules, program groups, pipeline, typed
+  SBT, launch, HDR/AOV denoiser); 11 GPU tests on the S1b PTX. Details in PLAN.md §8.
 - **M3 done**: `crates/cuda-ext` (external memory/semaphores, arrays, textures, surfaces, host
   registration, managed memory, UUID/LUID, green contexts); 7 GPU tests incl. a Vulkan round trip.
 - **M2 nearly done** — 18 sys crates build, load and pass their tests on this machine (counts in
@@ -24,7 +24,7 @@
 1. Remaining M2: **nvCOMP** (not installed on this machine), **NCCL** and **cuFile** (Linux only:
    WSL2 for NCCL, native Linux / RunPod for cuFile).
 2. Fork `main` now carries the OptiX patches (`b34ecb947`); spike S1b still pins the branch.
-3. M4 rest: denoiser, reusable caller-owned scratch, AS update/refit; M5 `optix-device` (Rust
+3. M5 `optix-device` (Rust
    wrappers for the `_optix_*` intrinsics, typed payload) + `#[device(export_name)]` for callables;
    M6 `nv-wgpu` on top of cuda-ext.
 

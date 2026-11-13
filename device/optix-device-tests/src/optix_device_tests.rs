@@ -23,6 +23,17 @@ fn main() {
         Ok(g) => g,
         Err(e) => fail(&e),
     };
+    if let Ok(path) = std::env::var("ODT_PTX_PROBE") {
+        let r = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|ptx| {
+            let o = cases::common::opts("params_lp", 16)?;
+            let (m, log) = optix::Module::new(&gpu.ctx, &Default::default(), &o, &ptx).map_err(|e| e.to_string())?;
+            eprintln!("[probe log] {log}");
+            let hg = optix::ProgramGroup::hit_group(&gpu.ctx, optix::HitGroup { closest_hit: Some((&m, "__closesthit__lp")), ..Default::default() }).map_err(|e| e.to_string())?;
+            hg.stack_sizes(None).map_err(|e| e.to_string())
+        });
+        println!("probe {path}: {r:?}");
+        return;
+    }
     let only: Vec<String> = std::env::args().skip(1).collect();
     let mut failed = 0;
     for (name, case) in cases::ALL.iter().filter(|(n, _)| only.is_empty() || only.iter().any(|o| o == n)) {

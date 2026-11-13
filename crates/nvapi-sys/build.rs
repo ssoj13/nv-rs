@@ -16,8 +16,10 @@ const SPEC: LibSpec = LibSpec {
     // the body of `nvapi.h` is left without them. Force-including the Windows SDK's `sal.h` first
     // makes them pre-existing: NVAPI then neither defines nor undefines them.
     clang_args: &["-include", "sal.h"],
-    // The only bitfield union in NVAPI; bindgen sizes it 3 bytes where MSVC lays out 4.
-    opaque_types: &["NV_TIMING_FLAG"],
+    // The only bitfield union in NVAPI (`NV_TIMING_FLAG`'s anonymous member); bindgen sizes it 3
+    // bytes where MSVC lays out 4. bindgen still emits nested anonymous types of an opaque parent,
+    // so the pattern covers the union itself (patterns are whole-name matches).
+    opaque_types: &["NV_TIMING_FLAG.*"],
     shape: Shape::QueryInterface {
         interface_header: "nvapi_interface.h",
         loader_fn: "nvapi_api",

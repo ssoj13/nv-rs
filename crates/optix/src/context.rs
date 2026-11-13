@@ -336,7 +336,7 @@ fn error_text(f: Option<unsafe extern "C" fn(sys::OptixResult) -> *const c_char>
 }
 
 /// The enum name of an `OptixResult` (`"OPTIX_ERROR_INVALID_VALUE"`; OptiX answers
-/// `"Unrecognized OptixResult code"` for unknown codes).
+/// `"Unknown OptixResult code"` for unknown codes).
 pub fn error_name(code: sys::OptixResult) -> Result<&'static str> {
     error_text(table()?.optixGetErrorName, "optixGetErrorName", code)
 }

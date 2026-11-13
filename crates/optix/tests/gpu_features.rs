@@ -221,8 +221,7 @@ fn error_names_and_display() {
     let text = error_string(code).expect("string");
     assert!(!text.is_empty() && !text.contains("OPTIX_"), "a description, not the name: {text}");
     assert_eq!(error_name(sys::OptixResult_OPTIX_ERROR_SYMBOL_NOT_FOUND).expect("name"), "OPTIX_ERROR_SYMBOL_NOT_FOUND");
-    let unknown = error_name(12345).expect("unknown code");
-    assert!(unknown.contains("Unrecognized"), "{unknown}");
+    assert_eq!(error_name(12345).expect("unknown code"), "Unknown OptixResult code");
     let shown = Error::Optix { call: "optixFoo", code, log: "detail".into() }.to_string();
     assert!(shown.contains("optixFoo") && shown.contains("OPTIX_ERROR_INVALID_VALUE (7001)") && shown.contains(text) && shown.contains("detail"), "{shown}");
 }
@@ -869,17 +868,44 @@ fn motion_gas_traces_key_zero_and_vanishes() {
     unsafe { gas.refit_triangles(&s, &mut rig.scratch, &[mesh]) }.expect("refit motion GAS");
     assert_eq!(rig.trace(gas.handle()), mask(DX), "time 0 sees the refitted key 0");
 
-    let late = BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 0.5, end: 1.0, start_vanish: true, end_vanish: false }, ..Default::default() };
+    let late = BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 0.5, end: 1.0, start_vanish: false, end_vanish: false }, ..Default::default() };
     let gas = tri_gas(&mut rig, &[TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&keys)), flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&k0) }], late);
-    assert_eq!(rig.trace(gas.handle()), misses(), "a ray before begin misses a start-vanishing structure");
-    let clamp = BuildOptions { motion: MotionOptions { start_vanish: false, ..late.motion }, ..late };
-    let gas = tri_gas(&mut rig, &[TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&keys)), flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&k0) }], clamp);
-    assert_eq!(rig.trace(gas.handle()), mask(0.0), "without vanish the first key is clamped");
+    assert_eq!(rig.trace(gas.handle()), mask(0.0), "without vanish a ray before begin sees the first key");
 
     let one = [&k0];
     invalid(Accel::triangles(&rig.ctx, &s, &mut rig.scratch, &[TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&one)), ..TriangleMesh::new(&k0) }], opts), "one buffer for two keys");
     invalid(Accel::triangles(&rig.ctx, &s, &mut rig.scratch, &[opaque(&k0)], BuildOptions { motion_keys: 0, ..Default::default() }), "zero motion keys");
     invalid(Accel::triangles(&rig.ctx, &s, &mut rig.scratch, &[opaque(&k0)], BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 1.0, end: 1.0, ..Default::default() }, ..Default::default() }), "empty time range");
+}
+
+/// A two-key GAS over [0.5, 1] that vanishes before its first key, traced at time 0 either
+/// directly (single-GAS pipeline) or through an IAS.
+fn vanish_gas(through_ias: bool) -> Vec<u32> {
+    let mut rig = rig(Cfg { single_gas: !through_ias, motion: true, ..Default::default() });
+    let s = rig.stream.clone();
+    let k0 = up(&s, &tri_verts(0.0, LEG));
+    let k1 = up(&s, &tri_verts(DX, LEG));
+    let keys = [&k0, &k1];
+    let late = BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 0.5, end: 1.0, start_vanish: true, end_vanish: false }, ..Default::default() };
+    let gas = tri_gas(&mut rig, &[TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&keys)), flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&k0) }], late);
+    if through_ias {
+        let top = ias(&mut rig, &[Instance::new(&gas)], BuildOptions::default());
+        rig.trace(top.handle())
+    } else {
+        rig.trace(gas.handle())
+    }
+}
+
+#[test]
+#[ignore = "GPU"]
+fn motion_gas_start_vanish_misses_direct() {
+    assert_eq!(vanish_gas(false), misses(), "a ray before begin misses a start-vanishing GAS");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn motion_gas_start_vanish_misses_through_ias() {
+    assert_eq!(vanish_gas(true), misses(), "a ray before begin misses a start-vanishing GAS");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1139,7 +1165,12 @@ fn cluster_builds_trace() {
     let exact = unsafe { ClusterAccel::get_sizes(&rig.ctx, &s, &mut rig.scratch, &input, &args, None) }.expect("get sizes").to_host_vec(&s).expect("read sizes");
     assert_eq!(exact, out, "get-sizes matches the implicit build's sizes");
     // SAFETY: `exact` is the get-sizes result of these arguments.
-    let explicit = unsafe { ClusterAccel::build_explicit(&rig.ctx, &s, &mut rig.scratch, &input, &args, &exact, ClusterOptions::default()) }.expect("explicit CLAS");
+    let explicit = unsafe { ClusterAccel::build_explicit(&rig.ctx, &s, &mut rig.scratch, &input, &args, &exact, ClusterOptions { sizes: true, ..Default::default() }) }.expect("explicit CLAS");
+    let eh = explicit.handles().to_host_vec(&s).expect("explicit handle")[0];
+    let es = explicit.output_sizes().expect("sizes").to_host_vec(&s).expect("explicit sizes");
+    println!("implicit handle {:#x}, explicit handle {eh:#x}, explicit sizes {es:?}, explicit buffer {} bytes", clas.handles().to_host_vec(&s).expect("h")[0], explicit.size_bytes());
+    assert_ne!(eh, 0, "the explicit build writes a CLAS address");
+    assert_eq!(es, exact, "the explicit build reports the sizes get-sizes predicted");
     assert_eq!(trace_clusters(&mut rig, &explicit), mask(0.0), "explicit CLAS");
     // SAFETY: rejected before reaching OptiX.
     invalid(unsafe { ClusterAccel::build_explicit(&rig.ctx, &s, &mut rig.scratch, &input, &args, &[], ClusterOptions::default()) }, "no sizes");

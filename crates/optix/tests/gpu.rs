@@ -166,7 +166,9 @@ fn scratch_is_reused_across_builds() {
     let other = rig.ctx.cuda().new_stream().expect("stream");
     let verts = vertices(&rig, 0.0);
     let mesh = TriangleMesh { vertices: &verts, indices: None, flags: GeometryFlags::NONE };
-    let err = Accel::triangles(&rig.ctx, &other, &mut rig.scratch, &[mesh], BuildOptions::default()).expect_err("scratch bound to its stream");
+    let Err(err) = Accel::triangles(&rig.ctx, &other, &mut rig.scratch, &[mesh], BuildOptions::default()) else {
+        panic!("scratch is bound to its stream");
+    };
     assert!(matches!(err, Error::Invalid(_)), "{err}");
 }
 

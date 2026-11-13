@@ -86,6 +86,22 @@ pub enum Shape {
         /// Expression returned when a part's library lacks a symbol.
         missing_symbol: &'static str,
     },
+    /// The DLL exports one query function returning entry points by numeric id (NVAPI:
+    /// `nvapi_QueryInterface(id)`, ids listed in `nvapi_interface.h`). Shims resolve each function
+    /// through the query and fall back like [`Shape::Exports`] shims.
+    QueryInterface {
+        /// Header holding `{ "Name", 0x1234abcd }` id entries.
+        interface_header: &'static str,
+        /// Name of the sys crate's loader function; it returns the loaded query entry point
+        /// (`Result<&'static nv_loader::QueryInterface, _>`).
+        loader_fn: &'static str,
+        /// Status type names as they appear in signatures.
+        status_types: &'static [&'static str],
+        /// Expression returned when the library could not be loaded.
+        not_loaded: &'static str,
+        /// Expression returned when the query has no entry point for the id.
+        missing_symbol: &'static str,
+    },
     /// Entry points come from a runtime query into a table struct (OptiX, NVENC); types only.
     FunctionTable {
         /// The table struct whose fields are the entry points (`"OptixFunctionTable"`).
@@ -199,8 +215,9 @@ pub struct Output {
 pub struct GeneratedPart {
     /// File-name infix: empty for a single-DLL library, `_<part>` for a split one.
     pub stem: String,
-    /// The dynamic-loading struct.
-    pub api: String,
+    /// The dynamic-loading struct (`None` for [`Shape::QueryInterface`], whose shims resolve
+    /// through the query instead).
+    pub api: Option<String>,
     /// The panic-free shims.
     pub shims: String,
 }
@@ -251,7 +268,9 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         // `<lib>_api.rs` for one DLL, `<lib>_<part>_api.rs` per DLL of a split library.
         let stem = part.stem.trim_start_matches('_');
         let prefix = if stem.is_empty() { String::new() } else { format!("{stem}_") };
-        write(&format!("{prefix}api.rs"), &part.api)?;
+        if let Some(api) = &part.api {
+            write(&format!("{prefix}api.rs"), api)?;
+        }
         write(&format!("{prefix}shims.rs"), &part.shims)?;
     }
     let json = serde_json::to_string_pretty(&out.inventory).map_err(|e| Error::Generated { lib: spec.name, msg: e.to_string() })?;
@@ -303,6 +322,8 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     // (stem, api_type, loader_fn, header files or empty for "all allowlisted functions")
     let plan: Vec<(String, &str, &str, &[&str])> = match spec.shape {
         Shape::Exports { api_type, loader_fn, .. } => vec![(String::new(), api_type, loader_fn, &[])],
+        // The signatures come from a throwaway dynamic-loading struct; the shims call the query.
+        Shape::QueryInterface { loader_fn, .. } => vec![(String::new(), QI_SIGNATURES, loader_fn, &[])],
         Shape::SplitExports { parts, .. } => {
             parts.iter().map(|p| (format!("_{}", p.name), p.api_type, p.loader_fn, p.header_files)).collect()
         }
@@ -364,7 +385,23 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
                 let generated = shims(spec.name, &api, api_type, loader_fn, &codes)?;
                 symbols.extend(inventory(spec.name, &api, api_type)?);
                 unshimmed.extend(generated.unshimmed);
-                parts.push(GeneratedPart { stem, api, shims: generated.source });
+                parts.push(GeneratedPart { stem, api: Some(api), shims: generated.source });
+            }
+        }
+        Shape::QueryInterface { interface_header, status_types, not_loaded, missing_symbol, .. } => {
+            let path = find_header(include_dirs, interface_header).ok_or_else(|| Error::HeaderNotFound {
+                lib: spec.name,
+                header: interface_header.to_string(),
+                searched: include_dirs.to_vec(),
+            })?;
+            let text = std::fs::read_to_string(&path).map_err(|source| Error::Io { lib: spec.name, path, source })?;
+            let ids = interface_ids(&text);
+            let codes = StatusCodes { types: status_types, not_loaded, missing_symbol };
+            for (stem, _, loader_fn, api) in apis {
+                let generated = query_shims(spec.name, &api, loader_fn, &ids, &codes)?;
+                symbols.extend(generated.bound);
+                unshimmed.extend(generated.unshimmed);
+                parts.push(GeneratedPart { stem, api: None, shims: generated.source });
             }
         }
         Shape::FunctionTable { table_type } => symbols = inventory(spec.name, &types, table_type)?,
@@ -374,6 +411,121 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     unshimmed.sort();
 
     Ok(Output { types, parts, inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed } })
+}
+
+/// Internal name of the signature-only struct used by [`Shape::QueryInterface`].
+const QI_SIGNATURES: &str = "NvBindgenQiSignatures";
+
+/// `{ "Name", 0x1234abcd }` entries of a query-interface header, in header order.
+pub fn interface_ids(text: &str) -> Vec<(String, u32)> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix('{')?.trim_start().strip_prefix('"')?;
+            let (name, rest) = rest.split_once('"')?;
+            let hex = rest.trim_start().strip_prefix(',')?.trim().trim_end_matches(['}', ',', ' ']).trim();
+            let id = u32::from_str_radix(hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?, 16).ok()?;
+            Some((name.to_string(), id))
+        })
+        .collect()
+}
+
+/// Query-interface shims plus what they cover.
+#[derive(Debug)]
+pub struct QueryShims {
+    /// The shim source.
+    pub source: String,
+    /// Functions that got a shim (declared in the headers and listed with an id), sorted.
+    pub bound: Vec<String>,
+    /// Functions declared without an id or without a failure value, sorted.
+    pub unshimmed: Vec<String>,
+}
+
+/// Shims that resolve each declared function through the library's query entry point.
+///
+/// `loader_fn()` returns the loaded `nv_loader::QueryInterface`; a null result for the function's id
+/// returns `codes.missing_symbol`, a failed load returns `codes.not_loaded` (pointer and `void`
+/// returns fall back as in [`shims`]). Functions declared in the headers but absent from the id
+/// table cannot be reached and are listed in [`QueryShims::unshimmed`].
+pub fn query_shims(
+    lib: &'static str,
+    signatures_source: &str,
+    loader_fn: &str,
+    ids: &[(String, u32)],
+    codes: &StatusCodes<'_>,
+) -> Result<QueryShims, Error> {
+    let gen_err = |msg: String| Error::Generated { lib, msg };
+    let file = syn::parse_file(signatures_source).map_err(|e| gen_err(e.to_string()))?;
+    let sigs = find_struct(&file, QI_SIGNATURES).ok_or_else(|| gen_err(format!("no struct {QI_SIGNATURES}")))?;
+    let loader = format_ident!("{loader_fn}");
+    let not_loaded: Expr = syn::parse_str(codes.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
+    let missing: Expr = syn::parse_str(codes.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+    let Fields::Named(fields) = &sigs.fields else {
+        return Err(gen_err(format!("{QI_SIGNATURES} has no named fields")));
+    };
+
+    let mut bound = Vec::new();
+    let mut unshimmed = Vec::new();
+    let mut fns: Vec<TokenStream> = Vec::new();
+    for field in &fields.named {
+        let (Some(name), Some(bare)) = (field.ident.as_ref(), result_bare_fn(&field.ty)) else { continue };
+        let Some(id) = ids.iter().find(|(n, _)| n == &name.to_string()).map(|(_, id)| *id) else {
+            unshimmed.push(name.to_string());
+            continue;
+        };
+        let Some(fb) = fallback(&bare.output, codes.types) else {
+            unshimmed.push(name.to_string());
+            continue;
+        };
+        let (on_missing, on_not_loaded) = match fb {
+            Fallback::Status => (quote!(#missing), quote!(#not_loaded)),
+            Fallback::Null { mutable: false } => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
+            Fallback::Null { mutable: true } => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
+            Fallback::Unit => (quote!(()), quote!(())),
+        };
+        let args: Vec<(proc_macro2::Ident, TokenStream)> = bare
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| {
+                let n = arg.name.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(|| format_ident!("arg_{i}"));
+                let ty = &arg.ty;
+                (n.clone(), quote!(#n: #ty))
+            })
+            .collect();
+        let names = args.iter().map(|(n, _)| n);
+        let defs = args.iter().map(|(_, d)| d);
+        let ret = match &bare.output {
+            ReturnType::Default => quote!(),
+            ReturnType::Type(_, ty) => quote!(-> #ty),
+        };
+        let fn_ty = bare;
+        let id_lit = proc_macro2::Literal::u32_suffixed(id);
+        fns.push(quote! {
+            #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
+            #[inline]
+            pub unsafe extern "C" fn #name(#(#defs),*) #ret {
+                // Safety argument: the query returns the driver's implementation of exactly this
+                // id, whose signature the header declares; the library stays loaded for the process.
+                match #loader() {
+                    Ok(__nv_qi) => {
+                        let __nv_ptr = unsafe { (__nv_qi.query)(#id_lit) };
+                        if __nv_ptr.is_null() {
+                            #on_missing
+                        } else {
+                            let __nv_fn = unsafe { ::core::mem::transmute::<*mut ::core::ffi::c_void, #fn_ty>(__nv_ptr) };
+                            unsafe { __nv_fn(#(#names),*) }
+                        }
+                    }
+                    Err(_) => #on_not_loaded,
+                }
+            }
+        });
+        bound.push(name.to_string());
+    }
+    let parsed: syn::File = syn::parse2(quote!(#(#fns)*)).map_err(|e| gen_err(format!("shims: {e}")))?;
+    bound.sort();
+    unshimmed.sort();
+    Ok(QueryShims { source: prettyplease::unparse(&parsed), bound, unshimmed })
 }
 
 /// Escapes regex metacharacters in a file name (`.` in `nppcore.h`).
@@ -819,6 +971,40 @@ mod tests {
         assert!(out.parts[1].shims.contains("fn splitBeta(") && !out.parts[1].shims.contains("fn splitAlpha("));
         assert!(out.parts[0].shims.contains("split_a_api()") && out.parts[1].shims.contains("split_b_api()"));
         assert!(out.types.contains("splitStatus_enum_SPLIT_SUCCESS"), "shared types are generated once");
+    }
+
+    #[test]
+    fn query_interface_shims_call_by_id_and_report_functions_without_one() {
+        let spec = LibSpec {
+            name: "qi",
+            headers: &["qi.h"],
+            allow_fn: &["^qi.*"],
+            allow_type: &["^qi.*", "^_qi.*"],
+            allow_var: &[],
+            positive_enums: &[],
+            shape: Shape::QueryInterface {
+                interface_header: "qi_interface.h",
+                loader_fn: "qi_api",
+                status_types: &["qiStatus"],
+                not_loaded: "_qiStatus_QI_LIBRARY_NOT_FOUND",
+                missing_symbol: "_qiStatus_QI_NO_IMPLEMENTATION",
+            },
+            ..FAKE
+        };
+        let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("qi fixture binds");
+        assert_eq!(out.inventory.symbols, ["qiGetValue", "qiInitialize"]);
+        // Declared but absent from the id table: unreachable, so reported, never shimmed.
+        assert_eq!(out.inventory.unshimmed, ["qiNotInTable"]);
+        let part = &out.parts[0];
+        assert!(part.api.is_none(), "query-interface libraries need no loading struct");
+        assert!(part.shims.contains("0x150e828u32") || part.shims.contains("22079528u32"), "{}", part.shims);
+        assert!(part.shims.contains("_qiStatus_QI_NO_IMPLEMENTATION") && part.shims.contains("_qiStatus_QI_LIBRARY_NOT_FOUND"));
+    }
+
+    #[test]
+    fn interface_ids_parse_the_table_form() {
+        let text = "struct T t[] =\n{\n    { \"NvAPI_Initialize\", 0x0150e828 },\n    { \"NvAPI_Unload\", 0xd22bdd7e },\n};\n";
+        assert_eq!(interface_ids(text), [("NvAPI_Initialize".to_string(), 0x0150e828), ("NvAPI_Unload".to_string(), 0xd22bdd7e)]);
     }
 
     #[test]

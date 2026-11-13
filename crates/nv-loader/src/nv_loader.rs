@@ -373,6 +373,75 @@ impl fmt::Display for Group {
     }
 }
 
+/// A library whose only export is a query returning entry points by numeric id (NVAPI's
+/// `nvapi_QueryInterface`). Kept loaded for the process.
+pub struct QueryInterface {
+    /// The query entry point: id -> function pointer, or null when the driver lacks it.
+    pub query: unsafe extern "C" fn(u32) -> *mut core::ffi::c_void,
+    _lib: libloading::Library,
+}
+
+impl QueryInterface {
+    /// Opens `path` and resolves the query export `symbol` (NUL-terminated).
+    ///
+    /// # Safety
+    /// `symbol` must name a function with the signature `void* (unsigned int)`.
+    pub unsafe fn open(path: &Path, symbol: &[u8]) -> Result<Self, String> {
+        // SAFETY: loading the library runs only its initialisers.
+        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
+        // SAFETY: the caller guarantees the symbol's signature.
+        let query = unsafe { lib.get::<unsafe extern "C" fn(u32) -> *mut core::ffi::c_void>(symbol) }
+            .map(|s| *s)
+            .map_err(|e| e.to_string())?;
+        Ok(Self { query, _lib: lib })
+    }
+}
+
+/// The body of a query-interface sys crate (nv-bindgen `Shape::QueryInterface`, e.g. NVAPI):
+/// generated types and shims, the cached loader the shims call, `DLL`, `load()` and `INVENTORY`.
+#[macro_export]
+macro_rules! query_interface_sys {
+    (lib: $lib:literal, loader: $loader:ident, query_symbol: $sym:literal, dll: $dll:expr $(,)?) => {
+        // Generated code: lint levels differ per header, so the generated modules opt out.
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+        mod types {
+            include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
+        }
+        // Shim bodies share one safety argument, documented once in nv-bindgen (`query_shims`).
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        mod shims {
+            use super::$loader;
+            use super::types::*;
+            include!(concat!(env!("OUT_DIR"), "/", $lib, "_shims.rs"));
+        }
+        pub use shims::*;
+        pub use types::*;
+
+        /// Where this library ships and what its files are called.
+        pub const DLL: $crate::DllSpec = $dll;
+
+        /// Entry points and header sha256 of the generated bindings (coverage evidence).
+        pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
+
+        fn loaded() -> &'static ::core::result::Result<$crate::Loaded<$crate::QueryInterface>, $crate::LoadError> {
+            static API: ::std::sync::OnceLock<::core::result::Result<$crate::Loaded<$crate::QueryInterface>, $crate::LoadError>> =
+                ::std::sync::OnceLock::new();
+            // SAFETY: the query symbol named by the sys crate has the `void* (unsigned int)` signature.
+            API.get_or_init(|| $crate::open_first(&DLL, |p| unsafe { $crate::QueryInterface::open(p, $sym) }))
+        }
+
+        /// The loaded query, for the shims.
+        fn $loader() -> ::core::result::Result<&'static $crate::QueryInterface, &'static $crate::LoadError> {
+            loaded().as_ref().map(|l| &l.value)
+        }
+
+        /// Loads the library now and reports which file was used, or why loading failed.
+        pub fn load() -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
+            loaded().as_ref().map(|l| l.path.as_path())
+        }
+    };
+}
+
 /// The body of a sys crate for a library split over several DLLs (nv-bindgen
 /// `Shape::SplitExports`, e.g. NPP).
 ///

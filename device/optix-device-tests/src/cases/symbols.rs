@@ -65,6 +65,7 @@ mod kernels {
                 o.add(N + 2).write(c[2]);
                 o.add(N + 3).write(c[3]);
             }
+            (&raw mut ODT_SYM_OUT).cast::<u32>().add(x).write_volatile(2 * v + 1);
         }
     }
 

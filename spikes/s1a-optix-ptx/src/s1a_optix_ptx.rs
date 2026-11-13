@@ -30,6 +30,12 @@ pub struct Params {
     pub _pad: u32,
 }
 
+// SAFETY: plain integers; the all-zero pattern is a valid `Params`.
+unsafe impl cuda_device::ConstantMemoryValue for Params {}
+
+/// `OPTIX_SBT_RECORD_HEADER_SIZE` is a cast macro bindgen cannot evaluate.
+const SBT_HEADER: usize = 32;
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -99,7 +105,7 @@ unsafe extern "C" fn log_cb(level: c_uint, tag: *const c_char, msg: *const c_cha
 }
 
 #[repr(C, align(16))]
-struct Record([u8; ox::OPTIX_SBT_RECORD_HEADER_SIZE as usize]);
+struct Record([u8; SBT_HEADER]);
 
 fn main() -> Result<(), String> {
     const W: u32 = 4;
@@ -160,15 +166,25 @@ fn main() -> Result<(), String> {
         check("deviceContextCreate", t.optixDeviceContextCreate.unwrap()(ctx.cu_ctx() as _, &opts, &mut dctx), &[0])?;
 
         let mco = ox::OptixModuleCompileOptions::default();
-        let pname = c"params";
+        // cuda-oxide ignores `#[constant(export_name)]` and mangles the symbol, so take the real
+        // `.const` name from the PTX (finding for the fork patch list).
+        let pname_str = ptx_text
+            .lines()
+            .find(|l| l.contains(".const") && l.contains("PARAMS"))
+            .and_then(|l| l.split_whitespace().last())
+            .and_then(|tok| tok.split('[').next())
+            .ok_or("PARAMS .const symbol not found in PTX")?
+            .to_owned();
+        println!("launch params symbol: {pname_str}");
+        let pname = std::ffi::CString::new(pname_str).map_err(|e| e.to_string())?;
         let pco = ox::OptixPipelineCompileOptions {
-            traversableGraphFlags: ox::OptixTraversableGraphFlags_OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS,
+            traversableGraphFlags: ox::OptixTraversableGraphFlags_OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS as u32,
             numPayloadValues: 0,
             numAttributeValues: 2,
-            exceptionFlags: ox::OptixExceptionFlags_OPTIX_EXCEPTION_FLAG_NONE,
+            exceptionFlags: ox::OptixExceptionFlags_OPTIX_EXCEPTION_FLAG_NONE as u32,
             pipelineLaunchParamsVariableName: pname.as_ptr(),
             pipelineLaunchParamsSizeInBytes: size_of::<Params>(),
-            usesPrimitiveTypeFlags: ox::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE,
+            usesPrimitiveTypeFlags: ox::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE as u32,
             ..Default::default()
         };
         let mut module: ox::OptixModule = ptr::null_mut();

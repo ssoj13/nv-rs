@@ -183,6 +183,15 @@ looped suites, no stacked builds.
 | M10 | render-rs `pt-optix` backend next to `pt-cuda` | same scene matches `pt-cuda` within tolerance | after M4-M6 |
 | M11 | pitch package: docs, coverage matrix, demo | coverage generated; demo runs from a clean checkout | last |
 
+**S1a result (2026-11-12): PASS.** RTX 3080 Ti, driver 621.24, OptiX 9.1 (ABI 118), cuda-rust_b
+`0379bbf`. cuda-oxide emitted clean PTX (`.version 7.1`, `.target sm_86`, `.visible .entry
+__raygen__ids()` with the two `call (%r), _optix_get_launch_index_*, ();` asm blocks);
+`optixModuleCreate` succeeded with an info-only log, pipeline + 4x4 launch wrote indices 1..16
+correctly. Finding: `#[constant(export_name = "params")]` is ignored inside `#[cuda_module]`; the
+symbol is mangled to `cuda_oxide_const_<hash>_kernels_L<line>C<col>_PARAMS`, so the spike reads the
+name from the PTX. Added to the fork patch list (alongside `ptx_asm!` input arity and
+`#[device(export_name)]`).
+
 If S1a fails (OptiX rejects LLVM-NVPTX PTX): stop and reassess. Fallback is post-processing PTX with
 the fork's `ptx-parse`; that changes M5.
 

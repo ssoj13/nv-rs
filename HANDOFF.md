@@ -2,7 +2,7 @@
 
 ## State
 
-- **S1a** (`spikes/s1a-optix-ptx`): code written, never compiled past the toolchain step.
+- **S1a** (`spikes/s1a-optix-ptx`): **PASS** (see PLAN.md §8).
   - Device: `__raygen__ids` reads `_optix_get_launch_index_{x,y}` via `ptx_asm!` `call`, writes
     `index + 1` into the buffer from `.const params` (`#[constant(export_name = "params")]`).
     `__miss__noop` is an empty miss program.

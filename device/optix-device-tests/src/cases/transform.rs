@@ -203,6 +203,12 @@ mod kernels {
                 let gas = state::gas_traversable_handle();
                 *r.add(90) = xf::gas_motion_step_count(gas);
                 put(r, 91, [xf::gas_motion_time_begin(gas), xf::gas_motion_time_end(gas), time]);
+                if n == 1 && xf::gas_motion_step_count(gas) > 1 {
+                    let d = optix_device::geometry::triangle_vertices_from_handle(gas, state::primitive_index(), state::sbt_gas_index(), time);
+                    put(r, 120, d[0]);
+                    put(r, 123, d[1]);
+                    put(r, 126, d[2]);
+                }
             }
         }
     }
@@ -432,7 +438,7 @@ pub fn run(g: &Gpu) -> R {
     let gas = Accel::triangles(&g.ctx, &g.stream, &mut scratch, &[TriangleMesh { flags: &flags, ..TriangleMesh::new(&v0) }], BuildOptions::default()).ctx("GAS")?;
     let v1 = g.up(&TRI1)?;
     let keys = [&v0, &v1];
-    let mgas_opts = BuildOptions { motion_keys: 2, motion: MotionOptions::default(), ..Default::default() };
+    let mgas_opts = BuildOptions { motion_keys: 2, motion: MotionOptions::default(), random_vertex_access: true, ..Default::default() };
     let mgas = Accel::triangles(&g.ctx, &g.stream, &mut scratch, &[TriangleMesh { flags: &flags, ..TriangleMesh::new(Vertices::Float3(Keys::Motion(&keys))) }], mgas_opts).ctx("motion GAS")?;
     let st = Transform::fixed(&g.ctx, &g.stream, &gas, static_m()).ctx("static transform")?;
     let mm = Transform::matrix_motion(&g.ctx, &g.stream, &gas, MotionOptions::default(), &mm_keys()).ctx("matrix motion transform")?;
@@ -492,10 +498,13 @@ pub fn run(g: &Gpu) -> R {
         chk("instance transform", 62, &s.m)?;
         chk("instance inverse", 74, &inv(&s.m))?;
         let verts = (s.verts)(t);
-        chk("vertices at the ray time", 49, verts.as_flattened())?;
         let world = verts.map(|v| point(&o2w, v));
         let (th, u, v) = intersect([q[0], q[1], q[2]], [q[3], q[4], q[5]], world).ok_or_else(|| label("misses on the CPU"))?;
         close(&label("t, barycentrics"), &f(&r[46..49]), &[th, u, v], 2e-4, |j| format!("[{j}]"))?;
+        if *k == 4 {
+            chk("motion GAS vertices from handle at the ray time", 120, verts.as_flattened())?;
+        }
+        chk("vertices at the ray time", 49, verts.as_flattened())?;
         if let Some(e) = entry_m {
             chk("transform_from_handle o2w", 96, &e)?;
             chk("transform_from_handle w2o", 108, &inv(&e))?;

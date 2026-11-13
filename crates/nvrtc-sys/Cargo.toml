@@ -1,0 +1,22 @@
+[package]
+name = "nvrtc-sys"
+description = "Raw NVRTC bindings (CUDA Toolkit), generated at build time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvrtc_sys.rs"
+
+[dependencies]
+nv-loader.workspace = true
+libloading.workspace = true
+
+
+[build-dependencies]
+nv-bindgen.workspace = true
+
+[lints]
+workspace = true

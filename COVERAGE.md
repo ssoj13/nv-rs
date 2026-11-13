@@ -9,8 +9,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | cublas | 517 | 517 | 0 | 0 |
 | cublaslt | 54 | 54 | 0 | 0 |
 | cufft | 35 | 35 | 0 | 0 |
+| cupti | 116 | 116 | 0 | 0 |
 | cusolver | 483 | 483 | 0 | 0 |
 | cusparse | 453 | 453 | 0 | 0 |
+| nvcuvid | 24 | 24 | 0 | 0 |
+| nvenc | 42 | 42 | 0 | 0 |
 | nvjpeg | 81 | 81 | 0 | 0 |
 | nvml | 390 | 390 | 0 | 0 |
 | nvrtc | 29 | 29 | 0 | 0 |
@@ -642,6 +645,129 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cufftSetPlanPropertyInt64` | yes |  |  |  |
 | `cufftSetStream` | yes |  |  |  |
 | `cufftSetWorkArea` | yes |  |  |  |
+
+## cupti
+
+- `cupti.h` sha256 `ea7d389ee01b728f3ae35cb9c620363506b838b3fe8d3fb97ba10d5ff3a93e01`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `cuptiActivityConfigurePCSampling` | yes |  |  |  |
+| `cuptiActivityConfigureUnifiedMemoryCounter` | yes |  |  |  |
+| `cuptiActivityDisable` | yes |  |  |  |
+| `cuptiActivityDisableContext` | yes |  |  |  |
+| `cuptiActivityDisable_v2` | yes |  |  |  |
+| `cuptiActivityEnable` | yes |  |  |  |
+| `cuptiActivityEnableAllSyncRecords` | yes |  |  |  |
+| `cuptiActivityEnableAndDump` | yes |  |  |  |
+| `cuptiActivityEnableAndDump_v2` | yes |  |  |  |
+| `cuptiActivityEnableContext` | yes |  |  |  |
+| `cuptiActivityEnableCudaEventDeviceTimestamps` | yes |  |  |  |
+| `cuptiActivityEnableDeviceGraph` | yes |  |  |  |
+| `cuptiActivityEnableDriverApi` | yes |  |  |  |
+| `cuptiActivityEnableDriverApi_v2` | yes |  |  |  |
+| `cuptiActivityEnableHWTrace` | yes |  |  |  |
+| `cuptiActivityEnableLatencyTimestamps` | yes |  |  |  |
+| `cuptiActivityEnableLaunchAttributes` | yes |  |  |  |
+| `cuptiActivityEnableRuntimeApi` | yes |  |  |  |
+| `cuptiActivityEnableRuntimeApi_v2` | yes |  |  |  |
+| `cuptiActivityEnable_v2` | yes |  |  |  |
+| `cuptiActivityFlush` | yes |  |  |  |
+| `cuptiActivityFlushAll` | yes |  |  |  |
+| `cuptiActivityFlushPeriod` | yes |  |  |  |
+| `cuptiActivityGetAttribute` | yes |  |  |  |
+| `cuptiActivityGetAttribute_v2` | yes |  |  |  |
+| `cuptiActivityGetEnabledKinds` | yes |  |  |  |
+| `cuptiActivityGetNextRecord` | yes |  |  |  |
+| `cuptiActivityGetNextRecord_v2` | yes |  |  |  |
+| `cuptiActivityGetNumDroppedRecords` | yes |  |  |  |
+| `cuptiActivityGetNumDroppedRecords_v2` | yes |  |  |  |
+| `cuptiActivityGetStructSize` | yes |  |  |  |
+| `cuptiActivityPopExternalCorrelationId` | yes |  |  |  |
+| `cuptiActivityPopExternalCorrelationId_v2` | yes |  |  |  |
+| `cuptiActivityPushExternalCorrelationId` | yes |  |  |  |
+| `cuptiActivityPushExternalCorrelationId_v2` | yes |  |  |  |
+| `cuptiActivityRegisterCallbacks` | yes |  |  |  |
+| `cuptiActivityRegisterCallbacks_v2` | yes |  |  |  |
+| `cuptiActivityRegisterTimestampCallback` | yes |  |  |  |
+| `cuptiActivitySetAttribute` | yes |  |  |  |
+| `cuptiActivitySetAttribute_v2` | yes |  |  |  |
+| `cuptiComputeCapabilitySupported` | yes |  |  |  |
+| `cuptiDeviceEnumEventDomains` | yes |  |  |  |
+| `cuptiDeviceEnumMetrics` | yes |  |  |  |
+| `cuptiDeviceGetAttribute` | yes |  |  |  |
+| `cuptiDeviceGetEventDomainAttribute` | yes |  |  |  |
+| `cuptiDeviceGetNumEventDomains` | yes |  |  |  |
+| `cuptiDeviceGetNumMetrics` | yes |  |  |  |
+| `cuptiDeviceSupported` | yes |  |  |  |
+| `cuptiDeviceVirtualizationMode` | yes |  |  |  |
+| `cuptiDisableKernelReplayMode` | yes |  |  |  |
+| `cuptiEnableAllDomains` | yes |  |  |  |
+| `cuptiEnableCallback` | yes |  |  |  |
+| `cuptiEnableDomain` | yes |  |  |  |
+| `cuptiEnableKernelReplayMode` | yes |  |  |  |
+| `cuptiEnumEventDomains` | yes |  |  |  |
+| `cuptiEnumMetrics` | yes |  |  |  |
+| `cuptiEventDomainEnumEvents` | yes |  |  |  |
+| `cuptiEventDomainGetAttribute` | yes |  |  |  |
+| `cuptiEventDomainGetNumEvents` | yes |  |  |  |
+| `cuptiEventGetAttribute` | yes |  |  |  |
+| `cuptiEventGetIdFromName` | yes |  |  |  |
+| `cuptiEventGroupAddEvent` | yes |  |  |  |
+| `cuptiEventGroupCreate` | yes |  |  |  |
+| `cuptiEventGroupDestroy` | yes |  |  |  |
+| `cuptiEventGroupDisable` | yes |  |  |  |
+| `cuptiEventGroupEnable` | yes |  |  |  |
+| `cuptiEventGroupGetAttribute` | yes |  |  |  |
+| `cuptiEventGroupReadAllEvents` | yes |  |  |  |
+| `cuptiEventGroupReadEvent` | yes |  |  |  |
+| `cuptiEventGroupRemoveAllEvents` | yes |  |  |  |
+| `cuptiEventGroupRemoveEvent` | yes |  |  |  |
+| `cuptiEventGroupResetAllEvents` | yes |  |  |  |
+| `cuptiEventGroupSetAttribute` | yes |  |  |  |
+| `cuptiEventGroupSetDisable` | yes |  |  |  |
+| `cuptiEventGroupSetEnable` | yes |  |  |  |
+| `cuptiEventGroupSetsCreate` | yes |  |  |  |
+| `cuptiEventGroupSetsDestroy` | yes |  |  |  |
+| `cuptiFinalize` | yes |  |  |  |
+| `cuptiGetAutoBoostState` | yes |  |  |  |
+| `cuptiGetCallbackName` | yes |  |  |  |
+| `cuptiGetCallbackState` | yes |  |  |  |
+| `cuptiGetContextId` | yes |  |  |  |
+| `cuptiGetDeviceId` | yes |  |  |  |
+| `cuptiGetEnabledCallbacks` | yes |  |  |  |
+| `cuptiGetErrorMessage` | yes |  |  |  |
+| `cuptiGetGraphExecId` | yes |  |  |  |
+| `cuptiGetGraphId` | yes |  |  |  |
+| `cuptiGetGraphNodeId` | yes |  |  |  |
+| `cuptiGetLastError` | yes |  |  |  |
+| `cuptiGetNumEventDomains` | yes |  |  |  |
+| `cuptiGetNumMetrics` | yes |  |  |  |
+| `cuptiGetResultString` | yes |  |  |  |
+| `cuptiGetStreamId` | yes |  |  |  |
+| `cuptiGetStreamIdEx` | yes |  |  |  |
+| `cuptiGetThreadIdType` | yes |  |  |  |
+| `cuptiGetTimestamp` | yes |  |  |  |
+| `cuptiGetTimestamp_v2` | yes |  |  |  |
+| `cuptiGetVersion` | yes |  |  |  |
+| `cuptiIsTracingSessionRunning` | yes |  |  |  |
+| `cuptiKernelReplaySubscribeUpdate` | yes |  |  |  |
+| `cuptiMetricCreateEventGroupSets` | yes |  |  |  |
+| `cuptiMetricEnumEvents` | yes |  |  |  |
+| `cuptiMetricEnumProperties` | yes |  |  |  |
+| `cuptiMetricGetAttribute` | yes |  |  |  |
+| `cuptiMetricGetIdFromName` | yes |  |  |  |
+| `cuptiMetricGetNumEvents` | yes |  |  |  |
+| `cuptiMetricGetNumProperties` | yes |  |  |  |
+| `cuptiMetricGetRequiredEventGroupSets` | yes |  |  |  |
+| `cuptiMetricGetValue` | yes |  |  |  |
+| `cuptiMetricGetValue2` | yes |  |  |  |
+| `cuptiSetEventCollectionMode` | yes |  |  |  |
+| `cuptiSetThreadIdType` | yes |  |  |  |
+| `cuptiSubscribe` | yes |  |  |  |
+| `cuptiSubscribe_v2` | yes |  |  |  |
+| `cuptiSupportedDomains` | yes |  |  |  |
+| `cuptiUnsubscribe` | yes |  |  |  |
 
 ## cusolver
 
@@ -1594,6 +1720,86 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseZgtsvInterleavedBatch_bufferSizeExt` | yes |  |  |  |
 | `cusparseZnnz` | yes |  |  |  |
 | `cusparseZnnz_compress` | yes |  |  |  |
+
+## nvcuvid
+
+- `nvcuvid.h` sha256 `8980e3d9c1e41b116240a451b6249b3ab9e8e9582f4792ccc6eade42a6024e0d`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `cuvidCreateDecoder` | yes |  |  |  |
+| `cuvidCreateVideoParser` | yes |  |  |  |
+| `cuvidCreateVideoSource` | yes |  |  |  |
+| `cuvidCreateVideoSourceW` | yes |  |  |  |
+| `cuvidCtxLock` | yes |  |  |  |
+| `cuvidCtxLockCreate` | yes |  |  |  |
+| `cuvidCtxLockDestroy` | yes |  |  |  |
+| `cuvidCtxUnlock` | yes |  |  |  |
+| `cuvidDecodePicture` | yes |  |  |  |
+| `cuvidDecodePictureAsync` | yes |  |  |  |
+| `cuvidDestroyDecoder` | yes |  |  |  |
+| `cuvidDestroyVideoParser` | yes |  |  |  |
+| `cuvidDestroyVideoSource` | yes |  |  |  |
+| `cuvidGetDecodeStatus` | yes |  |  |  |
+| `cuvidGetDecoderCaps` | yes |  |  |  |
+| `cuvidGetSourceAudioFormat` | yes |  |  |  |
+| `cuvidGetSourceVideoFormat` | yes |  |  |  |
+| `cuvidGetVideoSourceState` | yes |  |  |  |
+| `cuvidMapVideoFrame64` | yes |  |  |  |
+| `cuvidParseVideoData` | yes |  |  |  |
+| `cuvidReconfigureDecoder` | yes |  |  |  |
+| `cuvidRegisterDecodeSurfaces` | yes |  |  |  |
+| `cuvidSetVideoSourceState` | yes |  |  |  |
+| `cuvidUnmapVideoFrame64` | yes |  |  |  |
+
+## nvenc
+
+- `nvEncodeAPI.h` sha256 `75939d1b11cc3cbe7123c922903f2123644ea167b006207e5965c9fe2eab241a`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `nvEncCreateBitstreamBuffer` | yes |  |  |  |
+| `nvEncCreateInputBuffer` | yes |  |  |  |
+| `nvEncCreateMVBuffer` | yes |  |  |  |
+| `nvEncDestroyBitstreamBuffer` | yes |  |  |  |
+| `nvEncDestroyEncoder` | yes |  |  |  |
+| `nvEncDestroyInputBuffer` | yes |  |  |  |
+| `nvEncDestroyMVBuffer` | yes |  |  |  |
+| `nvEncEncodePicture` | yes |  |  |  |
+| `nvEncGetEncodeCaps` | yes |  |  |  |
+| `nvEncGetEncodeGUIDCount` | yes |  |  |  |
+| `nvEncGetEncodeGUIDs` | yes |  |  |  |
+| `nvEncGetEncodePresetConfig` | yes |  |  |  |
+| `nvEncGetEncodePresetConfigEx` | yes |  |  |  |
+| `nvEncGetEncodePresetCount` | yes |  |  |  |
+| `nvEncGetEncodePresetGUIDs` | yes |  |  |  |
+| `nvEncGetEncodeProfileGUIDCount` | yes |  |  |  |
+| `nvEncGetEncodeProfileGUIDs` | yes |  |  |  |
+| `nvEncGetEncodeStats` | yes |  |  |  |
+| `nvEncGetInputFormatCount` | yes |  |  |  |
+| `nvEncGetInputFormats` | yes |  |  |  |
+| `nvEncGetLastErrorString` | yes |  |  |  |
+| `nvEncGetSequenceParamEx` | yes |  |  |  |
+| `nvEncGetSequenceParams` | yes |  |  |  |
+| `nvEncInitializeEncoder` | yes |  |  |  |
+| `nvEncInvalidateRefFrames` | yes |  |  |  |
+| `nvEncLockBitstream` | yes |  |  |  |
+| `nvEncLockInputBuffer` | yes |  |  |  |
+| `nvEncLookaheadPicture` | yes |  |  |  |
+| `nvEncMapInputResource` | yes |  |  |  |
+| `nvEncOpenEncodeSession` | yes |  |  |  |
+| `nvEncOpenEncodeSessionEx` | yes |  |  |  |
+| `nvEncReconfigureEncoder` | yes |  |  |  |
+| `nvEncRegisterAsyncEvent` | yes |  |  |  |
+| `nvEncRegisterResource` | yes |  |  |  |
+| `nvEncRestoreEncoderState` | yes |  |  |  |
+| `nvEncRunMotionEstimationOnly` | yes |  |  |  |
+| `nvEncSetIOCudaStreams` | yes |  |  |  |
+| `nvEncUnlockBitstream` | yes |  |  |  |
+| `nvEncUnlockInputBuffer` | yes |  |  |  |
+| `nvEncUnmapInputResource` | yes |  |  |  |
+| `nvEncUnregisterAsyncEvent` | yes |  |  |  |
+| `nvEncUnregisterResource` | yes |  |  |  |
 
 ## nvjpeg
 

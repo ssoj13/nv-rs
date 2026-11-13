@@ -21,7 +21,7 @@
 use super::common::{Ctx, Gpu, R, close, same, subset_ptx};
 use cuda_core::{Function, Module, launch_kernel_on_stream};
 use cuda_device::{cuda_module, kernel, thread};
-use cuda_ext::{AddressMode, Array, ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, SurfaceObject, TextureDesc, TextureObject, TilePool};
+use cuda_ext::{Array, ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, SurfaceObject, TextureDesc, TextureObject, TilePool};
 use cuda_tex_device as tx;
 use std::ffi::c_void;
 use std::sync::Arc;

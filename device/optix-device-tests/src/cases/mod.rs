@@ -7,6 +7,7 @@ pub mod calls;
 pub mod common;
 pub mod coopvec;
 pub mod exception;
+pub mod footprint;
 pub mod geometry;
 pub mod hitobject;
 pub mod intersect;
@@ -36,4 +37,5 @@ pub const ALL: &[Case] = &[
     ("coop_vec", coopvec::run),
     ("texture", texture::run),
     ("sparse", texture::sparse),
+    ("footprint", footprint::run),
 ];

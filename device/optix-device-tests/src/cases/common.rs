@@ -129,7 +129,7 @@ fn func_name(header: &str) -> Option<&str> {
 pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
     let text = std::str::from_utf8(ptx).ctx("PTX is not UTF-8")?;
     // Top-level items: (function name or None, text, is a definition).
-    let mut items: Vec<(Option<&str>, String, bool)> = Vec::new();
+    let mut items: Vec<(Option<String>, String, bool)> = Vec::new();
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         let t = line.trim_start();
@@ -155,7 +155,7 @@ pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
                 None => return Err("PTX ends inside a function header".into()),
             }
         }
-        let name = func_name(&header).ok_or_else(|| format!("no function name in PTX header {header:?}"))?;
+        let name = func_name(&header).map(str::to_owned).ok_or_else(|| format!("no function name in PTX header {header:?}"))?;
         if is_def {
             // Count braces outside `//` comments until the body closes (inline asm brings its own
             // balanced braces).
@@ -169,7 +169,7 @@ pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
         }
         items.push((Some(name), header, is_def));
     }
-    let defined: Vec<&str> = items.iter().filter(|i| i.2).filter_map(|i| i.0).collect();
+    let defined: Vec<&str> = items.iter().filter(|i| i.2).filter_map(|i| i.0.as_deref()).collect();
     for e in entries {
         if !defined.contains(e) {
             return Err(format!("entry {e} not found in the PTX"));
@@ -179,7 +179,7 @@ pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
     let mut keep: Vec<&str> = entries.to_vec();
     let mut i = 0;
     while i < keep.len() {
-        let body = items.iter().find(|it| it.2 && it.0 == Some(keep[i])).map(|it| it.1.as_str()).unwrap_or_default();
+        let body = items.iter().find(|it| it.2 && it.0.as_deref() == Some(keep[i])).map(|it| it.1.as_str()).unwrap_or_default();
         for name in &defined {
             if !keep.contains(name) && body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(|tok| tok == *name) {
                 keep.push(name);
@@ -187,7 +187,7 @@ pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
         }
         i += 1;
     }
-    let out: String = items.iter().filter(|it| it.0.is_none_or(|n| keep.contains(&n))).map(|it| it.1.as_str()).collect();
+    let out: String = items.iter().filter(|it| it.0.as_deref().is_none_or(|n| keep.contains(&n))).map(|it| it.1.as_str()).collect();
     Ok(out.into_bytes())
 }
 

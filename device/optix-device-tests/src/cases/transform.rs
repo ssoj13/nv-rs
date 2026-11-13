@@ -181,6 +181,20 @@ mod kernels {
                 let h1 = xf::transform_list_handle(1);
                 *r.add(86) = xf::transform_type(h1) as u32;
                 put64(r, 132, xf::static_transform_ptr(h1) as u64 | xf::matrix_motion_transform_ptr(h1) as u64 | xf::srt_motion_transform_ptr(h1) as u64);
+                let h1 = xf::transform_list_handle(1);
+                let ty = xf::transform_type(h1);
+                if m & 128 != 0 && ty == 1 {
+                    put64(r, 134, (&raw const (*xf::static_transform_ptr(h1)).child).read());
+                }
+                if m & 256 != 0 && ty == 2 {
+                    put64(r, 134, (&raw const (*xf::matrix_motion_transform_ptr(h1)).child).read());
+                }
+                if m & 512 != 0 && ty == 3 {
+                    put64(r, 134, (&raw const (*xf::srt_motion_transform_ptr(h1)).child).read());
+                }
+                if m & 1024 != 0 {
+                    put(r, 96, xf::transform_from_handle(h1, time, true));
+                }
             }
             if m & 16 != 0 {
                 *r.add(89) = u32::from(xf::instance_traversable_from_ias(PARAMS.get().handle, state::instance_index()) == h0);
@@ -436,7 +450,7 @@ pub fn run(g: &Gpu) -> R {
     if std::env::var("ODT_XF_SECTIONS").is_ok() {
         for (i, (k, _)) in pr.iter().enumerate() {
             let r = &got[i * REC..(i + 1) * REC];
-            eprintln!("probe {i} inst {k}: n {} type1 {} ptr {:#x} child0 {:#x}", r[1], r[86], u64::from(r[132]) | u64::from(r[133]) << 32, u64::from(r[60]) | u64::from(r[61]) << 32);
+            eprintln!("probe {i} inst {k}: n {} type1 {} ptr {:#x} child0 {:#x} child1 {:#x}", r[1], r[86], u64::from(r[132]) | u64::from(r[133]) << 32, u64::from(r[60]) | u64::from(r[61]) << 32, u64::from(r[134]) | u64::from(r[135]) << 32);
         }
         eprintln!("handles: st {:#x} gas {:#x} mm {:#x} sm {:#x} mgas {:#x}", st.handle(), gas.handle(), mm.handle(), sm.handle(), mgas.handle());
     }

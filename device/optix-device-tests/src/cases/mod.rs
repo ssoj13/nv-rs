@@ -5,6 +5,7 @@
 
 pub mod calls;
 pub mod common;
+pub mod coopvec;
 pub mod exception;
 pub mod geometry;
 pub mod hitobject;
@@ -31,4 +32,5 @@ pub const ALL: &[Case] = &[
     ("callables", calls::callables),
     ("payload_types", calls::payload_types),
     ("symbols", symbols::run),
+    ("coop_vec", coopvec::run),
 ];

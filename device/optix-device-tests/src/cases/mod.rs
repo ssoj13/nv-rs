@@ -11,6 +11,7 @@ pub mod hitobject;
 pub mod intersect;
 pub mod local;
 pub mod shade;
+pub mod symbols;
 pub mod transform;
 
 use common::{Gpu, R};
@@ -29,4 +30,5 @@ pub const ALL: &[Case] = &[
     ("exception", exception::run),
     ("callables", calls::callables),
     ("payload_types", calls::payload_types),
+    ("symbols", symbols::run),
 ];

@@ -331,6 +331,51 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     Ok(out.inventory)
 }
 
+/// The types and constants of `spec` (its `allow_type` / `allow_var`) as `no_std` Rust (`core::`
+/// paths, no layout tests, `Default` derived), for device crates compiled by cuda-oxide: the
+/// same header-derived definitions the host sys crate uses, so host and device agree on layouts
+/// and enum values without hand-copied constants. Headers are located as in [`generate`].
+pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
+    for var in rerun_vars(spec) {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let include_dirs = sdk_include_dirs(spec)?;
+    let mut wrapper = String::new();
+    for name in spec.headers {
+        let path = find_header(&include_dirs, name).ok_or_else(|| Error::HeaderNotFound {
+            lib: spec.name,
+            header: (*name).to_string(),
+            searched: include_dirs.clone(),
+        })?;
+        println!("cargo:rerun-if-changed={}", path.display());
+        wrapper.push_str(&format!("#include <{name}>\n"));
+    }
+    let mut b = bindgen::Builder::default()
+        .header_contents(&format!("nv_bindgen_{}_core.h", spec.name), &wrapper)
+        .default_enum_style(bindgen::EnumVariation::Consts)
+        .generate_comments(false)
+        .use_core()
+        .layout_tests(false)
+        .derive_default(true)
+        .with_codegen_config(bindgen::CodegenConfig::TYPES | bindgen::CodegenConfig::VARS);
+    for d in &include_dirs {
+        b = b.clang_arg(format!("-I{}", d.display()));
+    }
+    for d in system_include_dirs() {
+        b = b.clang_arg(format!("-idirafter{}", d.display()));
+    }
+    for a in spec.clang_args {
+        b = b.clang_arg(*a);
+    }
+    for t in spec.allow_type {
+        b = b.allowlist_type(*t);
+    }
+    for v in spec.allow_var {
+        b = b.allowlist_var(*v);
+    }
+    b.generate().map(|g| g.to_string()).map_err(|e| Error::Bindgen { lib: spec.name, msg: e.to_string() })
+}
+
 /// Runs bindgen for `spec` against explicit include directories (`include_dirs` searched first,
 /// `system_dirs` after libclang's own). Pure apart from reading headers.
 pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf]) -> Result<Output, Error> {

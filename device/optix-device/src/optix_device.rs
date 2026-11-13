@@ -17,3 +17,10 @@ pub mod raw {
 
 /// Intrinsic names and header hashes the raw layer was generated from (coverage evidence).
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/optix_device_inventory.json"));
+
+/// OptiX types and constants (`optix_types.h`, generated, `no_std`): transform structs, enums,
+/// flags — the same definitions the host `optix-sys` crate uses.
+#[allow(missing_docs, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, clippy::all)]
+pub mod sys {
+    include!(concat!(env!("OUT_DIR"), "/optix_types.rs"));
+}

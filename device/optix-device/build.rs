@@ -33,4 +33,27 @@ fn main() {
         hashes.iter().map(|(h, s)| format!("{{\"file\":\"{h}\",\"sha256\":\"{s}\"}}")).collect::<Vec<_>>().join(",")
     );
     std::fs::write(out.join("optix_device_inventory.json"), inventory).expect("write inventory");
+
+    // Types and constants (transform structs, enums) from the same header the host `optix-sys`
+    // crate uses, as `no_std` Rust.
+    let spec = nv_bindgen::LibSpec {
+        name: "optix_device",
+        headers: &["optix_types.h"],
+        sdks: &[nv_bindgen::Sdk::Optix, nv_bindgen::Sdk::CudaToolkit],
+        allow_fn: &[],
+        allow_type: &["^Optix.*"],
+        allow_var: &["^OPTIX_.*"],
+        reuse_cuda_types: &[],
+        positive_enums: &[],
+        clang_args: &[],
+        opaque_types: &[],
+        shape: nv_bindgen::Shape::FunctionTable { table_type: "OptixFunctionTable" },
+    };
+    match nv_bindgen::core_types(&spec) {
+        Ok(src) => std::fs::write(out.join("optix_types.rs"), src).expect("write optix_types.rs"),
+        Err(e) => {
+            println!("cargo::error={e}");
+            std::process::exit(1);
+        }
+    }
 }

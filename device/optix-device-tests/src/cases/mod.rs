@@ -4,6 +4,7 @@
 //! it and compares every output value with a CPU reference. **Used by** `main`.
 
 pub mod common;
+pub mod exception;
 pub mod geometry;
 pub mod hitobject;
 pub mod intersect;
@@ -24,4 +25,5 @@ pub const ALL: &[Case] = &[
     ("transform", transform::run),
     ("hitobject", hitobject::run),
     ("intersect", intersect::run),
+    ("exception", exception::run),
 ];

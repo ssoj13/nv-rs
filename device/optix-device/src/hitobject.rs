@@ -13,6 +13,8 @@
 //! [`traverse`] and [`invoke`] pass the 32 payload registers the way [`crate::trace::trace`] does.
 //! Matrix and transform queries build the transform-list matrix with [`crate::transform`] from
 //! the hit object's list and ray time, with the header's identity shortcut for an empty list.
+//! The per-primitive vertex getters (`optixHitObjectGet*VertexData`, `...SphereData`,
+//! `...RibbonNormal`) live with their incoming-hit twins in [`crate::geometry`].
 //!
 //! **Used by** raygen programs that sort work before shading (path tracers with SER), and by
 //! closest-hit / miss / callable programs that query or rebuild hit objects.
@@ -29,15 +31,6 @@ use crate::{Float3, raw, sys};
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TraverseData(pub [u32; 20]);
-
-/// The `C`-wide rows of a flat intrinsic result (`float3` / `float4` arrays in the header).
-#[inline(always)]
-fn rows<const C: usize, const W: usize, const N: usize>(w: [f32; W]) -> [[f32; C]; N] {
-    const { assert!(W == C * N, "flat length must be rows * columns") };
-    // SAFETY: `[[f32; C]; N]` is `C * N == W` contiguous `f32`s with no padding and the same
-    // alignment as `[f32; W]` (checked above), and every bit pattern is a valid `f32`.
-    unsafe { core::ptr::read((&raw const w).cast::<[[f32; C]; N]>()) }
-}
 
 /// Traverses `ray` into `handle` like [`crate::trace::trace`], but runs no closest-hit or miss
 /// program: the result becomes the outgoing hit object, to be queried, [`reorder`]ed and
@@ -125,7 +118,8 @@ pub unsafe fn invoke_typed<P: Payload>(payload_type: u32, payload: &mut P) {
 }
 
 /// Rebuilds a hit as the outgoing hit object from a ray, the [`TraverseData`] of an earlier hit
-/// object and its transform list (`optixMakeHitObject`). `ray_flags` is `OPTIX_RAY_FLAG_*` bits.
+/// object and its transform list (`optixMakeHitObject`). `ray_flags` is `OPTIX_RAY_FLAG_*` bits;
+/// the ray's `tmax` is not used (the hit distance is part of `data`).
 ///
 /// # Safety
 ///
@@ -134,18 +128,10 @@ pub unsafe fn invoke_typed<P: Payload>(payload_type: u32, payload: &mut P) {
 /// `transforms` must be that hit's transform list ([`transform_list_handle`]), readable for as
 /// long as this hit object is current.
 #[inline(always)]
-pub unsafe fn make_hit(
-    handle: u64,
-    origin: Float3,
-    direction: Float3,
-    tmin: f32,
-    time: f32,
-    ray_flags: u32,
-    data: &TraverseData,
-    transforms: &[u64],
-) {
-    let [ox, oy, oz] = origin;
-    let [dx, dy, dz] = direction;
+pub unsafe fn make_hit(handle: u64, ray: &Ray, ray_flags: u32, data: &TraverseData, transforms: &[u64]) {
+    let [ox, oy, oz] = ray.origin;
+    let [dx, dy, dz] = ray.direction;
+    let (tmin, time) = (ray.tmin, ray.time);
     let d = &data.0;
     // A slice longer than `u32::MAX` handles cannot exist on the device (it would exceed memory).
     let n = transforms.len() as u32;
@@ -411,85 +397,6 @@ pub unsafe fn ribbon_parameters() -> [f32; 2] {
     unsafe { raw::hitobject_get_ribbon_parameters() }
 }
 
-/// The object-space ribbon normal at `params` (from [`ribbon_parameters`])
-/// (`optixHitObjectGetRibbonNormal`).
-///
-/// # Safety
-///
-/// As [`ribbon_parameters`].
-#[inline(always)]
-pub unsafe fn ribbon_normal(params: [f32; 2]) -> Float3 {
-    // SAFETY: forwarded contract.
-    unsafe { raw::hitobject_get_ribbon_normal(params[0], params[1]) }
-}
-
-/// Object-space vertices of the hit triangle (`optixHitObjectGetTriangleVertexData`).
-///
-/// # Safety
-///
-/// As [`triangle_barycentrics`]; the GAS must be built with
-/// `OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS`.
-#[inline(always)]
-pub unsafe fn triangle_vertex_data() -> [Float3; 3] {
-    // SAFETY: forwarded contract.
-    rows(unsafe { raw::hitobject_get_triangle_vertex_data() })
-}
-
-/// The hit sphere's object-space `[x, y, z, radius]` (`optixHitObjectGetSphereData`).
-///
-/// # Safety
-///
-/// As [`is_hit`]; the hit's primitive type must be `OPTIX_PRIMITIVE_TYPE_SPHERE` and the GAS
-/// built with `OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS`.
-#[inline(always)]
-pub unsafe fn sphere_data() -> [f32; 4] {
-    // SAFETY: forwarded contract.
-    unsafe { raw::hitobject_get_sphere_data() }
-}
-
-macro_rules! curve_getters {
-    ($($(#[$doc:meta])* $name:ident -> $n:literal = $raw:ident, $ty:literal;)*) => {$(
-        $(#[$doc])*
-        /// Each row is `[x, y, z, radius]` of one object-space control vertex.
-        ///
-        /// # Safety
-        ///
-        /// Valid in raygen, closest-hit, miss, continuation-callable and direct-callable programs;
-        #[doc = concat!("the hit's primitive type must be `", $ty, "` and the GAS built with")]
-        /// `OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS`.
-        #[inline(always)]
-        pub unsafe fn $name() -> [[f32; 4]; $n] {
-            // SAFETY: forwarded contract.
-            rows(unsafe { raw::$raw() })
-        }
-    )*};
-}
-
-curve_getters! {
-    /// Control vertices of the hit linear curve (`optixHitObjectGetLinearCurveVertexData`).
-    linear_curve_vertex_data -> 2 = hitobject_get_linear_curve_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_LINEAR";
-    /// Control vertices of the hit quadratic B-spline (`optixHitObjectGetQuadraticBSplineVertexData`).
-    quadratic_bspline_vertex_data -> 3 = hitobject_get_quadratic_bspline_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE";
-    /// Control vertices of the hit rocaps quadratic B-spline
-    /// (`optixHitObjectGetQuadraticBSplineRocapsVertexData`).
-    quadratic_bspline_rocaps_vertex_data -> 3 = hitobject_get_quadratic_bspline_rocaps_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS";
-    /// Control vertices of the hit cubic B-spline (`optixHitObjectGetCubicBSplineVertexData`).
-    cubic_bspline_vertex_data -> 4 = hitobject_get_cubic_bspline_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE";
-    /// Control vertices of the hit rocaps cubic B-spline (`optixHitObjectGetCubicBSplineRocapsVertexData`).
-    cubic_bspline_rocaps_vertex_data -> 4 = hitobject_get_cubic_bspline_rocaps_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE_ROCAPS";
-    /// Control vertices of the hit Catmull-Rom curve (`optixHitObjectGetCatmullRomVertexData`).
-    catmullrom_vertex_data -> 4 = hitobject_get_catmullrom_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM";
-    /// Control vertices of the hit rocaps Catmull-Rom curve (`optixHitObjectGetCatmullRomRocapsVertexData`).
-    catmullrom_rocaps_vertex_data -> 4 = hitobject_get_catmullrom_rocaps_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM_ROCAPS";
-    /// Control vertices of the hit cubic Bezier curve (`optixHitObjectGetCubicBezierVertexData`).
-    cubic_bezier_vertex_data -> 4 = hitobject_get_cubic_bezier_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER";
-    /// Control vertices of the hit rocaps cubic Bezier curve (`optixHitObjectGetCubicBezierRocapsVertexData`).
-    cubic_bezier_rocaps_vertex_data -> 4 = hitobject_get_cubic_bezier_rocaps_vertex_data, "OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER_ROCAPS";
-    /// Control vertices of the hit ribbon, a flat quadratic B-spline
-    /// (`optixHitObjectGetRibbonVertexData`).
-    ribbon_vertex_data -> 3 = hitobject_get_ribbon_vertex_data, "OPTIX_PRIMITIVE_TYPE_FLAT_QUADRATIC_BSPLINE";
-}
-
 /// The 3x4 row-major identity (`optix_device_impl.h`'s result for an empty transform list).
 const IDENTITY: Matrix3x4 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
@@ -500,8 +407,10 @@ const IDENTITY: Matrix3x4 = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1
 /// As [`is_hit`]; `n` is [`transform_list_size`] and nonzero.
 #[inline(always)]
 unsafe fn o2w(n: u32) -> Matrix3x4 {
-    // SAFETY: forwarded contract; every index the helper asks for is below `n`.
-    unsafe { object_to_world_from_list(n, |i| unsafe { raw::hitobject_get_transform_list_handle(i) }, ray_time()) }
+    // SAFETY: forwarded contract; the list helper only asks for indices below `n`.
+    let at = |i: u32| unsafe { raw::hitobject_get_transform_list_handle(i) };
+    // SAFETY: forwarded contract; `n` is the list size and `at` reads that list.
+    unsafe { object_to_world_from_list(n, at, ray_time()) }
 }
 
 /// World-to-object matrix of a non-empty list of `n` transforms at the hit object's ray time.
@@ -511,8 +420,10 @@ unsafe fn o2w(n: u32) -> Matrix3x4 {
 /// As [`o2w`].
 #[inline(always)]
 unsafe fn w2o(n: u32) -> Matrix3x4 {
-    // SAFETY: forwarded contract; every index the helper asks for is below `n`.
-    unsafe { world_to_object_from_list(n, |i| unsafe { raw::hitobject_get_transform_list_handle(i) }, ray_time()) }
+    // SAFETY: forwarded contract; the list helper only asks for indices below `n`.
+    let at = |i: u32| unsafe { raw::hitobject_get_transform_list_handle(i) };
+    // SAFETY: forwarded contract; `n` is the list size and `at` reads that list.
+    unsafe { world_to_object_from_list(n, at, ray_time()) }
 }
 
 /// The world-to-object matrix (3x4, row-major) of the hit's transform list at its ray time;

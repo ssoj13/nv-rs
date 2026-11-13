@@ -12,6 +12,8 @@
 //! - [`exception`] — user exceptions, codes, details, line info.
 //! - [`geometry`] — vertex data of the hit primitive (triangles, every curve kind, ribbons,
 //!   spheres), current hit, by GAS index or by handle, and hit-kind helpers;
+//! - [`hitobject`] — hit objects and shader execution reordering: traverse, make hit / miss /
+//!   nop, invoke, reorder, every hit-object getter and transform;
 //! - [`transform`] — transform lists, transforms by handle (static, matrix / SRT motion,
 //!   instance), object <-> world matrices and point / vector / normal transforms, GAS motion;
 //!
@@ -24,6 +26,7 @@
 
 pub mod exception;
 pub mod geometry;
+pub mod hitobject;
 pub mod payload;
 pub mod state;
 pub mod trace;

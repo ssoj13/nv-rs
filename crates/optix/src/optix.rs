@@ -3,7 +3,10 @@
 //! **What.**
 //! - [`context`] — [`DeviceContext`]: OptiX on one CUDA context, with an optional log sink.
 //! - [`accel`] — [`Accel`]: geometry (triangle meshes) and instance acceleration structures,
-//!   with optional compaction. An instance structure keeps the structures it references alive.
+//!   with compaction, a byte budget, refit in place and a caller-owned reusable [`Scratch`]. An
+//!   instance structure keeps the structures it references alive.
+//! - [`denoise`] — [`Denoiser`]: the AI denoiser (HDR / AOV models, albedo and normal guides)
+//!   for RGBA `f32` images.
 //! - [`module`] — [`Module`] from PTX or OptiX-IR, [`ProgramGroup`]s (raygen, miss, hit group,
 //!   callables), [`PipelineOptions`] / [`ModuleOptions`].
 //! - [`pipeline`] — [`Pipeline`] and [`Pipeline::launch`] with typed launch parameters.
@@ -22,11 +25,13 @@
 
 pub mod accel;
 pub mod context;
+pub mod denoise;
 pub mod module;
 pub mod pipeline;
 pub mod sbt;
 
-pub use accel::{Accel, BuildOptions, GeometryFlags, Instance, TriangleMesh};
+pub use accel::{Accel, BuildOptions, GeometryFlags, Instance, Scratch, TriangleMesh};
+pub use denoise::{Denoiser, DenoiserModel, DenoiserOptions, Image};
 pub use context::{DeviceContext, LogFn};
 pub use module::{HitGroup, Module, ModuleOptions, PipelineOptions, ProgramGroup};
 pub use pipeline::{LinkOptions, Pipeline};

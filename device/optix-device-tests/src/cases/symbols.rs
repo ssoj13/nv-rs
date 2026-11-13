@@ -17,12 +17,13 @@ use optix_device::state;
 
 const N: usize = 8;
 
-/// Read by the raygen; written by the host.
+/// Read by the raygen; written by the host. The length is a literal: cuda-oxide rejects a static
+/// whose array length is a named constant ("Array length must be a value constant").
 #[unsafe(no_mangle)]
-pub static mut ODT_SYM_IN: [u32; N] = [1, 2, 3, 4, 5, 6, 7, 8];
+pub static mut ODT_SYM_IN: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 /// Written by the raygen; read by the host.
 #[unsafe(no_mangle)]
-pub static mut ODT_SYM_OUT: [u32; N] = [0; N];
+pub static mut ODT_SYM_OUT: [u32; 8] = [0; 8];
 
 /// Launch parameters (`params_sym`).
 #[repr(C)]

@@ -16,3 +16,8 @@ cuda-bindings.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+gpu-info-rs = { git = "ssh://git@github.com/ssoj13/gpu-info-rs.git", branch = "main", default-features = false, features = ["wgpu"] }
+wgpu = "30"
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }

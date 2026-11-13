@@ -6,6 +6,9 @@
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
   Details and findings in PLAN.md §8; code under `spikes/`.
 - **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`.
+- **S1b PASS** (Rust raygen calls `optixTrace`; fork branch `feat/optix-device`) and **M4 first cut**:
+  `crates/optix` (context, GAS/IAS + compaction + byte budget, modules, program groups, pipeline,
+  typed SBT, launch); 5 GPU tests on the S1b PTX. Details in PLAN.md §8.
 - **M3 done**: `crates/cuda-ext` (external memory/semaphores, arrays, textures, surfaces, host
   registration, managed memory, UUID/LUID, green contexts); 7 GPU tests incl. a Vulkan round trip.
 - **M2 nearly done** — 18 sys crates build, load and pass their tests on this machine (counts in
@@ -20,7 +23,10 @@
 
 1. Remaining M2: **nvCOMP** (not installed on this machine), **NCCL** and **cuFile** (Linux only:
    WSL2 for NCCL, native Linux / RunPod for cuFile).
-2. S1b (fork patches: `ptx_asm!` arity, export names) and M4/M5 OptiX; M6 `nv-wgpu` on top of cuda-ext.
+2. Merge fork `feat/optix-device` into fork `main` (additive; render-rs consumes `main`).
+3. M4 rest: denoiser, reusable caller-owned scratch, AS update/refit; M5 `optix-device` (Rust
+   wrappers for the `_optix_*` intrinsics, typed payload) + `#[device(export_name)]` for callables;
+   M6 `nv-wgpu` on top of cuda-ext.
 
 ## Building
 
@@ -32,8 +38,7 @@
 
 ## Open items
 
-- fork patch list: `ptx_asm!` input arity (16 -> 64), `#[device(export_name)]`, honour
-  `#[constant(export_name)]` inside `#[cuda_module]`;
+- fork patch still to write: `#[device(export_name)]` (callables, M5);
 - reconcile D6 with the fork's committed `cuda-bindings/generated/`;
 - types shared between toolkit libraries (cuSOLVER pulls its own copy of cuBLAS/cuSPARSE handle
   types) should be re-used across sys crates, like CUDA types are from `cuda-bindings`;
@@ -44,3 +49,12 @@
 
 - GPU: RTX 3080 Ti (sm_86), driver 621.24; CUDA 13.3; cuDNN 9.23 (CUDA 13.3 build). Host
   toolchain 1.98.0; spikes/device 1.99.1.
+
+## Traps
+
+- OptiX descriptors hold raw `*const c_char` entry names: the `CString`s must outlive the create
+  call. `ProgramGroup::hit_group` once moved them into a list before the call (dangling names,
+  "entryFunctionNameCH does not start with __closesthit__"); the GPU tests lock this.
+- cuda-oxide device code: `ptx_asm!` `out` operands need declared variables (`_` is not a place).
+- `cargo oxide` copies its backend into `~/.cargo/cuda-oxide`, which other sessions' builds keep
+  open; set `CUDA_OXIDE_BACKEND` to a private copy instead of waiting or killing their processes.

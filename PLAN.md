@@ -196,6 +196,26 @@ symbol is mangled to `cuda_oxide_const_<hash>_kernels_L<line>C<col>_PARAMS`, so 
 name from the PTX. Added to the fork patch list (alongside `ptx_asm!` input arity and
 `#[device(export_name)]`).
 
+**S1b result (2026-11-13): PASS.** Fork branch `feat/optix-device` (cuda-rust_b `09b082e8d`):
+`ptx_asm!` admits 64 inputs (markers `__ptx_asm_out_0..128`, `__ptx_asm_void_0..64`; before,
+64 outputs were admitted but only 32-argument markers existed) and `#[cuda_module]` keeps a
+user `#[constant(export_name = "...")]`. `spikes/s1b-optix-trace`: `__raygen__mask` written in
+Rust issues `_optix_trace_typed_32` (32 outputs + 49 inputs, the `optix_device_impl.h` shape)
+against a one-triangle GAS; closest-hit / miss set payload 0 via `_optix_set_payload`; launch
+params found as `.const params`. The 16x16 hit mask equals the analytic mask (legs 1.03, every
+pixel centre at least 0.03 from an edge). Finding: other sessions keep the shared
+`~/.cargo/cuda-oxide` backend DLL open, so a run that needs a rebuilt backend uses a private
+copy through `CUDA_OXIDE_BACKEND`.
+
+**M4 status (2026-11-13): first cut done.** `crates/optix`: `DeviceContext` (log sink behind
+`catch_unwind`, validation mode), `Accel` (triangle GAS, IAS holding its children, compaction,
+`BuildOptions::budget` checked before allocation), `Module` / `ProgramGroup` (raygen, miss,
+exception, hit group, callables), `Pipeline` (+ `unsafe launch`, params size checked),
+`SbtRecord<T: Pod>` / `ShaderBindingTable`. Gate: clippy `-D warnings` clean; 5/5 GPU tests on
+the PTX cuda-oxide produced for S1b (GAS mask, IAS with a translated instance, budget refusal,
+params size, compile log). Not yet: `optix-repr` (shared host/device types, with M5), caller-owned
+reusable scratch, denoiser, motion blur, opacity micromaps, AS update/refit.
+
 **S2 result (2026-11-12): PASS.** `spikes/s2-wgpu-cuda-share`: gpu-info-rs shared Vulkan device +
 `SharedBuffer::export` (dedicated, `OPAQUE_WIN32`) imported by `cuImportExternalMemory` +
 `cuExternalMemoryGetMappedBuffer`; Vulkan timeline semaphore exported `OPAQUE_WIN32`, imported as

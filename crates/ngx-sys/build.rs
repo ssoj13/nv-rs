@@ -15,7 +15,8 @@ const SPEC: LibSpec = LibSpec {
     clang_args: &[],
     opaque_types: &[],
     // NGX ships only static libraries; `_d` is the /MD (dynamic CRT) build Rust's MSVC target uses.
-    shape: Shape::StaticLink { link_libs: &["nvsdk_ngx_d"] },
+    // nvsdk_ngx_d reads the registry (advapi32) and window ownership (user32).
+    shape: Shape::StaticLink { link_libs: &["nvsdk_ngx_d"], system_libs: &["advapi32", "user32"] },
 };
 
 fn main() {

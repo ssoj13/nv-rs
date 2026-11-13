@@ -113,6 +113,8 @@ pub enum Shape {
     StaticLink {
         /// Static libraries to link (`"nvsdk_ngx_d"`).
         link_libs: &'static [&'static str],
+        /// OS libraries the static library itself depends on (`"advapi32"`), linked dynamically.
+        system_libs: &'static [&'static str],
     },
     /// Entry points come from a runtime query into a table struct (OptiX, NVENC); types only.
     FunctionTable {
@@ -287,7 +289,10 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         let path = out_dir.join(format!("{}_{suffix}", spec.name));
         std::fs::write(&path, text).map_err(|source| Error::Io { lib: spec.name, path, source })
     };
-    if let Shape::StaticLink { link_libs } = spec.shape {
+    if let Shape::StaticLink { link_libs, system_libs } = spec.shape {
+        for l in system_libs {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
         for s in spec.sdks {
             if let Sdk::Nv(kind) = s
                 && let Some(lib_dir) = vcv_rs::nvsdk::detect(*kind).and_then(|i| i.lib_dir)

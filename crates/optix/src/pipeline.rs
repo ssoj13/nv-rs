@@ -83,7 +83,7 @@ impl Pipeline {
         if params.len() != self.params_size {
             return Err(Error::Invalid("launch-parameter buffer size differs from PipelineOptions::params_size"));
         }
-        if dims.iter().any(|d| *d == 0) || dims.iter().map(|d| u64::from(*d)).product::<u64>() > 1 << 30 {
+        if dims.contains(&0) || dims.iter().map(|d| u64::from(*d)).product::<u64>() > 1 << 30 {
             return Err(Error::Invalid("launch dimensions must be non-zero with at most 2^30 invocations"));
         }
         self.ctx.cuda().bind_to_thread()?;

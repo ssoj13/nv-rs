@@ -21,9 +21,16 @@
 //! steps ([`bindings`], [`shims`], [`inventory`]) are separate from the `$OUT_DIR` writing so they
 //! are tested on a synthetic header without any NVIDIA SDK.
 //!
-//! **Used by** every `*-sys` crate's `build.rs`. Generated headers are never committed (PLAN D6).
+//! [`device_asm`] is the device-side counterpart: it turns the inline-PTX statements of a device
+//! header (OptiX) into `ptx_asm!` wrappers for cuda-oxide.
+//!
+//! **Used by** every `*-sys` crate's `build.rs` and `device/optix-device`. Generated headers are
+//! never committed (PLAN D6).
 
 pub use vcv_rs::nvsdk::Kind;
+
+pub mod device_asm;
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use serde::Serialize;

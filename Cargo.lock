@@ -247,6 +247,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cusolvermg-sys"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "cusparse-sys"
 version = "0.0.0"
 dependencies = [

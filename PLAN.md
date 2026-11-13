@@ -216,6 +216,15 @@ registry instead of scanning FileRepository.
 
 All three spikes passed; M1 can start.
 
+**M2 status (2026-11-13): 14 libraries bound, building, loading and tested on this machine** —
+nvml 390, optix 60, cufft 35, cublas 517, cublaslt 54, cusparse 453, cusolver 483, cusolvermg 19,
+nvjpeg 81, nvrtc 29, cupti 116, nvcuvid 24, nvenc 42, npp 8187 symbols (11,490 in all; COVERAGE.md).
+Gate: workspace clippy `-D warnings` clean, 58/58 tests including GPU. Generator bug classes found
+on real headers and locked by tests: non-status return types, types used only in signatures,
+C parameters shadowing shim bindings, typedef'd function-table fields, libraries split over
+several DLLs (NPP, mapped from the DLL export tables). Remaining M2: SDKs not installed here —
+cuDNN, NCCL, nvCOMP, NVAPI, NGX/DLSS, Optical Flow, cuFile (Linux).
+
 **M1 result (2026-11-12): DONE.** `crates/nv-loader` (Driver / DriverStore / Toolkit / Sdk groups;
 DriverStore via each display adapter's `OpenGLDriverName`, as `optix_stubs.h` does; `Probe` trait
 for machine-free tests; `LoadError::{NotFound, Rejected, RuntimeTooOld}`), `crates/nv-bindgen`

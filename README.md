@@ -17,7 +17,7 @@ binding coverage in [COVERAGE.md](COVERAGE.md).
 | `nv-loader` | The one runtime loader: finds NVIDIA libraries in System32, the display driver's DriverStore folder, the CUDA Toolkit or an SDK root, returns typed errors. `exports_sys!` is the shared body of every exports-shaped sys crate. |
 | `nv-bindgen` | Build-time generator: one declarative `LibSpec` per library; headers located by [vcv-rs](https://github.com/ssoj13/vcv-rs); emits types, panic-free `extern "C"` shims and a symbol inventory. |
 | `nv-bindgen-fixture` | Compiles generator output for a synthetic header and checks the shims' failure paths at runtime. |
-| `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`. |
+| `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`, `npp-sys` (eleven DLLs, `split_exports_sys!`), `cusolvermg-sys`. |
 | `xtask` | `cargo xtask coverage collect|generate|check`. |
 
 Spikes that de-risked the plan live in `spikes/` (OptiX running a Rust raygen, shared Vulkan/CUDA

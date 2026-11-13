@@ -1,4 +1,4 @@
-# Handoff — nv-rs (2026-11-12)
+# Handoff — nv-rs (2026-11-13)
 
 ## State
 
@@ -6,19 +6,15 @@
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
   Details and findings in PLAN.md §8; code under `spikes/`.
 - **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`.
-- **M2 in progress** — 12 sys crates build, load and pass their tests on this machine (counts in
+- **M2 in progress** — 14 sys crates build, load and pass their tests on this machine (counts in
   COVERAGE.md): nvml, optix, cufft, cublas, cublaslt, cusparse, cusolver, nvjpeg, nvrtc, cupti,
-  nvcuvid, nvenc. `nv-bindgen-fixture` locks generator bug classes found in real headers.
+  nvcuvid, nvenc, npp (11 DLLs), cusolvermg. `nv-bindgen-fixture` locks generator bug classes.
 
 ## Next
 
-1. **npp-sys** — NPP is eleven DLLs (nppc, nppial, nppicc, nppidei, nppif, nppig, nppim, nppist,
-   nppisu, nppitc, npps). Needs one shared types module plus one loader/shim set per DLL; the
-   `exports_sys!` macro assumes one DLL per crate, so nv-bindgen needs a "split by DLL" mode.
-2. **cusolvermg-sys** (separate `cusolverMg64_*.dll`).
-3. SDKs not installed on this machine (need the owner to install, then the same template):
+1. SDKs not installed on this machine (need the owner to install, then the same template):
    cuDNN, NCCL (Linux), nvCOMP, NVAPI, NGX/DLSS, Optical Flow (NVOFA), cuFile (Linux only).
-4. Then M3 `cuda-ext` and M4 `optix` safe crates.
+2. Then M3 `cuda-ext` and M4 `optix` safe crates.
 
 ## Building
 

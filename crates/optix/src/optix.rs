@@ -24,18 +24,29 @@
 //! raygen. **Used by** render-rs and the nv-rs OptiX tests.
 
 pub mod accel;
+pub mod cluster;
 pub mod context;
+pub mod coop_vec;
 pub mod denoise;
+pub mod micromap;
 pub mod module;
 pub mod pipeline;
 pub mod sbt;
+pub mod stack;
+pub mod task;
+pub mod xform;
 
-pub use accel::{Accel, BuildOptions, GeometryFlags, Instance, Scratch, TriangleMesh};
-pub use denoise::{Denoiser, DenoiserModel, DenoiserOptions, Image};
-pub use context::{DeviceContext, LogFn};
-pub use module::{HitGroup, Module, ModuleOptions, PipelineOptions, ProgramGroup};
+pub use accel::{Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit, GeometryFlags, Indices, Instance, Keys, Motion, Radii, RelocationInfo, Relink, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices};
+pub use cluster::{ClusterAccel, ClusterArg, ClusterArgs, ClusterFlags, ClusterInput, ClusterKind, ClusterLimits, ClusterMode, ClusterOptions, ClusterRefs, ClusterSizes, GridLimits, TriangleLimits};
+pub use context::{DeviceContext, LogFn, describe, error_name, error_string};
+pub use denoise::{AlphaMode, AovType, Denoiser, DenoiserModel, DenoiserOptions, Guides, Image, Layer, Params, Pixel, PixelFormat, Tile, split_image};
+pub use micromap::{MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapSizes, MicromapUse, OpacityMicromapArray, base_to_micro_bary, micro_to_base_bary};
+pub use module::{BoundValue, BuiltinIs, DebugLevel, HitGroup, Module, ModuleOptions, OptLevel, PayloadSemantics, PayloadType, PipelineOptions, Primitive, ProgramGroup};
 pub use pipeline::{LinkOptions, Pipeline};
 pub use sbt::{SbtRecord, ShaderBindingTable};
+pub use stack::{PipelineStack, StackSizes, simple_path_tracer};
+pub use task::{CompileState, PendingModule, Task};
+pub use xform::{Child, MotionOptions, Srt, Transform, TransformKind};
 
 pub use optix_sys as sys;
 
@@ -48,7 +59,7 @@ pub enum Error {
     #[error("OptiX unavailable: {0}")]
     Unavailable(String),
     /// An OptiX call returned an error; `log` is the compiler/linker log, if any.
-    #[error("{call} failed with OptixResult {code}{}", log_suffix(.log))]
+    #[error("{call} failed with {}{}", crate::context::describe(.code), log_suffix(.log))]
     Optix {
         /// The OptiX entry point.
         call: &'static str,

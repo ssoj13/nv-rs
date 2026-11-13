@@ -21,8 +21,12 @@ use cuda_core::{DeviceBuffer, Stream};
 use std::mem::offset_of;
 use std::sync::Arc;
 
-/// Time range and border behaviour of a motion transform (`OptixMotionOptions` without the key
-/// count, which comes from the keys given).
+/// Time range and border behaviour of a motion transform or motion structure
+/// (`OptixMotionOptions` without the key count, which comes from the keys given).
+///
+/// A motion GAS with a vanish flag must be traced through an instance structure: traced as the
+/// top-level handle, a ray outside the time range faults the launch with an illegal address
+/// (observed: OptiX 9.1 driver, sm_86, single-GAS and any-graph pipelines alike).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionOptions {
     /// Time of the first key.

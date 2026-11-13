@@ -875,40 +875,26 @@ fn motion_gas_traces_key_zero_and_vanishes() {
     invalid(Accel::triangles(&rig.ctx, &s, &mut rig.scratch, &[opaque(&k0)], BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 1.0, end: 1.0, ..Default::default() }, ..Default::default() }), "empty time range");
 }
 
-/// A two-key GAS over [0.5, 1] that vanishes before its first key, traced at time 0 either
-/// directly (in a single-GAS pipeline when `single_gas`) or through an IAS.
-fn vanish_gas(single_gas: bool, through_ias: bool) -> Vec<u32> {
-    let mut rig = rig(Cfg { single_gas, motion: true, ..Default::default() });
+/// A two-key GAS over [0.5, 1] that vanishes before its first key, traced at time 0 through an
+/// IAS. Traced as the top-level handle instead, the launch faults with an illegal address on the
+/// OptiX 9.1 driver (single-GAS and any-graph pipelines alike), which would poison the CUDA
+/// context of every later test; `MotionOptions` documents it.
+#[test]
+#[ignore = "GPU"]
+fn motion_gas_start_vanish_misses_through_ias() {
+    let mut rig = rig(Cfg { motion: true, ..Default::default() });
     let s = rig.stream.clone();
     let k0 = up(&s, &tri_verts(0.0, LEG));
     let k1 = up(&s, &tri_verts(DX, LEG));
     let keys = [&k0, &k1];
+    let mesh = || TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&keys)), flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&k0) };
     let late = BuildOptions { motion_keys: 2, motion: MotionOptions { begin: 0.5, end: 1.0, start_vanish: true, end_vanish: false }, ..Default::default() };
-    let gas = tri_gas(&mut rig, &[TriangleMesh { vertices: Vertices::Float3(Keys::Motion(&keys)), flags: &[GeometryFlags::DISABLE_ANYHIT], ..TriangleMesh::new(&k0) }], late);
-    if through_ias {
-        let top = ias(&mut rig, &[Instance::new(&gas)], BuildOptions::default());
-        rig.trace(top.handle())
-    } else {
-        rig.trace(gas.handle())
-    }
-}
-
-#[test]
-#[ignore = "GPU"]
-fn motion_gas_start_vanish_misses_direct_single_gas() {
-    assert_eq!(vanish_gas(true, false), misses(), "a ray before begin misses a start-vanishing GAS");
-}
-
-#[test]
-#[ignore = "GPU"]
-fn motion_gas_start_vanish_misses_direct_any_graph() {
-    assert_eq!(vanish_gas(false, false), misses(), "a ray before begin misses a start-vanishing GAS");
-}
-
-#[test]
-#[ignore = "GPU"]
-fn motion_gas_start_vanish_misses_through_ias() {
-    assert_eq!(vanish_gas(false, true), misses(), "a ray before begin misses a start-vanishing GAS");
+    let gas = tri_gas(&mut rig, &[mesh()], late);
+    let top = ias(&mut rig, &[Instance::new(&gas)], BuildOptions::default());
+    assert_eq!(rig.trace(top.handle()), misses(), "a ray before begin misses a start-vanishing GAS");
+    let clamped = tri_gas(&mut rig, &[mesh()], BuildOptions { motion: MotionOptions { start_vanish: false, ..late.motion }, ..late });
+    let top = ias(&mut rig, &[Instance::new(&clamped)], BuildOptions::default());
+    assert_eq!(rig.trace(top.handle()), mask(0.0), "the same structure without vanish shows key 0");
 }
 
 // ---------------------------------------------------------------------------------------------

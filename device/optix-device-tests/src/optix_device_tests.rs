@@ -23,10 +23,6 @@ fn main() {
         Ok(g) => g,
         Err(e) => fail(&e),
     };
-    if let Ok(path) = std::env::var("ODT_PTX_PROBE") {
-        println!("probe {path}: {:?}", probe(&gpu, &path));
-        return;
-    }
     let only: Vec<String> = std::env::args().skip(1).collect();
     let mut failed = 0;
     for (name, case) in cases::ALL.iter().filter(|(n, _)| only.is_empty() || only.iter().any(|o| o == n)) {
@@ -42,25 +38,6 @@ fn main() {
         eprintln!("{failed} case(s) failed");
         std::process::exit(1);
     }
-}
-
-/// Diagnostic: runs raygen `__raygen__lp` of a hand-written PTX (32 threads, `params_lp.out`)
-/// and returns the words it wrote.
-fn probe(g: &cases::common::Gpu, path: &str) -> Result<Vec<u32>, String> {
-    use cases::common::Ctx;
-    let ptx = std::fs::read(path).ctx("read")?;
-    let o = cases::common::opts("params_lp", 16)?;
-    let (m, _) = optix::Module::new(&g.ctx, &Default::default(), &o, &ptx).ctx("module")?;
-    let rg = optix::ProgramGroup::raygen(&m, "__raygen__lp").ctx("rg")?;
-    let ms = optix::ProgramGroup::miss(&m, "__miss__lp").ctx("ms")?;
-    let hg = optix::ProgramGroup::hit_group(&g.ctx, optix::HitGroup::default()).ctx("hg")?;
-    let p = g.pipeline(&o, optix::LinkOptions { max_trace_depth: 0, ..Default::default() }, &[rg.clone(), ms.clone(), hg.clone()])?;
-    let sbt = optix::ShaderBindingTable::new(&g.stream, &optix::SbtRecord::new(&rg, 0u32).ctx("r")?, &[optix::SbtRecord::new(&ms, 0u32).ctx("m")?], &[optix::SbtRecord::new(&hg, 0u32).ctx("h")?]).ctx("sbt")?;
-    let out = g.zeros::<u32>(32)?;
-    let params = [out.cu_deviceptr(), 0u64];
-    // SAFETY: diagnostic; the PTX writes 32 words to `out`.
-    unsafe { g.launch(&p, &sbt, &params, [32, 1, 1]) }?;
-    g.down(&out)
 }
 
 fn fail(msg: &str) -> ! {

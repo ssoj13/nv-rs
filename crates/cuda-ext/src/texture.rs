@@ -1,6 +1,7 @@
 //! Texture objects (filtered, cached reads) and surface objects (typed writes).
 //!
-//! **What.** [`TextureObject`] over an [`Array`], a [`MipmappedArray`] or a pitched 2D device
+//! **What.** [`TextureObject`] over an [`Array`], a [`MipmappedArray`], a linear device buffer
+//! (`tex1Dfetch`) or a pitched 2D device
 //! buffer; [`SurfaceObject`] over a surface-capable [`Array`]. Each object holds an `Arc` of its
 //! storage, so the storage cannot be freed while a kernel may still read it through the handle.
 //! [`TextureObject::handle`] / [`SurfaceObject::handle`] are the 64-bit values a kernel receives.
@@ -123,6 +124,7 @@ enum Source {
     Array(Arc<Array>),
     Mipmapped(Arc<MipmappedArray>),
     Pitched(RawDeviceBuffer),
+    Linear(RawDeviceBuffer),
 }
 
 /// A texture object.
@@ -181,6 +183,43 @@ impl TextureObject {
         res.res.pitch2D.height = height;
         res.res.pitch2D.pitchInBytes = pitch_bytes;
         Self::create(buffer.context(), &res, desc.to_sys(1), Source::Pitched(buffer.clone()))
+    }
+
+    /// A 1D texture over a whole linear device buffer (`CU_RESOURCE_TYPE_LINEAR`), read with
+    /// `tex1Dfetch` (integer texel index; no filtering, no normalized coordinates, no mipmaps).
+    /// The buffer must hold a whole number of `format` x `channels` elements, at most the
+    /// device's `MAXIMUM_TEXTURE1D_LINEAR_WIDTH`, and start on its `TEXTURE_ALIGNMENT`.
+    pub fn from_linear(buffer: &RawDeviceBuffer, format: ArrayFormat, channels: u32, desc: TextureDesc) -> Result<Self, DriverError> {
+        let elem = format.bytes() * channels as usize;
+        let ctx = buffer.context();
+        let attr = |a| -> Result<u64, DriverError> {
+            ctx.bind_to_thread()?;
+            let mut v = 0;
+            // SAFETY: valid attribute and out-pointer; the device belongs to `ctx`.
+            unsafe { sys::cuDeviceGetAttribute(&mut v, a, ctx.cu_device()) }.result()?;
+            u64::try_from(v).map_err(|_| invalid_value())
+        };
+        let max = attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LINEAR_WIDTH)?;
+        let align = attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT)?.max(1);
+        if !matches!(channels, 1 | 2 | 4) || buffer.len_bytes() == 0 || !buffer.len_bytes().is_multiple_of(elem) {
+            return Err(invalid_value());
+        }
+        if (buffer.len_bytes() / elem) as u64 > max || !buffer.cu_deviceptr().is_multiple_of(align) {
+            return Err(invalid_value());
+        }
+        // Linear textures take only element fetches: normalized coordinates and filtering do not
+        // apply, and the driver rejects them.
+        if desc.normalized_coords || desc.filter == FilterMode::Linear {
+            return Err(invalid_value());
+        }
+        // SAFETY: zeroed resource descriptor, then the linear range checked above.
+        let mut res: sys::CUDA_RESOURCE_DESC = unsafe { std::mem::zeroed() };
+        res.resType = sys::CUresourcetype_enum_CU_RESOURCE_TYPE_LINEAR;
+        res.res.linear.devPtr = buffer.cu_deviceptr();
+        res.res.linear.format = format.to_sys();
+        res.res.linear.numChannels = channels;
+        res.res.linear.sizeInBytes = buffer.len_bytes();
+        Self::create(ctx, &res, desc.to_sys(1), Source::Linear(buffer.clone()))
     }
 
     fn create(ctx: &Arc<Context>, res: &sys::CUDA_RESOURCE_DESC, tex: sys::CUDA_TEXTURE_DESC, source: Source) -> Result<Self, DriverError> {

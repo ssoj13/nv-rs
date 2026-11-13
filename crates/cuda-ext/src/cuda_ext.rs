@@ -7,7 +7,9 @@
 //!   interop. Imported buffers become ordinary `cuda_core::RawDeviceBuffer`s.
 //! - [`array`] — CUDA arrays and mipmapped arrays, the storage textures and surfaces read from,
 //!   with host <-> array copies.
-//! - [`texture`] — texture objects (filtered reads) and surface objects (writes).
+//! - [`texture`] — texture objects (filtered reads; arrays, mipmapped arrays, pitched and linear
+//!   buffers) and surface objects (writes).
+//! - [`sparse`] — sparse (tiled) arrays: tile geometry, tile pools, mapping tiles.
 //! - [`host`] — page-locking memory the caller already owns, and managed (unified) memory.
 //! - [`device_id`] — device UUID and Windows LUID, to pair a CUDA device with a Vulkan or DXGI
 //!   adapter.
@@ -24,6 +26,7 @@ pub mod device_id;
 pub mod external;
 pub mod green;
 pub mod host;
+pub mod sparse;
 pub mod texture;
 
 pub use array::{Array, ArrayDesc, ArrayFormat, MipmappedArray};
@@ -31,6 +34,7 @@ pub use device_id::{Luid, device_luid, device_uuid};
 pub use external::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 pub use green::{GreenContext, split_sms};
 pub use host::{HostRegistration, ManagedBuffer};
+pub use sparse::{SparseProperties, TilePool, sparse_arrays_supported};
 pub use texture::{AddressMode, FilterMode, SurfaceObject, TextureDesc, TextureObject};
 
 use cuda_core::{Context, DriverError};

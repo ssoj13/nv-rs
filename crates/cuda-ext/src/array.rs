@@ -70,12 +70,17 @@ pub struct ArrayDesc {
     pub surface: bool,
     /// `depth` counts layers of a layered 1D/2D array.
     pub layered: bool,
+    /// Six square faces (`depth` = 6, or 6 x layers with `layered`); `width == height`.
+    pub cubemap: bool,
+    /// Sparse (tiled) storage: no memory until tiles are mapped with [`crate::TilePool`]
+    /// (`CUDA_ARRAY3D_SPARSE`; 2D, 2D layered or 3D, see [`crate::sparse_arrays_supported`]).
+    pub sparse: bool,
 }
 
 impl ArrayDesc {
     /// A 2D layout.
     pub const fn d2(width: usize, height: usize, format: ArrayFormat, channels: u32) -> Self {
-        Self { width, height, depth: 0, format, channels, surface: false, layered: false }
+        Self { width, height, depth: 0, format, channels, surface: false, layered: false, cubemap: false, sparse: false }
     }
 
     /// Bytes per element (`format.bytes() * channels`).
@@ -97,6 +102,10 @@ impl ArrayDesc {
         if self.width == 0 || !matches!(self.channels, 1 | 2 | 4) {
             return Err(invalid_value());
         }
+        // A cubemap has square faces and 6 (or 6 x layers) of them, as cuArray3DCreate requires.
+        if self.cubemap && (self.width != self.height || self.depth == 0 || !self.depth.is_multiple_of(6) || (!self.layered && self.depth != 6)) {
+            return Err(invalid_value());
+        }
         Ok(())
     }
 
@@ -104,6 +113,12 @@ impl ArrayDesc {
         let mut flags = 0;
         if self.surface {
             flags |= sys::CUDA_ARRAY3D_SURFACE_LDST;
+        }
+        if self.cubemap {
+            flags |= sys::CUDA_ARRAY3D_CUBEMAP;
+        }
+        if self.sparse {
+            flags |= sys::CUDA_ARRAY3D_SPARSE;
         }
         if self.layered {
             flags |= sys::CUDA_ARRAY3D_LAYERED;

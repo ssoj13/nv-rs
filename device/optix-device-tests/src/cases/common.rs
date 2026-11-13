@@ -51,10 +51,6 @@ impl Gpu {
         // `ODT_VALIDATION=1` turns on OptiX validation mode (every exception enabled, checked launches).
         let validation = std::env::var("ODT_VALIDATION").is_ok_and(|v| v == "1");
         let ctx = DeviceContext::new(&cuda, Some(Box::new(|l, t, m| eprintln!("[optix {l} {t}] {m}"))), if validation { 4 } else { 2 }, validation).ctx("OptiX context")?;
-        if let Some(v) = std::env::var("ODT_CUDA_STACK").ok().and_then(|s| s.parse().ok()) {
-            cuda.set_limit(cuda_core::ContextLimit::StackSize, v).ctx("stack limit")?;
-        }
-        eprintln!("CUDA stack limit {:?}", cuda.limit(cuda_core::ContextLimit::StackSize));
         Ok(Self { cuda, stream, ctx, ptx })
     }
 
@@ -72,12 +68,6 @@ impl Gpu {
     /// Links `groups` into a pipeline.
     pub fn pipeline(&self, opts: &PipelineOptions, link: LinkOptions, groups: &[Arc<ProgramGroup>]) -> R<Pipeline> {
         let (p, log) = Pipeline::new(&self.ctx, opts, link, groups).ctx("pipeline")?;
-        if let Ok(s) = std::env::var("ODT_STACK") {
-            let v: Vec<u32> = s.split(',').filter_map(|x| x.parse().ok()).collect();
-            if let [a, b, c, d] = v[..] {
-                p.set_stack_size(a, b, c, d).ctx("stack override")?;
-            }
-        }
         if !log.is_empty() {
             eprintln!("[pipeline log] {log}");
         }

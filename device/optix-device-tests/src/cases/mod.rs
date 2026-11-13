@@ -13,6 +13,7 @@ pub mod intersect;
 pub mod local;
 pub mod shade;
 pub mod symbols;
+pub mod texture;
 pub mod transform;
 
 use common::{Gpu, R};
@@ -33,4 +34,6 @@ pub const ALL: &[Case] = &[
     ("payload_types", calls::payload_types),
     ("symbols", symbols::run),
     ("coop_vec", coopvec::run),
+    ("texture", texture::run),
+    ("sparse", texture::sparse),
 ];

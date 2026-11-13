@@ -51,6 +51,9 @@ pub enum Shape {
         /// Name of the sys crate's loader function the shims call; it must return
         /// `Result<&'static <api_type>, _>` (`"nvml_api"`).
         loader_fn: &'static str,
+        /// The library's status type names as they appear in signatures (`"nvmlReturn_t"`).
+        /// Functions returning one of these get shims that return the two codes below.
+        status_types: &'static [&'static str],
         /// Expression returned when the library could not be loaded.
         not_loaded: &'static str,
         /// Expression returned when the library loaded but lacks this symbol.
@@ -161,6 +164,9 @@ pub struct Inventory {
     pub headers: Vec<HeaderHash>,
     /// Every entry point, sorted.
     pub symbols: Vec<String>,
+    /// Entry points that got no shim because their return type has no failure value (neither a
+    /// status type, a pointer, nor `void`); a safe wrapper must load them explicitly.
+    pub unshimmed: Vec<String>,
 }
 
 /// A header and the sha256 of its contents.
@@ -237,8 +243,33 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     };
     let run = |b: bindgen::Builder| b.generate().map(|g| g.to_string()).map_err(|e| Error::Bindgen { lib: spec.name, msg: e.to_string() });
 
-    // Types pass: everything the allowlists reach except functions.
+    // Functions pass first (exports only): its signatures name the types the types pass must
+    // also emit. bindgen traces dependencies only of items it generates, so a function left out
+    // of codegen would not pull in `cudaStream_t` / `libraryPropertyType`; they are allowlisted
+    // by exact name instead.
+    let api = match spec.shape {
+        Shape::Exports { api_type, .. } => {
+            let mut ab = base()
+                .dynamic_library_name(api_type)
+                .dynamic_link_require_all(false)
+                .with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
+            for f in spec.allow_fn {
+                ab = ab.allowlist_function(*f);
+            }
+            Some(run(ab)?)
+        }
+        Shape::FunctionTable { .. } => None,
+    };
+    let signature_types = match (&api, spec.shape) {
+        (Some(src), Shape::Exports { api_type, .. }) => signature_types(spec.name, src, api_type)?,
+        _ => Vec::new(),
+    };
+
+    // Types pass: the allowlisted types and constants plus every type an entry point names.
     let mut tb = base().derive_default(true).blocklist_function(".*");
+    for t in &signature_types {
+        tb = tb.allowlist_type(format!("^{t}$"));
+    }
     for t in spec.allow_type {
         tb = tb.allowlist_type(*t);
     }
@@ -253,55 +284,104 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         types = format!("pub use cuda_bindings::{{{}}};\n{types}", spec.reuse_cuda_types.join(", "));
     }
 
-    let (api, shims_src, symbols) = match spec.shape {
-        Shape::Exports { api_type, loader_fn, not_loaded, missing_symbol } => {
-            let mut ab = base()
-                .dynamic_library_name(api_type)
-                .dynamic_link_require_all(false)
-                .with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
-            for f in spec.allow_fn {
-                ab = ab.allowlist_function(*f);
-            }
-            let api = run(ab)?;
-            let shims_src = shims(spec.name, &api, api_type, loader_fn, not_loaded, missing_symbol)?;
-            let symbols = inventory(spec.name, &api, api_type)?;
-            (Some(api), Some(shims_src), symbols)
+    let (shims_src, symbols, unshimmed) = match (spec.shape, &api) {
+        (Shape::Exports { api_type, loader_fn, status_types, not_loaded, missing_symbol }, Some(api)) => {
+            let codes = StatusCodes { types: status_types, not_loaded, missing_symbol };
+            let generated = shims(spec.name, api, api_type, loader_fn, &codes)?;
+            let symbols = inventory(spec.name, api, api_type)?;
+            (Some(generated.source), symbols, generated.unshimmed)
         }
-        Shape::FunctionTable { table_type } => {
-            let symbols = inventory(spec.name, &types, table_type)?;
-            (None, None, symbols)
+        (Shape::FunctionTable { table_type }, _) => (None, inventory(spec.name, &types, table_type)?, Vec::new()),
+        (Shape::Exports { .. }, None) => {
+            return Err(Error::Generated { lib: spec.name, msg: "exports shape produced no function pass".into() });
         }
     };
 
-    Ok(Output { types, api, shims: shims_src, inventory: Inventory { lib: spec.name.to_string(), headers, symbols } })
+    Ok(Output {
+        types,
+        api,
+        shims: shims_src,
+        inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed },
+    })
 }
 
-/// Panic-free `extern "C"` shims for every function-pointer field of `api_type` in `api_source`.
+/// How a library reports failure through its return values.
+#[derive(Clone, Copy, Debug)]
+pub struct StatusCodes<'a> {
+    /// Status type names as they appear in signatures.
+    pub types: &'a [&'a str],
+    /// Returned when the library could not be loaded.
+    pub not_loaded: &'a str,
+    /// Returned when the symbol is missing.
+    pub missing_symbol: &'a str,
+}
+
+/// Generated shims plus the entry points that could not get one.
+#[derive(Debug)]
+pub struct Shims {
+    /// The shim source.
+    pub source: String,
+    /// Sorted names of functions without a failure value (see [`Inventory::unshimmed`]).
+    pub unshimmed: Vec<String>,
+}
+
+/// What a shim returns when the call cannot be made, decided by the return type.
+enum Fallback {
+    /// The library's own codes.
+    Status,
+    /// A null pointer (`*const` / `*mut`).
+    Null { mutable: bool },
+    /// Nothing (`void`).
+    Unit,
+}
+
+fn fallback(ret: &ReturnType, status_types: &[&str]) -> Option<Fallback> {
+    match ret {
+        ReturnType::Default => Some(Fallback::Unit),
+        ReturnType::Type(_, ty) => match ty.as_ref() {
+            Type::Ptr(p) => Some(Fallback::Null { mutable: p.mutability.is_some() }),
+            Type::Path(p) => {
+                let last = p.path.segments.last()?.ident.to_string();
+                status_types.iter().any(|s| *s == last).then_some(Fallback::Status)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Panic-free `extern "C"` shims for the function-pointer fields of `api_type` in `api_source`.
 ///
-/// Each shim calls `loader_fn()`; a failed load returns `not_loaded`, a missing symbol returns
-/// `missing_symbol`. `extern "C"` (not `"C-unwind"`) so a shim coerces to a C function pointer;
-/// unwinding out of it would abort, hence no panic path exists in the body.
-pub fn shims(
-    lib: &'static str,
-    api_source: &str,
-    api_type: &str,
-    loader_fn: &str,
-    not_loaded: &str,
-    missing_symbol: &str,
-) -> Result<String, Error> {
+/// Each shim calls `loader_fn()`. What it returns when the call cannot be made depends on the
+/// return type: a status type returns `codes.not_loaded` / `codes.missing_symbol`, a pointer
+/// returns null, `void` returns nothing; any other return type has no failure value, so no shim
+/// is generated and the name is reported in [`Shims::unshimmed`]. `extern "C"` (not `"C-unwind"`)
+/// so a shim coerces to a C function pointer; unwinding out of it would abort, hence no panic path
+/// exists in the body.
+pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &str, codes: &StatusCodes<'_>) -> Result<Shims, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let file = syn::parse_file(api_source).map_err(|e| gen_err(e.to_string()))?;
     let api = find_struct(&file, api_type).ok_or_else(|| gen_err(format!("no struct {api_type}")))?;
     let loader = format_ident!("{loader_fn}");
-    let not_loaded: Expr = syn::parse_str(not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
-    let missing: Expr = syn::parse_str(missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+    let not_loaded: Expr = syn::parse_str(codes.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
+    let missing: Expr = syn::parse_str(codes.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
 
     let Fields::Named(fields) = &api.fields else {
         return Err(gen_err(format!("{api_type} has no named fields")));
     };
-    let fns = fields.named.iter().filter_map(|field| {
+    let mut unshimmed = Vec::new();
+    let fns: Vec<TokenStream> = fields.named.iter().filter_map(|field| {
         let name = field.ident.as_ref()?;
         let bare = result_bare_fn(&field.ty)?;
+        let Some(fb) = fallback(&bare.output, codes.types) else {
+            unshimmed.push(name.to_string());
+            return None;
+        };
+        let (on_missing, on_not_loaded) = match fb {
+            Fallback::Status => (quote!(#missing), quote!(#not_loaded)),
+            Fallback::Null { mutable: false } => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
+            Fallback::Null { mutable: true } => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
+            Fallback::Unit => (quote!(()), quote!(())),
+        };
         let args: Vec<(proc_macro2::Ident, TokenStream)> = bare
             .inputs
             .iter()
@@ -323,20 +403,22 @@ pub fn shims(
             #[inline]
             pub unsafe extern "C" fn #name(#(#defs),*) #ret {
                 match #loader() {
+                    // Safety argument (comments do not survive prettyplease, so it lives here):
+                    // the caller upholds the C function's contract, and the pointer was resolved
+                    // from the loaded library that `api` keeps alive for the process.
                     Ok(api) => match &api.#name {
-                        // SAFETY: the caller upholds the C function's contract; the pointer was
-                        // resolved from the loaded library, which `api` keeps alive.
                         Ok(f) => unsafe { (*f)(#(#names),*) },
-                        Err(_) => #missing,
+                        Err(_) => #on_missing,
                     },
-                    Err(_) => #not_loaded,
+                    Err(_) => #on_not_loaded,
                 }
             }
         })
-    });
+    }).collect();
     let tokens = quote!(#(#fns)*);
     let parsed: syn::File = syn::parse2(tokens).map_err(|e| gen_err(format!("shims: {e}")))?;
-    Ok(prettyplease::unparse(&parsed))
+    unshimmed.sort();
+    Ok(Shims { source: prettyplease::unparse(&parsed), unshimmed })
 }
 
 /// Sorted entry-point names: the function-pointer fields of `struct_name` in `source` (bindgen's
@@ -355,6 +437,60 @@ pub fn inventory(lib: &'static str, source: &str, struct_name: &str) -> Result<V
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// Every single-segment type name used in the entry-point signatures of `api_type` (bindgen's
+/// own aliases such as `cudaStream_t`; `::std::os::raw::*` paths have several segments and are
+/// skipped), sorted and deduplicated.
+pub fn signature_types(lib: &'static str, api_source: &str, api_type: &str) -> Result<Vec<String>, Error> {
+    let file = syn::parse_file(api_source).map_err(|e| Error::Generated { lib, msg: e.to_string() })?;
+    let s = find_struct(&file, api_type).ok_or_else(|| Error::Generated { lib, msg: format!("no struct {api_type}") })?;
+    let mut names = Vec::new();
+    if let Fields::Named(fields) = &s.fields {
+        for f in fields.named.iter().filter_map(|f| result_bare_fn(&f.ty)) {
+            for arg in &f.inputs {
+                collect_type_names(&arg.ty, &mut names);
+            }
+            if let ReturnType::Type(_, ty) = &f.output {
+                collect_type_names(ty, &mut names);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn collect_type_names(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Path(p) => {
+            if p.qself.is_none() && p.path.leading_colon.is_none() && p.path.segments.len() == 1 {
+                out.push(p.path.segments[0].ident.to_string());
+            }
+            for seg in &p.path.segments {
+                if let PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for a in &args.args {
+                        if let GenericArgument::Type(t) = a {
+                            collect_type_names(t, out);
+                        }
+                    }
+                }
+            }
+        }
+        Type::Ptr(p) => collect_type_names(&p.elem, out),
+        Type::Reference(r) => collect_type_names(&r.elem, out),
+        Type::Array(a) => collect_type_names(&a.elem, out),
+        Type::Paren(p) => collect_type_names(&p.elem, out),
+        Type::BareFn(f) => {
+            for arg in &f.inputs {
+                collect_type_names(&arg.ty, out);
+            }
+            if let ReturnType::Type(_, t) = &f.output {
+                collect_type_names(t, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn find_struct<'a>(file: &'a syn::File, name: &str) -> Option<&'a ItemStruct> {
@@ -485,6 +621,7 @@ mod tests {
         shape: Shape::Exports {
             api_type: "FakeApi",
             loader_fn: "fake_api",
+            status_types: &["fakeStatus"],
             not_loaded: "fakeStatus_enum_FAKE_ERROR_NOT_LOADED",
             missing_symbol: "fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL",
         },
@@ -497,11 +634,19 @@ mod tests {
     #[test]
     fn exports_produce_shims_for_allowlisted_functions_only() {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
-        assert_eq!(out.inventory.symbols, ["fakeCtxCreate", "fakeGetCount", "fakeInit"]);
+        assert_eq!(
+            out.inventory.symbols,
+            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeReset", "fakeVersionNumber"]
+        );
+        // An `int` return has no failure value: reported, never shimmed with a made-up code.
+        assert_eq!(out.inventory.unshimmed, ["fakeVersionNumber"]);
         let shims = out.shims.expect("exports have shims");
-        for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount"] {
+        for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount", "fakeErrorString", "fakeReset"] {
             assert!(shims.contains(&format!("pub unsafe extern \"C\" fn {f}(")), "shim for {f}");
         }
+        assert!(!shims.contains("fn fakeVersionNumber("));
+        // A pointer return falls back to null, not to a status code of the wrong type.
+        assert!(shims.contains("::core::ptr::null()"), "{shims}");
         assert!(!shims.contains("notFakeHelper"), "allowlist must exclude other functions");
         // Mutation that reddens this: drop either error arm, or let a shim fall back to a panic.
         assert!(shims.contains("fakeStatus_enum_FAKE_ERROR_NOT_LOADED"));
@@ -529,6 +674,23 @@ mod tests {
         let spec = LibSpec { headers: &["absent.h"], ..FAKE };
         let err = bindings(&spec, &fixture(), &[]).expect_err("no such header");
         assert!(matches!(err, Error::HeaderNotFound { ref searched, .. } if searched == &fixture()), "{err}");
+    }
+
+    #[test]
+    fn signature_types_collect_aliases_and_skip_std_paths() {
+        // The cuFFT failure that motivated this: `cudaStream_t` and `libraryPropertyType` appear
+        // only in signatures and were missing from the types pass.
+        let src = r#"
+            pub struct Api {
+                __library: ::libloading::Library,
+                pub cufftSetStream: Result<unsafe extern "C" fn(plan: cufftHandle, s: cudaStream_t) -> cufftResult, ::libloading::Error>,
+                pub cufftGetProperty: Result<unsafe extern "C" fn(t: libraryPropertyType, v: *mut ::std::os::raw::c_int) -> cufftResult, ::libloading::Error>,
+            }
+        "#;
+        assert_eq!(
+            signature_types("t", src, "Api").expect("parses"),
+            ["cudaStream_t", "cufftHandle", "cufftResult", "libraryPropertyType"]
+        );
     }
 
     #[test]

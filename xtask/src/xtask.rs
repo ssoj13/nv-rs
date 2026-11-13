@@ -29,7 +29,7 @@ enum Error {
     Parse { path: PathBuf, msg: String },
     #[error("coverage check failed:\n{0}")]
     Check(String),
-    #[error("usage: cargo xtask coverage <generate|check>")]
+    #[error("usage: cargo xtask coverage <collect|generate|check>")]
     Usage,
 }
 
@@ -95,6 +95,7 @@ fn main() -> ExitCode {
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["coverage", "generate"] => generate(&root),
         ["coverage", "check"] => check(&root),
+        ["coverage", "collect"] => collect(&root),
         _ => Err(Error::Usage),
     };
     match result {
@@ -118,6 +119,36 @@ fn generate(root: &Path) -> Result<String, Error> {
     let path = root.join("COVERAGE.md");
     std::fs::write(&path, &text).map_err(|source| Error::Io { path: path.clone(), source })?;
     Ok(format!("wrote {}", path.display()))
+}
+
+/// Copies the newest `<lib>_inventory.json` each sys crate's build script wrote under
+/// `target/*/build/*/out/` into `coverage/evidence/<lib>/inventory.json`. Run after building the
+/// sys crates; the copied files are committed as evidence.
+fn collect(root: &Path) -> Result<String, Error> {
+    let mut newest: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
+    for profile in list(&root.join("target")) {
+        for build in list(&profile.join("build")) {
+            for file in list(&build.join("out")) {
+                let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(lib) = name.strip_suffix("_inventory.json") else { continue };
+                let modified = std::fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                if newest.get(lib).is_none_or(|(t, _)| modified > *t) {
+                    newest.insert(lib.to_string(), (modified, file));
+                }
+            }
+        }
+    }
+    let mut copied = Vec::new();
+    for (lib, (_, src)) in &newest {
+        let text = read(src)?;
+        serde_json::from_str::<Inventory>(&text).map_err(|e| Error::Parse { path: src.clone(), msg: e.to_string() })?;
+        let dir = root.join("coverage").join("evidence").join(lib);
+        std::fs::create_dir_all(&dir).map_err(|source| Error::Io { path: dir.clone(), source })?;
+        let dst = dir.join("inventory.json");
+        std::fs::write(&dst, text).map_err(|source| Error::Io { path: dst, source })?;
+        copied.push(lib.as_str());
+    }
+    Ok(format!("collected inventories: {}", if copied.is_empty() { "none (build the sys crates first)".to_string() } else { copied.join(", ") }))
 }
 
 fn check(root: &Path) -> Result<String, Error> {

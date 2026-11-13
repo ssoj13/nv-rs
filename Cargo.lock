@@ -188,6 +188,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-bindings"
+version = "0.5.0"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
+dependencies = [
+ "libloading",
+ "serde_json",
+]
+
+[[package]]
+name = "cufft-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,10 +357,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvml-sys"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "optix-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
 
 [[package]]
 name = "prettyplease"

@@ -292,6 +292,66 @@ pub struct Loaded<T> {
     pub path: PathBuf,
 }
 
+/// The body of an exports-shaped sys crate (one `nv-bindgen` [`Shape::Exports`] library).
+///
+/// Includes the generated `<lib>_types.rs`, `<lib>_api.rs` and `<lib>_shims.rs` from `OUT_DIR`,
+/// re-exports types and shims, keeps the bindgen loading struct private (its methods `expect` a
+/// symbol and would panic), and defines the cached loader the shims call plus a public
+/// diagnostic `load()` and the `INVENTORY` evidence string. One definition for every sys crate.
+///
+/// [`Shape::Exports`]: https://docs.rs/nv-bindgen
+#[macro_export]
+macro_rules! exports_sys {
+    (lib: $lib:literal, api: $api:ident, loader: $loader:ident, dll: $dll:expr $(,)?) => {
+        // Generated code: lint levels differ per header, so the generated modules opt out.
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        mod types {
+            include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
+        }
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        mod api {
+            use super::types::*;
+            include!(concat!(env!("OUT_DIR"), "/", $lib, "_api.rs"));
+        }
+        // Shim bodies share one safety argument, documented once in nv-bindgen (`shims`);
+        // prettyplease drops comments, so the per-block SAFETY lint cannot be met here.
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        mod shims {
+            use super::$loader;
+            use super::types::*;
+            include!(concat!(env!("OUT_DIR"), "/", $lib, "_shims.rs"));
+        }
+        pub use shims::*;
+        pub use types::*;
+
+        /// Where this library ships and what its files are called.
+        pub const DLL: $crate::DllSpec = $dll;
+
+        /// Entry points and header sha256 of the generated bindings (coverage evidence).
+        pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
+
+        fn loaded() -> &'static ::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError> {
+            static API: ::std::sync::OnceLock<::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>> =
+                ::std::sync::OnceLock::new();
+            API.get_or_init(|| {
+                // SAFETY: opening the library runs only its loader initialisers; symbols are
+                // resolved lazily and a missing one becomes an `Err` field, not a crash.
+                $crate::open_first(&DLL, |p| unsafe { api::$api::new(p) }.map_err(|e| e.to_string()))
+            })
+        }
+
+        /// The loaded library, for the shims.
+        fn $loader() -> ::core::result::Result<&'static api::$api, &'static $crate::LoadError> {
+            loaded().as_ref().map(|l| &l.value)
+        }
+
+        /// Loads the library now and reports which file was used, or why loading failed.
+        pub fn load() -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
+            loaded().as_ref().map(|l| l.path.as_path())
+        }
+    };
+}
+
 /// Fails with [`LoadError::RuntimeTooOld`] when `found < required`.
 pub fn check_version(lib: &'static str, required: u32, found: u32) -> Result<(), LoadError> {
     if found < required {

@@ -21,6 +21,7 @@ quote = "1"
 proc-macro2 = "1"
 prettyplease = "0.2"
 libloading = "0.8"
+cuda-bindings = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
 winreg = "0.56"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

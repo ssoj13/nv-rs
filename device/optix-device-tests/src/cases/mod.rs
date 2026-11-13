@@ -3,6 +3,7 @@
 //! Each case builds its own pipeline over the shared module (all programs of the binary), runs
 //! it and compares every output value with a CPU reference. **Used by** `main`.
 
+pub mod calls;
 pub mod common;
 pub mod exception;
 pub mod geometry;
@@ -26,4 +27,6 @@ pub const ALL: &[Case] = &[
     ("hitobject", hitobject::run),
     ("intersect", intersect::run),
     ("exception", exception::run),
+    ("callables", calls::callables),
+    ("payload_types", calls::payload_types),
 ];

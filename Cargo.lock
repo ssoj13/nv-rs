@@ -382,6 +382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "npp-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "nv-bindgen"
 version = "0.0.0"
 dependencies = [

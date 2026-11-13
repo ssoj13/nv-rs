@@ -8,12 +8,16 @@
 //! `cuda_bindings::CUstream_st`.
 //! **Used by** a future safe `npp` crate.
 
-use nv_loader::{DllSpec, Group};
-
-/// Shorthand for an NPP DLL spec: `nppif` -> `nppif64_*.dll` / `libnppif.so.13`.
+/// Shorthand for an NPP DLL spec: `nppif` -> `nppif64_*.dll` / `libnppif.so.13`. Full paths: the
+/// spec is expanded inside each part's module.
 macro_rules! npp_dll {
     ($name:literal, $linux:literal) => {
-        DllSpec { lib: $name, group: Group::Toolkit, windows: &[concat!($name, "64_*")], linux: &[$linux, concat!("lib", $name, ".so")] }
+        ::nv_loader::DllSpec {
+            lib: $name,
+            group: ::nv_loader::Group::Toolkit,
+            windows: &[concat!($name, "64_*")],
+            linux: &[$linux, concat!("lib", $name, ".so")],
+        }
     };
 }
 

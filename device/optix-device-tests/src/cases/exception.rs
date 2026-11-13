@@ -1,8 +1,8 @@
 //! Case `exception`: user and built-in exceptions through `optix_device::exception`.
 //!
 //! The pipeline enables `OPTIX_EXCEPTION_FLAG_USER | OPTIX_EXCEPTION_FLAG_TRACE_DEPTH` and links
-//! with `max_trace_depth = 1`. Launch row 0: each raygen thread throws a user exception with code
-//! `100 + x` and 0, 2 or 8 detail words (by `x % 3`); row 1: each thread traces into a triangle
+//! with `max_trace_depth = 1`. Launch row 0: each raygen thread throws user exception
+//! `100 + x % 3` (a constant per call site) with 0, 2 or 8 detail words; row 1: each thread traces into a triangle
 //! whose closest-hit traces again, exceeding the trace depth. The exception program writes the
 //! code and the detail words it reads; the host checks every thread: user code and details, the
 //! built-in `OPTIX_EXCEPTION_CODE_TRACE_DEPTH_EXCEEDED`, and that no thread ran past its throw.
@@ -64,11 +64,10 @@ mod kernels {
             let [x, y, _] = state::launch_index();
             *rec() = 1;
             if y == 0 {
-                let code = 100 + x as i32;
                 match x % 3 {
-                    0 => exception::throw(code, []),
-                    1 => exception::throw(code, [detail(x, 0), detail(x, 1)]),
-                    _ => exception::throw(code, [detail(x, 0), detail(x, 1), detail(x, 2), detail(x, 3), detail(x, 4), detail(x, 5), detail(x, 6), detail(x, 7)]),
+                    0 => exception::throw::<100, 0>([]),
+                    1 => exception::throw::<101, 2>([detail(x, 0), detail(x, 1)]),
+                    _ => exception::throw::<102, 8>([detail(x, 0), detail(x, 1), detail(x, 2), detail(x, 3), detail(x, 4), detail(x, 5), detail(x, 6), detail(x, 7)]),
                 }
             } else {
                 trace::trace_no_payload(PARAMS.get().handle, &Ray::new([0.25, 0.25, -1.0], [0.0, 0.0, 1.0], 0.0, 1.0e16), &TraceOptions::default());
@@ -136,7 +135,7 @@ pub fn run(g: &Gpu) -> R {
             let r = &got[((y * N + x) as usize) * REC..][..REC];
             if y == 0 {
                 let n = [0, 2, 8][(x % 3) as usize];
-                let mut want = vec![2, 100 + x];
+                let mut want = vec![2, 100 + x % 3];
                 want.extend((0..n).map(|k| detail(x, k)));
                 same(&format!("user exception of thread {x} (marker, code, details)"), &r[..want.len()], &want, |j| format!("[{j}]"))?;
             } else {

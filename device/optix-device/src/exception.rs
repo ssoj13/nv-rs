@@ -3,15 +3,19 @@
 
 use crate::raw;
 
-/// Throws a user exception: `code` in `0..=2^30-1`, with up to 8 detail words.
+/// Throws user exception `CODE` (`0..=2^30-1`) with up to 8 detail words.
+///
+/// The code is a const parameter because OptiX requires it: a run-time value fails module
+/// creation with "Exception code in optixThrowException is not a constant".
 ///
 /// # Safety
 ///
 /// Valid in every program type except exception programs; the pipeline must enable user
 /// exceptions (`OPTIX_EXCEPTION_FLAG_USER`).
 #[inline(always)]
-pub unsafe fn throw<const N: usize>(code: i32, details: [u32; N]) {
+pub unsafe fn throw<const CODE: i32, const N: usize>(details: [u32; N]) {
     const { assert!(N <= 8, "at most 8 exception details") };
+    const { assert!(CODE >= 0 && CODE < 1 << 30, "user exception codes are 0..=2^30-1") };
     let d = {
         let mut d = [0u32; 8];
         let mut i = 0;
@@ -21,7 +25,7 @@ pub unsafe fn throw<const N: usize>(code: i32, details: [u32; N]) {
         }
         d
     };
-    let c = code as u32;
+    let c = CODE as u32;
     // SAFETY: forwarded contract; `N` is a compile-time constant.
     unsafe {
         match N {

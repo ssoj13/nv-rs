@@ -1,0 +1,23 @@
+[package]
+name = "optix-device-tests"
+description = "GPU tests for optix-device: OptiX programs written in Rust, driven by the host optix crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "optix-device-tests"
+path = "src/optix_device_tests.rs"
+
+[dependencies]
+optix-device = { path = "../optix-device" }
+optix = { path = "../../crates/optix" }
+cuda-device.workspace = true
+cuda-core.workspace = true
+cuda-host.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

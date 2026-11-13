@@ -1,0 +1,7 @@
+# cuda-oxide drives compiler-internal APIs from the pinned toolchain (cargo-oxide refuses others).
+[env]
+RUSTC_BOOTSTRAP = "1"
+CUDA_OXIDE_PTX_DIR = { value = "target/oxide-ptx", relative = true }
+
+[net]
+git-fetch-with-cli = true

@@ -1,0 +1,22 @@
+[package]
+name = "s1a-optix-ptx"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Spike S1a: does OptiX accept a raygen program compiled from Rust by cuda-oxide?"
+
+[workspace]
+
+[[bin]]
+name = "s1a-optix-ptx"
+path = "src/s1a_optix_ptx.rs"
+
+[dependencies]
+cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-device = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-host = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+libloading = "0.8"
+
+[build-dependencies]
+bindgen = "0.72"

@@ -231,7 +231,7 @@ dependencies = [
 [[package]]
 name = "cuda-artifact-finalizer"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -244,7 +244,7 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "libloading",
  "serde_json",
@@ -253,7 +253,7 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -267,7 +267,7 @@ dependencies = [
 [[package]]
 name = "cuda-core-derive"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -277,7 +277,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "bytemuck",
  "cuda-macros",
@@ -295,7 +295,7 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
@@ -312,7 +312,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "oxide-tile-export",
  "proc-macro2",
@@ -324,12 +324,12 @@ dependencies = [
 [[package]]
 name = "cuda-repr"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 
 [[package]]
 name = "cuda-target-spec"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 
 [[package]]
 name = "cuda-tex-device"
@@ -341,7 +341,7 @@ dependencies = [
 [[package]]
 name = "cuda-toolkit-discovery"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 
 [[package]]
 name = "digest"
@@ -470,7 +470,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "cuda-target-spec",
  "cuda-toolkit-discovery",
@@ -534,7 +534,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "cuda-toolkit-discovery",
  "libloading",
@@ -624,7 +624,7 @@ dependencies = [
 [[package]]
 name = "oxide-tile-export"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "serde",
  "serde_json",
@@ -653,7 +653,7 @@ dependencies = [
 [[package]]
 name = "ptx-parse"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 
 [[package]]
 name = "quote"
@@ -696,7 +696,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.4.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#f8b99f38580d9341c095a93c8e9778b6dca1c233"
+source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 
 [[package]]
 name = "rustc-hash"

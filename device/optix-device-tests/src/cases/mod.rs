@@ -6,6 +6,7 @@
 pub mod common;
 pub mod geometry;
 pub mod shade;
+pub mod transform;
 
 use common::{Gpu, R};
 
@@ -13,4 +14,4 @@ use common::{Gpu, R};
 pub type Case = (&'static str, fn(&Gpu) -> R);
 
 /// Every case, in run order.
-pub const ALL: &[Case] = &[("shade", shade::run), ("geometry", geometry::run)];
+pub const ALL: &[Case] = &[("shade", shade::run), ("geometry", geometry::run), ("transform", transform::run)];

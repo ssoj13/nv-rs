@@ -1,0 +1,19 @@
+[package]
+name = "optix"
+description = "Safe OptiX host API: device context, acceleration structures, modules, pipelines, typed shader binding tables, launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/optix.rs"
+
+[dependencies]
+optix-sys = { path = "../optix-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

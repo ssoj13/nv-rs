@@ -1,0 +1,23 @@
+[package]
+name = "s1b-optix-trace"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Spike S1b: a Rust raygen calls optixTrace against a one-triangle GAS"
+
+[workspace]
+
+[[bin]]
+name = "s1b-optix-trace"
+path = "src/s1b_optix_trace.rs"
+
+# The fork branch carrying the S1b patches (ptx_asm! arity, #[constant(export_name)]).
+[dependencies]
+cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "feat/optix-device" }
+cuda-device = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "feat/optix-device" }
+cuda-host = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "feat/optix-device" }
+libloading = "0.8"
+
+[build-dependencies]
+bindgen = "0.72"

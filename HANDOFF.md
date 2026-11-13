@@ -5,6 +5,7 @@
 - Spikes S1a (OptiX runs a Rust raygen from cuda-oxide), S2 (Vulkan buffer shared by wgpu and
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
   Details and findings in PLAN.md §8; code under `spikes/`.
+- **M2 in progress**: sys crates nvml, optix, cufft, cublas, cublaslt, cusparse, cusolver, nvjpeg, nvrtc built and loading (see COVERAGE.md). Next wave: cupti (extras/CUPTI), nvcuvid, nvenc (function table, Video Codec SDK), npp (multi-DLL design).
 - **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`. Gate green
   (clippy `-D warnings`, T0 14/14, `cargo xtask coverage check`).
 - vcv-rs detects the OptiX SDK (`vcv_rs::optix`, vcv-rs `18f6ed8`); nv-bindgen uses it.

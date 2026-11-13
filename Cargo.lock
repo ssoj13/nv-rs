@@ -493,6 +493,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvofa-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "nvrtc-sys"
 version = "0.0.0"
 dependencies = [

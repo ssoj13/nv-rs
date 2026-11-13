@@ -107,6 +107,13 @@ pub enum Shape {
         /// Expression returned when the query has no entry point for the id.
         missing_symbol: &'static str,
     },
+    /// The SDK ships only static libraries (NGX: `nvsdk_ngx_d.lib`), so entry points are plain
+    /// `extern "C"` declarations linked at build time against the SDK's `lib` directory (from
+    /// vcv-rs). The one deliberate exception to "nothing is linked at build time" (PLAN D15).
+    StaticLink {
+        /// Static libraries to link (`"nvsdk_ngx_d"`).
+        link_libs: &'static [&'static str],
+    },
     /// Entry points come from a runtime query into a table struct (OptiX, NVENC); types only.
     FunctionTable {
         /// The table struct whose fields are the entry points (`"OptixFunctionTable"`).
@@ -280,6 +287,18 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         let path = out_dir.join(format!("{}_{suffix}", spec.name));
         std::fs::write(&path, text).map_err(|source| Error::Io { lib: spec.name, path, source })
     };
+    if let Shape::StaticLink { link_libs } = spec.shape {
+        for s in spec.sdks {
+            if let Sdk::Nv(kind) = s
+                && let Some(lib_dir) = vcv_rs::nvsdk::detect(*kind).and_then(|i| i.lib_dir)
+            {
+                println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            }
+        }
+        for l in link_libs {
+            println!("cargo:rustc-link-lib=static={l}");
+        }
+    }
     write("types.rs", &out.types)?;
     for part in &out.parts {
         // `<lib>_api.rs` for one DLL, `<lib>_<part>_api.rs` per DLL of a split library.
@@ -350,7 +369,7 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         Shape::SplitExports { parts, .. } => {
             parts.iter().map(|p| (format!("_{}", p.name), p.api_type, p.loader_fn, p.header_files)).collect()
         }
-        Shape::FunctionTable { .. } => Vec::new(),
+        Shape::FunctionTable { .. } | Shape::StaticLink { .. } => Vec::new(),
     };
     let mut apis: Vec<(String, &str, &str, String)> = Vec::new();
     for (stem, api_type, loader_fn, files) in plan {
@@ -370,9 +389,23 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         }
         apis.push((stem, api_type, loader_fn, run(ab)?));
     }
+    // Statically linked libraries: plain `extern "C"` declarations instead of a loading struct.
+    let externs = match spec.shape {
+        Shape::StaticLink { .. } => {
+            let mut eb = base().with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
+            for f in spec.allow_fn {
+                eb = eb.allowlist_function(*f);
+            }
+            Some(run(eb)?)
+        }
+        _ => None,
+    };
     let mut signature_types_all = Vec::new();
     for (_, api_type, _, src) in &apis {
         signature_types_all.extend(signature_types(spec.name, src, api_type)?);
+    }
+    if let Some(src) = &externs {
+        signature_types_all.extend(extern_fns(spec.name, src)?.1);
     }
     signature_types_all.sort();
     signature_types_all.dedup();
@@ -428,12 +461,43 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
             }
         }
         Shape::FunctionTable { table_type } => symbols = inventory(spec.name, &types, table_type)?,
+        Shape::StaticLink { .. } => {
+            let src = externs.unwrap_or_default();
+            symbols = extern_fns(spec.name, &src)?.0;
+            // The `extern` block takes the place of shims: nothing is loaded at runtime.
+            parts.push(GeneratedPart { stem: String::new(), api: None, shims: src });
+        }
     }
     symbols.sort();
     symbols.dedup();
     unshimmed.sort();
 
     Ok(Output { types, parts, inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed } })
+}
+
+/// Names of the functions declared in `extern` blocks of `source`, and every single-segment type
+/// their signatures name (for the types pass).
+fn extern_fns(lib: &'static str, source: &str) -> Result<(Vec<String>, Vec<String>), Error> {
+    let file = syn::parse_file(source).map_err(|e| Error::Generated { lib, msg: e.to_string() })?;
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    for item in &file.items {
+        let Item::ForeignMod(block) = item else { continue };
+        for f in &block.items {
+            let syn::ForeignItem::Fn(f) = f else { continue };
+            names.push(f.sig.ident.to_string());
+            for arg in &f.sig.inputs {
+                if let syn::FnArg::Typed(t) = arg {
+                    collect_type_names(&t.ty, &mut types);
+                }
+            }
+            if let ReturnType::Type(_, t) = &f.sig.output {
+                collect_type_names(t, &mut types);
+            }
+        }
+    }
+    names.sort();
+    Ok((names, types))
 }
 
 /// Internal name of the signature-only struct used by [`Shape::QueryInterface`].

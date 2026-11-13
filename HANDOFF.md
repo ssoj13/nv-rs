@@ -24,7 +24,7 @@
   4. CUDA writes pattern A, signals 1; wgpu `Queue::as_hal` -> `add_wait_semaphore(sem, Some(1))`,
      submits acquire + copy to readback, checks A (also proves no lazy clear);
   5. wgpu writes pattern B, release, `add_signal_semaphore(sem, Some(2))`; CUDA waits 2, reads B.
-- **S3**: not started.
+- **S3** (`spikes/s3-nv-bindgen`): **PASS** (see PLAN.md §8). All spikes passed; next is M1.
 
 ## Blockers found
 

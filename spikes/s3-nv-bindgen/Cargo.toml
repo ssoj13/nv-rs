@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+nv-loader = { path = "crates/nv-loader" }
+nv-bindgen = { path = "crates/nv-bindgen" }
+nvml-sys = { path = "crates/nvml-sys" }
+optix-sys = { path = "crates/optix-sys" }
+cufft-sys = { path = "crates/cufft-sys" }
+cuda-bindings = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+libloading = "0.8"
+bindgen = "0.72"

@@ -201,6 +201,19 @@ CUDA wait 2 -> read: 0/4096 wrong. Device UUIDs match. Note: the fork's `cuda-bi
 now ships committed generated bindings (`cuda-bindings/generated/<target>/`), so D6 must be
 reconciled with the fork's policy.
 
+**S3 result (2026-11-12): PASS.** `spikes/s3-nv-bindgen`: `nv-loader` (System32 / DriverStore /
+toolkit prefix scan) + `nv-bindgen` (one `LibSpec` per library) drive `nvml-sys` (exports:
+init, count, name = RTX 3080 Ti), `optix-sys` (function table, ABI 118, 480 bytes) and
+`cufft-sys` (toolkit `cufft64_12.dll`, version 12300; `cudaStream_t` is
+`cuda_bindings::CUstream_st`, proven at compile time). 0 warnings with `wrap_unsafe_ops(true)`.
+Findings for M1: bindgen's dynamic-loading methods panic (`expect`) on a missing symbol, so
+`nv-bindgen` must emit its own panic-free shims returning the library's status code (as
+`cuda-bindings/build.rs` does); `optix-sys` should also re-use `cuda-bindings` for
+`CUcontext`/`CUstream`; DriverStore discovery must read the active adapter's driver folder from the
+registry instead of scanning FileRepository.
+
+All three spikes passed; M1 can start.
+
 If S1a fails (OptiX rejects LLVM-NVPTX PTX): stop and reassess. Fallback is post-processing PTX with
 the fork's `ptx-parse`; that changes M5.
 

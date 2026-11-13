@@ -1,0 +1,12 @@
+[package]
+name = "nv-bindgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nv_bindgen.rs"
+
+[dependencies]
+bindgen.workspace = true

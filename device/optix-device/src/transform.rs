@@ -208,13 +208,17 @@ pub fn transform_normal(m: &Matrix3x4, n: Float3) -> Float3 {
     ]
 }
 
-/// `a * t0 + b * t1` per component (the header's `optixAddFloat4(optixMulFloat4(..))` per float4).
+/// One `float4` of a transform key.
+type F4 = [f32; 4];
+
+/// `a * t0 + b * t1` (the header's `optixAddFloat4(optixMulFloat4(a, t0), optixMulFloat4(b, t1))`).
+///
+/// Keys are interpolated as `float4` rows by value with constant lane indices, like the header:
+/// a loop over a borrowed array made cuda-oxide keep both keys in a `.local` depot, and OptiX
+/// does not reserve stack for that depot in closest-hit programs (launches then fault).
 #[inline(always)]
-fn lerp<const N: usize>(mut a: [f32; N], b: &[f32; N], t0: f32, t1: f32) -> [f32; N] {
-    for (x, y) in a.iter_mut().zip(b.iter()) {
-        *x = *x * t0 + *y * t1;
-    }
-    a
+fn lerp4(a: F4, b: F4, t0: f32, t1: f32) -> F4 {
+    [a[0] * t0 + b[0] * t1, a[1] * t0 + b[1] * t1, a[2] * t0 + b[2] * t1, a[3] * t0 + b[3] * t1]
 }
 
 /// `optixResolveMotionKey`: `(local time in [0, 1], left key index)` of `globalt` in `opts`.
@@ -252,17 +256,19 @@ unsafe fn matrix_motion_at(p: *const OptixMatrixMotionTransform, time: f32) -> M
     let (t1, key) = resolve_key(&opts, time);
     // SAFETY: the transform's key array really holds `numKeys` matrices (the struct declares 2 as
     // a minimum, the allocation is sized for all keys), and `key + 1 < numKeys`.
-    let base = unsafe { (&raw const (*p).transform).cast::<Matrix3x4>().offset(key as isize) };
+    let base = unsafe { (&raw const (*p).transform).cast::<[F4; 3]>().offset(key as isize) };
     // SAFETY: as above, `base` is in bounds.
-    let m = unsafe { base.read() };
+    let [mut m0, mut m1, mut m2] = unsafe { base.read() };
     // The branch avoids the second key's load when it is not needed, as the header does.
     if t1 > 0.0 {
+        let t0 = 1.0 - t1;
         // SAFETY: `key + 1 < numKeys`, see `resolve_key`.
-        let next = unsafe { base.add(1).read() };
-        lerp(m, &next, 1.0 - t1, t1)
-    } else {
-        m
+        let [n0, n1, n2] = unsafe { base.add(1).read() };
+        m0 = lerp4(m0, n0, t0, t1);
+        m1 = lerp4(m1, n1, t0, t1);
+        m2 = lerp4(m2, n2, t0, t1);
     }
+    [m0[0], m0[1], m0[2], m0[3], m1[0], m1[1], m1[2], m1[3], m2[0], m2[1], m2[2], m2[3]]
 }
 
 /// `optixLoadInterpolatedSrtKey` + `optixGetInterpolatedTransformation(OptixSRTMotionTransform)`.
@@ -277,37 +283,41 @@ unsafe fn srt_motion_at(p: *const OptixSRTMotionTransform, time: f32) -> Matrix3
     let (t1, key) = resolve_key(&opts, time);
     // SAFETY: the key array holds `numKeys` `OptixSRTData` (16 f32 each, no padding), see
     // `matrix_motion_at`; `key + 1 < numKeys`.
-    let base = unsafe { (&raw const (*p).srtData).cast::<[f32; 16]>().offset(key as isize) };
+    let base = unsafe { (&raw const (*p).srtData).cast::<[F4; 4]>().offset(key as isize) };
     // SAFETY: as above, `base` is in bounds.
-    let mut d = unsafe { base.read() };
+    let [mut s0, mut s1, mut s2, mut s3] = unsafe { base.read() };
     if t1 > 0.0 {
+        let t0 = 1.0 - t1;
         // SAFETY: `key + 1 < numKeys`.
-        let next = unsafe { base.add(1).read() };
-        d = lerp(d, &next, 1.0 - t1, t1);
-        // nlerp: renormalise the lerped quaternion (qx, qy, qz, qw = words 9..12).
-        let inv_len = 1.0 / sqrt(d[9] * d[9] + d[10] * d[10] + d[11] * d[11] + d[12] * d[12]);
-        d[9] *= inv_len;
-        d[10] *= inv_len;
-        d[11] *= inv_len;
-        d[12] *= inv_len;
+        let [n0, n1, n2, n3] = unsafe { base.add(1).read() };
+        s0 = lerp4(s0, n0, t0, t1);
+        s1 = lerp4(s1, n1, t0, t1);
+        s2 = lerp4(s2, n2, t0, t1);
+        s3 = lerp4(s3, n3, t0, t1);
+        // nlerp: renormalise the lerped quaternion (qx, qy, qz = s2.yzw, qw = s3.x).
+        let inv_len = 1.0 / sqrt(s2[1] * s2[1] + s2[2] * s2[2] + s2[3] * s2[3] + s3[0] * s3[0]);
+        s2[1] *= inv_len;
+        s2[2] *= inv_len;
+        s2[3] *= inv_len;
+        s3[0] *= inv_len;
     }
     let srt = OptixSRTData {
-        sx: d[0],
-        a: d[1],
-        b: d[2],
-        pvx: d[3],
-        sy: d[4],
-        c: d[5],
-        pvy: d[6],
-        sz: d[7],
-        pvz: d[8],
-        qx: d[9],
-        qy: d[10],
-        qz: d[11],
-        qw: d[12],
-        tx: d[13],
-        ty: d[14],
-        tz: d[15],
+        sx: s0[0],
+        a: s0[1],
+        b: s0[2],
+        pvx: s0[3],
+        sy: s1[0],
+        c: s1[1],
+        pvy: s1[2],
+        sz: s1[3],
+        pvz: s2[0],
+        qx: s2[1],
+        qy: s2[2],
+        qz: s2[3],
+        qw: s3[0],
+        tx: s3[1],
+        ty: s3[2],
+        tz: s3[3],
     };
     srt_to_matrix(&srt)
 }

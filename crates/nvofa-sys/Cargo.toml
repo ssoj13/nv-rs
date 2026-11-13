@@ -1,0 +1,22 @@
+[package]
+name = "nvofa-sys"
+description = "Raw NVIDIA Optical Flow (NVOFA) bindings: SDK types plus the driver CUDA function list"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvofa_sys.rs"
+
+[dependencies]
+nv-loader.workspace = true
+libloading.workspace = true
+cuda-bindings.workspace = true
+
+[build-dependencies]
+nv-bindgen.workspace = true
+
+[lints]
+workspace = true

@@ -98,7 +98,7 @@ impl<T: DeviceCopy> ManagedBuffer<T> {
         ctx.bind_to_thread()?;
         let mut ptr: sys::CUdeviceptr = 0;
         // SAFETY: valid out-pointer and size; globally attached so every stream may use it.
-        unsafe { sys::cuMemAllocManaged(&mut ptr, bytes, sys::CUmemAttach_flags_enum_CU_MEM_ATTACH_GLOBAL) }.result()?;
+        unsafe { sys::cuMemAllocManaged(&mut ptr, bytes, sys::CUmemAttach_flags_enum_CU_MEM_ATTACH_GLOBAL as u32) }.result()?;
         // SAFETY: freshly allocated managed memory of `bytes` bytes, idle and host-accessible.
         unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
         Ok(Self { ptr, len, ctx: ctx.clone(), _marker: PhantomData })

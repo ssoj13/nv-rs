@@ -119,7 +119,7 @@ pub fn split_sms(device: &Context, min_sms: u32) -> Result<Vec<GreenContext>, Dr
         unsafe { sys::cuDevResourceGenerateDesc(&mut desc, part, 1) }.result()?;
         let mut green: sys::CUgreenCtx = std::ptr::null_mut();
         // SAFETY: descriptor generated above for this device.
-        unsafe { sys::cuGreenCtxCreate(&mut green, desc, dev, sys::CUgreenCtxCreate_flags_CU_GREEN_CTX_DEFAULT_STREAM) }.result()?;
+        unsafe { sys::cuGreenCtxCreate(&mut green, desc, dev, sys::CUgreenCtxCreate_flags_CU_GREEN_CTX_DEFAULT_STREAM as u32) }.result()?;
         let owner = Arc::new(GreenOwner { raw: green });
         let mut cu_ctx: sys::CUcontext = std::ptr::null_mut();
         // SAFETY: live green context, valid out-pointer.

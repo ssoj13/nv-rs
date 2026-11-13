@@ -73,11 +73,37 @@ pub enum Shape {
         /// Expression returned when the library loaded but lacks this symbol.
         missing_symbol: &'static str,
     },
+    /// One library split over several DLLs (NPP: `nppc`, `nppial`, ... `npps`): shared types, and
+    /// per DLL its own loading struct and shims. Each part takes the functions declared in its
+    /// header files.
+    SplitExports {
+        /// One entry per DLL.
+        parts: &'static [ExportPart],
+        /// Status type names as they appear in signatures.
+        status_types: &'static [&'static str],
+        /// Expression returned when a part's library could not be loaded.
+        not_loaded: &'static str,
+        /// Expression returned when a part's library lacks a symbol.
+        missing_symbol: &'static str,
+    },
     /// Entry points come from a runtime query into a table struct (OptiX, NVENC); types only.
     FunctionTable {
         /// The table struct whose fields are the entry points (`"OptixFunctionTable"`).
         table_type: &'static str,
     },
+}
+
+/// One DLL of a [`Shape::SplitExports`] library.
+#[derive(Clone, Copy, Debug)]
+pub struct ExportPart {
+    /// Part name, used in file names and as the module name in the sys crate (`"nppist"`).
+    pub name: &'static str,
+    /// Name of this part's loading struct (`"NppistApi"`).
+    pub api_type: &'static str,
+    /// Name of this part's loader function the shims call (`"nppist_api"`).
+    pub loader_fn: &'static str,
+    /// Header file names whose functions this DLL exports (`"nppi_statistics_functions.h"`).
+    pub header_files: &'static [&'static str],
 }
 
 /// One library's binding recipe.
@@ -161,12 +187,22 @@ pub enum Error {
 pub struct Output {
     /// Types, constants, layout assertions.
     pub types: String,
-    /// The dynamic-loading struct ([`Shape::Exports`] only).
-    pub api: Option<String>,
-    /// The panic-free shims ([`Shape::Exports`] only).
-    pub shims: Option<String>,
+    /// Loading struct + shims per DLL: one for [`Shape::Exports`], one per part for
+    /// [`Shape::SplitExports`], none for [`Shape::FunctionTable`].
+    pub parts: Vec<GeneratedPart>,
     /// Entry points and header hashes.
     pub inventory: Inventory,
+}
+
+/// The generated sources for one DLL.
+#[derive(Debug)]
+pub struct GeneratedPart {
+    /// File-name infix: empty for a single-DLL library, `_<part>` for a split one.
+    pub stem: String,
+    /// The dynamic-loading struct.
+    pub api: String,
+    /// The panic-free shims.
+    pub shims: String,
 }
 
 /// What the coverage matrix needs to know about a generated library.
@@ -211,9 +247,12 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         std::fs::write(&path, text).map_err(|source| Error::Io { lib: spec.name, path, source })
     };
     write("types.rs", &out.types)?;
-    if let (Some(api), Some(shims)) = (&out.api, &out.shims) {
-        write("api.rs", api)?;
-        write("shims.rs", shims)?;
+    for part in &out.parts {
+        // `<lib>_api.rs` for one DLL, `<lib>_<part>_api.rs` per DLL of a split library.
+        let stem = part.stem.trim_start_matches('_');
+        let prefix = if stem.is_empty() { String::new() } else { format!("{stem}_") };
+        write(&format!("{prefix}api.rs"), &part.api)?;
+        write(&format!("{prefix}shims.rs"), &part.shims)?;
     }
     let json = serde_json::to_string_pretty(&out.inventory).map_err(|e| Error::Generated { lib: spec.name, msg: e.to_string() })?;
     write("inventory.json", &json)?;
@@ -261,23 +300,39 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     // also emit. bindgen traces dependencies only of items it generates, so a function left out
     // of codegen would not pull in `cudaStream_t` / `libraryPropertyType`; they are allowlisted
     // by exact name instead.
-    let api = match spec.shape {
-        Shape::Exports { api_type, .. } => {
-            let mut ab = base()
-                .dynamic_library_name(api_type)
-                .dynamic_link_require_all(false)
-                .with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
+    // (stem, api_type, loader_fn, header files or empty for "all allowlisted functions")
+    let plan: Vec<(String, &str, &str, &[&str])> = match spec.shape {
+        Shape::Exports { api_type, loader_fn, .. } => vec![(String::new(), api_type, loader_fn, &[])],
+        Shape::SplitExports { parts, .. } => {
+            parts.iter().map(|p| (format!("_{}", p.name), p.api_type, p.loader_fn, p.header_files)).collect()
+        }
+        Shape::FunctionTable { .. } => Vec::new(),
+    };
+    let mut apis: Vec<(String, &str, &str, String)> = Vec::new();
+    for (stem, api_type, loader_fn, files) in plan {
+        let mut ab = base()
+            .dynamic_library_name(api_type)
+            .dynamic_link_require_all(false)
+            .with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
+        // bindgen allowlists are a union, so a split part uses only its own headers (which
+        // restricts it to the functions declared there); a single-DLL library uses `allow_fn`.
+        if files.is_empty() {
             for f in spec.allow_fn {
                 ab = ab.allowlist_function(*f);
             }
-            Some(run(ab)?)
         }
-        Shape::FunctionTable { .. } => None,
-    };
-    let signature_types = match (&api, spec.shape) {
-        (Some(src), Shape::Exports { api_type, .. }) => signature_types(spec.name, src, api_type)?,
-        _ => Vec::new(),
-    };
+        for file in files {
+            ab = ab.allowlist_file(format!(r".*[/\\]{}$", regex_escape(file)));
+        }
+        apis.push((stem, api_type, loader_fn, run(ab)?));
+    }
+    let mut signature_types_all = Vec::new();
+    for (_, api_type, _, src) in &apis {
+        signature_types_all.extend(signature_types(spec.name, src, api_type)?);
+    }
+    signature_types_all.sort();
+    signature_types_all.dedup();
+    let signature_types = signature_types_all;
 
     // Types pass: the allowlisted types and constants plus every type an entry point names.
     let mut tb = base().derive_default(true).blocklist_function(".*");
@@ -298,24 +353,37 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         types = format!("pub use cuda_bindings::{{{}}};\n{types}", spec.reuse_cuda_types.join(", "));
     }
 
-    let (shims_src, symbols, unshimmed) = match (spec.shape, &api) {
-        (Shape::Exports { api_type, loader_fn, status_types, not_loaded, missing_symbol }, Some(api)) => {
+    let mut parts = Vec::new();
+    let mut symbols = Vec::new();
+    let mut unshimmed = Vec::new();
+    match spec.shape {
+        Shape::Exports { status_types, not_loaded, missing_symbol, .. }
+        | Shape::SplitExports { status_types, not_loaded, missing_symbol, .. } => {
             let codes = StatusCodes { types: status_types, not_loaded, missing_symbol };
-            let generated = shims(spec.name, api, api_type, loader_fn, &codes)?;
-            let symbols = inventory(spec.name, api, api_type)?;
-            (Some(generated.source), symbols, generated.unshimmed)
+            for (stem, api_type, loader_fn, api) in apis {
+                let generated = shims(spec.name, &api, api_type, loader_fn, &codes)?;
+                symbols.extend(inventory(spec.name, &api, api_type)?);
+                unshimmed.extend(generated.unshimmed);
+                parts.push(GeneratedPart { stem, api, shims: generated.source });
+            }
         }
-        (Shape::FunctionTable { table_type }, _) => (None, inventory(spec.name, &types, table_type)?, Vec::new()),
-        (Shape::Exports { .. }, None) => {
-            return Err(Error::Generated { lib: spec.name, msg: "exports shape produced no function pass".into() });
-        }
-    };
+        Shape::FunctionTable { table_type } => symbols = inventory(spec.name, &types, table_type)?,
+    }
+    symbols.sort();
+    symbols.dedup();
+    unshimmed.sort();
 
-    Ok(Output {
-        types,
-        api,
-        shims: shims_src,
-        inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed },
+    Ok(Output { types, parts, inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed } })
+}
+
+/// Escapes regex metacharacters in a file name (`.` in `nppcore.h`).
+fn regex_escape(s: &str) -> String {
+    s.chars().fold(String::new(), |mut out, c| {
+        if r"\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+        out
     })
 }
 
@@ -683,7 +751,8 @@ mod tests {
         );
         // An `int` return has no failure value: reported, never shimmed with a made-up code.
         assert_eq!(out.inventory.unshimmed, ["fakeVersionNumber"]);
-        let shims = out.shims.expect("exports have shims");
+        assert_eq!(out.parts.len(), 1, "a single-DLL library has one part");
+        let shims = &out.parts[0].shims;
         for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount", "fakeErrorString", "fakeReset"] {
             assert!(shims.contains(&format!("pub unsafe extern \"C\" fn {f}(")), "shim for {f}");
         }
@@ -717,6 +786,39 @@ mod tests {
         let spec = LibSpec { headers: &["absent.h"], ..FAKE };
         let err = bindings(&spec, &fixture(), &[]).expect_err("no such header");
         assert!(matches!(err, Error::HeaderNotFound { ref searched, .. } if searched == &fixture()), "{err}");
+    }
+
+    #[test]
+    fn split_exports_give_each_dll_only_its_own_headers_functions() {
+        const PARTS: &[ExportPart] = &[
+            ExportPart { name: "a", api_type: "SplitAApi", loader_fn: "split_a_api", header_files: &["split_a.h"] },
+            ExportPart { name: "b", api_type: "SplitBApi", loader_fn: "split_b_api", header_files: &["split_b.h"] },
+        ];
+        let spec = LibSpec {
+            name: "split",
+            headers: &["split.h"],
+            allow_fn: &["^split.*"],
+            allow_type: &["^split.*"],
+            allow_var: &[],
+            positive_enums: &[],
+            shape: Shape::SplitExports {
+                parts: PARTS,
+                status_types: &["splitStatus"],
+                not_loaded: "splitStatus_enum_SPLIT_NOT_LOADED",
+                missing_symbol: "splitStatus_enum_SPLIT_MISSING",
+            },
+            ..FAKE
+        };
+        let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("split fixture binds");
+        assert_eq!(out.inventory.symbols, ["splitAlpha", "splitAlphaToo", "splitBeta"]);
+        let stems: Vec<&str> = out.parts.iter().map(|p| p.stem.as_str()).collect();
+        assert_eq!(stems, ["_a", "_b"]);
+        // Mutation that reddens this: apply `allow_fn` to split parts (bindgen allowlists are a
+        // union, so every part would get every function).
+        assert!(out.parts[0].shims.contains("fn splitAlpha(") && !out.parts[0].shims.contains("fn splitBeta("));
+        assert!(out.parts[1].shims.contains("fn splitBeta(") && !out.parts[1].shims.contains("fn splitAlpha("));
+        assert!(out.parts[0].shims.contains("split_a_api()") && out.parts[1].shims.contains("split_b_api()"));
+        assert!(out.types.contains("splitStatus_enum_SPLIT_SUCCESS"), "shared types are generated once");
     }
 
     #[test]

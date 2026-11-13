@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^CUBLAS_.*"],
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &["cublasStatus_t"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "CublasApi",
         loader_fn: "cublas_api",

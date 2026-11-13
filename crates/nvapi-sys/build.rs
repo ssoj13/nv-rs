@@ -11,6 +11,9 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVAPI_.*", "^NV_.*"],
     reuse_cuda_types: &[],
     positive_enums: &[],
+    // NVAPI annotates every entry point with `__success(return == NVAPI_OK)`; MSVC's SAL
+    // definition of it is not C clang can parse, so it is emptied.
+    clang_args: &["-D__success(x)="],
     shape: Shape::QueryInterface {
         interface_header: "nvapi_interface.h",
         loader_fn: "nvapi_api",

@@ -143,6 +143,9 @@ pub struct LibSpec {
     /// Enums that MSVC clang types as `c_int` and GCC as `c_uint`; pinned to `c_uint` so host code
     /// sees one type on every target (same normalisation as cuda-bindings).
     pub positive_enums: &'static [&'static str],
+    /// Extra libclang arguments, for headers that need a macro neutralised (NVAPI's
+    /// `__success(...)` SAL annotation: `-D__success(x)=`).
+    pub clang_args: &'static [&'static str],
     /// The entry-point shape.
     pub shape: Shape,
 }
@@ -310,6 +313,9 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         }
         for d in system_dirs {
             b = b.clang_arg(format!("-idirafter{}", d.display()));
+        }
+        for a in spec.clang_args {
+            b = b.clang_arg(*a);
         }
         b
     };
@@ -881,6 +887,7 @@ mod tests {
         allow_var: &["FAKE_.*"],
         reuse_cuda_types: &[],
         positive_enums: &["fakeStatus_enum"],
+        clang_args: &[],
         shape: Shape::Exports {
             api_type: "FakeApi",
             loader_fn: "fake_api",

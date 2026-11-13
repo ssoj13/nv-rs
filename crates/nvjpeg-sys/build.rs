@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVJPEG_.*"],
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &["nvjpegStatus_t"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "NvjpegApi",
         loader_fn: "nvjpeg_api",

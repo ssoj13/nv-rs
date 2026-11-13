@@ -11,6 +11,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVENC.*", "^NV_ENC.*"],
     reuse_cuda_types: &[],
     positive_enums: &[],
+    clang_args: &[],
     shape: Shape::FunctionTable { table_type: "_NV_ENCODE_API_FUNCTION_LIST" },
 };
 

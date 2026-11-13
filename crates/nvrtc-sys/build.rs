@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVRTC_.*"],
     reuse_cuda_types: &[],
     positive_enums: &["nvrtcResult"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "NvrtcApi",
         loader_fn: "nvrtc_api",

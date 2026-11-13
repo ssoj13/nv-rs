@@ -435,6 +435,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvapi-sys"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "nvcuvid-sys"
 version = "0.0.0"
 dependencies = [

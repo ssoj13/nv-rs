@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^CUPTI_.*"],
     reuse_cuda_types: &["CUctx_st", "CUstream_st"],
     positive_enums: &["CUptiResult"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "CuptiApi",
         loader_fn: "cupti_api",

@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^CUSOLVER_.*"],
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &["cusolverStatus_t"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "CusolverApi",
         loader_fn: "cusolver_api",

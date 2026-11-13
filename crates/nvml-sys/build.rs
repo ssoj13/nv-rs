@@ -10,6 +10,7 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVML_.*"],
     reuse_cuda_types: &[],
     positive_enums: &["nvmlReturn_enum"],
+    clang_args: &[],
     shape: Shape::Exports {
         api_type: "NvmlApi",
         loader_fn: "nvml_api",

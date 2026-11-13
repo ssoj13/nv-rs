@@ -5,6 +5,7 @@
 
 pub mod common;
 pub mod geometry;
+pub mod hitobject;
 pub mod local;
 pub mod shade;
 pub mod transform;
@@ -14,5 +15,11 @@ use common::{Gpu, R};
 /// A case: name and entry point.
 pub type Case = (&'static str, fn(&Gpu) -> R);
 
-/// Every case, in run order.
-pub const ALL: &[Case] = &[("shade", shade::run), ("geometry", geometry::run), ("transform", transform::run), ("local", local::run)];
+/// Every case, in run order (`no_local` first: it only scans the PTX).
+pub const ALL: &[Case] = &[
+    ("no_local", local::run),
+    ("shade", shade::run),
+    ("geometry", geometry::run),
+    ("transform", transform::run),
+    ("hitobject", hitobject::run),
+];

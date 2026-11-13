@@ -177,6 +177,11 @@ mod kernels {
                 put(r, 96, xf::transform_from_handle(h1, time, true));
                 put(r, 108, xf::transform_from_handle(h1, time, false));
             }
+            if n > 1 && m & 64 != 0 {
+                let h1 = xf::transform_list_handle(1);
+                *r.add(86) = xf::transform_type(h1) as u32;
+                put64(r, 132, xf::static_transform_ptr(h1) as u64 | xf::matrix_motion_transform_ptr(h1) as u64 | xf::srt_motion_transform_ptr(h1) as u64);
+            }
             if m & 16 != 0 {
                 *r.add(89) = u32::from(xf::instance_traversable_from_ias(PARAMS.get().handle, state::instance_index()) == h0);
             }
@@ -428,6 +433,13 @@ pub fn run(g: &Gpu) -> R {
     // is read; everything outlives the launch (it synchronizes).
     unsafe { g.launch(&pipeline, &sbt, &params, [pr.len() as u32, 1, 1]) }?;
     let got = g.down(&out)?;
+    if std::env::var("ODT_XF_SECTIONS").is_ok() {
+        for (i, (k, _)) in pr.iter().enumerate() {
+            let r = &got[i * REC..(i + 1) * REC];
+            eprintln!("probe {i} inst {k}: n {} type1 {} ptr {:#x} child0 {:#x}", r[1], r[86], u64::from(r[132]) | u64::from(r[133]) << 32, u64::from(r[60]) | u64::from(r[61]) << 32);
+        }
+        eprintln!("handles: st {:#x} gas {:#x} mm {:#x} sm {:#x} mgas {:#x}", st.handle(), gas.handle(), mm.handle(), sm.handle(), mgas.handle());
+    }
 
     let f = |w: &[u32]| w.iter().map(|x| f32::from_bits(*x)).collect::<Vec<f32>>();
     let h64 = |w: &[u32]| u64::from(w[0]) | u64::from(w[1]) << 32;

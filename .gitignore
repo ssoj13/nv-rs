@@ -1,4 +1,4 @@
 target/
 target-build.log
 target-run.log
-Cargo.lock
+spikes/**/Cargo.lock

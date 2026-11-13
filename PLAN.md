@@ -26,6 +26,8 @@ Status: plan only. No code yet.
 | D12 | Linux testing: WSL2 daily, RunPod for what WSL cannot run (each rental priced and approved first) | WSL has no native NVIDIA Vulkan, no GPUDirect Storage, no multi-GPU NCCL |
 | D13 | NGX: full safe wrapper using `Init_with_ProjectID` (caller-supplied GUID, `engineType = CUSTOM`) — **pending owner confirmation** | No NVIDIA-issued app id needed; licence obligations fall on the final application |
 
+| D14 | SDK header discovery (CUDA Toolkit, OptiX, MSVC/UCRT for libclang) goes through vcv-rs; OptiX detection lives in vcv-rs | One discovery mechanism shared with the `vcv-rs` shell environment, so a shell and a build never select different SDKs |
+
 Dropped: Streamline and Reflex (C++ API, no C ABI); migrating gracefold-rs off its vendored
 cubecl/cudarc cuBLAS path.
 
@@ -213,6 +215,16 @@ Findings for M1: bindgen's dynamic-loading methods panic (`expect`) on a missing
 registry instead of scanning FileRepository.
 
 All three spikes passed; M1 can start.
+
+**M1 result (2026-11-12): DONE.** `crates/nv-loader` (Driver / DriverStore / Toolkit / Sdk groups;
+DriverStore via each display adapter's `OpenGLDriverName`, as `optix_stubs.h` does; `Probe` trait
+for machine-free tests; `LoadError::{NotFound, Rejected, RuntimeTooOld}`), `crates/nv-bindgen`
+(declarative `LibSpec`; headers located by vcv-rs `detect_cuda` / `optix::detect_optix` / SDK root
+var; MSVC/UCRT includes from vcv-rs passed as `-idirafter`; types pass + dynamic-loading struct +
+panic-free shims + `inventory.json`), `xtask coverage generate|check`. Gate: clippy `-D warnings`
+clean; T0 14/14 (nv-bindgen runs real bindgen on a synthetic header); `coverage check` ok on an
+empty overlay. OptiX SDK detection was added to vcv-rs itself (`vcv_rs::optix`, vcv-rs `18f6ed8`),
+so header discovery for every SDK lives in one place (decision D14).
 
 If S1a fails (OptiX rejects LLVM-NVPTX PTX): stop and reassess. Fallback is post-processing PTX with
 the fork's `ptx-parse`; that changes M5.

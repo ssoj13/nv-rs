@@ -1,0 +1,21 @@
+[package]
+name = "nv-loader"
+description = "Runtime discovery and loading of NVIDIA libraries (driver, driver store, CUDA toolkit, SDKs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nv_loader.rs"
+
+[dependencies]
+libloading.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true
+
+[lints]
+workspace = true

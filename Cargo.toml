@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+# Spikes are throwaway proofs with their own toolchains and lockfiles.
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ssoj13/nv-rs"
+publish = false
+
+[workspace.dependencies]
+nv-loader = { path = "crates/nv-loader" }
+nv-bindgen = { path = "crates/nv-bindgen" }
+vcv-rs = { git = "ssh://git@github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix"] }
+bindgen = "0.72"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+libloading = "0.8"
+winreg = "0.56"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"

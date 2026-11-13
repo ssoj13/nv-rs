@@ -1,54 +1,30 @@
-# Handoff — spikes S1a / S2 / S3 (2026-11-12, paused for shell restart)
+# Handoff — nv-rs (2026-11-12)
 
 ## State
 
-- **S1a** (`spikes/s1a-optix-ptx`): **PASS** (see PLAN.md §8).
-  - Device: `__raygen__ids` reads `_optix_get_launch_index_{x,y}` via `ptx_asm!` `call`, writes
-    `index + 1` into the buffer from `.const params` (`#[constant(export_name = "params")]`).
-    `__miss__noop` is an empty miss program.
-  - Host: `nvoptix.dll` from DriverStore, `optixQueryFunctionTable(118)`, bindgen over
-    `optix_function_table.h` (build.rs, needs `OPTIX_ROOT` + `CUDA_PATH`), module from the
-    embedded PTX payload, raygen + miss pipeline, SBT, 4x4 launch, per-cell check. Dumps the PTX
-    to `target/s1a.ptx`.
-  - Build: `cd spikes/s1a-optix-ptx && OPTIX_ROOT=C:/projects/projects.rust.cg/nv/optix-dev cargo oxide build`
-    then `cargo oxide run`.
-- **S2** (`spikes/s2-wgpu-cuda-share`): **PASS** (see PLAN.md §8). Original design: Build on gpu-info-rs: `gpu_info::shared_device()` (Vulkan device
-  already has `VK_KHR_external_memory_win32` + `VK_KHR_external_semaphore_win32`),
-  `gpu_info::external::SharedBuffer::export(&device, size)` -> `Export { handle, allocation,
-  memory_type }`, `acquire`/`release` ownership command buffers, `device_uuid`. Steps:
-  1. force `WGPU_BACKEND=vulkan`; compare `device_uuid` with `cuDeviceGetUuid`;
-  2. `cuImportExternalMemory(OPAQUE_WIN32, handle, allocation, DEDICATED)` +
-     `cuExternalMemoryGetMappedBuffer`;
-  3. timeline `VkSemaphore` exported as `OPAQUE_WIN32`, imported as
-     `TIMELINE_SEMAPHORE_WIN32`;
-  4. CUDA writes pattern A, signals 1; wgpu `Queue::as_hal` -> `add_wait_semaphore(sem, Some(1))`,
-     submits acquire + copy to readback, checks A (also proves no lazy clear);
-  5. wgpu writes pattern B, release, `add_signal_semaphore(sem, Some(2))`; CUDA waits 2, reads B.
-- **S3** (`spikes/s3-nv-bindgen`): **PASS** (see PLAN.md §8). All spikes passed; next is M1.
+- Spikes S1a (OptiX runs a Rust raygen from cuda-oxide), S2 (Vulkan buffer shared by wgpu and
+  CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
+  Details and findings in PLAN.md §8; code under `spikes/`.
+- **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`. Gate green
+  (clippy `-D warnings`, T0 14/14, `cargo xtask coverage check`).
+- vcv-rs detects the OptiX SDK (`vcv_rs::optix`, vcv-rs `18f6ed8`); nv-bindgen uses it.
 
-## Blockers found
+## Next: M2 — sys crates
 
-1. **Disk C full** (0.59 GB free at 20:45). Builds fail or misbehave. Owner is freeing space.
-2. **Stale shared cuda-oxide backend cache**: `C:\Users\joss1\.cargo\cuda-oxide\rustc_codegen_cuda.dll`
-   (17:43) links `rustc_driver-9cc664dca72b379e.dll` from toolchain **1.99.0**; the pinned
-   toolchain is **1.99.1** (`rustc_driver-58995fd3f1c8ecc6.dll`). Result: `couldn't load codegen
-   backend ... os error 126`. `cargo oxide` claimed a rebuild but finished in 9 s and kept the old
-   file (likely the full disk). Shared with render-rs sessions — do not delete without the owner.
-   Retry `cargo oxide build` once space is free; if the error persists, ask the owner to remove
-   the cached DLL so it rebuilds.
+One crate per DLL family under `crates/`, each `build.rs` a single `nv_bindgen::generate(&SPEC)`
+call and a loader function built on `nv_loader::open_first`. Start with the three S3 proved
+(`nvml-sys`, `optix-sys`, `cufft-sys`), then fan out per library (disjoint directories, no
+concurrent builds; one gate per wave). Each sys crate copies its `inventory.json` into
+`coverage/evidence/<lib>/` and gets a `coverage/<lib>.toml` overlay.
 
-## Environment facts
+Open items carried from the spikes:
+- fork patch list: `ptx_asm!` input arity (16 -> 64), `#[device(export_name)]`, honour
+  `#[constant(export_name)]` inside `#[cuda_module]`;
+- reconcile D6 with the fork's committed `cuda-bindings/generated/`;
+- `optix-sys` should re-use `cuda-bindings` for `CUcontext`/`CUstream`.
 
-- OptiX headers: `C:\projects\projects.rust.cg\nv\optix-dev` (public NVIDIA/optix-dev clone,
-  OptiX 9.1.0, ABI 118). Never copied into this repo.
-- GPU: RTX 3080 Ti (sm_86), driver 621.14. CUDA 13.3 at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`.
-- Fork checkout `nv\cuda-oxide-windows` is on `feat/committed-bindings` with the owner's
-  uncommitted work — read only. Spikes take cuda-rust_b `main` by git URL.
-- render-rs `953c889` removed `pt_integrator::trace_path_gpu` (now `trace_path_with_options`);
-  relevant for M10.
+## Environment
 
-## Next
-
-1. Retry S1a build; on success run it and record the gate result in PLAN.md §8.
-2. If OptiX rejects the PTX: save `target/s1a.ptx` + the OptiX log, stop, reassess (PLAN.md §8 fallback).
-3. Write and run S2, then S3. One build at a time; the machine is shared.
+- OptiX headers: `C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0` and `nv\optix-dev` (both 9.1, ABI 118).
+- GPU: RTX 3080 Ti (sm_86), driver 621.24; CUDA 13.3. Host toolchain 1.98.0; spikes/device 1.99.1.
+- The machine is shared: one build at a time, no looped test runs.

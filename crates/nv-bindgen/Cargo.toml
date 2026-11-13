@@ -1,0 +1,26 @@
+[package]
+name = "nv-bindgen"
+description = "Build-time binding generator for nv-rs sys crates: one declarative LibSpec per NVIDIA library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nv_bindgen.rs"
+
+[dependencies]
+bindgen.workspace = true
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true
+prettyplease.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+vcv-rs.workspace = true
+
+[lints]
+workspace = true

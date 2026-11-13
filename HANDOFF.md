@@ -6,6 +6,8 @@
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
   Details and findings in PLAN.md §8; code under `spikes/`.
 - **M1 done**: `crates/nv-loader`, `crates/nv-bindgen` (on vcv-rs), `xtask coverage`.
+- **M3 done**: `crates/cuda-ext` (external memory/semaphores, arrays, textures, surfaces, host
+  registration, managed memory, UUID/LUID, green contexts); 7 GPU tests incl. a Vulkan round trip.
 - **M2 nearly done** — 18 sys crates build, load and pass their tests on this machine (counts in
   COVERAGE.md): nvml, optix, cufft, cublas, cublaslt, cusparse, cusolver, cusolvermg, nvjpeg,
   nvrtc, cupti, nvcuvid, nvenc, npp (11 DLLs), cudnn, nvapi, nvofa, ngx. Generator shapes:
@@ -18,7 +20,7 @@
 
 1. Remaining M2: **nvCOMP** (not installed on this machine), **NCCL** and **cuFile** (Linux only:
    WSL2 for NCCL, native Linux / RunPod for cuFile).
-2. M3 `cuda-ext`, then S1b (fork patches) and M4/M5 OptiX.
+2. S1b (fork patches: `ptx_asm!` arity, export names) and M4/M5 OptiX; M6 `nv-wgpu` on top of cuda-ext.
 
 ## Building
 

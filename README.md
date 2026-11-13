@@ -18,6 +18,7 @@ binding coverage in [COVERAGE.md](COVERAGE.md).
 | `nv-bindgen` | Build-time generator: one declarative `LibSpec` per library; headers located by [vcv-rs](https://github.com/ssoj13/vcv-rs); emits types, panic-free `extern "C"` shims and a symbol inventory. |
 | `nv-bindgen-fixture` | Compiles generator output for a synthetic header and checks the shims' failure paths at runtime. |
 | `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`, `npp-sys` (eleven DLLs, `split_exports_sys!`), `cusolvermg-sys`, `cudnn-sys`, `nvapi-sys` (by id through `nvapi_QueryInterface`, `query_interface_sys!`), `nvofa-sys` (Optical Flow), `ngx-sys` (DLSS; statically linked, PLAN D15). |
+| `cuda-ext` | CUDA driver features cuda-core lacks: external memory and semaphores, arrays, texture and surface objects, host registration, managed memory, device UUID/LUID, green contexts. |
 | `xtask` | `cargo xtask coverage collect|generate|check`. |
 
 Spikes that de-risked the plan live in `spikes/` (OptiX running a Rust raygen, shared Vulkan/CUDA

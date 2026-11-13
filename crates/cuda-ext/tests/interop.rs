@@ -76,7 +76,7 @@ fn vulkan_buffer_and_timeline_semaphore_round_trip() {
     slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).expect("send"));
     sg.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     rx.recv().expect("recv").expect("map");
-    let got: Vec<u32> = slice.get_mapped_range().expect("range").chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let got: Vec<u32> = slice.get_mapped_range().expect("range").as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     readback.unmap();
     assert_eq!(got, a, "CUDA -> wgpu");
 

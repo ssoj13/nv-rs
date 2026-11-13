@@ -270,3 +270,13 @@ orchestrator runs one build/test gate per wave.
 ## 12. Open
 
 - D13 (NGX full wrapper with ProjectID) awaits confirmation.
+
+**M3 result (2026-11-13): DONE.** `crates/cuda-ext` in cuda-core's style: external memory and
+semaphores (Win32/fd/D3D12, timeline and binary), CUDA arrays and mipmapped arrays with blocking
+host copies, texture objects (array / mipmapped / pitched 2D) and surface objects, host
+registration with device mapping, managed memory, device UUID and LUID, green contexts (SM
+partitions with their own streams). Gate: clippy `-D warnings` clean; 7 GPU tests pass including
+a Vulkan -> CUDA -> wgpu round trip of a shared buffer ordered by an imported timeline semaphore
+(both directions exact). Not covered: sampling a texture / writing a surface from device code
+(needs cuda-oxide texture intrinsics, M5); `cuMemExportToShareableHandle` (lives with cuda-core's
+VMM API).

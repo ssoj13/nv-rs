@@ -47,6 +47,9 @@ pub enum Sdk {
         /// The header directory under the root.
         subdir: &'static str,
     },
+    /// A header directory inside the CUDA Toolkit other than `include/` (CUPTI:
+    /// `extras/CUPTI/include`), relative to the toolkit root vcv-rs located.
+    CudaToolkitSubdir(&'static str),
     /// A header directory inside the calling crate (relative to `CARGO_MANIFEST_DIR`); used by the
     /// generator's own fixture crate.
     CrateDir(&'static str),
@@ -441,10 +444,25 @@ pub fn inventory(lib: &'static str, source: &str, struct_name: &str) -> Result<V
     let Fields::Named(fields) = &s.fields else {
         return Ok(Vec::new());
     };
+    // Tables often name their fields through typedef'd pointer types (NVENC:
+    // `PNVENCOPENENCODESESSIONEX nvEncOpenEncodeSessionEx;`), which bindgen emits as
+    // `pub type PNVENC... = Option<unsafe extern "C" fn(..)>`; resolve those aliases.
+    let fn_aliases: Vec<String> = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Type(t) if option_bare_fn(&t.ty).is_some() || result_bare_fn(&t.ty).is_some() => Some(t.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    let is_fn_alias = |ty: &Type| match ty {
+        Type::Path(p) if p.path.segments.len() == 1 => fn_aliases.iter().any(|a| p.path.segments[0].ident == a.as_str()),
+        _ => false,
+    };
     let mut names: Vec<String> = fields
         .named
         .iter()
-        .filter(|f| result_bare_fn(&f.ty).is_some() || option_bare_fn(&f.ty).is_some())
+        .filter(|f| result_bare_fn(&f.ty).is_some() || option_bare_fn(&f.ty).is_some() || is_fn_alias(&f.ty))
         .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
         .collect();
     names.sort();
@@ -564,7 +582,7 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
     let mut vars = Vec::new();
     for sdk in spec.sdks {
         match sdk {
-            Sdk::CudaToolkit => vars.extend(["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]),
+            Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => vars.extend(["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]),
             Sdk::Optix => vars.extend(["OPTIX_ROOT", "OptiX_INSTALL_DIR", "OPTIX_PATH"]),
             Sdk::EnvRoot(v) | Sdk::EnvRootSubdir { var: v, .. } => vars.push(v),
             Sdk::CrateDir(_) => {}
@@ -579,6 +597,11 @@ fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
     for sdk in spec.sdks {
         let dir = match sdk {
             Sdk::CudaToolkit => vcv_rs::detect_cuda().map(|c| c.include_dir()).ok_or_else(|| Error::SdkNotFound {
+                lib: spec.name,
+                sdk: "CUDA Toolkit".into(),
+                hint: "set CUDA_PATH or install the toolkit".into(),
+            })?,
+            Sdk::CudaToolkitSubdir(rel) => vcv_rs::detect_cuda().map(|c| c.root.join(rel)).ok_or_else(|| Error::SdkNotFound {
                 lib: spec.name,
                 sdk: "CUDA Toolkit".into(),
                 hint: "set CUDA_PATH or install the toolkit".into(),
@@ -715,13 +738,18 @@ mod tests {
 
     #[test]
     fn function_table_inventory_reads_option_fn_fields() {
+        // `PBAZOPEN` is how NVENC names its table fields: a typedef'd function-pointer type.
         let src = r#"
+            pub type PBAZOPEN = Option<unsafe extern "C" fn(p: *mut u8) -> i32>;
+            pub type NotAFn = u32;
             pub struct Table {
                 pub fooCreate: Option<unsafe extern "C" fn(x: i32) -> i32>,
                 pub barDestroy: Option<unsafe extern "C" fn()>,
+                pub bazOpen: PBAZOPEN,
+                pub version: NotAFn,
                 pub reserved: u64,
             }
         "#;
-        assert_eq!(inventory("t", src, "Table").expect("parses"), ["barDestroy", "fooCreate"]);
+        assert_eq!(inventory("t", src, "Table").expect("parses"), ["barDestroy", "bazOpen", "fooCreate"]);
     }
 }

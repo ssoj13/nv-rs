@@ -231,7 +231,8 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
             for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"] {
                 if let Some(root) = probe.env(var) {
                     let root = PathBuf::from(root);
-                    for dir in [root.join("bin").join("x64"), root.join("bin")] {
+                    // CUPTI ships its DLLs under extras\CUPTI\lib64, outside bin.
+                    for dir in [root.join("bin").join("x64"), root.join("bin"), root.join("extras").join("CUPTI").join("lib64")] {
                         if !dirs.contains(&dir) {
                             dirs.push(dir);
                         }

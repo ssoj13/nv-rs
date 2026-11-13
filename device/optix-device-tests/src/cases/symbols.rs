@@ -56,15 +56,15 @@ mod kernels {
             let v = (&raw const ODT_SYM_IN).cast::<u32>().add(x).read_volatile();
             let o = PARAMS.get().out as *mut u32;
             o.add(x).write(v);
-            // Constant indices: a run-time index into the by-value array would need a `.local` depot.
-            let c = CONSTS.get();
-            o.add(N + x).write(match x % 4 {
-                0 => c[0],
-                1 => c[1],
-                2 => c[2],
-                _ => c[3],
-            });
-            (&raw mut ODT_SYM_OUT).cast::<u32>().add(x).write_volatile(2 * v + 1);
+            // Thread 0 copies the constant array with constant indices only: a run-time index made
+            // cuda-oxide select a 32-bit `.const` pointer through a `brx.idx` jump table.
+            if x == 0 {
+                let c = CONSTS.get();
+                o.add(N).write(c[0]);
+                o.add(N + 1).write(c[1]);
+                o.add(N + 2).write(c[2]);
+                o.add(N + 3).write(c[3]);
+            }
         }
     }
 
@@ -121,7 +121,7 @@ pub fn run(g: &Gpu) -> R {
     unsafe { g.launch(&pipeline, &sbt, &params, [N as u32, 1, 1]) }?;
     let o1 = g.down(&out)?;
     same("program read of write_symbol data", &o1[..N], &want, label)?;
-    same("program read of the named .const symbol", &o1[N..], &[40, 41, 42, 43, 40, 41, 42, 43], label)?;
+    same("program read of the named .const symbol", &o1[N..], &[40, 41, 42, 43, 0, 0, 0, 0], label)?;
     same("read_symbol of program writes", &pipeline.read_symbol::<[u32; N]>(s, sym_out, 0).ctx("read_symbol")?, &want.map(|v| 2 * v + 1), label)?;
     same("read_symbol at an offset", &[pipeline.read_symbol::<u32>(s, sym_out, 4 * 5).ctx("read_symbol at an offset")?], &[2 * 99 + 1], label)?;
 

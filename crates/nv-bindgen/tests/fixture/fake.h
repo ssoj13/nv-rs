@@ -13,6 +13,7 @@ fakeStatus fakeInit(unsigned int flags);
 fakeStatus fakeCtxCreate(fakeCtx* out, int device);
 fakeStatus fakeGetCount(int* count);
 int notFakeHelper(void);
+fakeStatus fakeShadow(int f, int api);
 const char* fakeErrorString(fakeStatus status);
 void fakeReset(void);
 int fakeVersionNumber(void);

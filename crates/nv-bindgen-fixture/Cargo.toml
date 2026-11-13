@@ -1,0 +1,21 @@
+[package]
+name = "nv-bindgen-fixture"
+description = "Compiles nv-bindgen output for a synthetic header and checks the shims at runtime (T0, no NVIDIA SDK)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nv_bindgen_fixture.rs"
+
+[dependencies]
+nv-loader.workspace = true
+libloading.workspace = true
+
+[build-dependencies]
+nv-bindgen.workspace = true
+
+[lints]
+workspace = true

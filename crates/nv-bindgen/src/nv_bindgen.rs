@@ -39,6 +39,17 @@ pub enum Sdk {
     Optix,
     /// A separately installed SDK whose root (containing `include/`) is named by a variable.
     EnvRoot(&'static str),
+    /// A separately installed SDK whose headers sit in `<root>/<subdir>` (Video Codec SDK:
+    /// `Interface`).
+    EnvRootSubdir {
+        /// The variable naming the SDK root.
+        var: &'static str,
+        /// The header directory under the root.
+        subdir: &'static str,
+    },
+    /// A header directory inside the calling crate (relative to `CARGO_MANIFEST_DIR`); used by the
+    /// generator's own fixture crate.
+    CrateDir(&'static str),
 }
 
 /// How a library exposes its entry points.
@@ -406,8 +417,9 @@ pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &st
                     // Safety argument (comments do not survive prettyplease, so it lives here):
                     // the caller upholds the C function's contract, and the pointer was resolved
                     // from the loaded library that `api` keeps alive for the process.
-                    Ok(api) => match &api.#name {
-                        Ok(f) => unsafe { (*f)(#(#names),*) },
+                    // `__nv_*` names: C parameters such as `f` or `api` must not shadow them.
+                    Ok(__nv_api) => match &__nv_api.#name {
+                        Ok(__nv_fn) => unsafe { (*__nv_fn)(#(#names),*) },
                         Err(_) => #on_missing,
                     },
                     Err(_) => #on_not_loaded,
@@ -554,7 +566,8 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
         match sdk {
             Sdk::CudaToolkit => vars.extend(["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]),
             Sdk::Optix => vars.extend(["OPTIX_ROOT", "OptiX_INSTALL_DIR", "OPTIX_PATH"]),
-            Sdk::EnvRoot(v) => vars.push(v),
+            Sdk::EnvRoot(v) | Sdk::EnvRootSubdir { var: v, .. } => vars.push(v),
+            Sdk::CrateDir(_) => {}
         }
     }
     vars
@@ -579,6 +592,13 @@ fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
                 .filter(|v| !v.is_empty())
                 .map(|root| Path::new(&root).join("include"))
                 .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*var).to_string(), hint: format!("set {var}") })?,
+            Sdk::EnvRootSubdir { var, subdir } => std::env::var_os(var)
+                .filter(|v| !v.is_empty())
+                .map(|root| Path::new(&root).join(subdir))
+                .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*var).to_string(), hint: format!("set {var}") })?,
+            Sdk::CrateDir(rel) => std::env::var_os("CARGO_MANIFEST_DIR")
+                .map(|m| Path::new(&m).join(rel))
+                .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*rel).to_string(), hint: "CARGO_MANIFEST_DIR unset".into() })?,
         };
         if !dirs.contains(&dir) {
             dirs.push(dir);
@@ -636,7 +656,7 @@ mod tests {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
         assert_eq!(
             out.inventory.symbols,
-            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeReset", "fakeVersionNumber"]
+            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeReset", "fakeShadow", "fakeVersionNumber"]
         );
         // An `int` return has no failure value: reported, never shimmed with a made-up code.
         assert_eq!(out.inventory.unshimmed, ["fakeVersionNumber"]);

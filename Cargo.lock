@@ -188,6 +188,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cublas-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
+name = "cublaslt-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "0.5.0"
 source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
@@ -198,6 +218,26 @@ dependencies = [
 
 [[package]]
 name = "cufft-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
+name = "cusolver-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
+name = "cusparse-sys"
 version = "0.0.0"
 dependencies = [
  "cuda-bindings",
@@ -357,7 +397,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvjpeg-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "nvml-sys"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
+name = "nvrtc-sys"
 version = "0.0.0"
 dependencies = [
  "libloading",

@@ -305,18 +305,18 @@ pub struct Loaded<T> {
 macro_rules! exports_sys {
     (lib: $lib:literal, api: $api:ident, loader: $loader:ident, dll: $dll:expr $(,)?) => {
         // Generated code: lint levels differ per header, so the generated modules opt out.
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
         mod types {
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
         }
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
         mod api {
             use super::types::*;
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_api.rs"));
         }
         // Shim bodies share one safety argument, documented once in nv-bindgen (`shims`);
         // prettyplease drops comments, so the per-block SAFETY lint cannot be met here.
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
         mod shims {
             use super::$loader;
             use super::types::*;

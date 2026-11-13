@@ -13,7 +13,7 @@ use std::ffi::{c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 // Generated code: lint levels differ per header.
-#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
 mod types {
     include!(concat!(env!("OUT_DIR"), "/optix_types.rs"));
 }

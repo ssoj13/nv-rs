@@ -12,7 +12,7 @@ use nv_loader::{DllSpec, Group, LoadError, Loaded, open_first};
 use std::sync::OnceLock;
 
 // Generated code: lint levels differ per header.
-#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
 mod types {
     include!(concat!(env!("OUT_DIR"), "/nvenc_types.rs"));
 }
@@ -49,6 +49,14 @@ pub struct NvencApi {
     /// Entry points for [`API_VERSION`].
     pub list: NV_ENCODE_API_FUNCTION_LIST,
 }
+
+// SAFETY: the function list is written once by `NvEncodeAPICreateInstance` and never mutated
+// afterwards; its raw-pointer fields are function pointers into the loaded driver and reserved
+// slots the driver leaves null. Sharing read-only references across threads is therefore sound;
+// thread-safety of the calls themselves is the caller's contract with NVENC (per session).
+unsafe impl Send for NvencApi {}
+// SAFETY: see `Send` above — immutable after construction.
+unsafe impl Sync for NvencApi {}
 
 type MaxVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 type CreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;

@@ -27,8 +27,8 @@ mod tests {
     }
 
     #[test]
-    fn streams_are_cuda_bindings_streams() {
-        let _: cudaStream_t = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
+    fn contexts_are_cuda_bindings_contexts() {
+        let _: CUcontext = std::ptr::null_mut::<cuda_bindings::CUctx_st>();
     }
 
     #[test]

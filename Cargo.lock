@@ -227,6 +227,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cupti-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "cusolver-sys"
 version = "0.0.0"
 dependencies = [
@@ -403,6 +413,26 @@ dependencies = [
  "libloading",
  "thiserror",
  "winreg",
+]
+
+[[package]]
+name = "nvcuvid-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
+name = "nvenc-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
 ]
 
 [[package]]

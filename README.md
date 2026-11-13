@@ -19,7 +19,9 @@ binding coverage in [COVERAGE.md](COVERAGE.md).
 | `nv-bindgen-fixture` | Compiles generator output for a synthetic header and checks the shims' failure paths at runtime. |
 | `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`, `npp-sys` (eleven DLLs, `split_exports_sys!`), `cusolvermg-sys`, `cudnn-sys`, `nvapi-sys` (by id through `nvapi_QueryInterface`, `query_interface_sys!`), `nvofa-sys` (Optical Flow), `ngx-sys` (DLSS; statically linked, PLAN D15). |
 | `cuda-ext` | CUDA driver features cuda-core lacks: external memory and semaphores, arrays, texture and surface objects, host registration, managed memory, device UUID/LUID, green contexts. |
-| `optix` | Safe OptiX host API: device context with log sink, acceleration structures (triangle GAS, IAS, compaction, byte budget, reusable scratch, refit), modules and program groups, pipelines, typed `SbtRecord<T>` / `ShaderBindingTable`, launch, AI denoiser (HDR/AOV, albedo and normal guides). Device code is Rust compiled by cuda-oxide. |
+| `optix` | Safe host API for all of OptiX 9.1: context (properties, log, cache), modules (tasks, payload types, bound values, built-in IS), pipelines (stack sizes, symbols), typed SBT, every acceleration-structure input incl. curves, spheres, motion, opacity micromaps and cluster AS, transforms, relocation, every denoiser model, coop-vec matrices. |
+| `device/optix-device` | OptiX device API for Rust programs (cuda-oxide): every `_optix_*` intrinsic generated from the SDK headers plus a typed layer (payloads, trace, SER, geometry, transforms, coop vectors, callables). `cargo xtask coverage optix` proves 248/248 device functions covered. |
+| `device/cuda-tex-device` | CUDA texture, sparse-texture and surface reads/writes for cuda-oxide device code. |
 | `xtask` | `cargo xtask coverage collect|generate|check`. |
 
 Spikes that de-risked the plan live in `spikes/` (OptiX running a Rust raygen, a Rust raygen

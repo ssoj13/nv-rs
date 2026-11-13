@@ -223,7 +223,9 @@ impl ProgramGroup {
             moduleIS: m_is,
             entryFunctionNameIS: n_is,
         };
-        let modules = [ch, ah, is].into_iter().flatten().map(|(m, _)| m).collect();
+        // Clone the modules: `ch`/`ah`/`is` own the entry-name strings `desc` points at and must
+        // live until `create` returns.
+        let modules = [&ch, &ah, &is].into_iter().flatten().map(|(m, _)| m.clone()).collect();
         Self::create(ctx, &desc, modules)
     }
 
@@ -240,7 +242,8 @@ impl ProgramGroup {
             moduleCC: m_cc,
             entryFunctionNameCC: n_cc,
         };
-        let modules = [dc, cc].into_iter().flatten().map(|(m, _)| m).collect();
+        // As in `hit_group`: `dc`/`cc` own the entry names and must outlive `create`.
+        let modules = [&dc, &cc].into_iter().flatten().map(|(m, _)| m.clone()).collect();
         Self::create(ctx, &desc, modules)
     }
 

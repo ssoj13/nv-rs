@@ -1,7 +1,7 @@
 //! Raw NVENC bindings: the Video Codec SDK's types plus the driver's encoder function list.
 //!
-//! **What.** Types are generated at build time by `nv-bindgen` from `nvEncodeAPI.h` (root from
-//! `VIDEO_CODEC_SDK_ROOT`; never committed). [`api`] opens the driver's `nvEncodeAPI64.dll` /
+//! **What.** Types are generated at build time by `nv-bindgen` from `nvEncodeAPI.h` (located by
+//! vcv-rs; never committed). [`api`] opens the driver's `nvEncodeAPI64.dll` /
 //! `libnvidia-encode.so.1`, checks `NvEncodeAPIGetMaxSupportedVersion` against the header's
 //! [`NVENCAPI_MAJOR_VERSION`]/[`NVENCAPI_MINOR_VERSION`] (an older driver is a typed load error),
 //! and fills [`NV_ENCODE_API_FUNCTION_LIST`] through `NvEncodeAPICreateInstance`.

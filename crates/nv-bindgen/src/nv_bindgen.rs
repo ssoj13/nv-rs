@@ -23,6 +23,7 @@
 //!
 //! **Used by** every `*-sys` crate's `build.rs`. Generated headers are never committed (PLAN D6).
 
+pub use vcv_rs::nvsdk::Kind;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use serde::Serialize;
@@ -47,6 +48,10 @@ pub enum Sdk {
         /// The header directory under the root.
         subdir: &'static str,
     },
+    /// A separately shipped NVIDIA SDK located by vcv-rs (`vcv_rs::nvsdk`: root variables, the
+    /// installers' standard folders, `NV_SDK_DIRS`). If it ships DLLs, their directory is passed
+    /// to the sys crate as `env!("NV_RS_SDK_BIN")` for `nv_loader::Group::Sdk::hint`.
+    Nv(vcv_rs::nvsdk::Kind),
     /// A header directory inside the CUDA Toolkit other than `include/` (CUPTI:
     /// `extras/CUPTI/include`), relative to the toolkit root vcv-rs located.
     CudaToolkitSubdir(&'static str),
@@ -257,6 +262,12 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     for var in rerun_vars(spec) {
         println!("cargo:rerun-if-env-changed={var}");
     }
+    // The DLL directory of the first SDK that ships DLLs, for `nv_loader::Group::Sdk::hint`.
+    let sdk_bin = spec.sdks.iter().find_map(|s| match s {
+        Sdk::Nv(kind) => vcv_rs::nvsdk::detect(*kind).and_then(|i| i.bin_dir),
+        _ => None,
+    });
+    println!("cargo:rustc-env=NV_RS_SDK_BIN={}", sdk_bin.map(|p| p.display().to_string()).unwrap_or_default());
     let include_dirs = sdk_include_dirs(spec)?;
     let system_dirs = system_include_dirs();
     let out = bindings(spec, &include_dirs, &system_dirs)?;
@@ -817,6 +828,10 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
             Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => vars.extend(["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]),
             Sdk::Optix => vars.extend(["OPTIX_ROOT", "OptiX_INSTALL_DIR", "OPTIX_PATH"]),
             Sdk::EnvRoot(v) | Sdk::EnvRootSubdir { var: v, .. } => vars.push(v),
+            Sdk::Nv(kind) => {
+                vars.extend(kind.root_vars());
+                vars.extend(["NV_SDK_DIRS", "CUDA_PATH"]);
+            }
             Sdk::CrateDir(_) => {}
         }
     }
@@ -832,6 +847,14 @@ fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
                 lib: spec.name,
                 sdk: "CUDA Toolkit".into(),
                 hint: "set CUDA_PATH or install the toolkit".into(),
+            })?,
+            Sdk::Nv(kind) => vcv_rs::nvsdk::detect(*kind).map(|s| s.include_dir).ok_or_else(|| Error::SdkNotFound {
+                lib: spec.name,
+                sdk: kind.name().into(),
+                hint: format!(
+                    "set {} or NV_SDK_DIRS, or install it under %ProgramFiles%\\NVIDIA",
+                    kind.root_vars().first().copied().unwrap_or("its root variable")
+                ),
             })?,
             Sdk::CudaToolkitSubdir(rel) => vcv_rs::detect_cuda().map(|c| c.root.join(rel)).ok_or_else(|| Error::SdkNotFound {
                 lib: spec.name,

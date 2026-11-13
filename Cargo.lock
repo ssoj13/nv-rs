@@ -217,6 +217,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudnn-sys"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "libloading",
+ "nv-bindgen",
+ "nv-loader",
+]
+
+[[package]]
 name = "cufft-sys"
 version = "0.0.0"
 dependencies = [
@@ -747,7 +757,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "vcv-rs"
 version = "0.1.1"
-source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#18f6ed8575540c11d5a810dc886f8f17f8b8dfda"
+source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#6eb28c0a4c78a5b34771dbfbb5b14742ecb696ca"
 dependencies = [
  "clap",
  "serde",

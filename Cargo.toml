@@ -14,7 +14,7 @@ publish = false
 [workspace.dependencies]
 nv-loader = { path = "crates/nv-loader" }
 nv-bindgen = { path = "crates/nv-bindgen" }
-vcv-rs = { git = "ssh://git@github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix"] }
+vcv-rs = { git = "ssh://git@github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix", "nvsdk"] }
 bindgen = "0.72"
 syn = { version = "2", features = ["full"] }
 quote = "1"

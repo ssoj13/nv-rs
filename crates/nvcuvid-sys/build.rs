@@ -1,12 +1,12 @@
 //! Generates the NVDEC (nvcuvid) bindings from the Video Codec SDK's `Interface/nvcuvid.h`.
-//! The SDK is a zip with no installer, so its root comes from `VIDEO_CODEC_SDK_ROOT`. CUDA types
+//! The SDK (a zip with no installer) is located by vcv-rs: `VIDEO_CODEC_SDK_ROOT` or `NV_SDK_DIRS`. CUDA types
 //! (`CUresult`, `CUcontext`, `CUstream`) are the `cuda-bindings` ones.
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvcuvid",
     headers: &["nvcuvid.h"],
-    sdks: &[Sdk::EnvRootSubdir { var: "VIDEO_CODEC_SDK_ROOT", subdir: "Interface" }, Sdk::CudaToolkit],
+    sdks: &[Sdk::Nv(Kind::VideoCodec), Sdk::CudaToolkit],
     allow_fn: &["^cuvid.*"],
     allow_type: &["^CUVID.*", "^_CUVID.*", "^CUvideo.*", "^cudaVideo.*", "^cudaAudio.*"],
     allow_var: &["^CUVID_.*"],

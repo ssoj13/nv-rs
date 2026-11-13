@@ -33,11 +33,15 @@ pub enum Group {
     DriverStore,
     /// Part of the CUDA Toolkit, found under the toolkit root (`cufft64_12`, `nvrtc64_130_0`).
     Toolkit,
-    /// A separately installed SDK whose root is named by an environment variable
-    /// (`CUDNN_ROOT`, `NVCOMP_ROOT`, ...). Never guessed when the variable is unset.
+    /// A separately installed SDK (cuDNN, nvCOMP, ...). Searched in, in order: the directory next
+    /// to the running executable (how applications ship these DLLs), `<root_var>/bin[/x64]` and
+    /// `<root_var>/lib`, then `hint` — the SDK's DLL directory vcv-rs found when the sys crate was
+    /// built (`env!`-baked by nv-bindgen, `None` when the SDK had none).
     Sdk {
         /// The environment variable naming the SDK root.
         root_var: &'static str,
+        /// The build machine's SDK DLL directory, if known.
+        hint: Option<&'static str>,
     },
 }
 
@@ -108,6 +112,8 @@ pub trait Probe {
     /// Directories of the display adapters' drivers (Windows: each display-class adapter's
     /// `OpenGLDriverName` parent; empty elsewhere).
     fn display_driver_dirs(&self) -> Vec<PathBuf>;
+    /// The directory of the running executable, if known.
+    fn exe_dir(&self) -> Option<PathBuf>;
 }
 
 /// The machine itself.
@@ -128,6 +134,10 @@ impl Probe for SystemProbe {
             return Vec::new();
         };
         entries.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect()
+    }
+
+    fn exe_dir(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
     fn display_driver_dirs(&self) -> Vec<PathBuf> {
@@ -241,13 +251,16 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
             }
             dirs
         }
-        Group::Sdk { root_var } => probe
-            .env(root_var)
-            .map(|root| {
+        Group::Sdk { root_var, hint } => {
+            let mut dirs: Vec<PathBuf> = probe.exe_dir().into_iter().collect();
+            if let Some(root) = probe.env(root_var) {
                 let root = PathBuf::from(root);
-                vec![root.join("bin").join("x64"), root.join("bin"), root.join("lib")]
-            })
-            .unwrap_or_default(),
+                dirs.extend([root.join("bin").join("x64"), root.join("bin"), root.join("lib")]);
+            }
+            dirs.extend(hint.map(PathBuf::from));
+            dirs.dedup();
+            dirs
+        }
     }
 }
 
@@ -353,6 +366,12 @@ macro_rules! exports_sys {
     };
 }
 
+/// `Some(dir)` unless `dir` is empty: turns the `env!("NV_RS_SDK_BIN")` nv-bindgen bakes into a sys
+/// crate (empty when the SDK ships no DLLs) into a [`Group::Sdk`] hint.
+pub const fn hint(dir: &'static str) -> Option<&'static str> {
+    if dir.is_empty() { None } else { Some(dir) }
+}
+
 /// Fails with [`LoadError::RuntimeTooOld`] when `found < required`.
 pub fn check_version(lib: &'static str, required: u32, found: u32) -> Result<(), LoadError> {
     if found < required {
@@ -368,7 +387,7 @@ impl fmt::Display for Group {
             Group::Driver => f.write_str("driver"),
             Group::DriverStore => f.write_str("driver store"),
             Group::Toolkit => f.write_str("CUDA toolkit"),
-            Group::Sdk { root_var } => write!(f, "SDK ({root_var})"),
+            Group::Sdk { root_var, .. } => write!(f, "SDK ({root_var})"),
         }
     }
 }
@@ -518,9 +537,13 @@ mod tests {
         env: HashMap<&'static str, &'static str>,
         dirs: HashMap<PathBuf, Vec<&'static str>>,
         drivers: Vec<PathBuf>,
+        exe: Option<PathBuf>,
     }
 
     impl Probe for Fake {
+        fn exe_dir(&self) -> Option<PathBuf> {
+            self.exe.clone()
+        }
         fn env(&self, name: &str) -> Option<String> {
             self.env.get(name).map(|s| (*s).to_string())
         }
@@ -604,8 +627,32 @@ mod tests {
 
     #[test]
     fn an_unset_sdk_root_is_never_guessed() {
-        let spec = DllSpec { lib: "cudnn", group: Group::Sdk { root_var: "CUDNN_ROOT" }, windows: &["cudnn64_*"], linux: &[] };
+        let spec = DllSpec { lib: "cudnn", group: Group::Sdk { root_var: "CUDNN_ROOT", hint: None }, windows: &["cudnn64_*"], linux: &[] };
         assert!(candidates_with(&Fake::default(), &spec).is_empty());
+    }
+
+    #[test]
+    fn sdk_dlls_are_searched_next_to_the_exe_then_root_then_build_hint() {
+        let spec = DllSpec {
+            lib: "cudnn",
+            group: Group::Sdk { root_var: "CUDNN_ROOT", hint: Some(r"C:\hint\bin") },
+            windows: &["cudnn64_*"],
+            linux: &[],
+        };
+        let mut fake = Fake { exe: Some(PathBuf::from(r"C:\app")), ..Fake::default() };
+        fake.env.insert("CUDNN_ROOT", r"C:\cudnn");
+        for dir in [r"C:\app", r"C:\cudnn\bin\x64", r"C:\hint\bin"] {
+            fake.dirs.insert(PathBuf::from(dir), vec!["cudnn64_9.dll"]);
+        }
+        let got = candidates_with(&fake, &spec);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(r"C:\app\cudnn64_9.dll"),
+                PathBuf::from(r"C:\cudnn\bin\x64\cudnn64_9.dll"),
+                PathBuf::from(r"C:\hint\bin\cudnn64_9.dll"),
+            ]
+        );
     }
 
     #[test]

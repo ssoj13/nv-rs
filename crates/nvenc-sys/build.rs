@@ -1,11 +1,11 @@
-//! Generates the NVENC types from the Video Codec SDK's `Interface/nvEncodeAPI.h` (root from
-//! `VIDEO_CODEC_SDK_ROOT`). Entry points come from the driver's `NvEncodeAPICreateInstance`.
-use nv_bindgen::{LibSpec, Sdk, Shape};
+//! Generates the NVENC types from the Video Codec SDK's `Interface/nvEncodeAPI.h` (located by vcv-rs:
+//! `VIDEO_CODEC_SDK_ROOT` or `NV_SDK_DIRS`). Entry points come from the driver's `NvEncodeAPICreateInstance`.
+use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvenc",
     headers: &["nvEncodeAPI.h"],
-    sdks: &[Sdk::EnvRootSubdir { var: "VIDEO_CODEC_SDK_ROOT", subdir: "Interface" }],
+    sdks: &[Sdk::Nv(Kind::VideoCodec)],
     allow_fn: &[],
     allow_type: &["^_?NV_ENC.*", "^NVENC.*", "^PNVENC.*", "^_?NV_ENCODE_API_FUNCTION_LIST$", "^_?GUID$"],
     allow_var: &["^NVENC.*", "^NV_ENC.*"],

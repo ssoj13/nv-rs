@@ -1,7 +1,7 @@
 //! Raw NVAPI bindings: types plus one panic-free shim per entry point, resolved by id.
 //!
-//! **What.** Generated at build time by `nv-bindgen` from the NVAPI SDK (`nvapi.h`, root from
-//! `NVAPI_ROOT`; headers never committed). The driver's `nvapi64.dll` exports only
+//! **What.** Generated at build time by `nv-bindgen` from the NVAPI SDK (`nvapi.h`, located by
+//! vcv-rs; headers never committed). The driver's `nvapi64.dll` exports only
 //! `nvapi_QueryInterface(id)`; each shim asks it for its function by the id listed in the SDK's
 //! `nvapi_interface.h`, returns `NVAPI_LIBRARY_NOT_FOUND` when the DLL is absent and
 //! `NVAPI_NO_IMPLEMENTATION` when this driver has no entry for the id. Windows only (NVAPI does not

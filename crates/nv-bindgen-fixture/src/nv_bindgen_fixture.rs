@@ -14,7 +14,7 @@ nv_loader::exports_sys! {
     lib: "fake",
     api: FakeApi,
     loader: fake_api,
-    dll: DllSpec { lib: "fake", group: Group::Sdk { root_var: "NV_RS_FAKE_ROOT_NEVER_SET" }, windows: &["fake.dll"], linux: &["libfake-nv-rs-fixture.so"] },
+    dll: DllSpec { lib: "fake", group: Group::Sdk { root_var: "NV_RS_FAKE_ROOT_NEVER_SET", hint: None }, windows: &["fake.dll"], linux: &["libfake-nv-rs-fixture.so"] },
 }
 
 /// The query-interface fixture (`qi.h`, NVAPI-shaped), compiled through `query_interface_sys!`.
@@ -25,7 +25,7 @@ pub mod qi {
         query_symbol: b"qi_QueryInterface\0",
         dll: nv_loader::DllSpec {
             lib: "qi",
-            group: nv_loader::Group::Sdk { root_var: "NV_RS_QI_ROOT_NEVER_SET" },
+            group: nv_loader::Group::Sdk { root_var: "NV_RS_QI_ROOT_NEVER_SET", hint: None },
             windows: &["qi.dll"],
             linux: &["libqi-nv-rs-fixture.so"],
         },

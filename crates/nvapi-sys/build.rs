@@ -1,11 +1,11 @@
-//! Generates the NVAPI bindings from the NVAPI SDK (`nvapi.h`; root from `NVAPI_ROOT`, headers
-//! at the root). Function ids come from the SDK's `nvapi_interface.h`.
-use nv_bindgen::{LibSpec, Sdk, Shape};
+//! Generates the NVAPI bindings from the NVAPI SDK (`nvapi.h`, located by vcv-rs: `NVAPI_ROOT`,
+//! the standard folders or `NV_SDK_DIRS`). Function ids come from the SDK's `nvapi_interface.h`.
+use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvapi",
     headers: &["nvapi.h"],
-    sdks: &[Sdk::EnvRootSubdir { var: "NVAPI_ROOT", subdir: "" }],
+    sdks: &[Sdk::Nv(Kind::Nvapi)],
     allow_fn: &["^NvAPI_.*"],
     allow_type: &["^_?NV.*", "^_?Nv.*"],
     allow_var: &["^NVAPI_.*", "^NV_.*"],

@@ -1,7 +1,7 @@
 //! Raw NVDEC bindings (`nvcuvid`): video parser and decoder types, one panic-free shim per entry point.
 //!
 //! **What.** Generated at build time by `nv-bindgen` from the Video Codec SDK's `nvcuvid.h` /
-//! `cuviddec.h` (root from `VIDEO_CODEC_SDK_ROOT`; headers never committed). The decoder ships with
+//! `cuviddec.h` (located by vcv-rs; headers never committed). The decoder ships with
 //! the display driver (`nvcuvid.dll` / `libnvcuvid.so.1`). Shims return the CUDA driver's
 //! `CUDA_ERROR_NOT_INITIALIZED` when the library is absent and `CUDA_ERROR_NOT_FOUND` when a
 //! symbol is missing. `CUresult`, `CUcontext` and `CUstream` are `cuda-bindings` types, so a

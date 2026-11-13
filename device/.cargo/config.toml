@@ -1,0 +1,6 @@
+# cuda-oxide drives compiler-internal APIs from the pinned toolchain (cargo-oxide refuses others).
+[env]
+RUSTC_BOOTSTRAP = "1"
+
+[net]
+git-fetch-with-cli = true

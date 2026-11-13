@@ -1,0 +1,29 @@
+# Device-side crates: Rust compiled to PTX by cuda-oxide (`cargo oxide`), on the toolchain pinned
+# in rust-toolchain.toml. Kept out of the host workspace, which builds on the cuda-rust host
+# crates' toolchain.
+[workspace]
+resolver = "3"
+members = ["optix-device"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ssoj13/nv-rs"
+publish = false
+
+[workspace.dependencies]
+cuda-device = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-host = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+nv-bindgen = { path = "../crates/nv-bindgen" }
+vcv-rs = { git = "ssh://git@github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix", "nvsdk"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"

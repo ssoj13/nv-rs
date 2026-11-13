@@ -162,6 +162,8 @@ pub fn scan(file: &str, text: &str) -> Result<Scan, ScanError> {
                 scan.plain_ptx.push(template);
                 continue;
             };
+            // GCC rule: an asm statement without outputs is implicitly volatile.
+            let volatile = volatile || outputs.is_empty();
             let new = Intrinsic { name: name.clone(), template, outputs: outputs.clone(), inputs: inputs.clone(), volatile, sites: 1 };
             match scan.intrinsics.get_mut(&name) {
                 None => {
@@ -482,6 +484,7 @@ unsigned int a1() { BODY( 1 ); }
 #undef BODY
 static void helper() { asm volatile( "cvta.to.global.u64 %0, %1;" : "=l"( ptr ) : "l"( addr ) ); }
 static void terminate() { asm volatile( "call _optix_terminate_ray, ();" ); }
+static void acc() { asm( "call (), _optix_reduce, (%0);" : : "l"( p ) ); }
 "#;
 
     #[test]
@@ -490,7 +493,7 @@ static void terminate() { asm volatile( "call _optix_terminate_ray, ();" ); }
         let names: Vec<_> = s.intrinsics.keys().cloned().collect();
         assert_eq!(
             names,
-            ["_optix_get_attribute_0", "_optix_get_attribute_1", "_optix_get_launch_index_x", "_optix_get_tri", "_optix_set_payload", "_optix_terminate_ray"]
+            ["_optix_get_attribute_0", "_optix_get_attribute_1", "_optix_get_launch_index_x", "_optix_get_tri", "_optix_reduce", "_optix_set_payload", "_optix_terminate_ray"]
         );
         let tri = &s.intrinsics["_optix_get_tri"];
         assert_eq!(tri.template, "call (%0, %1, %2), _optix_get_tri, (%3, %4);");
@@ -500,6 +503,7 @@ static void terminate() { asm volatile( "call _optix_terminate_ray, ();" ); }
         let set = &s.intrinsics["_optix_set_payload"];
         assert!(set.volatile);
         assert_eq!(set.sites, 2);
+        assert!(s.intrinsics["_optix_reduce"].volatile, "no outputs: implicitly volatile");
         assert_eq!(s.intrinsics["_optix_get_attribute_1"].template, "call (%0), _optix_get_attribute_1, ();");
         assert_eq!(s.plain_ptx, ["cvta.to.global.u64 %0, %1;"]);
     }

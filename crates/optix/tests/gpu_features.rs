@@ -840,7 +840,7 @@ fn relocated_structures_trace_after_the_sources_are_gone() {
 
 #[test]
 #[ignore = "GPU"]
-fn motion_gas_traces_key_zero_and_vanishes() {
+fn motion_gas_traces_key_zero_emits_and_refits() {
     let mut rig = rig(Cfg { single_gas: true, motion: true, ..Default::default() });
     let s = rig.stream.clone();
     let k0 = up(&s, &tri_verts(0.0, LEG));

@@ -23,7 +23,7 @@
 
 1. Remaining M2: **nvCOMP** (not installed on this machine), **NCCL** and **cuFile** (Linux only:
    WSL2 for NCCL, native Linux / RunPod for cuFile).
-2. Merge fork `feat/optix-device` into fork `main` (additive; render-rs consumes `main`).
+2. Fork `main` now carries the OptiX patches (`b34ecb947`); spike S1b still pins the branch.
 3. M4 rest: denoiser, reusable caller-owned scratch, AS update/refit; M5 `optix-device` (Rust
    wrappers for the `_optix_*` intrinsics, typed payload) + `#[device(export_name)]` for callables;
    M6 `nv-wgpu` on top of cuda-ext.

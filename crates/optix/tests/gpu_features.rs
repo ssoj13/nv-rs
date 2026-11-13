@@ -373,9 +373,12 @@ fn payload_types_compile_link_and_trace() {
     invalid(Module::new(&ctx, &ModuleOptions { payload_types: &empty, ..Default::default() }, &opts, PTX), "empty payload type");
     invalid(ProgramGroup::new(&ctx, Programs::Raygen(&module, "__raygen__mask"), Some(PayloadType { words: &[] })), "empty program-group payload type");
     let two = [PayloadSemantics::ALL_RW, PayloadSemantics::ALL_RW];
-    let err = ProgramGroup::new(&ctx, Programs::Raygen(&module, "__raygen__mask"), Some(PayloadType { words: &two })).map(|_| ()).expect_err("payload type the module lacks");
-    println!("mismatched payload type: {err}");
-    assert!(matches!(err, Error::Optix { call: "optixProgramGroupCreate", .. }), "{err}");
+    // Miss and closest hit read payload words, so a type the module lacks is refused; raygen
+    // only traces and accepts any type (observed).
+    let mismatch = sys::OptixResult_OPTIX_ERROR_PAYLOAD_TYPE_MISMATCH;
+    optix_err(ProgramGroup::new(&ctx, Programs::Miss(&module, "__miss__none"), Some(PayloadType { words: &two })), mismatch, "miss with a payload type the module lacks");
+    let ch = optix::HitGroup { closest_hit: Some((&module, "__closesthit__hit")), ..Default::default() };
+    optix_err(ProgramGroup::new(&ctx, Programs::HitGroup(ch), Some(PayloadType { words: &two })), mismatch, "hit group with a payload type the module lacks");
 }
 
 #[test]
@@ -482,24 +485,18 @@ fn stack_sizes_follow_the_header_formulas() {
 #[ignore = "GPU"]
 fn symbol_copies() {
     let rig = rig(Cfg::default());
-    // The fixture's only global is the launch-parameter block `params` (`.visible .const`).
-    let probe = rig.pipeline.read_symbol::<u64>(&rig.stream, "params", 0);
-    println!("read_symbol(params): {:?}", probe.as_ref().map_err(ToString::to_string));
-    match probe {
-        Ok(_) => {
-            rig.pipeline.write_symbol(&rig.stream, "params", 16, &0x1234_5678u32).expect("write params");
-            assert_eq!(rig.pipeline.read_symbol::<u32>(&rig.stream, "params", 16).expect("read params"), 0x1234_5678);
-            let src = up(&rig.stream, &0xABCD_u32.to_le_bytes());
-            // SAFETY: `src` lives until the synchronization below.
-            unsafe { rig.pipeline.write_symbol_from(&rig.stream, "params", 20, &src) }.expect("write from device");
-            let mut dst = DeviceBuffer::<u8>::zeroed(&rig.stream, 4).expect("dst");
-            // SAFETY: `dst` is read only after the synchronization below.
-            unsafe { rig.pipeline.read_symbol_into(&rig.stream, "params", 20, &mut dst) }.expect("read into device");
-            rig.stream.synchronize().expect("sync");
-            assert_eq!(dst.to_host_vec(&rig.stream).expect("read back"), 0xABCD_u32.to_le_bytes());
-        }
-        Err(e) => panic!("the fixture's params symbol is not copyable: {e}"),
-    }
+    // The fixture's only global is the launch-parameter block `params` (`.visible .const`);
+    // OptiX owns it, so every copy direction is refused, and no other symbol exists.
+    let invalid_op = sys::OptixResult_OPTIX_ERROR_INVALID_OPERATION;
+    optix_err(rig.pipeline.read_symbol::<u64>(&rig.stream, "params", 0), invalid_op, "read the launch parameters");
+    optix_err(rig.pipeline.write_symbol(&rig.stream, "params", 16, &W), invalid_op, "write the launch parameters");
+    let src = up(&rig.stream, &W.to_le_bytes());
+    // SAFETY: `src` outlives the synchronization below.
+    optix_err(unsafe { rig.pipeline.write_symbol_from(&rig.stream, "params", 16, &src) }, invalid_op, "write the launch parameters from the device");
+    let mut dst = DeviceBuffer::<u8>::zeroed(&rig.stream, 4).expect("dst");
+    // SAFETY: `dst` is not read before the synchronization below.
+    optix_err(unsafe { rig.pipeline.read_symbol_into(&rig.stream, "params", 16, &mut dst) }, invalid_op, "read the launch parameters to the device");
+    rig.stream.synchronize().expect("sync");
     optix_err(rig.pipeline.write_symbol(&rig.stream, "no_such_symbol", 0, &1u32), sys::OptixResult_OPTIX_ERROR_SYMBOL_NOT_FOUND, "write unknown symbol");
     optix_err(rig.pipeline.read_symbol::<u32>(&rig.stream, "no_such_symbol", 0), sys::OptixResult_OPTIX_ERROR_SYMBOL_NOT_FOUND, "read unknown symbol");
     let empty = DeviceBuffer::<u8>::zeroed(&rig.stream, 0).expect("empty");
@@ -1112,8 +1109,9 @@ fn tri_limits() -> TriangleLimits {
     TriangleLimits { max_args: 1, max_triangles_per_arg: 1, max_vertices_per_arg: 3, ..Default::default() }
 }
 
-/// A GAS over the CLAS of `clas` (its first handle), traced through an IAS.
-fn trace_clusters(rig: &mut Rig, clas: &Arc<ClusterAccel>) -> Vec<u32> {
+/// A GAS over the CLAS of `clas` (its first handle), built with implicit destinations or, when
+/// `explicit`, with get-sizes + explicit destinations, traced through an IAS.
+fn trace_clusters(rig: &mut Rig, clas: &Arc<ClusterAccel>, explicit: bool) -> Vec<u32> {
     let args = ClusterArgs::upload(&rig.stream, &[sys::OptixClusterAccelBuildInputClustersArgs {
         clusterHandlesCount: 1,
         clusterHandlesBufferStrideInBytes: size_of::<u64>() as u32,
@@ -1122,8 +1120,15 @@ fn trace_clusters(rig: &mut Rig, clas: &Arc<ClusterAccel>) -> Vec<u32> {
     .expect("cluster args");
     let input = ClusterInput::GasesFromClusters(ClusterLimits { flags: ClusterFlags::NONE, max_args: 1, max_total_clusters: 1, max_clusters_per_arg: 1 });
     let opts = ClusterOptions { refs: ClusterRefs { clusters: std::slice::from_ref(clas), micromaps: &[] }, ..Default::default() };
-    // SAFETY: the handle buffer is the CLAS build's output on this stream, kept alive by `refs`.
-    let gas = unsafe { ClusterAccel::build(&rig.ctx, &rig.stream, &mut rig.scratch, &input, &args, opts) }.expect("GAS from clusters");
+    let gas = if explicit {
+        // SAFETY: the handle buffer is the CLAS build's output on this stream, alive in `clas`.
+        let sizes = unsafe { ClusterAccel::get_sizes(&rig.ctx, &rig.stream, &mut rig.scratch, &input, &args, None) }.expect("GAS sizes").to_host_vec(&rig.stream).expect("read sizes");
+        // SAFETY: as above, kept alive by `refs`; `sizes` is the get-sizes result of these args.
+        unsafe { ClusterAccel::build_explicit(&rig.ctx, &rig.stream, &mut rig.scratch, &input, &args, &sizes, opts) }.expect("explicit GAS from clusters")
+    } else {
+        // SAFETY: the handle buffer is the CLAS build's output on this stream, kept alive by `refs`.
+        unsafe { ClusterAccel::build(&rig.ctx, &rig.stream, &mut rig.scratch, &input, &args, opts) }.expect("GAS from clusters")
+    };
     assert_eq!(gas.kind(), optix::ClusterKind::GasesFromClusters);
     let child = gas.child(&rig.stream, 0).expect("cluster GAS child");
     invalid(gas.child(&rig.stream, 1), "child index past the build");
@@ -1158,7 +1163,8 @@ fn cluster_builds_trace() {
     let clas = unsafe { ClusterAccel::build(&rig.ctx, &s, &mut rig.scratch, &input, &args, ClusterOptions { sizes: true, ..Default::default() }) }.expect("CLAS");
     let out = clas.output_sizes().expect("sizes requested").to_host_vec(&s).expect("read sizes");
     assert!(out[0] > 0);
-    assert_eq!(trace_clusters(&mut rig, &clas), mask(0.0), "implicit CLAS");
+    assert_eq!(trace_clusters(&mut rig, &clas, false), mask(0.0), "implicit CLAS, implicit GAS");
+    assert_eq!(trace_clusters(&mut rig, &clas, true), mask(0.0), "implicit CLAS, explicit GAS");
 
     // Get sizes, then explicit destinations.
     // SAFETY: as above.
@@ -1168,10 +1174,12 @@ fn cluster_builds_trace() {
     let explicit = unsafe { ClusterAccel::build_explicit(&rig.ctx, &s, &mut rig.scratch, &input, &args, &exact, ClusterOptions { sizes: true, ..Default::default() }) }.expect("explicit CLAS");
     let eh = explicit.handles().to_host_vec(&s).expect("explicit handle")[0];
     let es = explicit.output_sizes().expect("sizes").to_host_vec(&s).expect("explicit sizes");
-    println!("implicit handle {:#x}, explicit handle {eh:#x}, explicit sizes {es:?}, explicit buffer {} bytes", clas.handles().to_host_vec(&s).expect("h")[0], explicit.size_bytes());
-    assert_ne!(eh, 0, "the explicit build writes a CLAS address");
+    println!("explicit CLAS handle {eh:#x}, sizes {es:?}, buffer {} bytes", explicit.size_bytes());
+    assert_ne!(eh, 0, "the explicit build yields a CLAS address");
     assert_eq!(es, exact, "the explicit build reports the sizes get-sizes predicted");
-    assert_eq!(trace_clusters(&mut rig, &explicit), mask(0.0), "explicit CLAS");
+    assert_eq!(explicit.size_bytes(), (exact[0] as usize).next_multiple_of(sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT as usize), "one tight, aligned object");
+    assert_eq!(trace_clusters(&mut rig, &explicit, false), mask(0.0), "explicit CLAS, implicit GAS");
+    assert_eq!(trace_clusters(&mut rig, &explicit, true), mask(0.0), "explicit CLAS, explicit GAS");
     // SAFETY: rejected before reaching OptiX.
     invalid(unsafe { ClusterAccel::build_explicit(&rig.ctx, &s, &mut rig.scratch, &input, &args, &[], ClusterOptions::default()) }, "no sizes");
 
@@ -1188,7 +1196,7 @@ fn cluster_builds_trace() {
     // SAFETY: the template is kept alive by `refs`; `moved` outlives the build.
     let inst = unsafe { ClusterAccel::build(&rig.ctx, &s, &mut rig.scratch, &iinput, &targs, ClusterOptions { refs: ClusterRefs { clusters: &refs, micromaps: &[] }, ..Default::default() }) }
         .expect("CLAS from templates");
-    assert_eq!(trace_clusters(&mut rig, &inst), mask(DX), "CLAS instantiated from a template");
+    assert_eq!(trace_clusters(&mut rig, &inst, false), mask(DX), "CLAS instantiated from a template");
 
     // Templates from a 2x2 grid (smoke).
     let mut g = sys::OptixClusterAccelBuildInputGridsArgs { dimensions: [2, 2], ..Default::default() };

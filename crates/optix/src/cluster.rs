@@ -534,22 +534,25 @@ impl ClusterAccel {
             total = (*s as usize).checked_next_multiple_of(align).and_then(|s| total.checked_add(s)).ok_or(Error::Invalid("explicit cluster output size overflows usize"))?;
         }
         let temp_size = Self::memory_usage(ctx, ClusterMode::Explicit, input)?.temp;
-        let arrays = n.saturating_mul(2 * size_of::<u64>()).saturating_add(if opts.sizes { n.saturating_mul(size_of::<u32>()) } else { 0 });
+        let arrays = n.saturating_mul(size_of::<u64>()).saturating_add(if opts.sizes { n.saturating_mul(size_of::<u32>()) } else { 0 });
         within(opts.budget, scratch.growth(temp_size).saturating_add(total).saturating_add(arrays))?;
         let (temp, temp_len) = scratch.reserve(stream, temp_size)?;
         // SAFETY: OptiX writes every object before anything reads it.
         let buffer = unsafe { alloc(stream, total, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
         // Each destination keeps the buffer's alignment: offsets are multiples of it.
         let dests: Vec<u64> = offsets.iter().map(|o| buffer.cu_deviceptr() + *o as u64).collect();
+        // The destination array is also the handle array, which the header allows ("can be the
+        // same as destAddresses"): in explicit mode the driver leaves the handle array untouched
+        // for CLAS outputs (observed: OptiX 9.1, sm_86), whose handle is the destination address,
+        // and overwrites it with the traversable handle for GAS outputs.
         // SAFETY: `u64` has no padding.
-        let dest_buffer = unsafe { upload(stream, &dests) }?;
-        let handles = zeroed_async::<u64>(stream, n)?;
+        let handles = unsafe { upload(stream, &dests) }?.cast_chunks::<u64>().map_err(|_| Error::Invalid("destination array is not u64-aligned"))?;
         let out_sizes = if opts.sizes { Some(zeroed_async::<u32>(stream, n)?) } else { None };
         let mut desc = sys::OptixClusterAccelBuildModeDesc { mode: ClusterMode::Explicit.raw(), ..Default::default() };
         desc.__bindgen_anon_1.explicitDest = sys::OptixClusterAccelBuildModeDescExplicitDest {
             tempBuffer: temp,
             tempBufferSizeInBytes: temp_len,
-            destAddressesBuffer: dest_buffer.cu_deviceptr(),
+            destAddressesBuffer: handles.cu_deviceptr(),
             destAddressesStrideInBytes: size_of::<u64>() as u32,
             outputHandlesBuffer: handles.cu_deviceptr(),
             outputHandlesStrideInBytes: size_of::<u64>() as u32,
@@ -557,10 +560,9 @@ impl ClusterAccel {
             outputSizesStrideInBytes: if out_sizes.is_some() { size_of::<u32>() as u32 } else { 0 },
         };
         // SAFETY: each destination has its object's reported size (contract) inside `buffer`;
-        // the address array is freed after the build in stream order; arguments per the
-        // forwarded contract.
+        // the destination/handle array is owned by the result; arguments per the forwarded
+        // contract.
         unsafe { Self::run(ctx, stream, &desc, input, args) }?;
-        drop(dest_buffer);
         Ok(Arc::new(Self::make(ctx, input.kind(), buffer, handles, out_sizes, &opts.refs)))
     }
 

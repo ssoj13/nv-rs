@@ -5,7 +5,9 @@
 //! `width x height x depth` grid of raygen invocations on a stream with launch parameters read
 //! from a device buffer and an SBT. [`Pipeline::write_symbol`] / [`Pipeline::read_symbol`] (and
 //! the device-buffer variants) copy to and from device globals of the linked modules
-//! (`optixPipelineSymbolMemcpyAsync`).
+//! (`optixPipelineSymbolMemcpyAsync`). The launch-parameter variable is not one of them: OptiX
+//! refuses copies to or from it with `OPTIX_ERROR_INVALID_OPERATION`; an unknown name is
+//! `OPTIX_ERROR_SYMBOL_NOT_FOUND`.
 //! **Stack sizes** are computed by OptiX from the [`LinkOptions`] depths at link time; change
 //! them with [`Pipeline::set_stack_from_depths`], or compute exact sizes with `stack.rs`
 //! ([`crate::StackSizes`]) and apply them with [`Pipeline::set_stack_size`].

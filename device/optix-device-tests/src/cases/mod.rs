@@ -6,6 +6,7 @@
 pub mod common;
 pub mod geometry;
 pub mod hitobject;
+pub mod intersect;
 pub mod local;
 pub mod shade;
 pub mod transform;
@@ -22,4 +23,5 @@ pub const ALL: &[Case] = &[
     ("geometry", geometry::run),
     ("transform", transform::run),
     ("hitobject", hitobject::run),
+    ("intersect", intersect::run),
 ];

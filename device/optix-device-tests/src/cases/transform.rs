@@ -40,10 +40,6 @@ pub struct Params {
     pub probes: u64,
     /// The IAS.
     pub handle: u64,
-    /// Bit mask of the closest-hit sections to run (debugging aid; all set by default).
-    pub sections: u32,
-    /// Padding.
-    pub _pad: u32,
 }
 
 // SAFETY: plain integers; all-zero is valid.
@@ -126,41 +122,34 @@ mod kernels {
         // SAFETY: closest-hit on triangles under an instance; list entries are read by their type.
         unsafe {
             let r = rec();
-            let m = PARAMS.get().sections;
             let n = xf::transform_list_size();
             let time = state::ray_time();
             *r = 1;
             *r.add(1) = n;
             *r.add(2) = state::instance_id();
             *r.add(3) = state::instance_index();
-            if m & 1 != 0 {
-                put(r, 4, xf::object_to_world_matrix());
-                put(r, 16, xf::world_to_object_matrix());
-                put(r, 28, xf::transform_point_from_object_to_world(P));
-                put(r, 31, xf::transform_vector_from_object_to_world(V));
-                put(r, 34, xf::transform_normal_from_object_to_world(N));
-                put(r, 37, xf::transform_point_from_world_to_object(P));
-                put(r, 40, xf::transform_vector_from_world_to_object(V));
-                put(r, 43, xf::transform_normal_from_world_to_object(N));
-            }
-            if m & 2 != 0 {
-                put(r, 46, [state::ray_tmax()]);
-                put(r, 47, state::triangle_barycentrics());
-                let v = optix_device::geometry::triangle_vertices();
-                put(r, 49, v[0]);
-                put(r, 52, v[1]);
-                put(r, 55, v[2]);
-            }
+            put(r, 4, xf::object_to_world_matrix());
+            put(r, 16, xf::world_to_object_matrix());
+            put(r, 28, xf::transform_point_from_object_to_world(P));
+            put(r, 31, xf::transform_vector_from_object_to_world(V));
+            put(r, 34, xf::transform_normal_from_object_to_world(N));
+            put(r, 37, xf::transform_point_from_world_to_object(P));
+            put(r, 40, xf::transform_vector_from_world_to_object(V));
+            put(r, 43, xf::transform_normal_from_world_to_object(N));
+            put(r, 46, [state::ray_tmax()]);
+            put(r, 47, state::triangle_barycentrics());
+            let v = optix_device::geometry::triangle_vertices();
+            put(r, 49, v[0]);
+            put(r, 52, v[1]);
+            put(r, 55, v[2]);
             let h0 = xf::transform_list_handle(0);
-            if m & 4 != 0 {
-                *r.add(58) = xf::transform_type(h0) as u32;
-                *r.add(59) = xf::instance_id(h0);
-                put64(r, 60, xf::instance_child(h0));
-                put(r, 62, xf::instance_transform(h0));
-                put(r, 74, xf::instance_inverse_transform(h0));
-            }
+            *r.add(58) = xf::transform_type(h0) as u32;
+            *r.add(59) = xf::instance_id(h0);
+            put64(r, 60, xf::instance_child(h0));
+            put(r, 62, xf::instance_transform(h0));
+            put(r, 74, xf::instance_inverse_transform(h0));
             *r.add(86) = u32::MAX;
-            if n > 1 && m & 8 != 0 {
+            if n > 1 {
                 let h1 = xf::transform_list_handle(1);
                 let ty = xf::transform_type(h1);
                 *r.add(86) = ty as u32;
@@ -177,38 +166,16 @@ mod kernels {
                 put(r, 96, xf::transform_from_handle(h1, time, true));
                 put(r, 108, xf::transform_from_handle(h1, time, false));
             }
-            if n > 1 && m & 64 != 0 {
-                let h1 = xf::transform_list_handle(1);
-                *r.add(86) = xf::transform_type(h1) as u32;
-                put64(r, 132, xf::static_transform_ptr(h1) as u64 | xf::matrix_motion_transform_ptr(h1) as u64 | xf::srt_motion_transform_ptr(h1) as u64);
-                let h1 = xf::transform_list_handle(1);
-                let ty = xf::transform_type(h1);
-                if m & 128 != 0 && ty == 1 {
-                    put64(r, 134, (&raw const (*xf::static_transform_ptr(h1)).child).read());
-                }
-                if m & 256 != 0 && ty == 2 {
-                    put64(r, 134, (&raw const (*xf::matrix_motion_transform_ptr(h1)).child).read());
-                }
-                if m & 512 != 0 && ty == 3 {
-                    put64(r, 134, (&raw const (*xf::srt_motion_transform_ptr(h1)).child).read());
-                }
-                if m & 1024 != 0 {
-                    put(r, 96, xf::transform_from_handle(h1, time, true));
-                }
-            }
-            if m & 16 != 0 {
-                *r.add(89) = u32::from(xf::instance_traversable_from_ias(PARAMS.get().handle, state::instance_index()) == h0);
-            }
-            if m & 32 != 0 {
-                let gas = state::gas_traversable_handle();
-                *r.add(90) = xf::gas_motion_step_count(gas);
-                put(r, 91, [xf::gas_motion_time_begin(gas), xf::gas_motion_time_end(gas), time]);
-                if n == 1 && xf::gas_motion_step_count(gas) > 1 {
-                    let d = optix_device::geometry::triangle_vertices_from_handle(gas, state::primitive_index(), state::sbt_gas_index(), time);
-                    put(r, 120, d[0]);
-                    put(r, 123, d[1]);
-                    put(r, 126, d[2]);
-                }
+            *r.add(89) = u32::from(xf::instance_traversable_from_ias(PARAMS.get().handle, state::instance_index()) == h0);
+            let gas = state::gas_traversable_handle();
+            let steps = xf::gas_motion_step_count(gas);
+            *r.add(90) = steps;
+            put(r, 91, [xf::gas_motion_time_begin(gas), xf::gas_motion_time_end(gas), time]);
+            if steps > 1 {
+                let d = optix_device::geometry::triangle_vertices_from_handle(gas, state::primitive_index(), state::sbt_gas_index(), time);
+                put(r, 120, d[0]);
+                put(r, 123, d[1]);
+                put(r, 126, d[2]);
             }
         }
     }
@@ -425,11 +392,6 @@ pub fn run(g: &Gpu) -> R {
     let miss = ProgramGroup::miss(&module, "__miss__xf").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__xf")), ..Default::default() }).ctx("hit group")?;
     let pipeline = g.pipeline(&o, LinkOptions { max_graph_depth: 3, ..Default::default() }, &[raygen.clone(), miss.clone(), hit.clone()])?;
-    if let Some(css) = std::env::var("ODT_STACK").ok().and_then(|s| s.parse().ok()) {
-        pipeline.set_stack_size(0, 0, css, 3).ctx("stack")?;
-        let s = [&raygen, &miss, &hit].map(|g| g.stack_sizes(Some(&pipeline)).map(|s| format!("{s:?}")).unwrap_or_default());
-        eprintln!("stack sizes {s:?}");
-    }
     let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[SbtRecord::new(&miss, 0u32).ctx("ms")?], &[SbtRecord::new(&hit, 0u32).ctx("hg")?]).ctx("SBT")?;
 
     let mut scratch = Scratch::new(&g.stream);
@@ -453,19 +415,11 @@ pub fn run(g: &Gpu) -> R {
     let pr = probes();
     let table = g.up(&pr.iter().map(|p| p.1).collect::<Vec<_>>())?;
     let out = g.zeros::<u32>(pr.len() * REC)?;
-    let params = Params { out: out.cu_deviceptr(), probes: table.cu_deviceptr(), handle: ias.handle(), sections: std::env::var("ODT_XF_SECTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(63), _pad: 0 };
+    let params = Params { out: out.cu_deviceptr(), probes: table.cu_deviceptr(), handle: ias.handle() };
     // SAFETY: `params` matches the device struct; `out` holds `REC` words per probe; no SBT data
     // is read; everything outlives the launch (it synchronizes).
     unsafe { g.launch(&pipeline, &sbt, &params, [pr.len() as u32, 1, 1]) }?;
     let got = g.down(&out)?;
-    if std::env::var("ODT_XF_SECTIONS").is_ok() {
-        for (i, (k, _)) in pr.iter().enumerate() {
-            let r = &got[i * REC..(i + 1) * REC];
-            let v: Vec<f32> = r[49..58].iter().map(|x| f32::from_bits(*x)).collect();
-            eprintln!("probe {i} inst {k} t {}: current-hit vertices {v:?}", f32::from_bits(r[93]));
-        }
-        eprintln!("handles: st {:#x} gas {:#x} mm {:#x} sm {:#x} mgas {:#x}", st.handle(), gas.handle(), mm.handle(), sm.handle(), mgas.handle());
-    }
 
     let f = |w: &[u32]| w.iter().map(|x| f32::from_bits(*x)).collect::<Vec<f32>>();
     let h64 = |w: &[u32]| u64::from(w[0]) | u64::from(w[1]) << 32;
@@ -505,7 +459,14 @@ pub fn run(g: &Gpu) -> R {
         if *k == 4 {
             chk("motion GAS vertices from handle at the ray time", 120, verts.as_flattened())?;
         }
-        chk("vertices at the ray time", 49, verts.as_flattened())?;
+        if *k == 4 {
+            // Observed with OptiX 9.1 / driver 621.24: the current-hit query on a motion GAS
+            // returns key 0 at every ray time, although optix_device.h documents "at the current
+            // ray time" (the from-handle query above interpolates). Pinned so a driver change shows.
+            chk("current-hit vertices on a motion GAS (driver returns key 0)", 49, TRI.as_flattened())?;
+        } else {
+            chk("vertices at the ray time", 49, verts.as_flattened())?;
+        }
         if let Some(e) = entry_m {
             chk("transform_from_handle o2w", 96, &e)?;
             chk("transform_from_handle w2o", 108, &inv(&e))?;

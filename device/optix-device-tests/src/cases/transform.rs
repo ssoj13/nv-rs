@@ -204,7 +204,7 @@ fn inv(m: &M) -> M {
     let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
     let c = |i: usize, j: usize| {
         let (r0, r1) = ([0, 1, 2].into_iter().filter(|x| *x != j).collect::<Vec<_>>(), [0, 1, 2].into_iter().filter(|x| *x != i).collect::<Vec<_>>());
-        let s = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
+        let s = if (i + j).is_multiple_of(2) { 1.0 } else { -1.0 };
         s * (a(r0[0], r1[0]) * a(r0[1], r1[1]) - a(r0[0], r1[1]) * a(r0[1], r1[0])) / det
     };
     let mut r = [0.0f32; 12];
@@ -328,12 +328,15 @@ const TRI1: [[f32; 3]; 3] = [[-2.5, -3.5, 0.0], [3.5, -2.0, 0.0], [0.5, 4.5, 0.0
 const SPACING: f32 = 20.0;
 const IDS: [u32; 5] = [7, 11, 13, 17, 19];
 
+/// The object-to-world matrix of a list entry at a ray time.
+type EntryFn = Box<dyn Fn(f32) -> M>;
+
 /// What the host knows about one instance.
 struct Inst {
     /// Instance object-to-world.
     m: M,
     /// Second list entry: its object-to-world at a time, and its kind.
-    entry: Option<(Box<dyn Fn(f32) -> M>, sys::OptixTransformType)>,
+    entry: Option<(EntryFn, sys::OptixTransformType)>,
     /// Vertices at a time.
     verts: Box<dyn Fn(f32) -> [[f32; 3]; 3]>,
 }

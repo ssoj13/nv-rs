@@ -41,7 +41,7 @@ unsafe impl cuda_device::ConstantMemoryValue for Params {}
 
 /// Ray `x` of either case: the even ones hit the triangle.
 fn ray(x: u32) -> Ray {
-    let ox = if x % 2 == 0 { 0.25 } else { 2.0 };
+    let ox = if x.is_multiple_of(2) { 0.25 } else { 2.0 };
     Ray::new([ox, 0.25 + x as f32 * 0.01, -1.0], [0.0, 0.0, 1.0], 0.0, 1.0e16)
 }
 

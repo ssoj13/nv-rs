@@ -124,7 +124,7 @@ mod kernels {
             let mode = payload::word::<0>();
             payload::set_word::<1>(payload::word::<1>() + 1);
             payload::set_word::<2>(payload::word::<2>() | 1 << prim);
-            if (mode == 1 && prim % 2 == 0) || mode == 2 {
+            if (mode == 1 && prim.is_multiple_of(2)) || mode == 2 {
                 state::ignore_intersection();
             } else if mode == 3 {
                 state::terminate_ray();

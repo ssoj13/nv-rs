@@ -14,6 +14,7 @@
 //! 4. `traverse` + `set_sbt_record_index(1)` (hits) or `make_miss(1, ..)` (misses) + `invoke`:
 //!    closest-hit B / miss 1 runs instead;
 //! 5. `traverse` + `reorder` + `invoke`, and `is_nop` after an invoke.
+//!
 //! The host checks the normal trace against the analytic scene and every hit-object result
 //! against the normal trace.
 

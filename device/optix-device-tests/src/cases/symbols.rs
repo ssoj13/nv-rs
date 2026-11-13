@@ -140,6 +140,6 @@ pub fn run(g: &Gpu) -> R {
     unsafe { pipeline.read_symbol_into(s, sym_out, 0, &mut dst) }.ctx("read_symbol_into")?;
     s.synchronize().ctx("sync")?;
     let bytes = g.down(&dst)?;
-    let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     same("read_symbol_into of program writes", &words, &want.map(|v| 2 * v + 1), label)
 }

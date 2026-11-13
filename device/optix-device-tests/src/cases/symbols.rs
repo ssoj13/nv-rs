@@ -13,7 +13,7 @@ use super::common::{Ctx, Gpu, R, ensure, opts, same};
 use bytemuck::{Pod, Zeroable};
 use cuda_core::DeviceBuffer;
 use cuda_device::{ConstantMemory, constant, cuda_module, kernel};
-use optix::{LinkOptions, ProgramGroup, SbtRecord, ShaderBindingTable};
+use optix::{HitGroup, LinkOptions, ProgramGroup, SbtRecord, ShaderBindingTable};
 use optix_device::state;
 
 const N: usize = 8;
@@ -67,6 +67,9 @@ mod kernels {
             (&raw mut ODT_SYM_OUT).cast::<u32>().add(x).write_volatile(2 * v + 1);
         }
     }
+
+    #[kernel]
+    pub fn __miss__sym() {}
 }
 
 /// Runs the case.
@@ -94,10 +97,13 @@ pub fn run(g: &Gpu) -> R {
         return Err(format!("the raygen does not reference both globals: {names:?}"));
     };
     let o = opts("params_sym", size_of::<Params>())?;
-    let module = g.module(&Default::default(), &o, &["__raygen__sym"])?;
+    let module = g.module(&Default::default(), &o, &["__raygen__sym", "__miss__sym"])?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__sym").ctx("raygen")?;
-    let pipeline = g.pipeline(&o, LinkOptions { max_trace_depth: 0, ..Default::default() }, std::slice::from_ref(&raygen))?;
-    let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[] as &[SbtRecord<u32>], &[] as &[SbtRecord<u32>]).ctx("SBT")?;
+    // The SBT needs one miss and one hit-group record even though nothing is traced.
+    let miss = ProgramGroup::miss(&module, "__miss__sym").ctx("miss")?;
+    let hit = ProgramGroup::hit_group(&g.ctx, HitGroup::default()).ctx("empty hit group")?;
+    let pipeline = g.pipeline(&o, LinkOptions { max_trace_depth: 0, ..Default::default() }, &[raygen.clone(), miss.clone(), hit.clone()])?;
+    let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[SbtRecord::new(&miss, 0u32).ctx("ms")?], &[SbtRecord::new(&hit, 0u32).ctx("hg")?]).ctx("SBT")?;
     let out = g.zeros::<u32>(2 * N)?;
     // A constant-memory static keeps its `export_name`; OptiX copies into `.const` symbols too.
     pipeline.write_symbol(&g.stream, "odt_sym_const", 0, &[40u32, 41, 42, 43]).ctx("write_symbol into a .const symbol")?;

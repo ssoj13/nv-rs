@@ -876,9 +876,9 @@ fn motion_gas_traces_key_zero_and_vanishes() {
 }
 
 /// A two-key GAS over [0.5, 1] that vanishes before its first key, traced at time 0 either
-/// directly (single-GAS pipeline) or through an IAS.
-fn vanish_gas(through_ias: bool) -> Vec<u32> {
-    let mut rig = rig(Cfg { single_gas: !through_ias, motion: true, ..Default::default() });
+/// directly (in a single-GAS pipeline when `single_gas`) or through an IAS.
+fn vanish_gas(single_gas: bool, through_ias: bool) -> Vec<u32> {
+    let mut rig = rig(Cfg { single_gas, motion: true, ..Default::default() });
     let s = rig.stream.clone();
     let k0 = up(&s, &tri_verts(0.0, LEG));
     let k1 = up(&s, &tri_verts(DX, LEG));
@@ -895,14 +895,20 @@ fn vanish_gas(through_ias: bool) -> Vec<u32> {
 
 #[test]
 #[ignore = "GPU"]
-fn motion_gas_start_vanish_misses_direct() {
-    assert_eq!(vanish_gas(false), misses(), "a ray before begin misses a start-vanishing GAS");
+fn motion_gas_start_vanish_misses_direct_single_gas() {
+    assert_eq!(vanish_gas(true, false), misses(), "a ray before begin misses a start-vanishing GAS");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn motion_gas_start_vanish_misses_direct_any_graph() {
+    assert_eq!(vanish_gas(false, false), misses(), "a ray before begin misses a start-vanishing GAS");
 }
 
 #[test]
 #[ignore = "GPU"]
 fn motion_gas_start_vanish_misses_through_ias() {
-    assert_eq!(vanish_gas(true), misses(), "a ray before begin misses a start-vanishing GAS");
+    assert_eq!(vanish_gas(false, true), misses(), "a ray before begin misses a start-vanishing GAS");
 }
 
 // ---------------------------------------------------------------------------------------------

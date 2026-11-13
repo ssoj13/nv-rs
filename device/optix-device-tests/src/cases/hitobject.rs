@@ -226,10 +226,13 @@ fn expected(i: u32) -> Pay {
     [1, prim, IDS[inst], 1.0f32.to_bits(), u.to_bits(), v.to_bits(), 0, sys::OptixHitKind_OPTIX_HIT_KIND_TRIANGLE_BACK_FACE as u32]
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__ho", "__closesthit__ho_a", "__closesthit__ho_b", "__miss__ho0", "__miss__ho1"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let o = opts("params_ho", size_of::<Params>())?;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__ho").ctx("raygen")?;
     let miss0 = ProgramGroup::miss(&module, "__miss__ho0").ctx("miss 0")?;
     let miss1 = ProgramGroup::miss(&module, "__miss__ho1").ctx("miss 1")?;

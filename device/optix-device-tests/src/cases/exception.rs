@@ -105,12 +105,15 @@ mod kernels {
     }
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__exc", "__closesthit__exc", "__miss__exc", "__exception__exc"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let mut o = opts("params_exc", size_of::<Params>())?;
     o.single_gas = true;
     o.exceptions = (sys::OptixExceptionFlags_OPTIX_EXCEPTION_FLAG_USER | sys::OptixExceptionFlags_OPTIX_EXCEPTION_FLAG_TRACE_DEPTH) as u32;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__exc").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__exc").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__exc")), ..Default::default() }).ctx("hit group")?;

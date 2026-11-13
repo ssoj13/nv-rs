@@ -1,9 +1,9 @@
 //! Shared rig of the device test cases: one CUDA + OptiX context, the binary's PTX, pipeline
 //! options every case starts from, a launch helper and comparisons.
 //!
-//! **Why.** Every case compiles the whole embedded PTX (all cases' programs live in one module),
-//! so the options that constrain every program (payload and attribute register counts) must be
-//! the same in every case; [`opts`] is their single source. **Used by** every `cases::*` module.
+//! **Why.** All cases live in one PTX; each compiles only its own programs ([`subset_ptx`]), and
+//! the register counts that constrain programs (payload, attributes) have one source, [`opts`].
+//! **Used by** every `cases::*` module.
 
 use bytemuck::Pod;
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Stream};
@@ -54,9 +54,11 @@ impl Gpu {
         Ok(Self { cuda, stream, ctx, ptx })
     }
 
-    /// The binary's PTX compiled as one module with `mo` / `opts`.
-    pub fn module(&self, mo: &ModuleOptions<'_>, opts: &PipelineOptions) -> R<Arc<Module>> {
-        let (m, log) = Module::new(&self.ctx, mo, opts, &self.ptx).ctx("module")?;
+    /// The programs `entries` (and what they call) of the binary's PTX compiled as one module
+    /// with `mo` / `opts` (see [`subset_ptx`]).
+    pub fn module(&self, mo: &ModuleOptions<'_>, opts: &PipelineOptions, entries: &[&str]) -> R<Arc<Module>> {
+        let ptx = subset_ptx(&self.ptx, entries)?;
+        let (m, log) = Module::new(&self.ctx, mo, opts, &ptx).ctx("module")?;
         if !log.is_empty() {
             eprintln!("[module log] {log}");
         }
@@ -99,6 +101,94 @@ impl Gpu {
         unsafe { pipeline.launch(&self.stream, &dev, sbt, dims) }.ctx("launch")?;
         self.stream.synchronize().ctx("synchronize after launch")
     }
+}
+
+/// The function name in a PTX function header (`.visible .entry name(`, `.func (.param ..)
+/// name(`, ...): the identifier after the keywords and the optional return-parameter list.
+fn func_name(header: &str) -> Option<&str> {
+    let mut s = header.trim_start();
+    for kw in [".visible", ".weak", ".extern", ".entry", ".func"] {
+        s = s.trim_start().strip_prefix(kw).unwrap_or(s);
+    }
+    s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('(') {
+        s = &rest[rest.find(')')? + 1..];
+    }
+    let s = s.trim_start();
+    let end = s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).unwrap_or(s.len());
+    (end > 0).then(|| &s[..end])
+}
+
+/// `ptx` reduced to the entry functions `entries` and the functions they reach (directly or
+/// through other kept functions), with every non-function line (header, globals) kept.
+///
+/// **Why.** OptiX compiles every function of a module and validates it against the module's
+/// options: one program calling `optixSetPayloadTypes` breaks every module without payload
+/// types, and plain CUDA kernels must not drag `_optix_*` calls into `cuModuleLoadData`. Each
+/// case therefore compiles only its own programs out of the binary's single PTX.
+pub fn subset_ptx(ptx: &[u8], entries: &[&str]) -> R<Vec<u8>> {
+    let text = std::str::from_utf8(ptx).ctx("PTX is not UTF-8")?;
+    // Top-level items: (function name or None, text, is a definition).
+    let mut items: Vec<(Option<&str>, String, bool)> = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim_start();
+        let is_func = [".visible .entry", ".entry", ".visible .func", ".func", ".weak .func", ".extern .func"].iter().any(|k| t.starts_with(k));
+        if !is_func {
+            items.push((None, format!("{line}\n"), false));
+            continue;
+        }
+        let mut header = format!("{line}\n");
+        // The header ends with `;` (a declaration) or is followed by the body's `{`.
+        let mut is_def = false;
+        loop {
+            let last = header.lines().last().unwrap_or_default().trim();
+            if last.ends_with(';') {
+                break;
+            }
+            if last == "{" || last.ends_with('{') {
+                is_def = true;
+                break;
+            }
+            match lines.next() {
+                Some(l) => header.push_str(&format!("{l}\n")),
+                None => return Err("PTX ends inside a function header".into()),
+            }
+        }
+        let name = func_name(&header).ok_or_else(|| format!("no function name in PTX header {header:?}"))?;
+        if is_def {
+            // Count braces outside `//` comments until the body closes (inline asm brings its own
+            // balanced braces).
+            let count = |s: &str| s.split("//").next().unwrap_or_default().chars().fold(0i64, |d, c| d + i64::from(c == '{') - i64::from(c == '}'));
+            let mut depth: i64 = header.lines().map(count).sum();
+            while depth > 0 {
+                let l = lines.next().ok_or_else(|| format!("PTX ends inside function {name}"))?;
+                depth += count(l);
+                header.push_str(&format!("{l}\n"));
+            }
+        }
+        items.push((Some(name), header, is_def));
+    }
+    let defined: Vec<&str> = items.iter().filter(|i| i.2).filter_map(|i| i.0).collect();
+    for e in entries {
+        if !defined.contains(e) {
+            return Err(format!("entry {e} not found in the PTX"));
+        }
+    }
+    // Closure over references: a kept body naming another defined function keeps it.
+    let mut keep: Vec<&str> = entries.to_vec();
+    let mut i = 0;
+    while i < keep.len() {
+        let body = items.iter().find(|it| it.2 && it.0 == Some(keep[i])).map(|it| it.1.as_str()).unwrap_or_default();
+        for name in &defined {
+            if !keep.contains(name) && body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(|tok| tok == *name) {
+                keep.push(name);
+            }
+        }
+        i += 1;
+    }
+    let out: String = items.iter().filter(|it| it.0.is_none_or(|n| keep.contains(&n))).map(|it| it.1.as_str()).collect();
+    Ok(out.into_bytes())
 }
 
 /// Pipeline options every case starts from: launch parameters `name` of `size` bytes,

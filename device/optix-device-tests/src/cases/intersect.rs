@@ -156,12 +156,15 @@ mod kernels {
     pub fn __miss__isect() {}
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__isect", "__intersection__isect", "__anyhit__isect", "__closesthit__isect", "__miss__isect"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let mut o = opts("params_is", size_of::<Params>())?;
     o.single_gas = true;
     o.primitive_types = (sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_CUSTOM | sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE) as u32;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__isect").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__isect").ctx("miss")?;
     let hg = HitGroup { closest_hit: Some((&module, "__closesthit__isect")), any_hit: Some((&module, "__anyhit__isect")), intersection: Some((&module, "__intersection__isect")) };

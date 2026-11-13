@@ -190,7 +190,7 @@ pub fn payload_types(g: &Gpu) -> R {
     let mut o = opts("params_pt", size_of::<Params>())?;
     o.payload_values = 0;
     o.single_gas = true;
-    let module = g.module(&ModuleOptions { payload_types: &types, ..Default::default() }, &o)?;
+    let module = g.module(&ModuleOptions { payload_types: &types, ..Default::default() }, &o, &["__raygen__pt", "__closesthit__pt0", "__closesthit__pt1", "__miss__pt0", "__miss__pt1"])?;
     let raygen = ProgramGroup::new(&g.ctx, Programs::Raygen(&module, "__raygen__pt"), None).ctx("raygen")?;
     let ms0 = ProgramGroup::new(&g.ctx, Programs::Miss(&module, "__miss__pt0"), Some(pt0)).ctx("miss 0")?;
     let ms1 = ProgramGroup::new(&g.ctx, Programs::Miss(&module, "__miss__pt1"), Some(pt1)).ctx("miss 1")?;
@@ -214,7 +214,7 @@ pub fn payload_types(g: &Gpu) -> R {
 pub fn callables(g: &Gpu) -> R {
     let mut o = opts("params_call", size_of::<Params>())?;
     o.single_gas = true;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, &["__raygen__call", "__closesthit__call", "__miss__call", "__direct_callable__mix", "__direct_callable__store", "__continuation_callable__cc"])?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__call").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__call").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__call")), ..Default::default() }).ctx("hit group")?;

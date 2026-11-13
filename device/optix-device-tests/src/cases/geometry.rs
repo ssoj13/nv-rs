@@ -297,13 +297,16 @@ fn build_flags() -> u32 {
     (sys::OptixBuildFlags_OPTIX_BUILD_FLAG_PREFER_FAST_TRACE | sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_COMPACTION | sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS) as u32
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__geo", "__miss__geo", "__closesthit__geo_tri", "__closesthit__geo_sphere", "__closesthit__geo_curve"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let mut o = opts("params_geo", size_of::<Params>())?;
     o.primitive_types = (sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE
         | sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE
         | sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE) as u32;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let is = |primitive| Module::builtin_intersection(&g.ctx, &Default::default(), &o, BuiltinIs { primitive, motion_blur: false, build_flags: build_flags(), endcaps: false });
     let sphere_is = is(Primitive::Sphere).ctx("sphere intersector")?;
     let curve_is = is(Primitive::RoundCubicBspline).ctx("curve intersector")?;

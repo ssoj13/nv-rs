@@ -124,11 +124,14 @@ fn reference(x: u32, y: u32) -> [f32; 4] {
     [BG[0], BG[1], BG[2], -1.0]
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__render", "__miss__background", "__closesthit__shade", "__direct_callable__double"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let mut o = opts("params_shade", size_of::<Params>())?;
     o.single_gas = true;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__render").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__background").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__shade")), ..Default::default() }).ctx("hit group")?;

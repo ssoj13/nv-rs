@@ -383,11 +383,14 @@ fn probes() -> Vec<(usize, [f32; 8])> {
     v
 }
 
+/// The programs this case links.
+const ENTRIES: &[&str] = &["__raygen__xf", "__miss__xf", "__closesthit__xf"];
+
 /// Runs the case.
 pub fn run(g: &Gpu) -> R {
     let mut o = opts("params_xf", size_of::<Params>())?;
     o.motion_blur = true;
-    let module = g.module(&Default::default(), &o)?;
+    let module = g.module(&Default::default(), &o, ENTRIES)?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__xf").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__xf").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__xf")), ..Default::default() }).ctx("hit group")?;

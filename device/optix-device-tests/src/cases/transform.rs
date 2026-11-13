@@ -461,7 +461,8 @@ pub fn run(g: &Gpu) -> R {
     if std::env::var("ODT_XF_SECTIONS").is_ok() {
         for (i, (k, _)) in pr.iter().enumerate() {
             let r = &got[i * REC..(i + 1) * REC];
-            eprintln!("probe {i} inst {k}: n {} type1 {} ptr {:#x} child0 {:#x} child1 {:#x}", r[1], r[86], u64::from(r[132]) | u64::from(r[133]) << 32, u64::from(r[60]) | u64::from(r[61]) << 32, u64::from(r[134]) | u64::from(r[135]) << 32);
+            let v: Vec<f32> = r[49..58].iter().map(|x| f32::from_bits(*x)).collect();
+            eprintln!("probe {i} inst {k} t {}: current-hit vertices {v:?}", f32::from_bits(r[93]));
         }
         eprintln!("handles: st {:#x} gas {:#x} mm {:#x} sm {:#x} mgas {:#x}", st.handle(), gas.handle(), mm.handle(), sm.handle(), mgas.handle());
     }

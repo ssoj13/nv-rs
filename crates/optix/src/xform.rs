@@ -130,6 +130,8 @@ pub enum Child {
     Accel(Arc<Accel>),
     /// Another transform.
     Transform(Arc<Transform>),
+    /// One GAS of a cluster build ([`crate::ClusterAccel::child`]): the build and the GAS handle.
+    Cluster(Arc<crate::ClusterAccel>, sys::OptixTraversableHandle),
 }
 
 impl Child {
@@ -138,13 +140,16 @@ impl Child {
         match self {
             Self::Accel(a) => a.handle(),
             Self::Transform(t) => t.handle(),
+            Self::Cluster(_, h) => *h,
         }
     }
 
-    fn context(&self) -> &Arc<DeviceContext> {
+    /// The device context the child lives in.
+    pub fn context(&self) -> &Arc<DeviceContext> {
         match self {
             Self::Accel(a) => a.context(),
             Self::Transform(t) => &t.ctx,
+            Self::Cluster(c, _) => c.context(),
         }
     }
 }
@@ -158,6 +163,18 @@ impl From<Arc<Accel>> for Child {
 impl From<Arc<Transform>> for Child {
     fn from(t: Arc<Transform>) -> Self {
         Self::Transform(t)
+    }
+}
+
+impl From<&Arc<Accel>> for Child {
+    fn from(a: &Arc<Accel>) -> Self {
+        Self::Accel(a.clone())
+    }
+}
+
+impl From<&Arc<Transform>> for Child {
+    fn from(t: &Arc<Transform>) -> Self {
+        Self::Transform(t.clone())
     }
 }
 

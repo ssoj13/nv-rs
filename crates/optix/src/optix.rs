@@ -36,12 +36,12 @@ pub mod stack;
 pub mod task;
 pub mod xform;
 
-pub use accel::{Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit, GeometryFlags, Indices, Instance, Keys, Motion, Radii, RelocationInfo, Relink, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices};
+pub use accel::{Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit, GeometryFlags, Indices, Instance, Keys, Radii, RelocationInfo, Relink, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices};
 pub use cluster::{ClusterAccel, ClusterArg, ClusterArgs, ClusterFlags, ClusterInput, ClusterKind, ClusterLimits, ClusterMode, ClusterOptions, ClusterRefs, ClusterSizes, GridLimits, TriangleLimits};
 pub use context::{DeviceContext, LogFn, describe, error_name, error_string};
 pub use denoise::{AlphaMode, AovType, Denoiser, DenoiserModel, DenoiserOptions, Guides, Image, Layer, Params, Pixel, PixelFormat, Tile, split_image};
 pub use micromap::{MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapSizes, MicromapUse, OpacityMicromapArray, base_to_micro_bary, micro_to_base_bary};
-pub use module::{BoundValue, BuiltinIs, DebugLevel, HitGroup, Module, ModuleOptions, OptLevel, PayloadSemantics, PayloadType, PipelineOptions, Primitive, ProgramGroup};
+pub use module::{BoundValue, BuiltinIs, DebugLevel, HitGroup, Module, ModuleOptions, OptLevel, PayloadSemantics, PayloadType, PipelineOptions, Primitive, ProgramGroup, Programs};
 pub use pipeline::{LinkOptions, Pipeline};
 pub use sbt::{SbtRecord, ShaderBindingTable};
 pub use stack::{PipelineStack, StackSizes, simple_path_tracer};

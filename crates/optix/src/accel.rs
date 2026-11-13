@@ -28,6 +28,7 @@
 //! [`Scratch`]), render-rs and the nv-rs OptiX tests.
 
 use crate::micromap::{MicromapUse, OpacityMicromapArray};
+use crate::xform::{Child, MotionOptions};
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -419,46 +420,6 @@ impl<'a> CustomPrimitives<'a> {
     }
 }
 
-/// Motion blur of a build (`OptixMotionOptions`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Motion {
-    /// Number of keys (at least 2); every per-key input carries this many buffers.
-    pub keys: u16,
-    /// Time of the first key.
-    pub time_begin: f32,
-    /// Time of the last key (greater than `time_begin`).
-    pub time_end: f32,
-    /// The object does not exist before `time_begin`.
-    pub start_vanish: bool,
-    /// The object does not exist after `time_end`.
-    pub end_vanish: bool,
-}
-
-impl Motion {
-    /// `keys` keys spread over `[time_begin, time_end]`, clamped outside.
-    pub fn new(keys: u16, time_begin: f32, time_end: f32) -> Self {
-        Self { keys, time_begin, time_end, start_vanish: false, end_vanish: false }
-    }
-
-    fn to_sys(self) -> Result<sys::OptixMotionOptions> {
-        if self.keys < 2 {
-            return Err(Error::Invalid("motion needs at least two keys"));
-        }
-        // Anything but `Less` (including NaN times) is rejected.
-        if self.time_begin.partial_cmp(&self.time_end) != Some(std::cmp::Ordering::Less) {
-            return Err(Error::Invalid("motion time_begin must be less than time_end"));
-        }
-        let mut flags = sys::OptixMotionFlags_OPTIX_MOTION_FLAG_NONE as u16;
-        if self.start_vanish {
-            flags |= sys::OptixMotionFlags_OPTIX_MOTION_FLAG_START_VANISH as u16;
-        }
-        if self.end_vanish {
-            flags |= sys::OptixMotionFlags_OPTIX_MOTION_FLAG_END_VANISH as u16;
-        }
-        Ok(sys::OptixMotionOptions { numKeys: self.keys, flags, timeBegin: self.time_begin, timeEnd: self.time_end })
-    }
-}
-
 /// How a structure is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BuildOptions {
@@ -471,8 +432,10 @@ pub struct BuildOptions {
     /// New device bytes the build may allocate at peak (scratch growth + output); `None` admits
     /// any size. Checked after OptiX reports the sizes and before anything is allocated.
     pub budget: Option<usize>,
-    /// Motion blur; `None` builds a static structure.
-    pub motion: Option<Motion>,
+    /// Motion keys per input (1 = static; every per-key input then carries this many buffers).
+    pub motion_keys: u16,
+    /// Time range and vanish flags of the keys (ignored when `motion_keys` is 1).
+    pub motion: MotionOptions,
     /// Allow `optixGet*VertexDataFromHandle` / `optixGetSphereDataFromHandle` on the result.
     pub random_vertex_access: bool,
     /// Allow `optixGetInstanceTraversableFromIAS` on the result.
@@ -491,7 +454,8 @@ impl Default for BuildOptions {
             compact: true,
             allow_update: false,
             budget: None,
-            motion: None,
+            motion_keys: 1,
+            motion: MotionOptions::default(),
             random_vertex_access: false,
             random_instance_access: false,
             allow_micromap_update: false,
@@ -523,7 +487,11 @@ impl BuildOptions {
     }
 
     fn motion_sys(&self) -> Result<sys::OptixMotionOptions> {
-        self.motion.map_or(Ok(sys::OptixMotionOptions::default()), Motion::to_sys)
+        match self.motion_keys {
+            0 => Err(Error::Invalid("motion_keys must be at least 1")),
+            1 => Ok(sys::OptixMotionOptions::default()),
+            keys => self.motion.to_sys(keys),
+        }
     }
 }
 
@@ -650,8 +618,8 @@ impl Scratch {
 /// One instance of a structure inside an instance structure.
 #[derive(Clone)]
 pub struct Instance {
-    /// The instanced structure.
-    pub accel: Arc<Accel>,
+    /// What is instanced: a structure, a transform (motion blur) or a cluster GAS.
+    pub child: Child,
     /// Row-major 3x4 object-to-world transform.
     pub transform: [f32; 12],
     /// Value `optixGetInstanceId` returns.
@@ -668,9 +636,9 @@ impl Instance {
     /// The identity transform.
     pub const IDENTITY: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
-    /// `accel` with the identity transform, id 0, SBT offset 0, visible to every ray.
-    pub fn new(accel: &Arc<Accel>) -> Self {
-        Self { accel: accel.clone(), transform: Self::IDENTITY, id: 0, sbt_offset: 0, mask: 0xFF, flags: 0 }
+    /// `child` with the identity transform, id 0, SBT offset 0, visible to every ray.
+    pub fn new(child: impl Into<Child>) -> Self {
+        Self { child: child.into(), transform: Self::IDENTITY, id: 0, sbt_offset: 0, mask: 0xFF, flags: 0 }
     }
 
     fn raw(&self) -> sys::OptixInstance {
@@ -680,7 +648,7 @@ impl Instance {
             sbtOffset: self.sbt_offset,
             visibilityMask: u32::from(self.mask),
             flags: self.flags,
-            traversableHandle: self.accel.handle(),
+            traversableHandle: self.child.handle(),
             pad: [0; 2],
         }
     }
@@ -693,7 +661,7 @@ const _: () = assert!(size_of::<sys::OptixInstance>().is_multiple_of(sys::OPTIX_
 
 /// Rejects instances of structures from another device context.
 fn check_children(ctx: &Arc<DeviceContext>, instances: &[Instance]) -> Result<()> {
-    if instances.iter().any(|i| !Arc::ptr_eq(&i.accel.ctx, ctx)) {
+    if instances.iter().any(|i| !Arc::ptr_eq(i.child.context(), ctx)) {
         return Err(Error::Invalid("instance of a structure from another device context"));
     }
     Ok(())
@@ -703,7 +671,7 @@ fn check_children(ctx: &Arc<DeviceContext>, instances: &[Instance]) -> Result<()
 /// (`OPTIX_BUILD_INPUT_TYPE_INSTANCE_POINTERS`); one set can feed several structures.
 pub struct DeviceInstances {
     buffer: DeviceBuffer<u8>,
-    children: Vec<Arc<Accel>>,
+    children: Vec<Child>,
     stream: Arc<Stream>,
     ctx: Arc<DeviceContext>,
 }
@@ -722,7 +690,7 @@ impl DeviceInstances {
         if buffer.cu_deviceptr() % u64::from(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT) != 0 {
             return Err(Error::Invalid("allocator returned instances below OptiX's instance alignment"));
         }
-        Ok(Self { buffer, children: instances.iter().map(|i| i.accel.clone()).collect(), stream: stream.clone(), ctx: ctx.clone() })
+        Ok(Self { buffer, children: instances.iter().map(|i| i.child.clone()).collect(), stream: stream.clone(), ctx: ctx.clone() })
     }
 
     /// Number of instances.
@@ -751,7 +719,7 @@ enum Item {
 /// What a structure keeps alive: instanced structures and micromap arrays it reads.
 #[derive(Clone, Default)]
 struct Refs {
-    children: Vec<Arc<Accel>>,
+    children: Vec<Child>,
     micromaps: Vec<Arc<OpacityMicromapArray>>,
 }
 
@@ -1027,7 +995,7 @@ fn gas_inputs<G: Gas>(items: &[G], cx: &Cx<'_>) -> Result<Inputs> {
 }
 
 /// One instance-array input over `raw` instances of `kind`'s device array `device`.
-fn instance_input(kind: sys::OptixBuildInputType, device: DeviceBuffer<u8>, n: u32, item: Item, children: Vec<Arc<Accel>>) -> Inputs {
+fn instance_input(kind: sys::OptixBuildInputType, device: DeviceBuffer<u8>, n: u32, item: Item, children: Vec<Child>) -> Inputs {
     let mut input = sys::OptixBuildInput { type_: kind, ..Default::default() };
     input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray { instances: device.cu_deviceptr(), numInstances: n, instanceStride: 0 };
     Inputs { inputs: vec![input], shape: vec![item], _device: vec![device], refs: Refs { children, micromaps: Vec::new() }, ..Default::default() }
@@ -1045,7 +1013,7 @@ fn instance_inputs(cx: &Cx<'_>, instances: &[Instance]) -> Result<Inputs> {
     if device.cu_deviceptr() % u64::from(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT) != 0 {
         return Err(Error::Invalid("allocator returned instances below OptiX's instance alignment"));
     }
-    let children = instances.iter().map(|i| i.accel.clone()).collect();
+    let children = instances.iter().map(|i| i.child.clone()).collect();
     Ok(instance_input(sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES, device, n, Item::Instances(n), children))
 }
 
@@ -1104,7 +1072,7 @@ pub enum Relink<'a> {
     /// Keep the source's children and micromap arrays (same device context only).
     Keep,
     /// Instance structures: the (relocated) structure per instance, in build order.
-    Children(&'a [Arc<Accel>]),
+    Children(&'a [Child]),
     /// Triangle structures: the (relocated) micromap array per mesh, given exactly for the meshes
     /// built with one.
     Micromaps(&'a [Option<Arc<OpacityMicromapArray>>]),
@@ -1163,10 +1131,8 @@ impl Accel {
 
     fn cx<'a>(ctx: &'a Arc<DeviceContext>, stream: &'a Arc<Stream>, opts: &BuildOptions) -> Result<Cx<'a>> {
         same_ctx(stream, ctx)?;
-        let keys = match opts.motion {
-            Some(m) => usize::from(m.to_sys()?.numKeys),
-            None => 1,
-        };
+        opts.motion_sys()?;
+        let keys = usize::from(opts.motion_keys);
         Ok(Cx { ctx, stream, keys, omm_update: opts.allow_micromap_update })
     }
 
@@ -1191,7 +1157,7 @@ impl Accel {
         let t = ctx.table();
         let flags = opts.flags();
         let motion = opts.motion_sys()?;
-        let keys = opts.motion.map_or(1, |m| usize::from(m.keys));
+        let keys = usize::from(opts.motion_keys);
         let accel_opts = sys::OptixAccelBuildOptions { buildFlags: flags, operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_BUILD, motionOptions: motion };
         let sizes = Self::sizes(ctx, &accel_opts, &inputs.inputs)?;
         within(opts.budget, scratch.growth(sizes.tempSizeInBytes).saturating_add(sizes.outputSizeInBytes))?;
@@ -1442,7 +1408,7 @@ impl Accel {
                 if children.len() != n as usize {
                     return Err(Error::Invalid("Relink::Children needs one structure per instance"));
                 }
-                if children.iter().any(|c| !Arc::ptr_eq(&c.ctx, ctx)) {
+                if children.iter().any(|c| !Arc::ptr_eq(c.context(), ctx)) {
                     return Err(Error::Invalid("relinked child from another device context than the target"));
                 }
                 let raw: Vec<sys::OptixTraversableHandle> = children.iter().map(|c| c.handle()).collect();

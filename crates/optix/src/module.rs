@@ -567,31 +567,68 @@ fn raw_of(m: &Option<(Arc<Module>, Option<CString>)>) -> (sys::OptixModule, *con
     m.as_ref().map_or((std::ptr::null_mut(), std::ptr::null()), |(m, n)| (m.raw(), n.as_ref().map_or(std::ptr::null(), |n| n.as_ptr())))
 }
 
+/// The programs of one group, for [`ProgramGroup::new`].
+#[derive(Clone)]
+pub enum Programs<'a> {
+    /// A ray-generation program.
+    Raygen(&'a Arc<Module>, &'a str),
+    /// A miss program.
+    Miss(&'a Arc<Module>, &'a str),
+    /// An exception program.
+    Exception(&'a Arc<Module>, &'a str),
+    /// A hit group.
+    HitGroup(HitGroup<'a>),
+    /// Direct and / or continuation callables.
+    Callables {
+        /// `__direct_callable__*`.
+        direct: Option<(&'a Arc<Module>, &'a str)>,
+        /// `__continuation_callable__*`.
+        continuation: Option<(&'a Arc<Module>, &'a str)>,
+    },
+}
+
 impl ProgramGroup {
+    /// A program group whose programs use `payload_type` (`OptixProgramGroupOptions::payloadType`):
+    /// required when its modules declare several payload types and OptiX cannot deduce which one
+    /// the group uses; `None` lets OptiX deduce it.
+    pub fn new(ctx: &Arc<DeviceContext>, programs: Programs<'_>, payload_type: Option<PayloadType<'_>>) -> Result<Arc<Self>> {
+        match programs {
+            Programs::Raygen(m, e) => Self::single(ctx, m, e, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_RAYGEN, payload_type),
+            Programs::Miss(m, e) => Self::single(ctx, m, e, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_MISS, payload_type),
+            Programs::Exception(m, e) => Self::single(ctx, m, e, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_EXCEPTION, payload_type),
+            Programs::HitGroup(h) => Self::hits(ctx, h, payload_type),
+            Programs::Callables { direct, continuation } => Self::calls(ctx, direct, continuation, payload_type),
+        }
+    }
+
     /// A ray-generation program.
     pub fn raygen(module: &Arc<Module>, entry: &str) -> Result<Arc<Self>> {
-        Self::single(module, entry, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_RAYGEN)
+        Self::new(&module.ctx, Programs::Raygen(module, entry), None)
     }
 
     /// A miss program.
     pub fn miss(module: &Arc<Module>, entry: &str) -> Result<Arc<Self>> {
-        Self::single(module, entry, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_MISS)
+        Self::new(&module.ctx, Programs::Miss(module, entry), None)
     }
 
     /// An exception program.
     pub fn exception(module: &Arc<Module>, entry: &str) -> Result<Arc<Self>> {
-        Self::single(module, entry, sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_EXCEPTION)
+        Self::new(&module.ctx, Programs::Exception(module, entry), None)
     }
 
-    fn single(module: &Arc<Module>, entry: &str, kind: sys::OptixProgramGroupKind) -> Result<Arc<Self>> {
+    fn single(ctx: &Arc<DeviceContext>, module: &Arc<Module>, entry: &str, kind: sys::OptixProgramGroupKind, payload: Option<PayloadType<'_>>) -> Result<Arc<Self>> {
         let name = CString::new(entry).map_err(|_| Error::Invalid("entry name contains NUL"))?;
         let mut desc = sys::OptixProgramGroupDesc { kind, ..Default::default() };
         desc.__bindgen_anon_1.raygen = sys::OptixProgramGroupSingleModule { module: module.raw(), entryFunctionName: name.as_ptr() };
-        Self::create(&module.ctx, &desc, vec![module.clone()])
+        Self::create(ctx, &desc, vec![module.clone()], payload)
     }
 
     /// A hit group (closest hit, any hit, intersection).
     pub fn hit_group(ctx: &Arc<DeviceContext>, programs: HitGroup<'_>) -> Result<Arc<Self>> {
+        Self::new(ctx, Programs::HitGroup(programs), None)
+    }
+
+    fn hits(ctx: &Arc<DeviceContext>, programs: HitGroup<'_>, payload: Option<PayloadType<'_>>) -> Result<Arc<Self>> {
         let ch = named(programs.closest_hit)?;
         let ah = named(programs.any_hit)?;
         let is = named(programs.intersection)?;
@@ -608,12 +645,16 @@ impl ProgramGroup {
         // Clone the modules: `ch`/`ah`/`is` own the entry-name strings `desc` points at and must
         // live until `create` returns.
         let modules = [&ch, &ah, &is].into_iter().flatten().map(|(m, _)| m.clone()).collect();
-        Self::create(ctx, &desc, modules)
+        Self::create(ctx, &desc, modules, payload)
     }
 
     /// A callable program: direct (`__direct_callable__*`) and/or continuation
     /// (`__continuation_callable__*`).
     pub fn callables(ctx: &Arc<DeviceContext>, direct: Option<(&Arc<Module>, &str)>, continuation: Option<(&Arc<Module>, &str)>) -> Result<Arc<Self>> {
+        Self::new(ctx, Programs::Callables { direct, continuation }, None)
+    }
+
+    fn calls(ctx: &Arc<DeviceContext>, direct: Option<(&Arc<Module>, &str)>, continuation: Option<(&Arc<Module>, &str)>, payload: Option<PayloadType<'_>>) -> Result<Arc<Self>> {
         let dc = named(direct)?;
         let cc = named(continuation)?;
         let ((m_dc, n_dc), (m_cc, n_cc)) = (raw_of(&dc), raw_of(&cc));
@@ -626,15 +667,20 @@ impl ProgramGroup {
         };
         // As in `hit_group`: `dc`/`cc` own the entry names and must outlive `create`.
         let modules = [&dc, &cc].into_iter().flatten().map(|(m, _)| m.clone()).collect();
-        Self::create(ctx, &desc, modules)
+        Self::create(ctx, &desc, modules, payload)
     }
 
-    fn create(ctx: &Arc<DeviceContext>, desc: &sys::OptixProgramGroupDesc, modules: Vec<Arc<Module>>) -> Result<Arc<Self>> {
+    fn create(ctx: &Arc<DeviceContext>, desc: &sys::OptixProgramGroupDesc, modules: Vec<Arc<Module>>, payload: Option<PayloadType<'_>>) -> Result<Arc<Self>> {
         if modules.iter().any(|m| !Arc::ptr_eq(&m.ctx, ctx)) {
             return Err(Error::Invalid("program group mixes device contexts"));
         }
         let t = ctx.table();
-        let opts = sys::OptixProgramGroupOptions::default();
+        if payload.is_some_and(|p| p.words.is_empty() || p.words.len() > 32) {
+            return Err(Error::Invalid("a payload type has 1..=32 words"));
+        }
+        // `PayloadSemantics` is `repr(transparent)` over the `u32` OptiX reads; `ty` outlives the call.
+        let ty = payload.map(|p| sys::OptixPayloadType { numPayloadValues: p.words.len() as u32, payloadSemantics: p.words.as_ptr().cast() });
+        let opts = sys::OptixProgramGroupOptions { payloadType: ty.as_ref().map_or(std::ptr::null(), |t| t as *const _) };
         let mut log = vec![0u8; LOG_BYTES];
         let mut log_len = log.len();
         let mut raw = std::ptr::null_mut();

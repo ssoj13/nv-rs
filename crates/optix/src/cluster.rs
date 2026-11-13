@@ -593,4 +593,18 @@ impl ClusterAccel {
     pub fn context(&self) -> &Arc<DeviceContext> {
         &self.ctx
     }
+
+    /// GAS `index` of a [`ClusterKind::GasesFromClusters`] build as an instance child: reads its
+    /// handle back (synchronizes `stream`, which must be the build stream or ordered after it).
+    pub fn child(self: &Arc<Self>, stream: &Stream, index: usize) -> Result<crate::Child> {
+        if self.kind != ClusterKind::GasesFromClusters {
+            return Err(Error::Invalid("only GasesFromClusters builds produce traversable GASes"));
+        }
+        let handles = self.handles.to_host_vec(stream)?;
+        let handle = *handles.get(index).ok_or(Error::Invalid("cluster GAS index out of range"))?;
+        if handle == 0 {
+            return Err(Error::Invalid("cluster GAS slot was not built (past the device count)"));
+        }
+        Ok(crate::Child::Cluster(self.clone(), handle))
+    }
 }

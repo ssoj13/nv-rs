@@ -215,23 +215,34 @@ const fn by_ptr<T>(n: usize) -> bool {
     n > 64 || size_of::<T>() > size_of::<u32>()
 }
 
-/// Widens `v` into `R` registers; slots past `N` stay `0`.
+/// Runs `$body` with `$k` bound to every literal `0..64` below `$n` (the guards fold away).
+///
+/// Register packing indexes vectors only with constants this way: a loop over the arrays (even
+/// a fixed-count one) made cuda-oxide keep them in a `.local` depot addressed through 32-bit
+/// registers, which OptiX programs fault on.
+macro_rules! each64 {
+    ($n:expr, $k:ident => $body:expr) => {
+        each64!(@ $n, $k => $body; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+            32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63)
+    };
+    (@ $n:expr, $k:ident => $body:expr; $($i:literal)*) => {
+        $( if $i < $n { let $k: usize = $i; $body; } )*
+    };
+}
+
+/// Widens `v` into `R` registers; slots past `N` stay `0` (`N <= R <= 64` on every call path).
 #[inline(always)]
 fn pack<T: CoopElem, const N: usize, const R: usize>(v: &CoopVec<T, N>) -> [u32; R] {
     let mut r = [0u32; R];
-    for (d, s) in r.iter_mut().zip(v.0.iter()) {
-        *d = s.to_reg();
-    }
+    each64!(if N < R { N } else { R }, k => r[k] = v.0[k].to_reg());
     r
 }
 
-/// Narrows the first `N` of `R` registers into a vector (`N <= R` on every call path).
+/// Narrows the first `N` of `R` registers into a vector (`N <= R <= 64` on every call path).
 #[inline(always)]
 fn unpack<T: CoopElem, const N: usize, const R: usize>(r: &[u32; R]) -> CoopVec<T, N> {
     let mut v = [T::from_reg(0); N];
-    for (d, s) in v.iter_mut().zip(r.iter()) {
-        *d = T::from_reg(*s);
-    }
+    each64!(if N < R { N } else { R }, k => v[k] = T::from_reg(r[k]));
     CoopVec(v)
 }
 

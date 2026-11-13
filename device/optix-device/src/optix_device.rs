@@ -10,6 +10,10 @@
 //! - [`payload`] — typed [`Payload`]s in payload registers;
 //! - [`trace`] — [`trace::trace`] with a [`trace::Ray`] and [`trace::TraceOptions`];
 //! - [`exception`] — user exceptions, codes, details, line info.
+//! - [`geometry`] — vertex data of the hit primitive (triangles, every curve kind, ribbons,
+//!   spheres), current hit, by GAS index or by handle, and hit-kind helpers;
+//! - [`transform`] — transform lists, transforms by handle (static, matrix / SRT motion,
+//!   instance), object <-> world matrices and point / vector / normal transforms, GAS motion;
 //!
 //! Every function is `unsafe`: OptiX restricts each intrinsic to certain program types, which the
 //! type system cannot see; each documents where it is valid.
@@ -19,9 +23,11 @@
 #![no_std]
 
 pub mod exception;
+pub mod geometry;
 pub mod payload;
 pub mod state;
 pub mod trace;
+pub mod transform;
 
 pub use payload::Payload;
 

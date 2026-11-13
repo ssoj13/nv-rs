@@ -11,9 +11,11 @@ const SPEC: LibSpec = LibSpec {
     allow_var: &["^NVAPI_.*", "^NV_.*"],
     reuse_cuda_types: &[],
     positive_enums: &[],
-    // NVAPI annotates every entry point with `__success(return == NVAPI_OK)`; MSVC's SAL
-    // definition of it is not C clang can parse, so it is emptied.
-    clang_args: &["-D__success(x)="],
+    // NVAPI's headers define SAL macros (`__in`, `__success`, ...) only when absent and every
+    // `nvapi_lite_*.h` undefines its own definitions again at its end (`nvapi_lite_salend.h`), so
+    // the body of `nvapi.h` is left without them. Force-including the Windows SDK's `sal.h` first
+    // makes them pre-existing: NVAPI then neither defines nor undefines them.
+    clang_args: &["-include", "sal.h"],
     shape: Shape::QueryInterface {
         interface_header: "nvapi_interface.h",
         loader_fn: "nvapi_api",

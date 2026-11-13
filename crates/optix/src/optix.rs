@@ -55,6 +55,14 @@ pub enum Error {
     /// A CUDA driver call failed.
     #[error("CUDA: {0}")]
     Driver(#[from] DriverError),
+    /// A build needs more device memory than the caller's budget admits.
+    #[error("needs {requested} device bytes, budget admits {available}")]
+    Budget {
+        /// Peak bytes the operation would allocate.
+        requested: usize,
+        /// The caller's budget.
+        available: usize,
+    },
     /// An argument was rejected before reaching OptiX.
     #[error("invalid argument: {0}")]
     Invalid(&'static str),

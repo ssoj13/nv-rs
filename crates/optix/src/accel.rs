@@ -43,12 +43,15 @@ pub struct BuildOptions {
     pub prefer_fast_trace: bool,
     /// Compact after building (one stream synchronization, usually halves the memory).
     pub compact: bool,
+    /// Device bytes the build may allocate at peak (temp + output); `None` admits any size.
+    /// Checked after OptiX reports the sizes and before anything is allocated.
+    pub budget: Option<usize>,
 }
 
 impl Default for BuildOptions {
-    /// Fast trace, compacted: the right choice for static geometry.
+    /// Fast trace, compacted, no budget: the right choice for static geometry.
     fn default() -> Self {
-        Self { prefer_fast_trace: true, compact: true }
+        Self { prefer_fast_trace: true, compact: true, budget: None }
     }
 }
 
@@ -177,6 +180,12 @@ impl Accel {
         // SAFETY: `inputs` and the buffers they point at are alive for the call.
         check("optixAccelComputeMemoryUsage", unsafe { entry!(t, optixAccelComputeMemoryUsage)(ctx.raw(), &accel_opts, inputs.as_ptr(), n, &mut sizes) })?;
 
+        let peak = sizes.tempSizeInBytes.saturating_add(sizes.outputSizeInBytes);
+        if let Some(available) = opts.budget
+            && peak > available
+        {
+            return Err(Error::Budget { requested: peak, available });
+        }
         // SAFETY: OptiX writes both buffers before anything reads them.
         let temp = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, sizes.tempSizeInBytes.max(1)) }?;
         // SAFETY: as above.

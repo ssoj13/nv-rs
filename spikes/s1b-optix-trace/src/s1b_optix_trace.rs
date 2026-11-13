@@ -68,6 +68,37 @@ mod kernels {
         let oz = -1.0f32;
         let handle = p.handle;
         let p0: u32;
+        let _p1: u32;
+        let _p2: u32;
+        let _p3: u32;
+        let _p4: u32;
+        let _p5: u32;
+        let _p6: u32;
+        let _p7: u32;
+        let _p8: u32;
+        let _p9: u32;
+        let _p10: u32;
+        let _p11: u32;
+        let _p12: u32;
+        let _p13: u32;
+        let _p14: u32;
+        let _p15: u32;
+        let _p16: u32;
+        let _p17: u32;
+        let _p18: u32;
+        let _p19: u32;
+        let _p20: u32;
+        let _p21: u32;
+        let _p22: u32;
+        let _p23: u32;
+        let _p24: u32;
+        let _p25: u32;
+        let _p26: u32;
+        let _p27: u32;
+        let _p28: u32;
+        let _p29: u32;
+        let _p30: u32;
+        let _p31: u32;
         // SAFETY: `optixTrace` with the default payload type, one payload register, a single
         // GAS handle from the launch params and SBT stride/offset matching the host SBT.
         unsafe {
@@ -354,7 +385,7 @@ fn main() -> Result<(), String> {
 
         let got = out.to_host_vec(&stream).map_err(e)?;
         let want: Vec<u32> = (0..H)
-            .flat_map(|y| (0..W).map(move |x| u32::from((x as f32 + 0.5) / W as f32 + (y as f32 + 0.5) / H as f32 < LEG)))
+            .flat_map(|y| (0..W).map(move |x| u32::from((x as f32 + 0.5) / W as f32 + (y as f32 + 0.5) / (H as f32) < LEG)))
             .collect();
         for y in (0..H).rev() {
             println!("{}", (0..W).map(|x| match got[(y * W + x) as usize] { 1 => '#', 0 => '.', _ => '?' }).collect::<String>());

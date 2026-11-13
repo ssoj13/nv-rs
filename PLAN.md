@@ -27,6 +27,8 @@ Status: plan only. No code yet.
 | D13 | NGX: full safe wrapper using `Init_with_ProjectID` (caller-supplied GUID, `engineType = CUSTOM`) — **pending owner confirmation** | No NVIDIA-issued app id needed; licence obligations fall on the final application |
 
 | D14 | SDK header discovery (CUDA Toolkit, OptiX, MSVC/UCRT for libclang) goes through vcv-rs; OptiX detection lives in vcv-rs | One discovery mechanism shared with the `vcv-rs` shell environment, so a shell and a build never select different SDKs |
+| D15 | `ngx-sys` links the NGX SDK's static library (`nvsdk_ngx_d.lib`, plus `advapi32`/`user32`) at build time | NGX ships no DLL exposing its API, only static libraries; the only exception to runtime loading. Revisit if NVIDIA ships a loadable NGX API |
+| D16 | Every separately shipped SDK (cuDNN, Video Codec, Optical Flow, NVAPI, NGX, nvCOMP) is located by `vcv_rs::nvsdk` (root vars, `%ProgramFiles%/NVIDIA`, `%ProgramData%/NVIDIA Corporation`, `NV_SDK_DIRS`) | Replaces per-SDK environment variables; the SDK's DLL folder is baked into the sys crate as a load hint |
 
 Dropped: Streamline and Reflex (C++ API, no C ABI); migrating gracefold-rs off its vendored
 cubecl/cudarc cuBLAS path.
@@ -216,14 +218,16 @@ registry instead of scanning FileRepository.
 
 All three spikes passed; M1 can start.
 
-**M2 status (2026-11-13): 14 libraries bound, building, loading and tested on this machine** —
+**M2 status (2026-11-13): 18 libraries bound, building, loading and tested on this machine** —
 nvml 390, optix 60, cufft 35, cublas 517, cublaslt 54, cusparse 453, cusolver 483, cusolvermg 19,
-nvjpeg 81, nvrtc 29, cupti 116, nvcuvid 24, nvenc 42, npp 8187 symbols (11,490 in all; COVERAGE.md).
-Gate: workspace clippy `-D warnings` clean, 58/58 tests including GPU. Generator bug classes found
-on real headers and locked by tests: non-status return types, types used only in signatures,
-C parameters shadowing shim bindings, typedef'd function-table fields, libraries split over
-several DLLs (NPP, mapped from the DLL export tables). Remaining M2: SDKs not installed here —
-cuDNN, NCCL, nvCOMP, NVAPI, NGX/DLSS, Optical Flow, cuFile (Linux).
+nvjpeg 81, nvrtc 29, cupti 116, nvcuvid 24, nvenc 42, npp 8187, cudnn 224, nvapi 298, nvofa 12,
+ngx 68 symbols (11,092 in all; COVERAGE.md). Gate: workspace clippy `-D warnings` clean, 71/71
+tests including GPU. Generator bug classes found on real headers and locked by tests: non-status
+return types, types used only in signatures, C parameters shadowing shim bindings, typedef'd
+function-table fields, libraries split over several DLLs (NPP, mapped from the DLL export
+tables), query-interface libraries (NVAPI), headers needing clang arguments (NVAPI SAL macros),
+layouts bindgen gets wrong (MSVC bitfield union, made opaque), static-only SDKs (NGX, D15).
+Remaining M2: nvCOMP (not installed here), NCCL and cuFile (Linux only).
 
 **M1 result (2026-11-12): DONE.** `crates/nv-loader` (Driver / DriverStore / Toolkit / Sdk groups;
 DriverStore via each display adapter's `OpenGLDriverName`, as `optix_stubs.h` does; `Probe` trait

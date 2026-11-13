@@ -17,7 +17,7 @@ binding coverage in [COVERAGE.md](COVERAGE.md).
 | `nv-loader` | The one runtime loader: finds NVIDIA libraries in System32, the display driver's DriverStore folder, the CUDA Toolkit or an SDK root, returns typed errors. `exports_sys!` is the shared body of every exports-shaped sys crate. |
 | `nv-bindgen` | Build-time generator: one declarative `LibSpec` per library; headers located by [vcv-rs](https://github.com/ssoj13/vcv-rs); emits types, panic-free `extern "C"` shims and a symbol inventory. |
 | `nv-bindgen-fixture` | Compiles generator output for a synthetic header and checks the shims' failure paths at runtime. |
-| `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`, `npp-sys` (eleven DLLs, `split_exports_sys!`), `cusolvermg-sys`. |
+| `*-sys` | Raw bindings per library: `nvml-sys`, `optix-sys`, `cufft-sys`, `cublas-sys`, `cublaslt-sys`, `cusparse-sys`, `cusolver-sys`, `nvjpeg-sys`, `nvrtc-sys`, `cupti-sys`, `nvcuvid-sys` (NVDEC), `nvenc-sys`, `npp-sys` (eleven DLLs, `split_exports_sys!`), `cusolvermg-sys`, `cudnn-sys`, `nvapi-sys` (by id through `nvapi_QueryInterface`, `query_interface_sys!`), `nvofa-sys` (Optical Flow), `ngx-sys` (DLSS; statically linked, PLAN D15). |
 | `xtask` | `cargo xtask coverage collect|generate|check`. |
 
 Spikes that de-risked the plan live in `spikes/` (OptiX running a Rust raygen, shared Vulkan/CUDA
@@ -49,9 +49,15 @@ the SDKs installed on the build machine and are never committed.
 
 ## Building
 
-Needs the CUDA Toolkit (found through `CUDA_PATH` or the default install location); `nvcuvid-sys` and `nvenc-sys` need `VIDEO_CODEC_SDK_ROOT` pointing at the Video Codec SDK (it has no installer); for
-`optix-sys`, the OptiX SDK (`OPTIX_ROOT` or the default install location). On Windows the MSVC
-include paths come from vcv-rs, so any shell works.
+Needs the CUDA Toolkit (`CUDA_PATH` or the default install). Every other SDK is located by
+[vcv-rs](https://github.com/ssoj13/vcv-rs):
+
+- its root variable (`OPTIX_ROOT`, `CUDNN_ROOT`, `VIDEO_CODEC_SDK_ROOT`, `NVAPI_ROOT`, ...);
+- the installers' folders `%ProgramFiles%\NVIDIA` and `%ProgramData%\NVIDIA Corporation`;
+- any folder listed in `NV_SDK_DIRS`, for SDKs unpacked or cloned elsewhere.
+
+`vcv-rs -l` shows what it finds. `ngx-sys` also needs the Vulkan SDK (`VULKAN_SDK`). On Windows
+the MSVC include paths come from vcv-rs too, so any shell works.
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings

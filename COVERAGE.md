@@ -8,16 +8,20 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 |---|---:|---:|---:|---:|
 | cublas | 517 | 517 | 0 | 0 |
 | cublaslt | 54 | 54 | 0 | 0 |
+| cudnn | 224 | 224 | 0 | 0 |
 | cufft | 35 | 35 | 0 | 0 |
 | cupti | 116 | 116 | 0 | 0 |
 | cusolver | 483 | 483 | 0 | 0 |
 | cusolvermg | 19 | 19 | 0 | 0 |
 | cusparse | 453 | 453 | 0 | 0 |
+| ngx | 68 | 68 | 0 | 0 |
 | npp | 8187 | 8187 | 0 | 0 |
+| nvapi | 298 | 298 | 0 | 0 |
 | nvcuvid | 24 | 24 | 0 | 0 |
 | nvenc | 42 | 42 | 0 | 0 |
 | nvjpeg | 81 | 81 | 0 | 0 |
 | nvml | 390 | 390 | 0 | 0 |
+| nvofa | 12 | 12 | 0 | 0 |
 | nvrtc | 29 | 29 | 0 | 0 |
 | optix | 60 | 60 | 0 | 0 |
 
@@ -605,6 +609,237 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasLtMatrixTransformDescGetAttribute` | yes |  |  |  |
 | `cublasLtMatrixTransformDescInit_internal` | yes |  |  |  |
 | `cublasLtMatrixTransformDescSetAttribute` | yes |  |  |  |
+
+## cudnn
+
+- `cudnn.h` sha256 `f113f07032ea02b54ca17d6e0469e1adb362ca6bfe26a8627f77f94de7a6ef04`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `cudnnActivationBackward` | yes |  |  |  |
+| `cudnnActivationForward` | yes |  |  |  |
+| `cudnnAddTensor` | yes |  |  |  |
+| `cudnnAdvVersionCheck` | yes |  |  |  |
+| `cudnnBackendCreateDescriptor` | yes |  |  |  |
+| `cudnnBackendDestroyDescriptor` | yes |  |  |  |
+| `cudnnBackendExecute` | yes |  |  |  |
+| `cudnnBackendFinalize` | yes |  |  |  |
+| `cudnnBackendGetAttribute` | yes |  |  |  |
+| `cudnnBackendInitialize` | yes |  |  |  |
+| `cudnnBackendPopulateCudaGraph` | yes |  |  |  |
+| `cudnnBackendSetAttribute` | yes |  |  |  |
+| `cudnnBackendUpdateCudaGraph` | yes |  |  |  |
+| `cudnnBatchNormalizationBackward` | yes |  |  |  |
+| `cudnnBatchNormalizationBackwardEx` | yes |  |  |  |
+| `cudnnBatchNormalizationForwardInference` | yes |  |  |  |
+| `cudnnBatchNormalizationForwardTraining` | yes |  |  |  |
+| `cudnnBatchNormalizationForwardTrainingEx` | yes |  |  |  |
+| `cudnnBuildRNNDynamic` | yes |  |  |  |
+| `cudnnCTCLoss` | yes |  |  |  |
+| `cudnnCTCLoss_v8` | yes |  |  |  |
+| `cudnnCausalConv1dBackward` | yes |  |  |  |
+| `cudnnCausalConv1dForward` | yes |  |  |  |
+| `cudnnCnnVersionCheck` | yes |  |  |  |
+| `cudnnConvolutionBackwardBias` | yes |  |  |  |
+| `cudnnConvolutionBackwardData` | yes |  |  |  |
+| `cudnnConvolutionBackwardFilter` | yes |  |  |  |
+| `cudnnConvolutionBiasActivationForward` | yes |  |  |  |
+| `cudnnConvolutionForward` | yes |  |  |  |
+| `cudnnCreate` | yes |  |  |  |
+| `cudnnCreateActivationDescriptor` | yes |  |  |  |
+| `cudnnCreateAttnDescriptor` | yes |  |  |  |
+| `cudnnCreateCTCLossDescriptor` | yes |  |  |  |
+| `cudnnCreateConvolutionDescriptor` | yes |  |  |  |
+| `cudnnCreateDropoutDescriptor` | yes |  |  |  |
+| `cudnnCreateFilterDescriptor` | yes |  |  |  |
+| `cudnnCreateFusedOpsConstParamPack` | yes |  |  |  |
+| `cudnnCreateFusedOpsPlan` | yes |  |  |  |
+| `cudnnCreateFusedOpsVariantParamPack` | yes |  |  |  |
+| `cudnnCreateLRNDescriptor` | yes |  |  |  |
+| `cudnnCreateOpTensorDescriptor` | yes |  |  |  |
+| `cudnnCreatePoolingDescriptor` | yes |  |  |  |
+| `cudnnCreateRNNDataDescriptor` | yes |  |  |  |
+| `cudnnCreateRNNDescriptor` | yes |  |  |  |
+| `cudnnCreateReduceTensorDescriptor` | yes |  |  |  |
+| `cudnnCreateSeqDataDescriptor` | yes |  |  |  |
+| `cudnnCreateSpatialTransformerDescriptor` | yes |  |  |  |
+| `cudnnCreateTensorDescriptor` | yes |  |  |  |
+| `cudnnCreateTensorTransformDescriptor` | yes |  |  |  |
+| `cudnnDeriveBNTensorDescriptor` | yes |  |  |  |
+| `cudnnDeriveNormTensorDescriptor` | yes |  |  |  |
+| `cudnnDestroy` | yes |  |  |  |
+| `cudnnDestroyActivationDescriptor` | yes |  |  |  |
+| `cudnnDestroyAttnDescriptor` | yes |  |  |  |
+| `cudnnDestroyCTCLossDescriptor` | yes |  |  |  |
+| `cudnnDestroyConvolutionDescriptor` | yes |  |  |  |
+| `cudnnDestroyDropoutDescriptor` | yes |  |  |  |
+| `cudnnDestroyFilterDescriptor` | yes |  |  |  |
+| `cudnnDestroyFusedOpsConstParamPack` | yes |  |  |  |
+| `cudnnDestroyFusedOpsPlan` | yes |  |  |  |
+| `cudnnDestroyFusedOpsVariantParamPack` | yes |  |  |  |
+| `cudnnDestroyLRNDescriptor` | yes |  |  |  |
+| `cudnnDestroyOpTensorDescriptor` | yes |  |  |  |
+| `cudnnDestroyPoolingDescriptor` | yes |  |  |  |
+| `cudnnDestroyRNNDataDescriptor` | yes |  |  |  |
+| `cudnnDestroyRNNDescriptor` | yes |  |  |  |
+| `cudnnDestroyReduceTensorDescriptor` | yes |  |  |  |
+| `cudnnDestroySeqDataDescriptor` | yes |  |  |  |
+| `cudnnDestroySpatialTransformerDescriptor` | yes |  |  |  |
+| `cudnnDestroyTensorDescriptor` | yes |  |  |  |
+| `cudnnDestroyTensorTransformDescriptor` | yes |  |  |  |
+| `cudnnDivisiveNormalizationBackward` | yes |  |  |  |
+| `cudnnDivisiveNormalizationForward` | yes |  |  |  |
+| `cudnnDropoutBackward` | yes |  |  |  |
+| `cudnnDropoutForward` | yes |  |  |  |
+| `cudnnDropoutGetReserveSpaceSize` | yes |  |  |  |
+| `cudnnDropoutGetStatesSize` | yes |  |  |  |
+| `cudnnFindConvolutionBackwardDataAlgorithm` | yes |  |  |  |
+| `cudnnFindConvolutionBackwardDataAlgorithmEx` | yes |  |  |  |
+| `cudnnFindConvolutionBackwardFilterAlgorithm` | yes |  |  |  |
+| `cudnnFindConvolutionBackwardFilterAlgorithmEx` | yes |  |  |  |
+| `cudnnFindConvolutionForwardAlgorithm` | yes |  |  |  |
+| `cudnnFindConvolutionForwardAlgorithmEx` | yes |  |  |  |
+| `cudnnFusedOpsExecute` | yes |  |  |  |
+| `cudnnGetActivationDescriptor` | yes |  |  |  |
+| `cudnnGetActivationDescriptorSwishBeta` | yes |  |  |  |
+| `cudnnGetAttnDescriptor` | yes |  |  |  |
+| `cudnnGetBatchNormalizationBackwardExWorkspaceSize` | yes |  |  |  |
+| `cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize` | yes |  |  |  |
+| `cudnnGetBatchNormalizationTrainingExReserveSpaceSize` | yes |  |  |  |
+| `cudnnGetCTCLossDescriptor` | yes |  |  |  |
+| `cudnnGetCTCLossDescriptorEx` | yes |  |  |  |
+| `cudnnGetCTCLossDescriptor_v8` | yes |  |  |  |
+| `cudnnGetCTCLossDescriptor_v9` | yes |  |  |  |
+| `cudnnGetCTCLossWorkspaceSize` | yes |  |  |  |
+| `cudnnGetCTCLossWorkspaceSize_v8` | yes |  |  |  |
+| `cudnnGetCallback` | yes |  |  |  |
+| `cudnnGetConvolution2dDescriptor` | yes |  |  |  |
+| `cudnnGetConvolution2dForwardOutputDim` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardDataAlgorithmMaxCount` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardDataAlgorithm_v7` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardDataWorkspaceSize` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardFilterAlgorithmMaxCount` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardFilterAlgorithm_v7` | yes |  |  |  |
+| `cudnnGetConvolutionBackwardFilterWorkspaceSize` | yes |  |  |  |
+| `cudnnGetConvolutionForwardAlgorithmMaxCount` | yes |  |  |  |
+| `cudnnGetConvolutionForwardAlgorithm_v7` | yes |  |  |  |
+| `cudnnGetConvolutionForwardWorkspaceSize` | yes |  |  |  |
+| `cudnnGetConvolutionGroupCount` | yes |  |  |  |
+| `cudnnGetConvolutionMathType` | yes |  |  |  |
+| `cudnnGetConvolutionNdDescriptor` | yes |  |  |  |
+| `cudnnGetConvolutionNdForwardOutputDim` | yes |  |  |  |
+| `cudnnGetConvolutionReorderType` | yes |  |  |  |
+| `cudnnGetCudartVersion` | yes |  |  |  |
+| `cudnnGetDropoutDescriptor` | yes |  |  |  |
+| `cudnnGetErrorString` | yes |  |  |  |
+| `cudnnGetExecutionPlanWorkspaceSize` | yes |  |  |  |
+| `cudnnGetFilter4dDescriptor` | yes |  |  |  |
+| `cudnnGetFilterNdDescriptor` | yes |  |  |  |
+| `cudnnGetFilterSizeInBytes` | yes |  |  |  |
+| `cudnnGetFoldedConvBackwardDataDescriptors` | yes |  |  |  |
+| `cudnnGetFusedOpsConstParamPackAttribute` | yes |  |  |  |
+| `cudnnGetFusedOpsVariantParamPackAttribute` | yes |  |  |  |
+| `cudnnGetLRNDescriptor` | yes |  |  |  |
+| `cudnnGetLastErrorString` | yes |  |  |  |
+| `cudnnGetMaxDeviceVersion` | yes |  |  |  |
+| `cudnnGetMultiHeadAttnBuffers` | yes |  |  |  |
+| `cudnnGetMultiHeadAttnWeights` | yes |  |  |  |
+| `cudnnGetNormalizationBackwardWorkspaceSize` | yes |  |  |  |
+| `cudnnGetNormalizationForwardTrainingWorkspaceSize` | yes |  |  |  |
+| `cudnnGetNormalizationTrainingReserveSpaceSize` | yes |  |  |  |
+| `cudnnGetOpTensorDescriptor` | yes |  |  |  |
+| `cudnnGetPooling2dDescriptor` | yes |  |  |  |
+| `cudnnGetPooling2dForwardOutputDim` | yes |  |  |  |
+| `cudnnGetPoolingNdDescriptor` | yes |  |  |  |
+| `cudnnGetPoolingNdForwardOutputDim` | yes |  |  |  |
+| `cudnnGetProperty` | yes |  |  |  |
+| `cudnnGetRNNDataDescriptor` | yes |  |  |  |
+| `cudnnGetRNNDescriptor_v8` | yes |  |  |  |
+| `cudnnGetRNNTempSpaceSizes` | yes |  |  |  |
+| `cudnnGetRNNWeightParams` | yes |  |  |  |
+| `cudnnGetRNNWeightSpaceSize` | yes |  |  |  |
+| `cudnnGetReduceTensorDescriptor` | yes |  |  |  |
+| `cudnnGetReductionIndicesSize` | yes |  |  |  |
+| `cudnnGetReductionWorkspaceSize` | yes |  |  |  |
+| `cudnnGetSeqDataDescriptor` | yes |  |  |  |
+| `cudnnGetStream` | yes |  |  |  |
+| `cudnnGetTensor4dDescriptor` | yes |  |  |  |
+| `cudnnGetTensorNdDescriptor` | yes |  |  |  |
+| `cudnnGetTensorSizeInBytes` | yes |  |  |  |
+| `cudnnGetTensorTransformDescriptor` | yes |  |  |  |
+| `cudnnGetVersion` | yes |  |  |  |
+| `cudnnGraphVersionCheck` | yes |  |  |  |
+| `cudnnIm2Col` | yes |  |  |  |
+| `cudnnInitTransformDest` | yes |  |  |  |
+| `cudnnLRNCrossChannelBackward` | yes |  |  |  |
+| `cudnnLRNCrossChannelForward` | yes |  |  |  |
+| `cudnnMakeFusedOpsPlan` | yes |  |  |  |
+| `cudnnMultiHeadAttnBackwardData` | yes |  |  |  |
+| `cudnnMultiHeadAttnBackwardWeights` | yes |  |  |  |
+| `cudnnMultiHeadAttnForward` | yes |  |  |  |
+| `cudnnNormalizationBackward` | yes |  |  |  |
+| `cudnnNormalizationForwardInference` | yes |  |  |  |
+| `cudnnNormalizationForwardTraining` | yes |  |  |  |
+| `cudnnOpTensor` | yes |  |  |  |
+| `cudnnOpsVersionCheck` | yes |  |  |  |
+| `cudnnPoolingBackward` | yes |  |  |  |
+| `cudnnPoolingForward` | yes |  |  |  |
+| `cudnnQueryRuntimeError` | yes |  |  |  |
+| `cudnnRNNBackwardData_v8` | yes |  |  |  |
+| `cudnnRNNBackwardWeights_v8` | yes |  |  |  |
+| `cudnnRNNForward` | yes |  |  |  |
+| `cudnnRNNGetClip_v8` | yes |  |  |  |
+| `cudnnRNNGetClip_v9` | yes |  |  |  |
+| `cudnnRNNSetClip_v8` | yes |  |  |  |
+| `cudnnRNNSetClip_v9` | yes |  |  |  |
+| `cudnnReduceTensor` | yes |  |  |  |
+| `cudnnReorderFilterAndBias` | yes |  |  |  |
+| `cudnnRestoreDropoutDescriptor` | yes |  |  |  |
+| `cudnnScaleTensor` | yes |  |  |  |
+| `cudnnSetActivationDescriptor` | yes |  |  |  |
+| `cudnnSetActivationDescriptorSwishBeta` | yes |  |  |  |
+| `cudnnSetAttnDescriptor` | yes |  |  |  |
+| `cudnnSetCTCLossDescriptor` | yes |  |  |  |
+| `cudnnSetCTCLossDescriptorEx` | yes |  |  |  |
+| `cudnnSetCTCLossDescriptor_v8` | yes |  |  |  |
+| `cudnnSetCTCLossDescriptor_v9` | yes |  |  |  |
+| `cudnnSetCallback` | yes |  |  |  |
+| `cudnnSetConvolution2dDescriptor` | yes |  |  |  |
+| `cudnnSetConvolutionGroupCount` | yes |  |  |  |
+| `cudnnSetConvolutionMathType` | yes |  |  |  |
+| `cudnnSetConvolutionNdDescriptor` | yes |  |  |  |
+| `cudnnSetConvolutionReorderType` | yes |  |  |  |
+| `cudnnSetDropoutDescriptor` | yes |  |  |  |
+| `cudnnSetFilter4dDescriptor` | yes |  |  |  |
+| `cudnnSetFilterNdDescriptor` | yes |  |  |  |
+| `cudnnSetFusedOpsConstParamPackAttribute` | yes |  |  |  |
+| `cudnnSetFusedOpsVariantParamPackAttribute` | yes |  |  |  |
+| `cudnnSetLRNDescriptor` | yes |  |  |  |
+| `cudnnSetOpTensorDescriptor` | yes |  |  |  |
+| `cudnnSetPooling2dDescriptor` | yes |  |  |  |
+| `cudnnSetPoolingNdDescriptor` | yes |  |  |  |
+| `cudnnSetRNNDataDescriptor` | yes |  |  |  |
+| `cudnnSetRNNDescriptor_v8` | yes |  |  |  |
+| `cudnnSetReduceTensorDescriptor` | yes |  |  |  |
+| `cudnnSetSeqDataDescriptor` | yes |  |  |  |
+| `cudnnSetSpatialTransformerNdDescriptor` | yes |  |  |  |
+| `cudnnSetStream` | yes |  |  |  |
+| `cudnnSetTensor` | yes |  |  |  |
+| `cudnnSetTensor4dDescriptor` | yes |  |  |  |
+| `cudnnSetTensor4dDescriptorEx` | yes |  |  |  |
+| `cudnnSetTensorNdDescriptor` | yes |  |  |  |
+| `cudnnSetTensorNdDescriptorEx` | yes |  |  |  |
+| `cudnnSetTensorTransformDescriptor` | yes |  |  |  |
+| `cudnnSoftmaxBackward` | yes |  |  |  |
+| `cudnnSoftmaxForward` | yes |  |  |  |
+| `cudnnSpatialTfGridGeneratorBackward` | yes |  |  |  |
+| `cudnnSpatialTfGridGeneratorForward` | yes |  |  |  |
+| `cudnnSpatialTfSamplerBackward` | yes |  |  |  |
+| `cudnnSpatialTfSamplerForward` | yes |  |  |  |
+| `cudnnSubquadraticOpsVersionCheck` | yes |  |  |  |
+| `cudnnTransformFilter` | yes |  |  |  |
+| `cudnnTransformTensor` | yes |  |  |  |
+| `cudnnTransformTensorEx` | yes |  |  |  |
 
 ## cufft
 
@@ -1748,6 +1983,83 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseZgtsvInterleavedBatch_bufferSizeExt` | yes |  |  |  |
 | `cusparseZnnz` | yes |  |  |  |
 | `cusparseZnnz_compress` | yes |  |  |  |
+
+## ngx
+
+- `vulkan/vulkan.h` sha256 `dfb52fde20c963f4d74829a7a07aef1e822e6fa0df4ea45a26c7effb7c286802`
+- `nvsdk_ngx.h` sha256 `96f21266a05ef06bb49f58c89de1a7845f2d9b1e0e0e069fe03740b8eaf0344d`
+- `nvsdk_ngx_vk.h` sha256 `3be54d0103cce02174fd34912c60c9f40c73b5eec919e42613a2268c589c53ad`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `NVSDK_NGX_CUDA_AllocateParameters` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_CreateFeature` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_CreateFeature1` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_DestroyParameters` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_EvaluateFeature_C` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_GetCapabilityParameters` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_GetFeatureRequirements` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_GetScratchBufferSize` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_Init` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_Init1` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_Init_with_ProjectID` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_ReleaseFeature` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_Shutdown` | yes |  |  |  |
+| `NVSDK_NGX_CUDA_Shutdown1` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_AllocateParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_CreateFeature` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_DestroyParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_EvaluateFeature_C` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_GetCapabilityParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_GetFeatureRequirements` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_GetScratchBufferSize` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_Init` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_Init_with_ProjectID` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_ReleaseFeature` | yes |  |  |  |
+| `NVSDK_NGX_D3D11_Shutdown1` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_AllocateParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_CreateFeature` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_DestroyParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_EvaluateFeature_C` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_GetCapabilityParameters` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_GetFeatureRequirements` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_GetScratchBufferSize` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_Init` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_Init_with_ProjectID` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_ReleaseFeature` | yes |  |  |  |
+| `NVSDK_NGX_D3D12_Shutdown1` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetD` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetD3d11Resource` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetD3d12Resource` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetF` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetI` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetUI` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetULL` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetVoidPointer` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetD` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetD3d11Resource` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetD3d12Resource` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetF` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetI` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetUI` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetULL` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetVoidPointer` | yes |  |  |  |
+| `NVSDK_NGX_UpdateFeature` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_AllocateParameters` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_CreateFeature` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_CreateFeature1` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_DestroyParameters` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_EvaluateFeature_C` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetCapabilityParameters` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetFeatureRequirements` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetScratchBufferSize` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_Init` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_Init_with_ProjectID` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_ReleaseFeature` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_RequiredExtensions` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_Shutdown1` | yes |  |  |  |
 
 ## npp
 
@@ -9943,6 +10255,311 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsZero_64sc_Ctx` | yes |  |  |  |
 | `nppsZero_8u_Ctx` | yes |  |  |  |
 
+## nvapi
+
+- `nvapi.h` sha256 `6969bf2e9657f9c113b592333e26213abe8d50390137b6b49e6f5599c99dfd9b`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `NvAPI_CreateDisplayFromUnAttachedDisplay` | yes |  |  |  |
+| `NvAPI_DISP_DeleteCustomDisplay` | yes |  |  |  |
+| `NvAPI_DISP_EnumCustomDisplay` | yes |  |  |  |
+| `NvAPI_DISP_GetAdaptiveSyncData` | yes |  |  |  |
+| `NvAPI_DISP_GetAssociatedUnAttachedNvidiaDisplayHandle` | yes |  |  |  |
+| `NvAPI_DISP_GetDisplayConfig` | yes |  |  |  |
+| `NvAPI_DISP_GetDisplayIdByDisplayName` | yes |  |  |  |
+| `NvAPI_DISP_GetEdidData` | yes |  |  |  |
+| `NvAPI_DISP_GetGDIPrimaryDisplayId` | yes |  |  |  |
+| `NvAPI_DISP_GetMonitorCapabilities` | yes |  |  |  |
+| `NvAPI_DISP_GetMonitorColorCapabilities` | yes |  |  |  |
+| `NvAPI_DISP_GetPreferredStereoDisplay` | yes |  |  |  |
+| `NvAPI_DISP_GetTiming` | yes |  |  |  |
+| `NvAPI_DISP_GetVirtualRefreshRateData` | yes |  |  |  |
+| `NvAPI_DISP_RevertCustomDisplayTrial` | yes |  |  |  |
+| `NvAPI_DISP_SaveCustomDisplay` | yes |  |  |  |
+| `NvAPI_DISP_SetAdaptiveSyncData` | yes |  |  |  |
+| `NvAPI_DISP_SetDisplayConfig` | yes |  |  |  |
+| `NvAPI_DISP_SetPreferredStereoDisplay` | yes |  |  |  |
+| `NvAPI_DISP_SetVirtualRefreshRateData` | yes |  |  |  |
+| `NvAPI_DISP_TryCustomDisplay` | yes |  |  |  |
+| `NvAPI_DRS_CreateApplication` | yes |  |  |  |
+| `NvAPI_DRS_CreateProfile` | yes |  |  |  |
+| `NvAPI_DRS_CreateSession` | yes |  |  |  |
+| `NvAPI_DRS_DeleteApplication` | yes |  |  |  |
+| `NvAPI_DRS_DeleteApplicationEx` | yes |  |  |  |
+| `NvAPI_DRS_DeleteProfile` | yes |  |  |  |
+| `NvAPI_DRS_DeleteProfileSetting` | yes |  |  |  |
+| `NvAPI_DRS_DestroySession` | yes |  |  |  |
+| `NvAPI_DRS_EnumApplications` | yes |  |  |  |
+| `NvAPI_DRS_EnumAvailableSettingIds` | yes |  |  |  |
+| `NvAPI_DRS_EnumAvailableSettingValues` | yes |  |  |  |
+| `NvAPI_DRS_EnumProfiles` | yes |  |  |  |
+| `NvAPI_DRS_EnumSettings` | yes |  |  |  |
+| `NvAPI_DRS_FindApplicationByName` | yes |  |  |  |
+| `NvAPI_DRS_FindProfileByName` | yes |  |  |  |
+| `NvAPI_DRS_GetApplicationInfo` | yes |  |  |  |
+| `NvAPI_DRS_GetBaseProfile` | yes |  |  |  |
+| `NvAPI_DRS_GetCurrentGlobalProfile` | yes |  |  |  |
+| `NvAPI_DRS_GetNumProfiles` | yes |  |  |  |
+| `NvAPI_DRS_GetProfileInfo` | yes |  |  |  |
+| `NvAPI_DRS_GetSetting` | yes |  |  |  |
+| `NvAPI_DRS_GetSettingIdFromName` | yes |  |  |  |
+| `NvAPI_DRS_GetSettingNameFromId` | yes |  |  |  |
+| `NvAPI_DRS_LoadSettings` | yes |  |  |  |
+| `NvAPI_DRS_LoadSettingsFromFile` | yes |  |  |  |
+| `NvAPI_DRS_RestoreAllDefaults` | yes |  |  |  |
+| `NvAPI_DRS_RestoreProfileDefault` | yes |  |  |  |
+| `NvAPI_DRS_RestoreProfileDefaultSetting` | yes |  |  |  |
+| `NvAPI_DRS_SaveSettings` | yes |  |  |  |
+| `NvAPI_DRS_SaveSettingsToFile` | yes |  |  |  |
+| `NvAPI_DRS_SetCurrentGlobalProfile` | yes |  |  |  |
+| `NvAPI_DRS_SetProfileInfo` | yes |  |  |  |
+| `NvAPI_DRS_SetSetting` | yes |  |  |  |
+| `NvAPI_DisableHWCursor` | yes |  |  |  |
+| `NvAPI_Disp_ColorControl` | yes |  |  |  |
+| `NvAPI_Disp_GetColorimetry` | yes |  |  |  |
+| `NvAPI_Disp_GetHdrCapabilities` | yes |  |  |  |
+| `NvAPI_Disp_GetHdrToneMapping` | yes |  |  |  |
+| `NvAPI_Disp_GetOutputMode` | yes |  |  |  |
+| `NvAPI_Disp_GetSourceColorSpace` | yes |  |  |  |
+| `NvAPI_Disp_GetSourceHdrMetadata` | yes |  |  |  |
+| `NvAPI_Disp_GetVRRInfo` | yes |  |  |  |
+| `NvAPI_Disp_HdrColorControl` | yes |  |  |  |
+| `NvAPI_Disp_InfoFrameControl` | yes |  |  |  |
+| `NvAPI_Disp_SetHdrToneMapping` | yes |  |  |  |
+| `NvAPI_Disp_SetOutputMode` | yes |  |  |  |
+| `NvAPI_Disp_SetSourceColorSpace` | yes |  |  |  |
+| `NvAPI_Disp_SetSourceHdrMetadata` | yes |  |  |  |
+| `NvAPI_EnableCurrentMosaicTopology` | yes |  |  |  |
+| `NvAPI_EnableHWCursor` | yes |  |  |  |
+| `NvAPI_EnumLogicalGPUs` | yes |  |  |  |
+| `NvAPI_EnumNvidiaDisplayHandle` | yes |  |  |  |
+| `NvAPI_EnumNvidiaUnAttachedDisplayHandle` | yes |  |  |  |
+| `NvAPI_EnumPhysicalGPUs` | yes |  |  |  |
+| `NvAPI_EnumTCCPhysicalGPUs` | yes |  |  |  |
+| `NvAPI_Event_RegisterCallback` | yes |  |  |  |
+| `NvAPI_Event_UnregisterCallback` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumDevicesGetControl` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumDevicesGetInfo` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumDevicesSetControl` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumZonesGetControl` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumZonesGetInfo` | yes |  |  |  |
+| `NvAPI_GPU_ClientIllumZonesSetControl` | yes |  |  |  |
+| `NvAPI_GPU_ClientRegisterForUtilizationSampleUpdates` | yes |  |  |  |
+| `NvAPI_GPU_CudaEnumComputeCapableGpus` | yes |  |  |  |
+| `NvAPI_GPU_GetAGPAperture` | yes |  |  |  |
+| `NvAPI_GPU_GetActiveOutputs` | yes |  |  |  |
+| `NvAPI_GPU_GetAdapterIdFromPhysicalGpu` | yes |  |  |  |
+| `NvAPI_GPU_GetAllClockFrequencies` | yes |  |  |  |
+| `NvAPI_GPU_GetAllDisplayIds` | yes |  |  |  |
+| `NvAPI_GPU_GetAllOutputs` | yes |  |  |  |
+| `NvAPI_GPU_GetArchInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetBoardInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetBusId` | yes |  |  |  |
+| `NvAPI_GPU_GetBusSlotId` | yes |  |  |  |
+| `NvAPI_GPU_GetBusType` | yes |  |  |  |
+| `NvAPI_GPU_GetConnectedDisplayIds` | yes |  |  |  |
+| `NvAPI_GPU_GetConnectedOutputs` | yes |  |  |  |
+| `NvAPI_GPU_GetConnectedOutputsWithLidState` | yes |  |  |  |
+| `NvAPI_GPU_GetConnectedSLIOutputs` | yes |  |  |  |
+| `NvAPI_GPU_GetConnectedSLIOutputsWithLidState` | yes |  |  |  |
+| `NvAPI_GPU_GetCurrentAGPRate` | yes |  |  |  |
+| `NvAPI_GPU_GetCurrentPCIEDownstreamWidth` | yes |  |  |  |
+| `NvAPI_GPU_GetCurrentPstate` | yes |  |  |  |
+| `NvAPI_GPU_GetDynamicPstatesInfoEx` | yes |  |  |  |
+| `NvAPI_GPU_GetECCConfigurationInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetECCErrorInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetECCStatusInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetEDID` | yes |  |  |  |
+| `NvAPI_GPU_GetEncoderSessionsInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetEncoderStatistics` | yes |  |  |  |
+| `NvAPI_GPU_GetFullName` | yes |  |  |  |
+| `NvAPI_GPU_GetGPUInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetGPUType` | yes |  |  |  |
+| `NvAPI_GPU_GetGpuCoreCount` | yes |  |  |  |
+| `NvAPI_GPU_GetGspFeatures` | yes |  |  |  |
+| `NvAPI_GPU_GetHDCPSupportStatus` | yes |  |  |  |
+| `NvAPI_GPU_GetIRQ` | yes |  |  |  |
+| `NvAPI_GPU_GetIllumination` | yes |  |  |  |
+| `NvAPI_GPU_GetLicensableFeatures` | yes |  |  |  |
+| `NvAPI_GPU_GetLogicalGpuInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetMemoryInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetMemoryInfoEx` | yes |  |  |  |
+| `NvAPI_GPU_GetOutputType` | yes |  |  |  |
+| `NvAPI_GPU_GetOverclockStatus` | yes |  |  |  |
+| `NvAPI_GPU_GetPCIIdentifiers` | yes |  |  |  |
+| `NvAPI_GPU_GetPerfDecreaseInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetPhysicalFrameBufferSize` | yes |  |  |  |
+| `NvAPI_GPU_GetPstates20` | yes |  |  |  |
+| `NvAPI_GPU_GetPstatesInfoEx` | yes |  |  |  |
+| `NvAPI_GPU_GetQuadroStatus` | yes |  |  |  |
+| `NvAPI_GPU_GetRamBusWidth` | yes |  |  |  |
+| `NvAPI_GPU_GetScanoutCompositionParameter` | yes |  |  |  |
+| `NvAPI_GPU_GetScanoutConfiguration` | yes |  |  |  |
+| `NvAPI_GPU_GetScanoutConfigurationEx` | yes |  |  |  |
+| `NvAPI_GPU_GetScanoutIntensityState` | yes |  |  |  |
+| `NvAPI_GPU_GetScanoutWarpingState` | yes |  |  |  |
+| `NvAPI_GPU_GetShaderSubPipeCount` | yes |  |  |  |
+| `NvAPI_GPU_GetSystemType` | yes |  |  |  |
+| `NvAPI_GPU_GetTachReading` | yes |  |  |  |
+| `NvAPI_GPU_GetThermalSettings` | yes |  |  |  |
+| `NvAPI_GPU_GetUUID` | yes |  |  |  |
+| `NvAPI_GPU_GetVRReadyData` | yes |  |  |  |
+| `NvAPI_GPU_GetVbiosOEMRevision` | yes |  |  |  |
+| `NvAPI_GPU_GetVbiosRevision` | yes |  |  |  |
+| `NvAPI_GPU_GetVbiosVersionString` | yes |  |  |  |
+| `NvAPI_GPU_GetVirtualFrameBufferSize` | yes |  |  |  |
+| `NvAPI_GPU_GetVirtualizationInfo` | yes |  |  |  |
+| `NvAPI_GPU_NVLINK_GetCaps` | yes |  |  |  |
+| `NvAPI_GPU_NVLINK_GetCapsEx` | yes |  |  |  |
+| `NvAPI_GPU_NVLINK_GetStatus` | yes |  |  |  |
+| `NvAPI_GPU_NVLINK_GetStatusEx` | yes |  |  |  |
+| `NvAPI_GPU_QueryIlluminationSupport` | yes |  |  |  |
+| `NvAPI_GPU_QueryWorkstationFeatureSupport` | yes |  |  |  |
+| `NvAPI_GPU_ResetECCErrorInfo` | yes |  |  |  |
+| `NvAPI_GPU_SetECCConfiguration` | yes |  |  |  |
+| `NvAPI_GPU_SetEDID` | yes |  |  |  |
+| `NvAPI_GPU_SetIllumination` | yes |  |  |  |
+| `NvAPI_GPU_SetScanoutCompositionParameter` | yes |  |  |  |
+| `NvAPI_GPU_SetScanoutIntensity` | yes |  |  |  |
+| `NvAPI_GPU_SetScanoutWarping` | yes |  |  |  |
+| `NvAPI_GPU_ValidateOutputCombination` | yes |  |  |  |
+| `NvAPI_GPU_WorkstationFeatureQuery` | yes |  |  |  |
+| `NvAPI_GPU_WorkstationFeatureSetup` | yes |  |  |  |
+| `NvAPI_GSync_AdjustSyncDelay` | yes |  |  |  |
+| `NvAPI_GSync_EnumSyncDevices` | yes |  |  |  |
+| `NvAPI_GSync_GetControlParameters` | yes |  |  |  |
+| `NvAPI_GSync_GetStatusParameters` | yes |  |  |  |
+| `NvAPI_GSync_GetSyncStatus` | yes |  |  |  |
+| `NvAPI_GSync_GetTopology` | yes |  |  |  |
+| `NvAPI_GSync_QueryCapabilities` | yes |  |  |  |
+| `NvAPI_GSync_SetControlParameters` | yes |  |  |  |
+| `NvAPI_GSync_SetSyncStateSettings` | yes |  |  |  |
+| `NvAPI_GetAssociatedDisplayOutputId` | yes |  |  |  |
+| `NvAPI_GetAssociatedNvidiaDisplayHandle` | yes |  |  |  |
+| `NvAPI_GetAssociatedNvidiaDisplayName` | yes |  |  |  |
+| `NvAPI_GetCurrentMosaicTopology` | yes |  |  |  |
+| `NvAPI_GetDisplayDriverVersion` | yes |  |  |  |
+| `NvAPI_GetDisplayPortInfo` | yes |  |  |  |
+| `NvAPI_GetErrorMessage` | yes |  |  |  |
+| `NvAPI_GetGPUIDfromPhysicalGPU` | yes |  |  |  |
+| `NvAPI_GetHDMISupportInfo` | yes |  |  |  |
+| `NvAPI_GetInterfaceVersionString` | yes |  |  |  |
+| `NvAPI_GetLogicalGPUFromDisplay` | yes |  |  |  |
+| `NvAPI_GetLogicalGPUFromPhysicalGPU` | yes |  |  |  |
+| `NvAPI_GetPhysicalGPUFromGPUID` | yes |  |  |  |
+| `NvAPI_GetPhysicalGPUFromUnAttachedDisplay` | yes |  |  |  |
+| `NvAPI_GetPhysicalGPUsFromDisplay` | yes |  |  |  |
+| `NvAPI_GetPhysicalGPUsFromLogicalGPU` | yes |  |  |  |
+| `NvAPI_GetSupportedMosaicTopologies` | yes |  |  |  |
+| `NvAPI_GetSupportedViews` | yes |  |  |  |
+| `NvAPI_GetUnAttachedAssociatedDisplayName` | yes |  |  |  |
+| `NvAPI_GetVBlankCounter` | yes |  |  |  |
+| `NvAPI_GetView` | yes |  |  |  |
+| `NvAPI_GetViewEx` | yes |  |  |  |
+| `NvAPI_I2CRead` | yes |  |  |  |
+| `NvAPI_I2CWrite` | yes |  |  |  |
+| `NvAPI_Initialize` | yes |  |  |  |
+| `NvAPI_Mosaic_EnableCurrentTopo` | yes |  |  |  |
+| `NvAPI_Mosaic_EnumDisplayGrids` | yes |  |  |  |
+| `NvAPI_Mosaic_EnumDisplayModes` | yes |  |  |  |
+| `NvAPI_Mosaic_GetCurrentTopo` | yes |  |  |  |
+| `NvAPI_Mosaic_GetDisplayViewportsByResolution` | yes |  |  |  |
+| `NvAPI_Mosaic_GetOverlapLimits` | yes |  |  |  |
+| `NvAPI_Mosaic_GetSupportedTopoInfo` | yes |  |  |  |
+| `NvAPI_Mosaic_GetTopoGroup` | yes |  |  |  |
+| `NvAPI_Mosaic_SetCurrentTopo` | yes |  |  |  |
+| `NvAPI_Mosaic_SetDisplayGrids` | yes |  |  |  |
+| `NvAPI_Mosaic_ValidateDisplayGrids` | yes |  |  |  |
+| `NvAPI_NGX_CloseSession` | yes |  |  |  |
+| `NvAPI_NGX_GetDriverFeatureSupport` | yes |  |  |  |
+| `NvAPI_NGX_GetNGXOverrideState` | yes |  |  |  |
+| `NvAPI_NGX_GetRuntimeParams` | yes |  |  |  |
+| `NvAPI_NGX_OpenSession` | yes |  |  |  |
+| `NvAPI_NGX_SetNGXOverrideState` | yes |  |  |  |
+| `NvAPI_NGX_SetRuntimeParams` | yes |  |  |  |
+| `NvAPI_OGL_ExpertModeDefaultsGet` | yes |  |  |  |
+| `NvAPI_OGL_ExpertModeDefaultsSet` | yes |  |  |  |
+| `NvAPI_OGL_ExpertModeGet` | yes |  |  |  |
+| `NvAPI_OGL_ExpertModeSet` | yes |  |  |  |
+| `NvAPI_RegisterRiseCallback` | yes |  |  |  |
+| `NvAPI_RequestRise` | yes |  |  |  |
+| `NvAPI_SYS_GetChipSetInfo` | yes |  |  |  |
+| `NvAPI_SYS_GetDisplayDriverInfo` | yes |  |  |  |
+| `NvAPI_SYS_GetDisplayIdFromGpuAndOutputId` | yes |  |  |  |
+| `NvAPI_SYS_GetDriverAndBranchVersion` | yes |  |  |  |
+| `NvAPI_SYS_GetGpuAndOutputIdFromDisplayId` | yes |  |  |  |
+| `NvAPI_SYS_GetLidAndDockInfo` | yes |  |  |  |
+| `NvAPI_SYS_GetLogicalGPUs` | yes |  |  |  |
+| `NvAPI_SYS_GetPhysicalGPUs` | yes |  |  |  |
+| `NvAPI_SYS_GetPhysicalGpuFromDisplayId` | yes |  |  |  |
+| `NvAPI_SetCurrentMosaicTopology` | yes |  |  |  |
+| `NvAPI_SetDisplayPort` | yes |  |  |  |
+| `NvAPI_SetRefreshRateOverride` | yes |  |  |  |
+| `NvAPI_SetView` | yes |  |  |  |
+| `NvAPI_SetViewEx` | yes |  |  |  |
+| `NvAPI_Stereo_Activate` | yes |  |  |  |
+| `NvAPI_Stereo_CaptureJpegImage` | yes |  |  |  |
+| `NvAPI_Stereo_CapturePngImage` | yes |  |  |  |
+| `NvAPI_Stereo_CreateConfigurationProfileRegistryKey` | yes |  |  |  |
+| `NvAPI_Stereo_Deactivate` | yes |  |  |  |
+| `NvAPI_Stereo_Debug_WasLastDrawStereoized` | yes |  |  |  |
+| `NvAPI_Stereo_DecreaseConvergence` | yes |  |  |  |
+| `NvAPI_Stereo_DecreaseSeparation` | yes |  |  |  |
+| `NvAPI_Stereo_DeleteConfigurationProfileRegistryKey` | yes |  |  |  |
+| `NvAPI_Stereo_DeleteConfigurationProfileValue` | yes |  |  |  |
+| `NvAPI_Stereo_DestroyHandle` | yes |  |  |  |
+| `NvAPI_Stereo_Disable` | yes |  |  |  |
+| `NvAPI_Stereo_Enable` | yes |  |  |  |
+| `NvAPI_Stereo_GetConvergence` | yes |  |  |  |
+| `NvAPI_Stereo_GetDefaultProfile` | yes |  |  |  |
+| `NvAPI_Stereo_GetEyeSeparation` | yes |  |  |  |
+| `NvAPI_Stereo_GetFrustumAdjustMode` | yes |  |  |  |
+| `NvAPI_Stereo_GetSeparation` | yes |  |  |  |
+| `NvAPI_Stereo_GetStereoSupport` | yes |  |  |  |
+| `NvAPI_Stereo_GetSurfaceCreationMode` | yes |  |  |  |
+| `NvAPI_Stereo_IncreaseConvergence` | yes |  |  |  |
+| `NvAPI_Stereo_IncreaseSeparation` | yes |  |  |  |
+| `NvAPI_Stereo_InitActivation` | yes |  |  |  |
+| `NvAPI_Stereo_IsActivated` | yes |  |  |  |
+| `NvAPI_Stereo_IsEnabled` | yes |  |  |  |
+| `NvAPI_Stereo_IsWindowedModeSupported` | yes |  |  |  |
+| `NvAPI_Stereo_ReverseStereoBlitControl` | yes |  |  |  |
+| `NvAPI_Stereo_SetActiveEye` | yes |  |  |  |
+| `NvAPI_Stereo_SetConfigurationProfileValue` | yes |  |  |  |
+| `NvAPI_Stereo_SetConvergence` | yes |  |  |  |
+| `NvAPI_Stereo_SetDefaultProfile` | yes |  |  |  |
+| `NvAPI_Stereo_SetDriverMode` | yes |  |  |  |
+| `NvAPI_Stereo_SetFrustumAdjustMode` | yes |  |  |  |
+| `NvAPI_Stereo_SetNotificationMessage` | yes |  |  |  |
+| `NvAPI_Stereo_SetSeparation` | yes |  |  |  |
+| `NvAPI_Stereo_SetSurfaceCreationMode` | yes |  |  |  |
+| `NvAPI_Stereo_Trigger_Activation` | yes |  |  |  |
+| `NvAPI_UninstallRise` | yes |  |  |  |
+| `NvAPI_Unload` | yes |  |  |  |
+| `NvAPI_VIO_Close` | yes |  |  |  |
+| `NvAPI_VIO_EnumDataFormats` | yes |  |  |  |
+| `NvAPI_VIO_EnumDevices` | yes |  |  |  |
+| `NvAPI_VIO_EnumSignalFormats` | yes |  |  |  |
+| `NvAPI_VIO_GetCSC` | yes |  |  |  |
+| `NvAPI_VIO_GetCapabilities` | yes |  |  |  |
+| `NvAPI_VIO_GetConfig` | yes |  |  |  |
+| `NvAPI_VIO_GetGamma` | yes |  |  |  |
+| `NvAPI_VIO_GetPCIInfo` | yes |  |  |  |
+| `NvAPI_VIO_GetSyncDelay` | yes |  |  |  |
+| `NvAPI_VIO_IsFrameLockModeCompatible` | yes |  |  |  |
+| `NvAPI_VIO_IsRunning` | yes |  |  |  |
+| `NvAPI_VIO_Open` | yes |  |  |  |
+| `NvAPI_VIO_QueryTopology` | yes |  |  |  |
+| `NvAPI_VIO_SetCSC` | yes |  |  |  |
+| `NvAPI_VIO_SetConfig` | yes |  |  |  |
+| `NvAPI_VIO_SetGamma` | yes |  |  |  |
+| `NvAPI_VIO_SetSyncDelay` | yes |  |  |  |
+| `NvAPI_VIO_Start` | yes |  |  |  |
+| `NvAPI_VIO_Status` | yes |  |  |  |
+| `NvAPI_VIO_Stop` | yes |  |  |  |
+| `NvAPI_VIO_SyncFormatDetect` | yes |  |  |  |
+
 ## nvcuvid
 
 - `nvcuvid.h` sha256 `8980e3d9c1e41b116240a451b6249b3ab9e8e9582f4792ccc6eade42a6024e0d`
@@ -10507,6 +11124,25 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlVgpuTypeGetName` | yes |  |  |  |
 | `nvmlVgpuTypeGetNumDisplayHeads` | yes |  |  |  |
 | `nvmlVgpuTypeGetResolution` | yes |  |  |  |
+
+## nvofa
+
+- `nvOpticalFlowCuda.h` sha256 `6c6c2f4ac11151aceecb7ba8f1da317be3d7862b4cdb0b280a467c4151ffee8c`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `nvCreateOpticalFlowCuda` | yes |  |  |  |
+| `nvOFCreateGPUBufferCuda` | yes |  |  |  |
+| `nvOFDestroy` | yes |  |  |  |
+| `nvOFDestroyGPUBufferCuda` | yes |  |  |  |
+| `nvOFExecute` | yes |  |  |  |
+| `nvOFGPUBufferGetCUarray` | yes |  |  |  |
+| `nvOFGPUBufferGetCUdeviceptr` | yes |  |  |  |
+| `nvOFGPUBufferGetStrideInfo` | yes |  |  |  |
+| `nvOFGetCaps` | yes |  |  |  |
+| `nvOFGetLastError` | yes |  |  |  |
+| `nvOFInit` | yes |  |  |  |
+| `nvOFSetIOCudaStreams` | yes |  |  |  |
 
 ## nvrtc
 

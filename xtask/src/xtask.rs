@@ -128,13 +128,13 @@ fn collect(root: &Path) -> Result<String, Error> {
     let mut newest: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
     for profile in list(&root.join("target")) {
         for build in list(&profile.join("build")) {
+            // nv-bindgen-fixture's synthetic libraries are a test harness, not NVIDIA evidence.
+            if build.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("nv-bindgen-fixture-")) {
+                continue;
+            }
             for file in list(&build.join("out")) {
                 let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
                 let Some(lib) = name.strip_suffix("_inventory.json") else { continue };
-                // nv-bindgen-fixture's synthetic library is a test harness, not NVIDIA evidence.
-                if lib == "fake" {
-                    continue;
-                }
                 let modified = std::fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
                 if newest.get(lib).is_none_or(|(t, _)| modified > *t) {
                     newest.insert(lib.to_string(), (modified, file));

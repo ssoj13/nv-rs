@@ -118,6 +118,7 @@ impl TextureDesc {
 }
 
 /// What a texture reads from (kept alive by the texture).
+#[expect(dead_code, reason = "held only to keep the storage alive while the texture handle exists")]
 enum Source {
     Array(Arc<Array>),
     Mipmapped(Arc<MipmappedArray>),

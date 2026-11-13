@@ -14,6 +14,7 @@ const FAKE: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &["fakeStatus_enum"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "FakeApi",
         loader_fn: "fake_api",
@@ -33,6 +34,7 @@ const QI: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &[],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::QueryInterface {
         interface_header: "qi_interface.h",
         loader_fn: "qi_api",

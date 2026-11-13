@@ -11,6 +11,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &["nvmlReturn_enum"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "NvmlApi",
         loader_fn: "nvml_api",

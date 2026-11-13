@@ -13,6 +13,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &["CUresult", "cudaError_enum", "CUctx_st", "CUstream_st", "CUarray_st"],
     positive_enums: &[],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "NvcuvidApi",
         loader_fn: "nvcuvid_api",

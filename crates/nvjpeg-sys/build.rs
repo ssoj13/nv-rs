@@ -11,6 +11,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &["nvjpegStatus_t"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "NvjpegApi",
         loader_fn: "nvjpeg_api",

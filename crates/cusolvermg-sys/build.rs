@@ -11,6 +11,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &["cusolverStatus_t"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "CusolverMgApi",
         loader_fn: "cusolvermg_api",

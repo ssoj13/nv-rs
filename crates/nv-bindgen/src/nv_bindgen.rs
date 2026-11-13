@@ -146,6 +146,9 @@ pub struct LibSpec {
     /// Extra libclang arguments, for headers that need a macro neutralised (NVAPI's
     /// `__success(...)` SAL annotation: `-D__success(x)=`).
     pub clang_args: &'static [&'static str],
+    /// Types emitted as opaque byte blobs of the C size and alignment, for layouts bindgen gets
+    /// wrong (MSVC bitfield unions in NVAPI's `NV_TIMING_FLAG`, caught by the layout assertions).
+    pub opaque_types: &'static [&'static str],
     /// The entry-point shape.
     pub shape: Shape,
 }
@@ -316,6 +319,9 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         }
         for a in spec.clang_args {
             b = b.clang_arg(*a);
+        }
+        for t in spec.opaque_types {
+            b = b.opaque_type(*t);
         }
         b
     };
@@ -888,6 +894,7 @@ mod tests {
         reuse_cuda_types: &[],
         positive_enums: &["fakeStatus_enum"],
         clang_args: &[],
+        opaque_types: &[],
         shape: Shape::Exports {
             api_type: "FakeApi",
             loader_fn: "fake_api",

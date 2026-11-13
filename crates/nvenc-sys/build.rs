@@ -12,6 +12,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &[],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::FunctionTable { table_type: "_NV_ENCODE_API_FUNCTION_LIST" },
 };
 

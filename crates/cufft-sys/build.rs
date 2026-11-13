@@ -12,6 +12,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &["cufftResult_t"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "CufftApi",
         loader_fn: "cufft_api",

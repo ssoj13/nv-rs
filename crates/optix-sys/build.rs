@@ -12,6 +12,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &["CUctx_st", "CUstream_st"],
     positive_enums: &[],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::FunctionTable { table_type: "OptixFunctionTable" },
 };
 

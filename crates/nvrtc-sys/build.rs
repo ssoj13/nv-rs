@@ -11,6 +11,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &[],
     positive_enums: &["nvrtcResult"],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::Exports {
         api_type: "NvrtcApi",
         loader_fn: "nvrtc_api",

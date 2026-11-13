@@ -60,6 +60,7 @@ const SPEC: LibSpec = LibSpec {
     reuse_cuda_types: &["CUstream_st"],
     positive_enums: &[],
     clang_args: &[],
+    opaque_types: &[],
     shape: Shape::SplitExports {
         parts: PARTS,
         status_types: &["NppStatus"],

@@ -254,7 +254,7 @@ mod tests {
         ] {
             let format = Format::default_for(kind);
             let mut mgr =
-                CompressionManager::new(&stream, format, 16 * 1024, Some(128 * 1024 * 1024)).unwrap();
+                CompressionManager::new(&stream, format, 16 * 1024, Some(512 * 1024 * 1024)).unwrap();
             let compressed = mgr.compress_async(&stream, &dev_in).unwrap();
             let dev_out = mgr.decompress_to_buffer_async(&stream, &compressed).unwrap();
             stream.synchronize().unwrap();

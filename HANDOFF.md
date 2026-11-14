@@ -1,6 +1,16 @@
 # Handoff — nv-rs (2026-11-13)
 
-## Wave 1 Completion Checkpoint — 2026-11-13
+## Wave 1 Completion Checkpoint — 2026-11-13 / 2026-11-14 (GPU Verified)
+
+- **GPU T2/T3 Verification on RTX 3080 Ti (`2026-11-14`)**: All Windows-runnable GPU integration tests passed after fixing real hardware/driver/SDK findings (`cudnn-sys` Windows cuDNN 9.23 sibling DLL `LOAD_WITH_ALTERED_SEARCH_PATH` preloading, `cusolver::SpHandle::csreigvsi` device `d_mu` pointer, `nvjpeg` v2 `JpegDecoder` + `JpegState::with_decoder`, `npp` `CmpOp` threshold mode validation + BT.601 rounding tolerance, `nvenc`/`nvdec` 256x256 min frame dims + AV1 cap check, `nvofa` non-periodic pattern, `nvrtc` `.entry` assertion, `nvml` WDDM `reserved` memory invariant, `nvcomp` 512 MiB test budget):
+  - `nv-wgpu --test gpu`: 5 passed; `nv-bindgen --lib -- --ignored`: 1 passed.
+  - `cublas --lib`: 2 passed; `cufft --lib`: 1 passed; `curand --lib`: 1 passed.
+  - `cusparse --test gpu`: 4 passed; `cusolver --test gpu`: 6 passed.
+  - `npp --test gpu`: 2 passed; `nvjpeg --test gpu`: 1 passed; `nvrtc --test gpu`: 4 passed; `cupti --test gpu`: 2 passed.
+  - `nvml --lib`: 1 passed; `nvapi --lib`: 1 passed.
+  - `nvenc --test gpu`: 1 passed; `nvdec --test gpu`: 1 passed; `nvofa --test gpu`: 1 passed.
+  - `cudnn-sys --lib`: 1 passed (`library_loads`); `cudnn --lib`: 2 passed; `nvcomp --lib`: 1 passed.
+  - `nccl` / `cufile` remain Linux-only (`x86_64-unknown-linux-gnu` target not installed on this Windows host); `ngx` held per `PLAN.md` D13.
 
 - **vcv-rs**: Completed Windows/Linux fixes, verified (`clippy -D warnings`, 117 tests + `pwsh`/`git-bash` roundtrips + mutant), and pushed to `main` at `31c54282807fe2b0705ffde543fc8dfef4c2b543`. `nv-rs/Cargo.lock` and `nv-rs/device/Cargo.lock` lock `31c54282`.
 - **M2 Audit & Repair (`D01_D02`)**: Audited `nvcomp-sys`, `nccl-sys`, `cufile-sys`, `nv-bindgen`, `nv-loader`, `nv-bindgen-fixture` against installed SDK headers; fixed `nvcomp-sys` `positive_enums` + `libnvcomp.so.6`, `nv-bindgen` `WrapMode::CheckedVoid` (`clippy::unit_arg`-clean) + `QueryInterface` `rerun-if-changed` + GCC `c_uint`, and `nv-loader` `Error::source()` unwrapping across `thiserror` 2.0.

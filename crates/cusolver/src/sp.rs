@@ -120,9 +120,34 @@ impl Drop for MatDescr {
 }
 
 mod sealed {
-    pub trait Sealed {}
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
+    use super::*;
+
+    pub trait Sealed: Sized {
+        fn alloc_scalar(stream: &Stream, val: Self) -> Result<DeviceBuffer<Self>>;
+        fn read_scalar(buf: &DeviceBuffer<Self>, stream: &Stream) -> Result<Self>;
+    }
+
+    impl Sealed for f32 {
+        fn alloc_scalar(stream: &Stream, val: Self) -> Result<DeviceBuffer<Self>> {
+            Ok(DeviceBuffer::from_host(stream, &[val])?)
+        }
+
+        fn read_scalar(buf: &DeviceBuffer<Self>, stream: &Stream) -> Result<Self> {
+            let host = buf.to_host_vec(stream)?;
+            Ok(host[0])
+        }
+    }
+
+    impl Sealed for f64 {
+        fn alloc_scalar(stream: &Stream, val: Self) -> Result<DeviceBuffer<Self>> {
+            Ok(DeviceBuffer::from_host(stream, &[val])?)
+        }
+
+        fn read_scalar(buf: &DeviceBuffer<Self>, stream: &Stream) -> Result<Self> {
+            let host = buf.to_host_vec(stream)?;
+            Ok(host[0])
+        }
+    }
 }
 
 /// Real floating-point scalar supported by sparse cuSOLVER (`f32` and `f64`).
@@ -388,8 +413,8 @@ impl SpHandle {
         }
         validate_csr_solve(m, nnz, csr_val.len(), csr_row_ptr.len(), csr_col_ind.len(), x0.len(), x.len())?;
         self.set_stream(stream)?;
-        let mut mu = mu0;
-        // SAFETY: buffer lengths were validated above; `mu` is a valid host out-pointer.
+        let d_mu = T::alloc_scalar(stream, mu0)?;
+        // SAFETY: buffer lengths were validated above; `d_mu` is a 1-element device buffer on `stream`.
         unsafe {
             T::csreigvsi(
                 self.raw,
@@ -403,11 +428,11 @@ impl SpHandle {
                 x0.cu_deviceptr() as *const T,
                 maxite,
                 eps,
-                &mut mu,
+                d_mu.cu_deviceptr() as *mut T,
                 x.cu_deviceptr() as *mut T,
             )?;
         }
-        Ok(mu)
+        T::read_scalar(&d_mu, stream)
     }
 }
 

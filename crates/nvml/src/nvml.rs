@@ -192,9 +192,25 @@ mod tests {
 
         let mem = dev.memory_info().expect("memory info");
         assert!(mem.total > 0);
-        // NVML v2 `used` already includes `reserved`.
-        assert_eq!(mem.free + mem.used, mem.total);
-        assert!(mem.reserved.unwrap_or(0) <= mem.used);
+        assert!(
+            mem.free + mem.used <= mem.total,
+            "free ({}) + used ({}) > total ({})",
+            mem.free,
+            mem.used,
+            mem.total,
+        );
+        // On Linux/TCC NVML v2 `used` includes `reserved`; on Windows WDDM `reserved` is separate.
+        if let Some(reserved) = mem.reserved {
+            assert!(
+                mem.free + mem.used + reserved == mem.total
+                    || (mem.free + mem.used == mem.total && reserved <= mem.used),
+                "unexpected memory accounting: free={}, used={}, reserved={}, total={}",
+                mem.free,
+                mem.used,
+                reserved,
+                mem.total,
+            );
+        }
 
         let util = dev.utilization_rates().expect("utilization rates");
         assert!(util.gpu <= 100 && util.memory <= 100);

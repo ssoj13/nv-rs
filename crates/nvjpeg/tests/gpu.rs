@@ -3,8 +3,8 @@
 
 use cuda_core::{Context, DeviceBuffer};
 use nvjpeg::{
-    ChromaSubsampling, EncoderParams, EncoderState, ExifOrientation, Handle, ImagePlanes, ImagePlanesMut, InputFormat, JpegEncoding, JpegState, JpegStream,
-    NvjpegDeviceBuffer, OutputFormat, PinnedBuffer,
+    Backend, ChromaSubsampling, DecodeParams, EncoderParams, EncoderState, ExifOrientation, Handle, ImagePlanes, ImagePlanesMut, InputFormat,
+    JpegDecoder, JpegEncoding, JpegState, JpegStream, NvjpegDeviceBuffer, OutputFormat, PinnedBuffer,
 };
 
 fn psnr_u8(a: &[u8], b: &[u8]) -> f64 {
@@ -68,19 +68,23 @@ fn encode_decode_psnr_interleaved_and_planar() {
     assert_eq!(jstream.sample_precision().expect("prec"), 8);
     assert_eq!(jstream.jpeg_encoding().expect("enc"), JpegEncoding::BaselineDct);
 
-    // Decode interleaved with attached pinned/device buffers.
+    // Decode interleaved with decoupled v2 decoder and attached pinned/device buffers.
     let pinned = PinnedBuffer::new(&handle).expect("pinned");
     pinned.resize(64 * 1024, &stream).expect("resize pinned");
     let dev_scratch = NvjpegDeviceBuffer::new(&handle).expect("dev_scratch");
     dev_scratch.resize(64 * 1024, &stream).expect("resize dev");
 
-    let mut dec = JpegState::new(&handle).expect("JpegState");
+    let decoder = JpegDecoder::new(&handle, Backend::Default).expect("JpegDecoder");
+    let mut dec = JpegState::with_decoder(&decoder).expect("JpegState::with_decoder");
     dec.attach_pinned(&pinned).expect("attach pinned");
     dec.attach_device(&dev_scratch).expect("attach device");
 
+    let mut dec_params = DecodeParams::new(&handle).expect("DecodeParams");
+    dec_params.set_output_format(OutputFormat::Rgbi).expect("set_output_format rgbi");
+
     let mut dst_rgbi = DeviceBuffer::from_host(&stream, &vec![0u8; rgb_host.len()]).expect("dst_rgbi");
     let mut dst_planes = ImagePlanesMut::interleaved(&mut dst_rgbi, w, h, 3, (w * 3) as usize).expect("dst_planes");
-    dec.decode(&jpeg, OutputFormat::Rgbi, &mut dst_planes, &stream).expect("decode rgbi");
+    dec.decode_jpeg(&jstream, &dec_params, &mut dst_planes, &stream).expect("decode rgbi");
     stream.synchronize().expect("sync");
 
     let decoded_rgbi = dst_rgbi.to_host_vec(&stream).expect("readback rgbi");
@@ -88,6 +92,7 @@ fn encode_decode_psnr_interleaved_and_planar() {
     assert!(psnr > 35.0, "interleaved decode PSNR {psnr:.2} dB too low");
 
     // Decode planar RGB.
+    dec_params.set_output_format(OutputFormat::Rgb).expect("set_output_format rgb");
     let plane_bytes = (w * h) as usize;
     let mut r_dev = DeviceBuffer::from_host(&stream, &vec![0u8; plane_bytes]).expect("r");
     let mut g_dev = DeviceBuffer::from_host(&stream, &vec![0u8; plane_bytes]).expect("g");
@@ -98,7 +103,7 @@ fn encode_decode_psnr_interleaved_and_planar() {
         h,
     )
     .expect("planar_dst");
-    dec.decode(&jpeg, OutputFormat::Rgb, &mut planar_dst, &stream).expect("decode planar");
+    dec.decode_jpeg(&jstream, &dec_params, &mut planar_dst, &stream).expect("decode planar");
     stream.synchronize().expect("sync planar");
 
     let r_host = r_dev.to_host_vec(&stream).expect("r readback");

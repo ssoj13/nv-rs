@@ -42,14 +42,23 @@ fn optical_flow_detects_synthetic_shift() {
     let mut img_cur = vec![0u8; (width * height) as usize];
     let mut img_ref = vec![0u8; (width * height) as usize];
     let pattern = |x: i32, y: i32| -> u8 {
-        let fx = (x as f32) * 0.15;
-        let fy = (y as f32) * 0.15;
-        ((fx.sin() * fy.cos() * 110.0) + 128.0).clamp(0.0, 255.0) as u8
+        // Rich, non-periodic multi-scale texture so hardware block matching has unique local descriptors.
+        let ux = x.wrapping_mul(374_761_393) as u32;
+        let uy = y.wrapping_mul(668_265_263) as u32;
+        let mut h = ux ^ uy.rotate_left(13);
+        h = h.wrapping_mul(1_274_126_177);
+        h ^= h >> 16;
+        let fine = (h & 0xff) as f32;
+        let fx = (x as f32) * 0.13 + ((y as f32) * 0.03).sin();
+        let fy = (y as f32) * 0.11 + ((x as f32) * 0.04).cos();
+        let coarse = (fx.sin() * fy.cos() * 64.0) + 128.0;
+        (0.55 * fine + 0.45 * coarse).clamp(0.0, 255.0) as u8
     };
     for y in 0..height as i32 {
         for x in 0..width as i32 {
             img_cur[(y * width as i32 + x) as usize] = pattern(x, y);
-            img_ref[(y * width as i32 + x) as usize] = pattern(x + shift_x, y + shift_y);
+            // Feature at (x, y) in input_frame moves to (x + shift_x, y + shift_y) in reference_frame.
+            img_ref[(y * width as i32 + x) as usize] = pattern(x - shift_x, y - shift_y);
         }
     }
 

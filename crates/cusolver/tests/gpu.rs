@@ -231,10 +231,12 @@ fn sp_csrlsvqr_and_csreigvsi_numerical_checks() {
     let max_err = x_h.iter().zip(expected.iter()).map(|(u, v)| (u - v).abs()).fold(0.0f32, f32::max);
     assert!(max_err < 1e-4, "csrlsvqr x={x_h:?}, max_err={max_err}");
 
-    let x0 = DeviceBuffer::from_host(&stream, &[1.0f32, 1.0, 1.0]).expect("x0");
+    // Shift `mu0` away from exact eigenvalue 4.0 (so `A - mu0*I` is nonsingular) and use
+    // `x0` non-orthogonal to the target eigenvector `[1, 0, -1]`.
+    let x0 = DeviceBuffer::from_host(&stream, &[1.0f32, 0.5, -0.5]).expect("x0");
     let mut eig_vec = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("eig_vec");
     let mu = sp
-        .csreigvsi(&stream, 3, 7, &descr, &csr_val, &csr_row, &csr_col, 4.0, &x0, 50, 1e-5, &mut eig_vec)
+        .csreigvsi(&stream, 3, 7, &descr, &csr_val, &csr_row, &csr_col, 3.9, &x0, 50, 1e-5, &mut eig_vec)
         .expect("csreigvsi");
     stream.synchronize().expect("sync");
     assert!((mu - 4.0).abs() < 1e-3, "expected eigenvalue near 4.0, got {mu}");

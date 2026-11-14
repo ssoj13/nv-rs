@@ -34,7 +34,8 @@ fn compile_ptx_inspect_and_launch_kernel() {
     let _log = prog.compile(&opts).expect("compile");
 
     let ptx_text = prog.ptx_string().expect("ptx_string");
-    assert!(ptx_text.contains(".visible .entry"), "PTX missing .entry");
+    // Template __global__ instantiations emit `.weak .entry` rather than `.visible .entry`.
+    assert!(ptx_text.contains(".entry"), "PTX missing .entry");
     let lowered = prog.lowered_name("&saxpy<float>").expect("lowered_name");
     assert!(ptx_text.contains(&lowered), "PTX missing lowered name {lowered}");
     assert!(prog.cubin().expect("cubin query").is_none(), "virtual arch produces PTX only");

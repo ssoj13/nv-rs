@@ -19,7 +19,7 @@ pub mod encode;
 pub mod handle;
 
 pub use encode::{EncoderParams, EncoderState};
-pub use handle::{Handle, JpegState, JpegStream, NvjpegDeviceBuffer, PinnedBuffer};
+pub use handle::{DecodeParams, Handle, JpegDecoder, JpegState, JpegStream, NvjpegDeviceBuffer, PinnedBuffer};
 
 pub use nvjpeg_sys as sys;
 

@@ -503,26 +503,41 @@ pub fn filter_gauss_8u_c3(ctx: &NppContext, src: &ImageView<'_, u8>, dst: &mut I
     })
 }
 
+fn validate_threshold_op(op: CmpOp) -> Result<sys::NppCmpOp> {
+    match op {
+        CmpOp::Less | CmpOp::Greater => Ok(op.to_sys()),
+        CmpOp::LessEq | CmpOp::Eq | CmpOp::GreaterEq => {
+            Err(Error::InvalidInput("nppiThreshold_Val only supports CmpOp::Less and CmpOp::Greater"))
+        }
+    }
+}
+
 /// Thresholds a 1-channel 8-bit image (`nppiThreshold_Val_8u_C1R_Ctx`): pixels where
 /// `src OP threshold` is true are set to `value`, otherwise copied from `src`.
+///
+/// NPP only supports [`CmpOp::Less`] and [`CmpOp::Greater`] for `nppiThreshold_Val`.
 pub fn threshold_val_8u_c1(ctx: &NppContext, src: &ImageView<'_, u8>, dst: &mut ImageViewMut<'_, u8>, threshold: u8, value: u8, op: CmpOp) -> Result<()> {
     sys::nppitc::load().map_err(|e| Error::Unavailable(e.to_string()))?;
     let roi = check_pair_roi(src, dst, 1, 1)?;
+    let cmp = validate_threshold_op(op)?;
     ctx.bind()?;
-    // SAFETY: validated 1-channel `u8` device views and comparison operator.
+    // SAFETY: validated 1-channel `u8` device views and supported comparison operator.
     check("nppiThreshold_Val_8u_C1R_Ctx", unsafe {
-        sys::nppiThreshold_Val_8u_C1R_Ctx(src.as_ptr(), src.step(), dst.as_mut_ptr(), dst.step(), roi, threshold, value, op.to_sys(), ctx.raw())
+        sys::nppiThreshold_Val_8u_C1R_Ctx(src.as_ptr(), src.step(), dst.as_mut_ptr(), dst.step(), roi, threshold, value, cmp, ctx.raw())
     })
 }
 
 /// Thresholds a 1-channel 32-bit float image (`nppiThreshold_Val_32f_C1R_Ctx`).
+///
+/// NPP only supports [`CmpOp::Less`] and [`CmpOp::Greater`] for `nppiThreshold_Val`.
 pub fn threshold_val_32f_c1(ctx: &NppContext, src: &ImageView<'_, f32>, dst: &mut ImageViewMut<'_, f32>, threshold: f32, value: f32, op: CmpOp) -> Result<()> {
     sys::nppitc::load().map_err(|e| Error::Unavailable(e.to_string()))?;
     let roi = check_pair_roi(src, dst, 1, 1)?;
+    let cmp = validate_threshold_op(op)?;
     ctx.bind()?;
-    // SAFETY: validated 1-channel `f32` device views and comparison operator.
+    // SAFETY: validated 1-channel `f32` device views and supported comparison operator.
     check("nppiThreshold_Val_32f_C1R_Ctx", unsafe {
-        sys::nppiThreshold_Val_32f_C1R_Ctx(src.as_ptr(), src.step(), dst.as_mut_ptr(), dst.step(), roi, threshold, value, op.to_sys(), ctx.raw())
+        sys::nppiThreshold_Val_32f_C1R_Ctx(src.as_ptr(), src.step(), dst.as_mut_ptr(), dst.step(), roi, threshold, value, cmp, ctx.raw())
     })
 }
 
@@ -560,5 +575,14 @@ mod tests {
         assert!(pad.check_at_least(1, 1, 1, 1).is_ok());
         assert!(matches!(pad.check_at_least(2, 1, 1, 1), Err(Error::InvalidInput(_))));
         assert!(matches!(BorderPad::default().check_at_least(1, 1, 1, 1), Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn threshold_op_validation_rejects_unsupported_modes() {
+        assert!(validate_threshold_op(CmpOp::Less).is_ok());
+        assert!(validate_threshold_op(CmpOp::Greater).is_ok());
+        assert!(matches!(validate_threshold_op(CmpOp::LessEq), Err(Error::InvalidInput(_))));
+        assert!(matches!(validate_threshold_op(CmpOp::Eq), Err(Error::InvalidInput(_))));
+        assert!(matches!(validate_threshold_op(CmpOp::GreaterEq), Err(Error::InvalidInput(_))));
     }
 }

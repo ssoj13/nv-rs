@@ -47,8 +47,8 @@ impl ParserHandler for RoundTripCollector {
 fn nvenc_to_nvdec_h264_roundtrip_psnr() {
     let cuda = Context::new(0).expect("CUDA device 0");
     let stream = cuda.default_stream();
-    let width = 128u32;
-    let height = 128u32;
+    let width = 256u32;
+    let height = 256u32;
     let num_frames = 4u32;
 
     let mut enc = EncodeSession::open(&cuda).expect("open NVENC");

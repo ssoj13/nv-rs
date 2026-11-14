@@ -1,0 +1,20 @@
+[package]
+name = "cublas"
+description = "Safe cuBLAS and cuBLASLt host API: handles, stream binding, GEMM/batched/strided, MatmulDesc/MatrixLayout/Preference, workspace scratch and byte budgets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cublas.rs"
+
+[dependencies]
+cublas-sys = { path = "../cublas-sys" }
+cublaslt-sys = { path = "../cublaslt-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

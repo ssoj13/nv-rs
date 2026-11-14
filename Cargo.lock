@@ -222,6 +222,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cublas"
+version = "0.0.0"
+dependencies = [
+ "cublas-sys",
+ "cublaslt-sys",
+ "cuda-core",
+ "thiserror",
+]
+
+[[package]]
 name = "cublas-sys"
 version = "0.0.0"
 dependencies = [
@@ -291,6 +301,17 @@ version = "0.5.0"
 source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
 
 [[package]]
+name = "cudnn"
+version = "0.1.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "cudnn-sys",
+ "nv-loader",
+ "thiserror",
+]
+
+[[package]]
 name = "cudnn-sys"
 version = "0.0.0"
 dependencies = [
@@ -301,6 +322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cufft"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "cufft-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "cufft-sys"
 version = "0.0.0"
 dependencies = [
@@ -308,6 +338,17 @@ dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "cufile"
+version = "0.1.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "cufile-sys",
+ "nv-loader",
+ "thiserror",
 ]
 
 [[package]]
@@ -322,6 +363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cupti"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "cupti-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "cupti-sys"
 version = "0.0.0"
 dependencies = [
@@ -329,6 +379,26 @@ dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "curand"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "thiserror",
+]
+
+[[package]]
+name = "cusolver"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "cusolver-sys",
+ "cusolvermg-sys",
+ "cusparse-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -348,6 +418,15 @@ dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "cusparse"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "cusparse-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -766,6 +845,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nccl"
+version = "0.1.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "nccl-sys",
+ "nv-loader",
+ "thiserror",
+]
+
+[[package]]
 name = "nccl-sys"
 version = "0.0.0"
 dependencies = [
@@ -801,6 +891,16 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "npp"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "npp-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -858,12 +958,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "nv-wgpu"
+version = "0.0.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "cuda-bindings",
+ "cuda-core",
+ "cuda-ext",
+ "gpu-info-rs",
+ "half",
+ "libc",
+ "thiserror",
+ "wgpu",
+ "windows",
+]
+
+[[package]]
+name = "nvapi"
+version = "0.0.0"
+dependencies = [
+ "nv-loader",
+ "nvapi-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "nvapi-sys"
 version = "0.0.0"
 dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "nvcomp"
+version = "0.1.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "nv-loader",
+ "nvcomp-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -888,6 +1025,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvdec"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "nvcuvid-sys",
+ "nvenc",
+ "thiserror",
+]
+
+[[package]]
+name = "nvenc"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "nvenc-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "nvenc-sys"
 version = "0.0.0"
 dependencies = [
@@ -895,6 +1051,15 @@ dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "nvjpeg"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "nvjpeg-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -908,12 +1073,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvml"
+version = "0.0.0"
+dependencies = [
+ "nv-loader",
+ "nvml-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "nvml-sys"
 version = "0.0.0"
 dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "nvofa"
+version = "0.0.0"
+dependencies = [
+ "cuda-core",
+ "nvofa-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -924,6 +1107,16 @@ dependencies = [
  "libloading",
  "nv-bindgen",
  "nv-loader",
+]
+
+[[package]]
+name = "nvrtc"
+version = "0.0.0"
+dependencies = [
+ "cuda-bindings",
+ "cuda-core",
+ "nvrtc-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -1509,7 +1702,7 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 [[package]]
 name = "vcv-rs"
 version = "0.1.1"
-source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#a8cab6688c1ef01f1067ea3d150ad7283e1367cb"
+source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#31c54282807fe2b0705ffde543fc8dfef4c2b543"
 dependencies = [
  "object 0.40.0",
  "serde",

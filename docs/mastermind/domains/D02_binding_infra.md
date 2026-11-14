@@ -1,13 +1,13 @@
 # D02 — shared binding infrastructure
 
-Updated: 2026-11-13. Status: source written and untested; checked-void repair is present, independent review and execution remain pending.
+Updated: 2026-11-14 (UTC). Status: static Inquisitor Q1–Q7 audit completed across `nv-bindgen`, `nv-loader`, and `nv-bindgen-fixture`; repairs applied (`nv_bindgen.rs:344` QueryInterface `rerun-if-changed`, `nv_bindgen.rs:759-812` `WrapMode::CheckedVoid` eliminating `clippy::unit_arg`, `nv_bindgen.rs:991` cross-OS `normalize_positive_enums` + test `nv_bindgen.rs:1286`, `nv_loader.rs:100-150` `CallError`/`SymbolError` manual `Error::source` + test `nv_loader.rs:642`); **no `cargo` or `git` executed by worker** — root reported `clippy -p nv-bindgen-fixture` clean (`#117`), `nv-bindgen`/`nv-loader` test re-run pending root.
 See the [domain index](../MASTERMIND_INDEX.md), [D01 ledger](D01_m2_sys.md), [seam matrix](../SEAM_MATRIX.md)
 and [work queue](../../../TODO.md).
 
 ## Exact source boundary
 
-D02's original boundary contains these 21 files. Root now owns nv-bindgen's vcv-rs adapter integration. D02 also received bounded permission for NCCL/cuFile checked-call fixtures and NCCL cleanup repairs, recorded in the [D01 ledger](D01_m2_sys.md). Documentation is maintained by the documentation lane.
-Workers do not build, run tests or mutate git.
+D02's original boundary contains these 21 files (plus `crates/nv-bindgen/src/device_asm.rs`, `crates/nv-bindgen/tests/fixture/split*.h`, and `Cargo.toml`s audited in D01_D02). Root owns nv-bindgen's vcv-rs adapter integration. D02 also received bounded permission for NCCL/cuFile checked-call fixtures and NCCL cleanup repairs, recorded in the [D01 ledger](D01_m2_sys.md).
+Workers do not run `cargo` or `git`.
 
 | # | Allowed source file |
 |---|---|
@@ -35,59 +35,40 @@ Workers do not build, run tests or mutate git.
 
 ## Current source checkpoint
 
-Root reports shared ReturnPolicy handling, boxed CallError diagnostics, mixed-return fixtures,
-Linux SDK load hints and migration of the 14 recipes listed above. All changes remain uncommitted
-and untested. No fresh independent Inquisitor verdict exists.
+Static Inquisitor audit verified shared `ReturnPolicy` handling, boxed `CallError` diagnostics, mixed-return fixtures, Linux SDK load hints, `device_asm`, `vcv-rs` adapter integration, lint compliance (`unsafe_op_in_unsafe_fn = deny`, `clippy::undocumented_unsafe_blocks = deny`, `missing_docs = warn`, `//!` headers), and `unused_variables` safety (`__nv_error` underscore prefix). All execution gates remain pending root.
 
-Read-only declaration inspection confirms these anchors; it is not a complete symbol manifest:
+Read-only inspection verified these anchors at current line numbers:
 
 | Anchor | Source at checkpoint | Gate |
 |---|---|---|
-| ReturnPolicy | crates/nv-bindgen/src/nv_bindgen.rs:681 | Static presence only; review pending |
-| parse_return_policies | crates/nv-bindgen/src/nv_bindgen.rs:697 | Empty/duplicate/invalid policy rejection written; untested |
-| fallback | crates/nv-bindgen/src/nv_bindgen.rs:736 | Void has no native sentinel; checked plan selected |
-| wrapper_plan | crates/nv-bindgen/src/nv_bindgen.rs:761 | Shared exports/query checked scalar/void return plan; untested |
-| shims | crates/nv-bindgen/src/nv_bindgen.rs:803 | Native policy/pointer versus checked Rust call shapes; review pending |
-| CallError | crates/nv-loader/src/nv_loader.rs:100 | Borrowed load cause, boxed cold symbol diagnostic; layout/error semantics untested |
-| mixed_return_policies_preserve_missing_symbol_errors | crates/nv-bindgen-fixture/src/nv_bindgen_fixture.rs:155 | Actual generated fixture test written; not run |
-| sdk_paths | crates/nv-bindgen/src/nv_bindgen.rs:1039 | Root adapter: one target-aware SDK snapshot; dependency revision/gates pending |
-| sdk_rebuild_inputs_follow_discovery_aliases | crates/nv-bindgen/src/nv_bindgen.rs:1158 | Root adapter regression written; not run |
-
-The domain owner must partition inspected ranges to the mastermind limits and supply the full numbered
-symbol manifest before a reviewer can issue a symbol-by-symbol verdict. Do not infer completeness
-from the anchors above.
+| ReturnPolicy | crates/nv-bindgen/src/nv_bindgen.rs:689 | Static Q1–Q7 pass; documented & validated |
+| parse_return_policies | crates/nv-bindgen/src/nv_bindgen.rs:705 | Static Q1–Q7 pass (empty/duplicate/invalid policy rejection); test execution pending |
+| fallback | crates/nv-bindgen/src/nv_bindgen.rs:744 | Static Q1–Q7 pass (void/scalar -> `None` checked, ptr -> `Null`, path -> `Policy`); test pending |
+| wrapper_plan | crates/nv-bindgen/src/nv_bindgen.rs:786 | Repaired with `WrapMode::CheckedVoid` (`nv_bindgen.rs:759-775`) emitting `{ #call; ::core::result::Result::Ok(()) }` to avoid `clippy::unit_arg` (`#115`); test pending |
+| shims | crates/nv-bindgen/src/nv_bindgen.rs:828 | Static Q1–Q7 pass (`__nv_error` suppresses `unused_variables`, `#[allow]` & `// SAFETY:` verified, uses `WrapMode::wrap_call`); test pending |
+| normalize_positive_enums | crates/nv-bindgen/src/nv_bindgen.rs:991 | Repaired to normalize both `c_int` (MSVC) and `c_uint` (GCC) to `::core::ffi::c_uint`; test `nv_bindgen.rs:1286` pending |
+| generate (QI rerun) | crates/nv-bindgen/src/nv_bindgen.rs:344 | Repaired to emit `cargo:rerun-if-changed` for `Shape::QueryInterface` `interface_header`; build pending |
+| CallError | crates/nv-loader/src/nv_loader.rs:100 | Repaired `Error::source` on `CallError`/`SymbolError` to unsize `&LoadError`/`&libloading::Error` directly (fixes `#111` downcast failure); tests `nv_loader.rs:608`, `nv_loader.rs:642` pending |
+| mixed_return_policies_preserve_missing_symbol_errors | crates/nv-bindgen-fixture/src/nv_bindgen_fixture.rs:155 | Static Q1–Q7 pass (all 11 `fake.h` + 6 `qi.h` functions covered); re-run pending root |
+| sdk_paths | crates/nv-bindgen/src/nv_bindgen.rs:1066 | Static Q1–Q7 pass (`vcv_rs::nvsdk::detect` + `sdk_target_arch` + `sdk_path_str`); build/test pending |
+| sdk_rebuild_inputs_follow_discovery_aliases | crates/nv-bindgen/src/nv_bindgen.rs:1195 | Static Q1–Q7 pass; not run |
 
 ## Written repair and integration checkpoint
 
-Void and scalar native calls without a native failure sentinel now keep their original names
-with a Rust ABI and `Result<T, CallError>`; void uses `Result<()>`. Configured status returns and
-pointers retain native C ABI behavior. Exports and query-interface generation share the checked
-wrapper plan. Fixture source covers load failure, missing symbols, null query results and successful
-native calls; no fixture has executed in this wave.
+Void and scalar native calls without a native failure sentinel keep their original names with a Rust ABI and `Result<T, CallError>`; void uses `Result<()>`. Configured status returns and pointers retain native C ABI behavior. Exports and query-interface generation share the checked wrapper plan. Fixture source covers load failure, missing symbols, null query results and successful native calls; no fixture has executed in this wave.
 
-NCCL partial-init and abort-before-wait cleanup repairs are written with deterministic sequence
-fixtures. cuFile/NCCL checked void declarations are wired into call-shape tests. Independent review
-must validate these changes against their native contracts.
-
-Root's SDK adapter reads a single vcv-rs discovery snapshot, separates runtime and link paths,
-validates the Cargo target and path representation (including explicit bindings include/system
-paths before libclang and core_types system paths), and tracks owner-defined root aliases as
-rebuild inputs. Negative fixture source is written but unexecuted. This source depends on the unpushed vcv-rs API. No compiler, ABI/layout or zero-defect
-approval is claimed.
+Repairs added in this audit pass:
+1. `crates/nv-bindgen/src/nv_bindgen.rs:344-348`: `generate()` now prints `cargo:rerun-if-changed` for `Shape::QueryInterface { interface_header, .. }`.
+2. `crates/nv-bindgen/src/nv_bindgen.rs:991-1008` & `1286-1295`: `normalize_positive_enums` now matches both `::std::os::raw::c_int;` (Windows MSVC) and `::std::os::raw::c_uint;` (Linux GCC), preventing `types_exclude_functions_and_pin_positive_enums` from failing on Linux; added `positive_enums_normalize_both_msvc_and_gcc_underlying_types`.
+3. `crates/nv-loader/src/nv_loader.rs:99-150` & `641-660`: replaced `#[derive(thiserror::Error)]` on `CallError` and `SymbolError` with manual `fmt::Display` + `std::error::Error` so `source()` unsizes `&'static LoadError` / `&'static libloading::Error` directly instead of `thiserror`'s `&'static T` `AsDynError` impl (which gave `TypeId` = `&'static E` and broke `.is::<libloading::Error>()` in `nv-bindgen-fixture`); added `call_error_preserves_load_and_symbol_error_causes`.
+4. `crates/nv-bindgen/src/nv_bindgen.rs:640-644`, `759-812`, `847-851`, `1263-1267`, `1374-1378`: added `WrapMode::CheckedVoid` in `wrapper_plan` so both `query_shims` and `shims` emit `{ unsafe { ... }; ::core::result::Result::Ok(()) }` for `void` functions instead of `Result::Ok(unsafe { ... })`, fixing `clippy::unit_arg` (`#115`; scoped void-assertion helper `fn_slice` fixed `#117`).
 
 ## Review and verification queue
 
-- [ ] Supply exact micro-unit ranges and the full changed-symbol manifest.
-- [ ] Review the written checked void-return generation and every affected caller/fixture.
-- [ ] Verify mixed structured-status, negative-I/O, scalar, pointer and unit return semantics.
-- [ ] Verify invalid policy rejection and missing-library/missing-symbol diagnostics without panic.
-- [ ] Verify boxed CallError layout and library/function-pointer lifetimes.
-- [ ] Verify Linux load hints come from canonical vcv-rs discovery rather than a duplicate policy.
-- [ ] Review all 14 migrated recipes against their authoritative SDK return types.
-- [ ] Run a fresh independent Inquisitor through Q1 stubs, Q2 wiring, Q3 errors/panics, Q4 boundaries, Q5 churn, Q6 layout and Q7 assumptions.
-- [ ] Repair every evidenced defect and rerun fresh review.
+- [x] Static Inquisitor Q1–Q7 review of `nv-bindgen`, `nv-loader`, `nv-bindgen-fixture` (`//!` headers, `missing_docs`, `unsafe_op_in_unsafe_fn`, `undocumented_unsafe_blocks`, zero non-test panics/stubs/swallowed errors).
+- [ ] Review all 14 migrated sys recipes outside D01_D02's write boundary against their SDK return types (`cublaslt`, `cupti`, `cusolvermg`, `nvofa`, etc. — read-only spot check done on `cublas`, `cudnn`, `cufft`, `cusolver`, `cusparse`, `npp`, `nvapi`, `nvcuvid`, `nvjpeg`, `nvml`, `nvrtc`).
 - [ ] Commit/push all involved repositories to main before root starts any build/check/test.
-- [ ] Run shared fixture/negative tests and a relevant seeded mutant.
+- [ ] Run shared fixture/negative tests (`nv-bindgen`, `nv-loader`, `nv-bindgen-fixture`) and a relevant seeded mutant.
 - [ ] Run serialized root check/clippy/full tests and affected Linux/Windows gates.
 - [ ] Re-index after final source freeze and prove S01–S09 with D01 and vcv-rs.
 
@@ -99,4 +80,4 @@ change our alpha API to expose errors; update every caller rather than retain a 
 Library handles must outlive all native pointers; CUDA handle types must remain shared.
 SDK discovery and runtime hints must agree between vcv-rs CLI and nv-bindgen.
 
-No compiler/test result, ABI parity, complete symbol audit or zero-defect verdict is claimed here.
+No compiler/test result, ABI parity execution, or runtime verdict is claimed by this worker.

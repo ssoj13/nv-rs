@@ -1,0 +1,19 @@
+[package]
+name = "nvapi"
+description = "Safe NVAPI wrapper (Windows): session lifecycle, physical/display GPU queries, thermal/perf/HDR/GSync/DRS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvapi.rs"
+
+[dependencies]
+nvapi-sys = { path = "../nvapi-sys" }
+nv-loader.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

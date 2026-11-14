@@ -1,0 +1,19 @@
+[package]
+name = "cusparse"
+description = "Safe cuSPARSE host API: handle, sparse/dense descriptors, SpMV, SpMM, SpGEMM, SpSV, SpSM with byte-budgeted scratch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cusparse.rs"
+
+[dependencies]
+cusparse-sys = { path = "../cusparse-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

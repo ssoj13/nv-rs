@@ -96,27 +96,57 @@ pub enum LoadError {
 ///
 /// Library causes are borrowed from the cached table. Symbol diagnostics are boxed only on
 /// failure, keeping successful checked results compact and free of allocations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum CallError {
     /// The library could not be loaded; preserves its original diagnostic.
-    #[error("{0}")]
-    Load(#[source] &'static LoadError),
+    Load(&'static LoadError),
     /// The library loaded but the requested entry point was unavailable.
-    #[error(transparent)]
     Symbol(Box<SymbolError>),
 }
 
 /// Cold diagnostic for an unavailable native entry point.
-#[derive(Debug, thiserror::Error)]
-#[error("{lib}: symbol {symbol} is unavailable")]
+#[derive(Debug)]
 pub struct SymbolError {
     /// The library's binding name.
     pub lib: &'static str,
     /// The exact native entry-point name.
     pub symbol: &'static str,
     /// The dynamic loader's cause, or `None` when a query interface returned null.
-    #[source]
     pub source: Option<&'static libloading::Error>,
+}
+
+impl fmt::Display for CallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(err) => fmt::Display::fmt(err, f),
+            Self::Symbol(diag) => fmt::Display::fmt(diag, f),
+        }
+    }
+}
+
+impl std::error::Error for CallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Dereference `&&LoadError` to `&LoadError` so callers' `.is::<LoadError>()` matches.
+            Self::Load(err) => Some(*err),
+            Self::Symbol(diag) => std::error::Error::source(diag.as_ref()),
+        }
+    }
+}
+
+impl fmt::Display for SymbolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: symbol {} is unavailable", self.lib, self.symbol)
+    }
+}
+
+impl std::error::Error for SymbolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Unsize `&libloading::Error` directly rather than via `thiserror`'s `&'static T` `AsDynError`,
+        // which would otherwise report `TypeId` = `&'static libloading::Error` instead of `libloading::Error`.
+        let err: &(dyn std::error::Error + 'static) = self.source?;
+        Some(err)
+    }
 }
 
 impl CallError {
@@ -606,6 +636,27 @@ mod linux_tests {
         for group in [Group::Driver, Group::DriverStore, Group::Toolkit, Group::Sdk { root_var: "TEST_ROOT", hint: None }] {
             assert_eq!(linux_candidates(&DllSpec { group, ..spec }), expected);
         }
+    }
+
+    #[test]
+    fn call_error_preserves_load_and_symbol_error_causes() {
+        static LOAD_ERR: LoadError = LoadError::NotFound { lib: "fake", tried: Vec::new() };
+        static DL_ERR: libloading::Error = libloading::Error::DlSymUnknown;
+
+        let load_err = CallError::Load(&LOAD_ERR);
+        assert!(load_err.to_string().starts_with("fake: not found"));
+        let load_cause = std::error::Error::source(&load_err).expect("load cause");
+        assert!(load_cause.is::<LoadError>(), "CallError::Load source must downcast to LoadError");
+
+        let sym_err = CallError::symbol("fake", "fakeSym", Some(&DL_ERR));
+        assert_eq!(sym_err.to_string(), "fake: symbol fakeSym is unavailable");
+        let sym_cause = std::error::Error::source(&sym_err).expect("loader cause");
+        assert!(sym_cause.is::<libloading::Error>(), "CallError::Symbol source must downcast to libloading::Error");
+        let CallError::Symbol(diag) = sym_err else { unreachable!() };
+        assert!(std::error::Error::source(diag.as_ref()).expect("symbol cause").is::<libloading::Error>());
+
+        let qi_err = CallError::symbol("fake", "fakeQi", None);
+        assert!(std::error::Error::source(&qi_err).is_none());
     }
 }
 

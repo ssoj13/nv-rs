@@ -1,0 +1,20 @@
+[package]
+name = "cudnn"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/cudnn.rs"
+
+[dependencies]
+cuda-bindings.workspace = true
+cuda-core.workspace = true
+cudnn-sys = { path = "../cudnn-sys" }
+nv-loader.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

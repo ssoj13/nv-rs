@@ -1,0 +1,87 @@
+//! RAII ownership of `cudnnHandle_t` with explicit stream binding and context-recorded teardown.
+
+use std::ptr;
+use std::sync::Arc;
+
+use cuda_core::{Context, Stream};
+use cudnn_sys as sys;
+
+use crate::{check, record_teardown, same_ctx, Result};
+
+/// Owned cuDNN library handle tied to one [`Context`].
+///
+/// The handle stores the most recently bound [`Arc<Stream>`] so stream lifetime outlives any
+/// queued cuDNN work. Dropping `Handle` binds the context and destroys the handle, recording any
+/// teardown error onto [`Context`] without panicking.
+pub struct Handle {
+    raw: sys::cudnnHandle_t,
+    ctx: Arc<Context>,
+    stream: Option<Arc<Stream>>,
+}
+
+// SAFETY: `Handle` exposes mutation only via `&mut self` (and is `!Sync`), guaranteeing exclusive
+// access whenever transferred across threads; cuDNN handles are bound to the `Context` via
+// `bind_to_thread` before every FFI call.
+unsafe impl Send for Handle {}
+
+impl Handle {
+    /// Creates a new cuDNN handle on `ctx`.
+    pub fn new(ctx: &Arc<Context>) -> Result<Self> {
+        sys::load()?;
+        ctx.bind_to_thread()?;
+        let mut raw: sys::cudnnHandle_t = ptr::null_mut();
+        // SAFETY: `raw` is a valid out-pointer and `ctx` is bound on this thread.
+        let status = unsafe { sys::cudnnCreate(&mut raw) };
+        check("cudnnCreate", status)?;
+        Ok(Self { raw, ctx: ctx.clone(), stream: None })
+    }
+
+    /// Owning CUDA context.
+    pub fn context(&self) -> &Arc<Context> {
+        &self.ctx
+    }
+
+    /// Currently bound CUDA stream, if any.
+    pub fn stream(&self) -> Option<&Arc<Stream>> {
+        self.stream.as_ref()
+    }
+
+    /// Raw underlying `cudnnHandle_t`.
+    pub fn as_raw(&self) -> sys::cudnnHandle_t {
+        self.raw
+    }
+
+    /// Explicitly binds `stream` to this cuDNN handle.
+    pub fn set_stream(&mut self, stream: &Arc<Stream>) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        self.ctx.bind_to_thread()?;
+        // SAFETY: `self.raw` is a live cuDNN handle and `stream.cu_stream()` is valid on `self.ctx`.
+        let status = unsafe { sys::cudnnSetStream(self.raw, stream.cu_stream()) };
+        check("cudnnSetStream", status)?;
+        self.stream = Some(stream.clone());
+        Ok(())
+    }
+
+    /// Ensures `stream` is bound to `self`, avoiding redundant `cudnnSetStream` FFI calls when the
+    /// same stream is already bound.
+    pub(crate) fn ensure_stream(&mut self, stream: &Arc<Stream>) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        if self.stream.as_ref().is_some_and(|bound| bound.cu_stream() == stream.cu_stream()) {
+            self.ctx.bind_to_thread()?;
+            return Ok(());
+        }
+        self.set_stream(stream)
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if let Err(err) = self.ctx.bind_to_thread() {
+            self.ctx.record_err(Err::<(), _>(err));
+            return;
+        }
+        // SAFETY: `self.raw` was initialized by `cudnnCreate` and has not been destroyed.
+        let code = unsafe { sys::cudnnDestroy(self.raw) };
+        record_teardown(&self.ctx, code);
+    }
+}

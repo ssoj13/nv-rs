@@ -24,6 +24,12 @@ prettyplease = "0.2"
 libloading = "0.8"
 cuda-bindings = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
 cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-async = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+gpu-info-rs = { git = "ssh://git@github.com/ssoj13/gpu-info-rs.git", branch = "main", default-features = false, features = ["wgpu"] }
+wgpu = "30"
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
 winreg = "0.56"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

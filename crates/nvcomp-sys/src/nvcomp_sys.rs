@@ -19,7 +19,7 @@ nv_loader::exports_sys! {
             hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
         },
         windows: &["nvcomp64_*"],
-        linux: &["libnvcomp.so"],
+        linux: &["libnvcomp.so.6", "libnvcomp.so"],
     },
 }
 
@@ -59,6 +59,18 @@ mod tests {
     #[test]
     fn streams_are_cuda_bindings_streams() {
         let _: cudaStream_t = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
+    }
+
+    #[test]
+    fn checked_native_and_enum_contracts_match_header_abis() {
+        let _: unsafe fn(usize) -> Result<usize, nv_loader::CallError> = bitcompMaxBuflen;
+        let _: unsafe extern "C" fn(nvcompStatus_t) -> *const std::os::raw::c_char = nvcompGetStatusString;
+        let _: unsafe extern "C" fn(*mut nvcompProperties_t) -> nvcompStatus_t = nvcompGetProperties;
+        let _: u32 = nvcompStatus_t_nvcompSuccess;
+        let _: u32 = nvcompType_t_NVCOMP_TYPE_FLOAT32;
+        let _: u32 = bitcompAlgorithm_t_BITCOMP_DEFAULT_ALGO;
+        let _: i32 = bitcompResult_t_BITCOMP_INVALID_PARAMETER;
+        assert_eq!(DLL.linux, ["libnvcomp.so.6", "libnvcomp.so"]);
     }
 
     #[test]

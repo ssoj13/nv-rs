@@ -1,0 +1,19 @@
+[package]
+name = "cupti"
+description = "Safe CUPTI wrapper: aligned activity buffer pool with catch_unwind callbacks, callback Subscriber, and teardown safety"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cupti.rs"
+
+[dependencies]
+cupti-sys = { path = "../cupti-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "nvrtc"
+description = "Safe NVRTC wrapper: CUDA C++ runtime compilation to PTX, CUBIN, LTO-IR, OptiX-IR, build logs, and lowered name lookup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvrtc.rs"
+
+[dependencies]
+nvrtc-sys = { path = "../nvrtc-sys" }
+thiserror.workspace = true
+
+[dev-dependencies]
+cuda-core.workspace = true
+cuda-bindings.workspace = true
+
+[lints]
+workspace = true

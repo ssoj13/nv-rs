@@ -1,0 +1,19 @@
+[package]
+name = "cufft"
+description = "Safe cuFFT host API: 1D/2D/3D/batched plans, R2C/C2R/C2C/D2Z/Z2D/Z2Z transforms, caller-owned scratch workspace and byte budgets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cufft.rs"
+
+[dependencies]
+cufft-sys = { path = "../cufft-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "curand"
+description = "Safe cuRAND host and device RNG API: pseudo/quasi-random generators, distributions, stream binding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/curand.rs"
+
+[dependencies]
+cuda-bindings.workspace = true
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

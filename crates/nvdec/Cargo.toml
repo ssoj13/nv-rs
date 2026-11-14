@@ -1,0 +1,22 @@
+[package]
+name = "nvdec"
+description = "Safe NVDEC hardware video decoder and parser wrapper over nvcuvid-sys and cuda-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvdec.rs"
+
+[dependencies]
+nvcuvid-sys = { path = "../nvcuvid-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+nvenc = { path = "../nvenc" }
+
+[lints]
+workspace = true

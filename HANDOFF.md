@@ -1,5 +1,19 @@
 # Handoff — nv-rs (2026-11-13)
 
+## Wave 1 Completion Checkpoint — 2026-11-13
+
+- **vcv-rs**: Completed Windows/Linux fixes, verified (`clippy -D warnings`, 117 tests + `pwsh`/`git-bash` roundtrips + mutant), and pushed to `main` at `31c54282807fe2b0705ffde543fc8dfef4c2b543`. `nv-rs/Cargo.lock` and `nv-rs/device/Cargo.lock` lock `31c54282`.
+- **M2 Audit & Repair (`D01_D02`)**: Audited `nvcomp-sys`, `nccl-sys`, `cufile-sys`, `nv-bindgen`, `nv-loader`, `nv-bindgen-fixture` against installed SDK headers; fixed `nvcomp-sys` `positive_enums` + `libnvcomp.so.6`, `nv-bindgen` `WrapMode::CheckedVoid` (`clippy::unit_arg`-clean) + `QueryInterface` `rerun-if-changed` + GCC `c_uint`, and `nv-loader` `Error::source()` unwrapping across `thiserror` 2.0.
+- **M6 (`D03`: `crates/nv-wgpu`)**: Implemented `wgpu 30` <-> CUDA interop (Vulkan Win `OPAQUE_WIN32` / Linux `OPAQUE_FD` + DX12 shared heaps/fences, `gpu-info-rs` `SharedGpu` composition, `SharedBuffer`, `SharedTexture`, `InteropSemaphore`, format table, `VkBarrierRunner` drop/sync hardening).
+- **M7–M9 Safe Wrappers (`D04`–`D09`)**: Implemented `cublas` (+ `cublasLt`), `cufft`, `curand`, `cusparse`, `cusolver` (`Dn`/`Sp`/`Mg`), `npp`, `nvjpeg`, `nvrtc`, `cupti`, `nvml`, `nvapi`, `nvenc`, `nvdec`, `nvofa`, `cudnn`, `nvcomp`, `nccl` (Linux, `Unsupported` on Win), and `cufile` (Linux, explicit `PosixFallback`). `ngx` remains held per `PLAN.md` D13.
+- **Verification**:
+  - Independent Inquisitor static audits (7 Mandatory Questions): **PASS** across all 8 domains (`D01_D02`–`D09`).
+  - `cargo +1.98.0 clippy --all-targets -j 2 -- -D warnings`: **PASS** (0 warnings, 0 errors) across all 22 target crates (`nv-bindgen`, `nv-loader`, `nv-bindgen-fixture`, `nv-wgpu`, `cublas`, `cufft`, `curand`, `cusparse`, `cusolver`, `npp`, `nvjpeg`, `nvrtc`, `cupti`, `nvml`, `nvapi`, `nvenc`, `nvdec`, `nvofa`, `cudnn`, `nvcomp`, `nccl`, `cufile`).
+  - `cargo +1.98.0 test --lib -j 2 --quiet`: **PASS** (0 failures) across all 22 target crates (GPU T2/T3 tests `#[ignore]` pending serialized GPU run).
+- **Next**: Run `#[ignore]` T2/T3 GPU integration tests (`cargo +1.98.0 test -- --ignored`) in serialized `-j 2` batches on RTX 3080 Ti, run Linux-target checks for `nccl`/`cufile`, and commit/push `nv-rs` with DCO (`git commit -s`).
+
+---
+
 ## Transfer checkpoint — 2026-11-13 (Codex)
 
 **Status: paused by owner for an environment change.** All task agents have stopped/completed; do not resume implementation automatically. The owner explicitly requested updating progress and pushing the unfinished source checkpoint to main.

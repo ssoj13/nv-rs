@@ -1,0 +1,21 @@
+[package]
+name = "cusolver"
+description = "Safe cuSOLVER host API: dense (Dn), sparse (Sp), and multi-GPU (Mg) solvers with byte-budgeted scratch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/cusolver.rs"
+
+[dependencies]
+cusolver-sys = { path = "../cusolver-sys" }
+cusolvermg-sys = { path = "../cusolvermg-sys" }
+cusparse-sys = { path = "../cusparse-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

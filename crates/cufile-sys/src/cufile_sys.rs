@@ -85,6 +85,11 @@ mod tests {
     }
 
     #[test]
+    fn return_policies_preserve_native_abi() {
+        let _: unsafe extern "C" fn() -> CUfileError_t = cuFileDriverOpen;
+    }
+
+    #[test]
     #[ignore = "runtime: needs the Linux cuFile library; run with --ignored"]
     fn version_is_reported() {
         load().expect("cufile loads");

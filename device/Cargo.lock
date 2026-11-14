@@ -716,7 +716,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "vcv-rs"
 version = "0.1.1"
-source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#a8cab6688c1ef01f1067ea3d150ad7283e1367cb"
+source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#31c54282807fe2b0705ffde543fc8dfef4c2b543"
 dependencies = [
  "object 0.40.0",
  "serde",

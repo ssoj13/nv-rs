@@ -1,0 +1,19 @@
+[package]
+name = "nvenc"
+description = "Safe NVENC hardware video encoder wrapper over nvenc-sys and cuda-core (H.264, HEVC, AV1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvenc.rs"
+
+[dependencies]
+nvenc-sys = { path = "../nvenc-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

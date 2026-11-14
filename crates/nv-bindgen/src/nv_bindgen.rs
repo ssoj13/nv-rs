@@ -341,6 +341,11 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
+    if let Shape::QueryInterface { interface_header, .. } = spec.shape
+        && let Some(path) = find_header(&include_dirs, interface_header)
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     Ok(out.inventory)
 }
 
@@ -632,12 +637,11 @@ pub fn query_shims(
             unshimmed.push(name.to_string());
         }
         let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(None));
-        let WrapperPlan { abi, ret, on_missing, on_not_loaded, checked } = plan;
+        let WrapperPlan { abi, ret, on_missing, on_not_loaded, mode } = plan;
         let args = shim_args(bare);
         let names = args.iter().map(|(n, _)| n);
         let defs = args.iter().map(|(_, d)| d);
-        let call = quote!(unsafe { __nv_fn(#(#names),*) });
-        let result = if checked { quote!(::core::result::Result::Ok(#call)) } else { call };
+        let result = mode.wrap_call(quote!(unsafe { __nv_fn(#(#names),*) }));
         let fn_ty = bare;
         let id_lit = proc_macro2::Literal::u32_suffixed(id);
         fns.push(quote! {
@@ -752,12 +756,30 @@ fn fallback<'a>(ret: &ReturnType, policies: &'a [ParsedReturnPolicy<'_>]) -> Opt
     }
 }
 
+#[derive(Clone, Copy)]
+enum WrapMode {
+    Native,
+    CheckedScalar,
+    CheckedVoid,
+}
+
+impl WrapMode {
+    fn wrap_call(self, call: TokenStream) -> TokenStream {
+        match self {
+            Self::Native => call,
+            Self::CheckedScalar => quote!(::core::result::Result::Ok(#call)),
+            // Emit `{ unsafe { call }; Ok(()) }` so void shims do not trigger `clippy::unit_arg`.
+            Self::CheckedVoid => quote!({ #call; ::core::result::Result::Ok(()) }),
+        }
+    }
+}
+
 struct WrapperPlan {
     abi: TokenStream,
     ret: TokenStream,
     on_missing: TokenStream,
     on_not_loaded: TokenStream,
-    checked: bool,
+    mode: WrapMode,
 }
 
 /// The same ABI and failure-value decision for exports and query-interface functions.
@@ -771,9 +793,9 @@ fn wrapper_plan(ret: &ReturnType, fb: Option<Fallback<'_>>, lib: &'static str, n
         Some(Fallback::Null { mutable: false }) => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
         Some(Fallback::Null { mutable: true }) => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
         None => {
-            let ty = match ret {
-                ReturnType::Default => quote!(()),
-                ReturnType::Type(_, ty) => quote!(#ty),
+            let (mode, ty) = match ret {
+                ReturnType::Default => (WrapMode::CheckedVoid, quote!(())),
+                ReturnType::Type(_, ty) => (WrapMode::CheckedScalar, quote!(#ty)),
             };
             return WrapperPlan {
                 abi: quote!(),
@@ -782,11 +804,11 @@ fn wrapper_plan(ret: &ReturnType, fb: Option<Fallback<'_>>, lib: &'static str, n
                     #lib, stringify!(#name), #source,
                 ))),
                 on_not_loaded: quote!(::core::result::Result::Err(nv_loader::CallError::Load(__nv_error))),
-                checked: true,
+                mode,
             };
         }
     };
-    WrapperPlan { abi: quote!(extern "C"), ret: native_ret, on_missing, on_not_loaded, checked: false }
+    WrapperPlan { abi: quote!(extern "C"), ret: native_ret, on_missing, on_not_loaded, mode: WrapMode::Native }
 }
 
 /// Keep C parameter names intact; unnamed parameters receive deterministic private names.
@@ -822,12 +844,11 @@ pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &st
             unshimmed.push(name.to_string());
         }
         let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(Some(__nv_error)));
-        let WrapperPlan { abi, ret, on_missing, on_not_loaded, checked } = plan;
+        let WrapperPlan { abi, ret, on_missing, on_not_loaded, mode } = plan;
         let args = shim_args(bare);
         let names = args.iter().map(|(n, _)| n);
         let defs = args.iter().map(|(_, d)| d);
-        let call = quote!(unsafe { (*__nv_fn)(#(#names),*) });
-        let result = if checked { quote!(::core::result::Result::Ok(#call)) } else { call };
+        let result = mode.wrap_call(quote!(unsafe { (*__nv_fn)(#(#names),*) }));
         Some(quote! {
             #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
             #[inline]
@@ -971,7 +992,10 @@ fn normalize_positive_enums(source: &str, enums: &[&str]) -> String {
     let mut out: String = source
         .lines()
         .map(|line| {
-            let pinned = enums.iter().any(|e| line == format!("pub type {e} = ::std::os::raw::c_int;"));
+            let pinned = enums.iter().any(|e| {
+                line == format!("pub type {e} = ::std::os::raw::c_int;")
+                    || line == format!("pub type {e} = ::std::os::raw::c_uint;")
+            });
             match line.split_once(" = ") {
                 Some((lhs, _)) if pinned => format!("{lhs} = ::core::ffi::c_uint;"),
                 _ => line.to_string(),
@@ -1210,6 +1234,14 @@ mod tests {
         }
     }
 
+    fn fn_slice<'a>(shims: &'a str, name: &str) -> &'a str {
+        let marker = format!("pub unsafe fn {name}(");
+        let start = shims.find(&marker).unwrap_or_else(|| panic!("missing {marker}"));
+        let tail = &shims[start..];
+        let end = tail.find("#[allow(").unwrap_or(tail.len());
+        &tail[..end]
+    }
+
     #[test]
     fn exports_produce_shims_for_allowlisted_functions_only() {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
@@ -1228,6 +1260,11 @@ mod tests {
         assert!(shims.contains("pub unsafe fn fakeReset("));
         assert!(shims.contains("pub unsafe fn fakeStore("));
         assert!(!shims.contains("pub unsafe extern \"C\" fn fakeVersionNumber("));
+        for void_fn in ["fakeReset", "fakeStore"] {
+            let body = fn_slice(shims, void_fn);
+            assert!(!body.contains("::core::result::Result::Ok(unsafe"), "{void_fn} must not pass unit into Ok(...)");
+            assert!(body.contains("::core::result::Result::Ok(())"), "{body}");
+        }
         // A pointer return falls back to null, not to a status code of the wrong type.
         assert!(shims.contains("::core::ptr::null()"), "{shims}");
         assert!(!shims.contains("notFakeHelper"), "allowlist must exclude other functions");
@@ -1243,6 +1280,18 @@ mod tests {
         assert!(out.types.contains("pub type fakeStatus_enum = ::core::ffi::c_uint;"), "{}", out.types);
         assert!(out.types.contains("FAKE_VERSION"));
         assert!(!out.types.contains("pub fn fakeInit"), "types pass must not declare functions");
+    }
+
+    #[test]
+    fn positive_enums_normalize_both_msvc_and_gcc_underlying_types() {
+        let raw = "\
+pub type winPos = ::std::os::raw::c_int;\n\
+pub type gccPos = ::std::os::raw::c_uint;\n\
+pub type signedErr = ::std::os::raw::c_int;\n";
+        let normalized = normalize_positive_enums(raw, &["winPos", "gccPos"]);
+        assert!(normalized.contains("pub type winPos = ::core::ffi::c_uint;\n"));
+        assert!(normalized.contains("pub type gccPos = ::core::ffi::c_uint;\n"));
+        assert!(normalized.contains("pub type signedErr = ::std::os::raw::c_int;\n"));
     }
 
     #[test]
@@ -1322,6 +1371,11 @@ mod tests {
         assert!(part.api.is_none(), "query-interface libraries need no loading struct");
         assert!(part.shims.contains("0x150e828u32") || part.shims.contains("22079528u32"), "{}", part.shims);
         assert!(part.shims.contains("_qiStatus_QI_NO_IMPLEMENTATION") && part.shims.contains("_qiStatus_QI_LIBRARY_NOT_FOUND"));
+        for void_fn in ["qiStore", "qiMissingStore"] {
+            let body = fn_slice(&part.shims, void_fn);
+            assert!(!body.contains("::core::result::Result::Ok(unsafe"), "{void_fn} must not pass unit into Ok(...)");
+            assert!(body.contains("::core::result::Result::Ok(())"), "{body}");
+        }
     }
 
     #[test]

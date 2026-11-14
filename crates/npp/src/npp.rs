@@ -1,0 +1,105 @@
+//! Safe wrapper over `npp-sys` for NVIDIA Performance Primitives (NPP).
+//!
+//! **What.**
+//! - [`NppContext`] — caches the `NppStreamContext` (stream handle, device ID, SM/thread/shared
+//!   memory properties, compute capability, stream flags) for a `cuda_core::Stream` so
+//!   stream-ordered operations execute with zero per-call host allocations or driver queries.
+//! - [`image`] — [`ImageView`], [`ImageViewMut`], [`Size`], [`Rect`], [`Interpolation`],
+//!   [`MaskSize`], [`CmpOp`], ROI/stride validation, color conversion (`rgb_to_gray_8u`,
+//!   `rgb_to_ycbcr_8u`, `ycbcr_to_rgb_8u`), resize (`resize_8u_c1`, `resize_8u_c3`,
+//!   `resize_8u_c4`, `resize_32f_c3`), filtering (`filter_box_8u_c1`, `filter_box_8u_c3`,
+//!   `filter_gauss_8u_c1`, `filter_gauss_8u_c3`), and thresholding (`threshold_val_8u_c1`,
+//!   `threshold_val_32f_c1`).
+//! - [`signal`] — 1D signal operations (`set_32f`, `add_32f`, `mul_32f`, two-phase
+//!   `sum_32f_scratch_bytes` + `sum_32f`).
+//! - [`lib_version`] — queries `nppGetLibVersion`.
+//!
+//! **Used by** `npp` GPU tests and image/signal processing pipelines.
+
+pub mod context;
+pub mod image;
+pub mod signal;
+
+pub use context::{LibVersion, NppContext, lib_version};
+pub use image::{CmpOp, ImageView, ImageViewMut, Interpolation, MaskSize, Rect, Size};
+
+pub use npp_sys as sys;
+
+use cuda_core::DriverError;
+use std::fmt;
+
+/// Raw `NppStatus` wrapped in a `Copy` integer newtype (`0` = success, `< 0` = error, `> 0` = warning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NppStatus(pub i32);
+
+impl NppStatus {
+    /// `NPP_SUCCESS` (`0`).
+    pub const SUCCESS: Self = Self(0);
+
+    /// Returns `true` if the status code indicates an error (`< 0`).
+    pub const fn is_error(self) -> bool {
+        self.0 < 0
+    }
+}
+
+impl fmt::Display for NppStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NppStatus({})", self.0)
+    }
+}
+
+/// Errors returned by `npp`.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// One of the NPP DLLs could not be loaded from the CUDA Toolkit.
+    #[error("NPP unavailable: {0}")]
+    Unavailable(String),
+    /// An NPP function returned a negative error status.
+    #[error("{call} failed with {code}")]
+    Status {
+        /// The NPP entry point.
+        call: &'static str,
+        /// The raw status code.
+        code: NppStatus,
+    },
+    /// A CUDA driver call failed.
+    #[error("CUDA: {0}")]
+    Driver(#[from] DriverError),
+    /// Operation scratch requirement exceeds the caller's byte budget.
+    #[error("needs {requested} device bytes, budget admits {available}")]
+    Budget {
+        /// Required scratch bytes.
+        requested: usize,
+        /// Caller-supplied byte budget.
+        available: usize,
+    },
+    /// An argument, ROI, or stride failed validation before reaching NPP.
+    #[error("invalid input: {0}")]
+    InvalidInput(&'static str),
+}
+
+/// Result alias for this crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Maps a raw `NppStatus` to [`Error::Status`] when negative (NPP warnings `> 0` succeed).
+pub(crate) fn check(call: &'static str, code: sys::NppStatus) -> Result<()> {
+    let status = NppStatus(code);
+    if status.is_error() {
+        Err(Error::Status { call, code: status })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_newtype_distinguishes_errors_and_warnings() {
+        assert!(!NppStatus::SUCCESS.is_error());
+        assert!(!NppStatus(1).is_error());
+        assert!(NppStatus(-37).is_error());
+        assert_eq!(NppStatus(-37).to_string(), "NppStatus(-37)");
+    }
+}

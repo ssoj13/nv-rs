@@ -1,0 +1,20 @@
+[package]
+name = "npp"
+description = "Safe NPP wrapper: NppStreamContext, validated ROI/stride image views, color conversion, resize, filtering, thresholding, and signal operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/npp.rs"
+
+[dependencies]
+npp-sys = { path = "../npp-sys" }
+cuda-core.workspace = true
+cuda-bindings.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

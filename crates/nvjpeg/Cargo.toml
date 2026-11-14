@@ -1,0 +1,19 @@
+[package]
+name = "nvjpeg"
+description = "Safe nvJPEG wrapper: Handle, JpegState, JpegStream, EncoderState/Params, pinned/device buffers, planar and interleaved decode/encode, EXIF/chroma metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/nvjpeg.rs"
+
+[dependencies]
+nvjpeg-sys = { path = "../nvjpeg-sys" }
+cuda-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -34,7 +34,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 ROOT_DIR = Path(__file__).parent.resolve()
 DEFAULT_SDK_DIR = ROOT_DIR / ".sdk"
-DEFAULT_TOOLCHAIN = "1.98.0"
+DEFAULT_TOOLCHAIN = "1.99.1"
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
@@ -777,7 +777,7 @@ def cmd_xtask(rest: list[str], toolchain: str | None) -> int:
 def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-d", "--debug", action="store_true", help="Use debug profile")
     p.add_argument("-p", "--package", action="append", default=[], help="Target crate (repeatable)")
-    p.add_argument("--toolchain", default=None, help="Cargo toolchain override (e.g. 1.98.0)")
+    p.add_argument("--toolchain", default=None, help="Cargo toolchain override (e.g. 1.99.1)")
 
 
 def main() -> int:

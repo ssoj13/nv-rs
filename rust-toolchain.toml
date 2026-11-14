@@ -1,6 +1,6 @@
 # Host workspace pin, in step with NVIDIA/cuda-rust's host crates (cuda-bindings, cuda-core).
 # Device crates (device/) are a separate workspace pinned to cuda-oxide's toolchain.
 [toolchain]
-channel = "1.98.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

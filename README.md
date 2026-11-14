@@ -54,7 +54,7 @@ own SDK directory) when building crates that use them.
 
 ## Building & Verification
 
-Never ship an unverified build. Pin the host toolchain to `1.98.0` and treat warnings as
+Never ship an unverified build. Pin the host toolchain to `1.99.1` and treat warnings as
 structural failures:
 
 ```bash
@@ -66,8 +66,8 @@ python bootstrap.py b        # workspace build (--release by default; -d for deb
 Or invoke Cargo directly:
 
 ```bash
-cargo +1.98.0 clippy --workspace --all-targets -- -D warnings
-cargo +1.98.0 test --workspace --lib
+cargo +1.99.1 clippy --workspace --all-targets -- -D warnings
+cargo +1.99.1 test --workspace --lib
 ```
 
 GPU and runtime-driver tests are marked `#[ignore]`; run them with `-- --ignored` on a box

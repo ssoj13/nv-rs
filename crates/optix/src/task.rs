@@ -103,9 +103,10 @@ impl Shared {
     /// Remembers the first failure code (later ones are consequences).
     fn fail(&self, code: sys::OptixResult) {
         // A lost exchange means an earlier failure is already recorded, which is the one to keep.
+        #[allow(clippy::unnecessary_cast)]
         let _first_kept = self.failure.compare_exchange(
-            sys::OptixResult_OPTIX_SUCCESS,
-            code,
+            sys::OptixResult_OPTIX_SUCCESS as i32,
+            code as i32,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -183,7 +184,8 @@ impl Module {
         let shared = Arc::new(Shared {
             module,
             gate: RwLock::new(()),
-            failure: AtomicI32::new(sys::OptixResult_OPTIX_SUCCESS),
+            #[allow(clippy::unnecessary_cast)]
+            failure: AtomicI32::new(sys::OptixResult_OPTIX_SUCCESS as i32),
             log,
             _code: code,
             _opts: opts,
@@ -270,12 +272,11 @@ impl PendingModule {
         match self.state()? {
             CompileState::Completed => Ok((self.shared.module.clone(), self.log()?)),
             CompileState::Failed | CompileState::ImpendingFailure => {
+                #[allow(clippy::unnecessary_cast)]
                 let code = match self.shared.failure.load(Ordering::Acquire) {
                     // No task reported an error, so the context-wide cancel stopped it.
-                    sys::OptixResult_OPTIX_SUCCESS => {
-                        sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED
-                    }
-                    c => c,
+                    0 => sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED,
+                    c => c as sys::OptixResult,
                 };
                 Err(Error::Optix {
                     call: "optixModuleCreateWithTasks",

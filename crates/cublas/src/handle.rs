@@ -38,7 +38,10 @@ impl Operation {
     /// Converts to `i32` (`cublasOperation_t`) for `cublasLtMatmulDescSetAttribute`.
     #[inline]
     pub const fn raw_lt(self) -> i32 {
-        self.raw()
+        #[allow(clippy::unnecessary_cast)]
+        {
+            self.raw() as i32
+        }
     }
 }
 
@@ -64,7 +67,10 @@ impl PointerMode {
     /// Converts to `i32` (`cublasLtPointerMode_t`) for `cublasLtMatmulDescSetAttribute`.
     #[inline]
     pub const fn raw_lt(self) -> i32 {
-        self.raw()
+        #[allow(clippy::unnecessary_cast)]
+        {
+            self.raw() as i32
+        }
     }
 
     pub(crate) fn from_raw(raw: sys::cublasPointerMode_t) -> Result<Self> {

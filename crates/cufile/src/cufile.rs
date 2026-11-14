@@ -516,6 +516,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux GPUDirect Storage / libcufile"]
     fn t2_gds_session_register_roundtrip() {

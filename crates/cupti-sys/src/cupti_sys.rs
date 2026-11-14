@@ -12,7 +12,7 @@ nv_loader::exports_sys! {
     lib: "cupti",
     api: CuptiApi,
     loader: cupti_api,
-    dll: DllSpec { lib: "cupti", group: Group::Toolkit, windows: &["cupti64_*"], linux: &["libcupti.so.13", "libcupti.so"] },
+    dll: DllSpec { lib: "cupti", group: Group::Toolkit, windows: &["cupti64_*"], linux: &["libcupti.so.13", "libcupti.so.12", "libcupti.so"] },
 }
 
 #[cfg(test)]

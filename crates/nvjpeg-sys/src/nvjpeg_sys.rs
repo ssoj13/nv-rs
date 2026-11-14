@@ -12,7 +12,7 @@ nv_loader::exports_sys! {
     lib: "nvjpeg",
     api: NvjpegApi,
     loader: nvjpeg_api,
-    dll: DllSpec { lib: "nvjpeg", group: Group::Toolkit, windows: &["nvjpeg64_*"], linux: &["libnvjpeg.so.13", "libnvjpeg.so"] },
+    dll: DllSpec { lib: "nvjpeg", group: Group::Toolkit, windows: &["nvjpeg64_*"], linux: &["libnvjpeg.so.13", "libnvjpeg.so.12", "libnvjpeg.so"] },
 }
 
 #[cfg(test)]

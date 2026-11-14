@@ -349,6 +349,7 @@ mod tests {
         assert!(matches!(group_end(), Err(Error::Unsupported(_))));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Linux CUDA GPU(s) and libnccl"]
     fn t2_single_rank_collectives() {

@@ -357,6 +357,7 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         archive_type=_CUDNN_ARC,
         manual_url="https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/redistrib_9.28.1.json",
         manual_note="NVIDIA cuDNN redist archive",
+        system_globs=("/usr",),
     ),
     SdkSpec(
         key="ngx",
@@ -374,12 +375,13 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         display="NCCL",
         env_vars=("NCCL_ROOT", "NCCL_PATH"),
         subdir="nccl",
-        marker_paths=("include/nccl.h", "src/include/nccl.h"),
+        marker_paths=("include/nccl.h", "include/*/nccl.h", "src/include/nccl.h"),
         url="https://github.com/NVIDIA/nccl/archive/refs/heads/master.zip" if IS_LINUX else None,
         archive_type="zip" if IS_LINUX else "manual",
         manual_url="https://github.com/NVIDIA/nccl",
         manual_note="Linux-only; source archive or libnccl-dev package",
         platforms=("Linux",),
+        system_globs=("/usr",),
     ),
 )
 
@@ -541,6 +543,13 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
                 with zf.open(info, "r") as src, out_path.open("wb") as out:
                     shutil.copyfileobj(src, out)
     elif archive_type in ("tar.xz", "tar.gz"):
+        if not IS_WINDOWS and shutil.which("tar"):
+            dst_resolved.mkdir(parents=True, exist_ok=True)
+            cmd = ["tar", "-xf", str(archive), "-C", str(dst_resolved)]
+            if strip_top:
+                cmd.append("--strip-components=1")
+            subprocess.run(cmd, check=True)
+            return
         mode = "r:xz" if archive_type == "tar.xz" else "r:gz"
         with tarfile.open(archive, mode) as tf:
             for member in tf.getmembers():
@@ -655,7 +664,7 @@ def _cargo_env() -> dict[str, str]:
         if any(os.environ.get(v, "").strip() for v in spec.env_vars):
             continue
         path, source = detect_sdk(spec)
-        if path is not None and source == "system":
+        if path is not None and source in ("system", "local:.sdk"):
             env[spec.env_vars[0]] = str(path)
     return env
 

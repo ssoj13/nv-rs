@@ -265,8 +265,8 @@ fn decode_record(
     match kind {
         sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_KERNEL
         | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL => {
-            // SAFETY: `kind` guarantees the record is `CUpti_ActivityKernel12`.
-            let k = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityKernel12>() };
+            // SAFETY: `kind` guarantees the record is the latest `CUpti_ActivityKernel*` struct for the bound CUPTI version.
+            let k = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityKernelLatest>() };
             let name = if k.name.is_null() {
                 String::new()
             } else {

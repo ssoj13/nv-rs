@@ -434,7 +434,8 @@ impl Architecture {
             sys::NVML_DEVICE_ARCH_ADA => Some("Ada"),
             sys::NVML_DEVICE_ARCH_HOPPER => Some("Hopper"),
             sys::NVML_DEVICE_ARCH_BLACKWELL => Some("Blackwell"),
-            sys::NVML_DEVICE_ARCH_RUBIN => Some("Rubin"),
+            // NVML_DEVICE_ARCH_RUBIN was added in CUDA 13.3; match the raw value so CUDA 12.x builds too.
+            13 => Some("Rubin"),
             _ => None,
         }
     }

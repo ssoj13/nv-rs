@@ -61,6 +61,19 @@ fn main() {
         return;
     }
     if let Err(error) = nv_bindgen::generate(&SPEC) {
+        let msg = error.to_string();
+        if msg.contains("nccl_device/") {
+            // NCCL < 2.28 (e.g. distro system packages) ships only `nccl.h` without `nccl_device/`.
+            let host_only = LibSpec {
+                headers: &["nccl.h"],
+                ..SPEC
+            };
+            if let Err(host_err) = nv_bindgen::generate(&host_only) {
+                println!("cargo::error={host_err}");
+                std::process::exit(1);
+            }
+            return;
+        }
         println!("cargo::error={error}");
         std::process::exit(1);
     }

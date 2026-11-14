@@ -42,7 +42,12 @@ pub struct MotionOptions {
 impl Default for MotionOptions {
     /// Keys over `[0, 1]`, clamped at both ends.
     fn default() -> Self {
-        Self { begin: 0.0, end: 1.0, start_vanish: false, end_vanish: false }
+        Self {
+            begin: 0.0,
+            end: 1.0,
+            start_vanish: false,
+            end_vanish: false,
+        }
     }
 }
 
@@ -53,7 +58,9 @@ impl MotionOptions {
             return Err(Error::Invalid("motion needs at least one key"));
         }
         if keys > 1 && !(self.begin.is_finite() && self.end.is_finite() && self.begin < self.end) {
-            return Err(Error::Invalid("motion time range must be finite with begin < end"));
+            return Err(Error::Invalid(
+                "motion time range must be finite with begin < end",
+            ));
         }
         let mut flags = sys::OptixMotionFlags_OPTIX_MOTION_FLAG_NONE;
         if self.start_vanish {
@@ -63,7 +70,12 @@ impl MotionOptions {
             flags |= sys::OptixMotionFlags_OPTIX_MOTION_FLAG_END_VANISH;
         }
         // Both flags fit in the low two bits.
-        Ok(sys::OptixMotionOptions { numKeys: keys, flags: flags as u16, timeBegin: self.begin, timeEnd: self.end })
+        Ok(sys::OptixMotionOptions {
+            numKeys: keys,
+            flags: flags as u16,
+            timeBegin: self.begin,
+            timeEnd: self.end,
+        })
     }
 }
 
@@ -109,23 +121,49 @@ pub struct Srt {
 
 impl Srt {
     /// No scale, rotation or translation.
-    pub const IDENTITY: Self =
-        Self { sx: 1.0, a: 0.0, b: 0.0, pvx: 0.0, sy: 1.0, c: 0.0, pvy: 0.0, sz: 1.0, pvz: 0.0, qx: 0.0, qy: 0.0, qz: 0.0, qw: 1.0, tx: 0.0, ty: 0.0, tz: 0.0 };
+    pub const IDENTITY: Self = Self {
+        sx: 1.0,
+        a: 0.0,
+        b: 0.0,
+        pvx: 0.0,
+        sy: 1.0,
+        c: 0.0,
+        pvy: 0.0,
+        sz: 1.0,
+        pvz: 0.0,
+        qx: 0.0,
+        qy: 0.0,
+        qz: 0.0,
+        qw: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+        tz: 0.0,
+    };
 
     /// The 16 floats in `OptixSRTData` order.
     fn words(&self) -> [f32; 16] {
         let s = self;
-        [s.sx, s.a, s.b, s.pvx, s.sy, s.c, s.pvy, s.sz, s.pvz, s.qx, s.qy, s.qz, s.qw, s.tx, s.ty, s.tz]
+        [
+            s.sx, s.a, s.b, s.pvx, s.sy, s.c, s.pvy, s.sz, s.pvz, s.qx, s.qy, s.qz, s.qw, s.tx,
+            s.ty, s.tz,
+        ]
     }
 }
 
 // The SRT key and the motion options are written field by field at these offsets.
 const _: () = assert!(size_of::<sys::OptixSRTData>() == 16 * size_of::<f32>());
 const _: () = assert!(offset_of!(sys::OptixSRTData, tz) == 15 * size_of::<f32>());
-const _: () = assert!(size_of::<sys::OptixMotionOptions>() == 2 * size_of::<u16>() + 2 * size_of::<f32>());
+const _: () =
+    assert!(size_of::<sys::OptixMotionOptions>() == 2 * size_of::<u16>() + 2 * size_of::<f32>());
 // Two keys of the variable-length layouts make exactly the fixed-size header structs.
-const _: () = assert!(offset_of!(sys::OptixMatrixMotionTransform, transform) + 2 * size_of::<[f32; 12]>() == size_of::<sys::OptixMatrixMotionTransform>());
-const _: () = assert!(offset_of!(sys::OptixSRTMotionTransform, srtData) + 2 * size_of::<sys::OptixSRTData>() == size_of::<sys::OptixSRTMotionTransform>());
+const _: () = assert!(
+    offset_of!(sys::OptixMatrixMotionTransform, transform) + 2 * size_of::<[f32; 12]>()
+        == size_of::<sys::OptixMatrixMotionTransform>()
+);
+const _: () = assert!(
+    offset_of!(sys::OptixSRTMotionTransform, srtData) + 2 * size_of::<sys::OptixSRTData>()
+        == size_of::<sys::OptixSRTMotionTransform>()
+);
 
 /// What a transform transforms.
 #[derive(Clone)]
@@ -197,8 +235,12 @@ impl TransformKind {
     fn to_sys(self) -> sys::OptixTraversableType {
         match self {
             Self::Static => sys::OptixTraversableType_OPTIX_TRAVERSABLE_TYPE_STATIC_TRANSFORM,
-            Self::MatrixMotion => sys::OptixTraversableType_OPTIX_TRAVERSABLE_TYPE_MATRIX_MOTION_TRANSFORM,
-            Self::SrtMotion => sys::OptixTraversableType_OPTIX_TRAVERSABLE_TYPE_SRT_MOTION_TRANSFORM,
+            Self::MatrixMotion => {
+                sys::OptixTraversableType_OPTIX_TRAVERSABLE_TYPE_MATRIX_MOTION_TRANSFORM
+            }
+            Self::SrtMotion => {
+                sys::OptixTraversableType_OPTIX_TRAVERSABLE_TYPE_SRT_MOTION_TRANSFORM
+            }
         }
     }
 }
@@ -208,8 +250,13 @@ struct Bytes(Vec<u8>);
 
 impl Bytes {
     fn put(&mut self, at: usize, data: &[u8]) -> Result<()> {
-        let end = at.checked_add(data.len()).ok_or(Error::Invalid("transform layout overflows"))?;
-        let dst = self.0.get_mut(at..end).ok_or(Error::Invalid("transform layout exceeds its buffer"))?;
+        let end = at
+            .checked_add(data.len())
+            .ok_or(Error::Invalid("transform layout overflows"))?;
+        let dst = self
+            .0
+            .get_mut(at..end)
+            .ok_or(Error::Invalid("transform layout exceeds its buffer"))?;
         dst.copy_from_slice(data);
         Ok(())
     }
@@ -273,11 +320,19 @@ pub struct Transform {
 impl Transform {
     /// A static transform of `child` by the row-major 3x4 object-to-world matrix `xform` (its
     /// inverse is computed). Uploads on `stream` and synchronizes it.
-    pub fn fixed(ctx: &Arc<DeviceContext>, stream: &Stream, child: impl Into<Child>, xform: [f32; 12]) -> Result<Arc<Self>> {
+    pub fn fixed(
+        ctx: &Arc<DeviceContext>,
+        stream: &Stream,
+        child: impl Into<Child>,
+        xform: [f32; 12],
+    ) -> Result<Arc<Self>> {
         let child = child.into();
         let inv = invert(&xform)?;
         let mut b = Bytes(vec![0; size_of::<sys::OptixStaticTransform>()]);
-        b.put(offset_of!(sys::OptixStaticTransform, child), &child.handle().to_ne_bytes())?;
+        b.put(
+            offset_of!(sys::OptixStaticTransform, child),
+            &child.handle().to_ne_bytes(),
+        )?;
         b.floats(offset_of!(sys::OptixStaticTransform, transform), &xform)?;
         b.floats(offset_of!(sys::OptixStaticTransform, invTransform), &inv)?;
         Self::upload(ctx, stream, child, TransformKind::Static, b)
@@ -286,13 +341,29 @@ impl Transform {
     /// A matrix motion transform of `child`: `keys` (at least two) row-major 3x4
     /// object-to-world matrices spread evenly over `motion`'s time range. Uploads on `stream`
     /// and synchronizes it.
-    pub fn matrix_motion(ctx: &Arc<DeviceContext>, stream: &Stream, child: impl Into<Child>, motion: MotionOptions, keys: &[[f32; 12]]) -> Result<Arc<Self>> {
+    pub fn matrix_motion(
+        ctx: &Arc<DeviceContext>,
+        stream: &Stream,
+        child: impl Into<Child>,
+        motion: MotionOptions,
+        keys: &[[f32; 12]],
+    ) -> Result<Arc<Self>> {
         let child = child.into();
-        let (opts, start) = Self::motion_header(&motion, keys.len(), offset_of!(sys::OptixMatrixMotionTransform, transform))?;
+        let (opts, start) = Self::motion_header(
+            &motion,
+            keys.len(),
+            offset_of!(sys::OptixMatrixMotionTransform, transform),
+        )?;
         let key = size_of::<[f32; 12]>();
         let mut b = Bytes(vec![0; start + size_of_val(keys)]);
-        b.put(offset_of!(sys::OptixMatrixMotionTransform, child), &child.handle().to_ne_bytes())?;
-        b.motion(offset_of!(sys::OptixMatrixMotionTransform, motionOptions), opts)?;
+        b.put(
+            offset_of!(sys::OptixMatrixMotionTransform, child),
+            &child.handle().to_ne_bytes(),
+        )?;
+        b.motion(
+            offset_of!(sys::OptixMatrixMotionTransform, motionOptions),
+            opts,
+        )?;
         for (i, k) in keys.iter().enumerate() {
             b.floats(start + i * key, k)?;
         }
@@ -301,13 +372,29 @@ impl Transform {
 
     /// An SRT motion transform of `child`: `keys` (at least two) spread evenly over `motion`'s
     /// time range. Uploads on `stream` and synchronizes it.
-    pub fn srt_motion(ctx: &Arc<DeviceContext>, stream: &Stream, child: impl Into<Child>, motion: MotionOptions, keys: &[Srt]) -> Result<Arc<Self>> {
+    pub fn srt_motion(
+        ctx: &Arc<DeviceContext>,
+        stream: &Stream,
+        child: impl Into<Child>,
+        motion: MotionOptions,
+        keys: &[Srt],
+    ) -> Result<Arc<Self>> {
         let child = child.into();
-        let (opts, start) = Self::motion_header(&motion, keys.len(), offset_of!(sys::OptixSRTMotionTransform, srtData))?;
+        let (opts, start) = Self::motion_header(
+            &motion,
+            keys.len(),
+            offset_of!(sys::OptixSRTMotionTransform, srtData),
+        )?;
         let key = size_of::<sys::OptixSRTData>();
         let mut b = Bytes(vec![0; start + keys.len() * key]);
-        b.put(offset_of!(sys::OptixSRTMotionTransform, child), &child.handle().to_ne_bytes())?;
-        b.motion(offset_of!(sys::OptixSRTMotionTransform, motionOptions), opts)?;
+        b.put(
+            offset_of!(sys::OptixSRTMotionTransform, child),
+            &child.handle().to_ne_bytes(),
+        )?;
+        b.motion(
+            offset_of!(sys::OptixSRTMotionTransform, motionOptions),
+            opts,
+        )?;
         for (i, k) in keys.iter().enumerate() {
             b.floats(start + i * key, &k.words())?;
         }
@@ -315,7 +402,11 @@ impl Transform {
     }
 
     /// Validated motion options for `n` keys and the byte offset of the first key.
-    fn motion_header(motion: &MotionOptions, n: usize, start: usize) -> Result<(sys::OptixMotionOptions, usize)> {
+    fn motion_header(
+        motion: &MotionOptions,
+        n: usize,
+        start: usize,
+    ) -> Result<(sys::OptixMotionOptions, usize)> {
         let keys = u16::try_from(n).map_err(|_| Error::Invalid("too many motion keys"))?;
         if keys < 2 {
             return Err(Error::Invalid("a motion transform needs at least two keys"));
@@ -323,25 +414,48 @@ impl Transform {
         Ok((motion.to_sys(keys)?, start))
     }
 
-    fn upload(ctx: &Arc<DeviceContext>, stream: &Stream, child: Child, kind: TransformKind, bytes: Bytes) -> Result<Arc<Self>> {
+    fn upload(
+        ctx: &Arc<DeviceContext>,
+        stream: &Stream,
+        child: Child,
+        kind: TransformKind,
+        bytes: Bytes,
+    ) -> Result<Arc<Self>> {
         if !Arc::ptr_eq(child.context(), ctx) {
-            return Err(Error::Invalid("transform child from another device context"));
+            return Err(Error::Invalid(
+                "transform child from another device context",
+            ));
         }
         if stream.context().cu_ctx() != ctx.cuda().cu_ctx() {
-            return Err(Error::Invalid("stream belongs to another CUDA context than the device context"));
+            return Err(Error::Invalid(
+                "stream belongs to another CUDA context than the device context",
+            ));
         }
         let buffer = DeviceBuffer::from_host(stream, &bytes.0)?;
         if buffer.cu_deviceptr() % u64::from(sys::OPTIX_TRANSFORM_BYTE_ALIGNMENT) != 0 {
-            return Err(Error::Invalid("allocator returned a transform buffer below OptiX's 64-byte alignment"));
+            return Err(Error::Invalid(
+                "allocator returned a transform buffer below OptiX's 64-byte alignment",
+            ));
         }
         let mut handle = 0;
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `buffer` holds a complete, aligned transform of `kind` on this context (written
         // and synchronized by `from_host`); `handle` is host memory.
         check("optixConvertPointerToTraversableHandle", unsafe {
-            entry!(ctx.table(), optixConvertPointerToTraversableHandle)(ctx.raw(), buffer.cu_deviceptr(), kind.to_sys(), &mut handle)
+            entry!(ctx.table(), optixConvertPointerToTraversableHandle)(
+                ctx.raw(),
+                buffer.cu_deviceptr(),
+                kind.to_sys(),
+                &mut handle,
+            )
         })?;
-        Ok(Arc::new(Self { handle, kind, buffer, child, ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            handle,
+            kind,
+            buffer,
+            child,
+            ctx: ctx.clone(),
+        }))
     }
 
     /// The handle to trace against or to reference from an instance.

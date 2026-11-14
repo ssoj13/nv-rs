@@ -29,7 +29,10 @@ mod tests {
     #[test]
     fn inventory_covers_public_api() {
         let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
-        let symbols = inventory.get("symbols").and_then(Value::as_array).expect("symbols array");
+        let symbols = inventory
+            .get("symbols")
+            .and_then(Value::as_array)
+            .expect("symbols array");
         for name in [
             "cuFileHandleRegister",
             "cuFileHandleDeregister",
@@ -58,18 +61,39 @@ mod tests {
             "cuFileDriverGetP2PFlags",
             "cuFileDriverSetP2PFlags",
         ] {
-            assert!(symbols.iter().any(|symbol| symbol.as_str() == Some(name)), "{name} missing");
+            assert!(
+                symbols.iter().any(|symbol| symbol.as_str() == Some(name)),
+                "{name} missing"
+            );
         }
-        let unshimmed = inventory.get("unshimmed").and_then(Value::as_array).expect("unshimmed array");
-        let names: Vec<&str> = unshimmed.iter().map(|value| value.as_str().expect("entry point name")).collect();
-        assert_eq!(names, ["cuFileBatchIODestroy", "cuFileHandleDeregister", "cuFileRead", "cuFileUseCount", "cuFileWrite"]);
+        let unshimmed = inventory
+            .get("unshimmed")
+            .and_then(Value::as_array)
+            .expect("unshimmed array");
+        let names: Vec<&str> = unshimmed
+            .iter()
+            .map(|value| value.as_str().expect("entry point name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cuFileBatchIODestroy",
+                "cuFileHandleDeregister",
+                "cuFileRead",
+                "cuFileUseCount",
+                "cuFileWrite"
+            ]
+        );
     }
 
     #[test]
     fn cuda_types_are_shared() {
         let _: CUstream = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
         let cuda_status: cuda_bindings::CUresult = cuda_bindings::cudaError_enum_CUDA_SUCCESS;
-        let status = CUfileError_t { err: CUfileOpError_CU_FILE_SUCCESS, cu_err: cuda_status };
+        let status = CUfileError_t {
+            err: CUfileOpError_CU_FILE_SUCCESS,
+            cu_err: cuda_status,
+        };
         assert_eq!(status.cu_err, cuda_bindings::cudaError_enum_CUDA_SUCCESS);
     }
 
@@ -80,8 +104,10 @@ mod tests {
 
     #[test]
     fn void_functions_are_checked() {
-        let _: unsafe fn(CUfileHandle_t) -> Result<(), nv_loader::CallError> = cuFileHandleDeregister;
-        let _: unsafe fn(CUfileBatchHandle_t) -> Result<(), nv_loader::CallError> = cuFileBatchIODestroy;
+        let _: unsafe fn(CUfileHandle_t) -> Result<(), nv_loader::CallError> =
+            cuFileHandleDeregister;
+        let _: unsafe fn(CUfileBatchHandle_t) -> Result<(), nv_loader::CallError> =
+            cuFileBatchIODestroy;
     }
 
     #[test]

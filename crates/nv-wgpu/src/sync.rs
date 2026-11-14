@@ -17,15 +17,15 @@ use std::sync::Arc;
 
 use ash::{khr, vk};
 use cuda_core::{Context, Stream};
-use cuda_ext::ExternalSemaphore;
+use cuda_core_ext::ExternalSemaphore;
+#[cfg(windows)]
+use wgpu::hal::api::Dx12;
+use wgpu::hal::api::Vulkan;
 #[cfg(windows)]
 use windows::Win32::{
     Graphics::Direct3D12,
     System::Threading::{CreateEventW, INFINITE, WaitForSingleObject},
 };
-use wgpu::hal::api::Vulkan;
-#[cfg(windows)]
-use wgpu::hal::api::Dx12;
 
 use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
@@ -71,12 +71,16 @@ unsafe impl Sync for InteropSemaphore {}
 
 impl Drop for InteropSemaphore {
     fn drop(&mut self) {
-        if let NativeSemaphore::Vulkan(vk) = &self.native {
-            // SAFETY: `cuda` (`ExternalSemaphore`) lives in an earlier struct field and has
-            // already dropped; `_device` lives in a later field so `raw_device` is still alive.
-            unsafe {
-                vk.raw_device.destroy_semaphore(vk.semaphore, None);
+        match &self.native {
+            NativeSemaphore::Vulkan(vk) => {
+                // SAFETY: `cuda` (`ExternalSemaphore`) lives in an earlier struct field and has
+                // already dropped; `_device` lives in a later field so `raw_device` is still alive.
+                unsafe {
+                    vk.raw_device.destroy_semaphore(vk.semaphore, None);
+                }
             }
+            #[cfg(windows)]
+            NativeSemaphore::Dx12 { .. } => {}
         }
     }
 }
@@ -88,11 +92,7 @@ impl InteropSemaphore {
     /// Fails explicitly with [`Error::Unsupported`] if the `wgpu::Device` lacks
     /// the required Vulkan external semaphore / timeline extensions or runs on an
     /// unsupported backend.
-    pub fn new(
-        device: &wgpu::Device,
-        cuda_ctx: &Arc<Context>,
-        initial_value: u64,
-    ) -> Result<Self> {
+    pub fn new(device: &wgpu::Device, cuda_ctx: &Arc<Context>, initial_value: u64) -> Result<Self> {
         match verify_device_interop_support(device)? {
             InteropBackend::Vulkan => Self::new_vulkan(device, cuda_ctx, initial_value),
             #[cfg(windows)]
@@ -106,10 +106,11 @@ impl InteropSemaphore {
         initial_value: u64,
     ) -> Result<Self> {
         // SAFETY: Reads Vulkan HAL device handles without destroying them.
-        let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
-            expected: "Vulkan",
-            found: device.adapter_info().backend,
-        })?;
+        let hal_dev =
+            unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
+                expected: "Vulkan",
+                found: device.adapter_info().backend,
+            })?;
         let raw_device = hal_dev.raw_device().clone();
         let instance = hal_dev.shared_instance().raw_instance().clone();
         let phys = hal_dev.raw_physical_device();
@@ -419,10 +420,8 @@ impl InteropSemaphore {
                 let event = unsafe { CreateEventW(None, false, false, None) }
                     .map_err(|e| Error::dx12("CreateEventW", e))?;
                 // Wrap in ExportedHandle / OwnedHandle immediately so early return closes `event`.
-                let _guard = crate::platform::ExportedHandle::from_raw_win32(
-                    event.0,
-                    "CreateEventW",
-                )?;
+                let _guard =
+                    crate::platform::ExportedHandle::from_raw_win32(event.0, "CreateEventW")?;
                 // SAFETY: `fence` and `event` are both live handles for the duration of the wait.
                 unsafe { fence.SetEventOnCompletion(value, event) }
                     .map_err(|e| Error::dx12("ID3D12Fence::SetEventOnCompletion", e))?;
@@ -458,7 +457,7 @@ impl InteropSemaphore {
         }
     }
 
-    /// Returns the underlying `cuda_ext::ExternalSemaphore`.
+    /// Returns the underlying `cuda_core_ext::ExternalSemaphore`.
     pub fn cuda_semaphore(&self) -> &Arc<ExternalSemaphore> {
         &self.cuda
     }

@@ -99,16 +99,25 @@ fn check(call: &'static str, code: sys::CUresult) -> Result<()> {
         return Ok(());
     }
     if code == cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_INITIALIZED {
-        return Err(Error::Unavailable(format!("{call}: nvcuvid library not loaded")));
+        return Err(Error::Unavailable(format!(
+            "{call}: nvcuvid library not loaded"
+        )));
     }
     if code == cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_FOUND {
-        return Err(Error::Unavailable(format!("{call}: symbol missing from nvcuvid")));
+        return Err(Error::Unavailable(format!(
+            "{call}: symbol missing from nvcuvid"
+        )));
     }
-    Err(Error::Status { call, code: StatusCode(code) })
+    Err(Error::Status {
+        call,
+        code: StatusCode(code),
+    })
 }
 
 fn ensure_loaded() -> Result<()> {
-    sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 /// Supported video codecs (`cudaVideoCodec`).
@@ -194,10 +203,18 @@ impl ChromaFormat {
 
     fn from_sys(raw: sys::cudaVideoChromaFormat) -> Option<Self> {
         match raw {
-            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_Monochrome => Some(Self::Monochrome),
-            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_420 => Some(Self::Yuv420),
-            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_422 => Some(Self::Yuv422),
-            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_444 => Some(Self::Yuv444),
+            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_Monochrome => {
+                Some(Self::Monochrome)
+            }
+            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_420 => {
+                Some(Self::Yuv420)
+            }
+            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_422 => {
+                Some(Self::Yuv422)
+            }
+            x if x == sys::cudaVideoChromaFormat_enum_cudaVideoChromaFormat_444 => {
+                Some(Self::Yuv444)
+            }
             _ => None,
         }
     }
@@ -222,7 +239,9 @@ impl SurfaceFormat {
             Self::Nv12 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_NV12,
             Self::P016 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P016,
             Self::Yuv444 => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444,
-            Self::Yuv444_16Bit => sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444_16Bit,
+            Self::Yuv444_16Bit => {
+                sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_YUV444_16Bit
+            }
         }
     }
 }
@@ -271,7 +290,12 @@ pub struct DecoderCaps {
 }
 
 /// Queries NVDEC hardware capabilities for `codec`, `chroma`, and `bit_depth_minus8`.
-pub fn decoder_caps(cuda: &Arc<Context>, codec: Codec, chroma: ChromaFormat, bit_depth_minus8: u32) -> Result<DecoderCaps> {
+pub fn decoder_caps(
+    cuda: &Arc<Context>,
+    codec: Codec,
+    chroma: ChromaFormat,
+    bit_depth_minus8: u32,
+) -> Result<DecoderCaps> {
     ensure_loaded()?;
     cuda.bind_to_thread()?;
     // SAFETY: all-zero bit pattern is valid for `CUVIDDECODECAPS`.
@@ -451,7 +475,10 @@ fn panic_payload_msg(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-unsafe extern "C" fn on_sequence_cb<H: ParserHandler>(user_data: *mut c_void, fmt: *mut sys::CUVIDEOFORMAT) -> c_int {
+unsafe extern "C" fn on_sequence_cb<H: ParserHandler>(
+    user_data: *mut c_void,
+    fmt: *mut sys::CUVIDEOFORMAT,
+) -> c_int {
     if user_data.is_null() || fmt.is_null() {
         return 0;
     }
@@ -472,7 +499,10 @@ unsafe extern "C" fn on_sequence_cb<H: ParserHandler>(user_data: *mut c_void, fm
     }
 }
 
-unsafe extern "C" fn on_decode_cb<H: ParserHandler>(user_data: *mut c_void, pic: *mut sys::CUVIDPICPARAMS) -> c_int {
+unsafe extern "C" fn on_decode_cb<H: ParserHandler>(
+    user_data: *mut c_void,
+    pic: *mut sys::CUVIDPICPARAMS,
+) -> c_int {
     if user_data.is_null() || pic.is_null() {
         return 0;
     }
@@ -491,7 +521,10 @@ unsafe extern "C" fn on_decode_cb<H: ParserHandler>(user_data: *mut c_void, pic:
     }
 }
 
-unsafe extern "C" fn on_display_cb<H: ParserHandler>(user_data: *mut c_void, disp: *mut sys::CUVIDPARSERDISPINFO) -> c_int {
+unsafe extern "C" fn on_display_cb<H: ParserHandler>(
+    user_data: *mut c_void,
+    disp: *mut sys::CUVIDPARSERDISPINFO,
+) -> c_int {
     if user_data.is_null() {
         return 0;
     }
@@ -524,7 +557,10 @@ impl<H: ParserHandler> VideoParser<H> {
     pub fn new(cuda: &Arc<Context>, cfg: &ParserConfig, handler: H) -> Result<Self> {
         ensure_loaded()?;
         cuda.bind_to_thread()?;
-        let mut inner = Box::new(ParserInner { handler, pending_error: None });
+        let mut inner = Box::new(ParserInner {
+            handler,
+            pending_error: None,
+        });
         // SAFETY: all-zero bit pattern is valid for `CUVIDPARSERPARAMS`.
         let mut params: sys::CUVIDPARSERPARAMS = unsafe { zeroed() };
         params.CodecType = cfg.codec.to_sys();
@@ -541,7 +577,11 @@ impl<H: ParserHandler> VideoParser<H> {
         // SAFETY: `params` points to `inner` at a stable heap address and `raw` is a valid out-pointer.
         let status = unsafe { sys::cuvidCreateVideoParser(&mut raw, &mut params) };
         check("cuvidCreateVideoParser", status)?;
-        Ok(Self { raw, cuda: cuda.clone(), inner })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            inner,
+        })
     }
 
     /// Parses one compressed bitstream packet with zero heap allocations.
@@ -553,7 +593,11 @@ impl<H: ParserHandler> VideoParser<H> {
         // SAFETY: all-zero bit pattern is valid for `CUVIDSOURCEDATAPACKET`.
         let mut pkt: sys::CUVIDSOURCEDATAPACKET = unsafe { zeroed() };
         pkt.payload_size = payload.len() as c_ulong;
-        pkt.payload = if payload.is_empty() { std::ptr::null() } else { payload.as_ptr() };
+        pkt.payload = if payload.is_empty() {
+            std::ptr::null()
+        } else {
+            payload.as_ptr()
+        };
         if let Some(ts) = timestamp {
             pkt.flags |= sys::CUvideopacketflags_CUVID_PKT_TIMESTAMP as c_ulong;
             pkt.timestamp = ts;
@@ -574,7 +618,8 @@ impl<H: ParserHandler> VideoParser<H> {
         self.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUVIDSOURCEDATAPACKET`.
         let mut pkt: sys::CUVIDSOURCEDATAPACKET = unsafe { zeroed() };
-        pkt.flags = (sys::CUvideopacketflags_CUVID_PKT_ENDOFSTREAM | sys::CUvideopacketflags_CUVID_PKT_NOTIFY_EOS) as c_ulong;
+        pkt.flags = (sys::CUvideopacketflags_CUVID_PKT_ENDOFSTREAM
+            | sys::CUvideopacketflags_CUVID_PKT_NOTIFY_EOS) as c_ulong;
         // SAFETY: `self.raw` is a live parser; EOS packet carries null/0 payload.
         let status = unsafe { sys::cuvidParseVideoData(self.raw, &mut pkt) };
         if let Some(err) = self.inner.pending_error.take() {
@@ -641,8 +686,12 @@ pub struct DecoderConfig {
 impl DecoderConfig {
     /// Builds a [`DecoderConfig`] from a [`VideoFormat`] reported by [`ParserHandler::on_sequence`].
     pub fn from_video_format(fmt: &VideoFormat, output_format: SurfaceFormat) -> Result<Self> {
-        let codec = fmt.codec.ok_or(Error::Invalid("unsupported or unknown codec in sequence header"))?;
-        let chroma_format = fmt.chroma_format.ok_or(Error::Invalid("unsupported or unknown chroma format"))?;
+        let codec = fmt.codec.ok_or(Error::Invalid(
+            "unsupported or unknown codec in sequence header",
+        ))?;
+        let chroma_format = fmt
+            .chroma_format
+            .ok_or(Error::Invalid("unsupported or unknown chroma format"))?;
         let w = fmt.display_width();
         let h = fmt.display_height();
         Ok(Self {
@@ -683,7 +732,9 @@ impl VideoDecoder {
             return Err(Error::Invalid("decoder dimensions must be non-zero"));
         }
         if !cfg.target_width.is_multiple_of(2) || !cfg.target_height.is_multiple_of(2) {
-            return Err(Error::Invalid("decoder target_width and target_height must be multiples of 2"));
+            return Err(Error::Invalid(
+                "decoder target_width and target_height must be multiples of 2",
+            ));
         }
         cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUVIDDECODECREATEINFO`.
@@ -724,12 +775,17 @@ impl VideoDecoder {
     pub unsafe fn decode_picture(&self, pic: &sys::CUVIDPICPARAMS) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.raw` is a live decoder and `pic` (plus its internal pointers) is valid per caller contract.
-        let status = unsafe { sys::cuvidDecodePicture(self.raw, std::ptr::from_ref(pic).cast_mut()) };
+        let status =
+            unsafe { sys::cuvidDecodePicture(self.raw, std::ptr::from_ref(pic).cast_mut()) };
         check("cuvidDecodePicture", status)
     }
 
     /// Maps a decoded display surface for CUDA access; unmapped automatically on `Drop`.
-    pub fn map_frame(&self, disp: &DisplayInfo, stream: Option<&Stream>) -> Result<MappedFrame<'_>> {
+    pub fn map_frame(
+        &self,
+        disp: &DisplayInfo,
+        stream: Option<&Stream>,
+    ) -> Result<MappedFrame<'_>> {
         self.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUVIDPROCPARAMS`.
         let mut proc_params: sys::CUVIDPROCPARAMS = unsafe { zeroed() };
@@ -742,7 +798,15 @@ impl VideoDecoder {
         let mut dev_ptr: u64 = 0;
         let mut pitch: u32 = 0;
         // SAFETY: `self.raw` is live and `dev_ptr`/`pitch` are valid out-pointers.
-        let status = unsafe { sys::cuvidMapVideoFrame64(self.raw, disp.picture_index, &mut dev_ptr, &mut pitch, &mut proc_params) };
+        let status = unsafe {
+            sys::cuvidMapVideoFrame64(
+                self.raw,
+                disp.picture_index,
+                &mut dev_ptr,
+                &mut pitch,
+                &mut proc_params,
+            )
+        };
         check("cuvidMapVideoFrame64", status)?;
         Ok(MappedFrame {
             decoder: self,
@@ -817,9 +881,12 @@ impl MappedFrame<'_> {
         if self.decoder.output_format != SurfaceFormat::Nv12 {
             return Err(Error::Invalid("surface format is not NV12"));
         }
-        let expected = nv12_frame_bytes(self.width(), self.height()).ok_or(Error::Invalid("NV12 frame size overflow"))?;
+        let expected = nv12_frame_bytes(self.width(), self.height())
+            .ok_or(Error::Invalid("NV12 frame size overflow"))?;
         if dst.len() != expected {
-            return Err(Error::Invalid("destination slice length does not match NV12 frame size"));
+            return Err(Error::Invalid(
+                "destination slice length does not match NV12 frame size",
+            ));
         }
         let rows = (self.height() as usize) + (self.height() as usize) / 2;
         self.copy_2d_to_host(stream, self.width() as usize, rows, dst.as_mut_ptr().cast())
@@ -830,15 +897,29 @@ impl MappedFrame<'_> {
         if self.decoder.output_format != SurfaceFormat::P016 {
             return Err(Error::Invalid("surface format is not P016"));
         }
-        let expected = p016_frame_u16s(self.width(), self.height()).ok_or(Error::Invalid("P016 frame size overflow"))?;
+        let expected = p016_frame_u16s(self.width(), self.height())
+            .ok_or(Error::Invalid("P016 frame size overflow"))?;
         if dst.len() != expected {
-            return Err(Error::Invalid("destination slice length does not match P016 frame size"));
+            return Err(Error::Invalid(
+                "destination slice length does not match P016 frame size",
+            ));
         }
         let rows = (self.height() as usize) + (self.height() as usize) / 2;
-        self.copy_2d_to_host(stream, (self.width() as usize) * 2, rows, dst.as_mut_ptr().cast())
+        self.copy_2d_to_host(
+            stream,
+            (self.width() as usize) * 2,
+            rows,
+            dst.as_mut_ptr().cast(),
+        )
     }
 
-    fn copy_2d_to_host(&self, stream: &Stream, width_bytes: usize, rows: usize, dst_host: *mut c_void) -> Result<()> {
+    fn copy_2d_to_host(
+        &self,
+        stream: &Stream,
+        width_bytes: usize,
+        rows: usize,
+        dst_host: *mut c_void,
+    ) -> Result<()> {
         self.decoder.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
         let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
@@ -867,7 +948,9 @@ impl Drop for MappedFrame<'_> {
         // SAFETY: `self.dev_ptr` was mapped by `cuvidMapVideoFrame64` on `self.decoder.raw`.
         let status = unsafe { sys::cuvidUnmapVideoFrame64(self.decoder.raw, self.dev_ptr) };
         if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
-            self.decoder.cuda.record_err(Err::<(), _>(DriverError(status)));
+            self.decoder
+                .cuda
+                .record_err(Err::<(), _>(DriverError(status)));
         }
     }
 }

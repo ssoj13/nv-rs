@@ -17,7 +17,7 @@ workspace = true
 [dependencies]
 cuda-bindings.workspace = true
 cuda-core.workspace = true
-cuda-ext = { path = "../cuda-ext" }
+cuda-core-ext = { path = "../cuda-core-ext" }
 gpu-info-rs.workspace = true
 wgpu.workspace = true
 ash.workspace = true

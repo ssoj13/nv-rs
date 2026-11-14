@@ -173,17 +173,23 @@ impl ManyDesc {
         }
         for i in 0..self.rank {
             if self.n[i] <= 0 {
-                return Err(Error::Invalid("ManyDesc transform dimensions must be positive"));
+                return Err(Error::Invalid(
+                    "ManyDesc transform dimensions must be positive",
+                ));
             }
             if let Some(in_e) = self.inembed
                 && in_e[i] <= 0
             {
-                return Err(Error::Invalid("ManyDesc inembed dimensions must be positive"));
+                return Err(Error::Invalid(
+                    "ManyDesc inembed dimensions must be positive",
+                ));
             }
             if let Some(out_e) = self.onembed
                 && out_e[i] <= 0
             {
-                return Err(Error::Invalid("ManyDesc onembed dimensions must be positive"));
+                return Err(Error::Invalid(
+                    "ManyDesc onembed dimensions must be positive",
+                ));
             }
         }
         let req_in = self.req_dims(false);
@@ -192,22 +198,30 @@ impl ManyDesc {
             if let Some(in_e) = self.inembed
                 && in_e[i] < req_in[i]
             {
-                return Err(Error::Invalid("ManyDesc inembed[i] must be >= required input dim for i >= 1"));
+                return Err(Error::Invalid(
+                    "ManyDesc inembed[i] must be >= required input dim for i >= 1",
+                ));
             }
             if let Some(out_e) = self.onembed
                 && out_e[i] < req_out[i]
             {
-                return Err(Error::Invalid("ManyDesc onembed[i] must be >= required output dim for i >= 1"));
+                return Err(Error::Invalid(
+                    "ManyDesc onembed[i] must be >= required output dim for i >= 1",
+                ));
             }
         }
         if self.istride <= 0 || self.ostride <= 0 {
-            return Err(Error::Invalid("ManyDesc istride and ostride must be positive"));
+            return Err(Error::Invalid(
+                "ManyDesc istride and ostride must be positive",
+            ));
         }
         if self.batch <= 0 {
             return Err(Error::Invalid("ManyDesc batch must be positive"));
         }
         if self.batch > 1 && (self.idist <= 0 || self.odist <= 0) {
-            return Err(Error::Invalid("ManyDesc idist and odist must be positive when batch > 1"));
+            return Err(Error::Invalid(
+                "ManyDesc idist and odist must be positive when batch > 1",
+            ));
         }
         Ok(())
     }
@@ -243,27 +257,43 @@ impl ManyDesc {
                 let batch_off = ((self.batch - 1) as usize)
                     .checked_mul(dist as usize)
                     .ok_or(Error::Invalid("ManyDesc batch distance overflow"))?;
-                intra.checked_add(batch_off).ok_or(Error::Invalid("ManyDesc total span overflow"))
+                intra
+                    .checked_add(batch_off)
+                    .ok_or(Error::Invalid("ManyDesc total span overflow"))
             }
         };
         let in_span = span(max_idx_for(req_in, self.inembed)?, self.istride, self.idist)?;
-        let out_span = span(max_idx_for(req_out, self.onembed)?, self.ostride, self.odist)?;
+        let out_span = span(
+            max_idx_for(req_out, self.onembed)?,
+            self.ostride,
+            self.odist,
+        )?;
         Ok((in_span, out_span))
     }
 }
 
 /// Computes minimum `(input_elems, output_elems)` for a contiguous 1D/2D/3D transform.
-pub(crate) fn dense_io_elems(dims: &[i32], batch: i32, fft_type: FftType) -> Result<(usize, usize)> {
+pub(crate) fn dense_io_elems(
+    dims: &[i32],
+    batch: i32,
+    fft_type: FftType,
+) -> Result<(usize, usize)> {
     if batch <= 0 || dims.is_empty() || dims.iter().any(|&d| d <= 0) {
         return Err(Error::Invalid("FFT dimensions and batch must be positive"));
     }
     let last = *dims.last().ok_or(Error::Invalid("empty FFT dimensions"))? as usize;
     let mut prefix = batch as usize;
     for &d in &dims[..dims.len() - 1] {
-        prefix = prefix.checked_mul(d as usize).ok_or(Error::Invalid("FFT element count overflow"))?;
+        prefix = prefix
+            .checked_mul(d as usize)
+            .ok_or(Error::Invalid("FFT element count overflow"))?;
     }
-    let real_elems = prefix.checked_mul(last).ok_or(Error::Invalid("FFT real element count overflow"))?;
-    let half_complex_elems = prefix.checked_mul(last / 2 + 1).ok_or(Error::Invalid("FFT complex element count overflow"))?;
+    let real_elems = prefix
+        .checked_mul(last)
+        .ok_or(Error::Invalid("FFT real element count overflow"))?;
+    let half_complex_elems = prefix
+        .checked_mul(last / 2 + 1)
+        .ok_or(Error::Invalid("FFT complex element count overflow"))?;
     match fft_type {
         FftType::C2C | FftType::Z2Z => Ok((real_elems, real_elems)),
         FftType::R2C | FftType::D2Z => Ok((real_elems, half_complex_elems)),
@@ -284,10 +314,15 @@ impl RawHandle {
         let mut handle: sys::cufftHandle = 0;
         // SAFETY: `cuda` is bound; `handle` is a valid out-pointer.
         check("cufftCreate", unsafe { sys::cufftCreate(&mut handle) })?;
-        let guard = Self { handle, cuda: cuda.clone() };
+        let guard = Self {
+            handle,
+            cuda: cuda.clone(),
+        };
         // Disable cuFFT's hidden workspace allocation so all workspace comes from `Scratch`.
         // SAFETY: `guard.handle` is a freshly created valid plan handle.
-        check("cufftSetAutoAllocation", unsafe { sys::cufftSetAutoAllocation(guard.handle, 0) })?;
+        check("cufftSetAutoAllocation", unsafe {
+            sys::cufftSetAutoAllocation(guard.handle, 0)
+        })?;
         Ok(guard)
     }
 
@@ -333,7 +368,9 @@ impl Plan {
         sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut work_size = 0usize;
         // SAFETY: `work_size` is a valid out-pointer.
-        check("cufftEstimate1d", unsafe { sys::cufftEstimate1d(nx, fft_type.raw(), batch, &mut work_size) })?;
+        check("cufftEstimate1d", unsafe {
+            sys::cufftEstimate1d(nx, fft_type.raw(), batch, &mut work_size)
+        })?;
         Ok(work_size)
     }
 
@@ -343,7 +380,9 @@ impl Plan {
         sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut work_size = 0usize;
         // SAFETY: `work_size` is a valid out-pointer.
-        check("cufftEstimate2d", unsafe { sys::cufftEstimate2d(nx, ny, fft_type.raw(), &mut work_size) })?;
+        check("cufftEstimate2d", unsafe {
+            sys::cufftEstimate2d(nx, ny, fft_type.raw(), &mut work_size)
+        })?;
         Ok(work_size)
     }
 
@@ -353,7 +392,9 @@ impl Plan {
         sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut work_size = 0usize;
         // SAFETY: `work_size` is a valid out-pointer.
-        check("cufftEstimate3d", unsafe { sys::cufftEstimate3d(nx, ny, nz, fft_type.raw(), &mut work_size) })?;
+        check("cufftEstimate3d", unsafe {
+            sys::cufftEstimate3d(nx, ny, nz, fft_type.raw(), &mut work_size)
+        })?;
         Ok(work_size)
     }
 
@@ -368,17 +409,28 @@ impl Plan {
     ) -> Result<Self> {
         let stream = scratch.stream().clone();
         if !Arc::ptr_eq(stream.context(), &guard.cuda) {
-            return Err(Error::Invalid("scratch stream belongs to a different CUDA context than the plan"));
+            return Err(Error::Invalid(
+                "scratch stream belongs to a different CUDA context than the plan",
+            ));
         }
         let ws_ptr = scratch.reserve(&stream, work_size, budget)?;
         let handle = guard.handle;
         if work_size > 0 {
             // SAFETY: `handle` is live with auto-allocation disabled; `ws_ptr` has `work_size` bytes.
-            check("cufftSetWorkArea", unsafe { sys::cufftSetWorkArea(handle, ws_ptr) })?;
+            check("cufftSetWorkArea", unsafe {
+                sys::cufftSetWorkArea(handle, ws_ptr)
+            })?;
         }
         let cuda = guard.cuda.clone();
         let handle = guard.into_handle();
-        Ok(Self { handle, cuda, fft_type, work_size, min_input_elems, min_output_elems })
+        Ok(Self {
+            handle,
+            cuda,
+            fft_type,
+            work_size,
+            min_input_elems,
+            min_output_elems,
+        })
     }
 
     /// Creates a 1D cuFFT plan (`cufftMakePlan1d`) with caller-owned [`Scratch`] admitted against `budget`.
@@ -452,8 +504,16 @@ impl Plan {
         let mut n = desc.n;
         let mut inembed = desc.inembed.unwrap_or([0; 3]);
         let mut onembed = desc.onembed.unwrap_or([0; 3]);
-        let inembed_ptr = if desc.inembed.is_some() { inembed.as_mut_ptr() } else { std::ptr::null_mut() };
-        let onembed_ptr = if desc.onembed.is_some() { onembed.as_mut_ptr() } else { std::ptr::null_mut() };
+        let inembed_ptr = if desc.inembed.is_some() {
+            inembed.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
+        let onembed_ptr = if desc.onembed.is_some() {
+            onembed.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
         let mut work_size = 0usize;
         // SAFETY: `n`, `inembed`, `onembed` are stack arrays valid for `desc.rank <= 3`.
         check("cufftMakePlanMany", unsafe {
@@ -472,7 +532,15 @@ impl Plan {
                 &mut work_size,
             )
         })?;
-        Self::finish_build(guard, desc.fft_type, work_size, min_in, min_out, budget, scratch)
+        Self::finish_build(
+            guard,
+            desc.fft_type,
+            work_size,
+            min_in,
+            min_out,
+            budget,
+            scratch,
+        )
     }
 
     /// Returns the raw `cufftHandle`.
@@ -503,13 +571,17 @@ impl Plan {
     pub fn set_work_area(&mut self, scratch: &mut Scratch, budget: usize) -> Result<()> {
         let stream = scratch.stream().clone();
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
-            return Err(Error::Invalid("scratch stream belongs to a different CUDA context than the plan"));
+            return Err(Error::Invalid(
+                "scratch stream belongs to a different CUDA context than the plan",
+            ));
         }
         let ws_ptr = scratch.reserve(&stream, self.work_size, budget)?;
         if self.work_size > 0 {
             self.cuda.bind_to_thread()?;
             // SAFETY: `self.handle` is live and `ws_ptr` has `self.work_size` device bytes.
-            check("cufftSetWorkArea", unsafe { sys::cufftSetWorkArea(self.handle, ws_ptr) })?;
+            check("cufftSetWorkArea", unsafe {
+                sys::cufftSetWorkArea(self.handle, ws_ptr)
+            })?;
         }
         Ok(())
     }
@@ -517,19 +589,27 @@ impl Plan {
     /// Binds `stream` to this plan.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
-            return Err(Error::Invalid("stream belongs to a different CUDA context than the cuFFT plan"));
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than the cuFFT plan",
+            ));
         }
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.handle` and `stream.cu_stream()` belong to the same live context.
-        check("cufftSetStream", unsafe { sys::cufftSetStream(self.handle, stream.cu_stream()) })
+        check("cufftSetStream", unsafe {
+            sys::cufftSetStream(self.handle, stream.cu_stream())
+        })
     }
 
     fn check_exec(&self, expected: FftType, in_len: usize, out_len: usize) -> Result<()> {
         if self.fft_type != expected {
-            return Err(Error::Invalid("cuFFT plan transform type does not match execution method"));
+            return Err(Error::Invalid(
+                "cuFFT plan transform type does not match execution method",
+            ));
         }
         if in_len < self.min_input_elems || out_len < self.min_output_elems {
-            return Err(Error::Invalid("device buffer smaller than required cuFFT transform extent"));
+            return Err(Error::Invalid(
+                "device buffer smaller than required cuFFT transform extent",
+            ));
         }
         Ok(())
     }

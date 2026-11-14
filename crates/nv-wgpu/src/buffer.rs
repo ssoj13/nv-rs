@@ -19,12 +19,12 @@ use std::sync::Arc;
 
 use ash::vk;
 use cuda_core::{Context, RawDeviceBuffer};
-use cuda_ext::ExternalMemory;
-#[cfg(windows)]
-use windows::Win32::Graphics::{Direct3D12, Dxgi};
-use wgpu::hal::api::Vulkan;
+use cuda_core_ext::ExternalMemory;
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
+use wgpu::hal::api::Vulkan;
+#[cfg(windows)]
+use windows::Win32::Graphics::{Direct3D12, Dxgi};
 
 use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
@@ -145,10 +145,11 @@ impl SharedBuffer {
         desc: &SharedBufferDescriptor<'_>,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
-        let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
-            expected: "Vulkan",
-            found: device.adapter_info().backend,
-        })?;
+        let hal_dev =
+            unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
+                expected: "Vulkan",
+                found: device.adapter_info().backend,
+            })?;
         let raw_dev = hal_dev.raw_device();
         let instance = hal_dev.shared_instance().raw_instance();
         let phys = hal_dev.raw_physical_device();
@@ -246,9 +247,7 @@ impl SharedBuffer {
             mapped_at_creation: false,
         };
         // SAFETY: `hal_buf` matches `wgpu_desc` and belongs to `device`.
-        let wgpu_buf = unsafe {
-            device.create_buffer_from_hal::<Vulkan>(hal_buf, &wgpu_desc)
-        };
+        let wgpu_buf = unsafe { device.create_buffer_from_hal::<Vulkan>(hal_buf, &wgpu_desc) };
 
         Ok(Self {
             cuda_buf,
@@ -303,9 +302,8 @@ impl SharedBuffer {
         };
 
         // SAFETY: Queries committed resource allocation size required by `cuImportExternalMemory`.
-        let alloc_info = unsafe {
-            raw_device.GetResourceAllocationInfo(0, core::slice::from_ref(&res_desc))
-        };
+        let alloc_info =
+            unsafe { raw_device.GetResourceAllocationInfo(0, core::slice::from_ref(&res_desc)) };
         if alloc_info.SizeInBytes == u64::MAX || alloc_info.SizeInBytes < desc.size {
             return Err(Error::InvalidInput(
                 "D3D12 rejected buffer descriptor allocation info",
@@ -380,7 +378,7 @@ impl SharedBuffer {
         self.cuda_buf.cu_deviceptr()
     }
 
-    /// Returns the underlying `cuda_ext::ExternalMemory` handle.
+    /// Returns the underlying `cuda_core_ext::ExternalMemory` handle.
     #[inline]
     pub fn external_memory(&self) -> &Arc<ExternalMemory> {
         &self.ext_mem
@@ -508,40 +506,50 @@ mod tests {
 
     #[test]
     fn buffer_descriptor_validation_rejects_zero_mappable_and_unaligned_uniform() {
-        assert!(validate_buffer_descriptor(&SharedBufferDescriptor {
-            label: None,
-            size: 0,
-            usage: wgpu::BufferUsages::STORAGE,
-        })
-        .is_err());
+        assert!(
+            validate_buffer_descriptor(&SharedBufferDescriptor {
+                label: None,
+                size: 0,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+            .is_err()
+        );
 
-        assert!(validate_buffer_descriptor(&SharedBufferDescriptor {
-            label: None,
-            size: 256,
-            usage: wgpu::BufferUsages::empty(),
-        })
-        .is_err());
+        assert!(
+            validate_buffer_descriptor(&SharedBufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::empty(),
+            })
+            .is_err()
+        );
 
-        assert!(validate_buffer_descriptor(&SharedBufferDescriptor {
-            label: None,
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_READ,
-        })
-        .is_err());
+        assert!(
+            validate_buffer_descriptor(&SharedBufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_READ,
+            })
+            .is_err()
+        );
 
-        assert!(validate_buffer_descriptor(&SharedBufferDescriptor {
-            label: None,
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_WRITE,
-        })
-        .is_err());
+        assert!(
+            validate_buffer_descriptor(&SharedBufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_WRITE,
+            })
+            .is_err()
+        );
 
-        assert!(validate_buffer_descriptor(&SharedBufferDescriptor {
-            label: None,
-            size: 128,
-            usage: wgpu::BufferUsages::UNIFORM,
-        })
-        .is_err());
+        assert!(
+            validate_buffer_descriptor(&SharedBufferDescriptor {
+                label: None,
+                size: 128,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+            .is_err()
+        );
 
         validate_buffer_descriptor(&SharedBufferDescriptor {
             label: Some("valid"),

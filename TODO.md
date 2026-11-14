@@ -1,5 +1,14 @@
 # nv-rs — work queue
 
+## 2026-11-14 Completed (Wave 2 & Corporate Release Readiness)
+
+- [x] Unify host toolchain pin to `1.99.1` (`rust-toolchain.toml`).
+- [x] Adapt `bootstrap.py` for `nv-rs` (`d s` / `d dl` SDK discovery & download, `b`/`t`/`c`/`s`/`cl`/`x`).
+- [x] Confirm & implement D13 in `crates/ngx` (`Init_with_ProjectID` + `ApplicationId`, Windows & WSL2 verified).
+- [x] Verify `cufile` and `nccl` on Linux WSL2.
+- [x] Rename `cuda-ext` -> `cuda-core-ext` across the workspace.
+- [x] Corporate release readiness (M4): update `README.md`, `Cargo.toml` `[workspace.package]`, `PLAN.md`, `HANDOFF.md`, `TODO.md`; create `CONTRIBUTING.md`, `SECURITY.md`, `deny.toml`.
+
 ## Transfer checkpoint — 2026-11-13 (Codex)
 
 **Status: paused by owner for an environment change.** All task agents have stopped/completed; do not resume implementation automatically. The owner explicitly requested updating progress and pushing the unfinished source checkpoint to main.
@@ -119,8 +128,8 @@ M5 records 55 host GPU tests, 15 device cases and the OptiX coverage gate. Do no
 ## M9 — separately shipped SDK wrappers
 
 - [ ] Implement cudnn, nvcomp, nccl and cufile safe wrappers; pass T1 and available T2 gates.
-- [ ] Resolve D13 owner confirmation before implementing the full NGX ProjectID wrapper.
-- [ ] Implement NGX, including its D3D11 helpers, after that decision; preserve the D15 static-link contract.
+- [x] Resolve D13 owner confirmation before implementing the full NGX ProjectID wrapper.
+- [x] Implement NGX (`Init_with_ProjectID` and `ApplicationId`), preserving the D15 static-link contract.
 - [ ] Obtain separate approval for any required native-Linux/multi-GPU rental under D12.
 
 ## M10 — render-rs OptiX backend

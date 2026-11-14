@@ -1,6 +1,6 @@
 //! Error and result types for `nv-wgpu` CUDA <-> `wgpu` interop.
 //!
-//! Why: `nv-wgpu` bridges `cuda-core` / `cuda-ext`, `wgpu`, `ash` (Vulkan), and
+//! Why: `nv-wgpu` bridges `cuda-core` / `cuda-core-ext`, `wgpu`, `ash` (Vulkan), and
 //! Win32/DX12 (`windows` on Windows). Unifying failures into a single typed
 //! enum prevents silent backend downgrades and surfaces explicit unsupported
 //! extension, format, device-mismatch, or validation diagnostics.
@@ -17,7 +17,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Typed error for CUDA <-> `wgpu` 30 external memory and synchronization interop.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Error propagated from the CUDA driver via `cuda-core` or `cuda-ext`.
+    /// Error propagated from the CUDA driver via `cuda-core` or `cuda-core-ext`.
     #[error("cuda driver error: {0}")]
     Driver(#[from] DriverError),
 

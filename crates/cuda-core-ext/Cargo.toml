@@ -1,5 +1,5 @@
 [package]
-name = "cuda-ext"
+name = "cuda-core-ext"
 description = "CUDA driver features missing from cuda-core: external memory and semaphores, arrays, texture and surface objects, host registration, managed memory, device LUID, green contexts"
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [lib]
-path = "src/cuda_ext.rs"
+path = "src/cuda_core_ext.rs"
 
 [dependencies]
 cuda-core.workspace = true

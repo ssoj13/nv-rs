@@ -36,12 +36,28 @@ pub mod stack;
 pub mod task;
 pub mod xform;
 
-pub use accel::{Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit, GeometryFlags, Indices, Instance, Keys, Radii, RelocationInfo, Relink, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices};
-pub use cluster::{ClusterAccel, ClusterArg, ClusterArgs, ClusterFlags, ClusterInput, ClusterKind, ClusterLimits, ClusterMode, ClusterOptions, ClusterRefs, ClusterSizes, GridLimits, TriangleLimits};
+pub use accel::{
+    Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit,
+    GeometryFlags, Indices, Instance, Keys, Radii, Relink, RelocationInfo, SbtOffsets, Scratch,
+    Spheres, TriangleMesh, VertexFormat, Vertices,
+};
+pub use cluster::{
+    ClusterAccel, ClusterArg, ClusterArgs, ClusterFlags, ClusterInput, ClusterKind, ClusterLimits,
+    ClusterMode, ClusterOptions, ClusterRefs, ClusterSizes, GridLimits, TriangleLimits,
+};
 pub use context::{DeviceContext, LogFn, describe, error_name, error_string};
-pub use denoise::{AlphaMode, AovType, Denoiser, DenoiserModel, DenoiserOptions, Guides, Image, Layer, Params, Pixel, PixelFormat, Tile, split_image};
-pub use micromap::{MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapSizes, MicromapUse, OpacityMicromapArray, base_to_micro_bary, micro_to_base_bary};
-pub use module::{BoundValue, BuiltinIs, DebugLevel, HitGroup, Module, ModuleOptions, OptLevel, PayloadSemantics, PayloadType, PipelineOptions, Primitive, ProgramGroup, Programs};
+pub use denoise::{
+    AlphaMode, AovType, Denoiser, DenoiserModel, DenoiserOptions, Guides, Image, Layer, Params,
+    Pixel, PixelFormat, Tile, split_image,
+};
+pub use micromap::{
+    MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapSizes,
+    MicromapUse, OpacityMicromapArray, base_to_micro_bary, micro_to_base_bary,
+};
+pub use module::{
+    BoundValue, BuiltinIs, DebugLevel, HitGroup, Module, ModuleOptions, OptLevel, PayloadSemantics,
+    PayloadType, PipelineOptions, Primitive, ProgramGroup, Programs,
+};
 pub use pipeline::{LinkOptions, Pipeline};
 pub use sbt::{SbtRecord, ShaderBindingTable};
 pub use stack::{PipelineStack, StackSizes, simple_path_tracer};
@@ -85,7 +101,11 @@ pub enum Error {
 }
 
 fn log_suffix(log: &str) -> String {
-    if log.is_empty() { String::new() } else { format!(":\n{log}") }
+    if log.is_empty() {
+        String::new()
+    } else {
+        format!(":\n{log}")
+    }
 }
 
 /// Result alias for this crate.
@@ -98,13 +118,22 @@ pub(crate) fn check(call: &'static str, code: sys::OptixResult) -> Result<()> {
 
 /// Like [`check`], attaching the first `len` bytes of `log` (OptiX reports the size it wanted,
 /// which may exceed the buffer).
-pub(crate) fn check_log(call: &'static str, code: sys::OptixResult, log: &[u8], len: usize) -> Result<()> {
+pub(crate) fn check_log(
+    call: &'static str,
+    code: sys::OptixResult,
+    log: &[u8],
+    len: usize,
+) -> Result<()> {
     if code == sys::OptixResult_OPTIX_SUCCESS {
         return Ok(());
     }
     let text = &log[..len.min(log.len())];
     let text = text.split(|b| *b == 0).next().unwrap_or_default();
-    Err(Error::Optix { call, code, log: String::from_utf8_lossy(text).trim().to_owned() })
+    Err(Error::Optix {
+        call,
+        code,
+        log: String::from_utf8_lossy(text).trim().to_owned(),
+    })
 }
 
 /// Size of the log buffers handed to compile and link calls.
@@ -112,13 +141,17 @@ pub(crate) const LOG_BYTES: usize = 16 * 1024;
 
 /// Returns the driver's OptiX function table.
 pub(crate) fn table() -> Result<&'static sys::OptixFunctionTable> {
-    sys::api().map(|a| &a.table).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::api()
+        .map(|a| &a.table)
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 /// Unwraps a function-table entry; a null entry means the driver did not fill it for this ABI.
 macro_rules! entry {
     ($t:expr, $name:ident) => {
-        $t.$name.ok_or($crate::Error::Unavailable(concat!(stringify!($name), " missing from the OptiX function table").into()))?
+        $t.$name.ok_or($crate::Error::Unavailable(
+            concat!(stringify!($name), " missing from the OptiX function table").into(),
+        ))?
     };
 }
 pub(crate) use entry;

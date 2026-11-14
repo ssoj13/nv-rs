@@ -21,25 +21,32 @@ impl CurandStatus {
     /// No errors (`CURAND_STATUS_SUCCESS`).
     pub const SUCCESS: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS);
     /// Header file and linked library version mismatch (`CURAND_STATUS_VERSION_MISMATCH`).
-    pub const VERSION_MISMATCH: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_VERSION_MISMATCH);
+    pub const VERSION_MISMATCH: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_VERSION_MISMATCH);
     /// Generator not initialized (`CURAND_STATUS_NOT_INITIALIZED`).
-    pub const NOT_INITIALIZED: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_NOT_INITIALIZED);
+    pub const NOT_INITIALIZED: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_NOT_INITIALIZED);
     /// Memory allocation failed (`CURAND_STATUS_ALLOCATION_FAILED`).
-    pub const ALLOCATION_FAILED: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_ALLOCATION_FAILED);
+    pub const ALLOCATION_FAILED: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_ALLOCATION_FAILED);
     /// Generator is wrong type (`CURAND_STATUS_TYPE_ERROR`).
     pub const TYPE_ERROR: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_TYPE_ERROR);
     /// Argument out of range (`CURAND_STATUS_OUT_OF_RANGE`).
     pub const OUT_OF_RANGE: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_OUT_OF_RANGE);
     /// Length requested is not a multiple of dimension (`CURAND_STATUS_LENGTH_NOT_MULTIPLE`).
-    pub const LENGTH_NOT_MULTIPLE: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_LENGTH_NOT_MULTIPLE);
+    pub const LENGTH_NOT_MULTIPLE: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_LENGTH_NOT_MULTIPLE);
     /// Double precision required (`CURAND_STATUS_DOUBLE_PRECISION_REQUIRED`).
-    pub const DOUBLE_PRECISION_REQUIRED: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_DOUBLE_PRECISION_REQUIRED);
+    pub const DOUBLE_PRECISION_REQUIRED: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_DOUBLE_PRECISION_REQUIRED);
     /// Kernel launch failure (`CURAND_STATUS_LAUNCH_FAILURE`).
     pub const LAUNCH_FAILURE: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_LAUNCH_FAILURE);
     /// Preexisting failure on library entry (`CURAND_STATUS_PREEXISTING_FAILURE`).
-    pub const PREEXISTING_FAILURE: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_PREEXISTING_FAILURE);
+    pub const PREEXISTING_FAILURE: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_PREEXISTING_FAILURE);
     /// Initialization of CUDA failed (`CURAND_STATUS_INITIALIZATION_FAILED`).
-    pub const INITIALIZATION_FAILED: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED);
+    pub const INITIALIZATION_FAILED: Self =
+        Self(cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED);
     /// Architecture mismatch (`CURAND_STATUS_ARCH_MISMATCH`).
     pub const ARCH_MISMATCH: Self = Self(cuda_bindings::curandStatus_CURAND_STATUS_ARCH_MISMATCH);
     /// Internal library error (`CURAND_STATUS_INTERNAL_ERROR`).
@@ -54,18 +61,38 @@ impl CurandStatus {
     pub const fn name(self) -> &'static str {
         match self.0 {
             cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS => "CURAND_STATUS_SUCCESS",
-            cuda_bindings::curandStatus_CURAND_STATUS_VERSION_MISMATCH => "CURAND_STATUS_VERSION_MISMATCH",
-            cuda_bindings::curandStatus_CURAND_STATUS_NOT_INITIALIZED => "CURAND_STATUS_NOT_INITIALIZED",
-            cuda_bindings::curandStatus_CURAND_STATUS_ALLOCATION_FAILED => "CURAND_STATUS_ALLOCATION_FAILED",
+            cuda_bindings::curandStatus_CURAND_STATUS_VERSION_MISMATCH => {
+                "CURAND_STATUS_VERSION_MISMATCH"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_NOT_INITIALIZED => {
+                "CURAND_STATUS_NOT_INITIALIZED"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_ALLOCATION_FAILED => {
+                "CURAND_STATUS_ALLOCATION_FAILED"
+            }
             cuda_bindings::curandStatus_CURAND_STATUS_TYPE_ERROR => "CURAND_STATUS_TYPE_ERROR",
             cuda_bindings::curandStatus_CURAND_STATUS_OUT_OF_RANGE => "CURAND_STATUS_OUT_OF_RANGE",
-            cuda_bindings::curandStatus_CURAND_STATUS_LENGTH_NOT_MULTIPLE => "CURAND_STATUS_LENGTH_NOT_MULTIPLE",
-            cuda_bindings::curandStatus_CURAND_STATUS_DOUBLE_PRECISION_REQUIRED => "CURAND_STATUS_DOUBLE_PRECISION_REQUIRED",
-            cuda_bindings::curandStatus_CURAND_STATUS_LAUNCH_FAILURE => "CURAND_STATUS_LAUNCH_FAILURE",
-            cuda_bindings::curandStatus_CURAND_STATUS_PREEXISTING_FAILURE => "CURAND_STATUS_PREEXISTING_FAILURE",
-            cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED => "CURAND_STATUS_INITIALIZATION_FAILED",
-            cuda_bindings::curandStatus_CURAND_STATUS_ARCH_MISMATCH => "CURAND_STATUS_ARCH_MISMATCH",
-            cuda_bindings::curandStatus_CURAND_STATUS_INTERNAL_ERROR => "CURAND_STATUS_INTERNAL_ERROR",
+            cuda_bindings::curandStatus_CURAND_STATUS_LENGTH_NOT_MULTIPLE => {
+                "CURAND_STATUS_LENGTH_NOT_MULTIPLE"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_DOUBLE_PRECISION_REQUIRED => {
+                "CURAND_STATUS_DOUBLE_PRECISION_REQUIRED"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_LAUNCH_FAILURE => {
+                "CURAND_STATUS_LAUNCH_FAILURE"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_PREEXISTING_FAILURE => {
+                "CURAND_STATUS_PREEXISTING_FAILURE"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED => {
+                "CURAND_STATUS_INITIALIZATION_FAILED"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_ARCH_MISMATCH => {
+                "CURAND_STATUS_ARCH_MISMATCH"
+            }
+            cuda_bindings::curandStatus_CURAND_STATUS_INTERNAL_ERROR => {
+                "CURAND_STATUS_INTERNAL_ERROR"
+            }
             _ => "CURAND_STATUS_UNKNOWN",
         }
     }
@@ -117,7 +144,10 @@ pub(crate) fn check(call: &'static str, code: cuda_bindings::curandStatus_t) -> 
     if code == cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Curand { call, code: CurandStatus(code) })
+        Err(Error::Curand {
+            call,
+            code: CurandStatus(code),
+        })
     }
 }
 
@@ -125,6 +155,8 @@ pub(crate) fn check(call: &'static str, code: cuda_bindings::curandStatus_t) -> 
 #[inline]
 pub(crate) fn teardown(ctx: &Context, code: cuda_bindings::curandStatus_t) {
     if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+        ctx.record_err(Err::<(), _>(DriverError(
+            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+        )));
     }
 }

@@ -21,8 +21,17 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["cufftCreate", "cufftPlan1d", "cufftExecC2C", "cufftSetStream", "cufftGetVersion"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "cufftCreate",
+            "cufftPlan1d",
+            "cufftExecC2C",
+            "cufftSetStream",
+            "cufftGetVersion",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 
@@ -38,7 +47,10 @@ mod tests {
         load().expect("cufft loads");
         let mut v = 0;
         // SAFETY: valid out-pointer.
-        assert_eq!(unsafe { cufftGetVersion(&mut v) }, cufftResult_t_CUFFT_SUCCESS);
+        assert_eq!(
+            unsafe { cufftGetVersion(&mut v) },
+            cufftResult_t_CUFFT_SUCCESS
+        );
         assert!(v >= 11000, "{v}");
     }
 }

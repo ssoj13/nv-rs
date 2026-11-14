@@ -1,11 +1,11 @@
-//! Zero-copy shared GPU textures (`wgpu::Texture` <-> `cuda_ext::MipmappedArray`).
+//! Zero-copy shared GPU textures (`wgpu::Texture` <-> `cuda_core_ext::MipmappedArray`).
 //!
 //! Why: Shares 2D/3D/layered/cubemap GPU images directly between `wgpu` rendering or
 //! compute passes and CUDA arrays/surfaces/textures without copying pixels through RAM:
 //! - On Vulkan: allocates an exportable dedicated `VkImage` + `VkDeviceMemory`, optionally
 //!   transitions it from `UNDEFINED` to the layout matching `initial_state`, wraps it via
 //!   `wgpu::hal::vulkan::Device::texture_from_raw(..., TextureMemory::External)` +
-//!   `create_texture_from_hal`, and maps a `cuda_ext::MipmappedArray` over the imported memory.
+//!   `create_texture_from_hal`, and maps a `cuda_core_ext::MipmappedArray` over the imported memory.
 //! - On DX12 (Windows): allocates a committed shared `ID3D12Resource` texture
 //!   (`D3D12_HEAP_FLAG_SHARED` + `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS`), wraps
 //!   via `wgpu::hal::dx12::Device::texture_from_raw`, and imports via `D3d12Resource`.
@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 use ash::vk;
 use cuda_core::{Context, IntoResult};
-use cuda_ext::array::LevelRef;
-use cuda_ext::{ArrayDesc, ExternalMemory, MipmappedArray, TextureDesc, TextureObject};
-#[cfg(windows)]
-use windows::Win32::Graphics::Direct3D12;
-use wgpu::hal::api::Vulkan;
+use cuda_core_ext::array::LevelRef;
+use cuda_core_ext::{ArrayDesc, ExternalMemory, MipmappedArray, TextureDesc, TextureObject};
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
+use wgpu::hal::api::Vulkan;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12;
 
 use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
@@ -79,7 +79,8 @@ impl<'a> SharedTextureDescriptor<'a> {
         usage: wgpu::TextureUsages,
         cuda_surface: bool,
     ) -> Self {
-        let initial_state = if cuda_surface || usage.contains(wgpu::TextureUsages::STORAGE_BINDING) {
+        let initial_state = if cuda_surface || usage.contains(wgpu::TextureUsages::STORAGE_BINDING)
+        {
             wgpu::TextureUses::STORAGE_READ_WRITE
         } else {
             wgpu::TextureUses::UNINITIALIZED
@@ -107,7 +108,9 @@ pub fn validate_texture_descriptor(
     desc: &SharedTextureDescriptor<'_>,
 ) -> Result<(FormatMapping, ArrayDesc)> {
     if desc.usage.is_empty() {
-        return Err(Error::InvalidInput("shared texture usage must be non-empty"));
+        return Err(Error::InvalidInput(
+            "shared texture usage must be non-empty",
+        ));
     }
     if desc.size.depth_or_array_layers > u32::from(u16::MAX)
         || desc.mip_level_count > u32::from(u16::MAX)
@@ -197,7 +200,7 @@ enum TextureNativeBacking {
 }
 
 /// Zero-copy GPU texture accessible simultaneously as [`wgpu::Texture`] and
-/// [`cuda_ext::MipmappedArray`].
+/// [`cuda_core_ext::MipmappedArray`].
 ///
 /// Field drop order is structural:
 /// 1. `cuda_array` (`Arc<MipmappedArray>`)
@@ -252,10 +255,11 @@ impl SharedTexture {
         array_desc: ArrayDesc,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
-        let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
-            expected: "Vulkan",
-            found: device.adapter_info().backend,
-        })?;
+        let hal_dev =
+            unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
+                expected: "Vulkan",
+                found: device.adapter_info().backend,
+            })?;
         let raw_dev = hal_dev.raw_device();
         let instance = hal_dev.shared_instance().raw_instance();
         let phys = hal_dev.raw_physical_device();
@@ -442,8 +446,9 @@ impl SharedTexture {
             view_formats: &[],
         };
         // SAFETY: `hal_tex` belongs to `device` and matches `wgpu_desc` + `desc.initial_state`.
-        let wgpu_tex =
-            unsafe { device.create_texture_from_hal::<Vulkan>(hal_tex, &wgpu_desc, desc.initial_state) };
+        let wgpu_tex = unsafe {
+            device.create_texture_from_hal::<Vulkan>(hal_tex, &wgpu_desc, desc.initial_state)
+        };
 
         Ok(Self {
             cuda_array,
@@ -514,9 +519,8 @@ impl SharedTexture {
         };
 
         // SAFETY: Queries committed texture allocation size for CUDA import.
-        let alloc_info = unsafe {
-            raw_device.GetResourceAllocationInfo(0, core::slice::from_ref(&res_desc))
-        };
+        let alloc_info =
+            unsafe { raw_device.GetResourceAllocationInfo(0, core::slice::from_ref(&res_desc)) };
         if alloc_info.SizeInBytes == u64::MAX || alloc_info.SizeInBytes == 0 {
             return Err(Error::InvalidInput(
                 "D3D12 rejected shared texture descriptor allocation info",
@@ -573,8 +577,9 @@ impl SharedTexture {
             view_formats: &[],
         };
         // SAFETY: `hal_tex` belongs to `device` and starts in `D3D12_RESOURCE_STATE_COMMON`.
-        let wgpu_tex =
-            unsafe { device.create_texture_from_hal::<Dx12>(hal_tex, &wgpu_desc, desc.initial_state) };
+        let wgpu_tex = unsafe {
+            device.create_texture_from_hal::<Dx12>(hal_tex, &wgpu_desc, desc.initial_state)
+        };
 
         Ok(Self {
             cuda_array,
@@ -594,7 +599,7 @@ impl SharedTexture {
         &self.wgpu_tex
     }
 
-    /// Returns the imported [`cuda_ext::MipmappedArray`] handle.
+    /// Returns the imported [`cuda_core_ext::MipmappedArray`] handle.
     #[inline]
     pub fn cuda_mipmapped_array(&self) -> &Arc<MipmappedArray> {
         &self.cuda_array
@@ -650,7 +655,7 @@ impl SharedTexture {
         &self.array_desc
     }
 
-    /// Returns the underlying `cuda_ext::ExternalMemory` handle.
+    /// Returns the underlying `cuda_core_ext::ExternalMemory` handle.
     #[inline]
     pub fn external_memory(&self) -> &Arc<ExternalMemory> {
         &self.ext_mem

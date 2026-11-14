@@ -125,7 +125,10 @@ pub(crate) fn check(call: &'static str, code: sys::cublasStatus_t) -> Result<()>
     if code == sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Cublas { call, code: Status(code) })
+        Err(Error::Cublas {
+            call,
+            code: Status(code),
+        })
     }
 }
 
@@ -139,7 +142,9 @@ pub(crate) fn check_lt(call: &'static str, code: lt_sys::cublasStatus_t) -> Resu
 #[inline]
 pub(crate) fn teardown(ctx: &Context, code: sys::cublasStatus_t) {
     if code != sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+        ctx.record_err(Err::<(), _>(DriverError(
+            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+        )));
     }
 }
 

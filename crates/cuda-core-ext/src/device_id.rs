@@ -30,6 +30,10 @@ pub fn device_luid(ctx: &Context) -> Result<Luid, DriverError> {
     let mut bytes = [0 as std::ffi::c_char; 8];
     let mut node_mask = 0u32;
     // SAFETY: 8-byte LUID buffer and a valid node-mask out-pointer, as the API requires.
-    unsafe { cuda_core::sys::cuDeviceGetLuid(bytes.as_mut_ptr(), &mut node_mask, ctx.cu_device()) }.result()?;
-    Ok(Luid { bytes: bytes.map(|b| b as u8), node_mask })
+    unsafe { cuda_core::sys::cuDeviceGetLuid(bytes.as_mut_ptr(), &mut node_mask, ctx.cu_device()) }
+        .result()?;
+    Ok(Luid {
+        bytes: bytes.map(|b| b as u8),
+        node_mask,
+    })
 }

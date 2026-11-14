@@ -10,8 +10,8 @@ use cuda_core::Context;
 use cudnn_sys as sys;
 
 use crate::{
-    check, checked_i32, record_teardown, DataType, Error, Handle, NanPropagation, Result,
-    TensorFormat,
+    DataType, Error, Handle, NanPropagation, Result, TensorFormat, check, checked_i32,
+    record_teardown,
 };
 
 /// Maximum tensor rank supported by cuDNN (`CUDNN_DIM_MAX`).
@@ -88,7 +88,9 @@ impl ConvFwdAlgo {
     /// Converts to the underlying `cudnnConvolutionFwdAlgo_t`.
     pub const fn to_sys(self) -> sys::cudnnConvolutionFwdAlgo_t {
         match self {
-            Self::ImplicitGemm => sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+            Self::ImplicitGemm => {
+                sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM
+            }
             Self::ImplicitPrecompGemm => {
                 sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM
             }
@@ -198,7 +200,9 @@ impl TensorDescriptor {
         sys::load()?;
         let mut raw: sys::cudnnTensorDescriptor_t = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check("cudnnCreateTensorDescriptor", unsafe { sys::cudnnCreateTensorDescriptor(&mut raw) })?;
+        check("cudnnCreateTensorDescriptor", unsafe {
+            sys::cudnnCreateTensorDescriptor(&mut raw)
+        })?;
         Ok(raw)
     }
 
@@ -239,7 +243,9 @@ impl TensorDescriptor {
         strides: &[usize],
     ) -> Result<Self> {
         if dims.len() != strides.len() {
-            return Err(Error::Invalid("tensor dims and strides must have matching rank"));
+            return Err(Error::Invalid(
+                "tensor dims and strides must have matching rank",
+            ));
         }
         if dims.contains(&0) {
             return Err(Error::Invalid("tensor dimensions must be non-zero"));
@@ -284,7 +290,12 @@ impl TensorDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone(), dtype, size_bytes })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            dtype,
+            size_bytes,
+        })
     }
 
     /// Raw `cudnnTensorDescriptor_t`.
@@ -348,10 +359,13 @@ impl FilterDescriptor {
 
         let mut raw: sys::cudnnFilterDescriptor_t = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check("cudnnCreateFilterDescriptor", unsafe { sys::cudnnCreateFilterDescriptor(&mut raw) })?;
+        check("cudnnCreateFilterDescriptor", unsafe {
+            sys::cudnnCreateFilterDescriptor(&mut raw)
+        })?;
         // SAFETY: `raw` was initialized above.
-        let status =
-            unsafe { sys::cudnnSetFilter4dDescriptor(raw, dtype.to_sys(), format.to_sys(), k, c, h, w) };
+        let status = unsafe {
+            sys::cudnnSetFilter4dDescriptor(raw, dtype.to_sys(), format.to_sys(), k, c, h, w)
+        };
         if let Err(err) = check("cudnnSetFilter4dDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
@@ -369,7 +383,12 @@ impl FilterDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone(), dtype, size_bytes })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            dtype,
+            size_bytes,
+        })
     }
 
     /// Creates an N-dimensional filter descriptor (`1..=8` dimensions).
@@ -387,10 +406,18 @@ impl FilterDescriptor {
         let nb_dims = copy_i32_dims(dims, &mut dim_a, "filter dim exceeds i32")?;
         let mut raw: sys::cudnnFilterDescriptor_t = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check("cudnnCreateFilterDescriptor", unsafe { sys::cudnnCreateFilterDescriptor(&mut raw) })?;
+        check("cudnnCreateFilterDescriptor", unsafe {
+            sys::cudnnCreateFilterDescriptor(&mut raw)
+        })?;
         // SAFETY: `raw` is live and `dim_a` contains `nb_dims` valid elements.
         let status = unsafe {
-            sys::cudnnSetFilterNdDescriptor(raw, dtype.to_sys(), format.to_sys(), nb_dims, dim_a.as_ptr())
+            sys::cudnnSetFilterNdDescriptor(
+                raw,
+                dtype.to_sys(),
+                format.to_sys(),
+                nb_dims,
+                dim_a.as_ptr(),
+            )
         };
         if let Err(err) = check("cudnnSetFilterNdDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
@@ -409,7 +436,12 @@ impl FilterDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone(), dtype, size_bytes })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            dtype,
+            size_bytes,
+        })
     }
 
     /// Raw `cudnnFilterDescriptor_t`.
@@ -463,7 +495,9 @@ impl ConvolutionDescriptor {
         compute_type: DataType,
     ) -> Result<Self> {
         if stride[0] == 0 || stride[1] == 0 || dilation[0] == 0 || dilation[1] == 0 {
-            return Err(Error::Invalid("convolution stride and dilation must be non-zero"));
+            return Err(Error::Invalid(
+                "convolution stride and dilation must be non-zero",
+            ));
         }
         sys::load()?;
         let pad_h = checked_i32(pad[0], "conv pad_h exceeds i32")?;
@@ -499,7 +533,10 @@ impl ConvolutionDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Creates an N-dimensional convolution descriptor (`1..=6` spatial dimensions; tensor rank `<= 8`).
@@ -512,10 +549,14 @@ impl ConvolutionDescriptor {
         compute_type: DataType,
     ) -> Result<Self> {
         if pad.len() != stride.len() || pad.len() != dilation.len() {
-            return Err(Error::Invalid("convolution pad, stride, and dilation ranks must match"));
+            return Err(Error::Invalid(
+                "convolution pad, stride, and dilation ranks must match",
+            ));
         }
         if stride.contains(&0) || dilation.contains(&0) {
-            return Err(Error::Invalid("convolution stride and dilation must be non-zero"));
+            return Err(Error::Invalid(
+                "convolution stride and dilation must be non-zero",
+            ));
         }
         sys::load()?;
         let mut pad_a = [0i32; MAX_DIMS];
@@ -549,7 +590,10 @@ impl ConvolutionDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Configures grouped convolution count (`group_count >= 1`).
@@ -579,7 +623,9 @@ impl ConvolutionDescriptor {
         filter: &FilterDescriptor,
     ) -> Result<[usize; 4]> {
         if !Arc::ptr_eq(&self.ctx, input.context()) || !Arc::ptr_eq(&self.ctx, filter.context()) {
-            return Err(Error::Invalid("descriptors belong to different CUDA contexts"));
+            return Err(Error::Invalid(
+                "descriptors belong to different CUDA contexts",
+            ));
         }
         let (mut n, mut c, mut h, mut w) = (0i32, 0i32, 0i32, 0i32);
         // SAFETY: all descriptors are live and out-pointers are valid stack integers.
@@ -661,8 +707,9 @@ impl ActivationDescriptor {
             sys::cudnnCreateActivationDescriptor(&mut raw)
         })?;
         // SAFETY: `raw` was initialized above.
-        let status =
-            unsafe { sys::cudnnSetActivationDescriptor(raw, mode.to_sys(), nan_prop.to_sys(), coef) };
+        let status = unsafe {
+            sys::cudnnSetActivationDescriptor(raw, mode.to_sys(), nan_prop.to_sys(), coef)
+        };
         if let Err(err) = check("cudnnSetActivationDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
@@ -670,7 +717,10 @@ impl ActivationDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Raw `cudnnActivationDescriptor_t`.
@@ -726,7 +776,9 @@ impl PoolingDescriptor {
 
         let mut raw: sys::cudnnPoolingDescriptor_t = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check("cudnnCreatePoolingDescriptor", unsafe { sys::cudnnCreatePoolingDescriptor(&mut raw) })?;
+        check("cudnnCreatePoolingDescriptor", unsafe {
+            sys::cudnnCreatePoolingDescriptor(&mut raw)
+        })?;
         // SAFETY: `raw` was initialized above.
         let status = unsafe {
             sys::cudnnSetPooling2dDescriptor(
@@ -748,7 +800,10 @@ impl PoolingDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Creates an N-dimensional pooling descriptor (`1..=6` spatial dimensions).
@@ -761,7 +816,9 @@ impl PoolingDescriptor {
         stride: &[usize],
     ) -> Result<Self> {
         if window.len() != pad.len() || window.len() != stride.len() {
-            return Err(Error::Invalid("pooling window, pad, and stride ranks must match"));
+            return Err(Error::Invalid(
+                "pooling window, pad, and stride ranks must match",
+            ));
         }
         if window.contains(&0) || stride.contains(&0) {
             return Err(Error::Invalid("pooling window and stride must be non-zero"));
@@ -776,7 +833,9 @@ impl PoolingDescriptor {
 
         let mut raw: sys::cudnnPoolingDescriptor_t = ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check("cudnnCreatePoolingDescriptor", unsafe { sys::cudnnCreatePoolingDescriptor(&mut raw) })?;
+        check("cudnnCreatePoolingDescriptor", unsafe {
+            sys::cudnnCreatePoolingDescriptor(&mut raw)
+        })?;
         // SAFETY: `raw` is live and all three arrays hold `rank` initialized `i32`s.
         let status = unsafe {
             sys::cudnnSetPoolingNdDescriptor(
@@ -796,13 +855,18 @@ impl PoolingDescriptor {
             }
             return Err(err);
         }
-        Ok(Self { raw, ctx: ctx.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Computes output `[N, C, H, W]` dimensions for a 2D pooling operation.
     pub fn output_dim_4d(&self, input: &TensorDescriptor) -> Result<[usize; 4]> {
         if !Arc::ptr_eq(&self.ctx, input.context()) {
-            return Err(Error::Invalid("pooling and input descriptors belong to different contexts"));
+            return Err(Error::Invalid(
+                "pooling and input descriptors belong to different contexts",
+            ));
         }
         let (mut n, mut c, mut h, mut w) = (0i32, 0i32, 0i32, 0i32);
         // SAFETY: descriptors are live and out-pointers point to stack integers.
@@ -853,7 +917,10 @@ mod tests {
         let mut out = [0i32; MAX_DIMS];
         assert!(copy_i32_dims(&[], &mut out, "dim").is_err());
         assert!(copy_i32_dims(&[1; MAX_DIMS + 1], &mut out, "dim").is_err());
-        assert_eq!(copy_i32_dims(&[1, 3, 224, 224], &mut out, "dim").unwrap(), 4);
+        assert_eq!(
+            copy_i32_dims(&[1, 3, 224, 224], &mut out, "dim").unwrap(),
+            4
+        );
         assert_eq!(out[..4], [1, 3, 224, 224]);
 
         assert_eq!(
@@ -864,6 +931,9 @@ mod tests {
             ActivationMode::Relu.to_sys(),
             sys::cudnnActivationMode_t_CUDNN_ACTIVATION_RELU
         );
-        assert_eq!(PoolingMode::Max.to_sys(), sys::cudnnPoolingMode_t_CUDNN_POOLING_MAX);
+        assert_eq!(
+            PoolingMode::Max.to_sys(),
+            sys::cudnnPoolingMode_t_CUDNN_POOLING_MAX
+        );
     }
 }

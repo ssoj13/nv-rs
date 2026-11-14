@@ -46,7 +46,9 @@ impl NvrtcStatus {
             return "unknown nvrtcResult";
         }
         // SAFETY: `ptr` is non-null and points to a static NUL-terminated string from NVRTC.
-        unsafe { CStr::from_ptr(ptr) }.to_str().unwrap_or("non-utf8 nvrtcResult")
+        unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap_or("non-utf8 nvrtcResult")
     }
 }
 
@@ -84,7 +86,11 @@ pub enum Error {
 }
 
 fn log_suffix(log: &str) -> String {
-    if log.is_empty() { String::new() } else { format!(":\n{log}") }
+    if log.is_empty() {
+        String::new()
+    } else {
+        format!(":\n{log}")
+    }
 }
 
 /// Result alias for this crate.
@@ -93,7 +99,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Ensures `nvrtc` is loaded so missing-DLL failures report [`Error::Unavailable`] rather than
 /// `NVRTC_ERROR_INTERNAL_ERROR`.
 pub(crate) fn ensure_loaded() -> Result<()> {
-    sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 /// Maps a raw `nvrtcResult` to [`Error::Status`].
@@ -101,7 +109,10 @@ pub(crate) fn check(call: &'static str, code: sys::nvrtcResult) -> Result<()> {
     if code == sys::nvrtcResult_NVRTC_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Status { call, code: NvrtcStatus(code) })
+        Err(Error::Status {
+            call,
+            code: NvrtcStatus(code),
+        })
     }
 }
 
@@ -110,7 +121,9 @@ pub fn version() -> Result<(i32, i32)> {
     ensure_loaded()?;
     let (mut major, mut minor) = (0i32, 0i32);
     // SAFETY: `major` and `minor` are valid stack out-pointers.
-    check("nvrtcVersion", unsafe { sys::nvrtcVersion(&mut major, &mut minor) })?;
+    check("nvrtcVersion", unsafe {
+        sys::nvrtcVersion(&mut major, &mut minor)
+    })?;
     Ok((major, minor))
 }
 
@@ -120,13 +133,17 @@ pub fn supported_archs() -> Result<Vec<i32>> {
     ensure_loaded()?;
     let mut count = 0i32;
     // SAFETY: `count` is a valid stack out-pointer.
-    check("nvrtcGetNumSupportedArchs", unsafe { sys::nvrtcGetNumSupportedArchs(&mut count) })?;
+    check("nvrtcGetNumSupportedArchs", unsafe {
+        sys::nvrtcGetNumSupportedArchs(&mut count)
+    })?;
     if count <= 0 {
         return Ok(Vec::new());
     }
     let mut archs = vec![0i32; count as usize];
     // SAFETY: `archs` has capacity `count` elements matching `nvrtcGetNumSupportedArchs`.
-    check("nvrtcGetSupportedArchs", unsafe { sys::nvrtcGetSupportedArchs(archs.as_mut_ptr()) })?;
+    check("nvrtcGetSupportedArchs", unsafe {
+        sys::nvrtcGetSupportedArchs(archs.as_mut_ptr())
+    })?;
     Ok(archs)
 }
 
@@ -137,12 +154,18 @@ mod tests {
     #[test]
     fn status_display_and_error_formatting() {
         let code = NvrtcStatus(6);
-        let err = Error::Compilation { code, log: "error: expected ';'".to_owned() };
+        let err = Error::Compilation {
+            code,
+            log: "error: expected ';'".to_owned(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("6"));
         assert!(msg.contains("error: expected ';'"));
 
-        let empty_err = Error::Compilation { code, log: String::new() };
+        let empty_err = Error::Compilation {
+            code,
+            log: String::new(),
+        };
         assert!(!empty_err.to_string().ends_with('\n'));
     }
 

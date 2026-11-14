@@ -17,7 +17,9 @@ use cuda_core::{Context, DeviceBufferView, Event, PinnedHostBuffer, Stream};
 use crate::check_status;
 #[cfg(target_os = "linux")]
 use crate::record_teardown_cufile;
-use crate::{decode_io_ret, record_teardown_driver_err, DeviceSpan, DeviceSpanMut, Error, IoMode, Result};
+use crate::{
+    DeviceSpan, DeviceSpanMut, Error, IoMode, Result, decode_io_ret, record_teardown_driver_err,
+};
 
 /// Properties returned by `cuFileDriverGetProperties` (`CUfileDrvProps_t`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,7 +125,10 @@ impl DriverSession {
             // SAFETY: `cufile_sys` is loaded and takes no pointer inputs.
             let status = unsafe { cufile_sys::cuFileDriverOpen() };
             check_status("cuFileDriverOpen", status)?;
-            Ok(Self { ctx: ctx.clone(), active: true })
+            Ok(Self {
+                ctx: ctx.clone(),
+                active: true,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -161,7 +166,9 @@ impl DriverSession {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Err(Error::Unsupported("cuFileDriverGetProperties requires Linux"))
+            Err(Error::Unsupported(
+                "cuFileDriverGetProperties requires Linux",
+            ))
         }
     }
 
@@ -240,7 +247,9 @@ impl<B: DeviceSpan> RegisteredBuffer<B> {
         let len = buf.num_bytes();
         let ctx = buf.context().clone();
         if ptr == 0 || len == 0 {
-            return Err(Error::Invalid("cannot register null or zero-length device buffer with cuFile"));
+            return Err(Error::Invalid(
+                "cannot register null or zero-length device buffer with cuFile",
+            ));
         }
         ctx.bind_to_thread()?;
 
@@ -254,7 +263,13 @@ impl<B: DeviceSpan> RegisteredBuffer<B> {
                 cufile_sys::cuFileBufRegister((ptr as usize) as *const c_void, len, c_flags)
             };
             check_status("cuFileBufRegister", status)?;
-            Ok(Arc::new(Self { inner: Some(buf), ptr, len, ctx, registered: true }))
+            Ok(Arc::new(Self {
+                inner: Some(buf),
+                ptr,
+                len,
+                ctx,
+                registered: true,
+            }))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -265,22 +280,29 @@ impl<B: DeviceSpan> RegisteredBuffer<B> {
 
     /// Borrows the underlying buffer.
     pub fn inner(&self) -> Result<&B> {
-        self.inner.as_ref().ok_or(Error::Invalid("registered buffer already consumed"))
+        self.inner
+            .as_ref()
+            .ok_or(Error::Invalid("registered buffer already consumed"))
     }
 
     /// Mutably borrows the underlying buffer when exclusively held.
     pub fn inner_mut(&mut self) -> Result<&mut B> {
-        self.inner.as_mut().ok_or(Error::Invalid("registered buffer already consumed"))
+        self.inner
+            .as_mut()
+            .ok_or(Error::Invalid("registered buffer already consumed"))
     }
 
     /// Explicitly deregisters the memory region (`cuFileBufDeregister`) and returns `B`.
     ///
     /// Fails with [`Error::Invalid`] if an async I/O operation still pins this buffer.
     pub fn deregister(this: Arc<Self>) -> Result<B> {
-        let mut this = Arc::try_unwrap(this)
-            .map_err(|_| Error::Invalid("registered buffer still referenced by in-flight async I/O"))?;
+        let mut this = Arc::try_unwrap(this).map_err(|_| {
+            Error::Invalid("registered buffer still referenced by in-flight async I/O")
+        })?;
         this.deregister_raw()?;
-        this.inner.take().ok_or(Error::Invalid("registered buffer already consumed"))
+        this.inner
+            .take()
+            .ok_or(Error::Invalid("registered buffer already consumed"))
     }
 
     fn deregister_raw(&mut self) -> Result<()> {
@@ -293,7 +315,8 @@ impl<B: DeviceSpan> RegisteredBuffer<B> {
         {
             // SAFETY: `self.ptr` was previously registered with `cuFileBufRegister` and `self.inner`
             // is still alive until after this call completes.
-            let status = unsafe { cufile_sys::cuFileBufDeregister((self.ptr as usize) as *const c_void) };
+            let status =
+                unsafe { cufile_sys::cuFileBufDeregister((self.ptr as usize) as *const c_void) };
             check_status("cuFileBufDeregister", status)?;
         }
         Ok(())
@@ -351,9 +374,13 @@ impl RegisteredStream {
         {
             cufile_sys::load()?;
             // SAFETY: `stream.cu_stream()` is a valid CUDA stream owned by `Arc<Stream>`.
-            let status = unsafe { cufile_sys::cuFileStreamRegister(stream.cu_stream(), flags.bits()) };
+            let status =
+                unsafe { cufile_sys::cuFileStreamRegister(stream.cu_stream(), flags.bits()) };
             check_status("cuFileStreamRegister", status)?;
-            Ok(Self { stream: stream.clone(), registered: true })
+            Ok(Self {
+                stream: stream.clone(),
+                registered: true,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -447,7 +474,12 @@ impl AsyncIoSlot {
         let fence = ctx.new_event_with_flags(None)?;
         Ok(Self {
             ctx: ctx.clone(),
-            params: Box::new(AsyncParams { size: 0, file_offset: 0, buf_offset: 0, bytes_transferred: 0 }),
+            params: Box::new(AsyncParams {
+                size: 0,
+                file_offset: 0,
+                buf_offset: 0,
+                bytes_transferred: 0,
+            }),
             fence,
             fence_armed: false,
             pending_call: None,
@@ -481,9 +513,9 @@ impl AsyncIoSlot {
             let cap = len.max(4096);
             self.staging = Some(PinnedHostBuffer::zeroed(&self.ctx, cap)?);
         }
-        self.staging
-            .as_mut()
-            .ok_or(Error::Invalid("pinned staging buffer missing after allocation"))
+        self.staging.as_mut().ok_or(Error::Invalid(
+            "pinned staging buffer missing after allocation",
+        ))
     }
 
     /// Non-blocking check for async operation completion; returns `Ok(None)` while still in flight.
@@ -499,17 +531,19 @@ impl AsyncIoSlot {
     /// transferred byte count (or surfaces any deferred GDS / OS error).
     pub fn wait(&mut self) -> Result<usize> {
         self.wait_fence_if_armed()?;
-        self.harvest_result()?.ok_or(Error::Invalid("no async I/O operation pending in slot"))
+        self.harvest_result()?
+            .ok_or(Error::Invalid("no async I/O operation pending in slot"))
     }
 
     fn harvest_result(&mut self) -> Result<Option<usize>> {
         if let Some(pw) = self.pending_posix_write.take() {
             let pins = self.in_flight.take();
-            let fh = pins.ok_or(Error::Invalid("missing FileHandle pin for pending async write"))?;
-            let staging = self
-                .staging
-                .as_ref()
-                .ok_or(Error::Invalid("missing staging buffer for pending async write"))?;
+            let fh = pins.ok_or(Error::Invalid(
+                "missing FileHandle pin for pending async write",
+            ))?;
+            let staging = self.staging.as_ref().ok_or(Error::Invalid(
+                "missing staging buffer for pending async write",
+            ))?;
             let n = posix_write_at(&fh.fh.file, pw.file_offset, &staging.as_slice()[..pw.len])?;
             self.pending_call = None;
             return Ok(Some(n));
@@ -540,10 +574,7 @@ impl Drop for AsyncIoSlot {
             && let Err(_io_err) =
                 posix_write_at(&pins.fh.file, pw.file_offset, &staging.as_slice()[..pw.len])
         {
-            record_teardown_driver_err(
-                &self.ctx,
-                cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-            );
+            record_teardown_driver_err(&self.ctx, cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN);
         }
         self.in_flight = None;
     }
@@ -667,7 +698,9 @@ impl FileHandle {
         len: usize,
     ) -> Result<(i64, i64)> {
         if !Arc::ptr_eq(buf.context(), &self.ctx) {
-            return Err(Error::Invalid("device buffer belongs to a different CUDA context"));
+            return Err(Error::Invalid(
+                "device buffer belongs to a different CUDA context",
+            ));
         }
         let end = buf_offset
             .checked_add(len)
@@ -675,10 +708,10 @@ impl FileHandle {
         if end > buf.num_bytes() {
             return Err(Error::Invalid("transfer range exceeds device buffer size"));
         }
-        let file_off =
-            i64::try_from(file_offset).map_err(|_| Error::Invalid("file_offset exceeds off_t range"))?;
-        let buf_off =
-            i64::try_from(buf_offset).map_err(|_| Error::Invalid("buf_offset exceeds off_t range"))?;
+        let file_off = i64::try_from(file_offset)
+            .map_err(|_| Error::Invalid("file_offset exceeds off_t range"))?;
+        let buf_off = i64::try_from(buf_offset)
+            .map_err(|_| Error::Invalid("buf_offset exceeds off_t range"))?;
         Ok((file_off, buf_off))
     }
 
@@ -699,9 +732,9 @@ impl FileHandle {
             let cap = len.max(4096);
             *guard = Some(PinnedHostBuffer::zeroed(&self.ctx, cap)?);
         }
-        let buf = guard
-            .as_mut()
-            .ok_or(Error::Invalid("pinned staging buffer missing after allocation"))?;
+        let buf = guard.as_mut().ok_or(Error::Invalid(
+            "pinned staging buffer missing after allocation",
+        ))?;
         f(buf)
     }
 
@@ -723,7 +756,9 @@ impl FileHandle {
             IoMode::GdsOnly => {
                 #[cfg(target_os = "linux")]
                 {
-                    let raw = self.raw.ok_or(Error::Invalid("cuFile handle already deregistered"))?;
+                    let raw = self
+                        .raw
+                        .ok_or(Error::Invalid("cuFile handle already deregistered"))?;
                     // SAFETY: `raw` is registered and `buf_off..buf_off+len` is within `dst`.
                     let ret = unsafe {
                         cufile_sys::cuFileRead(
@@ -749,10 +784,13 @@ impl FileHandle {
                     .checked_add(buf_offset as u64)
                     .ok_or(Error::Invalid("device pointer offset overflow"))?;
                 self.with_sync_staging(len, |staging| {
-                    let n = posix_read_at(&self.file, file_offset, &mut staging.as_mut_slice()[..len])?;
+                    let n =
+                        posix_read_at(&self.file, file_offset, &mut staging.as_mut_slice()[..len])?;
                     if n > 0 {
                         // SAFETY: `dst_ptr..dst_ptr+n` is inside `dst` and `staging` holds `n` initialized bytes.
-                        unsafe { cuda_core::memory::memcpy_htod_sync(dst_ptr, staging.as_ptr(), n)? };
+                        unsafe {
+                            cuda_core::memory::memcpy_htod_sync(dst_ptr, staging.as_ptr(), n)?
+                        };
                     }
                     Ok(n)
                 })
@@ -778,7 +816,9 @@ impl FileHandle {
             IoMode::GdsOnly => {
                 #[cfg(target_os = "linux")]
                 {
-                    let raw = self.raw.ok_or(Error::Invalid("cuFile handle already deregistered"))?;
+                    let raw = self
+                        .raw
+                        .ok_or(Error::Invalid("cuFile handle already deregistered"))?;
                     // SAFETY: `raw` is registered and `buf_off..buf_off+len` is within `src`.
                     let ret = unsafe {
                         cufile_sys::cuFileWrite(
@@ -812,7 +852,11 @@ impl FileHandle {
                             len,
                         ))?;
                     }
-                    Ok(posix_write_at(&self.file, file_offset, &staging.as_slice()[..len])?)
+                    Ok(posix_write_at(
+                        &self.file,
+                        file_offset,
+                        &staging.as_slice()[..len],
+                    )?)
                 })
             }
         }
@@ -834,9 +878,12 @@ impl FileHandle {
             return Err(Error::Invalid("stream belongs to a different CUDA context"));
         }
         if !Arc::ptr_eq(&slot.ctx, &self.ctx) {
-            return Err(Error::Invalid("AsyncIoSlot belongs to a different CUDA context"));
+            return Err(Error::Invalid(
+                "AsyncIoSlot belongs to a different CUDA context",
+            ));
         }
-        let (file_off, buf_off) = self.validate_transfer(file_offset, dst.as_ref(), buf_offset, len)?;
+        let (file_off, buf_off) =
+            self.validate_transfer(file_offset, dst.as_ref(), buf_offset, len)?;
         slot.finish_prior_before_reuse()?;
 
         if len == 0 {
@@ -849,7 +896,9 @@ impl FileHandle {
             IoMode::GdsOnly => {
                 #[cfg(target_os = "linux")]
                 {
-                    let raw = self.raw.ok_or(Error::Invalid("cuFile handle already deregistered"))?;
+                    let raw = self
+                        .raw
+                        .ok_or(Error::Invalid("cuFile handle already deregistered"))?;
                     slot.params.size = len;
                     slot.params.file_offset = file_off;
                     slot.params.buf_offset = buf_off;
@@ -937,9 +986,12 @@ impl FileHandle {
             return Err(Error::Invalid("stream belongs to a different CUDA context"));
         }
         if !Arc::ptr_eq(&slot.ctx, &self.ctx) {
-            return Err(Error::Invalid("AsyncIoSlot belongs to a different CUDA context"));
+            return Err(Error::Invalid(
+                "AsyncIoSlot belongs to a different CUDA context",
+            ));
         }
-        let (file_off, buf_off) = self.validate_transfer(file_offset, src.as_ref(), buf_offset, len)?;
+        let (file_off, buf_off) =
+            self.validate_transfer(file_offset, src.as_ref(), buf_offset, len)?;
         slot.finish_prior_before_reuse()?;
 
         if len == 0 {
@@ -952,7 +1004,9 @@ impl FileHandle {
             IoMode::GdsOnly => {
                 #[cfg(target_os = "linux")]
                 {
-                    let raw = self.raw.ok_or(Error::Invalid("cuFile handle already deregistered"))?;
+                    let raw = self
+                        .raw
+                        .ok_or(Error::Invalid("cuFile handle already deregistered"))?;
                     slot.params.size = len;
                     slot.params.file_offset = file_off;
                     slot.params.buf_offset = buf_off;
@@ -1028,7 +1082,10 @@ impl Drop for FileHandle {
             }
             // SAFETY: `raw` was opened via `cuFileHandleRegister` and `self.file` is still live.
             if let Err(_err) = unsafe { cufile_sys::cuFileHandleDeregister(raw) } {
-                record_teardown_driver_err(&self.ctx, cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN);
+                record_teardown_driver_err(
+                    &self.ctx,
+                    cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                );
             }
         }
     }

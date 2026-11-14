@@ -56,7 +56,8 @@ impl Status {
     /// `CUSOLVER_STATUS_INTERNAL_ERROR`.
     pub const INTERNAL_ERROR: Self = Self(sys::cusolverStatus_t_CUSOLVER_STATUS_INTERNAL_ERROR);
     /// `CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED`.
-    pub const MATRIX_TYPE_NOT_SUPPORTED: Self = Self(sys::cusolverStatus_t_CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED);
+    pub const MATRIX_TYPE_NOT_SUPPORTED: Self =
+        Self(sys::cusolverStatus_t_CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED);
     /// `CUSOLVER_STATUS_NOT_SUPPORTED`.
     pub const NOT_SUPPORTED: Self = Self(sys::cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED);
     /// `CUSOLVER_STATUS_ZERO_PIVOT`.
@@ -64,7 +65,8 @@ impl Status {
     /// `CUSOLVER_STATUS_INVALID_LICENSE`.
     pub const INVALID_LICENSE: Self = Self(sys::cusolverStatus_t_CUSOLVER_STATUS_INVALID_LICENSE);
     /// `CUSOLVER_STATUS_INVALID_WORKSPACE`.
-    pub const INVALID_WORKSPACE: Self = Self(sys::cusolverStatus_t_CUSOLVER_STATUS_INVALID_WORKSPACE);
+    pub const INVALID_WORKSPACE: Self =
+        Self(sys::cusolverStatus_t_CUSOLVER_STATUS_INVALID_WORKSPACE);
 
     /// Static human-readable name for known cuSOLVER status codes.
     pub const fn name(self) -> &'static str {
@@ -77,7 +79,9 @@ impl Status {
             x if x == Self::MAPPING_ERROR.0 => "CUSOLVER_STATUS_MAPPING_ERROR",
             x if x == Self::EXECUTION_FAILED.0 => "CUSOLVER_STATUS_EXECUTION_FAILED",
             x if x == Self::INTERNAL_ERROR.0 => "CUSOLVER_STATUS_INTERNAL_ERROR",
-            x if x == Self::MATRIX_TYPE_NOT_SUPPORTED.0 => "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED",
+            x if x == Self::MATRIX_TYPE_NOT_SUPPORTED.0 => {
+                "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED"
+            }
             x if x == Self::NOT_SUPPORTED.0 => "CUSOLVER_STATUS_NOT_SUPPORTED",
             x if x == Self::ZERO_PIVOT.0 => "CUSOLVER_STATUS_ZERO_PIVOT",
             x if x == Self::INVALID_LICENSE.0 => "CUSOLVER_STATUS_INVALID_LICENSE",
@@ -149,18 +153,25 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn ensure_loaded() -> Result<()> {
-    sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 pub(crate) fn ensure_mg_loaded() -> Result<()> {
-    mg_sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    mg_sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 pub(crate) fn check(call: &'static str, code: sys::cusolverStatus_t) -> Result<()> {
     if code == sys::cusolverStatus_t_CUSOLVER_STATUS_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Status { call, code: Status(code) })
+        Err(Error::Status {
+            call,
+            code: Status(code),
+        })
     }
 }
 
@@ -168,20 +179,29 @@ pub(crate) fn check_mg(call: &'static str, code: mg_sys::cusolverStatus_t) -> Re
     if code == mg_sys::cusolverStatus_t_CUSOLVER_STATUS_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Status { call, code: Status(code) })
+        Err(Error::Status {
+            call,
+            code: Status(code),
+        })
     }
 }
 
 /// Runs a cuSOLVER teardown call with `ctx` current; failures are recorded on `ctx` instead of
 /// panicking in `Drop`.
-pub(crate) fn teardown(ctx: &Context, call: &'static str, f: impl FnOnce() -> sys::cusolverStatus_t) {
+pub(crate) fn teardown(
+    ctx: &Context,
+    call: &'static str,
+    f: impl FnOnce() -> sys::cusolverStatus_t,
+) {
     if let Err(e) = ctx.bind_to_thread() {
         ctx.record_err(Err::<(), _>(e));
         return;
     }
     if let Err(e) = check(call, f()) {
         let _ = e;
-        ctx.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+        ctx.record_err(Err::<(), _>(DriverError(
+            cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+        )));
     }
 }
 
@@ -268,7 +288,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty scratch workspace for solver calls on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buffer: None }
+        Self {
+            stream: stream.clone(),
+            buffer: None,
+        }
     }
 
     /// Current capacity in bytes.
@@ -284,30 +307,56 @@ impl Scratch {
     /// Reserves at least `required` bytes without exceeding `budget`.
     ///
     /// Verifies that `stream` matches the stream this scratch buffer was created for.
-    pub fn reserve_bytes(&mut self, stream: &Stream, required: usize, budget: usize) -> Result<(*mut c_void, usize)> {
-        if stream.cu_stream() != self.stream.cu_stream() || !Arc::ptr_eq(stream.context(), self.stream.context()) {
-            return Err(Error::InvalidInput("scratch used on a different stream than it was created for"));
+    pub fn reserve_bytes(
+        &mut self,
+        stream: &Stream,
+        required: usize,
+        budget: usize,
+    ) -> Result<(*mut c_void, usize)> {
+        if stream.cu_stream() != self.stream.cu_stream()
+            || !Arc::ptr_eq(stream.context(), self.stream.context())
+        {
+            return Err(Error::InvalidInput(
+                "scratch used on a different stream than it was created for",
+            ));
         }
         if required > budget {
-            return Err(Error::Budget { requested: required, available: budget });
+            return Err(Error::Budget {
+                requested: required,
+                available: budget,
+            });
         }
         if required == 0 {
-            let ptr = self.buffer.as_ref().map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
+            let ptr = self
+                .buffer
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
             return Ok((ptr, self.capacity()));
         }
         if self.capacity() < required {
             self.buffer = None;
             // SAFETY: `required > 0`; `self.stream` matches `stream`; cuSOLVER writes workspace before reading it.
-            self.buffer = Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
+            self.buffer =
+                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
         }
-        let buf = self.buffer.as_ref().ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
+        let buf = self
+            .buffer
+            .as_ref()
+            .ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
         Ok((buf.cu_deviceptr() as *mut c_void, buf.len()))
     }
 
     /// Reserves workspace for `lwork` elements of `T` without exceeding `budget` bytes.
-    pub fn reserve_elements<T>(&mut self, stream: &Stream, lwork: i32, budget: usize) -> Result<(*mut T, i32)> {
+    pub fn reserve_elements<T>(
+        &mut self,
+        stream: &Stream,
+        lwork: i32,
+        budget: usize,
+    ) -> Result<(*mut T, i32)> {
         if lwork < 0 {
-            return Err(Error::InvalidInput("cuSOLVER reported negative workspace element count"));
+            return Err(Error::InvalidInput(
+                "cuSOLVER reported negative workspace element count",
+            ));
         }
         let bytes = (lwork as usize)
             .checked_mul(std::mem::size_of::<T>())
@@ -328,12 +377,18 @@ mod tests {
         assert_eq!(s, s2);
         assert_eq!(s.name(), "CUSOLVER_STATUS_UNKNOWN");
         assert_eq!(Status::SUCCESS.name(), "CUSOLVER_STATUS_SUCCESS");
-        assert_eq!(Status::INVALID_WORKSPACE.name(), "CUSOLVER_STATUS_INVALID_WORKSPACE");
+        assert_eq!(
+            Status::INVALID_WORKSPACE.name(),
+            "CUSOLVER_STATUS_INVALID_WORKSPACE"
+        );
     }
 
     #[test]
     fn budget_error_formats_requested_and_available() {
-        let err = Error::Budget { requested: 8192, available: 2048 };
+        let err = Error::Budget {
+            requested: 8192,
+            available: 2048,
+        };
         let msg = err.to_string();
         assert!(msg.contains("8192") && msg.contains("2048"), "{msg}");
     }

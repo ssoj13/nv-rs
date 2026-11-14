@@ -119,7 +119,10 @@ impl TextureDesc {
 }
 
 /// What a texture reads from (kept alive by the texture).
-#[expect(dead_code, reason = "held only to keep the storage alive while the texture handle exists")]
+#[expect(
+    dead_code,
+    reason = "held only to keep the storage alive while the texture handle exists"
+)]
 enum Source {
     Array(Arc<Array>),
     Mipmapped(Arc<MipmappedArray>),
@@ -146,16 +149,29 @@ impl TextureObject {
         let mut res: sys::CUDA_RESOURCE_DESC = unsafe { std::mem::zeroed() };
         res.resType = sys::CUresourcetype_enum_CU_RESOURCE_TYPE_ARRAY;
         res.res.array.hArray = array.cu_array();
-        Self::create(array.context(), &res, desc.to_sys(1), Source::Array(array.clone()))
+        Self::create(
+            array.context(),
+            &res,
+            desc.to_sys(1),
+            Source::Array(array.clone()),
+        )
     }
 
     /// A texture over every level of a mipmapped array.
-    pub fn from_mipmapped(array: &Arc<MipmappedArray>, desc: TextureDesc) -> Result<Self, DriverError> {
+    pub fn from_mipmapped(
+        array: &Arc<MipmappedArray>,
+        desc: TextureDesc,
+    ) -> Result<Self, DriverError> {
         // SAFETY: zeroed resource descriptor, then the mipmapped array.
         let mut res: sys::CUDA_RESOURCE_DESC = unsafe { std::mem::zeroed() };
         res.resType = sys::CUresourcetype_enum_CU_RESOURCE_TYPE_MIPMAPPED_ARRAY;
         res.res.mipmap.hMipmappedArray = array.cu_mipmapped_array();
-        Self::create(array.context(), &res, desc.to_sys(array.levels()), Source::Mipmapped(array.clone()))
+        Self::create(
+            array.context(),
+            &res,
+            desc.to_sys(array.levels()),
+            Source::Mipmapped(array.clone()),
+        )
     }
 
     /// A 2D texture over a pitched device buffer (`pitch_bytes` per row; the driver requires the
@@ -170,7 +186,12 @@ impl TextureObject {
         desc: TextureDesc,
     ) -> Result<Self, DriverError> {
         let row = width * format.bytes() * channels as usize;
-        if !matches!(channels, 1 | 2 | 4) || pitch_bytes < row || pitch_bytes.checked_mul(height).is_none_or(|n| n > buffer.len_bytes()) {
+        if !matches!(channels, 1 | 2 | 4)
+            || pitch_bytes < row
+            || pitch_bytes
+                .checked_mul(height)
+                .is_none_or(|n| n > buffer.len_bytes())
+        {
             return Err(invalid_value());
         }
         // SAFETY: zeroed resource descriptor, then the pitched range checked above.
@@ -182,14 +203,24 @@ impl TextureObject {
         res.res.pitch2D.width = width;
         res.res.pitch2D.height = height;
         res.res.pitch2D.pitchInBytes = pitch_bytes;
-        Self::create(buffer.context(), &res, desc.to_sys(1), Source::Pitched(buffer.clone()))
+        Self::create(
+            buffer.context(),
+            &res,
+            desc.to_sys(1),
+            Source::Pitched(buffer.clone()),
+        )
     }
 
     /// A 1D texture over a whole linear device buffer (`CU_RESOURCE_TYPE_LINEAR`), read with
     /// `tex1Dfetch` (integer texel index; no filtering, no normalized coordinates, no mipmaps).
     /// The buffer must hold a whole number of `format` x `channels` elements, at most the
     /// device's `MAXIMUM_TEXTURE1D_LINEAR_WIDTH`, and start on its `TEXTURE_ALIGNMENT`.
-    pub fn from_linear(buffer: &RawDeviceBuffer, format: ArrayFormat, channels: u32, desc: TextureDesc) -> Result<Self, DriverError> {
+    pub fn from_linear(
+        buffer: &RawDeviceBuffer,
+        format: ArrayFormat,
+        channels: u32,
+        desc: TextureDesc,
+    ) -> Result<Self, DriverError> {
         let elem = format.bytes() * channels as usize;
         let ctx = buffer.context();
         let attr = |a| -> Result<u64, DriverError> {
@@ -199,12 +230,18 @@ impl TextureObject {
             unsafe { sys::cuDeviceGetAttribute(&mut v, a, ctx.cu_device()) }.result()?;
             u64::try_from(v).map_err(|_| invalid_value())
         };
-        let max = attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LINEAR_WIDTH)?;
-        let align = attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT)?.max(1);
-        if !matches!(channels, 1 | 2 | 4) || buffer.len_bytes() == 0 || !buffer.len_bytes().is_multiple_of(elem) {
+        let max =
+            attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_LINEAR_WIDTH)?;
+        let align =
+            attr(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT)?.max(1);
+        if !matches!(channels, 1 | 2 | 4)
+            || buffer.len_bytes() == 0
+            || !buffer.len_bytes().is_multiple_of(elem)
+        {
             return Err(invalid_value());
         }
-        if (buffer.len_bytes() / elem) as u64 > max || !buffer.cu_deviceptr().is_multiple_of(align) {
+        if (buffer.len_bytes() / elem) as u64 > max || !buffer.cu_deviceptr().is_multiple_of(align)
+        {
             return Err(invalid_value());
         }
         // Linear textures take only element fetches: normalized coordinates and filtering do not
@@ -222,12 +259,21 @@ impl TextureObject {
         Self::create(ctx, &res, desc.to_sys(1), Source::Linear(buffer.clone()))
     }
 
-    fn create(ctx: &Arc<Context>, res: &sys::CUDA_RESOURCE_DESC, tex: sys::CUDA_TEXTURE_DESC, source: Source) -> Result<Self, DriverError> {
+    fn create(
+        ctx: &Arc<Context>,
+        res: &sys::CUDA_RESOURCE_DESC,
+        tex: sys::CUDA_TEXTURE_DESC,
+        source: Source,
+    ) -> Result<Self, DriverError> {
         ctx.bind_to_thread()?;
         let mut raw: sys::CUtexObject = 0;
         // SAFETY: valid descriptors; no resource view; the storage is kept alive by `source`.
         unsafe { sys::cuTexObjectCreate(&mut raw, res, &tex, std::ptr::null()) }.result()?;
-        Ok(Self { raw, ctx: ctx.clone(), _source: source })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            _source: source,
+        })
     }
 
     /// The handle a kernel receives.
@@ -271,7 +317,11 @@ impl SurfaceObject {
         let mut raw: sys::CUsurfObject = 0;
         // SAFETY: valid descriptor; the array is kept alive by `_array`.
         unsafe { sys::cuSurfObjectCreate(&mut raw, &res) }.result()?;
-        Ok(Self { raw, ctx: ctx.clone(), _array: array.clone() })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            _array: array.clone(),
+        })
     }
 
     /// The handle a kernel receives.

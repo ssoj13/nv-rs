@@ -51,7 +51,9 @@ impl CuptiStatus {
             return "unknown CUptiResult";
         }
         // SAFETY: `ptr` is non-null and points to a static NUL-terminated string from CUPTI.
-        unsafe { CStr::from_ptr(ptr) }.to_str().unwrap_or("non-utf8 CUptiResult")
+        unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap_or("non-utf8 CUptiResult")
     }
 }
 
@@ -90,14 +92,19 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) fn ensure_loaded() -> Result<()> {
-    sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 pub(crate) fn check(call: &'static str, code: sys::CUptiResult) -> Result<()> {
     if code == sys::CUptiResult_CUPTI_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Status { call, code: CuptiStatus(code) })
+        Err(Error::Status {
+            call,
+            code: CuptiStatus(code),
+        })
     }
 }
 

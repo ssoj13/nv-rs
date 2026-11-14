@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use cuda_core::Context;
-use cuda_ext::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
+use cuda_core_ext::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
 use wgpu::hal::api::Vulkan;
@@ -285,10 +285,9 @@ where
     let child: Direct3D12::ID3D12DeviceChild =
         object.cast().map_err(|e| Error::dx12(call_name, e))?;
     // SAFETY: `child` belongs to `raw_device` and was created with a `SHARED` heap/fence flag.
-    let handle: HANDLE = unsafe {
-        raw_device.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
-    }
-    .map_err(|e| Error::dx12("ID3D12Device::CreateSharedHandle", e))?;
+    let handle: HANDLE =
+        unsafe { raw_device.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null()) }
+            .map_err(|e| Error::dx12("ID3D12Device::CreateSharedHandle", e))?;
     ExportedHandle::from_raw_win32(handle.0, "ID3D12Device::CreateSharedHandle")
 }
 
@@ -385,7 +384,8 @@ pub(crate) fn map_vk_image_usage(usage: wgpu::TextureUsages) -> vk::ImageUsageFl
     if usage.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
         flags |= vk::ImageUsageFlags::SAMPLED;
     }
-    if usage.intersects(wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::STORAGE_ATOMIC) {
+    if usage.intersects(wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::STORAGE_ATOMIC)
+    {
         flags |= vk::ImageUsageFlags::STORAGE;
     }
     if usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
@@ -436,9 +436,11 @@ pub(crate) fn with_vk_queue<F, R>(queue: &wgpu::Queue, f: F) -> Result<R>
 where
     F: FnOnce(vk::Queue) -> Result<R>,
 {
-    let _guard = VK_QUEUE_SUBMIT_LOCK.lock().map_err(|_| Error::InvalidHandle {
-        source_api: "VK_QUEUE_SUBMIT_LOCK mutex poisoned",
-    })?;
+    let _guard = VK_QUEUE_SUBMIT_LOCK
+        .lock()
+        .map_err(|_| Error::InvalidHandle {
+            source_api: "VK_QUEUE_SUBMIT_LOCK mutex poisoned",
+        })?;
     // SAFETY: Inspects Vulkan HAL queue handle; caller serializes against external `wgpu::Queue::submit`.
     let hal_q = unsafe { queue.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
         expected: "Vulkan",
@@ -589,10 +591,9 @@ impl VkBarrierRunner {
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer),
     {
-        let mut guard = self
-            .slots
-            .lock()
-            .map_err(|_| Error::InvalidHandle { source_api: "VkBarrierRunner mutex poisoned" })?;
+        let mut guard = self.slots.lock().map_err(|_| Error::InvalidHandle {
+            source_api: "VkBarrierRunner mutex poisoned",
+        })?;
 
         let mut chosen = None;
         for (idx, slot) in guard.iter().enumerate() {
@@ -612,8 +613,8 @@ impl VkBarrierRunner {
         };
         let (slot_cmd, slot_fence) = (guard[idx].cmd, guard[idx].fence);
 
-        let begin_info =
-            vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: `slot_fence` is signaled (retired on GPU) and `guard` serializes pool/cmd access.
         unsafe {
             self.device
@@ -686,7 +687,9 @@ impl Drop for VkBarrierRunner {
                             u64::MAX,
                         )
                     {
-                        eprintln!("nv-wgpu: vkWaitForFences during VkBarrierRunner::drop failed: {err:?}");
+                        eprintln!(
+                            "nv-wgpu: vkWaitForFences during VkBarrierRunner::drop failed: {err:?}"
+                        );
                     }
                     self.device.destroy_fence(slot.fence, None);
                 }

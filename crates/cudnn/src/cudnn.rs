@@ -26,13 +26,13 @@ use thiserror::Error;
 
 pub use descriptor::{
     ActivationDescriptor, ActivationMode, ConvFwdAlgo, ConvMode, ConvolutionDescriptor,
-    FilterDescriptor, MathType, PoolingDescriptor, PoolingMode, TensorDescriptor, MAX_DIMS,
+    FilterDescriptor, MAX_DIMS, MathType, PoolingDescriptor, PoolingMode, TensorDescriptor,
 };
 pub use handle::Handle;
 pub use ops::{
-    batch_norm_forward_inference, conv_forward, conv_forward_workspace_size,
-    derive_bn_tensor_desc, activation_forward, pooling_forward, softmax_forward, BatchNormMode,
-    SoftmaxAlgo, SoftmaxMode,
+    BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward, batch_norm_forward_inference,
+    conv_forward, conv_forward_workspace_size, derive_bn_tensor_desc, pooling_forward,
+    softmax_forward,
 };
 pub use scratch::Scratch;
 
@@ -142,7 +142,9 @@ pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
 /// Verifies `stream` matches `expected` stream identity.
 pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Result<()> {
     if !Arc::ptr_eq(stream, expected) {
-        return Err(Error::Invalid("scratch workspace belongs to a different CUDA stream"));
+        return Err(Error::Invalid(
+            "scratch workspace belongs to a different CUDA stream",
+        ));
     }
     Ok(())
 }
@@ -150,7 +152,10 @@ pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Resul
 /// Rejects an allocation growth or peak byte count above `budget`.
 pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
     match budget {
-        Some(available) if peak > available => Err(Error::Budget { requested: peak, available }),
+        Some(available) if peak > available => Err(Error::Budget {
+            requested: peak,
+            available,
+        }),
         _ => Ok(()),
     }
 }
@@ -346,7 +351,13 @@ mod tests {
 
         assert!(check("noop", sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS).is_ok());
         let err = check("cudnnCreate", sys::cudnnStatus_t_CUDNN_STATUS_BAD_PARAM).unwrap_err();
-        assert!(matches!(err, Error::Status { call: "cudnnCreate", code: CudnnStatus::BAD_PARAM }));
+        assert!(matches!(
+            err,
+            Error::Status {
+                call: "cudnnCreate",
+                code: CudnnStatus::BAD_PARAM
+            }
+        ));
 
         for (dt, bytes) in [
             (DataType::F32, 4usize),
@@ -369,7 +380,13 @@ mod tests {
         assert!(within(None, usize::MAX).is_ok());
         assert!(within(Some(1024), 1024).is_ok());
         let err = within(Some(1024), 1025).unwrap_err();
-        assert!(matches!(err, Error::Budget { requested: 1025, available: 1024 }));
+        assert!(matches!(
+            err,
+            Error::Budget {
+                requested: 1025,
+                available: 1024
+            }
+        ));
 
         assert_eq!(checked_i32(42, "dim").unwrap(), 42);
         assert!(checked_i32(usize::MAX, "dim").is_err());
@@ -384,8 +401,12 @@ mod tests {
         handle.set_stream(&stream).unwrap();
 
         // 1x1x3x3 input, 1x1x2x2 ones filter -> 1x1x2x2 output; ReLU clamps negatives.
-        let x_desc = TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, [1, 1, 3, 3]).unwrap();
-        let w_desc = FilterDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, [1, 1, 2, 2]).unwrap();
+        let x_desc =
+            TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, [1, 1, 3, 3])
+                .unwrap();
+        let w_desc =
+            FilterDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, [1, 1, 2, 2])
+                .unwrap();
         let conv_desc = ConvolutionDescriptor::new_2d(
             &ctx,
             [0, 0],
@@ -397,7 +418,8 @@ mod tests {
         .unwrap();
         let out_dims = conv_desc.output_dim_4d(&x_desc, &w_desc).unwrap();
         assert_eq!(out_dims, [1, 1, 2, 2]);
-        let y_desc = TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, out_dims).unwrap();
+        let y_desc =
+            TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, DataType::F32, out_dims).unwrap();
 
         let x_host: [f32; 9] = [-10.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let w_host: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -425,8 +447,25 @@ mod tests {
         )
         .unwrap();
 
-        let act = ActivationDescriptor::new(&ctx, ActivationMode::Relu, NanPropagation::NotPropagate, 0.0).unwrap();
-        activation_forward(&mut handle, &stream, &act, 1.0, &y_desc, &y_dev, 0.0, &y_desc, &mut z_dev).unwrap();
+        let act = ActivationDescriptor::new(
+            &ctx,
+            ActivationMode::Relu,
+            NanPropagation::NotPropagate,
+            0.0,
+        )
+        .unwrap();
+        activation_forward(
+            &mut handle,
+            &stream,
+            &act,
+            1.0,
+            &y_desc,
+            &y_dev,
+            0.0,
+            &y_desc,
+            &mut z_dev,
+        )
+        .unwrap();
 
         stream.synchronize().unwrap();
         let out = z_dev.to_host_vec(&stream).unwrap();

@@ -45,7 +45,9 @@ impl NvApi {
     pub fn init() -> Result<Self> {
         #[cfg(windows)]
         {
-            Ok(Self { session: win::init_session()? })
+            Ok(Self {
+                session: win::init_session()?,
+            })
         }
         #[cfg(not(windows))]
         {
@@ -540,7 +542,10 @@ mod tests {
         assert!(Status::PROFILE_NOT_FOUND.is_profile_not_found());
 
         assert_eq!(Status::OK.known_name(), Some("NVAPI_OK"));
-        assert_eq!(Status::PROFILE_NOT_FOUND.known_name(), Some("NVAPI_PROFILE_NOT_FOUND"));
+        assert_eq!(
+            Status::PROFILE_NOT_FOUND.known_name(),
+            Some("NVAPI_PROFILE_NOT_FOUND")
+        );
 
         let unknown = Status(-4242);
         assert_eq!(unknown.known_name(), None);
@@ -587,7 +592,10 @@ mod tests {
 
     #[test]
     fn driver_version_splits_major_and_minor() {
-        let ver = DriverVersion { version: 62124, branch: "r620_00".to_owned() };
+        let ver = DriverVersion {
+            version: 62124,
+            branch: "r620_00".to_owned(),
+        };
         assert_eq!(ver.major_minor(), (621, 24));
     }
 
@@ -622,7 +630,9 @@ mod tests {
         let iface = nvapi.interface_version().expect("interface version");
         assert!(!iface.is_empty());
 
-        let drv = nvapi.driver_and_branch_version().expect("driver and branch version");
+        let drv = nvapi
+            .driver_and_branch_version()
+            .expect("driver and branch version");
         assert!(drv.version > 0);
         assert!(!drv.branch.is_empty());
 
@@ -651,13 +661,20 @@ mod tests {
         let pstate = gpu.current_pstate().expect("current P-state");
         assert!(pstate <= 16);
         let _dyn_pstates = gpu.dynamic_pstates().expect("dynamic P-states");
-        let clocks = gpu.clock_frequencies(ClockKind::Current).expect("current clocks");
+        let clocks = gpu
+            .clock_frequencies(ClockKind::Current)
+            .expect("current clocks");
         assert!(clocks.graphics_khz.is_some());
         let _perf_decr = gpu.perf_decrease_info().expect("perf decrease info");
 
         let logical = nvapi.logical_gpus().expect("logical GPUs");
         assert!(!logical.is_empty());
-        assert!(!logical[0].physical_gpus().expect("logical -> physical").is_empty());
+        assert!(
+            !logical[0]
+                .physical_gpus()
+                .expect("logical -> physical")
+                .is_empty()
+        );
 
         // Displays: query HDR & VRR if any display is attached.
         let displays = nvapi.displays().expect("enumerate displays");
@@ -683,6 +700,10 @@ mod tests {
         assert!(drs.num_profiles().expect("num profiles") > 0);
         let global = drs.global_profile().expect("global profile");
         assert!(!global.name.is_empty());
-        assert!(drs.find_profile("__nonexistent_nv_rs_profile__").expect("find").is_none());
+        assert!(
+            drs.find_profile("__nonexistent_nv_rs_profile__")
+                .expect("find")
+                .is_none()
+        );
     }
 }

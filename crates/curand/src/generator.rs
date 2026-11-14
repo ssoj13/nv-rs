@@ -54,9 +54,13 @@ impl RngType {
             Self::Philox4_32_10 => cuda_bindings::curandRngType_CURAND_RNG_PSEUDO_PHILOX4_32_10,
             Self::QuasiDefault => cuda_bindings::curandRngType_CURAND_RNG_QUASI_DEFAULT,
             Self::Sobol32 => cuda_bindings::curandRngType_CURAND_RNG_QUASI_SOBOL32,
-            Self::ScrambledSobol32 => cuda_bindings::curandRngType_CURAND_RNG_QUASI_SCRAMBLED_SOBOL32,
+            Self::ScrambledSobol32 => {
+                cuda_bindings::curandRngType_CURAND_RNG_QUASI_SCRAMBLED_SOBOL32
+            }
             Self::Sobol64 => cuda_bindings::curandRngType_CURAND_RNG_QUASI_SOBOL64,
-            Self::ScrambledSobol64 => cuda_bindings::curandRngType_CURAND_RNG_QUASI_SCRAMBLED_SOBOL64,
+            Self::ScrambledSobol64 => {
+                cuda_bindings::curandRngType_CURAND_RNG_QUASI_SCRAMBLED_SOBOL64
+            }
         }
     }
 
@@ -113,12 +117,21 @@ impl Ordering {
 }
 
 /// Validates normal/log-normal distribution parameters before calling cuRAND.
-pub(crate) fn validate_normal_params(rng_type: RngType, len: usize, stddev_positive: bool, finite: bool) -> Result<()> {
+pub(crate) fn validate_normal_params(
+    rng_type: RngType,
+    len: usize,
+    stddev_positive: bool,
+    finite: bool,
+) -> Result<()> {
     if !finite || !stddev_positive {
-        return Err(Error::Invalid("normal/log-normal distribution requires finite mean and positive finite stddev"));
+        return Err(Error::Invalid(
+            "normal/log-normal distribution requires finite mean and positive finite stddev",
+        ));
     }
     if rng_type.is_pseudo() && !len.is_multiple_of(2) {
-        return Err(Error::Invalid("pseudo-random normal/log-normal generation requires an even output length"));
+        return Err(Error::Invalid(
+            "pseudo-random normal/log-normal generation requires an even output length",
+        ));
     }
     Ok(())
 }
@@ -164,7 +177,10 @@ impl PoissonDistribution {
         check("curandCreatePoissonDistribution", unsafe {
             cuda_bindings::curandCreatePoissonDistribution(lambda, &mut raw)
         })?;
-        Ok(Self { raw, cuda: Some(cuda.clone()) })
+        Ok(Self {
+            raw,
+            cuda: Some(cuda.clone()),
+        })
     }
 
     /// Explicitly destroys the distribution histogram and returns any cuRAND error.
@@ -178,7 +194,9 @@ impl PoissonDistribution {
             ctx.bind_to_thread()?;
         }
         // SAFETY: `raw` was created by `curandCreatePoissonDistribution` and is destroyed once.
-        check("curandDestroyDistribution", unsafe { cuda_bindings::curandDestroyDistribution(raw) })
+        check("curandDestroyDistribution", unsafe {
+            cuda_bindings::curandDestroyDistribution(raw)
+        })
     }
 
     /// Returns the raw `curandDiscreteDistribution_t`.
@@ -197,13 +215,19 @@ impl Drop for PoissonDistribution {
                     let code = unsafe { cuda_bindings::curandDestroyDistribution(self.raw) };
                     teardown(ctx, code);
                 } else {
-                    teardown(ctx, cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED);
+                    teardown(
+                        ctx,
+                        cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED,
+                    );
                 }
             } else {
                 // SAFETY: `self.raw` was created by `curandCreatePoissonDistribution` and is destroyed once.
                 let code = unsafe { cuda_bindings::curandDestroyDistribution(self.raw) };
                 if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-                    eprintln!("curandDestroyDistribution failed during Drop: {}", crate::CurandStatus(code));
+                    eprintln!(
+                        "curandDestroyDistribution failed during Drop: {}",
+                        crate::CurandStatus(code)
+                    );
                 }
             }
             self.raw = std::ptr::null_mut();
@@ -231,7 +255,11 @@ impl Generator {
         check("curandCreateGenerator", unsafe {
             cuda_bindings::curandCreateGenerator(&mut raw, rng_type.raw())
         })?;
-        Ok(Self { raw, rng_type, cuda: Some(cuda.clone()) })
+        Ok(Self {
+            raw,
+            rng_type,
+            cuda: Some(cuda.clone()),
+        })
     }
 
     /// Creates a host-side cuRAND generator.
@@ -242,7 +270,11 @@ impl Generator {
         check("curandCreateGeneratorHost", unsafe {
             cuda_bindings::curandCreateGeneratorHost(&mut raw, rng_type.raw())
         })?;
-        Ok(Self { raw, rng_type, cuda: None })
+        Ok(Self {
+            raw,
+            rng_type,
+            cuda: None,
+        })
     }
 
     /// Returns the raw `curandGenerator_t`.
@@ -266,20 +298,28 @@ impl Generator {
     /// Binds `stream` to a device-side generator. Fails on host generators or mismatched contexts.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         let Some(ctx) = &self.cuda else {
-            return Err(Error::Invalid("cannot bind a CUDA stream to a host cuRAND generator"));
+            return Err(Error::Invalid(
+                "cannot bind a CUDA stream to a host cuRAND generator",
+            ));
         };
         if !Arc::ptr_eq(stream.context(), ctx) {
-            return Err(Error::Invalid("stream belongs to a different CUDA context than the cuRAND generator"));
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than the cuRAND generator",
+            ));
         }
         ctx.bind_to_thread()?;
         // SAFETY: `self.raw` and `stream.cu_stream()` belong to the same live context.
-        check("curandSetStream", unsafe { cuda_bindings::curandSetStream(self.raw, stream.cu_stream()) })
+        check("curandSetStream", unsafe {
+            cuda_bindings::curandSetStream(self.raw, stream.cu_stream())
+        })
     }
 
     /// Sets the seed for a pseudo-random generator.
     pub fn set_seed(&self, seed: u64) -> Result<()> {
         if self.rng_type.is_quasi() {
-            return Err(Error::Invalid("quasi-random Sobol generators do not take a seed"));
+            return Err(Error::Invalid(
+                "quasi-random Sobol generators do not take a seed",
+            ));
         }
         if let Some(ctx) = &self.cuda {
             ctx.bind_to_thread()?;
@@ -315,7 +355,9 @@ impl Generator {
     /// Sets the number of dimensions (`>= 1`) for a quasi-random Sobol generator.
     pub fn set_dimensions(&self, num_dimensions: u32) -> Result<()> {
         if !self.rng_type.is_quasi() {
-            return Err(Error::Invalid("dimensions only apply to quasi-random Sobol generators"));
+            return Err(Error::Invalid(
+                "dimensions only apply to quasi-random Sobol generators",
+            ));
         }
         if num_dimensions == 0 {
             return Err(Error::Invalid("quasi-random dimensions must be at least 1"));
@@ -335,19 +377,25 @@ impl Generator {
             ctx.bind_to_thread()?;
         }
         // SAFETY: `self.raw` is a live generator.
-        check("curandGenerateSeeds", unsafe { cuda_bindings::curandGenerateSeeds(self.raw) })
+        check("curandGenerateSeeds", unsafe {
+            cuda_bindings::curandGenerateSeeds(self.raw)
+        })
     }
 
     fn prepare_device(&self, stream: &Stream) -> Result<()> {
         if self.cuda.is_none() {
-            return Err(Error::Invalid("device generation called on a host cuRAND generator"));
+            return Err(Error::Invalid(
+                "device generation called on a host cuRAND generator",
+            ));
         }
         self.set_stream(stream)
     }
 
     fn ensure_host(&self) -> Result<()> {
         if self.cuda.is_some() {
-            return Err(Error::Invalid("host generation called on a device cuRAND generator"));
+            return Err(Error::Invalid(
+                "host generation called on a device cuRAND generator",
+            ));
         }
         Ok(())
     }
@@ -359,7 +407,11 @@ impl Generator {
         self.prepare_device(stream)?;
         // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` u32s.
         check("curandGenerate", unsafe {
-            cuda_bindings::curandGenerate(self.raw, out.cu_deviceptr() as usize as *mut u32, out.len())
+            cuda_bindings::curandGenerate(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut u32,
+                out.len(),
+            )
         })
     }
 
@@ -368,7 +420,11 @@ impl Generator {
         self.prepare_device(stream)?;
         // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` u64s.
         check("curandGenerateLongLong", unsafe {
-            cuda_bindings::curandGenerateLongLong(self.raw, out.cu_deviceptr() as usize as *mut u64, out.len())
+            cuda_bindings::curandGenerateLongLong(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut u64,
+                out.len(),
+            )
         })
     }
 
@@ -377,7 +433,11 @@ impl Generator {
         self.prepare_device(stream)?;
         // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` f32s.
         check("curandGenerateUniform", unsafe {
-            cuda_bindings::curandGenerateUniform(self.raw, out.cu_deviceptr() as usize as *mut f32, out.len())
+            cuda_bindings::curandGenerateUniform(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f32,
+                out.len(),
+            )
         })
     }
 
@@ -386,57 +446,139 @@ impl Generator {
         self.prepare_device(stream)?;
         // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` f64s.
         check("curandGenerateUniformDouble", unsafe {
-            cuda_bindings::curandGenerateUniformDouble(self.raw, out.cu_deviceptr() as usize as *mut f64, out.len())
+            cuda_bindings::curandGenerateUniformDouble(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f64,
+                out.len(),
+            )
         })
     }
 
     /// Generates `out.len()` normally distributed `f32` values on device.
-    pub fn generate_normal_f32(&self, stream: &Stream, out: &mut DeviceBuffer<f32>, mean: f32, stddev: f32) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_normal_f32(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        mean: f32,
+        stddev: f32,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.prepare_device(stream)?;
         // SAFETY: parameters and even length (for pseudo-random) are validated above.
         check("curandGenerateNormal", unsafe {
-            cuda_bindings::curandGenerateNormal(self.raw, out.cu_deviceptr() as usize as *mut f32, out.len(), mean, stddev)
+            cuda_bindings::curandGenerateNormal(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f32,
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` normally distributed `f64` values on device.
-    pub fn generate_normal_f64(&self, stream: &Stream, out: &mut DeviceBuffer<f64>, mean: f64, stddev: f64) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_normal_f64(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f64>,
+        mean: f64,
+        stddev: f64,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.prepare_device(stream)?;
         // SAFETY: parameters and even length (for pseudo-random) are validated above.
         check("curandGenerateNormalDouble", unsafe {
-            cuda_bindings::curandGenerateNormalDouble(self.raw, out.cu_deviceptr() as usize as *mut f64, out.len(), mean, stddev)
+            cuda_bindings::curandGenerateNormalDouble(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f64,
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f32` values on device.
-    pub fn generate_log_normal_f32(&self, stream: &Stream, out: &mut DeviceBuffer<f32>, mean: f32, stddev: f32) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_log_normal_f32(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        mean: f32,
+        stddev: f32,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.prepare_device(stream)?;
         // SAFETY: parameters and even length (for pseudo-random) are validated above.
         check("curandGenerateLogNormal", unsafe {
-            cuda_bindings::curandGenerateLogNormal(self.raw, out.cu_deviceptr() as usize as *mut f32, out.len(), mean, stddev)
+            cuda_bindings::curandGenerateLogNormal(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f32,
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f64` values on device.
-    pub fn generate_log_normal_f64(&self, stream: &Stream, out: &mut DeviceBuffer<f64>, mean: f64, stddev: f64) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_log_normal_f64(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f64>,
+        mean: f64,
+        stddev: f64,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.prepare_device(stream)?;
         // SAFETY: parameters and even length (for pseudo-random) are validated above.
         check("curandGenerateLogNormalDouble", unsafe {
-            cuda_bindings::curandGenerateLogNormalDouble(self.raw, out.cu_deviceptr() as usize as *mut f64, out.len(), mean, stddev)
+            cuda_bindings::curandGenerateLogNormalDouble(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut f64,
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` Poisson-distributed `u32` values on device.
-    pub fn generate_poisson(&self, stream: &Stream, out: &mut DeviceBuffer<u32>, lambda: f64) -> Result<()> {
+    pub fn generate_poisson(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<u32>,
+        lambda: f64,
+    ) -> Result<()> {
         validate_poisson_lambda(lambda)?;
         self.prepare_device(stream)?;
         // SAFETY: `lambda > 0.0` is validated and `out` is a live device buffer.
         check("curandGeneratePoisson", unsafe {
-            cuda_bindings::curandGeneratePoisson(self.raw, out.cu_deviceptr() as usize as *mut u32, out.len(), lambda)
+            cuda_bindings::curandGeneratePoisson(
+                self.raw,
+                out.cu_deviceptr() as usize as *mut u32,
+                out.len(),
+                lambda,
+            )
         })
     }
 
@@ -446,7 +588,9 @@ impl Generator {
     pub fn generate_host_u32(&self, out: &mut [u32]) -> Result<()> {
         self.ensure_host()?;
         // SAFETY: `out` is a valid mutable host slice of `out.len()` elements.
-        check("curandGenerate", unsafe { cuda_bindings::curandGenerate(self.raw, out.as_mut_ptr(), out.len()) })
+        check("curandGenerate", unsafe {
+            cuda_bindings::curandGenerate(self.raw, out.as_mut_ptr(), out.len())
+        })
     }
 
     /// Generates `out.len()` uniformly distributed 64-bit unsigned integers on host (Sobol64).
@@ -478,7 +622,12 @@ impl Generator {
 
     /// Generates `out.len()` normally distributed `f32` values on host.
     pub fn generate_host_normal_f32(&self, out: &mut [f32], mean: f32, stddev: f32) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.ensure_host()?;
         // SAFETY: `out` is a valid mutable host slice and parameters are validated.
         check("curandGenerateNormal", unsafe {
@@ -488,31 +637,74 @@ impl Generator {
 
     /// Generates `out.len()` normally distributed `f64` values on host.
     pub fn generate_host_normal_f64(&self, out: &mut [f64], mean: f64, stddev: f64) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.ensure_host()?;
         // SAFETY: `out` is a valid mutable host slice and parameters are validated.
         check("curandGenerateNormalDouble", unsafe {
-            cuda_bindings::curandGenerateNormalDouble(self.raw, out.as_mut_ptr(), out.len(), mean, stddev)
+            cuda_bindings::curandGenerateNormalDouble(
+                self.raw,
+                out.as_mut_ptr(),
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f32` values on host.
-    pub fn generate_host_log_normal_f32(&self, out: &mut [f32], mean: f32, stddev: f32) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_host_log_normal_f32(
+        &self,
+        out: &mut [f32],
+        mean: f32,
+        stddev: f32,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.ensure_host()?;
         // SAFETY: `out` is a valid mutable host slice and parameters are validated.
         check("curandGenerateLogNormal", unsafe {
-            cuda_bindings::curandGenerateLogNormal(self.raw, out.as_mut_ptr(), out.len(), mean, stddev)
+            cuda_bindings::curandGenerateLogNormal(
+                self.raw,
+                out.as_mut_ptr(),
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f64` values on host.
-    pub fn generate_host_log_normal_f64(&self, out: &mut [f64], mean: f64, stddev: f64) -> Result<()> {
-        validate_normal_params(self.rng_type, out.len(), stddev > 0.0, mean.is_finite() && stddev.is_finite())?;
+    pub fn generate_host_log_normal_f64(
+        &self,
+        out: &mut [f64],
+        mean: f64,
+        stddev: f64,
+    ) -> Result<()> {
+        validate_normal_params(
+            self.rng_type,
+            out.len(),
+            stddev > 0.0,
+            mean.is_finite() && stddev.is_finite(),
+        )?;
         self.ensure_host()?;
         // SAFETY: `out` is a valid mutable host slice and parameters are validated.
         check("curandGenerateLogNormalDouble", unsafe {
-            cuda_bindings::curandGenerateLogNormalDouble(self.raw, out.as_mut_ptr(), out.len(), mean, stddev)
+            cuda_bindings::curandGenerateLogNormalDouble(
+                self.raw,
+                out.as_mut_ptr(),
+                out.len(),
+                mean,
+                stddev,
+            )
         })
     }
 
@@ -536,13 +728,19 @@ impl Drop for Generator {
                     let code = unsafe { cuda_bindings::curandDestroyGenerator(self.raw) };
                     teardown(ctx, code);
                 } else {
-                    teardown(ctx, cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED);
+                    teardown(
+                        ctx,
+                        cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED,
+                    );
                 }
             } else {
                 // SAFETY: `self.raw` was created by `curandCreateGeneratorHost` and is destroyed once.
                 let code = unsafe { cuda_bindings::curandDestroyGenerator(self.raw) };
                 if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-                    eprintln!("curandDestroyGenerator(host) failed during Drop: {}", crate::CurandStatus(code));
+                    eprintln!(
+                        "curandDestroyGenerator(host) failed during Drop: {}",
+                        crate::CurandStatus(code)
+                    );
                 }
             }
             self.raw = std::ptr::null_mut();

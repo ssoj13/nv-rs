@@ -54,7 +54,10 @@ pub(crate) fn driver_and_branch_version(_session: &Arc<NvApiSession>) -> Result<
     // SAFETY: `ver` is a valid out-pointer and `branch` is a 64-byte `NvAPI_ShortString`.
     let code = unsafe { sys::NvAPI_SYS_GetDriverAndBranchVersion(&mut ver, branch.as_mut_ptr()) };
     check("NvAPI_SYS_GetDriverAndBranchVersion", code)?;
-    Ok(DriverVersion { version: ver, branch: decode_short_string(&branch) })
+    Ok(DriverVersion {
+        version: ver,
+        branch: decode_short_string(&branch),
+    })
 }
 
 pub(crate) fn enum_physical_gpus(session: &Arc<NvApiSession>) -> Result<Vec<PhysicalGpu>> {
@@ -70,7 +73,10 @@ pub(crate) fn enum_physical_gpus(session: &Arc<NvApiSession>) -> Result<Vec<Phys
     let n = (count as usize).min(handles.len());
     Ok(handles[..n]
         .iter()
-        .map(|&handle| PhysicalGpu { _session: Arc::clone(session), handle })
+        .map(|&handle| PhysicalGpu {
+            _session: Arc::clone(session),
+            handle,
+        })
         .collect())
 }
 
@@ -87,7 +93,10 @@ pub(crate) fn enum_tcc_physical_gpus(session: &Arc<NvApiSession>) -> Result<Vec<
     let n = (count as usize).min(handles.len());
     Ok(handles[..n]
         .iter()
-        .map(|&handle| PhysicalGpu { _session: Arc::clone(session), handle })
+        .map(|&handle| PhysicalGpu {
+            _session: Arc::clone(session),
+            handle,
+        })
         .collect())
 }
 
@@ -104,7 +113,10 @@ pub(crate) fn enum_logical_gpus(session: &Arc<NvApiSession>) -> Result<Vec<Logic
     let n = (count as usize).min(handles.len());
     Ok(handles[..n]
         .iter()
-        .map(|&handle| LogicalGpu { _session: Arc::clone(session), handle })
+        .map(|&handle| LogicalGpu {
+            _session: Arc::clone(session),
+            handle,
+        })
         .collect())
 }
 
@@ -119,7 +131,10 @@ pub(crate) fn enum_displays(session: &Arc<NvApiSession>) -> Result<Vec<Display>>
             break;
         }
         check("NvAPI_EnumNvidiaDisplayHandle", code)?;
-        out.push(Display { _session: Arc::clone(session), handle });
+        out.push(Display {
+            _session: Arc::clone(session),
+            handle,
+        });
     }
     Ok(out)
 }
@@ -137,7 +152,10 @@ pub(crate) fn enum_gsync_devices(session: &Arc<NvApiSession>) -> Result<Vec<GSyn
     let n = (count as usize).min(handles.len());
     Ok(handles[..n]
         .iter()
-        .map(|&handle| GSyncDevice { _session: Arc::clone(session), handle })
+        .map(|&handle| GSyncDevice {
+            _session: Arc::clone(session),
+            handle,
+        })
         .collect())
 }
 
@@ -192,7 +210,12 @@ impl PhysicalGpu {
             )
         };
         check("NvAPI_GPU_GetPCIIdentifiers", code)?;
-        Ok(PciIdentifiers { device_id, subsystem_id, revision_id, ext_device_id })
+        Ok(PciIdentifiers {
+            device_id,
+            subsystem_id,
+            revision_id,
+            ext_device_id,
+        })
     }
 
     pub(crate) fn bus_id(&self) -> Result<u32> {
@@ -403,17 +426,16 @@ impl LogicalGpu {
         let mut count = 0u32;
         // SAFETY: `self.handle` is valid and `handles`/`count` are valid out-buffers.
         let code = unsafe {
-            sys::NvAPI_GetPhysicalGPUsFromLogicalGPU(
-                self.handle,
-                handles.as_mut_ptr(),
-                &mut count,
-            )
+            sys::NvAPI_GetPhysicalGPUsFromLogicalGPU(self.handle, handles.as_mut_ptr(), &mut count)
         };
         check("NvAPI_GetPhysicalGPUsFromLogicalGPU", code)?;
         let n = (count as usize).min(handles.len());
         Ok(handles[..n]
             .iter()
-            .map(|&handle| PhysicalGpu { _session: Arc::clone(&self._session), handle })
+            .map(|&handle| PhysicalGpu {
+                _session: Arc::clone(&self._session),
+                handle,
+            })
             .collect())
     }
 }
@@ -434,7 +456,8 @@ impl Display {
     pub(crate) fn name(&self) -> Result<String> {
         let mut buf: sys::NvAPI_ShortString = [0; 64];
         // SAFETY: `self.handle` is valid and `buf` is a 64-byte `NvAPI_ShortString`.
-        let code = unsafe { sys::NvAPI_GetAssociatedNvidiaDisplayName(self.handle, buf.as_mut_ptr()) };
+        let code =
+            unsafe { sys::NvAPI_GetAssociatedNvidiaDisplayName(self.handle, buf.as_mut_ptr()) };
         check("NvAPI_GetAssociatedNvidiaDisplayName", code)?;
         Ok(decode_short_string(&buf))
     }
@@ -442,7 +465,8 @@ impl Display {
     pub(crate) fn display_id(&self) -> Result<u32> {
         let mut buf: sys::NvAPI_ShortString = [0; 64];
         // SAFETY: `self.handle` is valid and `buf` is a 64-byte `NvAPI_ShortString`.
-        let code = unsafe { sys::NvAPI_GetAssociatedNvidiaDisplayName(self.handle, buf.as_mut_ptr()) };
+        let code =
+            unsafe { sys::NvAPI_GetAssociatedNvidiaDisplayName(self.handle, buf.as_mut_ptr()) };
         check("NvAPI_GetAssociatedNvidiaDisplayName", code)?;
         let mut id = 0u32;
         // SAFETY: `buf` is NUL-terminated by `NvAPI_GetAssociatedNvidiaDisplayName` and `id` is a
@@ -526,7 +550,11 @@ impl GSyncDevice {
         check("NvAPI_GSync_QueryCapabilities", code)?;
         // SAFETY: `NvAPI_GSync_QueryCapabilities` succeeded and initialized `raw`.
         let raw = unsafe { raw.assume_init() };
-        Ok(GSyncCapabilities { board_id: raw.boardId, revision: raw.revision, cap_flags: raw.capFlags })
+        Ok(GSyncCapabilities {
+            board_id: raw.boardId,
+            revision: raw.revision,
+            cap_flags: raw.capFlags,
+        })
     }
 
     pub(crate) fn sync_status(&self, gpu: &PhysicalGpu) -> Result<GSyncStatus> {
@@ -536,7 +564,8 @@ impl GSyncDevice {
             (*raw.as_mut_ptr()).version = make_version::<sys::NV_GSYNC_STATUS>(1);
         }
         // SAFETY: `self.handle` and `gpu.handle` are valid; `raw` is a versioned `NV_GSYNC_STATUS`.
-        let code = unsafe { sys::NvAPI_GSync_GetSyncStatus(self.handle, gpu.handle, raw.as_mut_ptr()) };
+        let code =
+            unsafe { sys::NvAPI_GSync_GetSyncStatus(self.handle, gpu.handle, raw.as_mut_ptr()) };
         check("NvAPI_GSync_GetSyncStatus", code)?;
         // SAFETY: `NvAPI_GSync_GetSyncStatus` succeeded and initialized `raw`.
         let raw = unsafe { raw.assume_init() };
@@ -568,7 +597,10 @@ impl DrsSession {
         // SAFETY: `handle` is a valid out-pointer.
         let code = unsafe { sys::NvAPI_DRS_CreateSession(&mut handle) };
         check("NvAPI_DRS_CreateSession", code)?;
-        let drs = Self { _session: Arc::clone(session), handle };
+        let drs = Self {
+            _session: Arc::clone(session),
+            handle,
+        };
         // SAFETY: `drs.handle` is a freshly created DRS session handle.
         let code = unsafe { sys::NvAPI_DRS_LoadSettings(drs.handle) };
         check("NvAPI_DRS_LoadSettings", code)?;

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Event, PinnedHostBuffer, Stream};
 use nvcomp_sys as sys;
 
-use crate::{same_stream, within, Error, Result};
+use crate::{Error, Result, same_stream, within};
 
 // C-ABI pointer and status arrays copied verbatim to/from device memory.
 const _: () = assert!(size_of::<u64>() == size_of::<*const c_void>());
@@ -27,7 +27,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty scratch workspace bound to `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buf: None }
+        Self {
+            stream: stream.clone(),
+            buf: None,
+        }
     }
 
     /// Bound CUDA stream.
@@ -70,13 +73,17 @@ impl Scratch {
             let fresh = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, needed) }?;
             let req_align = u64::try_from(align.max(1)).unwrap_or(u64::MAX);
             if !fresh.cu_deviceptr().is_multiple_of(req_align) {
-                return Err(Error::Invalid("CUDA allocator returned workspace below nvCOMP temp alignment"));
+                return Err(Error::Invalid(
+                    "CUDA allocator returned workspace below nvCOMP temp alignment",
+                ));
             }
             self.buf = Some(fresh);
         } else if let Some(buf) = &self.buf {
             let req_align = u64::try_from(align.max(1)).unwrap_or(u64::MAX);
             if !buf.cu_deviceptr().is_multiple_of(req_align) {
-                return Err(Error::Invalid("cached workspace below nvCOMP temp alignment"));
+                return Err(Error::Invalid(
+                    "cached workspace below nvCOMP temp alignment",
+                ));
             }
         }
         Ok(self.as_raw_parts())
@@ -135,9 +142,7 @@ impl TableSet {
 
     fn device_bytes_for(capacity: usize) -> usize {
         let cap = capacity.max(1);
-        cap.saturating_mul(
-            2 * size_of::<u64>() + 3 * size_of::<usize>() + size_of::<u32>(),
-        )
+        cap.saturating_mul(2 * size_of::<u64>() + 3 * size_of::<usize>() + size_of::<u32>())
     }
 }
 
@@ -253,7 +258,9 @@ impl BatchStaging {
             self.tables = Some(TableSet::allocate(&self.ctx, stream, target_cap)?);
             self.capacity = target_cap;
         }
-        let _ = self.scratch.reserve(stream, temp_bytes, temp_align, budget)?;
+        let _ = self
+            .scratch
+            .reserve(stream, temp_bytes, temp_align, budget)?;
         Ok(())
     }
 

@@ -8,7 +8,7 @@
 //!   strongly typed DLSS/NGX enums and flags.
 //! - [`Parameters`] — RAII `NVSDK_NGX_Parameter` wrapper (`AllocateParameters` /
 //!   `GetCapabilityParameters` / `DestroyParameters`) with typed setters and getters.
-//! - [`NgxVulkan`] / [`FeatureHandle`] — Vulkan RAII wrappers (`Init_with_ProjectID` /
+//! - [`NgxVulkan`] / [`FeatureHandle`] — Vulkan RAII wrappers (`Init` / `Init_with_ProjectID` /
 //!   `Shutdown1`, `CreateFeature` / `EvaluateFeature_C` / `ReleaseFeature`).
 //!
 //! **Conventions.** Every native handle owns its NGX object, holds an `Arc` of the parent
@@ -197,5 +197,33 @@ mod tests {
             pid.engine_type(),
             sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM
         );
+    }
+
+    #[test]
+    fn vulkan_init_rejects_null_handles_or_reports_unsupported() {
+        let null_handles = VulkanDeviceHandles {
+            instance: std::ptr::null_mut(),
+            physical_device: std::ptr::null_mut(),
+            device: std::ptr::null_mut(),
+            get_instance_proc_addr: std::ptr::null(),
+            get_device_proc_addr: std::ptr::null(),
+        };
+        let pid = ProjectId::from_guid_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let data_path = std::path::Path::new(".");
+        // SAFETY: All pointers are null; both functions reject null handles before dereferencing
+        // (or return `Error::Unsupported` on non-Windows targets).
+        let res_pid = unsafe { NgxVulkan::init(&pid, data_path, null_handles) };
+        // SAFETY: Same as above.
+        let res_app = unsafe { NgxVulkan::init_with_app_id(12345, data_path, null_handles) };
+        #[cfg(target_os = "windows")]
+        {
+            assert!(matches!(res_pid, Err(Error::InvalidArgument(_))));
+            assert!(matches!(res_app, Err(Error::InvalidArgument(_))));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(matches!(res_pid, Err(Error::Unsupported(_))));
+            assert!(matches!(res_app, Err(Error::Unsupported(_))));
+        }
     }
 }

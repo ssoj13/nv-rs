@@ -3,7 +3,7 @@
 //! **What.** Generated at build time by `nv-bindgen` from the installed CUDA Toolkit
 //! (cusolverMg.h; headers are never committed). Each shim loads the toolkit's
 //! library on first use through `nv-loader` and returns `cusolverStatus_t_CUSOLVER_STATUS_NOT_INITIALIZED` when it is absent or
-//! `cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic. 
+//! `cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cusolvermg` crate; call [`load`] for a diagnosable load error.
 
 use nv_loader::{DllSpec, Group};
@@ -21,8 +21,15 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["cusolverMgCreate", "cusolverMgDeviceSelect", "cusolverMgPotrf"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "cusolverMgCreate",
+            "cusolverMgDeviceSelect",
+            "cusolverMgPotrf",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

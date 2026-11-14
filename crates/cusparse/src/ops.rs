@@ -108,7 +108,9 @@ impl SpGemmAlg {
         match self {
             Self::Default => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_DEFAULT,
             Self::Deterministic => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_CSR_ALG_DETERMINITIC,
-            Self::NonDeterministic => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_CSR_ALG_NONDETERMINITIC,
+            Self::NonDeterministic => {
+                sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_CSR_ALG_NONDETERMINITIC
+            }
             Self::Alg1 => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_ALG1,
             Self::Alg2 => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_ALG2,
             Self::Alg3 => sys::cusparseSpGEMMAlg_t_CUSPARSE_SPGEMM_ALG3,
@@ -149,13 +151,21 @@ impl SpSmAlg {
 }
 
 /// Validates `SpMV` operand dimensions: `y = alpha * op_a(A) * x + beta * y`.
-pub fn validate_spmv_dims(op_a: Op, a_rows: i64, a_cols: i64, x_len: i64, y_len: i64) -> Result<()> {
+pub fn validate_spmv_dims(
+    op_a: Op,
+    a_rows: i64,
+    a_cols: i64,
+    x_len: i64,
+    y_len: i64,
+) -> Result<()> {
     let (eff_rows, eff_cols) = match op_a {
         Op::NonTranspose => (a_rows, a_cols),
         Op::Transpose | Op::ConjTranspose => (a_cols, a_rows),
     };
     if eff_cols != x_len {
-        return Err(Error::InvalidInput("SpMV op(A) columns must match x length"));
+        return Err(Error::InvalidInput(
+            "SpMV op(A) columns must match x length",
+        ));
     }
     if eff_rows != y_len {
         return Err(Error::InvalidInput("SpMV op(A) rows must match y length"));
@@ -164,7 +174,10 @@ pub fn validate_spmv_dims(op_a: Op, a_rows: i64, a_cols: i64, x_len: i64, y_len:
 }
 
 /// Validates `SpMM` operand dimensions: `C = alpha * op_a(A) * op_b(B) + beta * C`.
-#[expect(clippy::too_many_arguments, reason = "validates op(A) * op(B) -> C dimensions")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "validates op(A) * op(B) -> C dimensions"
+)]
 pub fn validate_spmm_dims(
     op_a: Op,
     op_b: Op,
@@ -184,10 +197,14 @@ pub fn validate_spmm_dims(
         Op::Transpose | Op::ConjTranspose => (b_cols, b_rows),
     };
     if k_a != k_b {
-        return Err(Error::InvalidInput("SpMM inner dimensions of op(A) and op(B) must match"));
+        return Err(Error::InvalidInput(
+            "SpMM inner dimensions of op(A) and op(B) must match",
+        ));
     }
     if m_a != c_rows || n_b != c_cols {
-        return Err(Error::InvalidInput("SpMM output matrix C dimensions do not match op(A) * op(B)"));
+        return Err(Error::InvalidInput(
+            "SpMM output matrix C dimensions do not match op(A) * op(B)",
+        ));
     }
     Ok(())
 }
@@ -244,7 +261,17 @@ pub fn spmv<S: SparseScalar>(
     budget: usize,
 ) -> Result<()> {
     handle.set_stream(stream)?;
-    let req = spmv_buffer_size(handle, op_a, alpha, mat_a, vec_x, beta, vec_y, compute_type, alg)?;
+    let req = spmv_buffer_size(
+        handle,
+        op_a,
+        alpha,
+        mat_a,
+        vec_x,
+        beta,
+        vec_y,
+        compute_type,
+        alg,
+    )?;
     let (ws_ptr, _) = scratch.reserve_with_budget(stream, req, budget)?;
     // SAFETY: `ws_ptr` holds at least `req` bytes on `stream`; descriptors are valid.
     check("cusparseSpMV_preprocess", unsafe {
@@ -342,7 +369,18 @@ pub fn spmm<S: SparseScalar>(
     budget: usize,
 ) -> Result<()> {
     handle.set_stream(stream)?;
-    let req = spmm_buffer_size(handle, op_a, op_b, alpha, mat_a, mat_b, beta, mat_c, compute_type, alg)?;
+    let req = spmm_buffer_size(
+        handle,
+        op_a,
+        op_b,
+        alpha,
+        mat_a,
+        mat_b,
+        beta,
+        mat_c,
+        compute_type,
+        alg,
+    )?;
     let (ws_ptr, _) = scratch.reserve_with_budget(stream, req, budget)?;
     // SAFETY: `ws_ptr` holds at least `req` bytes on `stream`; descriptors are valid.
     check("cusparseSpMM_preprocess", unsafe {
@@ -394,8 +432,13 @@ impl SpGemm {
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpGEMMDescr_t = std::ptr::null_mut();
         // SAFETY: `cuda` is current and `raw` is a valid out-pointer.
-        check("cusparseSpGEMM_createDescr", unsafe { sys::cusparseSpGEMM_createDescr(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check("cusparseSpGEMM_createDescr", unsafe {
+            sys::cusparseSpGEMM_createDescr(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Phase 1: two-phase `cusparseSpGEMM_workEstimation` (queries `bufferSize1`, reserves
@@ -589,8 +632,13 @@ impl SpSv {
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpSVDescr_t = std::ptr::null_mut();
         // SAFETY: `cuda` is current and `raw` is a valid out-pointer.
-        check("cusparseSpSV_createDescr", unsafe { sys::cusparseSpSV_createDescr(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check("cusparseSpSV_createDescr", unsafe {
+            sys::cusparseSpSV_createDescr(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Queries workspace bytes, reserves `scratch` within `budget`, and runs `cusparseSpSV_analysis`.
@@ -609,8 +657,13 @@ impl SpSv {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<usize> {
-        if mat_a.rows() != mat_a.cols() || mat_a.rows() != vec_x.len() || mat_a.rows() != vec_y.len() {
-            return Err(Error::InvalidInput("SpSV requires square A matching x and y lengths"));
+        if mat_a.rows() != mat_a.cols()
+            || mat_a.rows() != vec_x.len()
+            || mat_a.rows() != vec_y.len()
+        {
+            return Err(Error::InvalidInput(
+                "SpSV requires square A matching x and y lengths",
+            ));
         }
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
@@ -711,8 +764,13 @@ impl SpSm {
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpSMDescr_t = std::ptr::null_mut();
         // SAFETY: `cuda` is current and `raw` is a valid out-pointer.
-        check("cusparseSpSM_createDescr", unsafe { sys::cusparseSpSM_createDescr(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check("cusparseSpSM_createDescr", unsafe {
+            sys::cusparseSpSM_createDescr(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Queries workspace bytes, reserves `scratch` within `budget`, and runs `cusparseSpSM_analysis`.
@@ -736,7 +794,7 @@ impl SpSm {
             return Err(Error::InvalidInput("SpSM requires square sparse matrix A"));
         }
         handle.ensure_host_pointer_mode()?;
-    validate_spmm_dims(
+        validate_spmm_dims(
             op_a,
             op_b,
             mat_a.rows(),

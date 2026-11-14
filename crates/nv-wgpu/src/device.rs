@@ -16,11 +16,11 @@ use std::sync::Arc;
 use ash::{khr, vk};
 use cuda_core::Context;
 #[cfg(windows)]
-use cuda_ext::device_luid as cuda_device_luid;
-use cuda_ext::device_uuid as cuda_device_uuid;
-use wgpu::hal::api::Vulkan;
+use cuda_core_ext::device_luid as cuda_device_luid;
+use cuda_core_ext::device_uuid as cuda_device_uuid;
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
+use wgpu::hal::api::Vulkan;
 
 use crate::error::{Error, Result};
 
@@ -143,6 +143,8 @@ pub fn verify_device_interop_support(device: &wgpu::Device) -> Result<InteropBac
 
 /// Queries the hardware UUID (Vulkan) or LUID (DX12) of a `wgpu::Adapter` / `wgpu::Device`.
 pub fn wgpu_gpu_identity(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Result<GpuIdentity> {
+    #[cfg(not(windows))]
+    let _ = adapter;
     match detect_backend(device)? {
         InteropBackend::Vulkan => wgpu_vulkan_uuid(device).map(GpuIdentity::Uuid),
         #[cfg(windows)]
@@ -171,14 +173,18 @@ pub fn wgpu_vulkan_uuid(device: &wgpu::Device) -> Result<[u8; 16]> {
         .extensions()
         .contains(&khr::get_physical_device_properties2::NAME)
     {
-        let ext = khr::get_physical_device_properties2::Instance::new(shared_inst.entry(), raw_inst);
+        let ext =
+            khr::get_physical_device_properties2::Instance::new(shared_inst.entry(), raw_inst);
         // SAFETY: Extension was verified present on the Vulkan instance.
         unsafe { ext.get_physical_device_properties2(phys, &mut props2) };
     } else {
         return Err(Error::Unsupported {
             what: "vulkan physical device UUID query",
             required: "Vulkan 1.1+ or VK_KHR_get_physical_device_properties2",
-            found: format!("instance_api_version=0x{:x}", shared_inst.instance_api_version()),
+            found: format!(
+                "instance_api_version=0x{:x}",
+                shared_inst.instance_api_version()
+            ),
         });
     }
 
@@ -196,7 +202,10 @@ pub fn wgpu_dx12_luid(adapter: &wgpu::Adapter) -> Result<[u8; 8]> {
     // SAFETY: `hal_adapter.as_raw()` returns a valid COM `IDXGIAdapter3`.
     let desc = unsafe { hal_adapter.as_raw().GetDesc2() }
         .map_err(|e| Error::dx12("IDXGIAdapter3::GetDesc2", e))?;
-    Ok(luid_to_bytes(desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart))
+    Ok(luid_to_bytes(
+        desc.AdapterLuid.LowPart,
+        desc.AdapterLuid.HighPart,
+    ))
 }
 
 /// Packs a Win32 `LUID` into the canonical 8-byte little-endian layout returned by CUDA.
@@ -326,7 +335,11 @@ pub fn open_vulkan_device_with_interop(
             })),
         )
     }
-    .map_err(|e| Error::WgpuRequest(format!("wgpu_hal::vulkan::Adapter::open_with_callback: {e}")))?;
+    .map_err(|e| {
+        Error::WgpuRequest(format!(
+            "wgpu_hal::vulkan::Adapter::open_with_callback: {e}"
+        ))
+    })?;
 
     let desc = wgpu::DeviceDescriptor {
         label,

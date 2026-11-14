@@ -23,6 +23,7 @@
 //! listing the missing names, on any gap.
 
 mod optix_cov;
+mod prebuilt;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -32,14 +33,21 @@ use std::process::ExitCode;
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("{path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{path}: {msg}")]
     Parse { path: PathBuf, msg: String },
     #[error("coverage check failed:\n{0}")]
     Check(String),
     #[error("optix coverage failed:\n{0}")]
     Optix(String),
-    #[error("usage: cargo xtask coverage <collect|generate|check|optix>")]
+    #[error("{0}")]
+    Prebuilt(String),
+    #[error(
+        "usage: cargo xtask <coverage <collect|generate|check|optix> | prebuilt [--out <dir>] [--target <triple>] | stage-prebuilt [--out <dir>] [--target <triple>]>"
+    )]
     Usage,
 }
 
@@ -102,11 +110,20 @@ struct Lib {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = repo_root();
-    let result = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let result = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["coverage", "generate"] => generate(&root),
         ["coverage", "check"] => check(&root),
         ["coverage", "collect"] => collect(&root),
         ["coverage", "optix"] => optix_cov::run(&root).map_err(Error::Optix),
+        ["prebuilt" | "stage-prebuilt", rest @ ..] => {
+            let refs: Vec<&str> = rest.to_vec();
+            prebuilt::run(&root, &refs).map_err(Error::Prebuilt)
+        }
         _ => Err(Error::Usage),
     };
     match result {
@@ -122,13 +139,19 @@ fn main() -> ExitCode {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn generate(root: &Path) -> Result<String, Error> {
     let (text, _) = render(root)?;
     let path = root.join("COVERAGE.md");
-    std::fs::write(&path, &text).map_err(|source| Error::Io { path: path.clone(), source })?;
+    std::fs::write(&path, &text).map_err(|source| Error::Io {
+        path: path.clone(),
+        source,
+    })?;
     Ok(format!("wrote {}", path.display()))
 }
 
@@ -140,13 +163,23 @@ fn collect(root: &Path) -> Result<String, Error> {
     for profile in list(&root.join("target")) {
         for build in list(&profile.join("build")) {
             // nv-bindgen-fixture's synthetic libraries are a test harness, not NVIDIA evidence.
-            if build.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("nv-bindgen-fixture-")) {
+            if build
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("nv-bindgen-fixture-"))
+            {
                 continue;
             }
             for file in list(&build.join("out")) {
-                let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
-                let Some(lib) = name.strip_suffix("_inventory.json") else { continue };
-                let modified = std::fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(lib) = name.strip_suffix("_inventory.json") else {
+                    continue;
+                };
+                let modified = std::fs::metadata(&file)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
                 if newest.get(lib).is_none_or(|(t, _)| modified > *t) {
                     newest.insert(lib.to_string(), (modified, file));
                 }
@@ -156,14 +189,27 @@ fn collect(root: &Path) -> Result<String, Error> {
     let mut copied = Vec::new();
     for (lib, (_, src)) in &newest {
         let text = read(src)?;
-        serde_json::from_str::<Inventory>(&text).map_err(|e| Error::Parse { path: src.clone(), msg: e.to_string() })?;
+        serde_json::from_str::<Inventory>(&text).map_err(|e| Error::Parse {
+            path: src.clone(),
+            msg: e.to_string(),
+        })?;
         let dir = root.join("coverage").join("evidence").join(lib);
-        std::fs::create_dir_all(&dir).map_err(|source| Error::Io { path: dir.clone(), source })?;
+        std::fs::create_dir_all(&dir).map_err(|source| Error::Io {
+            path: dir.clone(),
+            source,
+        })?;
         let dst = dir.join("inventory.json");
         std::fs::write(&dst, text).map_err(|source| Error::Io { path: dst, source })?;
         copied.push(lib.as_str());
     }
-    Ok(format!("collected inventories: {}", if copied.is_empty() { "none (build the sys crates first)".to_string() } else { copied.join(", ") }))
+    Ok(format!(
+        "collected inventories: {}",
+        if copied.is_empty() {
+            "none (build the sys crates first)".to_string()
+        } else {
+            copied.join(", ")
+        }
+    ))
 }
 
 fn check(root: &Path) -> Result<String, Error> {
@@ -172,7 +218,9 @@ fn check(root: &Path) -> Result<String, Error> {
     match std::fs::read_to_string(&path) {
         Ok(on_disk) if on_disk == text => {}
         Ok(_) => problems.push("COVERAGE.md is stale: run `cargo xtask coverage generate`".into()),
-        Err(_) => problems.push("COVERAGE.md is missing: run `cargo xtask coverage generate`".into()),
+        Err(_) => {
+            problems.push("COVERAGE.md is missing: run `cargo xtask coverage generate`".into())
+        }
     }
     if problems.is_empty() {
         Ok("coverage check: ok".into())
@@ -195,7 +243,9 @@ fn render(root: &Path) -> Result<(String, Vec<String>), Error> {
         return Ok((out, problems));
     }
 
-    out.push_str("\n| Library | Symbols | Bound | Wrapped | Tested on GPU |\n|---|---:|---:|---:|---:|\n");
+    out.push_str(
+        "\n| Library | Symbols | Bound | Wrapped | Tested on GPU |\n|---|---:|---:|---:|---:|\n",
+    );
     let mut sections = String::new();
     for lib in &libs {
         let rows = rows(root, lib, &mut problems);
@@ -216,13 +266,18 @@ fn render(root: &Path) -> Result<(String, Vec<String>), Error> {
             }
             sections.push('\n');
         }
-        sections.push_str("| Symbol | Bound | Wrapper | Tested on GPU | Note |\n|---|---|---|---|---|\n");
+        sections.push_str(
+            "| Symbol | Bound | Wrapper | Tested on GPU | Note |\n|---|---|---|---|---|\n",
+        );
         for r in &rows {
             sections.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} |\n",
                 r.name,
                 mark(r.bound),
-                r.wrapper.as_deref().filter(|_| r.wrapped).map_or_else(String::new, |w| format!("`{w}`")),
+                r.wrapper
+                    .as_deref()
+                    .filter(|_| r.wrapped)
+                    .map_or_else(String::new, |w| format!("`{w}`")),
                 r.tested.as_deref().unwrap_or(""),
                 r.note.as_deref().unwrap_or("")
             ));
@@ -246,17 +301,31 @@ fn mark(b: bool) -> &'static str {
 }
 
 fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
-    let symbols: Vec<String> = lib.inventory.as_ref().map(|i| i.symbols.clone()).unwrap_or_default();
-    let overlay: BTreeMap<&str, &OverlayFn> =
-        lib.overlay.iter().flat_map(|o| o.fns.iter()).map(|f| (f.name.as_str(), f)).collect();
+    let symbols: Vec<String> = lib
+        .inventory
+        .as_ref()
+        .map(|i| i.symbols.clone())
+        .unwrap_or_default();
+    let overlay: BTreeMap<&str, &OverlayFn> = lib
+        .overlay
+        .iter()
+        .flat_map(|o| o.fns.iter())
+        .map(|f| (f.name.as_str(), f))
+        .collect();
 
     if let (Some(o), Some(inv)) = (&lib.overlay, &lib.inventory) {
         if o.lib != inv.lib {
-            problems.push(format!("{}: overlay lib `{}` != inventory lib `{}`", lib.name, o.lib, inv.lib));
+            problems.push(format!(
+                "{}: overlay lib `{}` != inventory lib `{}`",
+                lib.name, o.lib, inv.lib
+            ));
         }
         for name in overlay.keys() {
             if !symbols.iter().any(|s| s == name) {
-                problems.push(format!("{}: overlay names `{name}`, which the inventory does not contain", lib.name));
+                problems.push(format!(
+                    "{}: overlay names `{name}`, which the inventory does not contain",
+                    lib.name
+                ));
             }
         }
     }
@@ -280,12 +349,27 @@ fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
             let test = o.and_then(|f| f.test.clone());
             let tested = test.as_ref().and_then(|t| {
                 if !contains_word(&all_src, &format!("fn {t}")) {
-                    problems.push(format!("{}: test `{t}` for `{name}` does not exist under crates/", lib.name));
+                    problems.push(format!(
+                        "{}: test `{t}` for `{name}` does not exist under crates/",
+                        lib.name
+                    ));
                     return None;
                 }
-                lib.gpu.iter().find(|g| &g.test == t && g.passed).map(|g| format!("{} {} ({}, {}, {})", g.gpu, g.driver, g.platform, g.date, g.commit))
+                lib.gpu.iter().find(|g| &g.test == t && g.passed).map(|g| {
+                    format!(
+                        "{} {} ({}, {}, {})",
+                        g.gpu, g.driver, g.platform, g.date, g.commit
+                    )
+                })
             });
-            Row { bound: symbols.contains(&name), name, wrapper, wrapped, tested, note: o.and_then(|f| f.note.clone()) }
+            Row {
+                bound: symbols.contains(&name),
+                name,
+                wrapper,
+                wrapped,
+                tested,
+                note: o.and_then(|f| f.note.clone()),
+            }
         })
         .collect()
 }
@@ -297,24 +381,37 @@ fn load_libs(root: &Path) -> Result<Vec<Lib>, Error> {
         if path.extension().is_some_and(|e| e == "toml")
             && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
         {
-            let o: Overlay = toml::from_str(&read(&path)?).map_err(|e| Error::Parse { path: path.clone(), msg: e.to_string() })?;
+            let o: Overlay = toml::from_str(&read(&path)?).map_err(|e| Error::Parse {
+                path: path.clone(),
+                msg: e.to_string(),
+            })?;
             lib_entry(&mut libs, stem).overlay = Some(o);
         }
     }
     for dir in list(&cov.join("evidence")) {
-        let Some(name) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
         if !dir.is_dir() {
             continue;
         }
         let inv_path = dir.join("inventory.json");
         let inventory = if inv_path.is_file() {
-            Some(serde_json::from_str::<Inventory>(&read(&inv_path)?).map_err(|e| Error::Parse { path: inv_path, msg: e.to_string() })?)
+            Some(
+                serde_json::from_str::<Inventory>(&read(&inv_path)?).map_err(|e| Error::Parse {
+                    path: inv_path,
+                    msg: e.to_string(),
+                })?,
+            )
         } else {
             None
         };
         let gpu_path = dir.join("gpu-tests.json");
         let gpu = if gpu_path.is_file() {
-            serde_json::from_str::<Vec<GpuRecord>>(&read(&gpu_path)?).map_err(|e| Error::Parse { path: gpu_path, msg: e.to_string() })?
+            serde_json::from_str::<Vec<GpuRecord>>(&read(&gpu_path)?).map_err(|e| Error::Parse {
+                path: gpu_path,
+                msg: e.to_string(),
+            })?
         } else {
             Vec::new()
         };
@@ -326,18 +423,27 @@ fn load_libs(root: &Path) -> Result<Vec<Lib>, Error> {
 }
 
 fn lib_entry<'a>(libs: &'a mut BTreeMap<String, Lib>, name: &str) -> &'a mut Lib {
-    libs.entry(name.to_string())
-        .or_insert_with(|| Lib { name: name.to_string(), overlay: None, inventory: None, gpu: Vec::new() })
+    libs.entry(name.to_string()).or_insert_with(|| Lib {
+        name: name.to_string(),
+        overlay: None,
+        inventory: None,
+        gpu: Vec::new(),
+    })
 }
 
 fn list(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir).map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
     v.sort();
     v
 }
 
 fn read(path: &Path) -> Result<String, Error> {
-    std::fs::read_to_string(path).map_err(|source| Error::Io { path: path.to_path_buf(), source })
+    std::fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Concatenated `.rs` sources under `dir` (empty when it does not exist).
@@ -416,11 +522,18 @@ mod tests {
             "lib = \"demo\"\n[[fn]]\nname = \"demoA\"\nwrapper = \"Demo::a\"\ntest = \"a_works\"\n[[fn]]\nname = \"demoZ\"\n",
         )
         .expect("overlay");
-        std::fs::write(dir.join("crates").join("demo").join("src").join("lib.rs"), "fn a() { demoA() }\n#[test] fn a_works() {}\n").expect("lib");
+        std::fs::write(
+            dir.join("crates").join("demo").join("src").join("lib.rs"),
+            "fn a() { demoA() }\n#[test] fn a_works() {}\n",
+        )
+        .expect("lib");
 
         let (text, problems) = render(&dir).expect("renders");
         assert!(text.contains("| demo | 3 | 2 | 1 | 1 |"), "{text}");
-        assert_eq!(problems, ["demo: overlay names `demoZ`, which the inventory does not contain"]);
+        assert_eq!(
+            problems,
+            ["demo: overlay names `demoZ`, which the inventory does not contain"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

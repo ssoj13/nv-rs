@@ -73,7 +73,8 @@ impl CompileOptions {
 
     /// Enables `--relocatable-device-code=true` (`-rdc=true`).
     pub fn rdc(mut self, enabled: bool) -> Self {
-        self.args.push(format!("--relocatable-device-code={enabled}"));
+        self.args
+            .push(format!("--relocatable-device-code={enabled}"));
         self
     }
 
@@ -96,7 +97,13 @@ impl CompileOptions {
 
     /// Converts all flags into `CString`s, rejecting interior NUL bytes.
     pub(crate) fn to_cstrings(&self) -> Result<Vec<CString>> {
-        self.args.iter().map(|s| CString::new(s.as_str()).map_err(|_| Error::InvalidInput("compile option contains NUL"))).collect()
+        self.args
+            .iter()
+            .map(|s| {
+                CString::new(s.as_str())
+                    .map_err(|_| Error::InvalidInput("compile option contains NUL"))
+            })
+            .collect()
     }
 }
 

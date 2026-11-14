@@ -43,28 +43,43 @@ impl SvdJob {
 /// Validates a column-major matrix buffer of `rows x cols` with leading dimension `lda`.
 pub fn validate_col_major_mat(rows: i32, cols: i32, lda: i32, buf_len: usize) -> Result<()> {
     if rows < 0 || cols < 0 || lda < rows.max(1) {
-        return Err(Error::InvalidInput("invalid matrix dimensions or leading dimension lda < max(1, rows)"));
+        return Err(Error::InvalidInput(
+            "invalid matrix dimensions or leading dimension lda < max(1, rows)",
+        ));
     }
     if cols > 0 {
         let req = (lda as usize)
             .checked_mul(cols as usize)
             .ok_or(Error::InvalidInput("matrix element count overflow"))?;
         if buf_len < req {
-            return Err(Error::InvalidInput("matrix device buffer smaller than lda * cols"));
+            return Err(Error::InvalidInput(
+                "matrix device buffer smaller than lda * cols",
+            ));
         }
     }
     Ok(())
 }
 
 /// Validates `getrf` arguments.
-pub fn validate_getrf(m: i32, n: i32, lda: i32, a_len: usize, ipiv_len: usize, info_len: usize) -> Result<()> {
+pub fn validate_getrf(
+    m: i32,
+    n: i32,
+    lda: i32,
+    a_len: usize,
+    ipiv_len: usize,
+    info_len: usize,
+) -> Result<()> {
     validate_col_major_mat(m, n, lda, a_len)?;
     let min_mn = m.min(n) as usize;
     if ipiv_len < min_mn {
-        return Err(Error::InvalidInput("getrf ipiv buffer smaller than min(m, n)"));
+        return Err(Error::InvalidInput(
+            "getrf ipiv buffer smaller than min(m, n)",
+        ));
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
@@ -87,7 +102,9 @@ pub fn validate_getrs(
         return Err(Error::InvalidInput("getrs ipiv buffer smaller than n"));
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
@@ -96,35 +113,66 @@ pub fn validate_getrs(
 pub fn validate_potrf(n: i32, lda: i32, a_len: usize, info_len: usize) -> Result<()> {
     validate_col_major_mat(n, n, lda, a_len)?;
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
 
 /// Validates `potrs` arguments.
-pub fn validate_potrs(n: i32, nrhs: i32, lda: i32, ldb: i32, a_len: usize, b_len: usize, info_len: usize) -> Result<()> {
+pub fn validate_potrs(
+    n: i32,
+    nrhs: i32,
+    lda: i32,
+    ldb: i32,
+    a_len: usize,
+    b_len: usize,
+    info_len: usize,
+) -> Result<()> {
     validate_col_major_mat(n, n, lda, a_len)?;
     validate_col_major_mat(n, nrhs, ldb, b_len)?;
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
 
 /// Validates `geqrf` arguments.
-pub fn validate_geqrf(m: i32, n: i32, lda: i32, a_len: usize, tau_len: usize, info_len: usize) -> Result<()> {
+pub fn validate_geqrf(
+    m: i32,
+    n: i32,
+    lda: i32,
+    a_len: usize,
+    tau_len: usize,
+    info_len: usize,
+) -> Result<()> {
     validate_col_major_mat(m, n, lda, a_len)?;
     if tau_len < m.min(n) as usize {
-        return Err(Error::InvalidInput("geqrf tau buffer smaller than min(m, n)"));
+        return Err(Error::InvalidInput(
+            "geqrf tau buffer smaller than min(m, n)",
+        ));
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
 
 /// Validates `orgqr` arguments.
-pub fn validate_orgqr(m: i32, n: i32, k: i32, lda: i32, a_len: usize, tau_len: usize, info_len: usize) -> Result<()> {
+pub fn validate_orgqr(
+    m: i32,
+    n: i32,
+    k: i32,
+    lda: i32,
+    a_len: usize,
+    tau_len: usize,
+    info_len: usize,
+) -> Result<()> {
     if k < 0 || k > n || n > m {
         return Err(Error::InvalidInput("orgqr requires 0 <= k <= n <= m"));
     }
@@ -133,7 +181,9 @@ pub fn validate_orgqr(m: i32, n: i32, k: i32, lda: i32, a_len: usize, tau_len: u
         return Err(Error::InvalidInput("orgqr tau buffer smaller than k"));
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
@@ -158,11 +208,15 @@ pub fn validate_gesvd(
         return Err(Error::InvalidInput("cusolverDn gesvd requires m >= n"));
     }
     if jobu == SvdJob::Overwrite && jobvt == SvdJob::Overwrite {
-        return Err(Error::InvalidInput("gesvd cannot set both jobu and jobvt to Overwrite"));
+        return Err(Error::InvalidInput(
+            "gesvd cannot set both jobu and jobvt to Overwrite",
+        ));
     }
     validate_col_major_mat(m, n, lda, a_len)?;
     if s_len < n as usize {
-        return Err(Error::InvalidInput("gesvd singular values buffer smaller than n"));
+        return Err(Error::InvalidInput(
+            "gesvd singular values buffer smaller than n",
+        ));
     }
     let u_cols = match jobu {
         SvdJob::All => m,
@@ -180,7 +234,9 @@ pub fn validate_gesvd(
         validate_col_major_mat(vt_rows, n, ldvt, vt_len)?;
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
@@ -189,10 +245,14 @@ pub fn validate_gesvd(
 pub fn validate_syevd(n: i32, lda: i32, a_len: usize, w_len: usize, info_len: usize) -> Result<()> {
     validate_col_major_mat(n, n, lda, a_len)?;
     if w_len < n as usize {
-        return Err(Error::InvalidInput("syevd eigenvalues buffer smaller than n"));
+        return Err(Error::InvalidInput(
+            "syevd eigenvalues buffer smaller than n",
+        ));
     }
     if info_len < 1 {
-        return Err(Error::InvalidInput("dev_info buffer must hold at least 1 i32"));
+        return Err(Error::InvalidInput(
+            "dev_info buffer must hold at least 1 i32",
+        ));
     }
     Ok(())
 }
@@ -209,7 +269,13 @@ pub trait DnFloat: sealed::Sealed + Copy + 'static {
     ///
     /// # Safety
     /// `handle` and `a` must be valid for `m x n` with `lda`.
-    unsafe fn getrf_buffer_size(handle: sys::cusolverDnHandle_t, m: i32, n: i32, a: *mut Self, lda: i32) -> Result<i32>;
+    unsafe fn getrf_buffer_size(
+        handle: sys::cusolverDnHandle_t,
+        m: i32,
+        n: i32,
+        a: *mut Self,
+        lda: i32,
+    ) -> Result<i32>;
 
     /// Executes `getrf` in-place.
     ///
@@ -294,7 +360,13 @@ pub trait DnFloat: sealed::Sealed + Copy + 'static {
     ///
     /// # Safety
     /// `handle` and `a` must be valid.
-    unsafe fn geqrf_buffer_size(handle: sys::cusolverDnHandle_t, m: i32, n: i32, a: *mut Self, lda: i32) -> Result<i32>;
+    unsafe fn geqrf_buffer_size(
+        handle: sys::cusolverDnHandle_t,
+        m: i32,
+        n: i32,
+        a: *mut Self,
+        lda: i32,
+    ) -> Result<i32>;
 
     /// Executes `geqrf` in-place.
     ///
@@ -411,10 +483,18 @@ pub trait DnFloat: sealed::Sealed + Copy + 'static {
 macro_rules! impl_dn_float {
     ($ty:ty, $getrf_bs:ident, $getrf:ident, $getrs:ident, $potrf_bs:ident, $potrf:ident, $potrs:ident, $geqrf_bs:ident, $geqrf:ident, $orgqr_bs:ident, $orgqr:ident, $gesvd_bs:ident, $gesvd:ident, $syevd_bs:ident, $syevd:ident) => {
         impl DnFloat for $ty {
-            unsafe fn getrf_buffer_size(handle: sys::cusolverDnHandle_t, m: i32, n: i32, a: *mut Self, lda: i32) -> Result<i32> {
+            unsafe fn getrf_buffer_size(
+                handle: sys::cusolverDnHandle_t,
+                m: i32,
+                n: i32,
+                a: *mut Self,
+                lda: i32,
+            ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle and device pointer.
-                check(stringify!($getrf_bs), unsafe { sys::$getrf_bs(handle, m, n, a, lda, &mut lwork) })?;
+                check(stringify!($getrf_bs), unsafe {
+                    sys::$getrf_bs(handle, m, n, a, lda, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn getrf(
@@ -428,7 +508,9 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
-                check(stringify!($getrf), unsafe { sys::$getrf(handle, m, n, a, lda, work, ipiv, info) })
+                check(stringify!($getrf), unsafe {
+                    sys::$getrf(handle, m, n, a, lda, work, ipiv, info)
+                })
             }
             unsafe fn getrs(
                 handle: sys::cusolverDnHandle_t,
@@ -443,7 +525,9 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers.
-                check(stringify!($getrs), unsafe { sys::$getrs(handle, trans, n, nrhs, a, lda, ipiv, b, ldb, info) })
+                check(stringify!($getrs), unsafe {
+                    sys::$getrs(handle, trans, n, nrhs, a, lda, ipiv, b, ldb, info)
+                })
             }
             unsafe fn potrf_buffer_size(
                 handle: sys::cusolverDnHandle_t,
@@ -454,7 +538,9 @@ macro_rules! impl_dn_float {
             ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle and device pointer.
-                check(stringify!($potrf_bs), unsafe { sys::$potrf_bs(handle, uplo, n, a, lda, &mut lwork) })?;
+                check(stringify!($potrf_bs), unsafe {
+                    sys::$potrf_bs(handle, uplo, n, a, lda, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn potrf(
@@ -468,7 +554,9 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
-                check(stringify!($potrf), unsafe { sys::$potrf(handle, uplo, n, a, lda, work, lwork, info) })
+                check(stringify!($potrf), unsafe {
+                    sys::$potrf(handle, uplo, n, a, lda, work, lwork, info)
+                })
             }
             unsafe fn potrs(
                 handle: sys::cusolverDnHandle_t,
@@ -482,12 +570,22 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers.
-                check(stringify!($potrs), unsafe { sys::$potrs(handle, uplo, n, nrhs, a, lda, b, ldb, info) })
+                check(stringify!($potrs), unsafe {
+                    sys::$potrs(handle, uplo, n, nrhs, a, lda, b, ldb, info)
+                })
             }
-            unsafe fn geqrf_buffer_size(handle: sys::cusolverDnHandle_t, m: i32, n: i32, a: *mut Self, lda: i32) -> Result<i32> {
+            unsafe fn geqrf_buffer_size(
+                handle: sys::cusolverDnHandle_t,
+                m: i32,
+                n: i32,
+                a: *mut Self,
+                lda: i32,
+            ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle and device pointer.
-                check(stringify!($geqrf_bs), unsafe { sys::$geqrf_bs(handle, m, n, a, lda, &mut lwork) })?;
+                check(stringify!($geqrf_bs), unsafe {
+                    sys::$geqrf_bs(handle, m, n, a, lda, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn geqrf(
@@ -502,7 +600,9 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
-                check(stringify!($geqrf), unsafe { sys::$geqrf(handle, m, n, a, lda, tau, work, lwork, info) })
+                check(stringify!($geqrf), unsafe {
+                    sys::$geqrf(handle, m, n, a, lda, tau, work, lwork, info)
+                })
             }
             unsafe fn orgqr_buffer_size(
                 handle: sys::cusolverDnHandle_t,
@@ -515,7 +615,9 @@ macro_rules! impl_dn_float {
             ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle and device pointers.
-                check(stringify!($orgqr_bs), unsafe { sys::$orgqr_bs(handle, m, n, k, a, lda, tau, &mut lwork) })?;
+                check(stringify!($orgqr_bs), unsafe {
+                    sys::$orgqr_bs(handle, m, n, k, a, lda, tau, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn orgqr(
@@ -531,12 +633,20 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
-                check(stringify!($orgqr), unsafe { sys::$orgqr(handle, m, n, k, a, lda, tau, work, lwork, info) })
+                check(stringify!($orgqr), unsafe {
+                    sys::$orgqr(handle, m, n, k, a, lda, tau, work, lwork, info)
+                })
             }
-            unsafe fn gesvd_buffer_size(handle: sys::cusolverDnHandle_t, m: i32, n: i32) -> Result<i32> {
+            unsafe fn gesvd_buffer_size(
+                handle: sys::cusolverDnHandle_t,
+                m: i32,
+                n: i32,
+            ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle.
-                check(stringify!($gesvd_bs), unsafe { sys::$gesvd_bs(handle, m, n, &mut lwork) })?;
+                check(stringify!($gesvd_bs), unsafe {
+                    sys::$gesvd_bs(handle, m, n, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn gesvd(
@@ -559,7 +669,10 @@ macro_rules! impl_dn_float {
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
                 check(stringify!($gesvd), unsafe {
-                    sys::$gesvd(handle, jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, rwork, info)
+                    sys::$gesvd(
+                        handle, jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, rwork,
+                        info,
+                    )
                 })
             }
             unsafe fn syevd_buffer_size(
@@ -573,7 +686,9 @@ macro_rules! impl_dn_float {
             ) -> Result<i32> {
                 let mut lwork = 0i32;
                 // SAFETY: caller guarantees valid handle and device pointers.
-                check(stringify!($syevd_bs), unsafe { sys::$syevd_bs(handle, jobz, uplo, n, a, lda, w, &mut lwork) })?;
+                check(stringify!($syevd_bs), unsafe {
+                    sys::$syevd_bs(handle, jobz, uplo, n, a, lda, w, &mut lwork)
+                })?;
                 Ok(lwork)
             }
             unsafe fn syevd(
@@ -589,7 +704,9 @@ macro_rules! impl_dn_float {
                 info: *mut i32,
             ) -> Result<()> {
                 // SAFETY: caller guarantees valid pointers and workspace.
-                check(stringify!($syevd), unsafe { sys::$syevd(handle, jobz, uplo, n, a, lda, w, work, lwork, info) })
+                check(stringify!($syevd), unsafe {
+                    sys::$syevd(handle, jobz, uplo, n, a, lda, w, work, lwork, info)
+                })
             }
         }
     };
@@ -648,8 +765,13 @@ impl DnHandle {
         cuda.bind_to_thread()?;
         let mut raw: sys::cusolverDnHandle_t = std::ptr::null_mut();
         // SAFETY: `cuda` is bound and `raw` is a valid out-pointer.
-        check("cusolverDnCreate", unsafe { sys::cusolverDnCreate(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check("cusolverDnCreate", unsafe {
+            sys::cusolverDnCreate(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Raw `cusolverDnHandle_t`.
@@ -665,10 +787,14 @@ impl DnHandle {
     /// Binds `stream` to this handle.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(&self.cuda, stream.context()) {
-            return Err(Error::InvalidInput("stream belongs to a different CUDA context than DnHandle"));
+            return Err(Error::InvalidInput(
+                "stream belongs to a different CUDA context than DnHandle",
+            ));
         }
         // SAFETY: `self.raw` and `stream.cu_stream()` are valid on `self.cuda`.
-        check("cusolverDnSetStream", unsafe { sys::cusolverDnSetStream(self.raw, stream.cu_stream()) })
+        check("cusolverDnSetStream", unsafe {
+            sys::cusolverDnSetStream(self.raw, stream.cu_stream())
+        })
     }
 
     /// Computes LU factorization `P * A = L * U` in-place on `stream`.
@@ -721,7 +847,16 @@ impl DnHandle {
         ldb: i32,
         dev_info: &mut DeviceBuffer<i32>,
     ) -> Result<()> {
-        validate_getrs(n, nrhs, lda, ldb, a.len(), ipiv.len(), b.len(), dev_info.len())?;
+        validate_getrs(
+            n,
+            nrhs,
+            lda,
+            ldb,
+            a.len(),
+            ipiv.len(),
+            b.len(),
+            dev_info.len(),
+        )?;
         self.set_stream(stream)?;
         // SAFETY: dimensions and buffers were validated above.
         unsafe {
@@ -760,7 +895,18 @@ impl DnHandle {
         let lwork = unsafe { T::potrf_buffer_size(self.raw, uplo.to_sys(), n, a_ptr, lda) }?;
         let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
-        unsafe { T::potrf(self.raw, uplo.to_sys(), n, a_ptr, lda, ws, lwork, dev_info.cu_deviceptr() as *mut i32) }
+        unsafe {
+            T::potrf(
+                self.raw,
+                uplo.to_sys(),
+                n,
+                a_ptr,
+                lda,
+                ws,
+                lwork,
+                dev_info.cu_deviceptr() as *mut i32,
+            )
+        }
     }
 
     /// Solves `A * X = B` using the Cholesky factor from [`DnHandle::potrf`].
@@ -854,7 +1000,20 @@ impl DnHandle {
         let lwork = unsafe { T::orgqr_buffer_size(self.raw, m, n, k, a_ptr, lda, tau_ptr) }?;
         let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
-        unsafe { T::orgqr(self.raw, m, n, k, a_ptr, lda, tau_ptr, ws, lwork, dev_info.cu_deviceptr() as *mut i32) }
+        unsafe {
+            T::orgqr(
+                self.raw,
+                m,
+                n,
+                k,
+                a_ptr,
+                lda,
+                tau_ptr,
+                ws,
+                lwork,
+                dev_info.cu_deviceptr() as *mut i32,
+            )
+        }
     }
 
     /// Computes singular value decomposition `A = U * diag(S) * V^T` on `stream` (`m >= n`).
@@ -883,7 +1042,20 @@ impl DnHandle {
             Some((buf, ld)) => (buf.cu_deviceptr() as *mut T, ld, buf.len()),
             None => (std::ptr::null_mut(), 1, 0),
         };
-        validate_gesvd(jobu, jobvt, m, n, lda, ldu, ldvt, a.len(), s.len(), u_len, vt_len, dev_info.len())?;
+        validate_gesvd(
+            jobu,
+            jobvt,
+            m,
+            n,
+            lda,
+            ldu,
+            ldvt,
+            a.len(),
+            s.len(),
+            u_len,
+            vt_len,
+            dev_info.len(),
+        )?;
         self.set_stream(stream)?;
         // SAFETY: `self.raw` is valid.
         let lwork = unsafe { T::gesvd_buffer_size(self.raw, m, n) }?;
@@ -931,7 +1103,9 @@ impl DnHandle {
         let a_ptr = a.cu_deviceptr() as *mut T;
         let w_ptr = w.cu_deviceptr() as *mut T;
         // SAFETY: dimensions and buffers were validated above.
-        let lwork = unsafe { T::syevd_buffer_size(self.raw, jobz.to_sys(), uplo.to_sys(), n, a_ptr, lda, w_ptr) }?;
+        let lwork = unsafe {
+            T::syevd_buffer_size(self.raw, jobz.to_sys(), uplo.to_sys(), n, a_ptr, lda, w_ptr)
+        }?;
         let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
@@ -983,7 +1157,23 @@ mod tests {
         assert!(validate_orgqr(4, 3, 3, 4, 12, 3, 1).is_ok());
 
         assert!(validate_gesvd(SvdJob::All, SvdJob::All, 2, 3, 2, 2, 3, 6, 2, 4, 9, 1).is_err());
-        assert!(validate_gesvd(SvdJob::Overwrite, SvdJob::Overwrite, 3, 2, 3, 1, 1, 6, 2, 0, 0, 1).is_err());
+        assert!(
+            validate_gesvd(
+                SvdJob::Overwrite,
+                SvdJob::Overwrite,
+                3,
+                2,
+                3,
+                1,
+                1,
+                6,
+                2,
+                0,
+                0,
+                1
+            )
+            .is_err()
+        );
         assert!(validate_gesvd(SvdJob::All, SvdJob::All, 3, 2, 3, 3, 2, 6, 2, 9, 4, 1).is_ok());
     }
 }

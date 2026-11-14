@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer, Stream};
 
-use crate::{same_stream, within, Result};
+use crate::{Result, same_stream, within};
 
 /// Reusable stream-ordered workspace buffer bound to a single [`Stream`].
 pub struct Scratch {
@@ -19,7 +19,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty scratch workspace bound to `stream` with zero bytes allocated.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buf: None }
+        Self {
+            stream: stream.clone(),
+            buf: None,
+        }
     }
 
     /// Bound CUDA stream.

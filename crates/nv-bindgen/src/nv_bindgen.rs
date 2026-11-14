@@ -33,11 +33,13 @@ pub mod device_asm;
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use syn::{Expr, Fields, GenericArgument, Item, ItemStruct, PathArguments, ReturnType, Type, TypeBareFn};
+use syn::{
+    Expr, Fields, GenericArgument, Item, ItemStruct, PathArguments, ReturnType, Type, TypeBareFn,
+};
 
 /// Where a library's headers come from.
 #[derive(Clone, Copy, Debug)]
@@ -260,7 +262,7 @@ pub struct GeneratedPart {
 }
 
 /// What the coverage matrix needs to know about a generated library.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Inventory {
     /// The library's short name.
     pub lib: String,
@@ -276,7 +278,7 @@ pub struct Inventory {
 }
 
 /// A header and the sha256 of its contents.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeaderHash {
     /// The `#include` name.
     pub name: String,
@@ -286,67 +288,300 @@ pub struct HeaderHash {
 
 /// Generates `spec` into `$OUT_DIR` (see the module docs) and prints the `cargo:rerun-if-*` lines.
 /// Returns the generated sources' inventory.
+///
+/// Falls back to pre-generated bindings when `NV_RS_USE_PREBUILT=1` or when SDK headers /
+/// `libclang` are unavailable and matching prebuilt files exist for `TARGET` under
+/// `NV_RS_PREBUILT_DIR` or `<CARGO_MANIFEST_DIR>/prebuilt/<TARGET>/`.
 pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
+    println!("cargo::rerun-if-env-changed=NV_RS_USE_PREBUILT");
+    println!("cargo::rerun-if-env-changed=NV_RS_PREBUILT_DIR");
     for var in rerun_vars(spec) {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    // One discovery snapshot supplies both the headers and their matching native libraries.
-    let SdkPaths { includes: include_dirs, nvidia } = sdk_paths(spec)?;
-    let runtime = match nvidia.iter().find_map(|sdk| sdk.runtime_dir.as_deref()) {
-        Some(path) => sdk_path_str(spec.name, path)?,
-        None => "",
-    };
-    println!("cargo:rustc-env=NV_RS_SDK_BIN={runtime}");
-    let system_dirs = system_include_dirs();
-    let out = bindings(spec, &include_dirs, &system_dirs)?;
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| Error::Generated {
         lib: spec.name,
         msg: "OUT_DIR is unset: generate() runs from build.rs".into(),
     })?);
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let use_prebuilt = std::env::var("NV_RS_USE_PREBUILT")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    if use_prebuilt {
+        let discovered = sdk_paths(spec).ok();
+        emit_runtime_env(
+            spec.name,
+            discovered.as_ref().map_or(&[][..], |d| &d.nvidia),
+        )?;
+        if let Shape::StaticLink {
+            link_libs,
+            system_libs,
+        } = spec.shape
+        {
+            emit_static_link_directives(
+                spec.name,
+                link_libs,
+                system_libs,
+                discovered.as_ref().map_or(&[][..], |d| &d.nvidia),
+                false,
+            )?;
+        }
+        return use_prebuilt_bindings(spec, &out_dir, &target, "NV_RS_USE_PREBUILT=1");
+    }
+
+    // One discovery snapshot supplies both the headers and their matching native libraries.
+    let SdkPaths {
+        includes: include_dirs,
+        nvidia,
+    } = match sdk_paths(spec) {
+        Ok(paths) => paths,
+        Err(err)
+            if matches!(
+                err,
+                Error::SdkNotFound { .. } | Error::MissingLinkDirectory { .. }
+            ) =>
+        {
+            if matches!(spec.shape, Shape::StaticLink { link_libs, .. } if !link_libs.is_empty()) {
+                return Err(err);
+            }
+            if let Ok(inv) = use_prebuilt_bindings(spec, &out_dir, &target, &err.to_string()) {
+                println!("cargo:rustc-env=NV_RS_SDK_BIN=");
+                return Ok(inv);
+            }
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
+
+    emit_runtime_env(spec.name, &nvidia)?;
+    if let Shape::StaticLink {
+        link_libs,
+        system_libs,
+    } = spec.shape
+    {
+        emit_static_link_directives(spec.name, link_libs, system_libs, &nvidia, true)?;
+    }
+
+    let system_dirs = system_include_dirs();
+    let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bindings(spec, &include_dirs, &system_dirs)
+    })) {
+        Ok(Ok(out)) => out,
+        Ok(Err(err)) if matches!(err, Error::HeaderNotFound { .. } | Error::Bindgen { .. }) => {
+            if let Ok(inv) = use_prebuilt_bindings(spec, &out_dir, &target, &err.to_string()) {
+                return Ok(inv);
+            }
+            return Err(err);
+        }
+        Ok(Err(err)) => return Err(err),
+        Err(panic_payload) => {
+            if let Ok(inv) =
+                use_prebuilt_bindings(spec, &out_dir, &target, "libclang is unavailable")
+            {
+                return Ok(inv);
+            }
+            std::panic::resume_unwind(panic_payload);
+        }
+    };
+
     let write = |suffix: &str, text: &str| {
         let path = out_dir.join(format!("{}_{suffix}", spec.name));
-        std::fs::write(&path, text).map_err(|source| Error::Io { lib: spec.name, path, source })
+        std::fs::write(&path, text).map_err(|source| Error::Io {
+            lib: spec.name,
+            path,
+            source,
+        })
     };
-    if let Shape::StaticLink { link_libs, system_libs } = spec.shape {
-        for l in system_libs {
-            println!("cargo:rustc-link-lib=dylib={l}");
-        }
-        if !link_libs.is_empty() && nvidia.iter().all(|sdk| sdk.lib_dir.is_none()) {
-            return Err(Error::MissingLinkDirectory { lib: spec.name });
-        }
-        for sdk in &nvidia {
-            if let Some(lib_dir) = &sdk.lib_dir {
-                println!("cargo:rustc-link-search=native={}", sdk_path_str(spec.name, lib_dir)?);
-            }
-        }
-        for l in link_libs {
-            println!("cargo:rustc-link-lib=static={l}");
-        }
-    }
     write("types.rs", &out.types)?;
     for part in &out.parts {
         // `<lib>_api.rs` for one DLL, `<lib>_<part>_api.rs` per DLL of a split library.
         let stem = part.stem.trim_start_matches('_');
-        let prefix = if stem.is_empty() { String::new() } else { format!("{stem}_") };
+        let prefix = if stem.is_empty() {
+            String::new()
+        } else {
+            format!("{stem}_")
+        };
         if let Some(api) = &part.api {
             write(&format!("{prefix}api.rs"), api)?;
         }
         write(&format!("{prefix}shims.rs"), &part.shims)?;
     }
-    let json = serde_json::to_string_pretty(&out.inventory).map_err(|e| Error::Generated { lib: spec.name, msg: e.to_string() })?;
+    let json = serde_json::to_string_pretty(&out.inventory).map_err(|e| Error::Generated {
+        lib: spec.name,
+        msg: e.to_string(),
+    })?;
     write("inventory.json", &json)?;
     for h in &out.inventory.headers {
         if let Some(path) = find_header(&include_dirs, &h.name) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
-    if let Shape::QueryInterface { interface_header, .. } = spec.shape
+    if let Shape::QueryInterface {
+        interface_header, ..
+    } = spec.shape
         && let Some(path) = find_header(&include_dirs, interface_header)
     {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     Ok(out.inventory)
+}
+
+fn emit_runtime_env(lib: &'static str, nvidia: &[vcv_rs::nvsdk::SdkInfo]) -> Result<(), Error> {
+    let runtime = match nvidia.iter().find_map(|sdk| sdk.runtime_dir.as_deref()) {
+        Some(path) => sdk_path_str(lib, path)?,
+        None => "",
+    };
+    println!("cargo:rustc-env=NV_RS_SDK_BIN={runtime}");
+    Ok(())
+}
+
+fn emit_static_link_directives(
+    lib: &'static str,
+    link_libs: &[&str],
+    system_libs: &[&str],
+    nvidia: &[vcv_rs::nvsdk::SdkInfo],
+    require_lib_dir: bool,
+) -> Result<(), Error> {
+    for l in system_libs {
+        println!("cargo:rustc-link-lib=dylib={l}");
+    }
+    if require_lib_dir && !link_libs.is_empty() && nvidia.iter().all(|sdk| sdk.lib_dir.is_none()) {
+        return Err(Error::MissingLinkDirectory { lib });
+    }
+    for sdk in nvidia {
+        if let Some(lib_dir) = &sdk.lib_dir {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                sdk_path_str(lib, lib_dir)?
+            );
+        }
+    }
+    for l in link_libs {
+        println!("cargo:rustc-link-lib=static={l}");
+    }
+    Ok(())
+}
+
+fn expected_output_files(spec: &LibSpec) -> Vec<String> {
+    let mut files = vec![
+        format!("{}_types.rs", spec.name),
+        format!("{}_inventory.json", spec.name),
+    ];
+    match spec.shape {
+        Shape::Exports { .. } => {
+            files.push(format!("{}_api.rs", spec.name));
+            files.push(format!("{}_shims.rs", spec.name));
+        }
+        Shape::SplitExports { parts, .. } => {
+            for part in parts {
+                files.push(format!("{}_{}_api.rs", spec.name, part.name));
+                files.push(format!("{}_{}_shims.rs", spec.name, part.name));
+            }
+        }
+        Shape::QueryInterface { .. } | Shape::StaticLink { .. } => {
+            files.push(format!("{}_shims.rs", spec.name));
+        }
+        Shape::FunctionTable { .. } => {}
+    }
+    files
+}
+
+fn resolve_prebuilt_dir(
+    manifest_dir: Option<&Path>,
+    env_dir: Option<&OsStr>,
+    target: &str,
+    expected: &[String],
+) -> Option<PathBuf> {
+    let has_all = |dir: &Path| expected.iter().all(|f| dir.join(f).is_file());
+    if let Some(raw) = env_dir.filter(|v| !v.is_empty()) {
+        let base = Path::new(raw);
+        if !target.is_empty() {
+            let targeted = base.join(target);
+            if has_all(&targeted) {
+                return Some(targeted);
+            }
+        }
+        if has_all(base) {
+            return Some(base.to_path_buf());
+        }
+        return Some(if target.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(target)
+        });
+    }
+    if target.is_empty() {
+        return None;
+    }
+    manifest_dir.map(|m| m.join("prebuilt").join(target))
+}
+
+fn copy_prebuilt_bindings(
+    spec: &LibSpec,
+    prebuilt_dir: &Path,
+    out_dir: &Path,
+) -> Result<(Vec<PathBuf>, Inventory), Error> {
+    let expected = expected_output_files(spec);
+    let mut copied_sources = Vec::with_capacity(expected.len());
+    for file in &expected {
+        let src = prebuilt_dir.join(file);
+        if !src.is_file() {
+            return Err(Error::Generated {
+                lib: spec.name,
+                msg: format!("prebuilt file missing: {}", src.display()),
+            });
+        }
+        let dst = out_dir.join(file);
+        std::fs::copy(&src, &dst).map_err(|source| Error::Io {
+            lib: spec.name,
+            path: dst,
+            source,
+        })?;
+        copied_sources.push(src);
+    }
+    let inv_path = out_dir.join(format!("{}_inventory.json", spec.name));
+    let inv_text = std::fs::read_to_string(&inv_path).map_err(|source| Error::Io {
+        lib: spec.name,
+        path: inv_path,
+        source,
+    })?;
+    let inventory: Inventory = serde_json::from_str(&inv_text).map_err(|e| Error::Generated {
+        lib: spec.name,
+        msg: format!("prebuilt inventory parse failed: {e}"),
+    })?;
+    Ok((copied_sources, inventory))
+}
+
+fn use_prebuilt_bindings(
+    spec: &LibSpec,
+    out_dir: &Path,
+    target: &str,
+    reason: &str,
+) -> Result<Inventory, Error> {
+    let expected = expected_output_files(spec);
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let env_dir = std::env::var_os("NV_RS_PREBUILT_DIR");
+    let prebuilt_dir = resolve_prebuilt_dir(
+        manifest_dir.as_deref(),
+        env_dir.as_deref(),
+        target,
+        &expected,
+    )
+    .ok_or_else(|| Error::Generated {
+        lib: spec.name,
+        msg: "cannot resolve prebuilt directory (TARGET or CARGO_MANIFEST_DIR unset)".into(),
+    })?;
+    let (sources, inventory) = copy_prebuilt_bindings(spec, &prebuilt_dir, out_dir)?;
+    for src in &sources {
+        println!("cargo::rerun-if-changed={}", src.display());
+    }
+    println!(
+        "cargo::warning=nv-bindgen: using prebuilt bindings for {} ({}) from {} ({reason})",
+        spec.name,
+        target,
+        prebuilt_dir.display()
+    );
+    Ok(inventory)
 }
 
 /// The types and constants of `spec` (its `allow_type` / `allow_var`) as `no_std` Rust (`core::`
@@ -391,12 +626,21 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
     for v in spec.allow_var {
         b = b.allowlist_var(*v);
     }
-    b.generate().map(|g| g.to_string()).map_err(|e| Error::Bindgen { lib: spec.name, msg: e.to_string() })
+    b.generate()
+        .map(|g| g.to_string())
+        .map_err(|e| Error::Bindgen {
+            lib: spec.name,
+            msg: e.to_string(),
+        })
 }
 
 /// Runs bindgen for `spec` against explicit include directories (`include_dirs` searched first,
 /// `system_dirs` after libclang's own). Pure apart from reading headers.
-pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf]) -> Result<Output, Error> {
+pub fn bindings(
+    spec: &LibSpec,
+    include_dirs: &[PathBuf],
+    system_dirs: &[PathBuf],
+) -> Result<Output, Error> {
     for path in include_dirs.iter().chain(system_dirs) {
         sdk_path_str(spec.name, path)?;
     }
@@ -408,8 +652,15 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
             header: (*name).to_string(),
             searched: include_dirs.to_vec(),
         })?;
-        let bytes = std::fs::read(&path).map_err(|source| Error::Io { lib: spec.name, path: path.clone(), source })?;
-        headers.push(HeaderHash { name: (*name).to_string(), sha256: hex(&Sha256::digest(&bytes)) });
+        let bytes = std::fs::read(&path).map_err(|source| Error::Io {
+            lib: spec.name,
+            path: path.clone(),
+            source,
+        })?;
+        headers.push(HeaderHash {
+            name: (*name).to_string(),
+            sha256: hex(&Sha256::digest(&bytes)),
+        });
         wrapper.push_str(&format!("#include <{name}>\n"));
     }
 
@@ -433,7 +684,14 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
         }
         b
     };
-    let run = |b: bindgen::Builder| b.generate().map(|g| g.to_string()).map_err(|e| Error::Bindgen { lib: spec.name, msg: e.to_string() });
+    let run = |b: bindgen::Builder| {
+        b.generate()
+            .map(|g| g.to_string())
+            .map_err(|e| Error::Bindgen {
+                lib: spec.name,
+                msg: e.to_string(),
+            })
+    };
 
     // Functions pass first (exports only): its signatures name the types the types pass must
     // also emit. bindgen traces dependencies only of items it generates, so a function left out
@@ -441,12 +699,26 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     // by exact name instead.
     // (stem, api_type, loader_fn, header files or empty for "all allowlisted functions")
     let plan: Vec<(String, &str, &str, &[&str])> = match spec.shape {
-        Shape::Exports { api_type, loader_fn, .. } => vec![(String::new(), api_type, loader_fn, &[])],
+        Shape::Exports {
+            api_type,
+            loader_fn,
+            ..
+        } => vec![(String::new(), api_type, loader_fn, &[])],
         // The signatures come from a throwaway dynamic-loading struct; the shims call the query.
-        Shape::QueryInterface { loader_fn, .. } => vec![(String::new(), QI_SIGNATURES, loader_fn, &[])],
-        Shape::SplitExports { parts, .. } => {
-            parts.iter().map(|p| (format!("_{}", p.name), p.api_type, p.loader_fn, p.header_files)).collect()
+        Shape::QueryInterface { loader_fn, .. } => {
+            vec![(String::new(), QI_SIGNATURES, loader_fn, &[])]
         }
+        Shape::SplitExports { parts, .. } => parts
+            .iter()
+            .map(|p| {
+                (
+                    format!("_{}", p.name),
+                    p.api_type,
+                    p.loader_fn,
+                    p.header_files,
+                )
+            })
+            .collect(),
         Shape::FunctionTable { .. } | Shape::StaticLink { .. } => Vec::new(),
     };
     let mut apis: Vec<(String, &str, &str, String)> = Vec::new();
@@ -505,7 +777,10 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     }
     let mut types = normalize_positive_enums(&run(tb)?, spec.positive_enums);
     if !spec.reuse_cuda_types.is_empty() {
-        types = format!("pub use cuda_bindings::{{{}}};\n{types}", spec.reuse_cuda_types.join(", "));
+        types = format!(
+            "pub use cuda_bindings::{{{}}};\n{types}",
+            spec.reuse_cuda_types.join(", ")
+        );
     }
 
     let mut parts = Vec::new();
@@ -517,22 +792,40 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
                 let generated = shims(spec.name, &api, api_type, loader_fn, returns)?;
                 symbols.extend(inventory(spec.name, &api, api_type)?);
                 unshimmed.extend(generated.unshimmed);
-                parts.push(GeneratedPart { stem, api: Some(api), shims: generated.source });
+                parts.push(GeneratedPart {
+                    stem,
+                    api: Some(api),
+                    shims: generated.source,
+                });
             }
         }
-        Shape::QueryInterface { interface_header, returns, .. } => {
-            let path = find_header(include_dirs, interface_header).ok_or_else(|| Error::HeaderNotFound {
-                lib: spec.name,
-                header: interface_header.to_string(),
-                searched: include_dirs.to_vec(),
+        Shape::QueryInterface {
+            interface_header,
+            returns,
+            ..
+        } => {
+            let path = find_header(include_dirs, interface_header).ok_or_else(|| {
+                Error::HeaderNotFound {
+                    lib: spec.name,
+                    header: interface_header.to_string(),
+                    searched: include_dirs.to_vec(),
+                }
             })?;
-            let text = std::fs::read_to_string(&path).map_err(|source| Error::Io { lib: spec.name, path, source })?;
+            let text = std::fs::read_to_string(&path).map_err(|source| Error::Io {
+                lib: spec.name,
+                path,
+                source,
+            })?;
             let ids = interface_ids(&text);
             for (stem, _, loader_fn, api) in apis {
                 let generated = query_shims(spec.name, &api, loader_fn, &ids, returns)?;
                 symbols.extend(generated.bound);
                 unshimmed.extend(generated.unshimmed);
-                parts.push(GeneratedPart { stem, api: None, shims: generated.source });
+                parts.push(GeneratedPart {
+                    stem,
+                    api: None,
+                    shims: generated.source,
+                });
             }
         }
         Shape::FunctionTable { table_type } => symbols = inventory(spec.name, &types, table_type)?,
@@ -540,24 +833,42 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
             let src = externs.unwrap_or_default();
             symbols = extern_fns(spec.name, &src)?.0;
             // The `extern` block takes the place of shims: nothing is loaded at runtime.
-            parts.push(GeneratedPart { stem: String::new(), api: None, shims: src });
+            parts.push(GeneratedPart {
+                stem: String::new(),
+                api: None,
+                shims: src,
+            });
         }
     }
     symbols.sort();
     symbols.dedup();
     unshimmed.sort();
 
-    Ok(Output { types, parts, inventory: Inventory { lib: spec.name.to_string(), headers, symbols, unshimmed } })
+    Ok(Output {
+        types,
+        parts,
+        inventory: Inventory {
+            lib: spec.name.to_string(),
+            headers,
+            symbols,
+            unshimmed,
+        },
+    })
 }
 
 /// Names of the functions declared in `extern` blocks of `source`, and every single-segment type
 /// their signatures name (for the types pass).
 fn extern_fns(lib: &'static str, source: &str) -> Result<(Vec<String>, Vec<String>), Error> {
-    let file = syn::parse_file(source).map_err(|e| Error::Generated { lib, msg: e.to_string() })?;
+    let file = syn::parse_file(source).map_err(|e| Error::Generated {
+        lib,
+        msg: e.to_string(),
+    })?;
     let mut names = Vec::new();
     let mut types = Vec::new();
     for item in &file.items {
-        let Item::ForeignMod(block) = item else { continue };
+        let Item::ForeignMod(block) = item else {
+            continue;
+        };
         for f in &block.items {
             let syn::ForeignItem::Fn(f) = f else { continue };
             names.push(f.sig.ident.to_string());
@@ -582,10 +893,23 @@ const QI_SIGNATURES: &str = "NvBindgenQiSignatures";
 pub fn interface_ids(text: &str) -> Vec<(String, u32)> {
     text.lines()
         .filter_map(|line| {
-            let rest = line.trim().strip_prefix('{')?.trim_start().strip_prefix('"')?;
+            let rest = line
+                .trim()
+                .strip_prefix('{')?
+                .trim_start()
+                .strip_prefix('"')?;
             let (name, rest) = rest.split_once('"')?;
-            let hex = rest.trim_start().strip_prefix(',')?.trim().trim_end_matches(['}', ',', ' ']).trim();
-            let id = u32::from_str_radix(hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?, 16).ok()?;
+            let hex = rest
+                .trim_start()
+                .strip_prefix(',')?
+                .trim()
+                .trim_end_matches(['}', ',', ' '])
+                .trim();
+            let id = u32::from_str_radix(
+                hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?,
+                16,
+            )
+            .ok()?;
             Some((name.to_string(), id))
         })
         .collect()
@@ -616,7 +940,8 @@ pub fn query_shims(
 ) -> Result<QueryShims, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let file = syn::parse_file(signatures_source).map_err(|e| gen_err(e.to_string()))?;
-    let sigs = find_struct(&file, QI_SIGNATURES).ok_or_else(|| gen_err(format!("no struct {QI_SIGNATURES}")))?;
+    let sigs = find_struct(&file, QI_SIGNATURES)
+        .ok_or_else(|| gen_err(format!("no struct {QI_SIGNATURES}")))?;
     let loader = format_ident!("{loader_fn}");
     let policies = parse_return_policies(lib, returns)?;
     let Fields::Named(fields) = &sigs.fields else {
@@ -627,8 +952,14 @@ pub fn query_shims(
     let mut unshimmed = Vec::new();
     let mut fns: Vec<TokenStream> = Vec::new();
     for field in &fields.named {
-        let (Some(name), Some(bare)) = (field.ident.as_ref(), result_bare_fn(&field.ty)) else { continue };
-        let Some(id) = ids.iter().find(|(n, _)| n == &name.to_string()).map(|(_, id)| *id) else {
+        let (Some(name), Some(bare)) = (field.ident.as_ref(), result_bare_fn(&field.ty)) else {
+            continue;
+        };
+        let Some(id) = ids
+            .iter()
+            .find(|(n, _)| n == &name.to_string())
+            .map(|(_, id)| *id)
+        else {
             unshimmed.push(name.to_string());
             continue;
         };
@@ -637,7 +968,13 @@ pub fn query_shims(
             unshimmed.push(name.to_string());
         }
         let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(None));
-        let WrapperPlan { abi, ret, on_missing, on_not_loaded, mode } = plan;
+        let WrapperPlan {
+            abi,
+            ret,
+            on_missing,
+            on_not_loaded,
+            mode,
+        } = plan;
         let args = shim_args(bare);
         let names = args.iter().map(|(n, _)| n);
         let defs = args.iter().map(|(_, d)| d);
@@ -666,10 +1003,15 @@ pub fn query_shims(
         });
         bound.push(name.to_string());
     }
-    let parsed: syn::File = syn::parse2(quote!(#(#fns)*)).map_err(|e| gen_err(format!("shims: {e}")))?;
+    let parsed: syn::File =
+        syn::parse2(quote!(#(#fns)*)).map_err(|e| gen_err(format!("shims: {e}")))?;
     bound.sort();
     unshimmed.sort();
-    Ok(QueryShims { source: prettyplease::unparse(&parsed), bound, unshimmed })
+    Ok(QueryShims {
+        source: prettyplease::unparse(&parsed),
+        bound,
+        unshimmed,
+    })
 }
 
 /// Escapes regex metacharacters in a file name (`.` in `nppcore.h`).
@@ -701,7 +1043,10 @@ struct ParsedReturnPolicy<'a> {
 }
 
 /// Validate and parse once, before visiting any entry points.
-fn parse_return_policies<'a>(lib: &'static str, returns: &[ReturnPolicy<'a>]) -> Result<Vec<ParsedReturnPolicy<'a>>, Error> {
+fn parse_return_policies<'a>(
+    lib: &'static str,
+    returns: &[ReturnPolicy<'a>],
+) -> Result<Vec<ParsedReturnPolicy<'a>>, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let mut names = Vec::new();
     let mut parsed = Vec::with_capacity(returns.len());
@@ -710,15 +1055,22 @@ fn parse_return_policies<'a>(lib: &'static str, returns: &[ReturnPolicy<'a>]) ->
             return Err(gen_err("return policy has no types".into()));
         }
         for name in policy.types {
-            syn::parse_str::<proc_macro2::Ident>(name).map_err(|e| gen_err(format!("return type {name:?}: {e}")))?;
+            syn::parse_str::<proc_macro2::Ident>(name)
+                .map_err(|e| gen_err(format!("return type {name:?}: {e}")))?;
             if names.contains(name) {
                 return Err(gen_err(format!("duplicate return policy for {name}")));
             }
             names.push(*name);
         }
-        let not_loaded = syn::parse_str(policy.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
-        let missing_symbol = syn::parse_str(policy.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
-        parsed.push(ParsedReturnPolicy { types: policy.types, not_loaded, missing_symbol });
+        let not_loaded =
+            syn::parse_str(policy.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
+        let missing_symbol = syn::parse_str(policy.missing_symbol)
+            .map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+        parsed.push(ParsedReturnPolicy {
+            types: policy.types,
+            not_loaded,
+            missing_symbol,
+        });
     }
     Ok(parsed)
 }
@@ -735,7 +1087,10 @@ pub struct Shims {
 /// Native failure values, when the return contract defines one.
 enum Fallback<'a> {
     /// Expressions from the matching policy.
-    Policy { not_loaded: &'a Expr, missing_symbol: &'a Expr },
+    Policy {
+        not_loaded: &'a Expr,
+        missing_symbol: &'a Expr,
+    },
     /// A null pointer (`*const` / `*mut`).
     Null { mutable: bool },
 }
@@ -744,12 +1099,18 @@ fn fallback<'a>(ret: &ReturnType, policies: &'a [ParsedReturnPolicy<'_>]) -> Opt
     match ret {
         ReturnType::Default => None,
         ReturnType::Type(_, ty) => match ty.as_ref() {
-            Type::Ptr(p) => Some(Fallback::Null { mutable: p.mutability.is_some() }),
+            Type::Ptr(p) => Some(Fallback::Null {
+                mutable: p.mutability.is_some(),
+            }),
             Type::Path(p) => {
                 let last = p.path.segments.last()?.ident.to_string();
-                policies.iter().find(|policy| policy.types.contains(&last.as_str())).map(|policy| {
-                    Fallback::Policy { not_loaded: &policy.not_loaded, missing_symbol: &policy.missing_symbol }
-                })
+                policies
+                    .iter()
+                    .find(|policy| policy.types.contains(&last.as_str()))
+                    .map(|policy| Fallback::Policy {
+                        not_loaded: &policy.not_loaded,
+                        missing_symbol: &policy.missing_symbol,
+                    })
             }
             _ => None,
         },
@@ -783,15 +1144,29 @@ struct WrapperPlan {
 }
 
 /// The same ABI and failure-value decision for exports and query-interface functions.
-fn wrapper_plan(ret: &ReturnType, fb: Option<Fallback<'_>>, lib: &'static str, name: &proc_macro2::Ident, source: TokenStream) -> WrapperPlan {
+fn wrapper_plan(
+    ret: &ReturnType,
+    fb: Option<Fallback<'_>>,
+    lib: &'static str,
+    name: &proc_macro2::Ident,
+    source: TokenStream,
+) -> WrapperPlan {
     let native_ret = match ret {
         ReturnType::Default => quote!(),
         ReturnType::Type(_, ty) => quote!(-> #ty),
     };
     let (on_missing, on_not_loaded) = match fb {
-        Some(Fallback::Policy { not_loaded, missing_symbol }) => (quote!(#missing_symbol), quote!(#not_loaded)),
-        Some(Fallback::Null { mutable: false }) => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
-        Some(Fallback::Null { mutable: true }) => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
+        Some(Fallback::Policy {
+            not_loaded,
+            missing_symbol,
+        }) => (quote!(#missing_symbol), quote!(#not_loaded)),
+        Some(Fallback::Null { mutable: false }) => {
+            (quote!(::core::ptr::null()), quote!(::core::ptr::null()))
+        }
+        Some(Fallback::Null { mutable: true }) => (
+            quote!(::core::ptr::null_mut()),
+            quote!(::core::ptr::null_mut()),
+        ),
         None => {
             let (mode, ty) = match ret {
                 ReturnType::Default => (WrapMode::CheckedVoid, quote!(())),
@@ -803,21 +1178,37 @@ fn wrapper_plan(ret: &ReturnType, fb: Option<Fallback<'_>>, lib: &'static str, n
                 on_missing: quote!(::core::result::Result::Err(nv_loader::CallError::symbol(
                     #lib, stringify!(#name), #source,
                 ))),
-                on_not_loaded: quote!(::core::result::Result::Err(nv_loader::CallError::Load(__nv_error))),
+                on_not_loaded: quote!(::core::result::Result::Err(nv_loader::CallError::Load(
+                    __nv_error
+                ))),
                 mode,
             };
         }
     };
-    WrapperPlan { abi: quote!(extern "C"), ret: native_ret, on_missing, on_not_loaded, mode: WrapMode::Native }
+    WrapperPlan {
+        abi: quote!(extern "C"),
+        ret: native_ret,
+        on_missing,
+        on_not_loaded,
+        mode: WrapMode::Native,
+    }
 }
 
 /// Keep C parameter names intact; unnamed parameters receive deterministic private names.
 fn shim_args(bare: &TypeBareFn) -> Vec<(proc_macro2::Ident, TokenStream)> {
-    bare.inputs.iter().enumerate().map(|(i, arg)| {
-        let name = arg.name.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(|| format_ident!("arg_{i}"));
-        let ty = &arg.ty;
-        (name.clone(), quote!(#name: #ty))
-    }).collect()
+    bare.inputs
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let name = arg
+                .name
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| format_ident!("arg_{i}"));
+            let ty = &arg.ty;
+            (name.clone(), quote!(#name: #ty))
+        })
+        .collect()
 }
 
 /// Panic-free functions for the function-pointer fields of `api_type`.
@@ -825,10 +1216,17 @@ fn shim_args(bare: &TypeBareFn) -> Vec<(proc_macro2::Ident, TokenStream)> {
 /// Policies and pointers preserve the native C ABI. Functions without a native failure
 /// value use their original name with a Rust ABI and return `Result<T, nv_loader::CallError>`.
 /// They remain in [`Shims::unshimmed`] because no native C ABI shim exists.
-pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &str, returns: &[ReturnPolicy<'_>]) -> Result<Shims, Error> {
+pub fn shims(
+    lib: &'static str,
+    api_source: &str,
+    api_type: &str,
+    loader_fn: &str,
+    returns: &[ReturnPolicy<'_>],
+) -> Result<Shims, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let file = syn::parse_file(api_source).map_err(|e| gen_err(e.to_string()))?;
-    let api = find_struct(&file, api_type).ok_or_else(|| gen_err(format!("no struct {api_type}")))?;
+    let api =
+        find_struct(&file, api_type).ok_or_else(|| gen_err(format!("no struct {api_type}")))?;
     let loader = format_ident!("{loader_fn}");
     let policies = parse_return_policies(lib, returns)?;
 
@@ -836,46 +1234,65 @@ pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &st
         return Err(gen_err(format!("{api_type} has no named fields")));
     };
     let mut unshimmed = Vec::new();
-    let fns: Vec<TokenStream> = fields.named.iter().filter_map(|field| {
-        let name = field.ident.as_ref()?;
-        let bare = result_bare_fn(&field.ty)?;
-        let fb = fallback(&bare.output, &policies);
-        if fb.is_none() {
-            unshimmed.push(name.to_string());
-        }
-        let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(Some(__nv_error)));
-        let WrapperPlan { abi, ret, on_missing, on_not_loaded, mode } = plan;
-        let args = shim_args(bare);
-        let names = args.iter().map(|(n, _)| n);
-        let defs = args.iter().map(|(_, d)| d);
-        let result = mode.wrap_call(quote!(unsafe { (*__nv_fn)(#(#names),*) }));
-        Some(quote! {
-            #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
-            #[inline]
-            pub unsafe #abi fn #name(#(#defs),*) #ret {
-                match #loader() {
-                    // SAFETY: the caller upholds the native contract and the pointer's library
-                    // remains loaded for the process. Private names avoid C parameter shadowing.
-                    Ok(__nv_api) => match &__nv_api.#name {
-                        Ok(__nv_fn) => #result,
-                        Err(__nv_error) => #on_missing,
-                    },
-                    Err(__nv_error) => #on_not_loaded,
-                }
+    let fns: Vec<TokenStream> = fields
+        .named
+        .iter()
+        .filter_map(|field| {
+            let name = field.ident.as_ref()?;
+            let bare = result_bare_fn(&field.ty)?;
+            let fb = fallback(&bare.output, &policies);
+            if fb.is_none() {
+                unshimmed.push(name.to_string());
             }
+            let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(Some(__nv_error)));
+            let WrapperPlan {
+                abi,
+                ret,
+                on_missing,
+                on_not_loaded,
+                mode,
+            } = plan;
+            let args = shim_args(bare);
+            let names = args.iter().map(|(n, _)| n);
+            let defs = args.iter().map(|(_, d)| d);
+            let result = mode.wrap_call(quote!(unsafe { (*__nv_fn)(#(#names),*) }));
+            Some(quote! {
+                #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
+                #[inline]
+                pub unsafe #abi fn #name(#(#defs),*) #ret {
+                    match #loader() {
+                        // SAFETY: the caller upholds the native contract and the pointer's library
+                        // remains loaded for the process. Private names avoid C parameter shadowing.
+                        Ok(__nv_api) => match &__nv_api.#name {
+                            Ok(__nv_fn) => #result,
+                            Err(__nv_error) => #on_missing,
+                        },
+                        Err(__nv_error) => #on_not_loaded,
+                    }
+                }
+            })
         })
-    }).collect();
+        .collect();
     let tokens = quote!(#(#fns)*);
     let parsed: syn::File = syn::parse2(tokens).map_err(|e| gen_err(format!("shims: {e}")))?;
     unshimmed.sort();
-    Ok(Shims { source: prettyplease::unparse(&parsed), unshimmed })
+    Ok(Shims {
+        source: prettyplease::unparse(&parsed),
+        unshimmed,
+    })
 }
 
 /// Sorted entry-point names: the function-pointer fields of `struct_name` in `source` (bindgen's
 /// dynamic-loading struct wraps them in `Result<fn, _>`, a function table holds `Option<fn>`).
 pub fn inventory(lib: &'static str, source: &str, struct_name: &str) -> Result<Vec<String>, Error> {
-    let file = syn::parse_file(source).map_err(|e| Error::Generated { lib, msg: e.to_string() })?;
-    let s = find_struct(&file, struct_name).ok_or_else(|| Error::Generated { lib, msg: format!("no struct {struct_name}") })?;
+    let file = syn::parse_file(source).map_err(|e| Error::Generated {
+        lib,
+        msg: e.to_string(),
+    })?;
+    let s = find_struct(&file, struct_name).ok_or_else(|| Error::Generated {
+        lib,
+        msg: format!("no struct {struct_name}"),
+    })?;
     let Fields::Named(fields) = &s.fields else {
         return Ok(Vec::new());
     };
@@ -886,18 +1303,24 @@ pub fn inventory(lib: &'static str, source: &str, struct_name: &str) -> Result<V
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Type(t) if option_bare_fn(&t.ty).is_some() || result_bare_fn(&t.ty).is_some() => Some(t.ident.to_string()),
+            Item::Type(t) if option_bare_fn(&t.ty).is_some() || result_bare_fn(&t.ty).is_some() => {
+                Some(t.ident.to_string())
+            }
             _ => None,
         })
         .collect();
     let is_fn_alias = |ty: &Type| match ty {
-        Type::Path(p) if p.path.segments.len() == 1 => fn_aliases.iter().any(|a| p.path.segments[0].ident == a.as_str()),
+        Type::Path(p) if p.path.segments.len() == 1 => fn_aliases
+            .iter()
+            .any(|a| p.path.segments[0].ident == a.as_str()),
         _ => false,
     };
     let mut names: Vec<String> = fields
         .named
         .iter()
-        .filter(|f| result_bare_fn(&f.ty).is_some() || option_bare_fn(&f.ty).is_some() || is_fn_alias(&f.ty))
+        .filter(|f| {
+            result_bare_fn(&f.ty).is_some() || option_bare_fn(&f.ty).is_some() || is_fn_alias(&f.ty)
+        })
         .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
         .collect();
     names.sort();
@@ -907,9 +1330,19 @@ pub fn inventory(lib: &'static str, source: &str, struct_name: &str) -> Result<V
 /// Every single-segment type name used in the entry-point signatures of `api_type` (bindgen's
 /// own aliases such as `cudaStream_t`; `::std::os::raw::*` paths have several segments and are
 /// skipped), sorted and deduplicated.
-pub fn signature_types(lib: &'static str, api_source: &str, api_type: &str) -> Result<Vec<String>, Error> {
-    let file = syn::parse_file(api_source).map_err(|e| Error::Generated { lib, msg: e.to_string() })?;
-    let s = find_struct(&file, api_type).ok_or_else(|| Error::Generated { lib, msg: format!("no struct {api_type}") })?;
+pub fn signature_types(
+    lib: &'static str,
+    api_source: &str,
+    api_type: &str,
+) -> Result<Vec<String>, Error> {
+    let file = syn::parse_file(api_source).map_err(|e| Error::Generated {
+        lib,
+        msg: e.to_string(),
+    })?;
+    let s = find_struct(&file, api_type).ok_or_else(|| Error::Generated {
+        lib,
+        msg: format!("no struct {api_type}"),
+    })?;
     let mut names = Vec::new();
     if let Fields::Named(fields) = &s.fields {
         for f in fields.named.iter().filter_map(|f| result_bare_fn(&f.ty)) {
@@ -981,7 +1414,9 @@ fn wrapped_bare_fn<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a TypeBareFn> {
     if seg.ident != wrapper {
         return None;
     }
-    let PathArguments::AngleBracketed(args) = &seg.arguments else { return None };
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
     match args.args.first() {
         Some(GenericArgument::Type(Type::BareFn(f))) => Some(f),
         _ => None,
@@ -1049,16 +1484,26 @@ struct SdkPaths {
 fn sdk_path_str<'a>(lib: &'static str, path: &'a Path) -> Result<&'a str, Error> {
     match path.to_str() {
         Some(text) if !text.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) => Ok(text),
-        _ => Err(Error::InvalidSdkPath { lib, path: path.to_path_buf() }),
+        _ => Err(Error::InvalidSdkPath {
+            lib,
+            path: path.to_path_buf(),
+        }),
     }
 }
 
 fn sdk_target_arch(lib: &'static str, requested: Option<&OsStr>) -> Result<vcv_rs::Arch, Error> {
     match requested {
-        Some(value) => value.to_str().and_then(vcv_rs::Arch::from_target_arch)
-            .ok_or_else(|| Error::UnsupportedTarget { lib, arch: value.to_string_lossy().into_owned() }),
-        None => vcv_rs::Arch::native()
-            .ok_or_else(|| Error::UnsupportedTarget { lib, arch: std::env::consts::ARCH.to_string() }),
+        Some(value) => value
+            .to_str()
+            .and_then(vcv_rs::Arch::from_target_arch)
+            .ok_or_else(|| Error::UnsupportedTarget {
+                lib,
+                arch: value.to_string_lossy().into_owned(),
+            }),
+        None => vcv_rs::Arch::native().ok_or_else(|| Error::UnsupportedTarget {
+            lib,
+            arch: std::env::consts::ARCH.to_string(),
+        }),
     }
 }
 
@@ -1069,56 +1514,87 @@ fn sdk_paths(spec: &LibSpec) -> Result<SdkPaths, Error> {
     let cargo_arch = std::env::var_os("CARGO_CFG_TARGET_ARCH");
     for sdk in spec.sdks {
         let dir = match sdk {
-            Sdk::CudaToolkit => vcv_rs::detect_cuda().map(|c| c.include_dir()).ok_or_else(|| Error::SdkNotFound {
-                lib: spec.name,
-                sdk: "CUDA Toolkit".into(),
-                hint: "set CUDA_PATH or install the toolkit".into(),
-            })?,
+            Sdk::CudaToolkit => {
+                vcv_rs::detect_cuda()
+                    .map(|c| c.include_dir())
+                    .ok_or_else(|| Error::SdkNotFound {
+                        lib: spec.name,
+                        sdk: "CUDA Toolkit".into(),
+                        hint: "set CUDA_PATH or install the toolkit".into(),
+                    })?
+            }
             Sdk::Nv(kind) => {
                 let target = sdk_target_arch(spec.name, cargo_arch.as_deref())?;
-                let info = vcv_rs::nvsdk::detect(*kind, target).ok_or_else(|| Error::SdkNotFound {
-                    lib: spec.name,
-                    sdk: kind.name().into(),
-                    hint: match kind.requested_root() {
-                        Some(request) => format!("configured {}={:?} is not usable for {target}", request.variable, request.path),
-                        None => format!("check {:?} or NV_SDK_DIRS for a native SDK on {}", kind.root_vars(), std::env::consts::OS),
-                    },
-                })?;
+                let info =
+                    vcv_rs::nvsdk::detect(*kind, target).ok_or_else(|| Error::SdkNotFound {
+                        lib: spec.name,
+                        sdk: kind.name().into(),
+                        hint: match kind.requested_root() {
+                            Some(request) => format!(
+                                "configured {}={:?} is not usable for {target}",
+                                request.variable, request.path
+                            ),
+                            None => format!(
+                                "check {:?} or NV_SDK_DIRS for a native SDK on {}",
+                                kind.root_vars(),
+                                std::env::consts::OS
+                            ),
+                        },
+                    })?;
                 for path in [&info.runtime_dir, &info.lib_dir].into_iter().flatten() {
                     sdk_path_str(spec.name, path)?;
                 }
                 let include = info.include_dir.clone();
                 nvidia.push(info);
                 include
-            },
-            Sdk::CudaToolkitSubdir(rel) => vcv_rs::detect_cuda().map(|c| c.root.join(rel)).ok_or_else(|| Error::SdkNotFound {
-                lib: spec.name,
-                sdk: "CUDA Toolkit".into(),
-                hint: "set CUDA_PATH or install the toolkit".into(),
-            })?,
-            Sdk::Optix => vcv_rs::optix::detect_optix().map(|o| o.include_dir()).ok_or_else(|| Error::SdkNotFound {
-                lib: spec.name,
-                sdk: "OptiX SDK".into(),
-                hint: "set OPTIX_ROOT or install the OptiX SDK".into(),
-            })?,
+            }
+            Sdk::CudaToolkitSubdir(rel) => vcv_rs::detect_cuda()
+                .map(|c| c.root.join(rel))
+                .ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: "CUDA Toolkit".into(),
+                    hint: "set CUDA_PATH or install the toolkit".into(),
+                })?,
+            Sdk::Optix => vcv_rs::optix::detect_optix()
+                .map(|o| o.include_dir())
+                .ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: "OptiX SDK".into(),
+                    hint: "set OPTIX_ROOT or install the OptiX SDK".into(),
+                })?,
             Sdk::EnvRoot(var) => std::env::var_os(var)
                 .filter(|v| !v.is_empty())
                 .map(|root| Path::new(&root).join("include"))
-                .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*var).to_string(), hint: format!("set {var}") })?,
+                .ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: (*var).to_string(),
+                    hint: format!("set {var}"),
+                })?,
             Sdk::EnvRootSubdir { var, subdir } => std::env::var_os(var)
                 .filter(|v| !v.is_empty())
                 .map(|root| Path::new(&root).join(subdir))
-                .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*var).to_string(), hint: format!("set {var}") })?,
+                .ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: (*var).to_string(),
+                    hint: format!("set {var}"),
+                })?,
             Sdk::CrateDir(rel) => std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(|m| Path::new(&m).join(rel))
-                .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*rel).to_string(), hint: "CARGO_MANIFEST_DIR unset".into() })?,
+                .ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: (*rel).to_string(),
+                    hint: "CARGO_MANIFEST_DIR unset".into(),
+                })?,
         };
         sdk_path_str(spec.name, &dir)?;
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
-    Ok(SdkPaths { includes: dirs, nvidia })
+    Ok(SdkPaths {
+        includes: dirs,
+        nvidia,
+    })
 }
 
 /// MSVC + Windows SDK + UCRT include directories from vcv-rs, so libclang finds `stddef.h` & co.
@@ -1131,7 +1607,14 @@ fn system_include_dirs() -> Vec<PathBuf> {
         };
         let sdk = vcv_rs::detect::detect_sdk();
         let ucrt = vcv_rs::detect::detect_ucrt();
-        vcv_rs::env::build_env(&vs, sdk.as_ref(), ucrt.as_ref(), vcv_rs::Arch::X64, vcv_rs::Arch::X64).include
+        vcv_rs::env::build_env(
+            &vs,
+            sdk.as_ref(),
+            ucrt.as_ref(),
+            vcv_rs::Arch::X64,
+            vcv_rs::Arch::X64,
+        )
+        .include
     }
     #[cfg(not(windows))]
     {
@@ -1178,7 +1661,11 @@ mod tests {
     };
 
     fn fixture() -> Vec<PathBuf> {
-        vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixture")]
+        vec![
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixture"),
+        ]
     }
 
     #[test]
@@ -1186,7 +1673,10 @@ mod tests {
         for bad in ["SDK\ninclude", "SDK\rinclude", "SDK\0include"] {
             let paths = [PathBuf::from(bad)];
             for (includes, system) in [(paths.as_slice(), &[][..]), (&[][..], paths.as_slice())] {
-                assert!(matches!(bindings(&FAKE, includes, system), Err(Error::InvalidSdkPath { .. })));
+                assert!(matches!(
+                    bindings(&FAKE, includes, system),
+                    Err(Error::InvalidSdkPath { .. })
+                ));
             }
         }
     }
@@ -1198,13 +1688,17 @@ mod tests {
             ..FAKE
         };
         let vars = rerun_vars(&spec);
-        for input in vcv_rs::cuda::root_vars().iter()
+        for input in vcv_rs::cuda::root_vars()
+            .iter()
             .chain(vcv_rs::optix::root_vars())
             .chain(Kind::Nvcomp.root_vars())
             .copied()
             .chain(["NV_SDK_DIRS", "PATH", "ProgramFiles", "ProgramData"])
         {
-            assert!(vars.contains(&input), "discovery input {input} must rerun generation");
+            assert!(
+                vars.contains(&input),
+                "discovery input {input} must rerun generation"
+            );
         }
     }
 
@@ -1215,28 +1709,48 @@ mod tests {
             ("x86", vcv_rs::Arch::X86),
             ("aarch64", vcv_rs::Arch::Arm64),
         ] {
-            assert_eq!(sdk_target_arch("fake", Some(OsStr::new(name))).expect("supported target"), expected);
+            assert_eq!(
+                sdk_target_arch("fake", Some(OsStr::new(name))).expect("supported target"),
+                expected
+            );
         }
-        assert!(matches!(sdk_target_arch("fake", Some(OsStr::new("riscv64"))), Err(Error::UnsupportedTarget { .. })));
-        assert_eq!(sdk_target_arch("fake", None).expect("native target"), vcv_rs::Arch::native().expect("supported test host"));
+        assert!(matches!(
+            sdk_target_arch("fake", Some(OsStr::new("riscv64"))),
+            Err(Error::UnsupportedTarget { .. })
+        ));
+        assert_eq!(
+            sdk_target_arch("fake", None).expect("native target"),
+            vcv_rs::Arch::native().expect("supported test host")
+        );
     }
 
     #[test]
     fn sdk_paths_cannot_inject_cargo_instructions() {
-        assert_eq!(sdk_path_str("fake", Path::new("SDK with spaces/include")).expect("ordinary path"), "SDK with spaces/include");
+        assert_eq!(
+            sdk_path_str("fake", Path::new("SDK with spaces/include")).expect("ordinary path"),
+            "SDK with spaces/include"
+        );
         for bad in ["SDK\ninclude", "SDK\rinclude", "SDK\0include"] {
-            assert!(matches!(sdk_path_str("fake", Path::new(bad)), Err(Error::InvalidSdkPath { .. })));
+            assert!(matches!(
+                sdk_path_str("fake", Path::new(bad)),
+                Err(Error::InvalidSdkPath { .. })
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            assert!(matches!(sdk_path_str("fake", Path::new(OsStr::from_bytes(b"SDK\xff/include"))), Err(Error::InvalidSdkPath { .. })));
+            assert!(matches!(
+                sdk_path_str("fake", Path::new(OsStr::from_bytes(b"SDK\xff/include"))),
+                Err(Error::InvalidSdkPath { .. })
+            ));
         }
     }
 
     fn fn_slice<'a>(shims: &'a str, name: &str) -> &'a str {
         let marker = format!("pub unsafe fn {name}(");
-        let start = shims.find(&marker).unwrap_or_else(|| panic!("missing {marker}"));
+        let start = shims
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing {marker}"));
         let tail = &shims[start..];
         let end = tail.find("#[allow(").unwrap_or(tail.len());
         &tail[..end]
@@ -1247,14 +1761,42 @@ mod tests {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
         assert_eq!(
             out.inventory.symbols,
-            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeIo", "fakeMissingNumber", "fakeReset", "fakeShadow", "fakeStore", "fakeTransfer", "fakeVersionNumber"]
+            [
+                "fakeCtxCreate",
+                "fakeErrorString",
+                "fakeGetCount",
+                "fakeInit",
+                "fakeIo",
+                "fakeMissingNumber",
+                "fakeReset",
+                "fakeShadow",
+                "fakeStore",
+                "fakeTransfer",
+                "fakeVersionNumber"
+            ]
         );
         // These have checked Rust wrappers, never native C shims with made-up return values.
-        assert_eq!(out.inventory.unshimmed, ["fakeMissingNumber", "fakeReset", "fakeStore", "fakeVersionNumber"]);
+        assert_eq!(
+            out.inventory.unshimmed,
+            [
+                "fakeMissingNumber",
+                "fakeReset",
+                "fakeStore",
+                "fakeVersionNumber"
+            ]
+        );
         assert_eq!(out.parts.len(), 1, "a single-DLL library has one part");
         let shims = &out.parts[0].shims;
-        for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount", "fakeErrorString"] {
-            assert!(shims.contains(&format!("pub unsafe extern \"C\" fn {f}(")), "shim for {f}");
+        for f in [
+            "fakeInit",
+            "fakeCtxCreate",
+            "fakeGetCount",
+            "fakeErrorString",
+        ] {
+            assert!(
+                shims.contains(&format!("pub unsafe extern \"C\" fn {f}(")),
+                "shim for {f}"
+            );
         }
         assert!(shims.contains("pub unsafe fn fakeVersionNumber("));
         assert!(shims.contains("pub unsafe fn fakeReset("));
@@ -1262,12 +1804,18 @@ mod tests {
         assert!(!shims.contains("pub unsafe extern \"C\" fn fakeVersionNumber("));
         for void_fn in ["fakeReset", "fakeStore"] {
             let body = fn_slice(shims, void_fn);
-            assert!(!body.contains("::core::result::Result::Ok(unsafe"), "{void_fn} must not pass unit into Ok(...)");
+            assert!(
+                !body.contains("::core::result::Result::Ok(unsafe"),
+                "{void_fn} must not pass unit into Ok(...)"
+            );
             assert!(body.contains("::core::result::Result::Ok(())"), "{body}");
         }
         // A pointer return falls back to null, not to a status code of the wrong type.
         assert!(shims.contains("::core::ptr::null()"), "{shims}");
-        assert!(!shims.contains("notFakeHelper"), "allowlist must exclude other functions");
+        assert!(
+            !shims.contains("notFakeHelper"),
+            "allowlist must exclude other functions"
+        );
         // Mutation that reddens this: drop either error arm, or let a shim fall back to a panic.
         assert!(shims.contains("fakeStatus_enum_FAKE_ERROR_NOT_LOADED"));
         assert!(shims.contains("fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL"));
@@ -1277,9 +1825,17 @@ mod tests {
     #[test]
     fn types_exclude_functions_and_pin_positive_enums() {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
-        assert!(out.types.contains("pub type fakeStatus_enum = ::core::ffi::c_uint;"), "{}", out.types);
+        assert!(
+            out.types
+                .contains("pub type fakeStatus_enum = ::core::ffi::c_uint;"),
+            "{}",
+            out.types
+        );
         assert!(out.types.contains("FAKE_VERSION"));
-        assert!(!out.types.contains("pub fn fakeInit"), "types pass must not declare functions");
+        assert!(
+            !out.types.contains("pub fn fakeInit"),
+            "types pass must not declare functions"
+        );
     }
 
     #[test]
@@ -1298,21 +1854,43 @@ pub type signedErr = ::std::os::raw::c_int;\n";
     fn inventory_hashes_the_header_bytes() {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
         let bytes = std::fs::read(fixture()[0].join("fake.h")).expect("fixture");
-        assert_eq!(out.inventory.headers, vec![HeaderHash { name: "fake.h".into(), sha256: hex(&Sha256::digest(&bytes)) }]);
+        assert_eq!(
+            out.inventory.headers,
+            vec![HeaderHash {
+                name: "fake.h".into(),
+                sha256: hex(&Sha256::digest(&bytes))
+            }]
+        );
     }
 
     #[test]
     fn a_missing_header_names_every_searched_directory() {
-        let spec = LibSpec { headers: &["absent.h"], ..FAKE };
+        let spec = LibSpec {
+            headers: &["absent.h"],
+            ..FAKE
+        };
         let err = bindings(&spec, &fixture(), &[]).expect_err("no such header");
-        assert!(matches!(err, Error::HeaderNotFound { ref searched, .. } if searched == &fixture()), "{err}");
+        assert!(
+            matches!(err, Error::HeaderNotFound { ref searched, .. } if searched == &fixture()),
+            "{err}"
+        );
     }
 
     #[test]
     fn split_exports_give_each_dll_only_its_own_headers_functions() {
         const PARTS: &[ExportPart] = &[
-            ExportPart { name: "a", api_type: "SplitAApi", loader_fn: "split_a_api", header_files: &["split_a.h"] },
-            ExportPart { name: "b", api_type: "SplitBApi", loader_fn: "split_b_api", header_files: &["split_b.h"] },
+            ExportPart {
+                name: "a",
+                api_type: "SplitAApi",
+                loader_fn: "split_a_api",
+                header_files: &["split_a.h"],
+            },
+            ExportPart {
+                name: "b",
+                api_type: "SplitBApi",
+                loader_fn: "split_b_api",
+                header_files: &["split_b.h"],
+            },
         ];
         let spec = LibSpec {
             name: "split",
@@ -1332,15 +1910,30 @@ pub type signedErr = ::std::os::raw::c_int;\n";
             ..FAKE
         };
         let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("split fixture binds");
-        assert_eq!(out.inventory.symbols, ["splitAlpha", "splitAlphaToo", "splitBeta"]);
+        assert_eq!(
+            out.inventory.symbols,
+            ["splitAlpha", "splitAlphaToo", "splitBeta"]
+        );
         let stems: Vec<&str> = out.parts.iter().map(|p| p.stem.as_str()).collect();
         assert_eq!(stems, ["_a", "_b"]);
         // Mutation that reddens this: apply `allow_fn` to split parts (bindgen allowlists are a
         // union, so every part would get every function).
-        assert!(out.parts[0].shims.contains("fn splitAlpha(") && !out.parts[0].shims.contains("fn splitBeta("));
-        assert!(out.parts[1].shims.contains("fn splitBeta(") && !out.parts[1].shims.contains("fn splitAlpha("));
-        assert!(out.parts[0].shims.contains("split_a_api()") && out.parts[1].shims.contains("split_b_api()"));
-        assert!(out.types.contains("splitStatus_enum_SPLIT_SUCCESS"), "shared types are generated once");
+        assert!(
+            out.parts[0].shims.contains("fn splitAlpha(")
+                && !out.parts[0].shims.contains("fn splitBeta(")
+        );
+        assert!(
+            out.parts[1].shims.contains("fn splitBeta(")
+                && !out.parts[1].shims.contains("fn splitAlpha(")
+        );
+        assert!(
+            out.parts[0].shims.contains("split_a_api()")
+                && out.parts[1].shims.contains("split_b_api()")
+        );
+        assert!(
+            out.types.contains("splitStatus_enum_SPLIT_SUCCESS"),
+            "shared types are generated once"
+        );
     }
 
     #[test]
@@ -1364,16 +1957,48 @@ pub type signedErr = ::std::os::raw::c_int;\n";
             ..FAKE
         };
         let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("qi fixture binds");
-        assert_eq!(out.inventory.symbols, ["qiAbsentNumber", "qiGetValue", "qiInitialize", "qiMissingStore", "qiStore", "qiVersionNumber"]);
+        assert_eq!(
+            out.inventory.symbols,
+            [
+                "qiAbsentNumber",
+                "qiGetValue",
+                "qiInitialize",
+                "qiMissingStore",
+                "qiStore",
+                "qiVersionNumber"
+            ]
+        );
         // Checked numeric/void functions plus the declaration lacking a query id have no C shim.
-        assert_eq!(out.inventory.unshimmed, ["qiAbsentNumber", "qiMissingStore", "qiNotInTable", "qiStore", "qiVersionNumber"]);
+        assert_eq!(
+            out.inventory.unshimmed,
+            [
+                "qiAbsentNumber",
+                "qiMissingStore",
+                "qiNotInTable",
+                "qiStore",
+                "qiVersionNumber"
+            ]
+        );
         let part = &out.parts[0];
-        assert!(part.api.is_none(), "query-interface libraries need no loading struct");
-        assert!(part.shims.contains("0x150e828u32") || part.shims.contains("22079528u32"), "{}", part.shims);
-        assert!(part.shims.contains("_qiStatus_QI_NO_IMPLEMENTATION") && part.shims.contains("_qiStatus_QI_LIBRARY_NOT_FOUND"));
+        assert!(
+            part.api.is_none(),
+            "query-interface libraries need no loading struct"
+        );
+        assert!(
+            part.shims.contains("0x150e828u32") || part.shims.contains("22079528u32"),
+            "{}",
+            part.shims
+        );
+        assert!(
+            part.shims.contains("_qiStatus_QI_NO_IMPLEMENTATION")
+                && part.shims.contains("_qiStatus_QI_LIBRARY_NOT_FOUND")
+        );
         for void_fn in ["qiStore", "qiMissingStore"] {
             let body = fn_slice(&part.shims, void_fn);
-            assert!(!body.contains("::core::result::Result::Ok(unsafe"), "{void_fn} must not pass unit into Ok(...)");
+            assert!(
+                !body.contains("::core::result::Result::Ok(unsafe"),
+                "{void_fn} must not pass unit into Ok(...)"
+            );
             assert!(body.contains("::core::result::Result::Ok(())"), "{body}");
         }
     }
@@ -1381,7 +2006,13 @@ pub type signedErr = ::std::os::raw::c_int;\n";
     #[test]
     fn interface_ids_parse_the_table_form() {
         let text = "struct T t[] =\n{\n    { \"NvAPI_Initialize\", 0x0150e828 },\n    { \"NvAPI_Unload\", 0xd22bdd7e },\n};\n";
-        assert_eq!(interface_ids(text), [("NvAPI_Initialize".to_string(), 0x0150e828), ("NvAPI_Unload".to_string(), 0xd22bdd7e)]);
+        assert_eq!(
+            interface_ids(text),
+            [
+                ("NvAPI_Initialize".to_string(), 0x0150e828),
+                ("NvAPI_Unload".to_string(), 0xd22bdd7e)
+            ]
+        );
     }
 
     #[test]
@@ -1397,13 +2028,19 @@ pub type signedErr = ::std::os::raw::c_int;\n";
         "#;
         assert_eq!(
             signature_types("t", src, "Api").expect("parses"),
-            ["cudaStream_t", "cufftHandle", "cufftResult", "libraryPropertyType"]
+            [
+                "cudaStream_t",
+                "cufftHandle",
+                "cufftResult",
+                "libraryPropertyType"
+            ]
         );
     }
 
     fn assert_invalid_return_policies(returns: &[ReturnPolicy<'_>], expected: &str) {
         let api = r#"pub struct Api { pub value: Result<unsafe extern "C" fn() -> Status, ::libloading::Error> }"#;
-        let error = shims("invalid", api, "Api", "loader", returns).expect_err("invalid recipe must be rejected");
+        let error = shims("invalid", api, "Api", "loader", returns)
+            .expect_err("invalid recipe must be rejected");
         match error {
             Error::Generated { lib, msg } => {
                 assert_eq!(lib, "invalid");
@@ -1415,15 +2052,29 @@ pub type signedErr = ::std::os::raw::c_int;\n";
 
     #[test]
     fn return_policies_reject_empty_type_lists() {
-        assert_invalid_return_policies(&[ReturnPolicy { types: &[], not_loaded: "1", missing_symbol: "2" }], "no types");
+        assert_invalid_return_policies(
+            &[ReturnPolicy {
+                types: &[],
+                not_loaded: "1",
+                missing_symbol: "2",
+            }],
+            "no types",
+        );
     }
 
     #[test]
     fn return_policies_reject_duplicate_type_names() {
-        let policy = ReturnPolicy { types: &["Status"], not_loaded: "1", missing_symbol: "2" };
+        let policy = ReturnPolicy {
+            types: &["Status"],
+            not_loaded: "1",
+            missing_symbol: "2",
+        };
         assert_invalid_return_policies(&[policy, policy], "duplicate return policy for Status");
         assert_invalid_return_policies(
-            &[ReturnPolicy { types: &["Status", "Status"], ..policy }],
+            &[ReturnPolicy {
+                types: &["Status", "Status"],
+                ..policy
+            }],
             "duplicate return policy for Status",
         );
     }
@@ -1431,7 +2082,11 @@ pub type signedErr = ::std::os::raw::c_int;\n";
     #[test]
     fn return_policies_reject_invalid_type_identifiers() {
         assert_invalid_return_policies(
-            &[ReturnPolicy { types: &["Not::AnIdentifier"], not_loaded: "1", missing_symbol: "2" }],
+            &[ReturnPolicy {
+                types: &["Not::AnIdentifier"],
+                not_loaded: "1",
+                missing_symbol: "2",
+            }],
             "return type",
         );
     }
@@ -1439,11 +2094,19 @@ pub type signedErr = ::std::os::raw::c_int;\n";
     #[test]
     fn return_policies_reject_malformed_failure_expressions() {
         assert_invalid_return_policies(
-            &[ReturnPolicy { types: &["Status"], not_loaded: "{", missing_symbol: "2" }],
+            &[ReturnPolicy {
+                types: &["Status"],
+                not_loaded: "{",
+                missing_symbol: "2",
+            }],
             "not_loaded",
         );
         assert_invalid_return_policies(
-            &[ReturnPolicy { types: &["Status"], not_loaded: "1", missing_symbol: "{" }],
+            &[ReturnPolicy {
+                types: &["Status"],
+                not_loaded: "1",
+                missing_symbol: "{",
+            }],
             "missing_symbol",
         );
     }
@@ -1462,6 +2125,140 @@ pub type signedErr = ::std::os::raw::c_int;\n";
                 pub reserved: u64,
             }
         "#;
-        assert_eq!(inventory("t", src, "Table").expect("parses"), ["barDestroy", "bazOpen", "fooCreate"]);
+        assert_eq!(
+            inventory("t", src, "Table").expect("parses"),
+            ["barDestroy", "bazOpen", "fooCreate"]
+        );
+    }
+
+    #[test]
+    fn expected_output_files_cover_every_shape() {
+        assert_eq!(
+            expected_output_files(&FAKE),
+            [
+                "fake_types.rs",
+                "fake_inventory.json",
+                "fake_api.rs",
+                "fake_shims.rs"
+            ]
+        );
+        const PARTS: &[ExportPart] = &[
+            ExportPart {
+                name: "a",
+                api_type: "A",
+                loader_fn: "a_api",
+                header_files: &[],
+            },
+            ExportPart {
+                name: "b",
+                api_type: "B",
+                loader_fn: "b_api",
+                header_files: &[],
+            },
+        ];
+        let split = LibSpec {
+            name: "npp",
+            shape: Shape::SplitExports {
+                parts: PARTS,
+                returns: &[],
+            },
+            ..FAKE
+        };
+        assert_eq!(
+            expected_output_files(&split),
+            [
+                "npp_types.rs",
+                "npp_inventory.json",
+                "npp_a_api.rs",
+                "npp_a_shims.rs",
+                "npp_b_api.rs",
+                "npp_b_shims.rs"
+            ]
+        );
+        let qi = LibSpec {
+            name: "nvapi",
+            shape: Shape::QueryInterface {
+                interface_header: "i.h",
+                loader_fn: "q",
+                returns: &[],
+            },
+            ..FAKE
+        };
+        assert_eq!(
+            expected_output_files(&qi),
+            ["nvapi_types.rs", "nvapi_inventory.json", "nvapi_shims.rs"]
+        );
+        let static_link = LibSpec {
+            name: "ngx",
+            shape: Shape::StaticLink {
+                link_libs: &["ngx"],
+                system_libs: &[],
+            },
+            ..FAKE
+        };
+        assert_eq!(
+            expected_output_files(&static_link),
+            ["ngx_types.rs", "ngx_inventory.json", "ngx_shims.rs"]
+        );
+        let table = LibSpec {
+            name: "optix",
+            shape: Shape::FunctionTable { table_type: "T" },
+            ..FAKE
+        };
+        assert_eq!(
+            expected_output_files(&table),
+            ["optix_types.rs", "optix_inventory.json"]
+        );
+    }
+
+    #[test]
+    fn prebuilt_copy_and_resolution_work() {
+        let base = std::env::temp_dir().join("nv_bindgen_prebuilt_test");
+        std::fs::remove_dir_all(&base).ok();
+        let target = "x86_64-pc-windows-msvc";
+        let prebuilt = base.join("prebuilt").join(target);
+        let out = base.join("out");
+        std::fs::create_dir_all(&prebuilt).expect("prebuilt dir");
+        std::fs::create_dir_all(&out).expect("out dir");
+
+        let expected = expected_output_files(&FAKE);
+        for f in &expected {
+            let content = if f.ends_with("_inventory.json") {
+                r#"{"lib":"fake","headers":[],"symbols":["fakeInit"],"unshimmed":[]}"#
+            } else {
+                "// prebuilt"
+            };
+            std::fs::write(prebuilt.join(f), content).expect("write prebuilt");
+        }
+
+        // Resolves <NV_RS_PREBUILT_DIR>/<target> when NV_RS_PREBUILT_DIR points to parent.
+        let resolved = resolve_prebuilt_dir(
+            Some(&base),
+            Some(OsStr::new(prebuilt.parent().unwrap())),
+            target,
+            &expected,
+        );
+        assert_eq!(resolved.as_deref(), Some(prebuilt.as_path()));
+        // Resolves <NV_RS_PREBUILT_DIR> directly when it already points to target dir.
+        let resolved_direct =
+            resolve_prebuilt_dir(Some(&base), Some(OsStr::new(&prebuilt)), target, &expected);
+        assert_eq!(resolved_direct.as_deref(), Some(prebuilt.as_path()));
+        // Resolves <CARGO_MANIFEST_DIR>/prebuilt/<target> when NV_RS_PREBUILT_DIR is unset.
+        let resolved_default = resolve_prebuilt_dir(Some(&base), None, target, &expected);
+        assert_eq!(resolved_default.as_deref(), Some(prebuilt.as_path()));
+
+        let (sources, inv) = copy_prebuilt_bindings(&FAKE, &prebuilt, &out).expect("copy prebuilt");
+        assert_eq!(sources.len(), expected.len());
+        assert_eq!(inv.lib, "fake");
+        assert_eq!(inv.symbols, ["fakeInit"]);
+        for f in &expected {
+            assert!(out.join(f).is_file(), "missing copied {f}");
+        }
+
+        // Missing file fails cleanly.
+        std::fs::remove_file(prebuilt.join("fake_shims.rs")).expect("remove");
+        assert!(copy_prebuilt_bindings(&FAKE, &prebuilt, &out).is_err());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

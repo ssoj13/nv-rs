@@ -97,7 +97,11 @@ pub enum Error {
 }
 
 fn detail_suffix(detail: &str) -> String {
-    if detail.is_empty() { String::new() } else { format!(" ({detail})") }
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
 }
 
 /// Result alias for this crate.
@@ -122,16 +126,27 @@ const VER_PIC_PARAMS: u32 = struct_version_hi(7);
 const VER_LOCK_BITSTREAM: u32 = struct_version_hi(2);
 
 fn fn_list() -> Result<&'static sys::NV_ENCODE_API_FUNCTION_LIST> {
-    sys::api().map(|a| &a.list).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::api()
+        .map(|a| &a.list)
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 macro_rules! entry {
     ($list:expr, $name:ident) => {
-        $list.$name.ok_or_else(|| Error::Unavailable(concat!(stringify!($name), " missing from NVENC function list").into()))?
+        $list.$name.ok_or_else(|| {
+            Error::Unavailable(
+                concat!(stringify!($name), " missing from NVENC function list").into(),
+            )
+        })?
     };
 }
 
-fn check(call: &'static str, status: sys::NVENCSTATUS, encoder: Option<*mut c_void>, list: &sys::NV_ENCODE_API_FUNCTION_LIST) -> Result<()> {
+fn check(
+    call: &'static str,
+    status: sys::NVENCSTATUS,
+    encoder: Option<*mut c_void>,
+    list: &sys::NV_ENCODE_API_FUNCTION_LIST,
+) -> Result<()> {
     if status == sys::_NVENCSTATUS_NV_ENC_SUCCESS {
         return Ok(());
     }
@@ -143,12 +158,19 @@ fn check(call: &'static str, status: sys::NVENCSTATUS, encoder: Option<*mut c_vo
                 String::new()
             } else {
                 // SAFETY: `ptr` is non-null and NUL-terminated per NVENC spec.
-                unsafe { CStr::from_ptr(ptr) }.to_string_lossy().trim().to_owned()
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned()
             }
         }
         _ => String::new(),
     };
-    Err(Error::Status { call, code: StatusCode(status), detail })
+    Err(Error::Status {
+        call,
+        code: StatusCode(status),
+        detail,
+    })
 }
 
 /// Supported video codecs.
@@ -307,7 +329,9 @@ impl BufferFormat {
     /// Maximum number of `pitch`-byte rows in a locked [`InputBuffer`] of `height` pixels.
     pub const fn locked_rows(self, height: u32) -> Option<u32> {
         match self {
-            Self::Nv12 | Self::Yv12 | Self::Iyuv | Self::Yuv420_10Bit => height.checked_add(height / 2),
+            Self::Nv12 | Self::Yv12 | Self::Iyuv | Self::Yuv420_10Bit => {
+                height.checked_add(height / 2)
+            }
             Self::Yuv444 | Self::Yuv444_10Bit => height.checked_mul(3),
             Self::Argb | Self::Abgr | Self::Argb10 | Self::Abgr10 => Some(height),
         }
@@ -517,12 +541,19 @@ impl EncodeSession {
                 // SAFETY: `raw` was returned by `nvEncOpenEncodeSessionEx`.
                 let d_status = unsafe { destroy_fn(raw) };
                 if d_status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                    cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                    cuda.record_err(Err::<(), _>(DriverError(
+                        cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                    )));
                 }
             }
             return check("nvEncOpenEncodeSessionEx", status, None, list).map(|()| unreachable!());
         }
-        Ok(Arc::new(Self { raw, cuda: cuda.clone(), list, initialized: false }))
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+            list,
+            initialized: false,
+        }))
     }
 
     /// Returns the owning CUDA context.
@@ -545,15 +576,33 @@ impl EncodeSession {
     }
 
     /// Queries the driver's default [`EncodeConfig`] for `codec`, `preset`, and `tuning`.
-    pub fn preset_config(&self, codec: Codec, preset: Preset, tuning: Tuning) -> Result<EncodeConfig> {
+    pub fn preset_config(
+        &self,
+        codec: Codec,
+        preset: Preset,
+        tuning: Tuning,
+    ) -> Result<EncodeConfig> {
         let get_preset = entry!(self.list, nvEncGetEncodePresetConfigEx);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_PRESET_CONFIG`.
         let mut out: sys::NV_ENC_PRESET_CONFIG = unsafe { zeroed() };
         out.version = VER_PRESET_CONFIG;
         out.presetCfg.version = VER_CONFIG;
         // SAFETY: `self.raw` is a live session and `out` is properly versioned.
-        let status = unsafe { get_preset(self.raw, codec.guid(), preset.guid(), tuning.to_sys(), &mut out) };
-        check("nvEncGetEncodePresetConfigEx", status, Some(self.raw), self.list)?;
+        let status = unsafe {
+            get_preset(
+                self.raw,
+                codec.guid(),
+                preset.guid(),
+                tuning.to_sys(),
+                &mut out,
+            )
+        };
+        check(
+            "nvEncGetEncodePresetConfigEx",
+            status,
+            Some(self.raw),
+            self.list,
+        )?;
         Ok(EncodeConfig { raw: out.presetCfg })
     }
 
@@ -563,9 +612,13 @@ impl EncodeSession {
             return Err(Error::Invalid("encode width and height must be non-zero"));
         }
         if cfg.fps_num == 0 || cfg.fps_den == 0 {
-            return Err(Error::Invalid("frame rate numerator and denominator must be non-zero"));
+            return Err(Error::Invalid(
+                "frame rate numerator and denominator must be non-zero",
+            ));
         }
-        let this = Arc::get_mut(self).ok_or(Error::Invalid("cannot initialize session while child buffers exist"))?;
+        let this = Arc::get_mut(self).ok_or(Error::Invalid(
+            "cannot initialize session while child buffers exist",
+        ))?;
         if this.initialized {
             return Err(Error::Invalid("encode session is already initialized"));
         }
@@ -604,7 +657,13 @@ impl EncodeSession {
         let mut in_stream = input.cu_stream().cast::<c_void>();
         let mut out_stream = output.cu_stream().cast::<c_void>();
         // SAFETY: `self.raw` is a live session and both `CUstream` handles are valid.
-        let status = unsafe { set_streams(self.raw, (&raw mut in_stream).cast(), (&raw mut out_stream).cast()) };
+        let status = unsafe {
+            set_streams(
+                self.raw,
+                (&raw mut in_stream).cast(),
+                (&raw mut out_stream).cast(),
+            )
+        };
         check("nvEncSetIOCudaStreams", status, Some(self.raw), self.list)
     }
 
@@ -621,20 +680,36 @@ impl EncodeSession {
             return Err(Error::Invalid("encode session is not initialized"));
         }
         if output.session.raw != self.raw {
-            return Err(Error::Invalid("output bitstream belongs to a different encode session"));
+            return Err(Error::Invalid(
+                "output bitstream belongs to a different encode session",
+            ));
         }
         let (input_ptr, format, width, height, pitch, input_session) = match input {
             EncodeInput::Buffer(b) => {
-                let p = b.format.tight_pitch(b.width).ok_or(Error::Invalid("input pitch overflow"))?;
+                let p = b
+                    .format
+                    .tight_pitch(b.width)
+                    .ok_or(Error::Invalid("input pitch overflow"))?;
                 (b.raw, b.format, b.width, b.height, p, b.session.raw)
             }
-            EncodeInput::Mapped(m) => (m.mapped, m.res.format, m.res.width, m.res.height, m.res.pitch, m.res.session.raw),
+            EncodeInput::Mapped(m) => (
+                m.mapped,
+                m.res.format,
+                m.res.width,
+                m.res.height,
+                m.res.pitch,
+                m.res.session.raw,
+            ),
         };
         if input_session != self.raw {
-            return Err(Error::Invalid("input surface belongs to a different encode session"));
+            return Err(Error::Invalid(
+                "input surface belongs to a different encode session",
+            ));
         }
         if width == 0 || height == 0 || pitch == 0 {
-            return Err(Error::Invalid("input dimensions and pitch must be non-zero"));
+            return Err(Error::Invalid(
+                "input dimensions and pitch must be non-zero",
+            ));
         }
         let encode_fn = entry!(self.list, nvEncEncodePicture);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_PIC_PARAMS`.
@@ -685,7 +760,9 @@ impl Drop for EncodeSession {
             // SAFETY: `self.raw` is owned by this `EncodeSession` and no child handles remain (they hold `Arc<EncodeSession>`).
             let status = unsafe { destroy_fn(self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -702,7 +779,12 @@ pub struct InputBuffer {
 
 impl InputBuffer {
     /// Allocates a driver input buffer for `width x height` pixels in `format`.
-    pub fn new(session: &Arc<EncodeSession>, width: u32, height: u32, format: BufferFormat) -> Result<Self> {
+    pub fn new(
+        session: &Arc<EncodeSession>,
+        width: u32,
+        height: u32,
+        format: BufferFormat,
+    ) -> Result<Self> {
         if width == 0 || height == 0 {
             return Err(Error::Invalid("input buffer dimensions must be non-zero"));
         }
@@ -715,8 +797,19 @@ impl InputBuffer {
         params.bufferFmt = format.to_sys();
         // SAFETY: `session.raw` is a live encoder session.
         let status = unsafe { create_fn(session.raw, &mut params) };
-        check("nvEncCreateInputBuffer", status, Some(session.raw), session.list)?;
-        Ok(Self { raw: params.inputBuffer, session: session.clone(), width, height, format })
+        check(
+            "nvEncCreateInputBuffer",
+            status,
+            Some(session.raw),
+            session.list,
+        )?;
+        Ok(Self {
+            raw: params.inputBuffer,
+            session: session.clone(),
+            width,
+            height,
+            format,
+        })
     }
 
     /// Locks the buffer for CPU write access; unlocked automatically on `Drop`.
@@ -728,7 +821,12 @@ impl InputBuffer {
         params.inputBuffer = self.raw;
         // SAFETY: `self.raw` is a live input buffer owned by `self.session`.
         let status = unsafe { lock_fn(self.session.raw, &mut params) };
-        check("nvEncLockInputBuffer", status, Some(self.session.raw), self.session.list)?;
+        check(
+            "nvEncLockInputBuffer",
+            status,
+            Some(self.session.raw),
+            self.session.list,
+        )?;
         Ok(InputLock {
             buf: self,
             ptr: params.bufferDataPtr.cast::<u8>(),
@@ -763,7 +861,9 @@ impl Drop for InputBuffer {
             // SAFETY: `self.raw` was created by `nvEncCreateInputBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -786,11 +886,19 @@ impl InputLock<'_> {
     ///
     /// For NV12, `rows` is at most `height + height / 2`; for packed RGB/RGBA, at most `height`.
     pub fn as_mut_slice(&mut self, rows: u32) -> Result<&mut [u8]> {
-        let max_rows = self.buf.format.locked_rows(self.buf.height).ok_or(Error::Invalid("input buffer height overflow"))?;
+        let max_rows = self
+            .buf
+            .format
+            .locked_rows(self.buf.height)
+            .ok_or(Error::Invalid("input buffer height overflow"))?;
         if rows > max_rows {
-            return Err(Error::Invalid("requested rows exceed allocated input buffer height"));
+            return Err(Error::Invalid(
+                "requested rows exceed allocated input buffer height",
+            ));
         }
-        let len = (self.pitch as usize).checked_mul(rows as usize).ok_or(Error::Invalid("locked slice size overflow"))?;
+        let len = (self.pitch as usize)
+            .checked_mul(rows as usize)
+            .ok_or(Error::Invalid("locked slice size overflow"))?;
         if self.ptr.is_null() {
             return Err(Error::Invalid("locked input buffer pointer is null"));
         }
@@ -805,7 +913,9 @@ impl Drop for InputLock<'_> {
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -836,13 +946,16 @@ impl RegisteredResource {
         format: BufferFormat,
     ) -> Result<Self> {
         if device_ptr == 0 || width == 0 || height == 0 || pitch == 0 || !pitch.is_multiple_of(4) {
-            return Err(Error::Invalid("CUDA pointer, dimensions, and 4-byte-aligned pitch must be valid"));
+            return Err(Error::Invalid(
+                "CUDA pointer, dimensions, and 4-byte-aligned pitch must be valid",
+            ));
         }
         let reg_fn = entry!(session.list, nvEncRegisterResource);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_REGISTER_RESOURCE`.
         let mut params: sys::NV_ENC_REGISTER_RESOURCE = unsafe { zeroed() };
         params.version = VER_REGISTER_RESOURCE;
-        params.resourceType = sys::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+        params.resourceType =
+            sys::_NV_ENC_INPUT_RESOURCE_TYPE_NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
         params.width = width;
         params.height = height;
         params.pitch = pitch;
@@ -851,8 +964,20 @@ impl RegisteredResource {
         params.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
         // SAFETY: `session.raw` is live and `device_ptr` is valid per caller contract.
         let status = unsafe { reg_fn(session.raw, &mut params) };
-        check("nvEncRegisterResource", status, Some(session.raw), session.list)?;
-        Ok(Self { raw: params.registeredResource, session: session.clone(), width, height, pitch, format })
+        check(
+            "nvEncRegisterResource",
+            status,
+            Some(session.raw),
+            session.list,
+        )?;
+        Ok(Self {
+            raw: params.registeredResource,
+            session: session.clone(),
+            width,
+            height,
+            pitch,
+            format,
+        })
     }
 
     /// Registers a 2D CUDA array (`CUarray`) created with `CUDA_ARRAY3D_SURFACE_LDST`.
@@ -868,7 +993,9 @@ impl RegisteredResource {
         format: BufferFormat,
     ) -> Result<Self> {
         if array.is_null() || width == 0 || height == 0 || pitch_bytes == 0 {
-            return Err(Error::Invalid("CUDA array handle and dimensions must be non-zero"));
+            return Err(Error::Invalid(
+                "CUDA array handle and dimensions must be non-zero",
+            ));
         }
         let reg_fn = entry!(session.list, nvEncRegisterResource);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_REGISTER_RESOURCE`.
@@ -883,8 +1010,20 @@ impl RegisteredResource {
         params.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
         // SAFETY: `session.raw` is live and `array` is valid per caller contract.
         let status = unsafe { reg_fn(session.raw, &mut params) };
-        check("nvEncRegisterResource", status, Some(session.raw), session.list)?;
-        Ok(Self { raw: params.registeredResource, session: session.clone(), width, height, pitch: pitch_bytes, format })
+        check(
+            "nvEncRegisterResource",
+            status,
+            Some(session.raw),
+            session.list,
+        )?;
+        Ok(Self {
+            raw: params.registeredResource,
+            session: session.clone(),
+            width,
+            height,
+            pitch: pitch_bytes,
+            format,
+        })
     }
 
     /// Maps the registered resource for one encode submission; unmapped automatically on `Drop`.
@@ -896,8 +1035,16 @@ impl RegisteredResource {
         params.registeredResource = self.raw;
         // SAFETY: `self.raw` is a live registered resource on `self.session`.
         let status = unsafe { map_fn(self.session.raw, &mut params) };
-        check("nvEncMapInputResource", status, Some(self.session.raw), self.session.list)?;
-        Ok(MappedResource { res: self, mapped: params.mappedResource })
+        check(
+            "nvEncMapInputResource",
+            status,
+            Some(self.session.raw),
+            self.session.list,
+        )?;
+        Ok(MappedResource {
+            res: self,
+            mapped: params.mappedResource,
+        })
     }
 
     /// Width in pixels.
@@ -927,7 +1074,9 @@ impl Drop for RegisteredResource {
             // SAFETY: `self.raw` was registered on `self.session` and all `MappedResource` guards have dropped.
             let status = unsafe { unreg_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -952,7 +1101,9 @@ impl Drop for MappedResource<'_> {
             // SAFETY: `self.mapped` was returned by `nvEncMapInputResource`.
             let status = unsafe { unmap_fn(self.res.session.raw, self.mapped) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.res.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.res.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -973,8 +1124,16 @@ impl OutputBitstream {
         params.version = VER_CREATE_BITSTREAM_BUFFER;
         // SAFETY: `session.raw` is a live encoder session.
         let status = unsafe { create_fn(session.raw, &mut params) };
-        check("nvEncCreateBitstreamBuffer", status, Some(session.raw), session.list)?;
-        Ok(Self { raw: params.bitstreamBuffer, session: session.clone() })
+        check(
+            "nvEncCreateBitstreamBuffer",
+            status,
+            Some(session.raw),
+            session.list,
+        )?;
+        Ok(Self {
+            raw: params.bitstreamBuffer,
+            session: session.clone(),
+        })
     }
 
     /// Locks the bitstream buffer, blocking until hardware encoding finishes, and returns an RAII guard.
@@ -986,7 +1145,12 @@ impl OutputBitstream {
         params.outputBitstream = self.raw;
         // SAFETY: `self.raw` is a live bitstream buffer owned by `self.session`.
         let status = unsafe { lock_fn(self.session.raw, &mut params) };
-        check("nvEncLockBitstream", status, Some(self.session.raw), self.session.list)?;
+        check(
+            "nvEncLockBitstream",
+            status,
+            Some(self.session.raw),
+            self.session.list,
+        )?;
         let size_bytes = params.bitstreamSizeInBytes as usize;
         let ptr = params.bitstreamBufferPtr.cast::<u8>();
         if size_bytes > 0 && ptr.is_null() {
@@ -995,7 +1159,9 @@ impl OutputBitstream {
                 // SAFETY: `self.raw` was just locked.
                 let _ = unsafe { unlock_fn(self.session.raw, self.raw) };
             }
-            return Err(Error::Invalid("locked bitstream pointer is null for non-empty payload"));
+            return Err(Error::Invalid(
+                "locked bitstream pointer is null for non-empty payload",
+            ));
         }
         let info = PacketInfo {
             frame_idx: params.frameIdx,
@@ -1021,7 +1187,9 @@ impl Drop for OutputBitstream {
             // SAFETY: `self.raw` was created by `nvEncCreateBitstreamBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -1059,7 +1227,9 @@ impl Drop for BitstreamLock<'_> {
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -1094,10 +1264,22 @@ mod tests {
 
     #[test]
     fn buffer_format_sizes_and_overflow_checks() {
-        assert_eq!(BufferFormat::Nv12.tight_frame_bytes(1920, 1080), Some(1920 * 1080 * 3 / 2));
-        assert_eq!(BufferFormat::Yuv420_10Bit.tight_frame_bytes(1920, 1080), Some(1920 * 1080 * 3));
-        assert_eq!(BufferFormat::Abgr.tight_frame_bytes(1920, 1080), Some(1920 * 1080 * 4));
-        assert_eq!(BufferFormat::Nv12.tight_frame_bytes(u32::MAX, u32::MAX), None);
+        assert_eq!(
+            BufferFormat::Nv12.tight_frame_bytes(1920, 1080),
+            Some(1920 * 1080 * 3 / 2)
+        );
+        assert_eq!(
+            BufferFormat::Yuv420_10Bit.tight_frame_bytes(1920, 1080),
+            Some(1920 * 1080 * 3)
+        );
+        assert_eq!(
+            BufferFormat::Abgr.tight_frame_bytes(1920, 1080),
+            Some(1920 * 1080 * 4)
+        );
+        assert_eq!(
+            BufferFormat::Nv12.tight_frame_bytes(u32::MAX, u32::MAX),
+            None
+        );
         assert_eq!(BufferFormat::Abgr.tight_pitch(64), Some(256));
         assert_eq!(BufferFormat::Abgr.tight_pitch(u32::MAX), None);
     }

@@ -49,7 +49,10 @@ impl<T: Pod> SbtRecord<T> {
 }
 
 /// Uploads `records` as one array; returns the buffer, stride and count.
-fn upload<T: Pod>(stream: &Stream, records: &[SbtRecord<T>]) -> Result<(DeviceBuffer<u8>, u32, u32)> {
+fn upload<T: Pod>(
+    stream: &Stream,
+    records: &[SbtRecord<T>],
+) -> Result<(DeviceBuffer<u8>, u32, u32)> {
     if records.is_empty() {
         return Err(Error::Invalid("an SBT section needs at least one record"));
     }
@@ -57,7 +60,8 @@ fn upload<T: Pod>(stream: &Stream, records: &[SbtRecord<T>]) -> Result<(DeviceBu
     for r in records {
         r.write_into(&mut bytes);
     }
-    let stride = u32::try_from(size_of::<SbtRecord<T>>()).map_err(|_| Error::Invalid("SBT record too large"))?;
+    let stride = u32::try_from(size_of::<SbtRecord<T>>())
+        .map_err(|_| Error::Invalid("SBT record too large"))?;
     let count = u32::try_from(records.len()).map_err(|_| Error::Invalid("too many SBT records"))?;
     Ok((DeviceBuffer::from_host(stream, &bytes)?, stride, count))
 }
@@ -71,7 +75,12 @@ pub struct ShaderBindingTable {
 impl ShaderBindingTable {
     /// One raygen record, the miss records (indexed by `optixTrace`'s miss index) and the hit-group
     /// records (indexed by instance SBT offset + mesh index * stride + ray SBT offset).
-    pub fn new<R: Pod, M: Pod, H: Pod>(stream: &Stream, raygen: &SbtRecord<R>, miss: &[SbtRecord<M>], hit_groups: &[SbtRecord<H>]) -> Result<Self> {
+    pub fn new<R: Pod, M: Pod, H: Pod>(
+        stream: &Stream,
+        raygen: &SbtRecord<R>,
+        miss: &[SbtRecord<M>],
+        hit_groups: &[SbtRecord<H>],
+    ) -> Result<Self> {
         let (rg, _, _) = upload(stream, std::slice::from_ref(raygen))?;
         let (ms, ms_stride, ms_count) = upload(stream, miss)?;
         let (hg, hg_stride, hg_count) = upload(stream, hit_groups)?;
@@ -85,11 +94,18 @@ impl ShaderBindingTable {
             hitgroupRecordCount: hg_count,
             ..Default::default()
         };
-        Ok(Self { raw, _buffers: vec![rg, ms, hg] })
+        Ok(Self {
+            raw,
+            _buffers: vec![rg, ms, hg],
+        })
     }
 
     /// Adds callable records (indexed by `optixDirectCall` / `optixContinuationCall`).
-    pub fn with_callables<C: Pod>(mut self, stream: &Stream, callables: &[SbtRecord<C>]) -> Result<Self> {
+    pub fn with_callables<C: Pod>(
+        mut self,
+        stream: &Stream,
+        callables: &[SbtRecord<C>],
+    ) -> Result<Self> {
         let (buf, stride, count) = upload(stream, callables)?;
         self.raw.callablesRecordBase = buf.cu_deviceptr();
         self.raw.callablesRecordStrideInBytes = stride;
@@ -99,7 +115,11 @@ impl ShaderBindingTable {
     }
 
     /// Adds the exception record.
-    pub fn with_exception<E: Pod>(mut self, stream: &Stream, exception: &SbtRecord<E>) -> Result<Self> {
+    pub fn with_exception<E: Pod>(
+        mut self,
+        stream: &Stream,
+        exception: &SbtRecord<E>,
+    ) -> Result<Self> {
         let (buf, _, _) = upload(stream, std::slice::from_ref(exception))?;
         self.raw.exceptionRecord = buf.cu_deviceptr();
         self._buffers.push(buf);

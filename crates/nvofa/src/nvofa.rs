@@ -90,23 +90,38 @@ pub enum Error {
 }
 
 fn detail_suffix(detail: &str) -> String {
-    if detail.is_empty() { String::new() } else { format!(" ({detail})") }
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
 }
 
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn fn_list() -> Result<&'static sys::NV_OF_CUDA_API_FUNCTION_LIST> {
-    sys::api().map(|a| &a.list).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::api()
+        .map(|a| &a.list)
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 macro_rules! entry {
     ($list:expr, $name:ident) => {
-        $list.$name.ok_or_else(|| Error::Unavailable(concat!(stringify!($name), " missing from NVOFA function list").into()))?
+        $list.$name.ok_or_else(|| {
+            Error::Unavailable(
+                concat!(stringify!($name), " missing from NVOFA function list").into(),
+            )
+        })?
     };
 }
 
-fn check(call: &'static str, status: sys::NV_OF_STATUS, handle: Option<sys::NvOFHandle>, list: &sys::NV_OF_CUDA_API_FUNCTION_LIST) -> Result<()> {
+fn check(
+    call: &'static str,
+    status: sys::NV_OF_STATUS,
+    handle: Option<sys::NvOFHandle>,
+    list: &sys::NV_OF_CUDA_API_FUNCTION_LIST,
+) -> Result<()> {
     if status == sys::_NV_OF_STATUS_NV_OF_SUCCESS {
         return Ok(());
     }
@@ -120,10 +135,17 @@ fn check(call: &'static str, status: sys::NV_OF_STATUS, handle: Option<sys::NvOF
         let rc = unsafe { get_err(h, buf.as_mut_ptr(), &mut size) };
         if rc == sys::_NV_OF_STATUS_NV_OF_SUCCESS {
             // SAFETY: `nvOFGetLastError` NUL-terminates `buf`.
-            detail = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().trim().to_owned();
+            detail = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                .to_string_lossy()
+                .trim()
+                .to_owned();
         }
     }
-    Err(Error::Status { call, code: StatusCode(status), detail })
+    Err(Error::Status {
+        call,
+        code: StatusCode(status),
+        detail,
+    })
 }
 
 /// Output flow-vector grid size (`NV_OF_OUTPUT_VECTOR_GRID_SIZE`).
@@ -325,16 +347,26 @@ impl RoiRect {
         let align_sy = 8 * g.max(2);
         let align_h = 8 * g;
         if !self.start_x.is_multiple_of(align_x) || !self.width.is_multiple_of(align_x) {
-            return Err(Error::Invalid("ROI start_x and width must align to 32 * out_grid"));
+            return Err(Error::Invalid(
+                "ROI start_x and width must align to 32 * out_grid",
+            ));
         }
         if !self.start_y.is_multiple_of(align_sy) || !self.height.is_multiple_of(align_h) {
             return Err(Error::Invalid("ROI start_y/height alignment invalid"));
         }
         if self.width < 32 || self.height < 16 || self.width > 8192 || self.height > 8192 {
-            return Err(Error::Invalid("ROI dimensions out of range [32..8192] x [16..8192]"));
+            return Err(Error::Invalid(
+                "ROI dimensions out of range [32..8192] x [16..8192]",
+            ));
         }
-        let end_x = self.start_x.checked_add(self.width).ok_or(Error::Invalid("ROI x overflow"))?;
-        let end_y = self.start_y.checked_add(self.height).ok_or(Error::Invalid("ROI y overflow"))?;
+        let end_x = self
+            .start_x
+            .checked_add(self.width)
+            .ok_or(Error::Invalid("ROI x overflow"))?;
+        let end_y = self
+            .start_y
+            .checked_add(self.height)
+            .ok_or(Error::Invalid("ROI y overflow"))?;
         if end_x > frame_w || end_y > frame_h {
             return Err(Error::Invalid("ROI exceeds frame bounds"));
         }
@@ -443,14 +475,23 @@ impl OpticalFlowSession {
         // SAFETY: `cuda.cu_ctx()` is a live CUDA context and `raw` is a valid out-pointer.
         let status = unsafe { create_fn(cuda.cu_ctx(), &mut raw) };
         check("nvCreateOpticalFlowCuda", status, None, list)?;
-        Ok(Arc::new(Self { raw, cuda: cuda.clone(), list, config: None }))
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+            list,
+            config: None,
+        }))
     }
 
     /// Queries an NVOFA capability (`nvOFGetCaps`) into `out_vals`, returning the count written.
     pub fn caps(&self, cap: sys::NV_OF_CAPS, out_vals: &mut [u32]) -> Result<u32> {
         let caps_fn = entry!(self.list, nvOFGetCaps);
         let mut size = out_vals.len() as u32;
-        let ptr = if out_vals.is_empty() { std::ptr::null_mut() } else { out_vals.as_mut_ptr() };
+        let ptr = if out_vals.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            out_vals.as_mut_ptr()
+        };
         // SAFETY: `self.raw` is live and `ptr` has `size` writable `u32` elements.
         let status = unsafe { caps_fn(self.raw, cap, ptr, &mut size) };
         check("nvOFGetCaps", status, Some(self.raw), self.list)?;
@@ -467,7 +508,9 @@ impl OpticalFlowSession {
         {
             return Err(Error::Invalid("hint_grid must be >= out_grid"));
         }
-        let this = Arc::get_mut(self).ok_or(Error::Invalid("cannot initialize session while buffers exist"))?;
+        let this = Arc::get_mut(self).ok_or(Error::Invalid(
+            "cannot initialize session while buffers exist",
+        ))?;
         this.cuda.bind_to_thread()?;
         let init_fn = entry!(this.list, nvOFInit);
         // SAFETY: all-zero bit pattern is valid for `NV_OF_INIT_PARAMS`.
@@ -514,18 +557,29 @@ impl OpticalFlowSession {
 
     /// Executes optical flow estimation on `params` with zero heap allocations.
     pub fn execute(&self, params: &mut ExecuteParams<'_>) -> Result<()> {
-        let cfg = self.config.ok_or(Error::Invalid("optical flow session is not initialized"))?;
+        let cfg = self
+            .config
+            .ok_or(Error::Invalid("optical flow session is not initialized"))?;
         if params.input_frame.session.raw != self.raw
             || params.reference_frame.session.raw != self.raw
             || params.output_buffer.session.raw != self.raw
-            || params.external_hints.is_some_and(|b| b.session.raw != self.raw)
-            || params.output_cost.as_ref().is_some_and(|b| b.session.raw != self.raw)
+            || params
+                .external_hints
+                .is_some_and(|b| b.session.raw != self.raw)
+            || params
+                .output_cost
+                .as_ref()
+                .is_some_and(|b| b.session.raw != self.raw)
         {
-            return Err(Error::Invalid("all OfBuffer handles must belong to this OpticalFlowSession"));
+            return Err(Error::Invalid(
+                "all OfBuffer handles must belong to this OpticalFlowSession",
+            ));
         }
         if !params.rois.is_empty() {
             if !cfg.enable_roi {
-                return Err(Error::Invalid("ROIs passed but enable_roi was false at init"));
+                return Err(Error::Invalid(
+                    "ROIs passed but enable_roi was false at init",
+                ));
             }
             for roi in params.rois {
                 roi.validate(cfg.out_grid, cfg.width, cfg.height)?;
@@ -537,7 +591,9 @@ impl OpticalFlowSession {
         let mut in_params: sys::NV_OF_EXECUTE_INPUT_PARAMS = unsafe { zeroed() };
         in_params.inputFrame = params.input_frame.raw;
         in_params.referenceFrame = params.reference_frame.raw;
-        in_params.externalHints = params.external_hints.map_or(std::ptr::null_mut(), |b| b.raw);
+        in_params.externalHints = params
+            .external_hints
+            .map_or(std::ptr::null_mut(), |b| b.raw);
         in_params.disableTemporalHints = if params.disable_temporal_hints {
             sys::_NV_OF_BOOL_NV_OF_TRUE
         } else {
@@ -548,13 +604,20 @@ impl OpticalFlowSession {
             std::ptr::null_mut()
         } else {
             // `RoiRect` is `#[repr(C)]` with identical layout to `NV_OF_ROI_RECT`.
-            params.rois.as_ptr().cast::<sys::NV_OF_ROI_RECT>().cast_mut()
+            params
+                .rois
+                .as_ptr()
+                .cast::<sys::NV_OF_ROI_RECT>()
+                .cast_mut()
         };
 
         // SAFETY: all-zero bit pattern is valid for `NV_OF_EXECUTE_OUTPUT_PARAMS`.
         let mut out_params: sys::NV_OF_EXECUTE_OUTPUT_PARAMS = unsafe { zeroed() };
         out_params.outputBuffer = params.output_buffer.raw;
-        out_params.outputCostBuffer = params.output_cost.as_ref().map_or(std::ptr::null_mut(), |b| b.raw);
+        out_params.outputCostBuffer = params
+            .output_cost
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |b| b.raw);
 
         // SAFETY: `self.raw` is initialized and all buffer handles belong to this session.
         let status = unsafe { exec_fn(self.raw, &in_params, &mut out_params) };
@@ -580,7 +643,9 @@ impl Drop for OpticalFlowSession {
             // SAFETY: `self.raw` is owned by this session and all child `OfBuffer`s have dropped.
             let status = unsafe { destroy_fn(self.raw) };
             if status != sys::_NV_OF_STATUS_NV_OF_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -596,7 +661,11 @@ pub struct OfBuffer {
 
 impl OfBuffer {
     /// Allocates an NVOFA GPU buffer on `session`.
-    pub fn new(session: &Arc<OpticalFlowSession>, desc: BufferDesc, kind: CudaBufferType) -> Result<Self> {
+    pub fn new(
+        session: &Arc<OpticalFlowSession>,
+        desc: BufferDesc,
+        kind: CudaBufferType,
+    ) -> Result<Self> {
         if desc.width == 0 || desc.height == 0 {
             return Err(Error::Invalid("buffer dimensions must be non-zero"));
         }
@@ -611,8 +680,18 @@ impl OfBuffer {
         let mut raw: sys::NvOFGPUBufferHandle = std::ptr::null_mut();
         // SAFETY: `session.raw` is live and `raw_desc`/`raw` are valid pointers.
         let status = unsafe { create_fn(session.raw, &raw_desc, kind.to_sys(), &mut raw) };
-        check("nvOFCreateGPUBufferCuda", status, Some(session.raw), session.list)?;
-        Ok(Self { raw, session: session.clone(), desc, kind })
+        check(
+            "nvOFCreateGPUBufferCuda",
+            status,
+            Some(session.raw),
+            session.list,
+        )?;
+        Ok(Self {
+            raw,
+            session: session.clone(),
+            desc,
+            kind,
+        })
     }
 
     /// Queries the hardware plane strides of this buffer.
@@ -622,13 +701,27 @@ impl OfBuffer {
         let mut info: sys::NV_OF_CUDA_BUFFER_STRIDE_INFO = unsafe { zeroed() };
         // SAFETY: `self.raw` is a live buffer handle.
         let status = unsafe { stride_fn(self.raw, &mut info) };
-        check("nvOFGPUBufferGetStrideInfo", status, Some(self.session.raw), self.session.list)?;
+        check(
+            "nvOFGPUBufferGetStrideInfo",
+            status,
+            Some(self.session.raw),
+            self.session.list,
+        )?;
         Ok(StrideInfo {
             num_planes: info.numPlanes,
             planes: [
-                (info.strideInfo[0].strideXInBytes, info.strideInfo[0].strideYInBytes),
-                (info.strideInfo[1].strideXInBytes, info.strideInfo[1].strideYInBytes),
-                (info.strideInfo[2].strideXInBytes, info.strideInfo[2].strideYInBytes),
+                (
+                    info.strideInfo[0].strideXInBytes,
+                    info.strideInfo[0].strideYInBytes,
+                ),
+                (
+                    info.strideInfo[1].strideXInBytes,
+                    info.strideInfo[1].strideYInBytes,
+                ),
+                (
+                    info.strideInfo[2].strideXInBytes,
+                    info.strideInfo[2].strideYInBytes,
+                ),
             ],
         })
     }
@@ -655,33 +748,58 @@ impl OfBuffer {
         if arr.is_null() { None } else { Some(arr) }
     }
 
-    fn validate_plane0_bounds(&self, width_bytes: usize, height: usize, slice_len: usize) -> Result<usize> {
+    fn validate_plane0_bounds(
+        &self,
+        width_bytes: usize,
+        height: usize,
+        slice_len: usize,
+    ) -> Result<usize> {
         if width_bytes == 0 || height == 0 {
-            return Err(Error::Invalid("plane0 copy width_bytes and height must be non-zero"));
+            return Err(Error::Invalid(
+                "plane0 copy width_bytes and height must be non-zero",
+            ));
         }
         if height > self.desc.height as usize {
-            return Err(Error::Invalid("plane0 copy height exceeds buffer descriptor height"));
+            return Err(Error::Invalid(
+                "plane0 copy height exceeds buffer descriptor height",
+            ));
         }
         let max_row_bytes = (self.desc.width as usize)
             .checked_mul(self.desc.format.plane0_elem_bytes())
             .ok_or(Error::Invalid("buffer row byte size overflow"))?;
         if width_bytes > max_row_bytes {
-            return Err(Error::Invalid("plane0 copy width_bytes exceeds buffer descriptor width"));
+            return Err(Error::Invalid(
+                "plane0 copy width_bytes exceeds buffer descriptor width",
+            ));
         }
-        let expected = width_bytes.checked_mul(height).ok_or(Error::Invalid("plane0 copy size overflow"))?;
+        let expected = width_bytes
+            .checked_mul(height)
+            .ok_or(Error::Invalid("plane0 copy size overflow"))?;
         if slice_len != expected {
-            return Err(Error::Invalid("slice length does not match width_bytes * height"));
+            return Err(Error::Invalid(
+                "slice length does not match width_bytes * height",
+            ));
         }
         let stride = self.stride_info()?.planes[0].0 as usize;
         if width_bytes > stride {
-            return Err(Error::Invalid("plane0 copy width_bytes exceeds GPU buffer stride"));
+            return Err(Error::Invalid(
+                "plane0 copy width_bytes exceeds GPU buffer stride",
+            ));
         }
         Ok(stride)
     }
 
     /// Uploads tightly packed host bytes into plane 0 of a `CuDevicePtr` buffer on `stream`.
-    pub fn upload_plane0(&self, stream: &Stream, width_bytes: usize, height: usize, src: &[u8]) -> Result<()> {
-        let dev_ptr = self.cu_deviceptr().ok_or(Error::Invalid("upload_plane0 requires CuDevicePtr buffer"))?;
+    pub fn upload_plane0(
+        &self,
+        stream: &Stream,
+        width_bytes: usize,
+        height: usize,
+        src: &[u8],
+    ) -> Result<()> {
+        let dev_ptr = self
+            .cu_deviceptr()
+            .ok_or(Error::Invalid("upload_plane0 requires CuDevicePtr buffer"))?;
         let stride = self.validate_plane0_bounds(width_bytes, height, src.len())?;
         self.session.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
@@ -701,8 +819,16 @@ impl OfBuffer {
     }
 
     /// Downloads plane 0 of a `CuDevicePtr` buffer into tightly packed `dst` on `stream`.
-    pub fn download_plane0(&self, stream: &Stream, width_bytes: usize, height: usize, dst: &mut [u8]) -> Result<()> {
-        let dev_ptr = self.cu_deviceptr().ok_or(Error::Invalid("download_plane0 requires CuDevicePtr buffer"))?;
+    pub fn download_plane0(
+        &self,
+        stream: &Stream,
+        width_bytes: usize,
+        height: usize,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        let dev_ptr = self.cu_deviceptr().ok_or(Error::Invalid(
+            "download_plane0 requires CuDevicePtr buffer",
+        ))?;
         let stride = self.validate_plane0_bounds(width_bytes, height, dst.len())?;
         self.session.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
@@ -724,18 +850,23 @@ impl OfBuffer {
     /// Downloads [`FlowVector`]s from a `Short2` output buffer into `dst` with zero allocations.
     pub fn download_flow_vectors(&self, stream: &Stream, dst: &mut [FlowVector]) -> Result<()> {
         if self.desc.format != BufferFormat::Short2 {
-            return Err(Error::Invalid("download_flow_vectors requires Short2 buffer format"));
+            return Err(Error::Invalid(
+                "download_flow_vectors requires Short2 buffer format",
+            ));
         }
         let count = (self.desc.width as usize)
             .checked_mul(self.desc.height as usize)
             .ok_or(Error::Invalid("flow vector count overflow"))?;
         if dst.len() != count {
-            return Err(Error::Invalid("destination slice length does not match grid_w * grid_h"));
+            return Err(Error::Invalid(
+                "destination slice length does not match grid_w * grid_h",
+            ));
         }
         let width_bytes = (self.desc.width as usize) * size_of::<FlowVector>();
         let byte_len = std::mem::size_of_val(dst);
         // SAFETY: `FlowVector` is `#[repr(C)]` POD (`i16`, `i16`), valid to view as mutable bytes.
-        let dst_bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), byte_len) };
+        let dst_bytes =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), byte_len) };
         self.download_plane0(stream, width_bytes, self.desc.height as usize, dst_bytes)
     }
 
@@ -751,7 +882,9 @@ impl Drop for OfBuffer {
             // SAFETY: `self.raw` was created on `self.session`.
             let status = unsafe { destroy_fn(self.raw) };
             if status != sys::_NV_OF_STATUS_NV_OF_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.session.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
     }
@@ -770,20 +903,38 @@ mod tests {
 
     #[test]
     fn flow_vector_s10_5_conversion() {
-        let fv = FlowVector { flow_x: 32 * 8, flow_y: -32 * 4 };
+        let fv = FlowVector {
+            flow_x: 32 * 8,
+            flow_y: -32 * 4,
+        };
         assert_eq!(fv.to_pixels(), (8.0, -4.0));
         assert_eq!(size_of::<FlowVector>(), size_of::<sys::NV_OF_FLOW_VECTOR>());
     }
 
     #[test]
     fn roi_rect_validation_enforces_alignment_and_bounds() {
-        let valid = RoiRect { start_x: 0, start_y: 0, width: 128, height: 32 };
+        let valid = RoiRect {
+            start_x: 0,
+            start_y: 0,
+            width: 128,
+            height: 32,
+        };
         assert!(valid.validate(GridSize::Four, 256, 256).is_ok());
 
-        let bad_x = RoiRect { start_x: 16, start_y: 0, width: 128, height: 32 };
+        let bad_x = RoiRect {
+            start_x: 16,
+            start_y: 0,
+            width: 128,
+            height: 32,
+        };
         assert!(bad_x.validate(GridSize::Four, 256, 256).is_err());
 
-        let out_of_bounds = RoiRect { start_x: 128, start_y: 0, width: 256, height: 32 };
+        let out_of_bounds = RoiRect {
+            start_x: 128,
+            start_y: 0,
+            width: 256,
+            height: 32,
+        };
         assert!(out_of_bounds.validate(GridSize::Four, 256, 256).is_err());
 
         assert_eq!(size_of::<RoiRect>(), size_of::<sys::NV_OF_ROI_RECT>());

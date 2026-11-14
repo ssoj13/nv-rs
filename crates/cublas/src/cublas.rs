@@ -41,7 +41,10 @@ mod tests {
         assert_eq!(s, copy);
         assert!(!s.is_success());
         assert!(Status::SUCCESS.is_success());
-        assert_eq!(Status::INVALID_VALUE.static_name(), "CUBLAS_STATUS_INVALID_VALUE");
+        assert_eq!(
+            Status::INVALID_VALUE.static_name(),
+            "CUBLAS_STATUS_INVALID_VALUE"
+        );
         assert!(s.to_string().contains("9999"));
     }
 
@@ -50,12 +53,18 @@ mod tests {
         let e1 = Error::Unavailable("missing cublas64_13.dll".into());
         assert!(e1.to_string().contains("missing cublas64_13.dll"));
 
-        let e2 = Error::Cublas { call: "cublasSgemm_v2", code: Status::INVALID_VALUE };
+        let e2 = Error::Cublas {
+            call: "cublasSgemm_v2",
+            code: Status::INVALID_VALUE,
+        };
         let msg2 = e2.to_string();
         assert!(msg2.contains("cublasSgemm_v2"));
         assert!(msg2.contains("CUBLAS_STATUS_INVALID_VALUE"));
 
-        let e3 = Error::Budget { requested: 4096, available: 1024 };
+        let e3 = Error::Budget {
+            requested: 4096,
+            available: 1024,
+        };
         assert!(e3.to_string().contains("4096") && e3.to_string().contains("1024"));
 
         let e4 = Error::Invalid("bad ld");
@@ -73,21 +82,42 @@ mod tests {
         assert_eq!((a, b, c), (6, 8, 12));
 
         // Rejects lda < rows(op(A))
-        assert!(matches!(validate_gemm_dims(4, 3, 2, Operation::N, Operation::N, 3, 2, 4), Err(Error::Invalid(_))));
+        assert!(matches!(
+            validate_gemm_dims(4, 3, 2, Operation::N, Operation::N, 3, 2, 4),
+            Err(Error::Invalid(_))
+        ));
         // Rejects negative m
-        assert!(matches!(validate_gemm_dims(-1, 3, 2, Operation::N, Operation::N, 1, 2, 1), Err(Error::Invalid(_))));
+        assert!(matches!(
+            validate_gemm_dims(-1, 3, 2, Operation::N, Operation::N, 1, 2, 1),
+            Err(Error::Invalid(_))
+        ));
         // Rejects ldc < m
-        assert!(matches!(validate_gemm_dims(4, 3, 2, Operation::N, Operation::N, 4, 2, 3), Err(Error::Invalid(_))));
+        assert!(matches!(
+            validate_gemm_dims(4, 3, 2, Operation::N, Operation::N, 4, 2, 3),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]
     fn strided_batch_validation_detects_negative_and_overflow() {
         let (ta, tb, tc) = validate_strided_batch(6, 6, 8, 8, 12, 12, 4).unwrap();
         assert_eq!((ta, tb, tc), (24, 32, 48));
-        assert_eq!(validate_strided_batch(6, 6, 8, 8, 12, 12, 0).unwrap(), (0, 0, 0));
-        assert!(matches!(validate_strided_batch(6, -1, 8, 8, 12, 12, 2), Err(Error::Invalid(_))));
-        assert!(matches!(validate_strided_batch(6, 6, 8, 8, 12, 12, -1), Err(Error::Invalid(_))));
-        assert!(matches!(validate_strided_batch(usize::MAX, 1, 1, 1, 1, 1, 2), Err(Error::Invalid(_))));
+        assert_eq!(
+            validate_strided_batch(6, 6, 8, 8, 12, 12, 0).unwrap(),
+            (0, 0, 0)
+        );
+        assert!(matches!(
+            validate_strided_batch(6, -1, 8, 8, 12, 12, 2),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_strided_batch(6, 6, 8, 8, 12, 12, -1),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_strided_batch(usize::MAX, 1, 1, 1, 1, 1, 2),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]
@@ -109,9 +139,16 @@ mod tests {
         assert!(handle.version().expect("version") > 0);
 
         // Pointer mode roundtrip
-        handle.set_pointer_mode(PointerMode::Device).expect("set device mode");
-        assert_eq!(handle.pointer_mode().expect("get mode"), PointerMode::Device);
-        handle.set_pointer_mode(PointerMode::Host).expect("set host mode");
+        handle
+            .set_pointer_mode(PointerMode::Device)
+            .expect("set device mode");
+        assert_eq!(
+            handle.pointer_mode().expect("get mode"),
+            PointerMode::Device
+        );
+        handle
+            .set_pointer_mode(PointerMode::Host)
+            .expect("set host mode");
         assert_eq!(handle.pointer_mode().expect("get mode"), PointerMode::Host);
 
         // Column-major C(3x4) = 1.5 * A(3x2) * B(2x4) + 0.5 * C(3x4)
@@ -125,7 +162,24 @@ mod tests {
         let b_dev = cuda_core::DeviceBuffer::from_host(&stream, &b_host).unwrap();
         let mut c_dev = cuda_core::DeviceBuffer::from_host(&stream, &c_init).unwrap();
 
-        handle.sgemm(&stream, Operation::N, Operation::N, m, n, k, alpha, &a_dev, m, &b_dev, k, beta, &mut c_dev, m).unwrap();
+        handle
+            .sgemm(
+                &stream,
+                Operation::N,
+                Operation::N,
+                m,
+                n,
+                k,
+                alpha,
+                &a_dev,
+                m,
+                &b_dev,
+                k,
+                beta,
+                &mut c_dev,
+                m,
+            )
+            .unwrap();
         let c_gpu = c_dev.to_host_vec(&stream).unwrap();
 
         for col in 0..(n as usize) {
@@ -135,7 +189,10 @@ mod tests {
                     acc += a_host[p * (m as usize) + row] * b_host[col * (k as usize) + p];
                 }
                 let expected = alpha * acc + beta * c_init[col * (m as usize) + row];
-                assert!((c_gpu[col * (m as usize) + row] - expected).abs() < 1e-5, "sgemm mismatch at ({row},{col})");
+                assert!(
+                    (c_gpu[col * (m as usize) + row] - expected).abs() < 1e-5,
+                    "sgemm mismatch at ({row},{col})"
+                );
             }
         }
 
@@ -146,7 +203,24 @@ mod tests {
         let a_d = cuda_core::DeviceBuffer::from_host(&stream, &a_f64).unwrap();
         let b_d = cuda_core::DeviceBuffer::from_host(&stream, &b_f64).unwrap();
         let mut c_d = cuda_core::DeviceBuffer::from_host(&stream, &c_f64_init).unwrap();
-        handle.dgemm(&stream, Operation::N, Operation::N, m, n, k, 1.5, &a_d, m, &b_d, k, 0.5, &mut c_d, m).unwrap();
+        handle
+            .dgemm(
+                &stream,
+                Operation::N,
+                Operation::N,
+                m,
+                n,
+                k,
+                1.5,
+                &a_d,
+                m,
+                &b_d,
+                k,
+                0.5,
+                &mut c_d,
+                m,
+            )
+            .unwrap();
         let c_d_gpu = c_d.to_host_vec(&stream).unwrap();
         for (g, s) in c_d_gpu.iter().zip(c_gpu.iter()) {
             assert!((g - f64::from(*s)).abs() < 1e-6);
@@ -178,16 +252,51 @@ mod tests {
         let mut pref = Preference::new(&ctx).unwrap();
         pref.set_max_workspace_bytes(1024 * 1024).unwrap();
 
-        let heuristic = lt.matmul_heuristic(&desc, &a_layout, &b_layout, &c_layout, &d_layout, &pref).unwrap();
+        let heuristic = lt
+            .matmul_heuristic(&desc, &a_layout, &b_layout, &c_layout, &d_layout, &pref)
+            .unwrap();
         let mut scratch = Scratch::new(&stream);
 
         // Budget rejection when budget < workspace_size
         if heuristic.workspace_size() > 0 {
-            let err = lt.matmul_f32(&stream, &desc, 1.0, &a_dev, &a_layout, &b_dev, &b_layout, 0.0, &c_dev, &c_layout, &mut d_dev, &d_layout, &heuristic, &mut scratch, 0);
+            let err = lt.matmul_f32(
+                &stream,
+                &desc,
+                1.0,
+                &a_dev,
+                &a_layout,
+                &b_dev,
+                &b_layout,
+                0.0,
+                &c_dev,
+                &c_layout,
+                &mut d_dev,
+                &d_layout,
+                &heuristic,
+                &mut scratch,
+                0,
+            );
             assert!(matches!(err, Err(Error::Budget { .. })));
         }
 
-        lt.matmul_f32(&stream, &desc, 1.0, &a_dev, &a_layout, &b_dev, &b_layout, 0.0, &c_dev, &c_layout, &mut d_dev, &d_layout, &heuristic, &mut scratch, 1024 * 1024).unwrap();
+        lt.matmul_f32(
+            &stream,
+            &desc,
+            1.0,
+            &a_dev,
+            &a_layout,
+            &b_dev,
+            &b_layout,
+            0.0,
+            &c_dev,
+            &c_layout,
+            &mut d_dev,
+            &d_layout,
+            &heuristic,
+            &mut scratch,
+            1024 * 1024,
+        )
+        .unwrap();
         let d_host = d_dev.to_host_vec(&stream).unwrap();
         for &val in &d_host {
             assert!((val - 8.0).abs() < 1e-4, "expected 8.0, got {val}");

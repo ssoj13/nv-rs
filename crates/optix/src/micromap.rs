@@ -36,12 +36,16 @@ impl MicromapFormat {
     fn raw(self) -> sys::OptixOpacityMicromapFormat {
         match self {
             Self::TwoState => sys::OptixOpacityMicromapFormat_OPTIX_OPACITY_MICROMAP_FORMAT_2_STATE,
-            Self::FourState => sys::OptixOpacityMicromapFormat_OPTIX_OPACITY_MICROMAP_FORMAT_4_STATE,
+            Self::FourState => {
+                sys::OptixOpacityMicromapFormat_OPTIX_OPACITY_MICROMAP_FORMAT_4_STATE
+            }
         }
     }
 
     fn from_raw(raw: u16) -> Option<Self> {
-        [Self::TwoState, Self::FourState].into_iter().find(|f| f.raw() == i32::from(raw))
+        [Self::TwoState, Self::FourState]
+            .into_iter()
+            .find(|f| f.raw() == i32::from(raw))
     }
 
     fn bits(self) -> u64 {
@@ -68,21 +72,35 @@ pub struct MicromapDesc {
 unsafe impl DeviceCopy for MicromapDesc {}
 
 const _: () = assert!(size_of::<MicromapDesc>() == size_of::<sys::OptixOpacityMicromapDesc>());
-const _: () = assert!(std::mem::offset_of!(MicromapDesc, level) == std::mem::offset_of!(sys::OptixOpacityMicromapDesc, subdivisionLevel));
-const _: () = assert!(std::mem::offset_of!(MicromapDesc, format) == std::mem::offset_of!(sys::OptixOpacityMicromapDesc, format));
+const _: () = assert!(
+    std::mem::offset_of!(MicromapDesc, level)
+        == std::mem::offset_of!(sys::OptixOpacityMicromapDesc, subdivisionLevel)
+);
+const _: () = assert!(
+    std::mem::offset_of!(MicromapDesc, format)
+        == std::mem::offset_of!(sys::OptixOpacityMicromapDesc, format)
+);
 // The tight descriptor stride must be a multiple of the descriptor alignment.
-const _: () = assert!(size_of::<MicromapDesc>().is_multiple_of(sys::OPTIX_OPACITY_MICROMAP_DESC_BUFFER_BYTE_ALIGNMENT as usize));
+const _: () = assert!(
+    size_of::<MicromapDesc>()
+        .is_multiple_of(sys::OPTIX_OPACITY_MICROMAP_DESC_BUFFER_BYTE_ALIGNMENT as usize)
+);
 
 impl MicromapDesc {
     /// A micromap of `format` at `level` whose bits start at `byte_offset`.
     pub fn new(byte_offset: u32, level: u16, format: MicromapFormat) -> Self {
         // Format values are 1 and 2, so the narrowing is exact.
-        Self { byte_offset, level, format: format.raw() as u16 }
+        Self {
+            byte_offset,
+            level,
+            format: format.raw() as u16,
+        }
     }
 
     /// Bytes of bit data the micromap occupies.
     fn bytes(&self) -> Result<u64> {
-        let format = MicromapFormat::from_raw(self.format).ok_or(Error::Invalid("micromap descriptor has an unknown format"))?;
+        let format = MicromapFormat::from_raw(self.format)
+            .ok_or(Error::Invalid("micromap descriptor has an unknown format"))?;
         let level = check_level(u32::from(self.level))?;
         Ok(((1u64 << (2 * level)) * format.bits()).div_ceil(8))
     }
@@ -90,7 +108,9 @@ impl MicromapDesc {
 
 fn check_level(level: u32) -> Result<u32> {
     if level > sys::OPTIX_OPACITY_MICROMAP_MAX_SUBDIVISION_LEVEL {
-        return Err(Error::Invalid("micromap subdivision level above OPTIX_OPACITY_MICROMAP_MAX_SUBDIVISION_LEVEL"));
+        return Err(Error::Invalid(
+            "micromap subdivision level above OPTIX_OPACITY_MICROMAP_MAX_SUBDIVISION_LEVEL",
+        ));
     }
     Ok(level)
 }
@@ -110,11 +130,19 @@ pub struct MicromapCount {
 
 impl MicromapCount {
     fn histogram(&self) -> Result<sys::OptixOpacityMicromapHistogramEntry> {
-        Ok(sys::OptixOpacityMicromapHistogramEntry { count: self.count, subdivisionLevel: check_level(self.level)?, format: self.format.raw() })
+        Ok(sys::OptixOpacityMicromapHistogramEntry {
+            count: self.count,
+            subdivisionLevel: check_level(self.level)?,
+            format: self.format.raw(),
+        })
     }
 
     fn usage(&self) -> Result<sys::OptixOpacityMicromapUsageCount> {
-        Ok(sys::OptixOpacityMicromapUsageCount { count: self.count, subdivisionLevel: check_level(self.level)?, format: self.format.raw() })
+        Ok(sys::OptixOpacityMicromapUsageCount {
+            count: self.count,
+            subdivisionLevel: check_level(self.level)?,
+            format: self.format.raw(),
+        })
     }
 }
 
@@ -122,11 +150,21 @@ impl MicromapCount {
 fn histogram_of(descs: &[MicromapDesc]) -> Result<Vec<MicromapCount>> {
     let mut counts: BTreeMap<(u32, MicromapFormat), u32> = BTreeMap::new();
     for d in descs {
-        let format = MicromapFormat::from_raw(d.format).ok_or(Error::Invalid("micromap descriptor has an unknown format"))?;
+        let format = MicromapFormat::from_raw(d.format)
+            .ok_or(Error::Invalid("micromap descriptor has an unknown format"))?;
         let n = counts.entry((u32::from(d.level), format)).or_insert(0);
-        *n = n.checked_add(1).ok_or(Error::Invalid("too many micromaps"))?;
+        *n = n
+            .checked_add(1)
+            .ok_or(Error::Invalid("too many micromaps"))?;
     }
-    Ok(counts.into_iter().map(|((level, format), count)| MicromapCount { count, level, format }).collect())
+    Ok(counts
+        .into_iter()
+        .map(|((level, format), count)| MicromapCount {
+            count,
+            level,
+            format,
+        })
+        .collect())
 }
 
 /// Sizes OptiX reports for an array build.
@@ -150,7 +188,10 @@ pub struct MicromapOptions {
 impl Default for MicromapOptions {
     /// Fast trace, no budget.
     fn default() -> Self {
-        Self { prefer_fast_trace: true, budget: None }
+        Self {
+            prefer_fast_trace: true,
+            budget: None,
+        }
     }
 }
 
@@ -174,8 +215,15 @@ pub struct OpacityMicromapArray {
 impl OpacityMicromapArray {
     /// Sizes of a build over micromaps counted by `histogram`
     /// (`optixOpacityMicromapArrayComputeMemoryUsage`).
-    pub fn sizes(ctx: &DeviceContext, histogram: &[MicromapCount], opts: MicromapOptions) -> Result<MicromapSizes> {
-        let entries = histogram.iter().map(MicromapCount::histogram).collect::<Result<Vec<_>>>()?;
+    pub fn sizes(
+        ctx: &DeviceContext,
+        histogram: &[MicromapCount],
+        opts: MicromapOptions,
+    ) -> Result<MicromapSizes> {
+        let entries = histogram
+            .iter()
+            .map(MicromapCount::histogram)
+            .collect::<Result<Vec<_>>>()?;
         let input = sys::OptixOpacityMicromapArrayBuildInput {
             flags: opts.flags(),
             numMicromapHistogramEntries: count(entries.len(), "too many histogram entries")?,
@@ -185,23 +233,45 @@ impl OpacityMicromapArray {
         Self::sizes_raw(ctx, &input)
     }
 
-    fn sizes_raw(ctx: &DeviceContext, input: &sys::OptixOpacityMicromapArrayBuildInput) -> Result<MicromapSizes> {
-        let mut sizes = sys::OptixMicromapBufferSizes { outputSizeInBytes: 0, tempSizeInBytes: 0 };
+    fn sizes_raw(
+        ctx: &DeviceContext,
+        input: &sys::OptixOpacityMicromapArrayBuildInput,
+    ) -> Result<MicromapSizes> {
+        let mut sizes = sys::OptixMicromapBufferSizes {
+            outputSizeInBytes: 0,
+            tempSizeInBytes: 0,
+        };
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `input` and its histogram are alive for the call; `sizes` is writable.
         check("optixOpacityMicromapArrayComputeMemoryUsage", unsafe {
-            entry!(ctx.table(), optixOpacityMicromapArrayComputeMemoryUsage)(ctx.raw(), input, &mut sizes)
+            entry!(ctx.table(), optixOpacityMicromapArrayComputeMemoryUsage)(
+                ctx.raw(),
+                input,
+                &mut sizes,
+            )
         })?;
-        Ok(MicromapSizes { output: sizes.outputSizeInBytes, temp: sizes.tempSizeInBytes })
+        Ok(MicromapSizes {
+            output: sizes.outputSizeInBytes,
+            temp: sizes.tempSizeInBytes,
+        })
     }
 
     /// Builds an array from bit `data` and host descriptors on `stream`. Every descriptor is
     /// checked (format, level, bits inside `data`) and the histogram is derived from them.
-    pub fn build(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, data: &DeviceBuffer<u8>, descs: &[MicromapDesc], opts: MicromapOptions) -> Result<Arc<Self>> {
+    pub fn build(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        data: &DeviceBuffer<u8>,
+        descs: &[MicromapDesc],
+        opts: MicromapOptions,
+    ) -> Result<Arc<Self>> {
         for d in descs {
             let end = u64::from(d.byte_offset).saturating_add(d.bytes()?);
             if end > data.len() as u64 {
-                return Err(Error::Invalid("micromap descriptor addresses bits beyond the data buffer"));
+                return Err(Error::Invalid(
+                    "micromap descriptor addresses bits beyond the data buffer",
+                ));
             }
         }
         let histogram = histogram_of(descs)?;
@@ -210,7 +280,18 @@ impl OpacityMicromapArray {
         let device = unsafe { upload(stream, descs) }?;
         // SAFETY: descriptors were checked against `data` above and uploaded on `stream`, and
         // the histogram is theirs.
-        unsafe { Self::build_raw(ctx, stream, scratch, data, device.cu_deviceptr(), descs.len(), &histogram, opts) }
+        unsafe {
+            Self::build_raw(
+                ctx,
+                stream,
+                scratch,
+                data,
+                device.cu_deviceptr(),
+                descs.len(),
+                &histogram,
+                opts,
+            )
+        }
     }
 
     /// Builds an array from bit `data` and device-written descriptors counted by `histogram`.
@@ -230,18 +311,36 @@ impl OpacityMicromapArray {
         opts: MicromapOptions,
     ) -> Result<Arc<Self>> {
         same_ctx(stream, ctx)?;
-        if !descs.cu_deviceptr().is_multiple_of(u64::from(sys::OPTIX_OPACITY_MICROMAP_DESC_BUFFER_BYTE_ALIGNMENT)) {
-            return Err(Error::Invalid("micromap descriptors are below OptiX's descriptor alignment"));
+        if !descs.cu_deviceptr().is_multiple_of(u64::from(
+            sys::OPTIX_OPACITY_MICROMAP_DESC_BUFFER_BYTE_ALIGNMENT,
+        )) {
+            return Err(Error::Invalid(
+                "micromap descriptors are below OptiX's descriptor alignment",
+            ));
         }
         // SAFETY: forwarded contract.
-        unsafe { Self::build_raw(ctx, stream, scratch, data, descs.cu_deviceptr(), descs.len(), histogram, opts) }
+        unsafe {
+            Self::build_raw(
+                ctx,
+                stream,
+                scratch,
+                data,
+                descs.cu_deviceptr(),
+                descs.len(),
+                histogram,
+                opts,
+            )
+        }
     }
 
     /// # Safety
     ///
     /// `descs` points at `n` descriptors valid for `data` and counted by `histogram`, readable in
     /// `stream` order until the build completes.
-    #[expect(clippy::too_many_arguments, reason = "private seam shared by the checked and unchecked builds")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private seam shared by the checked and unchecked builds"
+    )]
     unsafe fn build_raw(
         ctx: &Arc<DeviceContext>,
         stream: &Arc<Stream>,
@@ -253,18 +352,32 @@ impl OpacityMicromapArray {
         opts: MicromapOptions,
     ) -> Result<Arc<Self>> {
         if n == 0 {
-            return Err(Error::Invalid("a micromap array needs at least one micromap"));
+            return Err(Error::Invalid(
+                "a micromap array needs at least one micromap",
+            ));
         }
         let len = count(n, "too many micromaps")?;
-        let total = histogram.iter().try_fold(0u32, |acc, h| acc.checked_add(h.count)).ok_or(Error::Invalid("histogram counts overflow u32"))?;
+        let total = histogram
+            .iter()
+            .try_fold(0u32, |acc, h| acc.checked_add(h.count))
+            .ok_or(Error::Invalid("histogram counts overflow u32"))?;
         if total != len {
-            return Err(Error::Invalid("histogram does not count exactly the descriptors"));
+            return Err(Error::Invalid(
+                "histogram does not count exactly the descriptors",
+            ));
         }
         // The header asks for a 128-byte aligned data buffer, the array buffer alignment.
-        if !data.cu_deviceptr().is_multiple_of(u64::from(sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT)) {
-            return Err(Error::Invalid("micromap data is below the 128-byte alignment OptiX requires"));
+        if !data.cu_deviceptr().is_multiple_of(u64::from(
+            sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT,
+        )) {
+            return Err(Error::Invalid(
+                "micromap data is below the 128-byte alignment OptiX requires",
+            ));
         }
-        let entries = histogram.iter().map(MicromapCount::histogram).collect::<Result<Vec<_>>>()?;
+        let entries = histogram
+            .iter()
+            .map(MicromapCount::histogram)
+            .collect::<Result<Vec<_>>>()?;
         let input = sys::OptixOpacityMicromapArrayBuildInput {
             flags: opts.flags(),
             inputBuffer: data.cu_deviceptr(),
@@ -274,17 +387,40 @@ impl OpacityMicromapArray {
             micromapHistogramEntries: entries.as_ptr(),
         };
         let sizes = Self::sizes_raw(ctx, &input)?;
-        within(opts.budget, scratch.growth(sizes.temp).saturating_add(sizes.output))?;
+        within(
+            opts.budget,
+            scratch.growth(sizes.temp).saturating_add(sizes.output),
+        )?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.temp)?;
         // SAFETY: the build writes the array before anything reads it.
-        let buffer = unsafe { alloc(stream, sizes.output, sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT) }?;
-        let buffers = sys::OptixMicromapBuffers { output: buffer.cu_deviceptr(), outputSizeInBytes: buffer.len(), temp, tempSizeInBytes: temp_len };
+        let buffer = unsafe {
+            alloc(
+                stream,
+                sizes.output,
+                sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT,
+            )
+        }?;
+        let buffers = sys::OptixMicromapBuffers {
+            output: buffer.cu_deviceptr(),
+            outputSizeInBytes: buffer.len(),
+            temp,
+            tempSizeInBytes: temp_len,
+        };
         // SAFETY: buffers sized by OptiX and ordered on `stream`; inputs valid per the contract;
         // the histogram outlives the call.
         check("optixOpacityMicromapArrayBuild", unsafe {
-            entry!(ctx.table(), optixOpacityMicromapArrayBuild)(ctx.raw(), stream.cu_stream(), &input, &buffers)
+            entry!(ctx.table(), optixOpacityMicromapArrayBuild)(
+                ctx.raw(),
+                stream.cu_stream(),
+                &input,
+                &buffers,
+            )
         })?;
-        Ok(Arc::new(Self { buffer, len, ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            buffer,
+            len,
+            ctx: ctx.clone(),
+        }))
     }
 
     /// Relocation data for this array (`optixOpacityMicromapArrayGetRelocationInfo`).
@@ -293,7 +429,11 @@ impl OpacityMicromapArray {
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: owned array of this context; `info` is writable.
         check("optixOpacityMicromapArrayGetRelocationInfo", unsafe {
-            entry!(self.ctx.table(), optixOpacityMicromapArrayGetRelocationInfo)(self.ctx.raw(), self.ptr(), &mut info)
+            entry!(self.ctx.table(), optixOpacityMicromapArrayGetRelocationInfo)(
+                self.ctx.raw(),
+                self.ptr(),
+                &mut info,
+            )
         })?;
         Ok(RelocationInfo(info))
     }
@@ -306,23 +446,46 @@ impl OpacityMicromapArray {
     /// # Safety
     ///
     /// The source's build must be complete or ordered before `stream`.
-    pub unsafe fn relocate(&self, ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, budget: Option<usize>) -> Result<Arc<Self>> {
+    pub unsafe fn relocate(
+        &self,
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        budget: Option<usize>,
+    ) -> Result<Arc<Self>> {
         same_ctx(stream, ctx)?;
         let info = self.relocation_info()?;
         if !info.compatible(ctx)? {
-            return Err(Error::Invalid("micromap array is not relocatable to this device context"));
+            return Err(Error::Invalid(
+                "micromap array is not relocatable to this device context",
+            ));
         }
         within(budget, self.buffer.len())?;
         // SAFETY: filled by the copy below.
-        let target = unsafe { alloc(stream, self.buffer.len(), sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT) }?;
+        let target = unsafe {
+            alloc(
+                stream,
+                self.buffer.len(),
+                sys::OPTIX_OPACITY_MICROMAP_ARRAY_BUFFER_BYTE_ALIGNMENT,
+            )
+        }?;
         // SAFETY: source writes ordered before `stream` (contract); `target` is fresh.
         unsafe { copy_bytes(stream, &target, &self.buffer) }?;
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `target` holds the copy (same size, array alignment), ordered on `stream`.
         check("optixOpacityMicromapArrayRelocate", unsafe {
-            entry!(ctx.table(), optixOpacityMicromapArrayRelocate)(ctx.raw(), stream.cu_stream(), &info.0, target.cu_deviceptr(), target.len())
+            entry!(ctx.table(), optixOpacityMicromapArrayRelocate)(
+                ctx.raw(),
+                stream.cu_stream(),
+                &info.0,
+                target.cu_deviceptr(),
+                target.len(),
+            )
         })?;
-        Ok(Arc::new(Self { buffer: target, len: self.len, ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            buffer: target,
+            len: self.len,
+            ctx: ctx.clone(),
+        }))
     }
 
     /// Device address of the array (for cluster arguments and relocation inputs).
@@ -376,7 +539,11 @@ impl<'a> MicromapUse<'a> {
     /// `usage` must count exactly, per format and level, the micromaps the mesh's triangles use
     /// (OptiX sizes the structure from it).
     pub unsafe fn linear(array: &'a Arc<OpacityMicromapArray>, usage: &'a [MicromapCount]) -> Self {
-        Self { array, indices: None, usage }
+        Self {
+            array,
+            indices: None,
+            usage,
+        }
     }
 
     /// Triangle `i` uses micromap `indices[i] + offset`, or a predefined state for negative
@@ -387,8 +554,17 @@ impl<'a> MicromapUse<'a> {
     /// Every non-negative index plus `offset` must be a micromap of `array`, every negative one a
     /// predefined index, and `usage` must count exactly the micromaps referenced; the indices
     /// must be written before (or ordered before) the build's stream.
-    pub unsafe fn indexed(array: &'a Arc<OpacityMicromapArray>, indices: MicromapIndices<'a>, offset: u32, usage: &'a [MicromapCount]) -> Self {
-        Self { array, indices: Some((indices, offset)), usage }
+    pub unsafe fn indexed(
+        array: &'a Arc<OpacityMicromapArray>,
+        indices: MicromapIndices<'a>,
+        offset: u32,
+        usage: &'a [MicromapCount],
+    ) -> Self {
+        Self {
+            array,
+            indices: Some((indices, offset)),
+            usage,
+        }
     }
 
     pub(crate) fn array(&self) -> &Arc<OpacityMicromapArray> {
@@ -397,11 +573,22 @@ impl<'a> MicromapUse<'a> {
 
     /// The raw input for a mesh of `triangles` triangles (usage pointer left for the caller to
     /// set) and the usage counts it must point at.
-    pub(crate) fn input(&self, ctx: &Arc<DeviceContext>, triangles: u32) -> Result<(sys::OptixBuildInputOpacityMicromap, Vec<sys::OptixOpacityMicromapUsageCount>)> {
+    pub(crate) fn input(
+        &self,
+        ctx: &Arc<DeviceContext>,
+        triangles: u32,
+    ) -> Result<(
+        sys::OptixBuildInputOpacityMicromap,
+        Vec<sys::OptixOpacityMicromapUsageCount>,
+    )> {
         if !Arc::ptr_eq(&self.array.ctx, ctx) {
             return Err(Error::Invalid("micromap array from another device context"));
         }
-        let usage = self.usage.iter().map(MicromapCount::usage).collect::<Result<Vec<_>>>()?;
+        let usage = self
+            .usage
+            .iter()
+            .map(MicromapCount::usage)
+            .collect::<Result<Vec<_>>>()?;
         let mut raw = sys::OptixBuildInputOpacityMicromap {
             opacityMicromapArray: self.array.ptr(),
             numMicromapUsageCounts: count(usage.len(), "too many micromap usage counts")?,
@@ -410,7 +597,9 @@ impl<'a> MicromapUse<'a> {
         match self.indices {
             None => {
                 if self.array.len < triangles {
-                    return Err(Error::Invalid("linear micromap indexing needs one micromap per triangle"));
+                    return Err(Error::Invalid(
+                        "linear micromap indexing needs one micromap per triangle",
+                    ));
                 }
                 raw.indexingMode = sys::OptixOpacityMicromapArrayIndexingMode_OPTIX_OPACITY_MICROMAP_ARRAY_INDEXING_MODE_LINEAR;
             }
@@ -420,7 +609,9 @@ impl<'a> MicromapUse<'a> {
                     MicromapIndices::I32(b) => (b.cu_deviceptr(), b.len(), size_of::<i32>() as u32),
                 };
                 if len != triangles as usize {
-                    return Err(Error::Invalid("micromap index buffer length differs from the triangle count"));
+                    return Err(Error::Invalid(
+                        "micromap index buffer length differs from the triangle count",
+                    ));
                 }
                 raw.indexingMode = sys::OptixOpacityMicromapArrayIndexingMode_OPTIX_OPACITY_MICROMAP_ARRAY_INDEXING_MODE_INDEXED;
                 raw.indexBuffer = ptr;
@@ -472,7 +663,9 @@ fn index_to_dbary(index: u32) -> (u32, u32, u32) {
 pub fn micro_to_base_bary(index: u32, level: u32) -> Result<[[f32; 2]; 3]> {
     let level = check_level(level)?;
     if u64::from(index) >= 1u64 << (2 * level) {
-        return Err(Error::Invalid("micro-triangle index out of range of its subdivision level"));
+        return Err(Error::Invalid(
+            "micro-triangle index out of range of its subdivision level",
+        ));
     }
     if level == 0 {
         return Ok([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
@@ -506,5 +699,8 @@ pub fn base_to_micro_bary(base: [f32; 2], micro: [[f32; 2]; 3]) -> [f32; 2] {
     let e2 = [m2[0] - m0[0], m2[1] - m0[1]];
     let rdet = 1.0 / (e1[0] * e2[1] - e1[1] * e2[0]);
     let a = [e2[1], -e2[0], -e1[1], e1[0]];
-    [rdet * (p[0] * a[0] + p[1] * a[1]), rdet * (p[0] * a[2] + p[1] * a[3])]
+    [
+        rdet * (p[0] * a[0] + p[1] * a[1]),
+        rdet * (p[0] * a[2] + p[1] * a[3]),
+    ]
 }

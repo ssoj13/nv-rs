@@ -31,7 +31,10 @@ mod tests {
     #[test]
     fn inventory_covers_public_families() {
         let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
-        let symbols = inventory.get("symbols").and_then(Value::as_array).expect("symbols array");
+        let symbols = inventory
+            .get("symbols")
+            .and_then(Value::as_array)
+            .expect("symbols array");
         for name in [
             "nvcompGetProperties",
             "nvcompGetStatusString",
@@ -49,11 +52,24 @@ mod tests {
             "bitcompHostUncompress",
             "bitcompMaxBuflen",
         ] {
-            assert!(symbols.iter().any(|symbol| symbol.as_str() == Some(name)), "{name} missing");
+            assert!(
+                symbols.iter().any(|symbol| symbol.as_str() == Some(name)),
+                "{name} missing"
+            );
         }
-        let unshimmed = inventory.get("unshimmed").and_then(Value::as_array).expect("unshimmed array");
-        assert_eq!(unshimmed.len(), 1, "unexpected missing native shims: {unshimmed:?}");
-        assert_eq!(unshimmed.first().and_then(Value::as_str), Some("bitcompMaxBuflen"));
+        let unshimmed = inventory
+            .get("unshimmed")
+            .and_then(Value::as_array)
+            .expect("unshimmed array");
+        assert_eq!(
+            unshimmed.len(),
+            1,
+            "unexpected missing native shims: {unshimmed:?}"
+        );
+        assert_eq!(
+            unshimmed.first().and_then(Value::as_str),
+            Some("bitcompMaxBuflen")
+        );
     }
 
     #[test]
@@ -64,8 +80,10 @@ mod tests {
     #[test]
     fn checked_native_and_enum_contracts_match_header_abis() {
         let _: unsafe fn(usize) -> Result<usize, nv_loader::CallError> = bitcompMaxBuflen;
-        let _: unsafe extern "C" fn(nvcompStatus_t) -> *const std::os::raw::c_char = nvcompGetStatusString;
-        let _: unsafe extern "C" fn(*mut nvcompProperties_t) -> nvcompStatus_t = nvcompGetProperties;
+        let _: unsafe extern "C" fn(nvcompStatus_t) -> *const std::os::raw::c_char =
+            nvcompGetStatusString;
+        let _: unsafe extern "C" fn(*mut nvcompProperties_t) -> nvcompStatus_t =
+            nvcompGetProperties;
         let _: u32 = nvcompStatus_t_nvcompSuccess;
         let _: u32 = nvcompType_t_NVCOMP_TYPE_FLOAT32;
         let _: u32 = bitcompAlgorithm_t_BITCOMP_DEFAULT_ALGO;
@@ -80,7 +98,10 @@ mod tests {
         for input_bytes in [0, 1, 4096] {
             // SAFETY: this size query takes no pointers and has no input-size precondition.
             let bound = unsafe { query(input_bytes) }.expect("native bitcomp bound is available");
-            assert!(bound >= input_bytes, "bound {bound} is smaller than input {input_bytes}");
+            assert!(
+                bound >= input_bytes,
+                "bound {bound} is smaller than input {input_bytes}"
+            );
         }
     }
 
@@ -90,14 +111,23 @@ mod tests {
         load().expect("nvcomp loads");
         let mut properties = nvcompProperties_t::default();
         // SAFETY: properties is a valid, aligned output object for the duration of the call.
-        assert_eq!(unsafe { nvcompGetProperties(&mut properties) }, nvcompStatus_t_nvcompSuccess);
+        assert_eq!(
+            unsafe { nvcompGetProperties(&mut properties) },
+            nvcompStatus_t_nvcompSuccess
+        );
         assert!(properties.version > 0, "library version was not reported");
-        assert!(properties.cudart_version > 0, "CUDA runtime version was not reported");
+        assert!(
+            properties.cudart_version > 0,
+            "CUDA runtime version was not reported"
+        );
         // SAFETY: the header accepts a valid status value and returns a library-owned C string.
         let text = unsafe { nvcompGetStatusString(nvcompStatus_t_nvcompSuccess) };
         assert!(!text.is_null(), "success status string was not reported");
         // SAFETY: nvCOMP guarantees a NUL-terminated string, and load keeps its library alive.
         let text = unsafe { std::ffi::CStr::from_ptr(text) };
-        assert!(!text.to_bytes().is_empty(), "success status string is empty");
+        assert!(
+            !text.to_bytes().is_empty(),
+            "success status string is empty"
+        );
     }
 }

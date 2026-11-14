@@ -53,23 +53,35 @@ impl DenoiserModel {
             Self::Temporal => sys::OptixDenoiserModelKind_OPTIX_DENOISER_MODEL_KIND_TEMPORAL,
             Self::TemporalAov => sys::OptixDenoiserModelKind_OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV,
             Self::Upscale2x => sys::OptixDenoiserModelKind_OPTIX_DENOISER_MODEL_KIND_UPSCALE2X,
-            Self::TemporalUpscale2x => sys::OptixDenoiserModelKind_OPTIX_DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X,
+            Self::TemporalUpscale2x => {
+                sys::OptixDenoiserModelKind_OPTIX_DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X
+            }
         }
     }
 
     /// Frames need a flow guide, previous outputs and internal guide layers.
     pub fn is_temporal(self) -> bool {
-        matches!(self, Self::Temporal | Self::TemporalAov | Self::TemporalUpscale2x)
+        matches!(
+            self,
+            Self::Temporal | Self::TemporalAov | Self::TemporalUpscale2x
+        )
     }
 
     /// Output size divided by input size (2 for the upscaling models).
     pub fn scale(self) -> u32 {
-        if matches!(self, Self::Upscale2x | Self::TemporalUpscale2x) { 2 } else { 1 }
+        if matches!(self, Self::Upscale2x | Self::TemporalUpscale2x) {
+            2
+        } else {
+            1
+        }
     }
 
     /// Layers after the beauty (AOVs) are accepted.
     pub fn has_aovs(self) -> bool {
-        matches!(self, Self::Aov | Self::TemporalAov | Self::Upscale2x | Self::TemporalUpscale2x)
+        matches!(
+            self,
+            Self::Aov | Self::TemporalAov | Self::Upscale2x | Self::TemporalUpscale2x
+        )
     }
 }
 
@@ -224,13 +236,22 @@ impl<'a> Image<'a> {
 
     /// Wraps `buffer`, which must hold exactly `width * height` tightly packed `format` pixels
     /// (e.g. half images in a `DeviceBuffer<u16>` or `DeviceBuffer<[u16; 4]>`).
-    pub fn with_format<T: DeviceCopy>(buffer: &'a DeviceBuffer<T>, width: u32, height: u32, format: PixelFormat) -> Result<Self> {
+    pub fn with_format<T: DeviceCopy>(
+        buffer: &'a DeviceBuffer<T>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<Self> {
         let pixel = format.pixel_bytes();
         let bytes = (u64::from(width) * u64::from(height)).checked_mul(u64::from(pixel));
         if width == 0 || height == 0 || bytes != Some(buffer.num_bytes() as u64) {
-            return Err(Error::Invalid("image buffer size is not width * height * pixel bytes"));
+            return Err(Error::Invalid(
+                "image buffer size is not width * height * pixel bytes",
+            ));
         }
-        let row = width.checked_mul(pixel).ok_or(Error::Invalid("image row exceeds 4 GiB"))?;
+        let row = width
+            .checked_mul(pixel)
+            .ok_or(Error::Invalid("image row exceeds 4 GiB"))?;
         Self::strided(buffer, 0, width, height, format, row, pixel)
     }
 
@@ -253,15 +274,27 @@ impl<'a> Image<'a> {
             return Err(Error::Invalid("image size must be non-zero"));
         }
         if pixel_stride < pixel {
-            return Err(Error::Invalid("pixel stride is smaller than the pixel format"));
+            return Err(Error::Invalid(
+                "pixel stride is smaller than the pixel format",
+            ));
         }
         if u64::from(row_stride) < u64::from(width) * u64::from(pixel_stride) {
-            return Err(Error::Invalid("row stride is smaller than width * pixel stride"));
+            return Err(Error::Invalid(
+                "row stride is smaller than width * pixel stride",
+            ));
         }
         let invalid = || Error::Invalid("image extends past the end of its buffer");
-        let data = buffer.cu_deviceptr().checked_add(offset as u64).ok_or_else(invalid)?;
-        if !data.is_multiple_of(channel) || !u64::from(row_stride).is_multiple_of(channel) || !u64::from(pixel_stride).is_multiple_of(channel) {
-            return Err(Error::Invalid("image data or strides are not aligned to the channel size"));
+        let data = buffer
+            .cu_deviceptr()
+            .checked_add(offset as u64)
+            .ok_or_else(invalid)?;
+        if !data.is_multiple_of(channel)
+            || !u64::from(row_stride).is_multiple_of(channel)
+            || !u64::from(pixel_stride).is_multiple_of(channel)
+        {
+            return Err(Error::Invalid(
+                "image data or strides are not aligned to the channel size",
+            ));
         }
         // Each product is below 2^64; the sum is checked.
         let span = (u64::from(height - 1) * u64::from(row_stride))
@@ -272,7 +305,16 @@ impl<'a> Image<'a> {
         if end > buffer.num_bytes() as u64 {
             return Err(invalid());
         }
-        Ok(Self { data, width, height, row_stride, pixel_stride, format, span, _buffer: PhantomData })
+        Ok(Self {
+            data,
+            width,
+            height,
+            row_stride,
+            pixel_stride,
+            format,
+            span,
+            _buffer: PhantomData,
+        })
     }
 
     /// `(width, height)` in pixels.
@@ -298,13 +340,27 @@ impl<'a> Image<'a> {
 
     /// Byte ranges intersect (conservative for interleaved images).
     fn overlaps(&self, other: &Image<'_>) -> bool {
-        self.data < other.data.saturating_add(other.span) && other.data < self.data.saturating_add(self.span)
+        self.data < other.data.saturating_add(other.span)
+            && other.data < self.data.saturating_add(self.span)
     }
 
     /// The very same pixels with the same layout.
     fn same(&self, other: &Image<'_>) -> bool {
-        (self.data, self.width, self.height, self.row_stride, self.pixel_stride, self.format)
-            == (other.data, other.width, other.height, other.row_stride, other.pixel_stride, other.format)
+        (
+            self.data,
+            self.width,
+            self.height,
+            self.row_stride,
+            self.pixel_stride,
+            self.format,
+        ) == (
+            other.data,
+            other.width,
+            other.height,
+            other.row_stride,
+            other.pixel_stride,
+            other.format,
+        )
     }
 }
 
@@ -345,11 +401,21 @@ pub struct Layer<'a> {
 impl<'a> Layer<'a> {
     /// A non-temporal layer of unspecified type.
     pub fn new(input: Image<'a>, output: Image<'a>) -> Self {
-        Self { input, output, previous: None, aov: AovType::None }
+        Self {
+            input,
+            output,
+            previous: None,
+            aov: AovType::None,
+        }
     }
 
     fn to_sys(self) -> sys::OptixDenoiserLayer {
-        sys::OptixDenoiserLayer { input: self.input.to_sys(), previousOutput: raw_or_null(self.previous), output: self.output.to_sys(), type_: self.aov.to_sys() }
+        sys::OptixDenoiserLayer {
+            input: self.input.to_sys(),
+            previousOutput: raw_or_null(self.previous),
+            output: self.output.to_sys(),
+            type_: self.aov.to_sys(),
+        }
     }
 }
 
@@ -383,7 +449,14 @@ pub struct DenoiserOptions {
 impl Default for DenoiserOptions {
     /// The AOV model without guides, alpha copied, untiled, no budget.
     fn default() -> Self {
-        Self { model: DenoiserModel::Aov, albedo: false, normal: false, alpha: AlphaMode::Copy, tile: None, budget: None }
+        Self {
+            model: DenoiserModel::Aov,
+            albedo: false,
+            normal: false,
+            alpha: AlphaMode::Copy,
+            tile: None,
+            budget: None,
+        }
     }
 }
 
@@ -417,7 +490,13 @@ unsafe impl Send for Denoiser {}
 
 impl Denoiser {
     /// A denoiser running a built-in model on `width x height` input images on `stream`.
-    pub fn new(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, options: DenoiserOptions, width: u32, height: u32) -> Result<Self> {
+    pub fn new(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        options: DenoiserOptions,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         check_options(&options, width, height)?;
         let opts = sys::OptixDenoiserOptions {
             guideAlbedo: u32::from(options.albedo),
@@ -427,7 +506,14 @@ impl Denoiser {
         ctx.cuda().bind_to_thread()?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: options outlive the call; the driver loads the model weights.
-        check("optixDenoiserCreate", unsafe { entry!(ctx.table(), optixDenoiserCreate)(ctx.raw(), options.model.kind(), &opts, &mut raw) })?;
+        check("optixDenoiserCreate", unsafe {
+            entry!(ctx.table(), optixDenoiserCreate)(
+                ctx.raw(),
+                options.model.kind(),
+                &opts,
+                &mut raw,
+            )
+        })?;
         Self::setup(ctx, stream, raw, options, width, height)
     }
 
@@ -435,25 +521,46 @@ impl Denoiser {
     /// guides and alpha handling). `options` must describe what the weights expect: its model,
     /// guides and tiling drive the checks and allocations of this wrapper; `alpha` must be
     /// [`AlphaMode::Copy`].
-    pub fn with_user_model(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, weights: &[u8], options: DenoiserOptions, width: u32, height: u32) -> Result<Self> {
+    pub fn with_user_model(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        weights: &[u8],
+        options: DenoiserOptions,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         check_options(&options, width, height)?;
         if weights.is_empty() {
             return Err(Error::Invalid("user model weights are empty"));
         }
         if options.alpha != AlphaMode::Copy {
-            return Err(Error::Invalid("a user model fixes its own alpha handling; leave options.alpha at Copy"));
+            return Err(Error::Invalid(
+                "a user model fixes its own alpha handling; leave options.alpha at Copy",
+            ));
         }
         ctx.cuda().bind_to_thread()?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: OptiX reads `weights` only during the call.
         check("optixDenoiserCreateWithUserModel", unsafe {
-            entry!(ctx.table(), optixDenoiserCreateWithUserModel)(ctx.raw(), weights.as_ptr().cast(), weights.len(), &mut raw)
+            entry!(ctx.table(), optixDenoiserCreateWithUserModel)(
+                ctx.raw(),
+                weights.as_ptr().cast(),
+                weights.len(),
+                &mut raw,
+            )
         })?;
         Self::setup(ctx, stream, raw, options, width, height)
     }
 
     /// Sizes, allocates and sets up a freshly created handle; destroys it on error.
-    fn setup(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, raw: sys::OptixDenoiser, options: DenoiserOptions, width: u32, height: u32) -> Result<Self> {
+    fn setup(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        raw: sys::OptixDenoiser,
+        options: DenoiserOptions,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         // From here `Drop` owns `raw`, so an error below cannot leak it.
         let destroy_on_error = Guard { raw, ctx };
         let t = ctx.table();
@@ -462,24 +569,40 @@ impl Denoiser {
         let [tile_w, tile_h] = tile.unwrap_or([width, height]);
         let mut sizes = sys::OptixDenoiserSizes::default();
         // SAFETY: owned handle; writable sizes struct.
-        check("optixDenoiserComputeMemoryResources", unsafe { entry!(t, optixDenoiserComputeMemoryResources)(raw, tile_w, tile_h, &mut sizes) })?;
+        check("optixDenoiserComputeMemoryResources", unsafe {
+            entry!(t, optixDenoiserComputeMemoryResources)(raw, tile_w, tile_h, &mut sizes)
+        })?;
         let (overlap, invoke_scratch) = if tile.is_some() {
-            (sizes.overlapWindowSizeInPixels, sizes.withOverlapScratchSizeInBytes)
+            (
+                sizes.overlapWindowSizeInPixels,
+                sizes.withOverlapScratchSizeInBytes,
+            )
         } else {
             (0, sizes.withoutOverlapScratchSizeInBytes)
         };
-        let scratch_len = invoke_scratch.max(sizes.computeIntensitySizeInBytes).max(sizes.computeAverageColorSizeInBytes).max(1);
+        let scratch_len = invoke_scratch
+            .max(sizes.computeIntensitySizeInBytes)
+            .max(sizes.computeAverageColorSizeInBytes)
+            .max(1);
         let scale = options.model.scale();
         let out_width = width.checked_mul(scale).ok_or_else(overflow)?;
         let out_height = height.checked_mul(scale).ok_or_else(overflow)?;
         let temporal = options.model.is_temporal();
-        let guide_pixel = if temporal { u32::try_from(sizes.internalGuideLayerPixelSizeInBytes).map_err(|_| overflow())? } else { 0 };
+        let guide_pixel = if temporal {
+            u32::try_from(sizes.internalGuideLayerPixelSizeInBytes).map_err(|_| overflow())?
+        } else {
+            0
+        };
         if temporal && guide_pixel == 0 {
-            return Err(Error::Invalid("OptiX reported no internal guide layer pixel size for a temporal model"));
+            return Err(Error::Invalid(
+                "OptiX reported no internal guide layer pixel size for a temporal model",
+            ));
         }
         // Internal guide layers have the output size, as the tiling utility splits them.
         let guide_row = out_width.checked_mul(guide_pixel).ok_or_else(overflow)?;
-        let guide_bytes = (guide_row as usize).checked_mul(out_height as usize).ok_or_else(overflow)?;
+        let guide_bytes = (guide_row as usize)
+            .checked_mul(out_height as usize)
+            .ok_or_else(overflow)?;
         let peak = sizes
             .stateSizeInBytes
             .saturating_add(scratch_len)
@@ -488,13 +611,19 @@ impl Denoiser {
         if let Some(available) = options.budget
             && peak > available
         {
-            return Err(Error::Budget { requested: peak, available });
+            return Err(Error::Budget {
+                requested: peak,
+                available,
+            });
         }
         // Setup takes the largest input it will see: a tile plus overlap on both sides.
         let (setup_w, setup_h) = match tile {
             Some(_) => {
                 let pad = overlap.checked_mul(2).ok_or_else(overflow)?;
-                (tile_w.checked_add(pad).ok_or_else(overflow)?, tile_h.checked_add(pad).ok_or_else(overflow)?)
+                (
+                    tile_w.checked_add(pad).ok_or_else(overflow)?,
+                    tile_h.checked_add(pad).ok_or_else(overflow)?,
+                )
             }
             None => (width, height),
         };
@@ -511,7 +640,12 @@ impl Denoiser {
         let guide = if temporal {
             // SAFETY: zeroed on `stream` right below, before OptiX reads them; the header requires
             // the first frame's previous layer to be zero or valid data.
-            let (mut prev, mut out) = unsafe { (DeviceBuffer::<u8>::uninitialized_async(stream, guide_bytes)?, DeviceBuffer::<u8>::uninitialized_async(stream, guide_bytes)?) };
+            let (mut prev, mut out) = unsafe {
+                (
+                    DeviceBuffer::<u8>::uninitialized_async(stream, guide_bytes)?,
+                    DeviceBuffer::<u8>::uninitialized_async(stream, guide_bytes)?,
+                )
+            };
             prev.zero_async(stream)?;
             out.zero_async(stream)?;
             Some((prev, out))
@@ -520,7 +654,16 @@ impl Denoiser {
         };
         // SAFETY: buffers sized by OptiX for this input size, ordered on `stream`.
         check("optixDenoiserSetup", unsafe {
-            entry!(t, optixDenoiserSetup)(raw, stream.cu_stream(), setup_w, setup_h, state.cu_deviceptr(), state.len(), scratch.cu_deviceptr(), scratch.len())
+            entry!(t, optixDenoiserSetup)(
+                raw,
+                stream.cu_stream(),
+                setup_w,
+                setup_h,
+                state.cu_deviceptr(),
+                state.len(),
+                scratch.cu_deviceptr(),
+                scratch.len(),
+            )
         })?;
         let ctx = destroy_on_error.disarm();
         Ok(Self {
@@ -554,7 +697,13 @@ impl Denoiser {
     ///
     /// The images must stay alive and unmodified (outputs: unread) until the work completes on
     /// the stream: synchronize it, or order their reuse and release after this call on it.
-    pub unsafe fn invoke(&mut self, stream: &Arc<Stream>, guides: &Guides<'_>, layers: &[Layer<'_>], params: Params) -> Result<()> {
+    pub unsafe fn invoke(
+        &mut self,
+        stream: &Arc<Stream>,
+        guides: &Guides<'_>,
+        layers: &[Layer<'_>],
+        params: Params,
+    ) -> Result<()> {
         self.on(stream)?;
         if !(0.0..=1.0).contains(&params.blend) {
             return Err(Error::Invalid("blend must be within [0, 1]"));
@@ -563,7 +712,11 @@ impl Denoiser {
             return Err(Error::Invalid("flow multipliers must be finite"));
         }
         self.check_frame(guides, layers)?;
-        let beauty = layers.first().ok_or(Error::Invalid("the denoiser needs at least one layer"))?.input.to_sys();
+        let beauty = layers
+            .first()
+            .ok_or(Error::Invalid("the denoiser needs at least one layer"))?
+            .input
+            .to_sys();
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: the beauty image is valid per the caller's contract; the result buffer is owned.
         unsafe { self.intensity_into(stream, &beauty, self.intensity.cu_deviceptr()) }?;
@@ -622,7 +775,12 @@ impl Denoiser {
     ///
     /// `image` must stay alive and unmodified, and `out` unread, until the work completes on the
     /// stream.
-    pub unsafe fn compute_intensity(&mut self, stream: &Arc<Stream>, image: Image<'_>, out: &mut DeviceBuffer<f32>) -> Result<()> {
+    pub unsafe fn compute_intensity(
+        &mut self,
+        stream: &Arc<Stream>,
+        image: Image<'_>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
         self.on(stream)?;
         color_input(&image)?;
         if out.is_empty() {
@@ -639,7 +797,12 @@ impl Denoiser {
     /// # Safety
     ///
     /// As [`Denoiser::compute_intensity`].
-    pub unsafe fn compute_average_color(&mut self, stream: &Arc<Stream>, image: Image<'_>, out: &mut DeviceBuffer<[f32; 3]>) -> Result<()> {
+    pub unsafe fn compute_average_color(
+        &mut self,
+        stream: &Arc<Stream>,
+        image: Image<'_>,
+        out: &mut DeviceBuffer<[f32; 3]>,
+    ) -> Result<()> {
         self.on(stream)?;
         color_input(&image)?;
         if out.is_empty() {
@@ -672,7 +835,13 @@ impl Denoiser {
     }
 
     fn on(&self, stream: &Arc<Stream>) -> Result<()> {
-        if Arc::ptr_eq(stream, &self.stream) { Ok(()) } else { Err(Error::Invalid("denoiser used on a different stream than it was created for")) }
+        if Arc::ptr_eq(stream, &self.stream) {
+            Ok(())
+        } else {
+            Err(Error::Invalid(
+                "denoiser used on a different stream than it was created for",
+            ))
+        }
     }
 
     fn guide_image(&self, buffer: &DeviceBuffer<u8>) -> sys::OptixImage2D {
@@ -693,17 +862,28 @@ impl Denoiser {
         let input = (self.width, self.height);
         let output = (self.out_width, self.out_height);
         if g.albedo.is_some() != self.options.albedo || g.normal.is_some() != self.options.normal {
-            return Err(Error::Invalid("guide images must match the guides the denoiser was created with"));
+            return Err(Error::Invalid(
+                "guide images must match the guides the denoiser was created with",
+            ));
         }
         if g.flow.is_some() != model.is_temporal() {
-            return Err(Error::Invalid("temporal models need a flow guide; other models take none"));
+            return Err(Error::Invalid(
+                "temporal models need a flow guide; other models take none",
+            ));
         }
         if g.flow_trust.is_some() && !model.is_temporal() {
-            return Err(Error::Invalid("flow trustworthiness is for temporal models only"));
+            return Err(Error::Invalid(
+                "flow trustworthiness is for temporal models only",
+            ));
         }
-        for img in [g.albedo, g.normal, g.flow, g.flow_trust].into_iter().flatten() {
+        for img in [g.albedo, g.normal, g.flow, g.flow_trust]
+            .into_iter()
+            .flatten()
+        {
             if img.size() != input {
-                return Err(Error::Invalid("guide size differs from the denoiser's input size"));
+                return Err(Error::Invalid(
+                    "guide size differs from the denoiser's input size",
+                ));
             }
         }
         if let Some(a) = g.albedo
@@ -713,9 +893,12 @@ impl Denoiser {
         }
         if let Some(n) = g.normal
             && n.format.channels() < 3
-            && !(n.format.channels() == 2 && matches!(model, DenoiserModel::Ldr | DenoiserModel::Hdr))
+            && !(n.format.channels() == 2
+                && matches!(model, DenoiserModel::Ldr | DenoiserModel::Hdr))
         {
-            return Err(Error::Invalid("the normal guide needs 3 or 4 channels (2 only for the LDR/HDR models)"));
+            return Err(Error::Invalid(
+                "the normal guide needs 3 or 4 channels (2 only for the LDR/HDR models)",
+            ));
         }
         if let Some(f) = g.flow
             && f.format.channels() != 2
@@ -725,48 +908,74 @@ impl Denoiser {
         if let Some(f) = g.flow_trust
             && f.format.channels() != 1
         {
-            return Err(Error::Invalid("the flow trustworthiness guide needs 1 channel"));
+            return Err(Error::Invalid(
+                "the flow trustworthiness guide needs 1 channel",
+            ));
         }
         if layers.is_empty() {
             return Err(Error::Invalid("the denoiser needs at least one layer"));
         }
         if layers.len() > 1 && !model.has_aovs() {
-            return Err(Error::Invalid("this model denoises the beauty only; AOV layers need an AOV-capable model"));
+            return Err(Error::Invalid(
+                "this model denoises the beauty only; AOV layers need an AOV-capable model",
+            ));
         }
         for l in layers {
             if l.input.size() != input {
-                return Err(Error::Invalid("layer input size differs from the denoiser's input size"));
+                return Err(Error::Invalid(
+                    "layer input size differs from the denoiser's input size",
+                ));
             }
             if l.output.size() != output {
-                return Err(Error::Invalid("layer output size differs from Denoiser::output_size"));
+                return Err(Error::Invalid(
+                    "layer output size differs from Denoiser::output_size",
+                ));
             }
             if l.input.format.channels() < 3 || l.output.format.channels() < 3 {
                 return Err(Error::Invalid("layer images need 3 or 4 channels"));
             }
             match l.previous {
-                None if model.is_temporal() => return Err(Error::Invalid("temporal models need every layer's previous output")),
-                Some(_) if !model.is_temporal() => return Err(Error::Invalid("previous outputs are for temporal models only")),
+                None if model.is_temporal() => {
+                    return Err(Error::Invalid(
+                        "temporal models need every layer's previous output",
+                    ));
+                }
+                Some(_) if !model.is_temporal() => {
+                    return Err(Error::Invalid(
+                        "previous outputs are for temporal models only",
+                    ));
+                }
                 Some(p) if p.size() != output || p.format.channels() < 3 => {
-                    return Err(Error::Invalid("previous output needs Denoiser::output_size and 3 or 4 channels"));
+                    return Err(Error::Invalid(
+                        "previous output needs Denoiser::output_size and 3 or 4 channels",
+                    ));
                 }
                 _ => {}
             }
         }
         for (i, l) in layers.iter().enumerate() {
             let out = l.output;
-            if [g.albedo, g.normal, g.flow, g.flow_trust].into_iter().flatten().any(|r| out.overlaps(&r)) {
+            if [g.albedo, g.normal, g.flow, g.flow_trust]
+                .into_iter()
+                .flatten()
+                .any(|r| out.overlaps(&r))
+            {
                 return Err(Error::Invalid("an output overlaps a guide image"));
             }
             for (j, other) in layers.iter().enumerate() {
                 let own = i == j;
                 if out.overlaps(&other.input) && !(own && out.same(&other.input)) {
-                    return Err(Error::Invalid("an output overlaps an input other than its own, identically laid out input"));
+                    return Err(Error::Invalid(
+                        "an output overlaps an input other than its own, identically laid out input",
+                    ));
                 }
                 if let Some(p) = other.previous
                     && out.overlaps(&p)
                     && !(own && self.tile.is_none() && out.same(&p))
                 {
-                    return Err(Error::Invalid("an output overlaps a previous output other than its own, identically laid out, untiled one"));
+                    return Err(Error::Invalid(
+                        "an output overlaps a previous output other than its own, identically laid out, untiled one",
+                    ));
                 }
                 if !own && out.overlaps(&other.output) {
                     return Err(Error::Invalid("two layer outputs overlap"));
@@ -781,8 +990,16 @@ impl Denoiser {
     /// # Safety
     ///
     /// Every image in `guide` and `layers` must be valid until the work completes on `stream`.
-    unsafe fn run(&self, stream: &Stream, params: &sys::OptixDenoiserParams, guide: &sys::OptixDenoiserGuideLayer, layers: &[sys::OptixDenoiserLayer], offset: (u32, u32)) -> Result<()> {
-        let n = u32::try_from(layers.len()).map_err(|_| Error::Invalid("too many denoiser layers"))?;
+    unsafe fn run(
+        &self,
+        stream: &Stream,
+        params: &sys::OptixDenoiserParams,
+        guide: &sys::OptixDenoiserGuideLayer,
+        layers: &[sys::OptixDenoiserLayer],
+        offset: (u32, u32),
+    ) -> Result<()> {
+        let n =
+            u32::try_from(layers.len()).map_err(|_| Error::Invalid("too many denoiser layers"))?;
         // SAFETY: state and scratch were set up for this denoiser; descriptors outlive the call;
         // images valid per the caller's contract.
         check("optixDenoiserInvoke", unsafe {
@@ -809,35 +1026,81 @@ impl Denoiser {
     /// # Safety
     ///
     /// As [`Denoiser::run`].
-    unsafe fn run_tiled(&self, stream: &Stream, params: &sys::OptixDenoiserParams, guide: &sys::OptixDenoiserGuideLayer, layers: &[sys::OptixDenoiserLayer], [tile_w, tile_h]: [u32; 2]) -> Result<()> {
+    unsafe fn run_tiled(
+        &self,
+        stream: &Stream,
+        params: &sys::OptixDenoiserParams,
+        guide: &sys::OptixDenoiserGuideLayer,
+        layers: &[sys::OptixDenoiserLayer],
+        [tile_w, tile_h]: [u32; 2],
+    ) -> Result<()> {
         let overlap = self.overlap;
         let scale = self.options.model.scale();
         let overflow = || Error::Invalid("tile size overflows");
-        let (up_overlap, up_w, up_h) =
-            (overlap.checked_mul(scale).ok_or_else(overflow)?, tile_w.checked_mul(scale).ok_or_else(overflow)?, tile_h.checked_mul(scale).ok_or_else(overflow)?);
+        let (up_overlap, up_w, up_h) = (
+            overlap.checked_mul(scale).ok_or_else(overflow)?,
+            tile_w.checked_mul(scale).ok_or_else(overflow)?,
+            tile_h.checked_mul(scale).ok_or_else(overflow)?,
+        );
         let mut tiles = Vec::with_capacity(layers.len());
         let mut prev_tiles = Vec::with_capacity(layers.len());
         for l in layers {
             tiles.push(split_image(&l.input, &l.output, overlap, tile_w, tile_h)?);
-            prev_tiles.push(if l.previousOutput.data != 0 { Some(split_image(&l.previousOutput, &l.previousOutput, up_overlap, up_w, up_h)?) } else { None });
+            prev_tiles.push(if l.previousOutput.data != 0 {
+                Some(split_image(
+                    &l.previousOutput,
+                    &l.previousOutput,
+                    up_overlap,
+                    up_w,
+                    up_h,
+                )?)
+            } else {
+                None
+            });
         }
-        let split = |img: &sys::OptixImage2D| -> Result<Option<Vec<Tile>>> { if img.data != 0 { split_image(img, img, overlap, tile_w, tile_h).map(Some) } else { Ok(None) } };
+        let split = |img: &sys::OptixImage2D| -> Result<Option<Vec<Tile>>> {
+            if img.data != 0 {
+                split_image(img, img, overlap, tile_w, tile_h).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
         let albedo = split(&guide.albedo)?;
         let normal = split(&guide.normal)?;
         let flow = split(&guide.flow)?;
         let trust = split(&guide.flowTrustworthiness)?;
-        let (prev_ig, out_ig) = (&guide.previousOutputInternalGuideLayer, &guide.outputInternalGuideLayer);
-        let internal = if prev_ig.data != 0 && out_ig.data != 0 { Some(split_image(prev_ig, out_ig, up_overlap, up_w, up_h)?) } else { None };
-        let beauty = tiles.first().ok_or(Error::Invalid("the denoiser needs at least one layer"))?;
+        let (prev_ig, out_ig) = (
+            &guide.previousOutputInternalGuideLayer,
+            &guide.outputInternalGuideLayer,
+        );
+        let internal = if prev_ig.data != 0 && out_ig.data != 0 {
+            Some(split_image(prev_ig, out_ig, up_overlap, up_w, up_h)?)
+        } else {
+            None
+        };
+        let beauty = tiles
+            .first()
+            .ok_or(Error::Invalid("the denoiser needs at least one layer"))?;
         let mut tile_layers = Vec::with_capacity(layers.len());
         for (t, first) in beauty.iter().enumerate() {
             tile_layers.clear();
             for ((l, lt), pt) in layers.iter().zip(&tiles).zip(&prev_tiles) {
                 let cur = nth(lt, t)?;
                 let prev = pt.as_deref().map(|v| nth(v, t)).transpose()?;
-                tile_layers.push(sys::OptixDenoiserLayer { input: cur.input, previousOutput: prev.map(|p| p.input).unwrap_or_default(), output: cur.output, type_: l.type_ });
+                tile_layers.push(sys::OptixDenoiserLayer {
+                    input: cur.input,
+                    previousOutput: prev.map(|p| p.input).unwrap_or_default(),
+                    output: cur.output,
+                    type_: l.type_,
+                });
             }
-            let pick = |v: &Option<Vec<Tile>>| -> Result<sys::OptixImage2D> { Ok(v.as_deref().map(|v| nth(v, t)).transpose()?.map(|x| x.input).unwrap_or_default()) };
+            let pick = |v: &Option<Vec<Tile>>| -> Result<sys::OptixImage2D> {
+                Ok(v.as_deref()
+                    .map(|v| nth(v, t))
+                    .transpose()?
+                    .map(|x| x.input)
+                    .unwrap_or_default())
+            };
             let ig = internal.as_deref().map(|v| nth(v, t)).transpose()?;
             let gl = sys::OptixDenoiserGuideLayer {
                 albedo: pick(&albedo)?,
@@ -848,7 +1111,15 @@ impl Denoiser {
                 flowTrustworthiness: pick(&trust)?,
             };
             // SAFETY: tiles are sub-images of images valid per the caller's contract.
-            unsafe { self.run(stream, params, &gl, &tile_layers, (first.offset_x, first.offset_y)) }?;
+            unsafe {
+                self.run(
+                    stream,
+                    params,
+                    &gl,
+                    &tile_layers,
+                    (first.offset_x, first.offset_y),
+                )
+            }?;
         }
         Ok(())
     }
@@ -856,22 +1127,46 @@ impl Denoiser {
     /// # Safety
     ///
     /// `image` valid until the work completes on `stream`; `out` holds one float.
-    unsafe fn intensity_into(&self, stream: &Stream, image: &sys::OptixImage2D, out: sys::CUdeviceptr) -> Result<()> {
+    unsafe fn intensity_into(
+        &self,
+        stream: &Stream,
+        image: &sys::OptixImage2D,
+        out: sys::CUdeviceptr,
+    ) -> Result<()> {
         // SAFETY: owned handle; scratch holds at least computeIntensitySizeInBytes; forwarded
         // image and output contract.
         check("optixDenoiserComputeIntensity", unsafe {
-            entry!(self.ctx.table(), optixDenoiserComputeIntensity)(self.raw, stream.cu_stream(), image, out, self.scratch.cu_deviceptr(), self.scratch.len())
+            entry!(self.ctx.table(), optixDenoiserComputeIntensity)(
+                self.raw,
+                stream.cu_stream(),
+                image,
+                out,
+                self.scratch.cu_deviceptr(),
+                self.scratch.len(),
+            )
         })
     }
 
     /// # Safety
     ///
     /// `image` valid until the work completes on `stream`; `out` holds three floats.
-    unsafe fn average_into(&self, stream: &Stream, image: &sys::OptixImage2D, out: sys::CUdeviceptr) -> Result<()> {
+    unsafe fn average_into(
+        &self,
+        stream: &Stream,
+        image: &sys::OptixImage2D,
+        out: sys::CUdeviceptr,
+    ) -> Result<()> {
         // SAFETY: owned handle; scratch holds at least computeAverageColorSizeInBytes; forwarded
         // image and output contract.
         check("optixDenoiserComputeAverageColor", unsafe {
-            entry!(self.ctx.table(), optixDenoiserComputeAverageColor)(self.raw, stream.cu_stream(), image, out, self.scratch.cu_deviceptr(), self.scratch.len())
+            entry!(self.ctx.table(), optixDenoiserComputeAverageColor)(
+                self.raw,
+                stream.cu_stream(),
+                image,
+                out,
+                self.scratch.cu_deviceptr(),
+                self.scratch.len(),
+            )
         })
     }
 }
@@ -893,7 +1188,13 @@ fn check_options(o: &DenoiserOptions, width: u32, height: u32) -> Result<()> {
 
 /// The intensity and average-colour passes take 3- or 4-channel images only.
 fn color_input(image: &Image<'_>) -> Result<()> {
-    if image.format.channels() < 3 { Err(Error::Invalid("intensity and average colour need a 3 or 4 channel image")) } else { Ok(()) }
+    if image.format.channels() < 3 {
+        Err(Error::Invalid(
+            "intensity and average colour need a 3 or 4 channel image",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 impl Drop for Denoiser {
@@ -944,7 +1245,10 @@ pub struct Tile {
 }
 
 fn nth(tiles: &[Tile], t: usize) -> Result<Tile> {
-    tiles.get(t).copied().ok_or(Error::Invalid("tile grids of the denoiser images differ"))
+    tiles
+        .get(t)
+        .copied()
+        .ok_or(Error::Invalid("tile grids of the denoiser images differ"))
 }
 
 /// `optixUtilGetPixelStride`: the image's pixel stride, or its format's packed size when 0.
@@ -963,7 +1267,11 @@ fn pixel_stride(image: &sys::OptixImage2D) -> Result<u32> {
         sys::OptixPixelFormat_OPTIX_PIXEL_FORMAT_FLOAT4 => (4, size_of::<f32>()),
         sys::OptixPixelFormat_OPTIX_PIXEL_FORMAT_UCHAR3 => (3, size_of::<u8>()),
         sys::OptixPixelFormat_OPTIX_PIXEL_FORMAT_UCHAR4 => (4, size_of::<u8>()),
-        _ => return Err(Error::Invalid("pixel stride must be given for internal-guide-layer or unknown pixel formats")),
+        _ => {
+            return Err(Error::Invalid(
+                "pixel stride must be given for internal-guide-layer or unknown pixel formats",
+            ));
+        }
     };
     Ok((channels * bytes) as u32)
 }
@@ -973,7 +1281,8 @@ fn addr(base: sys::CUdeviceptr, y: i64, row: i64, x: i64, pixel: i64) -> Result<
     // i128 cannot overflow for 32-bit strides and 33-bit coordinates.
     let bytes = i128::from(y) * i128::from(row) + i128::from(x) * i128::from(pixel);
     let bytes = u64::try_from(bytes).map_err(|_| Error::Invalid("tile lies before its image"))?;
-    base.checked_add(bytes).ok_or(Error::Invalid("tile address overflows"))
+    base.checked_add(bytes)
+        .ok_or(Error::Invalid("tile address overflows"))
 }
 
 fn dim(v: i64) -> Result<u32> {
@@ -984,7 +1293,13 @@ fn dim(v: i64) -> Result<u32> {
 /// plus `overlap` on inner sides, and `output` (the same or an integer multiple of the input
 /// size) into the matching non-overlapping tiles. Pass each tile's offsets to
 /// `optixDenoiserInvoke`; tiles may run concurrently when each has its own scratch.
-pub fn split_image(input: &sys::OptixImage2D, output: &sys::OptixImage2D, overlap: u32, tile_w: u32, tile_h: u32) -> Result<Vec<Tile>> {
+pub fn split_image(
+    input: &sys::OptixImage2D,
+    output: &sys::OptixImage2D,
+    overlap: u32,
+    tile_w: u32,
+    tile_h: u32,
+) -> Result<Vec<Tile>> {
     if tile_w == 0 || tile_h == 0 {
         return Err(Error::Invalid("tile size must be non-zero"));
     }
@@ -995,7 +1310,10 @@ pub fn split_image(input: &sys::OptixImage2D, output: &sys::OptixImage2D, overla
     let out_pixel = i64::from(pixel_stride(output)?);
     let (in_w, in_h) = (i64::from(input.width), i64::from(input.height));
     let (o, tw, th) = (i64::from(overlap), i64::from(tile_w), i64::from(tile_h));
-    let (in_row, out_row) = (i64::from(input.rowStrideInBytes), i64::from(output.rowStrideInBytes));
+    let (in_row, out_row) = (
+        i64::from(input.rowStrideInBytes),
+        i64::from(output.rowStrideInBytes),
+    );
     let inp_w = (tw + 2 * o).min(in_w);
     let inp_h = (th + 2 * o).min(in_h);
     let up_x = i64::from(output.width) / in_w;
@@ -1003,12 +1321,28 @@ pub fn split_image(input: &sys::OptixImage2D, output: &sys::OptixImage2D, overla
     let mut tiles = Vec::new();
     let (mut inp_y, mut copied_y) = (0i64, 0i64);
     loop {
-        let off_y = if inp_y == 0 { 0 } else { o.max(inp_h - (in_h - inp_y)) };
-        let copy_y = if inp_y == 0 { in_h.min(th + o) } else { th.min(in_h - copied_y) };
+        let off_y = if inp_y == 0 {
+            0
+        } else {
+            o.max(inp_h - (in_h - inp_y))
+        };
+        let copy_y = if inp_y == 0 {
+            in_h.min(th + o)
+        } else {
+            th.min(in_h - copied_y)
+        };
         let (mut inp_x, mut copied_x) = (0i64, 0i64);
         loop {
-            let off_x = if inp_x == 0 { 0 } else { o.max(inp_w - (in_w - inp_x)) };
-            let copy_x = if inp_x == 0 { in_w.min(tw + o) } else { tw.min(in_w - copied_x) };
+            let off_x = if inp_x == 0 {
+                0
+            } else {
+                o.max(inp_w - (in_w - inp_x))
+            };
+            let copy_x = if inp_x == 0 {
+                in_w.min(tw + o)
+            } else {
+                tw.min(in_w - copied_x)
+            };
             let tile_in = sys::OptixImage2D {
                 data: addr(input.data, inp_y - off_y, in_row, inp_x - off_x, in_pixel)?,
                 width: dim(inp_w)?,
@@ -1025,7 +1359,12 @@ pub fn split_image(input: &sys::OptixImage2D, output: &sys::OptixImage2D, overla
                 pixelStrideInBytes: output.pixelStrideInBytes,
                 format: output.format,
             };
-            tiles.push(Tile { input: tile_in, output: tile_out, offset_x: dim(off_x)?, offset_y: dim(off_y)? });
+            tiles.push(Tile {
+                input: tile_in,
+                output: tile_out,
+                offset_x: dim(off_x)?,
+                offset_y: dim(off_y)?,
+            });
             inp_x += if inp_x == 0 { tw + o } else { tw };
             copied_x += copy_x;
             if inp_x >= in_w {

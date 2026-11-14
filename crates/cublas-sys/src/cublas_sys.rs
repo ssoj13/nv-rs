@@ -3,7 +3,7 @@
 //! **What.** Generated at build time by `nv-bindgen` from the installed CUDA Toolkit
 //! (cublas_v2.h; headers are never committed). Each shim loads the toolkit's
 //! library on first use through `nv-loader` and returns `cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED` when it is absent or
-//! `cublasStatus_t_CUBLAS_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic. 
+//! `cublasStatus_t_CUBLAS_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cublas` crate; call [`load`] for a diagnosable load error.
 
 use nv_loader::{DllSpec, Group};
@@ -22,7 +22,10 @@ mod tests {
     #[test]
     fn inventory_lists_the_core_entry_points() {
         for f in ["cublasCreate_v2", "cublasSgemm_v2", "cublasSetStream_v2"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

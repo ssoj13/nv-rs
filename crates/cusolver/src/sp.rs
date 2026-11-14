@@ -22,7 +22,9 @@ pub fn validate_csr_solve(
     sol_len: usize,
 ) -> Result<()> {
     if m < 0 || nnz < 0 {
-        return Err(Error::InvalidInput("sparse CSR matrix dimensions m and nnz must be non-negative"));
+        return Err(Error::InvalidInput(
+            "sparse CSR matrix dimensions m and nnz must be non-negative",
+        ));
     }
     let req_row = (m as usize)
         .checked_add(1)
@@ -31,10 +33,14 @@ pub fn validate_csr_solve(
         return Err(Error::InvalidInput("CSR row_ptr buffer smaller than m + 1"));
     }
     if col_ind_len < nnz as usize || val_len < nnz as usize {
-        return Err(Error::InvalidInput("CSR col_ind or values buffer smaller than nnz"));
+        return Err(Error::InvalidInput(
+            "CSR col_ind or values buffer smaller than nnz",
+        ));
     }
     if rhs_len < m as usize || sol_len < m as usize {
-        return Err(Error::InvalidInput("CSR solver vector buffer smaller than m"));
+        return Err(Error::InvalidInput(
+            "CSR solver vector buffer smaller than m",
+        ));
     }
     Ok(())
 }
@@ -58,7 +64,9 @@ fn check_cusparse(call: &'static str, code: cusparse_sys::cusparseStatus_t) -> R
         "CUSPARSE_STATUS_UNKNOWN"
     } else {
         // SAFETY: `ptr` is non-null and points to a static C string in `cusparse`.
-        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap_or("CUSPARSE_STATUS_UNKNOWN")
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap_or("CUSPARSE_STATUS_UNKNOWN")
     };
     Err(Error::Cusparse { call, code, name })
 }
@@ -70,28 +78,51 @@ impl MatDescr {
         cuda.bind_to_thread()?;
         let mut raw: cusparse_sys::cusparseMatDescr_t = std::ptr::null_mut();
         // SAFETY: `cuda` is current and `raw` is a valid out-pointer.
-        check_cusparse("cusparseCreateMatDescr", unsafe { cusparse_sys::cusparseCreateMatDescr(&mut raw) })?;
+        check_cusparse("cusparseCreateMatDescr", unsafe {
+            cusparse_sys::cusparseCreateMatDescr(&mut raw)
+        })?;
         // SAFETY: `raw` was just created by `cusparseCreateMatDescr`.
         if let Err(err) = check_cusparse("cusparseSetMatType", unsafe {
-            cusparse_sys::cusparseSetMatType(raw, cusparse_sys::cusparseMatrixType_t_CUSPARSE_MATRIX_TYPE_GENERAL)
+            cusparse_sys::cusparseSetMatType(
+                raw,
+                cusparse_sys::cusparseMatrixType_t_CUSPARSE_MATRIX_TYPE_GENERAL,
+            )
         }) {
             // SAFETY: clean up `raw` before returning error; record destroy failure on context.
-            if check_cusparse("cusparseDestroyMatDescr", unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) }).is_err() {
-                cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+            if check_cusparse("cusparseDestroyMatDescr", unsafe {
+                cusparse_sys::cusparseDestroyMatDescr(raw)
+            })
+            .is_err()
+            {
+                cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
             return Err(err);
         }
         // SAFETY: `raw` is valid.
         if let Err(err) = check_cusparse("cusparseSetMatIndexBase", unsafe {
-            cusparse_sys::cusparseSetMatIndexBase(raw, cusparse_sys::cusparseIndexBase_t_CUSPARSE_INDEX_BASE_ZERO)
+            cusparse_sys::cusparseSetMatIndexBase(
+                raw,
+                cusparse_sys::cusparseIndexBase_t_CUSPARSE_INDEX_BASE_ZERO,
+            )
         }) {
             // SAFETY: clean up `raw` before returning error; record destroy failure on context.
-            if check_cusparse("cusparseDestroyMatDescr", unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) }).is_err() {
-                cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+            if check_cusparse("cusparseDestroyMatDescr", unsafe {
+                cusparse_sys::cusparseDestroyMatDescr(raw)
+            })
+            .is_err()
+            {
+                cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
             return Err(err);
         }
-        Ok(Self { raw, cuda: cuda.clone() })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Casts to `cusolver_sys::cusparseMatDescr_t` (identical C ABI opaque pointer).
@@ -112,8 +143,9 @@ impl Drop for MatDescr {
             // SAFETY: `raw` is owned by `self` and destroyed once.
             let code = unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) };
             if code != cusparse_sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS {
-                self.cuda
-                    .record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
         }
     }
@@ -225,7 +257,20 @@ impl SpFloat for f32 {
     ) -> Result<()> {
         // SAFETY: caller guarantees valid handle, descriptor, and buffers.
         check("cusolverSpScsrlsvqr", unsafe {
-            sys::cusolverSpScsrlsvqr(handle, m, nnz, descr, csr_val, csr_row_ptr, csr_col_ind, b, tol, reorder, x, singularity)
+            sys::cusolverSpScsrlsvqr(
+                handle,
+                m,
+                nnz,
+                descr,
+                csr_val,
+                csr_row_ptr,
+                csr_col_ind,
+                b,
+                tol,
+                reorder,
+                x,
+                singularity,
+            )
         })
     }
 
@@ -246,7 +291,21 @@ impl SpFloat for f32 {
     ) -> Result<()> {
         // SAFETY: caller guarantees valid handle, descriptor, and buffers.
         check("cusolverSpScsreigvsi", unsafe {
-            sys::cusolverSpScsreigvsi(handle, m, nnz, descr, csr_val, csr_row_ptr, csr_col_ind, mu0, x0, maxite, eps, mu, x)
+            sys::cusolverSpScsreigvsi(
+                handle,
+                m,
+                nnz,
+                descr,
+                csr_val,
+                csr_row_ptr,
+                csr_col_ind,
+                mu0,
+                x0,
+                maxite,
+                eps,
+                mu,
+                x,
+            )
         })
     }
 }
@@ -276,7 +335,20 @@ impl SpFloat for f64 {
     ) -> Result<()> {
         // SAFETY: caller guarantees valid handle, descriptor, and buffers.
         check("cusolverSpDcsrlsvqr", unsafe {
-            sys::cusolverSpDcsrlsvqr(handle, m, nnz, descr, csr_val, csr_row_ptr, csr_col_ind, b, tol, reorder, x, singularity)
+            sys::cusolverSpDcsrlsvqr(
+                handle,
+                m,
+                nnz,
+                descr,
+                csr_val,
+                csr_row_ptr,
+                csr_col_ind,
+                b,
+                tol,
+                reorder,
+                x,
+                singularity,
+            )
         })
     }
 
@@ -297,7 +369,21 @@ impl SpFloat for f64 {
     ) -> Result<()> {
         // SAFETY: caller guarantees valid handle, descriptor, and buffers.
         check("cusolverSpDcsreigvsi", unsafe {
-            sys::cusolverSpDcsreigvsi(handle, m, nnz, descr, csr_val, csr_row_ptr, csr_col_ind, mu0, x0, maxite, eps, mu, x)
+            sys::cusolverSpDcsreigvsi(
+                handle,
+                m,
+                nnz,
+                descr,
+                csr_val,
+                csr_row_ptr,
+                csr_col_ind,
+                mu0,
+                x0,
+                maxite,
+                eps,
+                mu,
+                x,
+            )
         })
     }
 }
@@ -319,8 +405,13 @@ impl SpHandle {
         cuda.bind_to_thread()?;
         let mut raw: sys::cusolverSpHandle_t = std::ptr::null_mut();
         // SAFETY: `cuda` is current and `raw` is a valid out-pointer.
-        check("cusolverSpCreate", unsafe { sys::cusolverSpCreate(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check("cusolverSpCreate", unsafe {
+            sys::cusolverSpCreate(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Raw `cusolverSpHandle_t`.
@@ -336,10 +427,14 @@ impl SpHandle {
     /// Binds `stream` to this handle.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(&self.cuda, stream.context()) {
-            return Err(Error::InvalidInput("stream belongs to a different CUDA context than SpHandle"));
+            return Err(Error::InvalidInput(
+                "stream belongs to a different CUDA context than SpHandle",
+            ));
         }
         // SAFETY: `self.raw` and `stream.cu_stream()` are valid on `self.cuda`.
-        check("cusolverSpSetStream", unsafe { sys::cusolverSpSetStream(self.raw, stream.cu_stream()) })
+        check("cusolverSpSetStream", unsafe {
+            sys::cusolverSpSetStream(self.raw, stream.cu_stream())
+        })
     }
 
     /// Solves sparse linear system `A * x = b` using QR factorization on `stream`.
@@ -364,7 +459,15 @@ impl SpHandle {
         if !tol.is_nonneg_finite() {
             return Err(Error::InvalidInput("csrlsvqr requires finite tol >= 0"));
         }
-        validate_csr_solve(m, nnz, csr_val.len(), csr_row_ptr.len(), csr_col_ind.len(), b.len(), x.len())?;
+        validate_csr_solve(
+            m,
+            nnz,
+            csr_val.len(),
+            csr_row_ptr.len(),
+            csr_col_ind.len(),
+            b.len(),
+            x.len(),
+        )?;
         self.set_stream(stream)?;
         let mut singularity = -1i32;
         // SAFETY: buffer lengths were validated above; `singularity` is a valid host out-pointer.
@@ -411,7 +514,15 @@ impl SpHandle {
         if !eps.is_pos_finite() {
             return Err(Error::InvalidInput("csreigvsi requires finite eps > 0"));
         }
-        validate_csr_solve(m, nnz, csr_val.len(), csr_row_ptr.len(), csr_col_ind.len(), x0.len(), x.len())?;
+        validate_csr_solve(
+            m,
+            nnz,
+            csr_val.len(),
+            csr_row_ptr.len(),
+            csr_col_ind.len(),
+            x0.len(),
+            x.len(),
+        )?;
         self.set_stream(stream)?;
         let d_mu = T::alloc_scalar(stream, mu0)?;
         // SAFETY: buffer lengths were validated above; `d_mu` is a 1-element device buffer on `stream`.

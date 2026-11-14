@@ -42,11 +42,14 @@ impl GeometryFlags {
     /// Any-hit programs run as usual.
     pub const NONE: Self = Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_NONE as u32);
     /// Opaque geometry: any-hit programs are skipped.
-    pub const DISABLE_ANYHIT: Self = Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT as u32);
+    pub const DISABLE_ANYHIT: Self =
+        Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT as u32);
     /// Any-hit runs at most once per primitive per ray.
-    pub const REQUIRE_SINGLE_ANYHIT_CALL: Self = Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL as u32);
+    pub const REQUIRE_SINGLE_ANYHIT_CALL: Self =
+        Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL as u32);
     /// Triangles are never culled by their facing.
-    pub const DISABLE_TRIANGLE_FACE_CULLING: Self = Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_DISABLE_TRIANGLE_FACE_CULLING as u32);
+    pub const DISABLE_TRIANGLE_FACE_CULLING: Self =
+        Self(sys::OptixGeometryFlags_OPTIX_GEOMETRY_FLAG_DISABLE_TRIANGLE_FACE_CULLING as u32);
 }
 
 /// One SBT record with no flags: the default of [`TriangleMesh::new`] and friends.
@@ -117,13 +120,20 @@ impl<T> Keys<'_, T> {
     fn split(&self, keys: usize) -> Result<(Vec<sys::CUdeviceptr>, u32)> {
         let bufs = self.buffers();
         if bufs.len() != keys {
-            return Err(Error::Invalid("a per-key input needs exactly one buffer per motion key"));
+            return Err(Error::Invalid(
+                "a per-key input needs exactly one buffer per motion key",
+            ));
         }
         let len = bufs.first().map_or(0, |b| b.len());
         if bufs.iter().any(|b| b.len() != len) {
-            return Err(Error::Invalid("motion-key buffers of one input differ in length"));
+            return Err(Error::Invalid(
+                "motion-key buffers of one input differ in length",
+            ));
         }
-        Ok((bufs.iter().map(|b| b.cu_deviceptr()).collect(), count(len, "too many elements in a build input")?))
+        Ok((
+            bufs.iter().map(|b| b.cu_deviceptr()).collect(),
+            count(len, "too many elements in a build input")?,
+        ))
     }
 }
 
@@ -199,9 +209,24 @@ impl Indices<'_> {
     /// Pointer, triangle count, format and stride.
     fn parts(&self) -> Result<(sys::CUdeviceptr, u32, sys::OptixIndicesFormat, u32)> {
         let (ptr, len, format, stride) = match self {
-            Self::U8(b) => (b.cu_deviceptr(), b.len(), sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_BYTE3, stride::<[u8; 3]>()),
-            Self::U16(b) => (b.cu_deviceptr(), b.len(), sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3, stride::<[u16; 3]>()),
-            Self::U32(b) => (b.cu_deviceptr(), b.len(), sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_INT3, stride::<[u32; 3]>()),
+            Self::U8(b) => (
+                b.cu_deviceptr(),
+                b.len(),
+                sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_BYTE3,
+                stride::<[u8; 3]>(),
+            ),
+            Self::U16(b) => (
+                b.cu_deviceptr(),
+                b.len(),
+                sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3,
+                stride::<[u16; 3]>(),
+            ),
+            Self::U32(b) => (
+                b.cu_deviceptr(),
+                b.len(),
+                sys::OptixIndicesFormat_OPTIX_INDICES_FORMAT_UNSIGNED_INT3,
+                stride::<[u32; 3]>(),
+            ),
         };
         Ok((ptr, count(len, "too many triangles")?, format, stride))
     }
@@ -252,7 +277,15 @@ impl<'a> TriangleMesh<'a> {
     /// A mesh over `vertices` (non-indexed, one SBT record, no flags); set the other fields with
     /// struct-update syntax.
     pub fn new(vertices: impl Into<Vertices<'a>>) -> Self {
-        Self { vertices: vertices.into(), indices: None, flags: ONE_RECORD, sbt_offsets: None, pre_transform: None, primitive_offset: 0, micromap: None }
+        Self {
+            vertices: vertices.into(),
+            indices: None,
+            flags: ONE_RECORD,
+            sbt_offsets: None,
+            pre_transform: None,
+            primitive_offset: 0,
+            micromap: None,
+        }
     }
 }
 
@@ -285,15 +318,31 @@ impl CurveType {
     fn raw(self) -> sys::OptixPrimitiveType {
         match self {
             Self::RoundLinear => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_LINEAR,
-            Self::RoundQuadraticBspline => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE,
-            Self::RoundCubicBspline => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE,
+            Self::RoundQuadraticBspline => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE
+            }
+            Self::RoundCubicBspline => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE
+            }
             Self::RoundCatmullRom => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM,
-            Self::RoundCubicBezier => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER,
-            Self::RoundQuadraticBsplineRocaps => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS,
-            Self::RoundCubicBsplineRocaps => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE_ROCAPS,
-            Self::RoundCatmullRomRocaps => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM_ROCAPS,
-            Self::RoundCubicBezierRocaps => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER_ROCAPS,
-            Self::FlatQuadraticBspline => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_FLAT_QUADRATIC_BSPLINE,
+            Self::RoundCubicBezier => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER
+            }
+            Self::RoundQuadraticBsplineRocaps => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS
+            }
+            Self::RoundCubicBsplineRocaps => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE_ROCAPS
+            }
+            Self::RoundCatmullRomRocaps => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM_ROCAPS
+            }
+            Self::RoundCubicBezierRocaps => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER_ROCAPS
+            }
+            Self::FlatQuadraticBspline => {
+                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_FLAT_QUADRATIC_BSPLINE
+            }
         }
     }
 
@@ -317,7 +366,9 @@ impl CurveType {
     fn degree(self) -> u32 {
         match self {
             Self::RoundLinear => 1,
-            Self::RoundQuadraticBspline | Self::RoundQuadraticBsplineRocaps | Self::FlatQuadraticBspline => 2,
+            Self::RoundQuadraticBspline
+            | Self::RoundQuadraticBsplineRocaps
+            | Self::FlatQuadraticBspline => 2,
             Self::RoundCubicBspline
             | Self::RoundCatmullRom
             | Self::RoundCubicBezier
@@ -378,7 +429,13 @@ pub struct Spheres<'a> {
 impl<'a> Spheres<'a> {
     /// Spheres without motion, one SBT record, no flags.
     pub fn new(centers: &'a DeviceBuffer<[f32; 3]>, radii: Radii<'a>) -> Self {
-        Self { centers: Keys::One(centers), radii, flags: ONE_RECORD, sbt_offsets: None, primitive_offset: 0 }
+        Self {
+            centers: Keys::One(centers),
+            radii,
+            flags: ONE_RECORD,
+            sbt_offsets: None,
+            primitive_offset: 0,
+        }
     }
 }
 
@@ -396,9 +453,11 @@ pub struct Aabb {
 unsafe impl DeviceCopy for Aabb {}
 
 const _: () = assert!(size_of::<Aabb>() == size_of::<sys::OptixAabb>());
-const _: () = assert!(std::mem::offset_of!(Aabb, max) == std::mem::offset_of!(sys::OptixAabb, maxX));
+const _: () =
+    assert!(std::mem::offset_of!(Aabb, max) == std::mem::offset_of!(sys::OptixAabb, maxX));
 // The tight stride OptiX is given must keep every box on the AABB buffer alignment.
-const _: () = assert!(size_of::<Aabb>().is_multiple_of(sys::OPTIX_AABB_BUFFER_BYTE_ALIGNMENT as usize));
+const _: () =
+    assert!(size_of::<Aabb>().is_multiple_of(sys::OPTIX_AABB_BUFFER_BYTE_ALIGNMENT as usize));
 
 /// One custom-primitive input of a geometry structure; intersection programs decide hits.
 #[derive(Clone, Copy)]
@@ -416,7 +475,12 @@ pub struct CustomPrimitives<'a> {
 impl<'a> CustomPrimitives<'a> {
     /// Primitives without motion, one SBT record, no flags.
     pub fn new(aabbs: &'a DeviceBuffer<Aabb>) -> Self {
-        Self { aabbs: Keys::One(aabbs), flags: ONE_RECORD, sbt_offsets: None, primitive_offset: 0 }
+        Self {
+            aabbs: Keys::One(aabbs),
+            flags: ONE_RECORD,
+            sbt_offsets: None,
+            primitive_offset: 0,
+        }
     }
 }
 
@@ -472,12 +536,30 @@ impl BuildOptions {
             sys::OptixBuildFlags_OPTIX_BUILD_FLAG_PREFER_FAST_BUILD
         } as u32;
         for (on, flag) in [
-            (self.compact, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_COMPACTION),
-            (self.allow_update, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_UPDATE),
-            (self.random_vertex_access, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS),
-            (self.random_instance_access, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_RANDOM_INSTANCE_ACCESS),
-            (self.allow_micromap_update, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_OPACITY_MICROMAP_UPDATE),
-            (self.allow_disable_micromaps, sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_DISABLE_OPACITY_MICROMAPS),
+            (
+                self.compact,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_COMPACTION,
+            ),
+            (
+                self.allow_update,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_UPDATE,
+            ),
+            (
+                self.random_vertex_access,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS,
+            ),
+            (
+                self.random_instance_access,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_RANDOM_INSTANCE_ACCESS,
+            ),
+            (
+                self.allow_micromap_update,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_OPACITY_MICROMAP_UPDATE,
+            ),
+            (
+                self.allow_disable_micromaps,
+                sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_DISABLE_OPACITY_MICROMAPS,
+            ),
         ] {
             if on {
                 flags |= flag as u32;
@@ -503,7 +585,9 @@ pub(crate) fn count(n: usize, what: &'static str) -> Result<u32> {
 /// Rejects a stream of another CUDA context than `ctx`'s.
 pub(crate) fn same_ctx(stream: &Stream, ctx: &DeviceContext) -> Result<()> {
     if stream.context().as_ref() != ctx.cuda().as_ref() {
-        return Err(Error::Invalid("stream belongs to another CUDA context than the OptiX device context"));
+        return Err(Error::Invalid(
+            "stream belongs to another CUDA context than the OptiX device context",
+        ));
     }
     Ok(())
 }
@@ -511,7 +595,10 @@ pub(crate) fn same_ctx(stream: &Stream, ctx: &DeviceContext) -> Result<()> {
 /// Rejects a peak allocation above the caller's budget.
 pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
     match budget {
-        Some(available) if peak > available => Err(Error::Budget { requested: peak, available }),
+        Some(available) if peak > available => Err(Error::Budget {
+            requested: peak,
+            available,
+        }),
         _ => Ok(()),
     }
 }
@@ -523,11 +610,17 @@ pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
 ///
 /// The contents are uninitialized: the caller has them written (by OptiX or a copy) before
 /// anything reads them.
-pub(crate) unsafe fn alloc(stream: &Arc<Stream>, bytes: usize, align: u32) -> Result<DeviceBuffer<u8>> {
+pub(crate) unsafe fn alloc(
+    stream: &Arc<Stream>,
+    bytes: usize,
+    align: u32,
+) -> Result<DeviceBuffer<u8>> {
     // SAFETY: forwarded contract.
     let buffer = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes.max(1)) }?;
     if buffer.cu_deviceptr() % u64::from(align) != 0 {
-        return Err(Error::Invalid("allocator returned memory below the alignment OptiX requires"));
+        return Err(Error::Invalid(
+            "allocator returned memory below the alignment OptiX requires",
+        ));
     }
     Ok(buffer)
 }
@@ -537,7 +630,10 @@ pub(crate) unsafe fn alloc(stream: &Arc<Stream>, bytes: usize, align: u32) -> Re
 /// # Safety
 ///
 /// `T` has no padding bytes, so every copied byte is initialized.
-pub(crate) unsafe fn upload<T: Copy>(stream: &Arc<Stream>, items: &[T]) -> Result<DeviceBuffer<u8>> {
+pub(crate) unsafe fn upload<T: Copy>(
+    stream: &Arc<Stream>,
+    items: &[T],
+) -> Result<DeviceBuffer<u8>> {
     let bytes = size_of_val(items);
     // SAFETY: filled by the copy below before anything reads it.
     let device = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes.max(1)) }?;
@@ -545,7 +641,15 @@ pub(crate) unsafe fn upload<T: Copy>(stream: &Arc<Stream>, items: &[T]) -> Resul
         // SAFETY: `items` is `bytes` initialized bytes (no padding, per the contract); a pageable
         // source is staged before the call returns, so `items` may be dropped afterwards; the
         // destination holds at least `bytes` bytes.
-        unsafe { cuda_core::sys::cuMemcpyHtoDAsync_v2(device.cu_deviceptr(), items.as_ptr().cast(), bytes, stream.cu_stream()) }.result()?;
+        unsafe {
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                device.cu_deviceptr(),
+                items.as_ptr().cast(),
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .result()?;
     }
     Ok(device)
 }
@@ -555,19 +659,40 @@ pub(crate) unsafe fn upload<T: Copy>(stream: &Arc<Stream>, items: &[T]) -> Resul
 /// # Safety
 ///
 /// Every write to `src` is complete or ordered before `stream`; `dst` is not in use.
-pub(crate) unsafe fn copy_bytes(stream: &Stream, dst: &DeviceBuffer<u8>, src: &DeviceBuffer<u8>) -> Result<()> {
+pub(crate) unsafe fn copy_bytes(
+    stream: &Stream,
+    dst: &DeviceBuffer<u8>,
+    src: &DeviceBuffer<u8>,
+) -> Result<()> {
     if dst.len() != src.len() {
-        return Err(Error::Invalid("relocation target size differs from the source"));
+        return Err(Error::Invalid(
+            "relocation target size differs from the source",
+        ));
     }
     stream.context().bind_to_thread()?;
     if dst.context().as_ref() == src.context().as_ref() {
         // SAFETY: both hold `len` bytes in one context; distinct allocations do not overlap;
         // ordering per the contract.
-        unsafe { cuda_core::sys::cuMemcpyDtoDAsync_v2(dst.cu_deviceptr(), src.cu_deviceptr(), src.len(), stream.cu_stream()) }.result()?;
+        unsafe {
+            cuda_core::sys::cuMemcpyDtoDAsync_v2(
+                dst.cu_deviceptr(),
+                src.cu_deviceptr(),
+                src.len(),
+                stream.cu_stream(),
+            )
+        }
+        .result()?;
     } else {
         // SAFETY: as above, each pointer paired with the context that owns it.
         unsafe {
-            cuda_core::sys::cuMemcpyPeerAsync(dst.cu_deviceptr(), dst.context().cu_ctx(), src.cu_deviceptr(), src.context().cu_ctx(), src.len(), stream.cu_stream())
+            cuda_core::sys::cuMemcpyPeerAsync(
+                dst.cu_deviceptr(),
+                dst.context().cu_ctx(),
+                src.cu_deviceptr(),
+                src.context().cu_ctx(),
+                src.len(),
+                stream.cu_stream(),
+            )
         }
         .result()?;
     }
@@ -584,7 +709,10 @@ pub struct Scratch {
 impl Scratch {
     /// Empty scratch for builds on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buffer: None }
+        Self {
+            stream: stream.clone(),
+            buffer: None,
+        }
     }
 
     /// Bytes currently held.
@@ -599,18 +727,28 @@ impl Scratch {
 
     /// Device memory of at least `bytes` (at least one byte, so the pointer is never null),
     /// aligned for every OptiX temp buffer.
-    pub(crate) fn reserve(&mut self, stream: &Arc<Stream>, bytes: usize) -> Result<(sys::CUdeviceptr, usize)> {
+    pub(crate) fn reserve(
+        &mut self,
+        stream: &Arc<Stream>,
+        bytes: usize,
+    ) -> Result<(sys::CUdeviceptr, usize)> {
         if !Arc::ptr_eq(stream, &self.stream) {
-            return Err(Error::Invalid("scratch used on a different stream than it was created for"));
+            return Err(Error::Invalid(
+                "scratch used on a different stream than it was created for",
+            ));
         }
         let bytes = bytes.max(1);
         if self.capacity() < bytes {
             // The old buffer's free is ordered after the work already queued on this stream.
             self.buffer = None;
             // SAFETY: OptiX writes temp memory before reading it.
-            self.buffer = Some(unsafe { alloc(stream, bytes, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?);
+            self.buffer =
+                Some(unsafe { alloc(stream, bytes, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?);
         }
-        let b = self.buffer.as_ref().ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
+        let b = self
+            .buffer
+            .as_ref()
+            .ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
         Ok((b.cu_deviceptr(), b.len()))
     }
 }
@@ -638,7 +776,14 @@ impl Instance {
 
     /// `child` with the identity transform, id 0, SBT offset 0, visible to every ray.
     pub fn new(child: impl Into<Child>) -> Self {
-        Self { child: child.into(), transform: Self::IDENTITY, id: 0, sbt_offset: 0, mask: 0xFF, flags: 0 }
+        Self {
+            child: child.into(),
+            transform: Self::IDENTITY,
+            id: 0,
+            sbt_offset: 0,
+            mask: 0xFF,
+            flags: 0,
+        }
     }
 
     fn raw(&self) -> sys::OptixInstance {
@@ -657,12 +802,19 @@ impl Instance {
 // 12 f32 + 4 u32 + u64 + 2 u32 = 80 bytes: no padding, so instance arrays upload byte-exact.
 const _: () = assert!(size_of::<sys::OptixInstance>() == 80);
 // Consecutive instances (and pointers into an array of them) stay on the instance alignment.
-const _: () = assert!(size_of::<sys::OptixInstance>().is_multiple_of(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT as usize));
+const _: () = assert!(
+    size_of::<sys::OptixInstance>().is_multiple_of(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT as usize)
+);
 
 /// Rejects instances of structures from another device context.
 fn check_children(ctx: &Arc<DeviceContext>, instances: &[Instance]) -> Result<()> {
-    if instances.iter().any(|i| !Arc::ptr_eq(i.child.context(), ctx)) {
-        return Err(Error::Invalid("instance of a structure from another device context"));
+    if instances
+        .iter()
+        .any(|i| !Arc::ptr_eq(i.child.context(), ctx))
+    {
+        return Err(Error::Invalid(
+            "instance of a structure from another device context",
+        ));
     }
     Ok(())
 }
@@ -678,19 +830,32 @@ pub struct DeviceInstances {
 
 impl DeviceInstances {
     /// Uploads `instances` on `stream`; builds that point into them must run on `stream`.
-    pub fn new(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, instances: &[Instance]) -> Result<Self> {
+    pub fn new(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        instances: &[Instance],
+    ) -> Result<Self> {
         same_ctx(stream, ctx)?;
         if instances.is_empty() {
-            return Err(Error::Invalid("device instances need at least one instance"));
+            return Err(Error::Invalid(
+                "device instances need at least one instance",
+            ));
         }
         check_children(ctx, instances)?;
         let raw: Vec<sys::OptixInstance> = instances.iter().map(Instance::raw).collect();
         // SAFETY: `OptixInstance` has no padding (asserted above).
         let buffer = unsafe { upload(stream, &raw) }?;
         if buffer.cu_deviceptr() % u64::from(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT) != 0 {
-            return Err(Error::Invalid("allocator returned instances below OptiX's instance alignment"));
+            return Err(Error::Invalid(
+                "allocator returned instances below OptiX's instance alignment",
+            ));
         }
-        Ok(Self { buffer, children: instances.iter().map(|i| i.child.clone()).collect(), stream: stream.clone(), ctx: ctx.clone() })
+        Ok(Self {
+            buffer,
+            children: instances.iter().map(|i| i.child.clone()).collect(),
+            stream: stream.clone(),
+            ctx: ctx.clone(),
+        })
     }
 
     /// Number of instances.
@@ -708,10 +873,29 @@ impl DeviceInstances {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
     /// `omm`: the micromap array's address, or 0 when refits may swap it; `None` = no micromap.
-    Tri { vertices: u32, triangles: u32, format: sys::OptixVertexFormat, index: sys::OptixIndicesFormat, sbt: u32, omm: Option<u64> },
-    Curve { kind: sys::OptixPrimitiveType, segments: u32, vertices: u32, normals: bool },
-    Sphere { spheres: u32, single: bool, sbt: u32 },
-    Custom { prims: u32, sbt: u32 },
+    Tri {
+        vertices: u32,
+        triangles: u32,
+        format: sys::OptixVertexFormat,
+        index: sys::OptixIndicesFormat,
+        sbt: u32,
+        omm: Option<u64>,
+    },
+    Curve {
+        kind: sys::OptixPrimitiveType,
+        segments: u32,
+        vertices: u32,
+        normals: bool,
+    },
+    Sphere {
+        spheres: u32,
+        single: bool,
+        sbt: u32,
+    },
+    Custom {
+        prims: u32,
+        sbt: u32,
+    },
     Instances(u32),
     InstancePointers(u32),
 }
@@ -744,7 +928,10 @@ impl Inputs {
         p
     }
 
-    fn keep_usage(&mut self, v: Vec<sys::OptixOpacityMicromapUsageCount>) -> *const sys::OptixOpacityMicromapUsageCount {
+    fn keep_usage(
+        &mut self,
+        v: Vec<sys::OptixOpacityMicromapUsageCount>,
+    ) -> *const sys::OptixOpacityMicromapUsageCount {
         if v.is_empty() {
             return std::ptr::null();
         }
@@ -755,20 +942,33 @@ impl Inputs {
 
     /// Per-SBT-record flags and the optional per-primitive offsets of one input over `prims`
     /// primitives: (flags, records, offsets, offset size, offset stride).
-    fn sbt(&mut self, flags: &[GeometryFlags], offsets: Option<SbtOffsets<'_>>, prims: u32) -> Result<(*const u32, u32, sys::CUdeviceptr, u32, u32)> {
+    fn sbt(
+        &mut self,
+        flags: &[GeometryFlags],
+        offsets: Option<SbtOffsets<'_>>,
+        prims: u32,
+    ) -> Result<(*const u32, u32, sys::CUdeviceptr, u32, u32)> {
         if flags.is_empty() {
-            return Err(Error::Invalid("a build input needs at least one SBT record (flags entry)"));
+            return Err(Error::Invalid(
+                "a build input needs at least one SBT record (flags entry)",
+            ));
         }
         let records = count(flags.len(), "too many SBT records")?;
         let (ptr, size, stride) = match offsets {
             Some(o) => {
                 let (ptr, size, len) = o.parts();
                 if len != prims as usize {
-                    return Err(Error::Invalid("SBT offset buffer length differs from the primitive count"));
+                    return Err(Error::Invalid(
+                        "SBT offset buffer length differs from the primitive count",
+                    ));
                 }
                 (ptr, size, size)
             }
-            None if records > 1 => return Err(Error::Invalid("several SBT records need per-primitive SBT offsets")),
+            None if records > 1 => {
+                return Err(Error::Invalid(
+                    "several SBT records need per-primitive SBT offsets",
+                ));
+            }
             None => (0, 0, 0),
         };
         let raw: Vec<u32> = flags.iter().map(|f| f.0).collect();
@@ -790,7 +990,9 @@ struct Cx<'a> {
 
 /// Rejects `primitive_offset + prims` overflowing `u32`, which OptiX forbids.
 fn prim_range(prims: u32, offset: u32) -> Result<()> {
-    prims.checked_add(offset).map(|_| ()).ok_or(Error::Invalid("primitive_offset + primitive count overflows u32"))
+    prims.checked_add(offset).map(|_| ()).ok_or(Error::Invalid(
+        "primitive_offset + primitive count overflows u32",
+    ))
 }
 
 /// A geometry build input kind; all inputs of one geometry structure share the kind.
@@ -807,17 +1009,32 @@ impl Gas for TriangleMesh<'_> {
         };
         let triangles = match self.indices {
             Some(_) => triplets,
-            None if vertices % 3 != 0 => return Err(Error::Invalid("a non-indexed mesh needs a multiple of three vertices")),
+            None if vertices % 3 != 0 => {
+                return Err(Error::Invalid(
+                    "a non-indexed mesh needs a multiple of three vertices",
+                ));
+            }
             None => vertices / 3,
         };
         prim_range(triangles, self.primitive_offset)?;
-        let (flags, records, sbt_ptr, sbt_size, sbt_stride) = out.sbt(self.flags, self.sbt_offsets, triangles)?;
+        let (flags, records, sbt_ptr, sbt_size, sbt_stride) =
+            out.sbt(self.flags, self.sbt_offsets, triangles)?;
         let (pre_transform, transform_format) = match self.pre_transform {
-            Some(t) if t.len() != 1 => return Err(Error::Invalid("pre_transform holds exactly one 3x4 matrix")),
-            Some(t) if t.cu_deviceptr() % u64::from(sys::OPTIX_GEOMETRY_TRANSFORM_BYTE_ALIGNMENT) != 0 => {
-                return Err(Error::Invalid("pre_transform is below OptiX's geometry transform alignment"));
+            Some(t) if t.len() != 1 => {
+                return Err(Error::Invalid("pre_transform holds exactly one 3x4 matrix"));
             }
-            Some(t) => (t.cu_deviceptr(), sys::OptixTransformFormat_OPTIX_TRANSFORM_FORMAT_MATRIX_FLOAT12),
+            Some(t)
+                if t.cu_deviceptr() % u64::from(sys::OPTIX_GEOMETRY_TRANSFORM_BYTE_ALIGNMENT)
+                    != 0 =>
+            {
+                return Err(Error::Invalid(
+                    "pre_transform is below OptiX's geometry transform alignment",
+                ));
+            }
+            Some(t) => (
+                t.cu_deviceptr(),
+                sys::OptixTransformFormat_OPTIX_TRANSFORM_FORMAT_MATRIX_FLOAT12,
+            ),
             None => (0, sys::OptixTransformFormat_OPTIX_TRANSFORM_FORMAT_NONE),
         };
         let (opacity_micromap, omm) = match &self.micromap {
@@ -830,7 +1047,10 @@ impl Gas for TriangleMesh<'_> {
             None => (sys::OptixBuildInputOpacityMicromap::default(), None),
         };
         let vertex_buffers = out.keep_ptrs(vptrs);
-        let mut input = sys::OptixBuildInput { type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_TRIANGLES, ..Default::default() };
+        let mut input = sys::OptixBuildInput {
+            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_TRIANGLES,
+            ..Default::default()
+        };
         input.__bindgen_anon_1.triangleArray = sys::OptixBuildInputTriangleArray {
             vertexBuffers: vertex_buffers,
             numVertices: vertices,
@@ -851,7 +1071,14 @@ impl Gas for TriangleMesh<'_> {
             opacityMicromap: opacity_micromap,
         };
         out.inputs.push(input);
-        out.shape.push(Item::Tri { vertices, triangles, format: self.vertices.format().raw(), index: index_format, sbt: records, omm });
+        out.shape.push(Item::Tri {
+            vertices,
+            triangles,
+            format: self.vertices.format().raw(),
+            index: index_format,
+            sbt: records,
+            omm,
+        });
         Ok(())
     }
 }
@@ -864,7 +1091,11 @@ impl Gas for Curves<'_> {
             return Err(Error::Invalid("curves need one width per control point"));
         }
         let normals = match self.normals {
-            Some(_) if self.kind != CurveType::FlatQuadraticBspline => return Err(Error::Invalid("curve normals apply to flat quadratic B-spline ribbons only")),
+            Some(_) if self.kind != CurveType::FlatQuadraticBspline => {
+                return Err(Error::Invalid(
+                    "curve normals apply to flat quadratic B-spline ribbons only",
+                ));
+            }
             Some(n) => {
                 let (nptrs, normals) = n.split(cx.keys)?;
                 if normals != vertices {
@@ -882,14 +1113,19 @@ impl Gas for Curves<'_> {
             return Err(Error::Invalid("curves need at least one segment"));
         }
         if vertices <= self.kind.degree() {
-            return Err(Error::Invalid("curves need more control points than their degree"));
+            return Err(Error::Invalid(
+                "curves need more control points than their degree",
+            ));
         }
         prim_range(segments, self.primitive_offset)?;
         let has_normals = normals.is_some();
         let vertex_buffers = out.keep_ptrs(vptrs);
         let width_buffers = out.keep_ptrs(wptrs);
         let normal_buffers = normals.map_or(std::ptr::null(), |n| out.keep_ptrs(n));
-        let mut input = sys::OptixBuildInput { type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_CURVES, ..Default::default() };
+        let mut input = sys::OptixBuildInput {
+            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_CURVES,
+            ..Default::default()
+        };
         input.__bindgen_anon_1.curveArray = sys::OptixBuildInputCurveArray {
             curveType: self.kind.raw(),
             numPrimitives: segments,
@@ -904,10 +1140,19 @@ impl Gas for Curves<'_> {
             indexStrideInBytes: stride::<u32>(),
             flag: self.flags.0,
             primitiveIndexOffset: self.primitive_offset,
-            endcapFlags: if self.endcaps { sys::OptixCurveEndcapFlags_OPTIX_CURVE_ENDCAP_ON } else { sys::OptixCurveEndcapFlags_OPTIX_CURVE_ENDCAP_DEFAULT } as u32,
+            endcapFlags: if self.endcaps {
+                sys::OptixCurveEndcapFlags_OPTIX_CURVE_ENDCAP_ON
+            } else {
+                sys::OptixCurveEndcapFlags_OPTIX_CURVE_ENDCAP_DEFAULT
+            } as u32,
         };
         out.inputs.push(input);
-        out.shape.push(Item::Curve { kind: self.kind.raw(), segments, vertices, normals: has_normals });
+        out.shape.push(Item::Curve {
+            kind: self.kind.raw(),
+            segments,
+            vertices,
+            normals: has_normals,
+        });
         Ok(())
     }
 }
@@ -920,19 +1165,27 @@ impl Gas for Spheres<'_> {
             Radii::PerSphere(k) => (false, k.split(cx.keys)?),
         };
         if single && radii != 1 {
-            return Err(Error::Invalid("a single-radius buffer holds exactly one radius per key"));
+            return Err(Error::Invalid(
+                "a single-radius buffer holds exactly one radius per key",
+            ));
         }
         if !single && radii != spheres {
-            return Err(Error::Invalid("per-sphere radii need one radius per center"));
+            return Err(Error::Invalid(
+                "per-sphere radii need one radius per center",
+            ));
         }
         if spheres == 0 {
             return Err(Error::Invalid("a sphere input needs at least one sphere"));
         }
         prim_range(spheres, self.primitive_offset)?;
-        let (flags, records, sbt_ptr, sbt_size, sbt_stride) = out.sbt(self.flags, self.sbt_offsets, spheres)?;
+        let (flags, records, sbt_ptr, sbt_size, sbt_stride) =
+            out.sbt(self.flags, self.sbt_offsets, spheres)?;
         let vertex_buffers = out.keep_ptrs(cptrs);
         let radius_buffers = out.keep_ptrs(rptrs);
-        let mut input = sys::OptixBuildInput { type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_SPHERES, ..Default::default() };
+        let mut input = sys::OptixBuildInput {
+            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_SPHERES,
+            ..Default::default()
+        };
         input.__bindgen_anon_1.sphereArray = sys::OptixBuildInputSphereArray {
             vertexBuffers: vertex_buffers,
             vertexStrideInBytes: stride::<[f32; 3]>(),
@@ -948,7 +1201,11 @@ impl Gas for Spheres<'_> {
             primitiveIndexOffset: self.primitive_offset,
         };
         out.inputs.push(input);
-        out.shape.push(Item::Sphere { spheres, single, sbt: records });
+        out.shape.push(Item::Sphere {
+            spheres,
+            single,
+            sbt: records,
+        });
         Ok(())
     }
 }
@@ -956,16 +1213,27 @@ impl Gas for Spheres<'_> {
 impl Gas for CustomPrimitives<'_> {
     fn push(&self, cx: &Cx<'_>, out: &mut Inputs) -> Result<()> {
         let (aptrs, prims) = self.aabbs.split(cx.keys)?;
-        if aptrs.iter().any(|p| p % u64::from(sys::OPTIX_AABB_BUFFER_BYTE_ALIGNMENT) != 0) {
-            return Err(Error::Invalid("AABB buffer is below OptiX's AABB alignment"));
+        if aptrs
+            .iter()
+            .any(|p| p % u64::from(sys::OPTIX_AABB_BUFFER_BYTE_ALIGNMENT) != 0)
+        {
+            return Err(Error::Invalid(
+                "AABB buffer is below OptiX's AABB alignment",
+            ));
         }
         if prims == 0 {
-            return Err(Error::Invalid("a custom-primitive input needs at least one box"));
+            return Err(Error::Invalid(
+                "a custom-primitive input needs at least one box",
+            ));
         }
         prim_range(prims, self.primitive_offset)?;
-        let (flags, records, sbt_ptr, sbt_size, sbt_stride) = out.sbt(self.flags, self.sbt_offsets, prims)?;
+        let (flags, records, sbt_ptr, sbt_size, sbt_stride) =
+            out.sbt(self.flags, self.sbt_offsets, prims)?;
         let aabb_buffers = out.keep_ptrs(aptrs);
-        let mut input = sys::OptixBuildInput { type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES, ..Default::default() };
+        let mut input = sys::OptixBuildInput {
+            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES,
+            ..Default::default()
+        };
         input.__bindgen_anon_1.customPrimitiveArray = sys::OptixBuildInputCustomPrimitiveArray {
             aabbBuffers: aabb_buffers,
             numPrimitives: prims,
@@ -978,14 +1246,19 @@ impl Gas for CustomPrimitives<'_> {
             primitiveIndexOffset: self.primitive_offset,
         };
         out.inputs.push(input);
-        out.shape.push(Item::Custom { prims, sbt: records });
+        out.shape.push(Item::Custom {
+            prims,
+            sbt: records,
+        });
         Ok(())
     }
 }
 
 fn gas_inputs<G: Gas>(items: &[G], cx: &Cx<'_>) -> Result<Inputs> {
     if items.is_empty() {
-        return Err(Error::Invalid("a geometry structure needs at least one build input"));
+        return Err(Error::Invalid(
+            "a geometry structure needs at least one build input",
+        ));
     }
     let mut out = Inputs::default();
     for item in items {
@@ -995,15 +1268,39 @@ fn gas_inputs<G: Gas>(items: &[G], cx: &Cx<'_>) -> Result<Inputs> {
 }
 
 /// One instance-array input over `raw` instances of `kind`'s device array `device`.
-fn instance_input(kind: sys::OptixBuildInputType, device: DeviceBuffer<u8>, n: u32, item: Item, children: Vec<Child>) -> Inputs {
-    let mut input = sys::OptixBuildInput { type_: kind, ..Default::default() };
-    input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray { instances: device.cu_deviceptr(), numInstances: n, instanceStride: 0 };
-    Inputs { inputs: vec![input], shape: vec![item], _device: vec![device], refs: Refs { children, micromaps: Vec::new() }, ..Default::default() }
+fn instance_input(
+    kind: sys::OptixBuildInputType,
+    device: DeviceBuffer<u8>,
+    n: u32,
+    item: Item,
+    children: Vec<Child>,
+) -> Inputs {
+    let mut input = sys::OptixBuildInput {
+        type_: kind,
+        ..Default::default()
+    };
+    input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray {
+        instances: device.cu_deviceptr(),
+        numInstances: n,
+        instanceStride: 0,
+    };
+    Inputs {
+        inputs: vec![input],
+        shape: vec![item],
+        _device: vec![device],
+        refs: Refs {
+            children,
+            micromaps: Vec::new(),
+        },
+        ..Default::default()
+    }
 }
 
 fn instance_inputs(cx: &Cx<'_>, instances: &[Instance]) -> Result<Inputs> {
     if instances.is_empty() {
-        return Err(Error::Invalid("an instance structure needs at least one instance"));
+        return Err(Error::Invalid(
+            "an instance structure needs at least one instance",
+        ));
     }
     check_children(cx.ctx, instances)?;
     let raw: Vec<sys::OptixInstance> = instances.iter().map(Instance::raw).collect();
@@ -1011,35 +1308,59 @@ fn instance_inputs(cx: &Cx<'_>, instances: &[Instance]) -> Result<Inputs> {
     // SAFETY: `OptixInstance` has no padding (asserted above).
     let device = unsafe { upload(cx.stream, &raw) }?;
     if device.cu_deviceptr() % u64::from(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT) != 0 {
-        return Err(Error::Invalid("allocator returned instances below OptiX's instance alignment"));
+        return Err(Error::Invalid(
+            "allocator returned instances below OptiX's instance alignment",
+        ));
     }
     let children = instances.iter().map(|i| i.child.clone()).collect();
-    Ok(instance_input(sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES, device, n, Item::Instances(n), children))
+    Ok(instance_input(
+        sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES,
+        device,
+        n,
+        Item::Instances(n),
+        children,
+    ))
 }
 
 fn pointer_inputs(cx: &Cx<'_>, refs: &[(&DeviceInstances, u32)]) -> Result<Inputs> {
     if refs.is_empty() {
-        return Err(Error::Invalid("an instance structure needs at least one instance"));
+        return Err(Error::Invalid(
+            "an instance structure needs at least one instance",
+        ));
     }
     let mut ptrs = Vec::with_capacity(refs.len());
     let mut children = Vec::with_capacity(refs.len());
     for (set, index) in refs {
         if !Arc::ptr_eq(&set.stream, cx.stream) {
-            return Err(Error::Invalid("device instances were uploaded on a different stream than the build"));
+            return Err(Error::Invalid(
+                "device instances were uploaded on a different stream than the build",
+            ));
         }
         if !Arc::ptr_eq(&set.ctx, cx.ctx) {
-            return Err(Error::Invalid("device instances from another device context"));
+            return Err(Error::Invalid(
+                "device instances from another device context",
+            ));
         }
-        let child = set.children.get(*index as usize).ok_or(Error::Invalid("instance index out of range of its device instances"))?;
+        let child = set.children.get(*index as usize).ok_or(Error::Invalid(
+            "instance index out of range of its device instances",
+        ))?;
         // Each element stays on the instance alignment: the base is aligned and the size is a
         // multiple of it (asserted above).
-        ptrs.push(set.buffer.cu_deviceptr() + u64::from(*index) * size_of::<sys::OptixInstance>() as u64);
+        ptrs.push(
+            set.buffer.cu_deviceptr() + u64::from(*index) * size_of::<sys::OptixInstance>() as u64,
+        );
         children.push(child.clone());
     }
     let n = count(ptrs.len(), "too many instances")?;
     // SAFETY: `u64` has no padding.
     let device = unsafe { upload(cx.stream, &ptrs) }?;
-    Ok(instance_input(sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCE_POINTERS, device, n, Item::InstancePointers(n), children))
+    Ok(instance_input(
+        sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCE_POINTERS,
+        device,
+        n,
+        Item::InstancePointers(n),
+        children,
+    ))
 }
 
 /// A property [`Accel::emit`] writes.
@@ -1061,7 +1382,9 @@ impl RelocationInfo {
         let mut ok = 0;
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `self.0` came from OptiX; `ok` is writable.
-        check("optixCheckRelocationCompatibility", unsafe { entry!(ctx.table(), optixCheckRelocationCompatibility)(ctx.raw(), &self.0, &mut ok) })?;
+        check("optixCheckRelocationCompatibility", unsafe {
+            entry!(ctx.table(), optixCheckRelocationCompatibility)(ctx.raw(), &self.0, &mut ok)
+        })?;
         Ok(ok != 0)
     }
 }
@@ -1094,28 +1417,58 @@ pub struct Accel {
 impl Accel {
     /// A geometry structure over triangle `meshes`, built on `stream` with temp memory from
     /// `scratch`.
-    pub fn triangles(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, meshes: &[TriangleMesh<'_>], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn triangles(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        meshes: &[TriangleMesh<'_>],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         Self::geometry(ctx, stream, scratch, meshes, opts)
     }
 
     /// A geometry structure over curve inputs (the pipeline needs the matching built-in
     /// intersection module and [`CurveType::flag`] in its primitive types).
-    pub fn curves(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, curves: &[Curves<'_>], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn curves(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        curves: &[Curves<'_>],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         Self::geometry(ctx, stream, scratch, curves, opts)
     }
 
     /// A geometry structure over sphere inputs.
-    pub fn spheres(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, spheres: &[Spheres<'_>], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn spheres(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        spheres: &[Spheres<'_>],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         Self::geometry(ctx, stream, scratch, spheres, opts)
     }
 
     /// A geometry structure over custom primitives (AABBs).
-    pub fn custom(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, prims: &[CustomPrimitives<'_>], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn custom(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        prims: &[CustomPrimitives<'_>],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         Self::geometry(ctx, stream, scratch, prims, opts)
     }
 
     /// An instance structure over `instances`, built on `stream` with temp memory from `scratch`.
-    pub fn instances(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, instances: &[Instance], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn instances(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        instances: &[Instance],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         let cx = Self::cx(ctx, stream, &opts)?;
         let inputs = instance_inputs(&cx, instances)?;
         Self::build(ctx, stream, scratch, inputs, &opts)
@@ -1123,48 +1476,104 @@ impl Accel {
 
     /// An instance structure over pointers to device-resident instances: `(set, index)` per
     /// instance. The sets must have been uploaded on `stream`.
-    pub fn instance_pointers(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, instances: &[(&DeviceInstances, u32)], opts: BuildOptions) -> Result<Arc<Self>> {
+    pub fn instance_pointers(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        instances: &[(&DeviceInstances, u32)],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         let cx = Self::cx(ctx, stream, &opts)?;
         let inputs = pointer_inputs(&cx, instances)?;
         Self::build(ctx, stream, scratch, inputs, &opts)
     }
 
-    fn cx<'a>(ctx: &'a Arc<DeviceContext>, stream: &'a Arc<Stream>, opts: &BuildOptions) -> Result<Cx<'a>> {
+    fn cx<'a>(
+        ctx: &'a Arc<DeviceContext>,
+        stream: &'a Arc<Stream>,
+        opts: &BuildOptions,
+    ) -> Result<Cx<'a>> {
         same_ctx(stream, ctx)?;
         opts.motion_sys()?;
         let keys = usize::from(opts.motion_keys);
-        Ok(Cx { ctx, stream, keys, omm_update: opts.allow_micromap_update })
+        Ok(Cx {
+            ctx,
+            stream,
+            keys,
+            omm_update: opts.allow_micromap_update,
+        })
     }
 
-    fn geometry<G: Gas>(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, items: &[G], opts: BuildOptions) -> Result<Arc<Self>> {
+    fn geometry<G: Gas>(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        items: &[G],
+        opts: BuildOptions,
+    ) -> Result<Arc<Self>> {
         let cx = Self::cx(ctx, stream, &opts)?;
         let inputs = gas_inputs(items, &cx)?;
         Self::build(ctx, stream, scratch, inputs, &opts)
     }
 
-    fn sizes(ctx: &DeviceContext, accel_opts: &sys::OptixAccelBuildOptions, inputs: &[sys::OptixBuildInput]) -> Result<sys::OptixAccelBufferSizes> {
+    fn sizes(
+        ctx: &DeviceContext,
+        accel_opts: &sys::OptixAccelBuildOptions,
+        inputs: &[sys::OptixBuildInput],
+    ) -> Result<sys::OptixAccelBufferSizes> {
         let n = count(inputs.len(), "too many build inputs")?;
         let mut sizes = sys::OptixAccelBufferSizes::default();
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `inputs` and the host arrays and buffers they point at are alive for the call.
         check("optixAccelComputeMemoryUsage", unsafe {
-            entry!(ctx.table(), optixAccelComputeMemoryUsage)(ctx.raw(), accel_opts, inputs.as_ptr(), n, &mut sizes)
+            entry!(ctx.table(), optixAccelComputeMemoryUsage)(
+                ctx.raw(),
+                accel_opts,
+                inputs.as_ptr(),
+                n,
+                &mut sizes,
+            )
         })?;
         Ok(sizes)
     }
 
-    fn build(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, inputs: Inputs, opts: &BuildOptions) -> Result<Arc<Self>> {
+    fn build(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        inputs: Inputs,
+        opts: &BuildOptions,
+    ) -> Result<Arc<Self>> {
         let t = ctx.table();
         let flags = opts.flags();
         let motion = opts.motion_sys()?;
         let keys = usize::from(opts.motion_keys);
-        let accel_opts = sys::OptixAccelBuildOptions { buildFlags: flags, operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_BUILD, motionOptions: motion };
+        let accel_opts = sys::OptixAccelBuildOptions {
+            buildFlags: flags,
+            operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_BUILD,
+            motionOptions: motion,
+        };
         let sizes = Self::sizes(ctx, &accel_opts, &inputs.inputs)?;
-        within(opts.budget, scratch.growth(sizes.tempSizeInBytes).saturating_add(sizes.outputSizeInBytes))?;
+        within(
+            opts.budget,
+            scratch
+                .growth(sizes.tempSizeInBytes)
+                .saturating_add(sizes.outputSizeInBytes),
+        )?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.tempSizeInBytes)?;
         // SAFETY: OptiX writes the output before anything reads it.
-        let output = unsafe { alloc(stream, sizes.outputSizeInBytes, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
-        let compacted_size = if opts.compact { Some(DeviceBuffer::<u64>::zeroed(stream, 1)?) } else { None };
+        let output = unsafe {
+            alloc(
+                stream,
+                sizes.outputSizeInBytes,
+                sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT,
+            )
+        }?;
+        let compacted_size = if opts.compact {
+            Some(DeviceBuffer::<u64>::zeroed(stream, 1)?)
+        } else {
+            None
+        };
         let emit = compacted_size.as_ref().map(|b| sys::OptixAccelEmitDesc {
             result: b.cu_deviceptr(),
             type_: sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_COMPACTED_SIZE,
@@ -1190,14 +1599,29 @@ impl Accel {
             )
         })?;
         let (shape, refs) = (inputs.shape, inputs.refs);
-        let make = |handle, buffer| Arc::new(Self { handle: AtomicU64::new(handle), buffer, flags, motion, keys, shape, refs: Mutex::new(refs), ctx: ctx.clone() });
+        let make = |handle, buffer| {
+            Arc::new(Self {
+                handle: AtomicU64::new(handle),
+                buffer,
+                flags,
+                motion,
+                keys,
+                shape,
+                refs: Mutex::new(refs),
+                ctx: ctx.clone(),
+            })
+        };
 
         let Some(compacted_size) = compacted_size else {
             return Ok(make(handle, output));
         };
         let words = compacted_size.to_host_vec(stream)?;
-        let word = words.first().copied().ok_or(Error::Invalid("compacted size readback returned no value"))?;
-        let size = usize::try_from(word).map_err(|_| Error::Invalid("compacted size overflows usize"))?;
+        let word = words
+            .first()
+            .copied()
+            .ok_or(Error::Invalid("compacted size readback returned no value"))?;
+        let size =
+            usize::try_from(word).map_err(|_| Error::Invalid("compacted size overflows usize"))?;
         if size == 0 || size >= sizes.outputSizeInBytes {
             return Ok(make(handle, output));
         }
@@ -1207,7 +1631,14 @@ impl Accel {
         // SAFETY: `handle` was built with ALLOW_COMPACTION; `compact` holds `size` bytes on
         // `stream`; the source buffer's free is ordered after this call.
         check("optixAccelCompact", unsafe {
-            entry!(t, optixAccelCompact)(ctx.raw(), stream.cu_stream(), handle, compact.cu_deviceptr(), size, &mut compact_handle)
+            entry!(t, optixAccelCompact)(
+                ctx.raw(),
+                stream.cu_stream(),
+                handle,
+                compact.cu_deviceptr(),
+                size,
+                &mut compact_handle,
+            )
         })?;
         drop(output);
         Ok(make(compact_handle, compact))
@@ -1216,13 +1647,25 @@ impl Accel {
     /// The shared context of every refit: the build's motion keys and micromap-update flag.
     fn refit_cx<'a>(&'a self, stream: &'a Arc<Stream>) -> Result<Cx<'a>> {
         same_ctx(stream, &self.ctx)?;
-        Ok(Cx { ctx: &self.ctx, stream, keys: self.keys, omm_update: self.flags & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_OPACITY_MICROMAP_UPDATE as u32 != 0 })
+        Ok(Cx {
+            ctx: &self.ctx,
+            stream,
+            keys: self.keys,
+            omm_update: self.flags
+                & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_OPACITY_MICROMAP_UPDATE as u32
+                != 0,
+        })
     }
 
     /// # Safety
     ///
     /// See [`Accel::refit_triangles`].
-    unsafe fn refit<G: Gas>(&self, stream: &Arc<Stream>, scratch: &mut Scratch, items: &[G]) -> Result<()> {
+    unsafe fn refit<G: Gas>(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        items: &[G],
+    ) -> Result<()> {
         let inputs = gas_inputs(items, &self.refit_cx(stream)?)?;
         // SAFETY: forwarded contract.
         unsafe { self.update(stream, scratch, inputs) }
@@ -1236,7 +1679,12 @@ impl Accel {
     /// No launch may read this structure (directly or through an instance structure) while the
     /// refit runs: order such launches on `stream` or synchronize. Instance structures over this
     /// one keep stale bounds until they are refitted or rebuilt too.
-    pub unsafe fn refit_triangles(&self, stream: &Arc<Stream>, scratch: &mut Scratch, meshes: &[TriangleMesh<'_>]) -> Result<()> {
+    pub unsafe fn refit_triangles(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        meshes: &[TriangleMesh<'_>],
+    ) -> Result<()> {
         // SAFETY: forwarded contract.
         unsafe { self.refit(stream, scratch, meshes) }
     }
@@ -1246,7 +1694,12 @@ impl Accel {
     /// # Safety
     ///
     /// As [`Accel::refit_triangles`].
-    pub unsafe fn refit_curves(&self, stream: &Arc<Stream>, scratch: &mut Scratch, curves: &[Curves<'_>]) -> Result<()> {
+    pub unsafe fn refit_curves(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        curves: &[Curves<'_>],
+    ) -> Result<()> {
         // SAFETY: forwarded contract.
         unsafe { self.refit(stream, scratch, curves) }
     }
@@ -1256,7 +1709,12 @@ impl Accel {
     /// # Safety
     ///
     /// As [`Accel::refit_triangles`].
-    pub unsafe fn refit_spheres(&self, stream: &Arc<Stream>, scratch: &mut Scratch, spheres: &[Spheres<'_>]) -> Result<()> {
+    pub unsafe fn refit_spheres(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        spheres: &[Spheres<'_>],
+    ) -> Result<()> {
         // SAFETY: forwarded contract.
         unsafe { self.refit(stream, scratch, spheres) }
     }
@@ -1266,7 +1724,12 @@ impl Accel {
     /// # Safety
     ///
     /// As [`Accel::refit_triangles`].
-    pub unsafe fn refit_custom(&self, stream: &Arc<Stream>, scratch: &mut Scratch, prims: &[CustomPrimitives<'_>]) -> Result<()> {
+    pub unsafe fn refit_custom(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        prims: &[CustomPrimitives<'_>],
+    ) -> Result<()> {
         // SAFETY: forwarded contract.
         unsafe { self.refit(stream, scratch, prims) }
     }
@@ -1277,7 +1740,12 @@ impl Accel {
     /// # Safety
     ///
     /// As [`Accel::refit_triangles`].
-    pub unsafe fn refit_instances(&self, stream: &Arc<Stream>, scratch: &mut Scratch, instances: &[Instance]) -> Result<()> {
+    pub unsafe fn refit_instances(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        instances: &[Instance],
+    ) -> Result<()> {
         let inputs = instance_inputs(&self.refit_cx(stream)?, instances)?;
         // SAFETY: forwarded contract.
         unsafe { self.update(stream, scratch, inputs) }
@@ -1288,7 +1756,12 @@ impl Accel {
     /// # Safety
     ///
     /// As [`Accel::refit_triangles`].
-    pub unsafe fn refit_instance_pointers(&self, stream: &Arc<Stream>, scratch: &mut Scratch, instances: &[(&DeviceInstances, u32)]) -> Result<()> {
+    pub unsafe fn refit_instance_pointers(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        instances: &[(&DeviceInstances, u32)],
+    ) -> Result<()> {
         let inputs = pointer_inputs(&self.refit_cx(stream)?, instances)?;
         // SAFETY: forwarded contract.
         unsafe { self.update(stream, scratch, inputs) }
@@ -1297,14 +1770,27 @@ impl Accel {
     /// # Safety
     ///
     /// See [`Accel::refit_triangles`].
-    unsafe fn update(&self, stream: &Arc<Stream>, scratch: &mut Scratch, inputs: Inputs) -> Result<()> {
+    unsafe fn update(
+        &self,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        inputs: Inputs,
+    ) -> Result<()> {
         if self.flags & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_UPDATE as u32 == 0 {
-            return Err(Error::Invalid("structure was not built with BuildOptions::allow_update"));
+            return Err(Error::Invalid(
+                "structure was not built with BuildOptions::allow_update",
+            ));
         }
         if inputs.shape != self.shape {
-            return Err(Error::Invalid("refit inputs differ in shape from the build (kind, counts, formats or micromaps)"));
+            return Err(Error::Invalid(
+                "refit inputs differ in shape from the build (kind, counts, formats or micromaps)",
+            ));
         }
-        let accel_opts = sys::OptixAccelBuildOptions { buildFlags: self.flags, operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_UPDATE, motionOptions: self.motion };
+        let accel_opts = sys::OptixAccelBuildOptions {
+            buildFlags: self.flags,
+            operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_UPDATE,
+            motionOptions: self.motion,
+        };
         let sizes = Self::sizes(&self.ctx, &accel_opts, &inputs.inputs)?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.tempUpdateSizeInBytes)?;
         let mut handle = self.handle();
@@ -1328,7 +1814,10 @@ impl Accel {
             )
         })?;
         self.handle.store(handle, Ordering::Release);
-        let mut refs = self.refs.lock().map_err(|_| Error::Invalid("reference list poisoned by a panic"))?;
+        let mut refs = self
+            .refs
+            .lock()
+            .map_err(|_| Error::Invalid("reference list poisoned by a panic"))?;
         *refs = inputs.refs;
         Ok(())
     }
@@ -1342,18 +1831,42 @@ impl Accel {
     pub unsafe fn emit(&self, stream: &Stream, out: Emit<'_>) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
         let (result, type_) = match out {
-            Emit::CompactedSize(_) if self.flags & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_COMPACTION as u32 == 0 => {
-                return Err(Error::Invalid("compacted size needs a structure built with BuildOptions::compact"));
+            Emit::CompactedSize(_)
+                if self.flags & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_COMPACTION as u32
+                    == 0 =>
+            {
+                return Err(Error::Invalid(
+                    "compacted size needs a structure built with BuildOptions::compact",
+                ));
             }
-            Emit::CompactedSize(b) if b.len() != 1 => return Err(Error::Invalid("compacted size output holds exactly one u64")),
-            Emit::CompactedSize(b) => (b.cu_deviceptr(), sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_COMPACTED_SIZE),
-            Emit::Aabbs(b) if b.len() != self.keys => return Err(Error::Invalid("AABB output needs one box per motion key")),
-            Emit::Aabbs(b) => (b.cu_deviceptr(), sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_AABBS),
+            Emit::CompactedSize(b) if b.len() != 1 => {
+                return Err(Error::Invalid(
+                    "compacted size output holds exactly one u64",
+                ));
+            }
+            Emit::CompactedSize(b) => (
+                b.cu_deviceptr(),
+                sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_COMPACTED_SIZE,
+            ),
+            Emit::Aabbs(b) if b.len() != self.keys => {
+                return Err(Error::Invalid("AABB output needs one box per motion key"));
+            }
+            Emit::Aabbs(b) => (
+                b.cu_deviceptr(),
+                sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_AABBS,
+            ),
         };
         let desc = sys::OptixAccelEmitDesc { result, type_ };
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: owned handle; the output holds the property's size; lifetimes per the contract.
-        check("optixAccelEmitProperty", unsafe { entry!(self.ctx.table(), optixAccelEmitProperty)(self.ctx.raw(), stream.cu_stream(), self.handle(), &desc) })
+        check("optixAccelEmitProperty", unsafe {
+            entry!(self.ctx.table(), optixAccelEmitProperty)(
+                self.ctx.raw(),
+                stream.cu_stream(),
+                self.handle(),
+                &desc,
+            )
+        })
     }
 
     /// Relocation data for this structure (`optixAccelGetRelocationInfo`).
@@ -1361,7 +1874,13 @@ impl Accel {
         let mut info = sys::OptixRelocationInfo::default();
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: owned handle of this context; `info` is writable.
-        check("optixAccelGetRelocationInfo", unsafe { entry!(self.ctx.table(), optixAccelGetRelocationInfo)(self.ctx.raw(), self.handle(), &mut info) })?;
+        check("optixAccelGetRelocationInfo", unsafe {
+            entry!(self.ctx.table(), optixAccelGetRelocationInfo)(
+                self.ctx.raw(),
+                self.handle(),
+                &mut info,
+            )
+        })?;
         Ok(RelocationInfo(info))
     }
 
@@ -1377,14 +1896,24 @@ impl Accel {
     /// The source's build and refits must be complete or ordered before `stream`, and no refit of
     /// the source may run until the copy completes. Relinked children and micromap arrays must
     /// match the source's in count and order of use (instances, meshes).
-    pub unsafe fn relocate(&self, ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, relink: Relink<'_>, budget: Option<usize>) -> Result<Arc<Self>> {
+    pub unsafe fn relocate(
+        &self,
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        relink: Relink<'_>,
+        budget: Option<usize>,
+    ) -> Result<Arc<Self>> {
         same_ctx(stream, ctx)?;
         let info = self.relocation_info()?;
         if !info.compatible(ctx)? {
-            return Err(Error::Invalid("structure is not relocatable to this device context"));
+            return Err(Error::Invalid(
+                "structure is not relocatable to this device context",
+            ));
         }
         let extra = match relink {
-            Relink::Children(c) => c.len().saturating_mul(size_of::<sys::OptixTraversableHandle>()),
+            Relink::Children(c) => c
+                .len()
+                .saturating_mul(size_of::<sys::OptixTraversableHandle>()),
             _ => 0,
         };
         within(budget, self.buffer.len().saturating_add(extra))?;
@@ -1393,32 +1922,64 @@ impl Accel {
         let mut inputs: Vec<sys::OptixRelocateInput> = Vec::new();
         let refs = match relink {
             Relink::Keep => {
-                let refs = self.refs.lock().map_err(|_| Error::Invalid("reference list poisoned by a panic"))?.clone();
-                if !Arc::ptr_eq(ctx, &self.ctx) && (!refs.children.is_empty() || !refs.micromaps.is_empty()) {
-                    return Err(Error::Invalid("relocating to another device context needs Relink::Children or Relink::Micromaps"));
+                let refs = self
+                    .refs
+                    .lock()
+                    .map_err(|_| Error::Invalid("reference list poisoned by a panic"))?
+                    .clone();
+                if !Arc::ptr_eq(ctx, &self.ctx)
+                    && (!refs.children.is_empty() || !refs.micromaps.is_empty())
+                {
+                    return Err(Error::Invalid(
+                        "relocating to another device context needs Relink::Children or Relink::Micromaps",
+                    ));
                 }
                 refs
             }
             Relink::Children(children) => {
                 let (kind, n) = match self.shape.as_slice() {
-                    [Item::Instances(n)] => (sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES, *n),
-                    [Item::InstancePointers(n)] => (sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCE_POINTERS, *n),
-                    _ => return Err(Error::Invalid("Relink::Children applies to instance structures")),
+                    [Item::Instances(n)] => (
+                        sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES,
+                        *n,
+                    ),
+                    [Item::InstancePointers(n)] => (
+                        sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCE_POINTERS,
+                        *n,
+                    ),
+                    _ => {
+                        return Err(Error::Invalid(
+                            "Relink::Children applies to instance structures",
+                        ));
+                    }
                 };
                 if children.len() != n as usize {
-                    return Err(Error::Invalid("Relink::Children needs one structure per instance"));
+                    return Err(Error::Invalid(
+                        "Relink::Children needs one structure per instance",
+                    ));
                 }
                 if children.iter().any(|c| !Arc::ptr_eq(c.context(), ctx)) {
-                    return Err(Error::Invalid("relinked child from another device context than the target"));
+                    return Err(Error::Invalid(
+                        "relinked child from another device context than the target",
+                    ));
                 }
-                let raw: Vec<sys::OptixTraversableHandle> = children.iter().map(|c| c.handle()).collect();
+                let raw: Vec<sys::OptixTraversableHandle> =
+                    children.iter().map(|c| c.handle()).collect();
                 // SAFETY: `u64` handles have no padding.
                 let device = unsafe { upload(stream, &raw) }?;
-                let mut input = sys::OptixRelocateInput { type_: kind, ..Default::default() };
-                input.__bindgen_anon_1.instanceArray = sys::OptixRelocateInputInstanceArray { numInstances: n, traversableHandles: device.cu_deviceptr() };
+                let mut input = sys::OptixRelocateInput {
+                    type_: kind,
+                    ..Default::default()
+                };
+                input.__bindgen_anon_1.instanceArray = sys::OptixRelocateInputInstanceArray {
+                    numInstances: n,
+                    traversableHandles: device.cu_deviceptr(),
+                };
                 inputs.push(input);
                 handles = Some(device);
-                Refs { children: children.to_vec(), micromaps: Vec::new() }
+                Refs {
+                    children: children.to_vec(),
+                    micromaps: Vec::new(),
+                }
             }
             Relink::Micromaps(arrays) => {
                 if arrays.len() != shape.len() {
@@ -1427,13 +1988,21 @@ impl Accel {
                 let mut micromaps = Vec::new();
                 for (item, array) in shape.iter_mut().zip(arrays) {
                     let Item::Tri { sbt, omm, .. } = item else {
-                        return Err(Error::Invalid("Relink::Micromaps applies to triangle structures"));
+                        return Err(Error::Invalid(
+                            "Relink::Micromaps applies to triangle structures",
+                        ));
                     };
                     if omm.is_some() != array.is_some() {
-                        return Err(Error::Invalid("a relinked micromap array must be given exactly for the meshes built with one"));
+                        return Err(Error::Invalid(
+                            "a relinked micromap array must be given exactly for the meshes built with one",
+                        ));
                     }
                     let ptr = match array {
-                        Some(a) if !Arc::ptr_eq(a.context(), ctx) => return Err(Error::Invalid("relinked micromap array from another device context than the target")),
+                        Some(a) if !Arc::ptr_eq(a.context(), ctx) => {
+                            return Err(Error::Invalid(
+                                "relinked micromap array from another device context than the target",
+                            ));
+                        }
                         Some(a) => {
                             micromaps.push(a.clone());
                             a.ptr()
@@ -1446,18 +2015,32 @@ impl Accel {
                     {
                         *key = ptr;
                     }
-                    let mut input = sys::OptixRelocateInput { type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_TRIANGLES, ..Default::default() };
+                    let mut input = sys::OptixRelocateInput {
+                        type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_TRIANGLES,
+                        ..Default::default()
+                    };
                     input.__bindgen_anon_1.triangleArray = sys::OptixRelocateInputTriangleArray {
                         numSbtRecords: *sbt,
-                        opacityMicromap: sys::OptixRelocateInputOpacityMicromap { opacityMicromapArray: ptr },
+                        opacityMicromap: sys::OptixRelocateInputOpacityMicromap {
+                            opacityMicromapArray: ptr,
+                        },
                     };
                     inputs.push(input);
                 }
-                Refs { children: Vec::new(), micromaps }
+                Refs {
+                    children: Vec::new(),
+                    micromaps,
+                }
             }
         };
         // SAFETY: filled by the copy below.
-        let target = unsafe { alloc(stream, self.buffer.len(), sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
+        let target = unsafe {
+            alloc(
+                stream,
+                self.buffer.len(),
+                sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT,
+            )
+        }?;
         // SAFETY: the source's writes are ordered before `stream` (contract); `target` is fresh.
         unsafe { copy_bytes(stream, &target, &self.buffer) }?;
         let mut handle = 0;
@@ -1470,7 +2053,11 @@ impl Accel {
                 ctx.raw(),
                 stream.cu_stream(),
                 &info.0,
-                if inputs.is_empty() { std::ptr::null() } else { inputs.as_ptr() },
+                if inputs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    inputs.as_ptr()
+                },
                 inputs.len(),
                 target.cu_deviceptr(),
                 target.len(),
@@ -1478,7 +2065,16 @@ impl Accel {
             )
         })?;
         drop(handles);
-        Ok(Arc::new(Self { handle: AtomicU64::new(handle), buffer: target, flags: self.flags, motion: self.motion, keys: self.keys, shape, refs: Mutex::new(refs), ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            handle: AtomicU64::new(handle),
+            buffer: target,
+            flags: self.flags,
+            motion: self.motion,
+            keys: self.keys,
+            shape,
+            refs: Mutex::new(refs),
+            ctx: ctx.clone(),
+        }))
     }
 
     /// The handle device code traces against (`optixTrace`'s first argument).

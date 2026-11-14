@@ -66,7 +66,10 @@ pub use types::*;
 /// Where this library ships and what its files are called.
 pub const DLL: DllSpec = DllSpec {
     lib: "cudnn",
-    group: Group::Sdk { root_var: "CUDNN_ROOT", hint: nv_loader::hint(env!("NV_RS_SDK_BIN")) },
+    group: Group::Sdk {
+        root_var: "CUDNN_ROOT",
+        hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
+    },
     windows: &["cudnn64_*"],
     linux: &["libcudnn.so.9", "libcudnn.so"],
 };
@@ -167,7 +170,10 @@ fn open_cudnn(path: &Path) -> Result<CudnnBundle, String> {
     // SAFETY: `main_lib` is the opened `cudnn64_*.dll` with sibling sub-libraries already loaded;
     // symbols are resolved lazily and missing ones become `Err` fields in `CudnnApi`.
     let api = unsafe { api::CudnnApi::from_library(main_lib) }.map_err(|e| e.to_string())?;
-    Ok(CudnnBundle { api, _siblings: siblings })
+    Ok(CudnnBundle {
+        api,
+        _siblings: siblings,
+    })
 }
 
 #[cfg(not(windows))]
@@ -199,8 +205,16 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["cudnnCreate", "cudnnConvolutionForward", "cudnnBackendExecute", "cudnnGetVersion"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "cudnnCreate",
+            "cudnnConvolutionForward",
+            "cudnnBackendExecute",
+            "cudnnGetVersion",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use cuda_core::{Context, Stream};
 use cudnn_sys as sys;
 
-use crate::{check, record_teardown, same_ctx, Result};
+use crate::{Result, check, record_teardown, same_ctx};
 
 /// Owned cuDNN library handle tied to one [`Context`].
 ///
@@ -33,7 +33,11 @@ impl Handle {
         // SAFETY: `raw` is a valid out-pointer and `ctx` is bound on this thread.
         let status = unsafe { sys::cudnnCreate(&mut raw) };
         check("cudnnCreate", status)?;
-        Ok(Self { raw, ctx: ctx.clone(), stream: None })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            stream: None,
+        })
     }
 
     /// Owning CUDA context.
@@ -66,7 +70,11 @@ impl Handle {
     /// same stream is already bound.
     pub(crate) fn ensure_stream(&mut self, stream: &Arc<Stream>) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
-        if self.stream.as_ref().is_some_and(|bound| bound.cu_stream() == stream.cu_stream()) {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|bound| bound.cu_stream() == stream.cu_stream())
+        {
             self.ctx.bind_to_thread()?;
             return Ok(());
         }

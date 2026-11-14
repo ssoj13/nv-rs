@@ -80,7 +80,17 @@ pub struct ArrayDesc {
 impl ArrayDesc {
     /// A 2D layout.
     pub const fn d2(width: usize, height: usize, format: ArrayFormat, channels: u32) -> Self {
-        Self { width, height, depth: 0, format, channels, surface: false, layered: false, cubemap: false, sparse: false }
+        Self {
+            width,
+            height,
+            depth: 0,
+            format,
+            channels,
+            surface: false,
+            layered: false,
+            cubemap: false,
+            sparse: false,
+        }
     }
 
     /// Bytes per element (`format.bytes() * channels`).
@@ -103,7 +113,12 @@ impl ArrayDesc {
             return Err(invalid_value());
         }
         // A cubemap has square faces and 6 (or 6 x layers) of them, as cuArray3DCreate requires.
-        if self.cubemap && (self.width != self.height || self.depth == 0 || !self.depth.is_multiple_of(6) || (!self.layered && self.depth != 6)) {
+        if self.cubemap
+            && (self.width != self.height
+                || self.depth == 0
+                || !self.depth.is_multiple_of(6)
+                || (!self.layered && self.depth != 6))
+        {
             return Err(invalid_value());
         }
         Ok(())
@@ -157,7 +172,12 @@ impl Array {
         let mut raw: sys::CUarray = std::ptr::null_mut();
         // SAFETY: valid descriptor and out-pointer.
         unsafe { sys::cuArray3DCreate_v2(&mut raw, &d) }.result()?;
-        Ok(Self { raw, desc, ctx: ctx.clone(), owned: true })
+        Ok(Self {
+            raw,
+            desc,
+            ctx: ctx.clone(),
+            owned: true,
+        })
     }
 
     /// The layout.
@@ -262,7 +282,13 @@ impl MipmappedArray {
         let mut raw: sys::CUmipmappedArray = std::ptr::null_mut();
         // SAFETY: valid descriptor and out-pointer.
         unsafe { sys::cuMipmappedArrayCreate(&mut raw, &d, levels) }.result()?;
-        Ok(Self { raw, desc, levels, ctx: ctx.clone(), _keep: None })
+        Ok(Self {
+            raw,
+            desc,
+            levels,
+            ctx: ctx.clone(),
+            _keep: None,
+        })
     }
 
     pub(crate) fn from_owned_raw(
@@ -272,7 +298,13 @@ impl MipmappedArray {
         ctx: &Arc<Context>,
         keep: Option<Arc<crate::external::ExternalMemory>>,
     ) -> Self {
-        Self { raw, desc, levels, ctx: ctx.clone(), _keep: keep }
+        Self {
+            raw,
+            desc,
+            levels,
+            ctx: ctx.clone(),
+            _keep: keep,
+        }
     }
 
     /// Number of levels.
@@ -303,10 +335,22 @@ impl MipmappedArray {
         let desc = ArrayDesc {
             width: shrink(self.desc.width),
             height: shrink(self.desc.height),
-            depth: if self.desc.layered { self.desc.depth } else { shrink(self.desc.depth) },
+            depth: if self.desc.layered {
+                self.desc.depth
+            } else {
+                shrink(self.desc.depth)
+            },
             ..self.desc
         };
-        Ok(LevelRef { array: Array { raw, desc, ctx: self.ctx.clone(), owned: false }, _parent: std::marker::PhantomData })
+        Ok(LevelRef {
+            array: Array {
+                raw,
+                desc,
+                ctx: self.ctx.clone(),
+                owned: false,
+            },
+            _parent: std::marker::PhantomData,
+        })
     }
 }
 
@@ -342,6 +386,9 @@ mod tests {
         assert_eq!(d.element_bytes(), 8);
         assert_eq!(d.row_bytes(), 512);
         assert_eq!(d.total_bytes(), 512 * 32);
-        assert!(ArrayDesc { channels: 3, ..d }.validate().is_err(), "CUDA arrays take 1, 2 or 4 channels");
+        assert!(
+            ArrayDesc { channels: 3, ..d }.validate().is_err(),
+            "CUDA arrays take 1, 2 or 4 channels"
+        );
     }
 }

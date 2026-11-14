@@ -151,17 +151,33 @@ impl std::error::Error for SymbolError {
 
 impl CallError {
     /// Constructs the boxed symbol diagnostic on a generated call's failure branch.
-    pub fn symbol(lib: &'static str, symbol: &'static str, source: Option<&'static libloading::Error>) -> Self {
-        Self::Symbol(Box::new(SymbolError { lib, symbol, source }))
+    pub fn symbol(
+        lib: &'static str,
+        symbol: &'static str,
+        source: Option<&'static libloading::Error>,
+    ) -> Self {
+        Self::Symbol(Box::new(SymbolError {
+            lib,
+            symbol,
+            source,
+        }))
     }
 }
 
 fn show_paths(paths: &[PathBuf]) -> String {
-    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn show_failures(failures: &[(PathBuf, String)]) -> String {
-    failures.iter().map(|(p, e)| format!("{}: {e}", p.display())).collect::<Vec<_>>().join("; ")
+    failures
+        .iter()
+        .map(|(p, e)| format!("{}: {e}", p.display()))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Everything discovery reads from the machine. [`SystemProbe`] is the real one; tests supply a
@@ -197,11 +213,16 @@ impl Probe for SystemProbe {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Vec::new();
         };
-        entries.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect()
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
     }
 
     fn exe_dir(&self) -> Option<PathBuf> {
-        std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf))
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
     fn display_driver_dirs(&self) -> Vec<PathBuf> {
@@ -225,7 +246,9 @@ fn windows_display_driver_dirs() -> Vec<PathBuf> {
 
     const DISPLAY_CLASS: &str =
         r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
-    let Ok(class) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(DISPLAY_CLASS, KEY_READ) else {
+    let Ok(class) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(DISPLAY_CLASS, KEY_READ)
+    else {
         return Vec::new();
     };
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -239,7 +262,11 @@ fn windows_display_driver_dirs() -> Vec<PathBuf> {
         };
         let paths: Vec<String> = adapter
             .get_value::<Vec<String>, _>("OpenGLDriverName")
-            .or_else(|_| adapter.get_value::<String, _>("OpenGLDriverName").map(|s| vec![s]))
+            .or_else(|_| {
+                adapter
+                    .get_value::<String, _>("OpenGLDriverName")
+                    .map(|s| vec![s])
+            })
             .unwrap_or_default();
         for p in paths {
             if let Some(dir) = Path::new(&p).parent().map(Path::to_path_buf)
@@ -294,7 +321,10 @@ pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
 /// Linux SDK hints come from the discovery owner; retain the dynamic linker's sonames after them.
 fn linux_candidates(spec: &DllSpec) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Group::Sdk { hint: Some(dir), .. } = spec.group {
+    if let Group::Sdk {
+        hint: Some(dir), ..
+    } = spec.group
+    {
         out.extend(spec.linux.iter().map(|soname| Path::new(dir).join(soname)));
     }
     out.extend(spec.linux.iter().map(PathBuf::from));
@@ -303,20 +333,36 @@ fn linux_candidates(spec: &DllSpec) -> Vec<PathBuf> {
 
 /// Directories searched for a group on Windows, most preferred first.
 fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
-    let system32 = PathBuf::from(probe.env("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string())).join("System32");
+    let system32 = PathBuf::from(
+        probe
+            .env("SystemRoot")
+            .unwrap_or_else(|| r"C:\Windows".to_string()),
+    )
+    .join("System32");
     match group {
         Group::Driver => vec![system32],
         // NVIDIA's own order: System32 first (older drivers copied it there), then the adapters.
-        Group::DriverStore => std::iter::once(system32).chain(probe.display_driver_dirs()).collect(),
+        Group::DriverStore => std::iter::once(system32)
+            .chain(probe.display_driver_dirs())
+            .collect(),
         Group::Toolkit => {
             // The variables vcv-rs and cudarc honour, in the same order; CUDA 13 moved DLLs into
             // bin\x64 while 12.x keeps them in bin, so both are searched.
             let mut dirs = Vec::new();
-            for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"] {
+            for var in [
+                "CUDA_PATH",
+                "CUDA_HOME",
+                "CUDA_ROOT",
+                "CUDA_TOOLKIT_ROOT_DIR",
+            ] {
                 if let Some(root) = probe.env(var) {
                     let root = PathBuf::from(root);
                     // CUPTI ships its DLLs under extras\CUPTI\lib64, outside bin.
-                    for dir in [root.join("bin").join("x64"), root.join("bin"), root.join("extras").join("CUPTI").join("lib64")] {
+                    for dir in [
+                        root.join("bin").join("x64"),
+                        root.join("bin"),
+                        root.join("extras").join("CUPTI").join("lib64"),
+                    ] {
                         if !dirs.contains(&dir) {
                             dirs.push(dir);
                         }
@@ -329,7 +375,11 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
             let mut dirs: Vec<PathBuf> = probe.exe_dir().into_iter().collect();
             if let Some(root) = probe.env(root_var) {
                 let root = PathBuf::from(root);
-                dirs.extend([root.join("bin").join("x64"), root.join("bin"), root.join("lib")]);
+                dirs.extend([
+                    root.join("bin").join("x64"),
+                    root.join("bin"),
+                    root.join("lib"),
+                ]);
             }
             dirs.extend(hint.map(PathBuf::from));
             dirs.dedup();
@@ -342,7 +392,10 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
 ///
 /// `open` receives a path (Windows: an existing file; Linux: an SDK path or linker soname) and
 /// returns the loaded value or a reason it was rejected (wrong ABI, missing entry point, ...).
-pub fn open_first<T>(spec: &DllSpec, open: impl FnMut(&Path) -> Result<T, String>) -> Result<Loaded<T>, LoadError> {
+pub fn open_first<T>(
+    spec: &DllSpec,
+    open: impl FnMut(&Path) -> Result<T, String>,
+) -> Result<Loaded<T>, LoadError> {
     open_first_with(&SystemProbe, spec, open)
 }
 
@@ -359,7 +412,10 @@ pub fn open_first_with<T>(
         all.clone()
     };
     if present.is_empty() {
-        return Err(LoadError::NotFound { lib: spec.lib, tried: all });
+        return Err(LoadError::NotFound {
+            lib: spec.lib,
+            tried: all,
+        });
     }
     let mut failures = Vec::new();
     for path in present {
@@ -368,7 +424,10 @@ pub fn open_first_with<T>(
             Err(reason) => failures.push((path, reason)),
         }
     }
-    Err(LoadError::Rejected { lib: spec.lib, failures })
+    Err(LoadError::Rejected {
+        lib: spec.lib,
+        failures,
+    })
 }
 
 /// A loaded library value and the file it came from (reported by diagnostics and evidence).
@@ -392,21 +451,47 @@ pub struct Loaded<T> {
 macro_rules! exports_sys {
     (lib: $lib:literal, api: $api:ident, loader: $loader:ident, dll: $dll:expr $(,)?) => {
         // Generated code: lint levels differ per header, so the generated modules opt out.
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(
+            non_camel_case_types,
+            non_upper_case_globals,
+            non_snake_case,
+            dead_code,
+            missing_docs,
+            unnecessary_transmutes,
+            clippy::all,
+            clippy::undocumented_unsafe_blocks
+        )]
         mod types {
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
         }
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(
+            non_camel_case_types,
+            non_upper_case_globals,
+            non_snake_case,
+            dead_code,
+            missing_docs,
+            unnecessary_transmutes,
+            clippy::all,
+            clippy::undocumented_unsafe_blocks
+        )]
         mod api {
             use super::types::*;
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_api.rs"));
         }
         // Shim bodies share one safety argument, documented once in nv-bindgen (`shims`);
         // prettyplease drops comments, so the per-block SAFETY lint cannot be met here.
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(
+            non_camel_case_types,
+            non_upper_case_globals,
+            non_snake_case,
+            missing_docs,
+            unnecessary_transmutes,
+            clippy::all,
+            clippy::undocumented_unsafe_blocks
+        )]
         mod shims {
-            use super::$loader;
             use super::types::*;
+            use super::$loader;
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_shims.rs"));
         }
         pub use shims::*;
@@ -416,15 +501,20 @@ macro_rules! exports_sys {
         pub const DLL: $crate::DllSpec = $dll;
 
         /// Entry points and header sha256 of the generated bindings (coverage evidence).
-        pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
+        pub const INVENTORY: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
 
-        fn loaded() -> &'static ::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError> {
-            static API: ::std::sync::OnceLock<::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>> =
-                ::std::sync::OnceLock::new();
+        fn loaded() -> &'static ::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>
+        {
+            static API: ::std::sync::OnceLock<
+                ::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>,
+            > = ::std::sync::OnceLock::new();
             API.get_or_init(|| {
                 // SAFETY: opening the library runs only its loader initialisers; symbols are
                 // resolved lazily and a missing one becomes an `Err` field, not a crash.
-                $crate::open_first(&DLL, |p| unsafe { api::$api::new(p) }.map_err(|e| e.to_string()))
+                $crate::open_first(&DLL, |p| {
+                    unsafe { api::$api::new(p) }.map_err(|e| e.to_string())
+                })
             })
         }
 
@@ -434,7 +524,8 @@ macro_rules! exports_sys {
         }
 
         /// Loads the library now and reports which file was used, or why loading failed.
-        pub fn load() -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
+        pub fn load()
+        -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
             loaded().as_ref().map(|l| l.path.as_path())
         }
     };
@@ -449,7 +540,11 @@ pub const fn hint(dir: &'static str) -> Option<&'static str> {
 /// Fails with [`LoadError::RuntimeTooOld`] when `found < required`.
 pub fn check_version(lib: &'static str, required: u32, found: u32) -> Result<(), LoadError> {
     if found < required {
-        Err(LoadError::RuntimeTooOld { lib, required, found })
+        Err(LoadError::RuntimeTooOld {
+            lib,
+            required,
+            found,
+        })
     } else {
         Ok(())
     }
@@ -483,9 +578,10 @@ impl QueryInterface {
         // SAFETY: loading the library runs only its initialisers.
         let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
         // SAFETY: the caller guarantees the symbol's signature.
-        let query = unsafe { lib.get::<unsafe extern "C" fn(u32) -> *mut core::ffi::c_void>(symbol) }
-            .map(|s| *s)
-            .map_err(|e| e.to_string())?;
+        let query =
+            unsafe { lib.get::<unsafe extern "C" fn(u32) -> *mut core::ffi::c_void>(symbol) }
+                .map(|s| *s)
+                .map_err(|e| e.to_string())?;
         Ok(Self { query, _lib: lib })
     }
 }
@@ -496,15 +592,31 @@ impl QueryInterface {
 macro_rules! query_interface_sys {
     (lib: $lib:literal, loader: $loader:ident, query_symbol: $sym:literal, dll: $dll:expr $(,)?) => {
         // Generated code: lint levels differ per header, so the generated modules opt out.
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(
+            non_camel_case_types,
+            non_upper_case_globals,
+            non_snake_case,
+            dead_code,
+            missing_docs,
+            unnecessary_transmutes,
+            clippy::all,
+            clippy::undocumented_unsafe_blocks
+        )]
         mod types {
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
         }
         // Shim bodies share one safety argument, documented once in nv-bindgen (`query_shims`).
-        #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+        #[allow(
+            non_camel_case_types,
+            non_upper_case_globals,
+            non_snake_case,
+            missing_docs,
+            clippy::all,
+            clippy::undocumented_unsafe_blocks
+        )]
         mod shims {
-            use super::$loader;
             use super::types::*;
+            use super::$loader;
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_shims.rs"));
         }
         pub use shims::*;
@@ -514,22 +626,31 @@ macro_rules! query_interface_sys {
         pub const DLL: $crate::DllSpec = $dll;
 
         /// Entry points and header sha256 of the generated bindings (coverage evidence).
-        pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
+        pub const INVENTORY: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
 
-        fn loaded() -> &'static ::core::result::Result<$crate::Loaded<$crate::QueryInterface>, $crate::LoadError> {
-            static API: ::std::sync::OnceLock<::core::result::Result<$crate::Loaded<$crate::QueryInterface>, $crate::LoadError>> =
-                ::std::sync::OnceLock::new();
+        fn loaded() -> &'static ::core::result::Result<
+            $crate::Loaded<$crate::QueryInterface>,
+            $crate::LoadError,
+        > {
+            static API: ::std::sync::OnceLock<
+                ::core::result::Result<$crate::Loaded<$crate::QueryInterface>, $crate::LoadError>,
+            > = ::std::sync::OnceLock::new();
             // SAFETY: the query symbol named by the sys crate has the `void* (unsigned int)` signature.
-            API.get_or_init(|| $crate::open_first(&DLL, |p| unsafe { $crate::QueryInterface::open(p, $sym) }))
+            API.get_or_init(|| {
+                $crate::open_first(&DLL, |p| unsafe { $crate::QueryInterface::open(p, $sym) })
+            })
         }
 
         /// The loaded query, for the shims.
-        fn $loader() -> ::core::result::Result<&'static $crate::QueryInterface, &'static $crate::LoadError> {
+        fn $loader()
+        -> ::core::result::Result<&'static $crate::QueryInterface, &'static $crate::LoadError> {
             loaded().as_ref().map(|l| &l.value)
         }
 
         /// Loads the library now and reports which file was used, or why loading failed.
-        pub fn load() -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
+        pub fn load()
+        -> ::core::result::Result<&'static ::std::path::Path, &'static $crate::LoadError> {
             loaded().as_ref().map(|l| l.path.as_path())
         }
     };
@@ -610,50 +731,92 @@ mod linux_tests {
         let error = std::mem::size_of::<CallError>();
         let result = std::mem::size_of::<Result<usize, CallError>>();
         let diagnostic = std::mem::size_of::<SymbolError>();
-        println!("pointer={word} CallError={error} Result<usize, CallError>={result} SymbolError={diagnostic}");
+        println!(
+            "pointer={word} CallError={error} Result<usize, CallError>={result} SymbolError={diagnostic}"
+        );
         // Each error variant carries one pointer plus a discriminant; a checked usize result
         // needs at most one further word. The cold two-name diagnostic stays behind the box.
         assert!(error <= 2 * word, "CallError grew to {error} bytes");
         assert!(result <= 3 * word, "checked result grew to {result} bytes");
-        assert!(diagnostic > error, "the diagnostic must remain outside the compact error");
+        assert!(
+            diagnostic > error,
+            "the diagnostic must remain outside the compact error"
+        );
     }
 
     #[test]
     fn linux_sdk_hint_supports_a_versioned_soname_without_an_unversioned_link() {
         let spec = DllSpec {
             lib: "nccl",
-            group: Group::Sdk { root_var: "NCCL_ROOT", hint: Some("/sdk/nccl/lib") },
+            group: Group::Sdk {
+                root_var: "NCCL_ROOT",
+                hint: Some("/sdk/nccl/lib"),
+            },
             windows: &[],
             linux: &["libnccl.so.2"],
         };
-        assert_eq!(linux_candidates(&spec), [PathBuf::from("/sdk/nccl/lib/libnccl.so.2"), PathBuf::from("libnccl.so.2")]);
+        assert_eq!(
+            linux_candidates(&spec),
+            [
+                PathBuf::from("/sdk/nccl/lib/libnccl.so.2"),
+                PathBuf::from("libnccl.so.2")
+            ]
+        );
     }
 
     #[test]
     fn linux_driver_toolkit_and_unhinted_sdk_keep_bare_sonames() {
-        let spec = DllSpec { lib: "test", group: Group::Driver, windows: &[], linux: &["libtest.so.2", "libtest.so"] };
+        let spec = DllSpec {
+            lib: "test",
+            group: Group::Driver,
+            windows: &[],
+            linux: &["libtest.so.2", "libtest.so"],
+        };
         let expected = [PathBuf::from("libtest.so.2"), PathBuf::from("libtest.so")];
-        for group in [Group::Driver, Group::DriverStore, Group::Toolkit, Group::Sdk { root_var: "TEST_ROOT", hint: None }] {
+        for group in [
+            Group::Driver,
+            Group::DriverStore,
+            Group::Toolkit,
+            Group::Sdk {
+                root_var: "TEST_ROOT",
+                hint: None,
+            },
+        ] {
             assert_eq!(linux_candidates(&DllSpec { group, ..spec }), expected);
         }
     }
 
     #[test]
     fn call_error_preserves_load_and_symbol_error_causes() {
-        static LOAD_ERR: LoadError = LoadError::NotFound { lib: "fake", tried: Vec::new() };
+        static LOAD_ERR: LoadError = LoadError::NotFound {
+            lib: "fake",
+            tried: Vec::new(),
+        };
         static DL_ERR: libloading::Error = libloading::Error::DlSymUnknown;
 
         let load_err = CallError::Load(&LOAD_ERR);
         assert!(load_err.to_string().starts_with("fake: not found"));
         let load_cause = std::error::Error::source(&load_err).expect("load cause");
-        assert!(load_cause.is::<LoadError>(), "CallError::Load source must downcast to LoadError");
+        assert!(
+            load_cause.is::<LoadError>(),
+            "CallError::Load source must downcast to LoadError"
+        );
 
         let sym_err = CallError::symbol("fake", "fakeSym", Some(&DL_ERR));
         assert_eq!(sym_err.to_string(), "fake: symbol fakeSym is unavailable");
         let sym_cause = std::error::Error::source(&sym_err).expect("loader cause");
-        assert!(sym_cause.is::<libloading::Error>(), "CallError::Symbol source must downcast to libloading::Error");
-        let CallError::Symbol(diag) = sym_err else { unreachable!() };
-        assert!(std::error::Error::source(diag.as_ref()).expect("symbol cause").is::<libloading::Error>());
+        assert!(
+            sym_cause.is::<libloading::Error>(),
+            "CallError::Symbol source must downcast to libloading::Error"
+        );
+        let CallError::Symbol(diag) = sym_err else {
+            unreachable!()
+        };
+        assert!(
+            std::error::Error::source(diag.as_ref())
+                .expect("symbol cause")
+                .is::<libloading::Error>()
+        );
 
         let qi_err = CallError::symbol("fake", "fakeQi", None);
         assert!(std::error::Error::source(&qi_err).is_none());
@@ -682,19 +845,36 @@ mod tests {
             self.env.get(name).map(|s| (*s).to_string())
         }
         fn is_file(&self, path: &Path) -> bool {
-            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
-            self.dirs.get(dir).is_some_and(|files| files.iter().any(|f| *f == name.to_string_lossy()))
+            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                return false;
+            };
+            self.dirs
+                .get(dir)
+                .is_some_and(|files| files.iter().any(|f| *f == name.to_string_lossy()))
         }
         fn list_dir(&self, dir: &Path) -> Vec<String> {
-            self.dirs.get(dir).map(|f| f.iter().map(|s| (*s).to_string()).collect()).unwrap_or_default()
+            self.dirs
+                .get(dir)
+                .map(|f| f.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default()
         }
         fn display_driver_dirs(&self) -> Vec<PathBuf> {
             self.drivers.clone()
         }
     }
 
-    const CUFFT: DllSpec = DllSpec { lib: "cufft", group: Group::Toolkit, windows: &["cufft64_*"], linux: &[] };
-    const OPTIX: DllSpec = DllSpec { lib: "optix", group: Group::DriverStore, windows: &["nvoptix.dll"], linux: &[] };
+    const CUFFT: DllSpec = DllSpec {
+        lib: "cufft",
+        group: Group::Toolkit,
+        windows: &["cufft64_*"],
+        linux: &[],
+    };
+    const OPTIX: DllSpec = DllSpec {
+        lib: "optix",
+        group: Group::DriverStore,
+        windows: &["nvoptix.dll"],
+        linux: &[],
+    };
 
     #[test]
     fn toolkit_prefix_scan_prefers_the_highest_suffix_and_skips_other_libraries() {
@@ -704,12 +884,20 @@ mod tests {
         fake.env.insert("CUDA_PATH", r"C:\cuda");
         fake.dirs.insert(
             PathBuf::from(r"C:\cuda\bin\x64"),
-            vec!["cufft64_11.dll", "cufft64_12.dll", "cufft64_12.lib", "cublas64_13.dll"],
+            vec![
+                "cufft64_11.dll",
+                "cufft64_12.dll",
+                "cufft64_12.lib",
+                "cublas64_13.dll",
+            ],
         );
         let got = candidates_with(&fake, &CUFFT);
         assert_eq!(
             got,
-            vec![PathBuf::from(r"C:\cuda\bin\x64\cufft64_12.dll"), PathBuf::from(r"C:\cuda\bin\x64\cufft64_11.dll")]
+            vec![
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_12.dll"),
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_11.dll")
+            ]
         );
     }
 
@@ -734,18 +922,31 @@ mod tests {
         let mut fake = Fake::default();
         fake.env.insert("SystemRoot", r"C:\Windows");
         fake.drivers = vec![PathBuf::from(r"C:\DS\old"), PathBuf::from(r"C:\DS\new")];
-        fake.dirs.insert(PathBuf::from(r"C:\DS\old"), vec!["nvoptix.dll"]);
-        fake.dirs.insert(PathBuf::from(r"C:\DS\new"), vec!["nvoptix.dll"]);
+        fake.dirs
+            .insert(PathBuf::from(r"C:\DS\old"), vec!["nvoptix.dll"]);
+        fake.dirs
+            .insert(PathBuf::from(r"C:\DS\new"), vec!["nvoptix.dll"]);
 
         // The first present candidate is rejected (say, an ABI it does not offer); the second wins.
         let loaded = open_first_with(&fake, &OPTIX, |p| {
-            if p.starts_with(r"C:\DS\old") { Err("ABI 118 unsupported".into()) } else { Ok(7) }
+            if p.starts_with(r"C:\DS\old") {
+                Err("ABI 118 unsupported".into())
+            } else {
+                Ok(7)
+            }
         })
         .expect("second candidate opens");
-        assert_eq!((loaded.value, loaded.path), (7, PathBuf::from(r"C:\DS\new\nvoptix.dll")));
+        assert_eq!(
+            (loaded.value, loaded.path),
+            (7, PathBuf::from(r"C:\DS\new\nvoptix.dll"))
+        );
 
-        let err = open_first_with(&fake, &OPTIX, |_| Err::<(), _>("nope".into())).expect_err("all rejected");
-        assert!(matches!(&err, LoadError::Rejected { failures, .. } if failures.len() == 2), "{err}");
+        let err = open_first_with(&fake, &OPTIX, |_| Err::<(), _>("nope".into()))
+            .expect_err("all rejected");
+        assert!(
+            matches!(&err, LoadError::Rejected { failures, .. } if failures.len() == 2),
+            "{err}"
+        );
     }
 
     #[test]
@@ -761,7 +962,15 @@ mod tests {
 
     #[test]
     fn an_unset_sdk_root_is_never_guessed() {
-        let spec = DllSpec { lib: "cudnn", group: Group::Sdk { root_var: "CUDNN_ROOT", hint: None }, windows: &["cudnn64_*"], linux: &[] };
+        let spec = DllSpec {
+            lib: "cudnn",
+            group: Group::Sdk {
+                root_var: "CUDNN_ROOT",
+                hint: None,
+            },
+            windows: &["cudnn64_*"],
+            linux: &[],
+        };
         assert!(candidates_with(&Fake::default(), &spec).is_empty());
     }
 
@@ -769,11 +978,17 @@ mod tests {
     fn sdk_dlls_are_searched_next_to_the_exe_then_root_then_build_hint() {
         let spec = DllSpec {
             lib: "cudnn",
-            group: Group::Sdk { root_var: "CUDNN_ROOT", hint: Some(r"C:\hint\bin") },
+            group: Group::Sdk {
+                root_var: "CUDNN_ROOT",
+                hint: Some(r"C:\hint\bin"),
+            },
             windows: &["cudnn64_*"],
             linux: &[],
         };
-        let mut fake = Fake { exe: Some(PathBuf::from(r"C:\app")), ..Fake::default() };
+        let mut fake = Fake {
+            exe: Some(PathBuf::from(r"C:\app")),
+            ..Fake::default()
+        };
         fake.env.insert("CUDNN_ROOT", r"C:\cudnn");
         for dir in [r"C:\app", r"C:\cudnn\bin\x64", r"C:\hint\bin"] {
             fake.dirs.insert(PathBuf::from(dir), vec!["cudnn64_9.dll"]);
@@ -793,6 +1008,9 @@ mod tests {
     fn version_gate_rejects_only_older_runtimes() {
         assert!(check_version("nvml", 12000, 12000).is_ok());
         assert!(check_version("nvml", 12000, 12100).is_ok());
-        assert!(matches!(check_version("nvml", 12000, 11800), Err(LoadError::RuntimeTooOld { found: 11800, .. })));
+        assert!(matches!(
+            check_version("nvml", 12000, 11800),
+            Err(LoadError::RuntimeTooOld { found: 11800, .. })
+        ));
     }
 }

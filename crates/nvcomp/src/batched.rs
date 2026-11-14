@@ -14,7 +14,7 @@ use nvcomp_sys as sys;
 
 use crate::format::{DecompressBackend, Format};
 use crate::scratch::{BatchStaging, StagingTables};
-use crate::{check, same_stream, Error, NvcompStatus, Result};
+use crate::{Error, NvcompStatus, Result, check, same_stream};
 
 /// Metadata produced by [`compress_batched_async`] describing packed output slots inside the
 /// destination [`DeviceBuffer<u8>`].
@@ -124,13 +124,17 @@ pub(crate) fn aligned_stride(bytes: usize, align: usize) -> Result<usize> {
     if rem == 0 {
         Ok(bytes)
     } else {
-        bytes.checked_add(a - rem).ok_or(Error::Invalid("aligned stride overflow"))
+        bytes
+            .checked_add(a - rem)
+            .ok_or(Error::Invalid("aligned stride overflow"))
     }
 }
 
 fn validate_chunk_ranges(ranges: &[Range<usize>], total_bytes: usize) -> Result<(usize, usize)> {
     if ranges.is_empty() {
-        return Err(Error::Invalid("batched operation requires at least one chunk"));
+        return Err(Error::Invalid(
+            "batched operation requires at least one chunk",
+        ));
     }
     let mut max_chunk = 0usize;
     let mut total = 0usize;
@@ -140,7 +144,9 @@ fn validate_chunk_ranges(ranges: &[Range<usize>], total_bytes: usize) -> Result<
         }
         let len = r.end - r.start;
         max_chunk = max_chunk.max(len);
-        total = total.checked_add(len).ok_or(Error::Invalid("total chunk byte count overflow"))?;
+        total = total
+            .checked_add(len)
+            .ok_or(Error::Invalid("total chunk byte count overflow"))?;
     }
     Ok((max_chunk, total))
 }
@@ -163,7 +169,9 @@ pub fn compress_batched_async(
     if !Arc::ptr_eq(input.context(), staging.context())
         || !Arc::ptr_eq(output.context(), staging.context())
     {
-        return Err(Error::Invalid("input/output buffer belongs to another CUDA context"));
+        return Err(Error::Invalid(
+            "input/output buffer belongs to another CUDA context",
+        ));
     }
     let (max_chunk, total_bytes) = validate_chunk_ranges(input_ranges, input.num_bytes())?;
     let alignments = format.compress_alignments()?;
@@ -174,7 +182,9 @@ pub fn compress_batched_async(
         .checked_mul(slot_stride)
         .ok_or(Error::Invalid("compressed output buffer size overflow"))?;
     if output.num_bytes() < required_output {
-        return Err(Error::Invalid("output device buffer smaller than required worst-case batch span"));
+        return Err(Error::Invalid(
+            "output device buffer smaller than required worst-case batch span",
+        ));
     }
 
     let in_base = input.cu_deviceptr();
@@ -182,18 +192,30 @@ pub fn compress_batched_async(
     let in_align = u64::try_from(alignments.input).unwrap_or(u64::MAX);
     let out_align = u64::try_from(alignments.output).unwrap_or(u64::MAX);
     if !out_base.is_multiple_of(out_align) {
-        return Err(Error::Invalid("output buffer base pointer does not satisfy nvCOMP alignment"));
+        return Err(Error::Invalid(
+            "output buffer base pointer does not satisfy nvCOMP alignment",
+        ));
     }
     for r in input_ranges {
-        let addr = in_base.checked_add(r.start as u64).ok_or(Error::Invalid("input ptr overflow"))?;
+        let addr = in_base
+            .checked_add(r.start as u64)
+            .ok_or(Error::Invalid("input ptr overflow"))?;
         if !addr.is_multiple_of(in_align) {
-            return Err(Error::Invalid("input chunk offset does not satisfy nvCOMP alignment"));
+            return Err(Error::Invalid(
+                "input chunk offset does not satisfy nvCOMP alignment",
+            ));
         }
     }
 
     let temp_bytes =
         format.compress_temp_bytes(input_ranges.len(), max_chunk, total_bytes, stream)?;
-    staging.prepare(stream, input_ranges.len(), temp_bytes, alignments.temp, budget)?;
+    staging.prepare(
+        stream,
+        input_ranges.len(),
+        temp_bytes,
+        alignments.temp,
+        budget,
+    )?;
 
     let num_chunks = input_ranges.len();
     let mut uncomp_sizes = Vec::with_capacity(num_chunks);
@@ -284,16 +306,22 @@ pub fn query_decompress_sizes_async(
 ) -> Result<Vec<usize>> {
     same_stream(stream, staging.stream())?;
     if !Arc::ptr_eq(compressed.context(), staging.context()) {
-        return Err(Error::Invalid("compressed buffer belongs to another CUDA context"));
+        return Err(Error::Invalid(
+            "compressed buffer belongs to another CUDA context",
+        ));
     }
     let (_, _) = validate_chunk_ranges(compressed_ranges, compressed.num_bytes())?;
     let alignments = format.decompress_alignments(DecompressBackend::Default)?;
     let in_align = u64::try_from(alignments.input).unwrap_or(u64::MAX);
     let base = compressed.cu_deviceptr();
     for r in compressed_ranges {
-        let addr = base.checked_add(r.start as u64).ok_or(Error::Invalid("compressed ptr overflow"))?;
+        let addr = base
+            .checked_add(r.start as u64)
+            .ok_or(Error::Invalid("compressed ptr overflow"))?;
         if !addr.is_multiple_of(in_align) {
-            return Err(Error::Invalid("compressed chunk offset violates nvCOMP input alignment"));
+            return Err(Error::Invalid(
+                "compressed chunk offset violates nvCOMP input alignment",
+            ));
         }
     }
 
@@ -307,7 +335,13 @@ pub fn query_decompress_sizes_async(
             host_in_ptrs[i] = base + r.start as u64;
             host_in_bytes[i] = r.end - r.start;
         }
-        let StagingTables { host_in_ptrs, host_in_bytes, dev_in_ptrs, dev_in_bytes, .. } = tables;
+        let StagingTables {
+            host_in_ptrs,
+            host_in_bytes,
+            dev_in_ptrs,
+            dev_in_bytes,
+            ..
+        } = tables;
         BatchStaging::upload_prefix(host_in_ptrs, dev_in_ptrs, num_chunks, stream)?;
         BatchStaging::upload_prefix(host_in_bytes, dev_in_bytes, num_chunks, stream)?;
     }
@@ -357,10 +391,14 @@ pub fn decompress_batched_async(
     if !Arc::ptr_eq(compressed.context(), staging.context())
         || !Arc::ptr_eq(output.context(), staging.context())
     {
-        return Err(Error::Invalid("compressed/output buffer belongs to another CUDA context"));
+        return Err(Error::Invalid(
+            "compressed/output buffer belongs to another CUDA context",
+        ));
     }
     if compressed_ranges.len() != output_ranges.len() {
-        return Err(Error::Invalid("compressed and output range counts must match"));
+        return Err(Error::Invalid(
+            "compressed and output range counts must match",
+        ));
     }
     let _ = validate_chunk_ranges(compressed_ranges, compressed.num_bytes())?;
     let (max_uncomp_chunk, total_uncomp_bytes) =
@@ -373,15 +411,23 @@ pub fn decompress_batched_async(
     let out_base = output.cu_deviceptr();
 
     for r in compressed_ranges {
-        let addr = in_base.checked_add(r.start as u64).ok_or(Error::Invalid("compressed ptr overflow"))?;
+        let addr = in_base
+            .checked_add(r.start as u64)
+            .ok_or(Error::Invalid("compressed ptr overflow"))?;
         if !addr.is_multiple_of(in_align) {
-            return Err(Error::Invalid("compressed chunk offset violates nvCOMP input alignment"));
+            return Err(Error::Invalid(
+                "compressed chunk offset violates nvCOMP input alignment",
+            ));
         }
     }
     for r in output_ranges {
-        let addr = out_base.checked_add(r.start as u64).ok_or(Error::Invalid("output ptr overflow"))?;
+        let addr = out_base
+            .checked_add(r.start as u64)
+            .ok_or(Error::Invalid("output ptr overflow"))?;
         if !addr.is_multiple_of(out_align) {
-            return Err(Error::Invalid("output chunk offset violates nvCOMP output alignment"));
+            return Err(Error::Invalid(
+                "output chunk offset violates nvCOMP output alignment",
+            ));
         }
     }
 
@@ -402,7 +448,11 @@ pub fn decompress_batched_async(
         let host_out_ptrs = tables.host_out_ptrs.as_mut_slice();
         let host_buf_bytes = tables.host_buf_bytes.as_mut_slice();
 
-        for (i, (cr, or)) in compressed_ranges.iter().zip(output_ranges.iter()).enumerate() {
+        for (i, (cr, or)) in compressed_ranges
+            .iter()
+            .zip(output_ranges.iter())
+            .enumerate()
+        {
             host_in_ptrs[i] = in_base + cr.start as u64;
             host_in_bytes[i] = cr.end - cr.start;
             host_out_ptrs[i] = out_base + or.start as u64;

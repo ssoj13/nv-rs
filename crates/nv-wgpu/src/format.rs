@@ -1,6 +1,6 @@
 //! Texture format compatibility table and 256-byte row-pitch alignment helpers.
 //!
-//! Why: `wgpu` 30 textures and CUDA arrays (`cuda_ext::ArrayDesc` / `ArrayFormat`)
+//! Why: `wgpu` 30 textures and CUDA arrays (`cuda_core_ext::ArrayDesc` / `ArrayFormat`)
 //! only share memory cleanly for specific uncompressed, 1/2/4-channel formats,
 //! and buffer-to-texture staging copies in `wgpu` require `256`-byte row-pitch
 //! alignment (`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`). Keeping both in a single
@@ -9,7 +9,7 @@
 //! Used by `buffer`, `texture`, and user upload/readback paths.
 
 use ash::vk;
-use cuda_ext::{ArrayDesc, ArrayFormat};
+use cuda_core_ext::{ArrayDesc, ArrayFormat};
 
 use crate::error::{Error, Result};
 
@@ -371,7 +371,9 @@ pub fn aligned_row_pitch(format: wgpu::TextureFormat, width: u32) -> Result<u32>
 /// at `format` with `256`-byte aligned rows.
 pub fn aligned_staging_bytes(format: wgpu::TextureFormat, size: wgpu::Extent3d) -> Result<u64> {
     if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
-        return Err(Error::InvalidInput("texture extent dimensions must be non-zero"));
+        return Err(Error::InvalidInput(
+            "texture extent dimensions must be non-zero",
+        ));
     }
     let row_pitch = u64::from(aligned_row_pitch(format, size.width)?);
     let mapping = format_mapping(format)?;
@@ -387,10 +389,12 @@ pub fn aligned_staging_bytes(format: wgpu::TextureFormat, size: wgpu::Extent3d) 
     let leading_rows = total_rows.saturating_sub(1);
     let prefix = leading_rows
         .checked_mul(row_pitch)
-        .ok_or(Error::InvalidInput("staging buffer prefix size overflows u64"))?;
-    prefix
-        .checked_add(unaligned_row)
-        .ok_or(Error::InvalidInput("total staging buffer size overflows u64"))
+        .ok_or(Error::InvalidInput(
+            "staging buffer prefix size overflows u64",
+        ))?;
+    prefix.checked_add(unaligned_row).ok_or(Error::InvalidInput(
+        "total staging buffer size overflows u64",
+    ))
 }
 
 /// Aligns `value` up to `alignment` (must be a non-zero power of two).
@@ -429,7 +433,9 @@ pub fn build_cuda_array_desc(
     cubemap: bool,
 ) -> Result<(FormatMapping, ArrayDesc)> {
     if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 {
-        return Err(Error::InvalidInput("texture extent dimensions must be non-zero"));
+        return Err(Error::InvalidInput(
+            "texture extent dimensions must be non-zero",
+        ));
     }
     if mip_level_count == 0 {
         return Err(Error::InvalidInput("mip_level_count must be at least 1"));
@@ -463,7 +469,8 @@ pub fn build_cuda_array_desc(
             (0usize, 1usize, false)
         }
         wgpu::TextureDimension::D2 => {
-            if cubemap && (!size.depth_or_array_layers.is_multiple_of(6) || size.width != size.height)
+            if cubemap
+                && (!size.depth_or_array_layers.is_multiple_of(6) || size.width != size.height)
             {
                 return Err(Error::InvalidInput(
                     "cubemap texture must be square with depth_or_array_layers divisible by 6",
@@ -514,7 +521,9 @@ pub fn validate_copy_layout(
     offset: u64,
 ) -> Result<()> {
     if extent.width == 0 || extent.height == 0 || extent.depth_or_array_layers == 0 {
-        return Err(Error::InvalidInput("copy extent dimensions must be non-zero"));
+        return Err(Error::InvalidInput(
+            "copy extent dimensions must be non-zero",
+        ));
     }
     if !bytes_per_row.is_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT) {
         return Err(Error::InvalidInput(
@@ -569,7 +578,8 @@ mod tests {
     #[test]
     fn every_supported_format_has_consistent_bytes_and_channels() {
         for &entry in SUPPORTED_FORMATS {
-            let resolved = format_mapping(entry.wgpu).expect("supported format lookup must succeed");
+            let resolved =
+                format_mapping(entry.wgpu).expect("supported format lookup must succeed");
             assert_eq!(resolved, entry);
             assert!(matches!(entry.channels, 1 | 2 | 4));
             assert_eq!(
@@ -606,7 +616,10 @@ mod tests {
     #[test]
     fn row_pitch_aligns_to_256_bytes() {
         // 1px RGBA8 = 4B -> 256B
-        assert_eq!(aligned_row_pitch(wgpu::TextureFormat::Rgba8Unorm, 1).unwrap(), 256);
+        assert_eq!(
+            aligned_row_pitch(wgpu::TextureFormat::Rgba8Unorm, 1).unwrap(),
+            256
+        );
         // 64px RGBA8 = 256B -> 256B
         assert_eq!(
             aligned_row_pitch(wgpu::TextureFormat::Rgba8Unorm, 64).unwrap(),
@@ -654,26 +667,30 @@ mod tests {
         .unwrap();
 
         // Reject unaligned pitch
-        assert!(validate_copy_layout(
-            wgpu::TextureFormat::Rgba8Unorm,
-            extent,
-            128,
-            Some(4),
-            bytes,
-            0,
-        )
-        .is_err());
+        assert!(
+            validate_copy_layout(
+                wgpu::TextureFormat::Rgba8Unorm,
+                extent,
+                128,
+                Some(4),
+                bytes,
+                0,
+            )
+            .is_err()
+        );
 
         // Reject undersized buffer by 1 byte
-        assert!(validate_copy_layout(
-            wgpu::TextureFormat::Rgba8Unorm,
-            extent,
-            256,
-            Some(4),
-            bytes - 1,
-            0,
-        )
-        .is_err());
+        assert!(
+            validate_copy_layout(
+                wgpu::TextureFormat::Rgba8Unorm,
+                extent,
+                256,
+                Some(4),
+                bytes - 1,
+                0,
+            )
+            .is_err()
+        );
 
         // Reject missing rows_per_image for 2D array / 3D
         let layered = wgpu::Extent3d {
@@ -681,15 +698,10 @@ mod tests {
             height: 4,
             depth_or_array_layers: 2,
         };
-        assert!(validate_copy_layout(
-            wgpu::TextureFormat::Rgba8Unorm,
-            layered,
-            256,
-            None,
-            4096,
-            0,
-        )
-        .is_err());
+        assert!(
+            validate_copy_layout(wgpu::TextureFormat::Rgba8Unorm, layered, 256, None, 4096, 0,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -716,34 +728,38 @@ mod tests {
         assert!(!d2.cubemap);
 
         // 64x32 has max 7 mips; 8 must fail
-        assert!(build_cuda_array_desc(
-            wgpu::Extent3d {
-                width: 64,
-                height: 32,
-                depth_or_array_layers: 1,
-            },
-            wgpu::TextureDimension::D2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            8,
-            false,
-            false,
-        )
-        .is_err());
+        assert!(
+            build_cuda_array_desc(
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureDimension::D2,
+                wgpu::TextureFormat::Rgba8Unorm,
+                8,
+                false,
+                false,
+            )
+            .is_err()
+        );
 
         // Non-square cubemap must fail
-        assert!(build_cuda_array_desc(
-            wgpu::Extent3d {
-                width: 64,
-                height: 32,
-                depth_or_array_layers: 6,
-            },
-            wgpu::TextureDimension::D2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            1,
-            false,
-            true,
-        )
-        .is_err());
+        assert!(
+            build_cuda_array_desc(
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 32,
+                    depth_or_array_layers: 6,
+                },
+                wgpu::TextureDimension::D2,
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+                false,
+                true,
+            )
+            .is_err()
+        );
 
         let (_, cube) = build_cuda_array_desc(
             wgpu::Extent3d {
@@ -780,19 +796,21 @@ mod tests {
         assert_eq!(cube_array.depth, 12);
 
         // D1 with depth_or_array_layers != 1 or height != 1 must fail
-        assert!(build_cuda_array_desc(
-            wgpu::Extent3d {
-                width: 64,
-                height: 1,
-                depth_or_array_layers: 2,
-            },
-            wgpu::TextureDimension::D1,
-            wgpu::TextureFormat::Rgba8Unorm,
-            1,
-            false,
-            false,
-        )
-        .is_err());
+        assert!(
+            build_cuda_array_desc(
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 1,
+                    depth_or_array_layers: 2,
+                },
+                wgpu::TextureDimension::D1,
+                wgpu::TextureFormat::Rgba8Unorm,
+                1,
+                false,
+                false,
+            )
+            .is_err()
+        );
 
         let (_, d1) = build_cuda_array_desc(
             wgpu::Extent3d {

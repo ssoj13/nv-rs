@@ -12,7 +12,16 @@ use nv_loader::{DllSpec, Group, LoadError, Loaded, open_first};
 use std::sync::OnceLock;
 
 // Generated code: lint levels differ per header.
-#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code,
+    missing_docs,
+    unnecessary_transmutes,
+    clippy::all,
+    clippy::undocumented_unsafe_blocks
+)]
 mod types {
     include!(concat!(env!("OUT_DIR"), "/nvenc_types.rs"));
 }
@@ -70,9 +79,15 @@ fn open(path: &std::path::Path) -> Result<NvencApi, String> {
     // SAFETY: loading the driver's encoder library runs only its initialisers.
     let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
     // SAFETY: both exports have these signatures in nvEncodeAPI.h.
-    let max_version: MaxVersionFn = unsafe { lib.get::<MaxVersionFn>(b"NvEncodeAPIGetMaxSupportedVersion\0") }.map(|s| *s).map_err(|e| e.to_string())?;
+    let max_version: MaxVersionFn =
+        unsafe { lib.get::<MaxVersionFn>(b"NvEncodeAPIGetMaxSupportedVersion\0") }
+            .map(|s| *s)
+            .map_err(|e| e.to_string())?;
     // SAFETY: as above.
-    let create: CreateInstanceFn = unsafe { lib.get::<CreateInstanceFn>(b"NvEncodeAPICreateInstance\0") }.map(|s| *s).map_err(|e| e.to_string())?;
+    let create: CreateInstanceFn =
+        unsafe { lib.get::<CreateInstanceFn>(b"NvEncodeAPICreateInstance\0") }
+            .map(|s| *s)
+            .map_err(|e| e.to_string())?;
 
     let mut driver_max_version = 0u32;
     // SAFETY: valid out-pointer.
@@ -89,13 +104,20 @@ fn open(path: &std::path::Path) -> Result<NvencApi, String> {
         ));
     }
 
-    let mut list = NV_ENCODE_API_FUNCTION_LIST { version: FUNCTION_LIST_VERSION, ..Default::default() };
+    let mut list = NV_ENCODE_API_FUNCTION_LIST {
+        version: FUNCTION_LIST_VERSION,
+        ..Default::default()
+    };
     // SAFETY: `list` is a properly versioned, writable function list.
     let r = unsafe { create(&mut list) };
     if r != _NVENCSTATUS_NV_ENC_SUCCESS {
         return Err(format!("NvEncodeAPICreateInstance returned {r}"));
     }
-    Ok(NvencApi { _lib: lib, driver_max_version, list })
+    Ok(NvencApi {
+        _lib: lib,
+        driver_max_version,
+        list,
+    })
 }
 
 /// The NVENC function list for this process, loaded on first call.
@@ -114,15 +136,26 @@ mod tests {
 
     #[test]
     fn inventory_lists_function_list_entries() {
-        for f in ["nvEncOpenEncodeSessionEx", "nvEncInitializeEncoder", "nvEncEncodePicture", "nvEncDestroyEncoder"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "nvEncOpenEncodeSessionEx",
+            "nvEncInitializeEncoder",
+            "nvEncEncodePicture",
+            "nvEncDestroyEncoder",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 
     #[test]
     fn struct_version_matches_the_header_macro() {
         // NVENCAPI_STRUCT_VERSION(2) for API 13.1: 13 | 1<<24 | 2<<16 | 7<<28.
-        assert_eq!(struct_version(2), NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24) | (2 << 16) | (7 << 28));
+        assert_eq!(
+            struct_version(2),
+            NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24) | (2 << 16) | (7 << 28)
+        );
     }
 
     #[test]

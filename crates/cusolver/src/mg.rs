@@ -69,36 +69,56 @@ impl MgDataType {
 /// Validates multi-GPU grid dimensions against the supplied device ordinal list.
 pub fn validate_mg_grid(num_row_devices: i32, num_col_devices: i32, devices: &[i32]) -> Result<()> {
     if num_row_devices <= 0 || num_col_devices <= 0 {
-        return Err(Error::InvalidInput("MgGrid requires positive row and column device counts"));
+        return Err(Error::InvalidInput(
+            "MgGrid requires positive row and column device counts",
+        ));
     }
     let expected = (num_row_devices as usize)
         .checked_mul(num_col_devices as usize)
         .ok_or(Error::InvalidInput("MgGrid device count overflow"))?;
     if devices.len() != expected {
-        return Err(Error::InvalidInput("MgGrid device slice length must equal num_row_devices * num_col_devices"));
+        return Err(Error::InvalidInput(
+            "MgGrid device slice length must equal num_row_devices * num_col_devices",
+        ));
     }
     Ok(())
 }
 
 /// Validates distributed matrix descriptor dimensions and block sizes.
-pub fn validate_mg_matrix_desc(num_rows: i64, num_cols: i64, row_block_size: i64, col_block_size: i64) -> Result<()> {
+pub fn validate_mg_matrix_desc(
+    num_rows: i64,
+    num_cols: i64,
+    row_block_size: i64,
+    col_block_size: i64,
+) -> Result<()> {
     if num_rows <= 0 || num_cols <= 0 || row_block_size <= 0 || col_block_size <= 0 {
-        return Err(Error::InvalidInput("MgMatrixDesc requires positive dimensions and block sizes"));
+        return Err(Error::InvalidInput(
+            "MgMatrixDesc requires positive dimensions and block sizes",
+        ));
     }
     Ok(())
 }
 
 /// Checks `lwork` elements of `compute_type` against `budget_bytes` per GPU.
-pub fn check_mg_work_budget(lwork: i64, compute_type: MgDataType, budget_bytes: usize) -> Result<usize> {
+pub fn check_mg_work_budget(
+    lwork: i64,
+    compute_type: MgDataType,
+    budget_bytes: usize,
+) -> Result<usize> {
     if lwork < 0 {
         return Err(Error::InvalidInput("cusolverMg reported negative lwork"));
     }
     let bytes = usize::try_from(lwork)
         .ok()
         .and_then(|n| n.checked_mul(compute_type.byte_size()))
-        .ok_or(Error::InvalidInput("cusolverMg workspace byte size overflow"))?;
+        .ok_or(Error::InvalidInput(
+            "cusolverMg workspace byte size overflow",
+        ))?;
     if bytes > budget_bytes {
-        return Err(Error::Budget { requested: bytes, available: budget_bytes });
+        return Err(Error::Budget {
+            requested: bytes,
+            available: budget_bytes,
+        });
     }
     Ok(bytes)
 }
@@ -119,17 +139,25 @@ impl MgHandle {
         cuda.bind_to_thread()?;
         let mut raw: mg_sys::cusolverMgHandle_t = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
-        check_mg("cusolverMgCreate", unsafe { mg_sys::cusolverMgCreate(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check_mg("cusolverMgCreate", unsafe {
+            mg_sys::cusolverMgCreate(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Selects the CUDA device ordinals participating in multi-GPU operations.
     pub fn device_select(&mut self, devices: &[i32]) -> Result<()> {
         if devices.is_empty() {
-            return Err(Error::InvalidInput("device_select requires at least one device ordinal"));
+            return Err(Error::InvalidInput(
+                "device_select requires at least one device ordinal",
+            ));
         }
         self.cuda.bind_to_thread()?;
-        let nb = i32::try_from(devices.len()).map_err(|_| Error::InvalidInput("too many devices"))?;
+        let nb =
+            i32::try_from(devices.len()).map_err(|_| Error::InvalidInput("too many devices"))?;
         // SAFETY: `self.raw` is valid and `devices` has `nb` elements.
         check_mg("cusolverMgDeviceSelect", unsafe {
             mg_sys::cusolverMgDeviceSelect(self.raw, nb, devices.as_ptr().cast_mut())
@@ -500,10 +528,13 @@ impl Drop for MgHandle {
                 return;
             }
             // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroy", unsafe { mg_sys::cusolverMgDestroy(raw) }) {
+            if let Err(e) = check_mg("cusolverMgDestroy", unsafe {
+                mg_sys::cusolverMgDestroy(raw)
+            }) {
                 let _ = e;
-                self.cuda
-                    .record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
         }
     }
@@ -535,9 +566,18 @@ impl MgGrid {
         let mut raw: mg_sys::cudaLibMgGrid_t = std::ptr::null_mut();
         // SAFETY: `devices` has `num_row_devices * num_col_devices` entries.
         check_mg("cusolverMgCreateDeviceGrid", unsafe {
-            mg_sys::cusolverMgCreateDeviceGrid(&mut raw, num_row_devices, num_col_devices, devices.as_ptr(), mapping.to_sys())
+            mg_sys::cusolverMgCreateDeviceGrid(
+                &mut raw,
+                num_row_devices,
+                num_col_devices,
+                devices.as_ptr(),
+                mapping.to_sys(),
+            )
         })?;
-        Ok(Arc::new(Self { raw, cuda: cuda.clone() }))
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+        }))
     }
 
     /// Raw `cudaLibMgGrid_t`.
@@ -556,10 +596,13 @@ impl Drop for MgGrid {
                 return;
             }
             // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroyGrid", unsafe { mg_sys::cusolverMgDestroyGrid(raw) }) {
+            if let Err(e) = check_mg("cusolverMgDestroyGrid", unsafe {
+                mg_sys::cusolverMgDestroyGrid(raw)
+            }) {
                 let _ = e;
-                self.cuda
-                    .record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
         }
     }
@@ -600,7 +643,10 @@ impl MgMatrixDesc {
                 grid.raw(),
             )
         })?;
-        Ok(Self { raw, grid: grid.clone() })
+        Ok(Self {
+            raw,
+            grid: grid.clone(),
+        })
     }
 
     /// Raw `cudaLibMgMatrixDesc_t`.
@@ -619,11 +665,13 @@ impl Drop for MgMatrixDesc {
                 return;
             }
             // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroyMatrixDesc", unsafe { mg_sys::cusolverMgDestroyMatrixDesc(raw) }) {
+            if let Err(e) = check_mg("cusolverMgDestroyMatrixDesc", unsafe {
+                mg_sys::cusolverMgDestroyMatrixDesc(raw)
+            }) {
                 let _ = e;
-                self.grid
-                    .cuda
-                    .record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+                self.grid.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+                )));
             }
         }
     }
@@ -646,11 +694,20 @@ mod tests {
 
     #[test]
     fn mg_work_budget_enforces_limit() {
-        assert!(matches!(check_mg_work_budget(-1, MgDataType::F32, 1024), Err(Error::InvalidInput(_))));
+        assert!(matches!(
+            check_mg_work_budget(-1, MgDataType::F32, 1024),
+            Err(Error::InvalidInput(_))
+        ));
         assert!(matches!(
             check_mg_work_budget(512, MgDataType::F64, 1024),
-            Err(Error::Budget { requested: 4096, available: 1024 })
+            Err(Error::Budget {
+                requested: 4096,
+                available: 1024
+            })
         ));
-        assert_eq!(check_mg_work_budget(128, MgDataType::F64, 1024).unwrap(), 1024);
+        assert_eq!(
+            check_mg_work_budget(128, MgDataType::F64, 1024).unwrap(),
+            1024
+        );
     }
 }

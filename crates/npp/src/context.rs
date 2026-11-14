@@ -29,11 +29,17 @@ pub fn lib_version() -> Result<LibVersion> {
     // SAFETY: `nppGetLibVersion` takes no arguments and returns a pointer to a static struct.
     let ptr = unsafe { sys::nppGetLibVersion() };
     if ptr.is_null() {
-        return Err(Error::Unavailable("nppGetLibVersion returned null".to_owned()));
+        return Err(Error::Unavailable(
+            "nppGetLibVersion returned null".to_owned(),
+        ));
     }
     // SAFETY: `ptr` is non-null and points to a static `NppLibraryVersion` owned by `nppc`.
     let ver = unsafe { &*ptr };
-    Ok(LibVersion { major: ver.major, minor: ver.minor, build: ver.build })
+    Ok(LibVersion {
+        major: ver.major,
+        minor: ver.minor,
+        build: ver.build,
+    })
 }
 
 /// Stream-bound NPP execution context (`NppStreamContext`).
@@ -59,12 +65,30 @@ impl NppContext {
         // SAFETY: `cuda` is current on this thread and `dev` is a valid out-pointer.
         unsafe { cu::cuCtxGetDevice(&mut dev) }.result()?;
 
-        let mp_count = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
-        let max_threads_mp = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?;
-        let max_threads_blk = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?;
-        let shared_mem = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?;
-        let cc_major = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-        let cc_minor = dev_attr(dev, cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let mp_count = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        )?;
+        let max_threads_mp = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+        )?;
+        let max_threads_blk = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        )?;
+        let shared_mem = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+        )?;
+        let cc_major = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )?;
+        let cc_minor = dev_attr(
+            dev,
+            cu::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )?;
 
         let mut stream_flags = 0u32;
         // SAFETY: `stream.cu_stream()` is a valid `CUstream` on the bound context.
@@ -76,13 +100,17 @@ impl NppContext {
             nMultiProcessorCount: mp_count,
             nMaxThreadsPerMultiProcessor: max_threads_mp,
             nMaxThreadsPerBlock: max_threads_blk,
-            nSharedMemPerBlock: usize::try_from(shared_mem).map_err(|_| Error::InvalidInput("negative shared memory attribute"))?,
+            nSharedMemPerBlock: usize::try_from(shared_mem)
+                .map_err(|_| Error::InvalidInput("negative shared memory attribute"))?,
             nCudaDevAttrComputeCapabilityMajor: cc_major,
             nCudaDevAttrComputeCapabilityMinor: cc_minor,
             nStreamFlags: stream_flags,
             nReserved0: 0,
         };
-        Ok(Self { stream: stream.clone(), raw })
+        Ok(Self {
+            stream: stream.clone(),
+            raw,
+        })
     }
 
     /// Returns the underlying `cuda_core::Stream`.
@@ -103,7 +131,10 @@ impl NppContext {
     }
 }
 
-fn dev_attr(dev: cu::CUdevice, attr: cu::CUdevice_attribute) -> std::result::Result<i32, DriverError> {
+fn dev_attr(
+    dev: cu::CUdevice,
+    attr: cu::CUdevice_attribute,
+) -> std::result::Result<i32, DriverError> {
     let mut val = 0i32;
     // SAFETY: `dev` is a valid `CUdevice` and `val` is a valid out-pointer.
     unsafe { cu::cuDeviceGetAttribute(&mut val, attr, dev) }.result()?;

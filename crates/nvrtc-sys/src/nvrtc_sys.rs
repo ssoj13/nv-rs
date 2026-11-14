@@ -21,8 +21,16 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["nvrtcCreateProgram", "nvrtcCompileProgram", "nvrtcGetPTX", "nvrtcVersion"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "nvrtcCreateProgram",
+            "nvrtcCompileProgram",
+            "nvrtcGetPTX",
+            "nvrtcVersion",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

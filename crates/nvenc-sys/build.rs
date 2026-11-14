@@ -7,13 +7,21 @@ const SPEC: LibSpec = LibSpec {
     headers: &["nvEncodeAPI.h"],
     sdks: &[Sdk::Nv(Kind::VideoCodec)],
     allow_fn: &[],
-    allow_type: &["^_?NV_ENC.*", "^NVENC.*", "^PNVENC.*", "^_?NV_ENCODE_API_FUNCTION_LIST$", "^_?GUID$"],
+    allow_type: &[
+        "^_?NV_ENC.*",
+        "^NVENC.*",
+        "^PNVENC.*",
+        "^_?NV_ENCODE_API_FUNCTION_LIST$",
+        "^_?GUID$",
+    ],
     allow_var: &["^NVENC.*", "^NV_ENC.*"],
     reuse_cuda_types: &[],
     positive_enums: &[],
     clang_args: &[],
     opaque_types: &[],
-    shape: Shape::FunctionTable { table_type: "_NV_ENCODE_API_FUNCTION_LIST" },
+    shape: Shape::FunctionTable {
+        table_type: "_NV_ENCODE_API_FUNCTION_LIST",
+    },
 };
 
 fn main() {

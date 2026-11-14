@@ -14,7 +14,7 @@ path = "src/optix_device_tests.rs"
 [dependencies]
 optix-device = { path = "../optix-device" }
 optix = { path = "../../crates/optix" }
-cuda-ext = { path = "../../crates/cuda-ext" }
+cuda-core-ext = { path = "../../crates/cuda-core-ext" }
 cuda-tex-device = { path = "../cuda-tex-device" }
 cuda-device.workspace = true
 cuda-core.workspace = true

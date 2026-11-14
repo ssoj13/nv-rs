@@ -12,7 +12,16 @@ use nv_loader::{DllSpec, Group, LoadError, Loaded, open_first};
 use std::sync::OnceLock;
 
 // Generated code: lint levels differ per header.
-#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code,
+    missing_docs,
+    unnecessary_transmutes,
+    clippy::all,
+    clippy::undocumented_unsafe_blocks
+)]
 mod types {
     include!(concat!(env!("OUT_DIR"), "/nvofa_types.rs"));
 }
@@ -60,9 +69,14 @@ fn open(path: &std::path::Path) -> Result<NvofaApi, String> {
     // SAFETY: loading the driver's optical-flow library runs only its initialisers.
     let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
     // SAFETY: both exports have these signatures in nvOpticalFlowCommon.h / nvOpticalFlowCuda.h.
-    let max_version: MaxVersionFn = unsafe { lib.get::<MaxVersionFn>(b"NvOFGetMaxSupportedApiVersion\0") }.map(|s| *s).map_err(|e| e.to_string())?;
+    let max_version: MaxVersionFn =
+        unsafe { lib.get::<MaxVersionFn>(b"NvOFGetMaxSupportedApiVersion\0") }
+            .map(|s| *s)
+            .map_err(|e| e.to_string())?;
     // SAFETY: as above.
-    let create: CreateCudaFn = unsafe { lib.get::<CreateCudaFn>(b"NvOFAPICreateInstanceCuda\0") }.map(|s| *s).map_err(|e| e.to_string())?;
+    let create: CreateCudaFn = unsafe { lib.get::<CreateCudaFn>(b"NvOFAPICreateInstanceCuda\0") }
+        .map(|s| *s)
+        .map_err(|e| e.to_string())?;
 
     let mut driver_max_version = 0u32;
     // SAFETY: valid out-pointer.
@@ -83,7 +97,11 @@ fn open(path: &std::path::Path) -> Result<NvofaApi, String> {
     if r != _NV_OF_STATUS_NV_OF_SUCCESS {
         return Err(format!("NvOFAPICreateInstanceCuda returned {r}"));
     }
-    Ok(NvofaApi { _lib: lib, driver_max_version, list })
+    Ok(NvofaApi {
+        _lib: lib,
+        driver_max_version,
+        list,
+    })
 }
 
 /// The NVOFA CUDA function list for this process, loaded on first call.
@@ -102,8 +120,16 @@ mod tests {
 
     #[test]
     fn inventory_lists_function_list_entries() {
-        for f in ["nvCreateOpticalFlowCuda", "nvOFInit", "nvOFExecute", "nvOFDestroy"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "nvCreateOpticalFlowCuda",
+            "nvOFInit",
+            "nvOFExecute",
+            "nvOFDestroy",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

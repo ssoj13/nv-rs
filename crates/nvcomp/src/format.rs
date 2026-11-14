@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use cuda_core::Stream;
 use nvcomp_sys as sys;
 
-use crate::{check, Error, Result};
+use crate::{Error, Result, check};
 
 /// Supported nvCOMP codec family without payload options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -197,7 +197,10 @@ impl Lz4Opts {
         }
     }
 
-    fn to_decompress_sys(self, backend: DecompressBackend) -> sys::nvcompBatchedLZ4DecompressOpts_t {
+    fn to_decompress_sys(
+        self,
+        backend: DecompressBackend,
+    ) -> sys::nvcompBatchedLZ4DecompressOpts_t {
         sys::nvcompBatchedLZ4DecompressOpts_t {
             backend: backend.to_sys(),
             sort_before_hw_decompress: i32::from(self.sort_before_hw_decompress),
@@ -241,8 +244,14 @@ impl ZstdOpts {
         sys::nvcompBatchedZstdCompressOpts_t::default()
     }
 
-    fn to_decompress_sys(self, backend: DecompressBackend) -> sys::nvcompBatchedZstdDecompressOpts_t {
-        sys::nvcompBatchedZstdDecompressOpts_t { backend: backend.to_sys(), ..Default::default() }
+    fn to_decompress_sys(
+        self,
+        backend: DecompressBackend,
+    ) -> sys::nvcompBatchedZstdDecompressOpts_t {
+        sys::nvcompBatchedZstdDecompressOpts_t {
+            backend: backend.to_sys(),
+            ..Default::default()
+        }
     }
 }
 
@@ -324,7 +333,10 @@ impl Default for GdeflateOpts {
 
 impl GdeflateOpts {
     fn to_compress_sys(self) -> sys::nvcompBatchedGdeflateCompressOpts_t {
-        sys::nvcompBatchedGdeflateCompressOpts_t { algorithm: self.algorithm, ..Default::default() }
+        sys::nvcompBatchedGdeflateCompressOpts_t {
+            algorithm: self.algorithm,
+            ..Default::default()
+        }
     }
 
     fn to_decompress_sys(
@@ -415,7 +427,11 @@ pub struct Alignments {
 
 impl From<sys::nvcompAlignmentRequirements_t> for Alignments {
     fn from(raw: sys::nvcompAlignmentRequirements_t) -> Self {
-        Self { input: raw.input.max(1), output: raw.output.max(1), temp: raw.temp.max(1) }
+        Self {
+            input: raw.input.max(1),
+            output: raw.output.max(1),
+            temp: raw.temp.max(1),
+        }
     }
 }
 
@@ -470,7 +486,10 @@ impl Format {
             match self {
                 Self::Lz4(o) => (
                     "nvcompBatchedLZ4CompressGetRequiredAlignments",
-                    sys::nvcompBatchedLZ4CompressGetRequiredAlignments(o.to_compress_sys(), &mut req),
+                    sys::nvcompBatchedLZ4CompressGetRequiredAlignments(
+                        o.to_compress_sys(),
+                        &mut req,
+                    ),
                 ),
                 Self::Snappy(o) => (
                     "nvcompBatchedSnappyCompressGetRequiredAlignments",
@@ -1181,6 +1200,9 @@ mod tests {
 
         let cascaded = CascadedOpts::default().to_compress_sys();
         assert_eq!(cascaded.compression_level, 3);
-        assert_eq!(cascaded.common_opts.data_type, sys::nvcompType_t_NVCOMP_TYPE_UINT);
+        assert_eq!(
+            cascaded.common_opts.data_type,
+            sys::nvcompType_t_NVCOMP_TYPE_UINT
+        );
     }
 }

@@ -34,16 +34,41 @@ fn dn_lu_getrf_getrs_solves_and_checks_residual() {
     let mut ipiv = DeviceBuffer::<i32>::zeroed(&stream, 3).expect("ipiv");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
-    dn.getrf(&stream, 3, 3, &mut a, 3, &mut ipiv, &mut info, &mut scratch, 64 * 1024 * 1024)
-        .expect("getrf");
-    dn.getrs(&stream, Op::NonTranspose, 3, 1, &a, 3, &ipiv, &mut b, 3, &mut info)
-        .expect("getrs");
+    dn.getrf(
+        &stream,
+        3,
+        3,
+        &mut a,
+        3,
+        &mut ipiv,
+        &mut info,
+        &mut scratch,
+        64 * 1024 * 1024,
+    )
+    .expect("getrf");
+    dn.getrs(
+        &stream,
+        Op::NonTranspose,
+        3,
+        1,
+        &a,
+        3,
+        &ipiv,
+        &mut b,
+        3,
+        &mut info,
+    )
+    .expect("getrs");
     stream.synchronize().expect("sync");
 
     assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
     let x = b.to_host_vec(&stream).expect("x");
     let ax = matvec_col_major(&a_host, 3, 3, &x);
-    let res = ax.iter().zip(b_host.iter()).map(|(u, v)| (u - v).abs()).fold(0.0f32, f32::max);
+    let res = ax
+        .iter()
+        .zip(b_host.iter())
+        .map(|(u, v)| (u - v).abs())
+        .fold(0.0f32, f32::max);
     assert!(res < 1e-4, "LU residual={res}, x={x:?}");
 }
 
@@ -63,8 +88,17 @@ fn dn_cholesky_potrf_potrs_solves_spd_system() {
     let mut b = DeviceBuffer::from_host(&stream, &b_host).expect("b");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
-    dn.potrf(&stream, FillMode::Lower, 3, &mut a, 3, &mut info, &mut scratch, 64 * 1024 * 1024)
-        .expect("potrf");
+    dn.potrf(
+        &stream,
+        FillMode::Lower,
+        3,
+        &mut a,
+        3,
+        &mut info,
+        &mut scratch,
+        64 * 1024 * 1024,
+    )
+    .expect("potrf");
     dn.potrs(&stream, FillMode::Lower, 3, 1, &a, 3, &mut b, 3, &mut info)
         .expect("potrs");
     stream.synchronize().expect("sync");
@@ -72,7 +106,11 @@ fn dn_cholesky_potrf_potrs_solves_spd_system() {
     assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
     let x = b.to_host_vec(&stream).expect("x");
     let ax = matvec_col_major(&a_host, 3, 3, &x);
-    let res = ax.iter().zip(b_host.iter()).map(|(u, v)| (u - v).abs()).fold(0.0f32, f32::max);
+    let res = ax
+        .iter()
+        .zip(b_host.iter())
+        .map(|(u, v)| (u - v).abs())
+        .fold(0.0f32, f32::max);
     assert!(res < 1e-5, "Cholesky residual={res}, x={x:?}");
 }
 
@@ -89,10 +127,31 @@ fn dn_qr_geqrf_orgqr_checks_orthogonality() {
     let mut tau = DeviceBuffer::<f32>::zeroed(&stream, 2).expect("tau");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
-    dn.geqrf(&stream, 3, 2, &mut a, 3, &mut tau, &mut info, &mut scratch, 64 * 1024 * 1024)
-        .expect("geqrf");
-    dn.orgqr(&stream, 3, 2, 2, &mut a, 3, &tau, &mut info, &mut scratch, 64 * 1024 * 1024)
-        .expect("orgqr");
+    dn.geqrf(
+        &stream,
+        3,
+        2,
+        &mut a,
+        3,
+        &mut tau,
+        &mut info,
+        &mut scratch,
+        64 * 1024 * 1024,
+    )
+    .expect("geqrf");
+    dn.orgqr(
+        &stream,
+        3,
+        2,
+        2,
+        &mut a,
+        3,
+        &tau,
+        &mut info,
+        &mut scratch,
+        64 * 1024 * 1024,
+    )
+    .expect("orgqr");
     stream.synchronize().expect("sync");
 
     assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
@@ -214,21 +273,28 @@ fn sp_csrlsvqr_and_csreigvsi_numerical_checks() {
     let descr = MatDescr::new(&cuda).expect("MatDescr");
 
     // 3x3 SPD CSR: [[4, 1, 0], [1, 4, 1], [0, 1, 4]]
-    let csr_val = DeviceBuffer::from_host(&stream, &[4.0f32, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0]).expect("csr_val");
+    let csr_val =
+        DeviceBuffer::from_host(&stream, &[4.0f32, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0]).expect("csr_val");
     let csr_row = DeviceBuffer::from_host(&stream, &[0i32, 2, 5, 7]).expect("csr_row");
     let csr_col = DeviceBuffer::from_host(&stream, &[0i32, 1, 0, 1, 2, 1, 2]).expect("csr_col");
     let b = DeviceBuffer::from_host(&stream, &[6.0f32, 12.0, 14.0]).expect("b");
     let mut x = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("x");
 
     let singularity = sp
-        .csrlsvqr(&stream, 3, 7, &descr, &csr_val, &csr_row, &csr_col, &b, 1e-6, 0, &mut x)
+        .csrlsvqr(
+            &stream, 3, 7, &descr, &csr_val, &csr_row, &csr_col, &b, 1e-6, 0, &mut x,
+        )
         .expect("csrlsvqr");
     stream.synchronize().expect("sync");
     assert_eq!(singularity, -1);
 
     let x_h = x.to_host_vec(&stream).expect("read x");
     let expected = [1.0f32, 2.0, 3.0];
-    let max_err = x_h.iter().zip(expected.iter()).map(|(u, v)| (u - v).abs()).fold(0.0f32, f32::max);
+    let max_err = x_h
+        .iter()
+        .zip(expected.iter())
+        .map(|(u, v)| (u - v).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_err < 1e-4, "csrlsvqr x={x_h:?}, max_err={max_err}");
 
     // Shift `mu0` away from exact eigenvalue 4.0 (so `A - mu0*I` is nonsingular) and use
@@ -236,8 +302,24 @@ fn sp_csrlsvqr_and_csreigvsi_numerical_checks() {
     let x0 = DeviceBuffer::from_host(&stream, &[1.0f32, 0.5, -0.5]).expect("x0");
     let mut eig_vec = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("eig_vec");
     let mu = sp
-        .csreigvsi(&stream, 3, 7, &descr, &csr_val, &csr_row, &csr_col, 3.9, &x0, 50, 1e-5, &mut eig_vec)
+        .csreigvsi(
+            &stream,
+            3,
+            7,
+            &descr,
+            &csr_val,
+            &csr_row,
+            &csr_col,
+            3.9,
+            &x0,
+            50,
+            1e-5,
+            &mut eig_vec,
+        )
         .expect("csreigvsi");
     stream.synchronize().expect("sync");
-    assert!((mu - 4.0).abs() < 1e-3, "expected eigenvalue near 4.0, got {mu}");
+    assert!(
+        (mu - 4.0).abs() < 1e-3,
+        "expected eigenvalue near 4.0, got {mu}"
+    );
 }

@@ -1,0 +1,36 @@
+# cargo-deny configuration for nv-rs
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "ssh://git@github.com/ssoj13/vcv-rs.git",
+    "ssh://git@github.com/ssoj13/cuda-rust_b.git",
+    "ssh://git@github.com/ssoj13/gpu-info-rs.git",
+]

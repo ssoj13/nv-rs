@@ -36,7 +36,10 @@ pub struct DeviceContext {
     t: &'static sys::OptixFunctionTable,
     // Every sink ever installed; OptiX reads them through the pointers it holds, and the outer
     // box keeps each inner one at a fixed address while the vector grows.
-    #[expect(clippy::vec_box, reason = "OptiX holds the address of each `Box<LogFn>`; the outer box keeps it fixed while the Vec reallocates")]
+    #[expect(
+        clippy::vec_box,
+        reason = "OptiX holds the address of each `Box<LogFn>`; the outer box keeps it fixed while the Vec reallocates"
+    )]
     sinks: Mutex<Vec<Box<Box<LogFn>>>>,
 }
 
@@ -46,29 +49,55 @@ unsafe impl Send for DeviceContext {}
 // SAFETY: as above.
 unsafe impl Sync for DeviceContext {}
 
-unsafe extern "C" fn forward_log(level: c_uint, tag: *const c_char, msg: *const c_char, data: *mut c_void) {
+unsafe extern "C" fn forward_log(
+    level: c_uint,
+    tag: *const c_char,
+    msg: *const c_char,
+    data: *mut c_void,
+) {
     if data.is_null() || tag.is_null() || msg.is_null() {
         return;
     }
     // SAFETY: `data` is a `Box<LogFn>` owned by the context for its whole life, alive while OptiX
     // may call back; `tag`/`msg` are non-null NUL-terminated strings valid for the call.
-    let (sink, tag, msg) = unsafe { (&*data.cast::<Box<LogFn>>(), CStr::from_ptr(tag), CStr::from_ptr(msg)) };
+    let (sink, tag, msg) = unsafe {
+        (
+            &*data.cast::<Box<LogFn>>(),
+            CStr::from_ptr(tag),
+            CStr::from_ptr(msg),
+        )
+    };
     // A panicking sink must not unwind into OptiX; the panic was already reported by the hook.
-    let _unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(level, &tag.to_string_lossy(), &msg.to_string_lossy())));
+    let _unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sink(level, &tag.to_string_lossy(), &msg.to_string_lossy())
+    }));
 }
 
 /// Callback, user pointer and boxed sink for `log`.
-fn sink_parts(log: Option<Box<LogFn>>) -> (sys::OptixLogCallback, *mut c_void, Option<Box<Box<LogFn>>>) {
+fn sink_parts(
+    log: Option<Box<LogFn>>,
+) -> (sys::OptixLogCallback, *mut c_void, Option<Box<Box<LogFn>>>) {
     let mut sink = log.map(Box::new);
-    let data = sink.as_mut().map_or(std::ptr::null_mut(), |s| (&raw mut **s).cast::<c_void>());
-    let callback: sys::OptixLogCallback = if sink.is_some() { Some(forward_log) } else { None };
+    let data = sink
+        .as_mut()
+        .map_or(std::ptr::null_mut(), |s| (&raw mut **s).cast::<c_void>());
+    let callback: sys::OptixLogCallback = if sink.is_some() {
+        Some(forward_log)
+    } else {
+        None
+    };
     (callback, data, sink)
 }
 
 impl DeviceContext {
     /// OptiX on `cuda`. `log` receives messages up to `log_level` (0 = none, 4 = everything);
     /// `validation` turns on OptiX's full validation mode.
-    pub fn new(cuda: &Arc<Context>, log: Option<Box<LogFn>>, log_level: u32, validation: bool) -> Result<Arc<Self>> {
+    pub fn new(
+        cuda: &Arc<Context>,
+        log: Option<Box<LogFn>>,
+        log_level: u32,
+        validation: bool,
+    ) -> Result<Arc<Self>> {
         let t = table()?;
         cuda.bind_to_thread()?;
         let (callback, data, sink) = sink_parts(log);
@@ -85,8 +114,15 @@ impl DeviceContext {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `cuda` is current and alive (held below); `opts` and the sink outlive the call,
         // and the sink lives as long as the context.
-        check("optixDeviceContextCreate", unsafe { entry!(t, optixDeviceContextCreate)(cuda.cu_ctx(), &opts, &mut raw) })?;
-        Ok(Arc::new(Self { raw, cuda: cuda.clone(), t, sinks: Mutex::new(sink.into_iter().collect()) }))
+        check("optixDeviceContextCreate", unsafe {
+            entry!(t, optixDeviceContextCreate)(cuda.cu_ctx(), &opts, &mut raw)
+        })?;
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+            t,
+            sinks: Mutex::new(sink.into_iter().collect()),
+        }))
     }
 
     /// The raw handle.
@@ -107,7 +143,9 @@ impl DeviceContext {
     /// Records a failed destroy call on the CUDA context (drop paths cannot return errors).
     pub(crate) fn record(&self, code: sys::OptixResult) {
         if code != sys::OptixResult_OPTIX_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(cuda_core::DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+            self.cuda.record_err(Err::<(), _>(cuda_core::DriverError(
+                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+            )));
         }
     }
 
@@ -118,11 +156,19 @@ impl DeviceContext {
     /// therefore stay alive (and may still be called) until the context is dropped.
     pub fn set_log(&self, log: Option<Box<LogFn>>, level: u32) -> Result<()> {
         let (callback, data, sink) = sink_parts(log);
-        let mut sinks = self.sinks.lock().map_err(|_| Error::Invalid("log sink list poisoned by a panic"))?;
+        let mut sinks = self
+            .sinks
+            .lock()
+            .map_err(|_| Error::Invalid("log sink list poisoned by a panic"))?;
         // SAFETY: owned context; the new sink is pushed below and kept for the context's life, the
         // old ones were never released.
         check("optixDeviceContextSetLogCallback", unsafe {
-            entry!(self.t, optixDeviceContextSetLogCallback)(self.raw, callback, data, level.min(MAX_LOG_LEVEL))
+            entry!(self.t, optixDeviceContextSetLogCallback)(
+                self.raw,
+                callback,
+                data,
+                level.min(MAX_LOG_LEVEL),
+            )
         })?;
         sinks.extend(sink);
         Ok(())
@@ -133,7 +179,12 @@ impl DeviceContext {
         // SAFETY: every `OptixDeviceProperty` is documented as `sizeof(unsigned int)`; `value` is a
         // writable `unsigned int`.
         check("optixDeviceContextGetProperty", unsafe {
-            entry!(self.t, optixDeviceContextGetProperty)(self.raw, property, (&raw mut value).cast(), size_of::<c_uint>())
+            entry!(self.t, optixDeviceContextGetProperty)(
+                self.raw,
+                property,
+                (&raw mut value).cast(),
+                size_of::<c_uint>(),
+            )
         })?;
         Ok(value)
     }
@@ -178,7 +229,9 @@ impl DeviceContext {
     /// Usable bits of `OptixInstance::visibilityMask`
     /// (`OPTIX_DEVICE_PROPERTY_LIMIT_NUM_BITS_INSTANCE_VISIBILITY_MASK`).
     pub fn visibility_mask_bits(&self) -> Result<u32> {
-        self.prop(sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_LIMIT_NUM_BITS_INSTANCE_VISIBILITY_MASK)
+        self.prop(
+            sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_LIMIT_NUM_BITS_INSTANCE_VISIBILITY_MASK,
+        )
     }
 
     /// Most SBT records of one GAS (`OPTIX_DEVICE_PROPERTY_LIMIT_MAX_SBT_RECORDS_PER_GAS`).
@@ -203,7 +256,10 @@ impl DeviceContext {
 
     /// Cooperative vectors are supported (`OPTIX_DEVICE_PROPERTY_COOP_VEC`, flag `STANDARD`).
     pub fn coop_vec(&self) -> Result<bool> {
-        self.flag(sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_COOP_VEC, sys::OptixDevicePropertyCoopVecFlags_OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD)
+        self.flag(
+            sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_COOP_VEC,
+            sys::OptixDevicePropertyCoopVecFlags_OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD,
+        )
     }
 
     /// Cluster acceleration structure builds are supported (`OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL`,
@@ -228,7 +284,9 @@ impl DeviceContext {
     /// Largest grid resolution of a structured cluster
     /// (`OPTIX_DEVICE_PROPERTY_LIMIT_MAX_STRUCTURED_GRID_RESOLUTION`).
     pub fn max_grid_resolution(&self) -> Result<u32> {
-        self.prop(sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_LIMIT_MAX_STRUCTURED_GRID_RESOLUTION)
+        self.prop(
+            sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_LIMIT_MAX_STRUCTURED_GRID_RESOLUTION,
+        )
     }
 
     /// Largest SBT index in a cluster build (`OPTIX_DEVICE_PROPERTY_LIMIT_MAX_CLUSTER_SBT_INDEX`).
@@ -246,24 +304,32 @@ impl DeviceContext {
     /// disables the cache regardless.
     pub fn set_cache_enabled(&self, enabled: bool) -> Result<()> {
         // SAFETY: owned context; plain value argument.
-        check("optixDeviceContextSetCacheEnabled", unsafe { entry!(self.t, optixDeviceContextSetCacheEnabled)(self.raw, c_int::from(enabled)) })
+        check("optixDeviceContextSetCacheEnabled", unsafe {
+            entry!(self.t, optixDeviceContextSetCacheEnabled)(self.raw, c_int::from(enabled))
+        })
     }
 
     /// Whether the disk cache is on.
     pub fn cache_enabled(&self) -> Result<bool> {
         let mut enabled: c_int = 0;
         // SAFETY: owned context; writable `int`.
-        check("optixDeviceContextGetCacheEnabled", unsafe { entry!(self.t, optixDeviceContextGetCacheEnabled)(self.raw, &mut enabled) })?;
+        check("optixDeviceContextGetCacheEnabled", unsafe {
+            entry!(self.t, optixDeviceContextGetCacheEnabled)(self.raw, &mut enabled)
+        })?;
         Ok(enabled != 0)
     }
 
     /// Moves the disk cache to the directory `dir` (created if missing; must not be a network
     /// share). `OPTIX_CACHE_PATH` in the environment takes precedence.
     pub fn set_cache_location(&self, dir: &Path) -> Result<()> {
-        let dir = dir.to_str().ok_or(Error::Invalid("cache location is not valid UTF-8"))?;
+        let dir = dir
+            .to_str()
+            .ok_or(Error::Invalid("cache location is not valid UTF-8"))?;
         let dir = CString::new(dir).map_err(|_| Error::Invalid("cache location contains NUL"))?;
         // SAFETY: owned context; NUL-terminated string alive for the call (OptiX copies it).
-        check("optixDeviceContextSetCacheLocation", unsafe { entry!(self.t, optixDeviceContextSetCacheLocation)(self.raw, dir.as_ptr()) })
+        check("optixDeviceContextSetCacheLocation", unsafe {
+            entry!(self.t, optixDeviceContextSetCacheLocation)(self.raw, dir.as_ptr())
+        })
     }
 
     /// The disk cache directory (empty when `OPTIX_CACHE_MAXSIZE=0` disabled the cache).
@@ -271,10 +337,17 @@ impl DeviceContext {
         let mut buf = vec![0u8; PATH_BYTES];
         // SAFETY: owned context; `buf` is writable for the size passed, and OptiX NUL-terminates.
         check("optixDeviceContextGetCacheLocation", unsafe {
-            entry!(self.t, optixDeviceContextGetCacheLocation)(self.raw, buf.as_mut_ptr().cast(), buf.len())
+            entry!(self.t, optixDeviceContextGetCacheLocation)(
+                self.raw,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
         })?;
-        let text = CStr::from_bytes_until_nul(&buf).map_err(|_| Error::Invalid("cache location not NUL-terminated"))?;
-        let text = text.to_str().map_err(|_| Error::Invalid("cache location is not valid UTF-8"))?;
+        let text = CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| Error::Invalid("cache location not NUL-terminated"))?;
+        let text = text
+            .to_str()
+            .map_err(|_| Error::Invalid("cache location is not valid UTF-8"))?;
         Ok(PathBuf::from(text))
     }
 
@@ -283,7 +356,9 @@ impl DeviceContext {
     /// an error. `OPTIX_CACHE_MAXSIZE` overrides them.
     pub fn set_cache_sizes(&self, low: usize, high: usize) -> Result<()> {
         // SAFETY: owned context; plain value arguments.
-        check("optixDeviceContextSetCacheDatabaseSizes", unsafe { entry!(self.t, optixDeviceContextSetCacheDatabaseSizes)(self.raw, low, high) })
+        check("optixDeviceContextSetCacheDatabaseSizes", unsafe {
+            entry!(self.t, optixDeviceContextSetCacheDatabaseSizes)(self.raw, low, high)
+        })
     }
 
     /// The `(low, high)` water marks (both 0 when the environment disabled the cache).
@@ -301,13 +376,19 @@ impl DeviceContext {
     /// Safe from any thread.
     pub fn cancel_creations(&self, block: bool) -> Result<()> {
         // SAFETY: owned context; OptiX documents this call as thread safe.
-        check("optixDeviceContextCancelCreations", unsafe { entry!(self.t, optixDeviceContextCancelCreations)(self.raw, creation_flags(block)) })
+        check("optixDeviceContextCancelCreations", unsafe {
+            entry!(self.t, optixDeviceContextCancelCreations)(self.raw, creation_flags(block))
+        })
     }
 }
 
 /// `OptixCreationFlags` for a cancel call.
 pub(crate) fn creation_flags(block: bool) -> sys::OptixCreationFlags {
-    if block { sys::OptixCreationFlags_OPTIX_CREATION_FLAG_BLOCK_UNTIL_EFFECTIVE } else { sys::OptixCreationFlags_OPTIX_CREATION_FLAG_NONE }
+    if block {
+        sys::OptixCreationFlags_OPTIX_CREATION_FLAG_BLOCK_UNTIL_EFFECTIVE
+    } else {
+        sys::OptixCreationFlags_OPTIX_CREATION_FLAG_NONE
+    }
 }
 
 impl Drop for DeviceContext {
@@ -322,8 +403,14 @@ impl Drop for DeviceContext {
 }
 
 /// Reads a static string returned by `optixGetErrorName` / `optixGetErrorString`.
-fn error_text(f: Option<unsafe extern "C" fn(sys::OptixResult) -> *const c_char>, name: &'static str, code: sys::OptixResult) -> Result<&'static str> {
-    let f = f.ok_or_else(|| Error::Unavailable(format!("{name} missing from the OptiX function table")))?;
+fn error_text(
+    f: Option<unsafe extern "C" fn(sys::OptixResult) -> *const c_char>,
+    name: &'static str,
+    code: sys::OptixResult,
+) -> Result<&'static str> {
+    let f = f.ok_or_else(|| {
+        Error::Unavailable(format!("{name} missing from the OptiX function table"))
+    })?;
     // SAFETY: the entry takes any code and returns a pointer to a static string (or null).
     let p = unsafe { f(code) };
     if p.is_null() {
@@ -332,7 +419,8 @@ fn error_text(f: Option<unsafe extern "C" fn(sys::OptixResult) -> *const c_char>
     // SAFETY: non-null, NUL-terminated, static in the driver library, which `optix-sys` keeps
     // loaded for the life of the process.
     let text = unsafe { CStr::from_ptr(p) };
-    text.to_str().map_err(|_| Error::Invalid("OptiX error text is not UTF-8"))
+    text.to_str()
+        .map_err(|_| Error::Invalid("OptiX error text is not UTF-8"))
 }
 
 /// The enum name of an `OptixResult` (`"OPTIX_ERROR_INVALID_VALUE"`; OptiX answers

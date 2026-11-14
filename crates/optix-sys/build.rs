@@ -13,7 +13,9 @@ const SPEC: LibSpec = LibSpec {
     positive_enums: &[],
     clang_args: &[],
     opaque_types: &[],
-    shape: Shape::FunctionTable { table_type: "OptixFunctionTable" },
+    shape: Shape::FunctionTable {
+        table_type: "OptixFunctionTable",
+    },
 };
 
 fn main() {

@@ -96,9 +96,15 @@ impl MatrixLayout {
     fn to_sys(self) -> sys::OptixCoopVecMatrixLayout {
         match self {
             Self::RowMajor => sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_ROW_MAJOR,
-            Self::ColumnMajor => sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_COLUMN_MAJOR,
-            Self::InferencingOptimal => sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_INFERENCING_OPTIMAL,
-            Self::TrainingOptimal => sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_TRAINING_OPTIMAL,
+            Self::ColumnMajor => {
+                sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_COLUMN_MAJOR
+            }
+            Self::InferencingOptimal => {
+                sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_INFERENCING_OPTIMAL
+            }
+            Self::TrainingOptimal => {
+                sys::OptixCoopVecMatrixLayout_OPTIX_COOP_VEC_MATRIX_LAYOUT_TRAINING_OPTIMAL
+            }
         }
     }
 
@@ -126,7 +132,9 @@ fn check_stride(n: u32, k: u32, elem: ElemType, layout: MatrixLayout, stride: us
         return Err(Error::Invalid("optimal matrix layouts take stride 0"));
     }
     if !layout.is_optimal() && stride < packed {
-        return Err(Error::Invalid("matrix stride is smaller than a packed row or column"));
+        return Err(Error::Invalid(
+            "matrix stride is smaller than a packed row or column",
+        ));
     }
     Ok(())
 }
@@ -168,7 +176,14 @@ impl Matrix {
 /// Bytes an `n x k` matrix of `elem` takes in `layout` (`optixCoopVecMatrixComputeSize`), a
 /// multiple of [`MATRIX_ALIGN`]. `stride` is the row/column stride for row- and column-major
 /// layouts (0 = packed) and must be 0 for optimal layouts.
-pub fn matrix_size(ctx: &DeviceContext, n: u32, k: u32, elem: ElemType, layout: MatrixLayout, stride: usize) -> Result<usize> {
+pub fn matrix_size(
+    ctx: &DeviceContext,
+    n: u32,
+    k: u32,
+    elem: ElemType,
+    layout: MatrixLayout,
+    stride: usize,
+) -> Result<usize> {
     if n == 0 || k == 0 {
         return Err(Error::Invalid("matrix dimensions must be non-zero"));
     }
@@ -179,7 +194,15 @@ pub fn matrix_size(ctx: &DeviceContext, n: u32, k: u32, elem: ElemType, layout: 
     let mut size = 0usize;
     // SAFETY: plain values in, one writable size_t out.
     check("optixCoopVecMatrixComputeSize", unsafe {
-        entry!(ctx.table(), optixCoopVecMatrixComputeSize)(ctx.raw(), n, k, elem.to_sys(), layout.to_sys(), stride, &mut size)
+        entry!(ctx.table(), optixCoopVecMatrixComputeSize)(
+            ctx.raw(),
+            n,
+            k,
+            elem.to_sys(),
+            layout.to_sys(),
+            stride,
+            &mut size,
+        )
     })?;
     Ok(size)
 }
@@ -200,26 +223,39 @@ impl Network {
         }
         for m in &matrices {
             if m.n == 0 || m.k == 0 || m.size == 0 {
-                return Err(Error::Invalid("matrix dimensions and size must be non-zero"));
+                return Err(Error::Invalid(
+                    "matrix dimensions and size must be non-zero",
+                ));
             }
             if !(m.offset as usize).is_multiple_of(MATRIX_ALIGN) {
-                return Err(Error::Invalid("matrix offset is not a multiple of MATRIX_ALIGN"));
+                return Err(Error::Invalid(
+                    "matrix offset is not a multiple of MATRIX_ALIGN",
+                ));
             }
             check_stride(m.n, m.k, m.elem, m.layout, m.stride as usize)?;
         }
-        let mut spans: Vec<(u64, u64)> = matrices.iter().map(|m| (u64::from(m.offset), u64::from(m.offset) + u64::from(m.size))).collect();
+        let mut spans: Vec<(u64, u64)> = matrices
+            .iter()
+            .map(|m| (u64::from(m.offset), u64::from(m.offset) + u64::from(m.size)))
+            .collect();
         spans.sort_unstable();
         if spans.windows(2).any(|w| matches!(w, [a, b] if a.1 > b.0)) {
             return Err(Error::Invalid("network matrices overlap"));
         }
         let end = spans.iter().map(|s| s.1).fold(0, u64::max);
-        let bytes = usize::try_from(end).map_err(|_| Error::Invalid("network exceeds the address space"))?;
+        let bytes = usize::try_from(end)
+            .map_err(|_| Error::Invalid("network exceeds the address space"))?;
         Ok(Self { matrices, bytes })
     }
 
     /// Matrices of `shapes` (`(n, k)` each, in order) in one element type and layout, packed
     /// back to back at [`MATRIX_ALIGN`]-aligned offsets with sizes from [`matrix_size`].
-    pub fn packed(ctx: &DeviceContext, shapes: &[(u32, u32)], elem: ElemType, layout: MatrixLayout) -> Result<Self> {
+    pub fn packed(
+        ctx: &DeviceContext,
+        shapes: &[(u32, u32)],
+        elem: ElemType,
+        layout: MatrixLayout,
+    ) -> Result<Self> {
         let too_big = || Error::Invalid("network exceeds 4 GiB");
         let mut matrices = Vec::with_capacity(shapes.len());
         let mut offset = 0usize;
@@ -235,7 +271,10 @@ impl Network {
                 offset: u32::try_from(offset).map_err(|_| too_big())?,
                 size: u32::try_from(size).map_err(|_| too_big())?,
             });
-            offset = offset.checked_add(size).and_then(|o| o.checked_next_multiple_of(MATRIX_ALIGN)).ok_or_else(too_big)?;
+            offset = offset
+                .checked_add(size)
+                .and_then(|o| o.checked_next_multiple_of(MATRIX_ALIGN))
+                .ok_or_else(too_big)?;
         }
         Self::new(matrices)
     }
@@ -275,40 +314,76 @@ pub struct Batch<'a, B> {
 ///
 /// Both buffers must stay alive, `src` unmodified and `dst` unread, until the work completes on
 /// `stream`: synchronize it, or order their reuse and release after this call on it.
-pub unsafe fn convert<T: DeviceCopy, U: DeviceCopy>(ctx: &DeviceContext, stream: &Stream, count: u32, src: Batch<'_, &DeviceBuffer<T>>, dst: Batch<'_, &mut DeviceBuffer<U>>) -> Result<()> {
+pub unsafe fn convert<T: DeviceCopy, U: DeviceCopy>(
+    ctx: &DeviceContext,
+    stream: &Stream,
+    count: u32,
+    src: Batch<'_, &DeviceBuffer<T>>,
+    dst: Batch<'_, &mut DeviceBuffer<U>>,
+) -> Result<()> {
     if count == 0 {
         return Err(Error::Invalid("convert needs at least one network"));
     }
     let (from, to) = (src.network.matrices(), dst.network.matrices());
     if from.len() != to.len() {
-        return Err(Error::Invalid("source and destination networks differ in matrix count"));
+        return Err(Error::Invalid(
+            "source and destination networks differ in matrix count",
+        ));
     }
     for (a, b) in from.iter().zip(to) {
         if (a.n, a.k) != (b.n, b.k) {
-            return Err(Error::Invalid("source and destination matrix shapes differ"));
+            return Err(Error::Invalid(
+                "source and destination matrix shapes differ",
+            ));
         }
         if !convertible(a.elem, b.elem) {
-            return Err(Error::Invalid("element types differ and are not a float pair with F32 or F16 on the higher-precision side"));
+            return Err(Error::Invalid(
+                "element types differ and are not a float pair with F32 or F16 on the higher-precision side",
+            ));
         }
         if matches!(b.elem, ElemType::F8E4M3 | ElemType::F8E5M2) && !b.layout.is_optimal() {
-            return Err(Error::Invalid("8-bit float matrices must be converted into an optimal layout"));
+            return Err(Error::Invalid(
+                "8-bit float matrices must be converted into an optimal layout",
+            ));
         }
         for m in [a, b] {
-            if (m.size as usize) < matrix_size(ctx, m.n, m.k, m.elem, m.layout, m.stride as usize)? {
-                return Err(Error::Invalid("a matrix is smaller than optixCoopVecMatrixComputeSize reports"));
+            if (m.size as usize) < matrix_size(ctx, m.n, m.k, m.elem, m.layout, m.stride as usize)?
+            {
+                return Err(Error::Invalid(
+                    "a matrix is smaller than optixCoopVecMatrixComputeSize reports",
+                ));
             }
         }
     }
-    let (src_lo, src_hi) = extent(src.network, src.buffer.cu_deviceptr(), src.buffer.num_bytes(), count, src.stride)?;
-    let (dst_lo, dst_hi) = extent(dst.network, dst.buffer.cu_deviceptr(), dst.buffer.num_bytes(), count, dst.stride)?;
+    let (src_lo, src_hi) = extent(
+        src.network,
+        src.buffer.cu_deviceptr(),
+        src.buffer.num_bytes(),
+        count,
+        src.stride,
+    )?;
+    let (dst_lo, dst_hi) = extent(
+        dst.network,
+        dst.buffer.cu_deviceptr(),
+        dst.buffer.num_bytes(),
+        count,
+        dst.stride,
+    )?;
     if src_lo < dst_hi && dst_lo < src_hi {
         return Err(Error::Invalid("source and destination networks overlap"));
     }
     let (mut src_desc, mut dst_desc) = (src.network.to_sys(), dst.network.to_sys());
     // Bounded by `from.len() == to.len()`, which `Network::new` built from a Vec; checked anyway.
-    let layers = u32::try_from(src_desc.len()).map_err(|_| Error::Invalid("too many network matrices"))?;
-    let src_net = sys::OptixNetworkDescription { layers: src_desc.as_mut_ptr(), numLayers: layers };
-    let dst_net = sys::OptixNetworkDescription { layers: dst_desc.as_mut_ptr(), numLayers: layers };
+    let layers =
+        u32::try_from(src_desc.len()).map_err(|_| Error::Invalid("too many network matrices"))?;
+    let src_net = sys::OptixNetworkDescription {
+        layers: src_desc.as_mut_ptr(),
+        numLayers: layers,
+    };
+    let dst_net = sys::OptixNetworkDescription {
+        layers: dst_desc.as_mut_ptr(),
+        numLayers: layers,
+    };
     ctx.cuda().bind_to_thread()?;
     // SAFETY: descriptions and the arrays they point at outlive the call; both device ranges were
     // checked to lie inside their buffers, aligned and disjoint; the buffers' lifetime on the
@@ -338,20 +413,35 @@ fn convertible(from: ElemType, to: ElemType) -> bool {
 }
 
 /// Device byte range `count` networks take in a buffer at `base` holding `len` bytes.
-fn extent(network: &Network, base: sys::CUdeviceptr, len: usize, count: u32, stride: usize) -> Result<(u64, u64)> {
+fn extent(
+    network: &Network,
+    base: sys::CUdeviceptr,
+    len: usize,
+    count: u32,
+    stride: usize,
+) -> Result<(u64, u64)> {
     if !base.is_multiple_of(MATRIX_ALIGN as u64) {
-        return Err(Error::Invalid("network buffer base is not MATRIX_ALIGN-aligned"));
+        return Err(Error::Invalid(
+            "network buffer base is not MATRIX_ALIGN-aligned",
+        ));
     }
     let span = if count > 1 {
         if stride < network.bytes() || !stride.is_multiple_of(MATRIX_ALIGN) {
-            return Err(Error::Invalid("network stride must be a multiple of MATRIX_ALIGN and at least Network::bytes"));
+            return Err(Error::Invalid(
+                "network stride must be a multiple of MATRIX_ALIGN and at least Network::bytes",
+            ));
         }
-        ((count - 1) as usize).checked_mul(stride).and_then(|s| s.checked_add(network.bytes())).ok_or(Error::Invalid("networks exceed the address space"))?
+        ((count - 1) as usize)
+            .checked_mul(stride)
+            .and_then(|s| s.checked_add(network.bytes()))
+            .ok_or(Error::Invalid("networks exceed the address space"))?
     } else {
         network.bytes()
     };
     if span > len {
-        return Err(Error::Invalid("networks extend past the end of their buffer"));
+        return Err(Error::Invalid(
+            "networks extend past the end of their buffer",
+        ));
     }
     Ok((base, base.saturating_add(span as u64)))
 }

@@ -273,7 +273,11 @@ pub(crate) fn check_status(call: &'static str, raw: cufile_sys::CUfileError_t) -
     if code.is_success() {
         Ok(())
     } else {
-        Err(Error::Status { call, code, cuda_err: raw.cu_err })
+        Err(Error::Status {
+            call,
+            code,
+            cuda_err: raw.cu_err,
+        })
     }
 }
 
@@ -439,7 +443,9 @@ mod tests {
         let err_os = decode_io_ret_with("cuFileRead", -1, || {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied)
         });
-        assert!(matches!(err_os, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied));
+        assert!(
+            matches!(err_os, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
 
         let err_cufile = decode_io_ret("cuFileWrite", -5020);
         assert!(matches!(
@@ -456,7 +462,10 @@ mod tests {
     #[test]
     fn t0_non_linux_gds_explicit_unsupported_never_downgrades() {
         assert!(matches!(version(), Err(Error::Unsupported(_))));
-        assert!(matches!(DriverSession::use_count(), Err(Error::Unsupported(_))));
+        assert!(matches!(
+            DriverSession::use_count(),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -465,7 +474,9 @@ mod tests {
         let ctx = Context::new(0).unwrap();
         let stream = ctx.new_stream().unwrap();
         let path = std::env::temp_dir().join("nv_rs_cufile_t2_roundtrip.bin");
-        let payload: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(17) & 0xff) as u8).collect();
+        let payload: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(17) & 0xff) as u8)
+            .collect();
 
         // Try GDS session first; under PosixFallback verify explicit fallback works regardless.
         let file = std::fs::OpenOptions::new()
@@ -492,10 +503,12 @@ mod tests {
         // Async stream-ordered path with reusable slot (both read_async and write_async).
         let async_file_buf = Arc::new(DeviceBuffer::<u8>::zeroed(&stream, payload.len()).unwrap());
         let mut slot = AsyncIoSlot::new(&ctx).unwrap();
-        fh.write_async(&stream, 4096, &src_dev, 0, payload.len(), &mut slot).unwrap();
+        fh.write_async(&stream, 4096, &src_dev, 0, payload.len(), &mut slot)
+            .unwrap();
         assert_eq!(slot.wait().unwrap(), payload.len());
 
-        fh.read_async(&stream, 4096, &async_file_buf, 0, payload.len(), &mut slot).unwrap();
+        fh.read_async(&stream, 4096, &async_file_buf, 0, payload.len(), &mut slot)
+            .unwrap();
         assert_eq!(slot.wait().unwrap(), payload.len());
         assert_eq!(async_file_buf.to_host_vec(&stream).unwrap(), payload);
 

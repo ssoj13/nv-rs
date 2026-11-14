@@ -12,8 +12,8 @@
 
 use cuda_core::{Context, DeviceBuffer, Stream};
 use optix::{
-    BuiltinIs, DeviceContext, HitGroup, LinkOptions, LogFn, Module, ModuleOptions, PayloadType, Pipeline, PipelineOptions, ProgramGroup, Programs, SbtRecord, Scratch,
-    ShaderBindingTable,
+    BuiltinIs, DeviceContext, HitGroup, LinkOptions, LogFn, Module, ModuleOptions, PayloadType,
+    Pipeline, PipelineOptions, ProgramGroup, Programs, SbtRecord, Scratch, ShaderBindingTable,
 };
 use std::sync::Arc;
 
@@ -61,7 +61,16 @@ pub struct Cfg {
 
 impl Default for Cfg {
     fn default() -> Self {
-        Self { single_gas: false, motion: false, omm: false, clusters: false, builtin: None, records: 1, link: LinkOptions::default(), validation: false }
+        Self {
+            single_gas: false,
+            motion: false,
+            omm: false,
+            clusters: false,
+            builtin: None,
+            records: 1,
+            link: LinkOptions::default(),
+            validation: false,
+        }
     }
 }
 
@@ -101,30 +110,56 @@ pub fn primitive_flag(p: optix::Primitive) -> u32 {
     use optix::Primitive::*;
     use optix::sys;
     (match p {
-        RoundQuadraticBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE,
-        RoundCubicBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE,
+        RoundQuadraticBspline => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE
+        }
+        RoundCubicBspline => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE
+        }
         RoundLinear => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_LINEAR,
         RoundCatmullRom => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM,
-        FlatQuadraticBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_FLAT_QUADRATIC_BSPLINE,
+        FlatQuadraticBspline => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_FLAT_QUADRATIC_BSPLINE
+        }
         Sphere => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE,
-        RoundCubicBezier => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER,
-        RoundQuadraticBsplineRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS,
-        RoundCubicBsplineRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE_ROCAPS,
-        RoundCatmullRomRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM_ROCAPS,
-        RoundCubicBezierRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER_ROCAPS,
+        RoundCubicBezier => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER
+        }
+        RoundQuadraticBsplineRocaps => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS
+        }
+        RoundCubicBsplineRocaps => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE_ROCAPS
+        }
+        RoundCatmullRomRocaps => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM_ROCAPS
+        }
+        RoundCubicBezierRocaps => {
+            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER_ROCAPS
+        }
         Triangle => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE,
     }) as u32
 }
 
 /// Raygen, miss and hit groups over `module` (hit group: the fixture's closest hit plus the
 /// built-in intersector `is`), each created with `payload` as its payload type.
-pub fn groups(ctx: &Arc<DeviceContext>, module: &Arc<Module>, is: Option<&Arc<Module>>, payload: Option<PayloadType<'_>>) -> [Arc<ProgramGroup>; 3] {
-    let raygen = ProgramGroup::new(ctx, Programs::Raygen(module, "__raygen__mask"), payload).expect("raygen");
-    let miss = ProgramGroup::new(ctx, Programs::Miss(module, "__miss__none"), payload).expect("miss");
+pub fn groups(
+    ctx: &Arc<DeviceContext>,
+    module: &Arc<Module>,
+    is: Option<&Arc<Module>>,
+    payload: Option<PayloadType<'_>>,
+) -> [Arc<ProgramGroup>; 3] {
+    let raygen = ProgramGroup::new(ctx, Programs::Raygen(module, "__raygen__mask"), payload)
+        .expect("raygen");
+    let miss =
+        ProgramGroup::new(ctx, Programs::Miss(module, "__miss__none"), payload).expect("miss");
     let ch = Some((module, "__closesthit__hit"));
     let hit_group = match is {
         Some(is) => HitGroup::builtin(ch, is),
-        None => HitGroup { closest_hit: ch, ..Default::default() },
+        None => HitGroup {
+            closest_hit: ch,
+            ..Default::default()
+        },
     };
     let hit = ProgramGroup::new(ctx, Programs::HitGroup(hit_group), payload).expect("hit group");
     [raygen, miss, hit]
@@ -133,8 +168,16 @@ pub fn groups(ctx: &Arc<DeviceContext>, module: &Arc<Module>, is: Option<&Arc<Mo
 /// An SBT with one raygen and miss record and `records` hit records of `groups`.
 pub fn sbt(stream: &Stream, groups: &[Arc<ProgramGroup>; 3], records: usize) -> ShaderBindingTable {
     let [raygen, miss, hit] = groups;
-    let hits: Vec<SbtRecord<u32>> = (0..records).map(|_| SbtRecord::new(hit, 0u32).expect("hit record")).collect();
-    ShaderBindingTable::new(stream, &SbtRecord::new(raygen, 0u32).expect("rg record"), &[SbtRecord::new(miss, 0u32).expect("miss record")], &hits).expect("sbt")
+    let hits: Vec<SbtRecord<u32>> = (0..records)
+        .map(|_| SbtRecord::new(hit, 0u32).expect("hit record"))
+        .collect();
+    ShaderBindingTable::new(
+        stream,
+        &SbtRecord::new(raygen, 0u32).expect("rg record"),
+        &[SbtRecord::new(miss, 0u32).expect("miss record")],
+        &hits,
+    )
+    .expect("sbt")
 }
 
 /// The rig for `cfg`, with an optional log sink on the context.
@@ -143,12 +186,23 @@ pub fn rig_with_log(cfg: Cfg, log: Option<Box<LogFn>>) -> Rig {
     let ctx = DeviceContext::new(&cuda, log, 4, cfg.validation).expect("OptiX device context");
     let opts = options(&cfg, 1);
     let (module, _log) = Module::new(&ctx, &ModuleOptions::default(), &opts, PTX).expect("module");
-    let is = cfg.builtin.map(|b| Module::builtin_intersection(&ctx, &ModuleOptions::default(), &opts, b).expect("built-in intersection module"));
+    let is = cfg.builtin.map(|b| {
+        Module::builtin_intersection(&ctx, &ModuleOptions::default(), &opts, b)
+            .expect("built-in intersection module")
+    });
     let groups = groups(&ctx, &module, is.as_ref(), None);
     let (pipeline, _log) = Pipeline::new(&ctx, &opts, cfg.link, &groups).expect("pipeline");
     let sbt = sbt(&stream, &groups, cfg.records);
     let scratch = Scratch::new(&stream);
-    Rig { stream, ctx, scratch, opts, groups, pipeline, sbt }
+    Rig {
+        stream,
+        ctx,
+        scratch,
+        opts,
+        groups,
+        pipeline,
+        sbt,
+    }
 }
 
 /// The rig for `cfg`.
@@ -158,17 +212,34 @@ pub fn rig(cfg: Cfg) -> Rig {
 
 /// The fixture's launch parameters for output `out` and traversable `handle`.
 pub fn params(out: &DeviceBuffer<u32>, handle: u64, width: u32, height: u32) -> Vec<u8> {
-    [out.cu_deviceptr().to_le_bytes().as_slice(), &handle.to_le_bytes(), &width.to_le_bytes(), &height.to_le_bytes()].concat()
+    [
+        out.cu_deviceptr().to_le_bytes().as_slice(),
+        &handle.to_le_bytes(),
+        &width.to_le_bytes(),
+        &height.to_le_bytes(),
+    ]
+    .concat()
 }
 
 /// Launches `pipeline` over `handle` (W x H) and returns the per-pixel hit flags.
-pub fn launch(stream: &Arc<Stream>, pipeline: &Pipeline, sbt: &ShaderBindingTable, handle: u64) -> Vec<u32> {
+pub fn launch(
+    stream: &Arc<Stream>,
+    pipeline: &Pipeline,
+    sbt: &ShaderBindingTable,
+    handle: u64,
+) -> Vec<u32> {
     try_launch(stream, pipeline, sbt, handle, W).expect("launch")
 }
 
 /// Like [`launch`], with the `width` field of the launch parameters set to `width` (the launch
 /// itself stays W x H; for bound-value checks) and the launch error returned.
-pub fn try_launch(stream: &Arc<Stream>, pipeline: &Pipeline, sbt: &ShaderBindingTable, handle: u64, width: u32) -> optix::Result<Vec<u32>> {
+pub fn try_launch(
+    stream: &Arc<Stream>,
+    pipeline: &Pipeline,
+    sbt: &ShaderBindingTable,
+    handle: u64,
+    width: u32,
+) -> optix::Result<Vec<u32>> {
     let out = DeviceBuffer::<u32>::from_host(stream, &[7; (W * H) as usize]).expect("out");
     let params = DeviceBuffer::from_host(stream, &params(&out, handle, width, H)).expect("params");
     // SAFETY: `params` matches the fixture's launch-parameter struct; `out` holds W*H u32 (a
@@ -190,10 +261,15 @@ impl Rig {
 /// (positive inside); panics when a pixel centre lies within [`MARGIN`] of the boundary.
 pub fn grid(d: impl Fn(f32, f32) -> f32) -> Vec<u32> {
     (0..H)
-        .flat_map(|j| (0..W).map(move |i| ((i as f32 + 0.5) / W as f32, (j as f32 + 0.5) / H as f32)))
+        .flat_map(|j| {
+            (0..W).map(move |i| ((i as f32 + 0.5) / W as f32, (j as f32 + 0.5) / H as f32))
+        })
         .map(|(x, y)| {
             let v = d(x, y);
-            assert!(v.abs() > MARGIN, "pixel centre ({x}, {y}) lies {v} from the analytic boundary");
+            assert!(
+                v.abs() > MARGIN,
+                "pixel centre ({x}, {y}) lies {v} from the analytic boundary"
+            );
             u32::from(v > 0.0)
         })
         .collect()
@@ -231,7 +307,10 @@ pub fn f16(x: f32) -> u16 {
         return sign;
     }
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    assert!((1..31).contains(&exp), "{x} is outside the normal half range");
+    assert!(
+        (1..31).contains(&exp),
+        "{x} is outside the normal half range"
+    );
     let mant = bits & 0x7f_ffff;
     let mut h = ((exp as u32) << 10) | (mant >> 13);
     let rest = mant & 0x1fff;
@@ -263,10 +342,23 @@ pub fn noisy(n: usize, base: f32, amp: f32, seed: u32) -> Vec<[f32; 4]> {
         s ^= s << 5;
         (s as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    (0..n).map(|_| [base + amp * rnd(), base + amp * rnd(), base + amp * rnd(), 1.0]).collect()
+    (0..n)
+        .map(|_| {
+            [
+                base + amp * rnd(),
+                base + amp * rnd(),
+                base + amp * rnd(),
+                1.0,
+            ]
+        })
+        .collect()
 }
 
 /// Mean absolute deviation of the RGB channels from `base`.
 pub fn deviation(px: &[[f32; 4]], base: f32) -> f32 {
-    px.iter().flat_map(|p| p[..3].iter()).map(|c| (c - base).abs()).sum::<f32>() / (px.len() * 3) as f32
+    px.iter()
+        .flat_map(|p| p[..3].iter())
+        .map(|c| (c - base).abs())
+        .sum::<f32>()
+        / (px.len() * 3) as f32
 }

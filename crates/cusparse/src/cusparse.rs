@@ -21,7 +21,10 @@ pub mod ops;
 
 pub use descr::{DnMatDescr, DnVecDescr, SpMatDescr, SparseFormat};
 pub use handle::Handle;
-pub use ops::{SpGemm, SpGemmAlg, SpMmAlg, SpMvAlg, SpSm, SpSmAlg, SpSv, SpSvAlg, spmm, spmm_buffer_size, spmv, spmv_buffer_size};
+pub use ops::{
+    SpGemm, SpGemmAlg, SpMmAlg, SpMvAlg, SpSm, SpSmAlg, SpSv, SpSvAlg, spmm, spmm_buffer_size,
+    spmv, spmv_buffer_size,
+};
 
 pub use cusparse_sys as sys;
 
@@ -54,13 +57,15 @@ impl Status {
     /// `CUSPARSE_STATUS_INTERNAL_ERROR`.
     pub const INTERNAL_ERROR: Self = Self(sys::cusparseStatus_t_CUSPARSE_STATUS_INTERNAL_ERROR);
     /// `CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED`.
-    pub const MATRIX_TYPE_NOT_SUPPORTED: Self = Self(sys::cusparseStatus_t_CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED);
+    pub const MATRIX_TYPE_NOT_SUPPORTED: Self =
+        Self(sys::cusparseStatus_t_CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED);
     /// `CUSPARSE_STATUS_ZERO_PIVOT`.
     pub const ZERO_PIVOT: Self = Self(sys::cusparseStatus_t_CUSPARSE_STATUS_ZERO_PIVOT);
     /// `CUSPARSE_STATUS_NOT_SUPPORTED`.
     pub const NOT_SUPPORTED: Self = Self(sys::cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED);
     /// `CUSPARSE_STATUS_INSUFFICIENT_RESOURCES`.
-    pub const INSUFFICIENT_RESOURCES: Self = Self(sys::cusparseStatus_t_CUSPARSE_STATUS_INSUFFICIENT_RESOURCES);
+    pub const INSUFFICIENT_RESOURCES: Self =
+        Self(sys::cusparseStatus_t_CUSPARSE_STATUS_INSUFFICIENT_RESOURCES);
 
     /// Human-readable status name if cuSPARSE is loaded, or a static fallback.
     pub fn name(self) -> &'static str {
@@ -145,7 +150,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Ensures the cuSPARSE shared library is loaded, mapping load errors into [`Error::Unavailable`].
 pub(crate) fn ensure_loaded() -> Result<()> {
-    sys::load().map(|_| ()).map_err(|e| Error::Unavailable(e.to_string()))
+    sys::load()
+        .map(|_| ())
+        .map_err(|e| Error::Unavailable(e.to_string()))
 }
 
 /// Maps a raw `cusparseStatus_t` into [`Result<()>`].
@@ -153,13 +160,20 @@ pub(crate) fn check(call: &'static str, code: sys::cusparseStatus_t) -> Result<(
     if code == sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Status { call, code: Status(code) })
+        Err(Error::Status {
+            call,
+            code: Status(code),
+        })
     }
 }
 
 /// Runs a cuSPARSE teardown call with `ctx` current; failures are recorded on `ctx` instead of
 /// panicking in `Drop`.
-pub(crate) fn teardown(ctx: &Context, call: &'static str, f: impl FnOnce() -> sys::cusparseStatus_t) {
+pub(crate) fn teardown(
+    ctx: &Context,
+    call: &'static str,
+    f: impl FnOnce() -> sys::cusparseStatus_t,
+) {
     if let Err(e) = ctx.bind_to_thread() {
         ctx.record_err(Err::<(), _>(e));
         return;
@@ -167,7 +181,9 @@ pub(crate) fn teardown(ctx: &Context, call: &'static str, f: impl FnOnce() -> sy
     if let Err(e) = check(call, f()) {
         // Record teardown failure as a CUDA invalid-value marker on the context without panicking.
         let _ = e;
-        ctx.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE)));
+        ctx.record_err(Err::<(), _>(DriverError(
+            cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
+        )));
     }
 }
 
@@ -377,7 +393,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty scratch workspace for operations on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buffer: None }
+        Self {
+            stream: stream.clone(),
+            buffer: None,
+        }
     }
 
     /// Current capacity in bytes.
@@ -395,24 +414,43 @@ impl Scratch {
     /// Verifies that `stream` matches the stream this scratch buffer was created for.
     /// Returns a device pointer (null if `required == 0` and no buffer is allocated yet) and the
     /// available byte capacity.
-    pub fn reserve_with_budget(&mut self, stream: &Stream, required: usize, budget: usize) -> Result<(*mut c_void, usize)> {
-        if stream.cu_stream() != self.stream.cu_stream() || !Arc::ptr_eq(stream.context(), self.stream.context()) {
-            return Err(Error::InvalidInput("scratch used on a different stream than it was created for"));
+    pub fn reserve_with_budget(
+        &mut self,
+        stream: &Stream,
+        required: usize,
+        budget: usize,
+    ) -> Result<(*mut c_void, usize)> {
+        if stream.cu_stream() != self.stream.cu_stream()
+            || !Arc::ptr_eq(stream.context(), self.stream.context())
+        {
+            return Err(Error::InvalidInput(
+                "scratch used on a different stream than it was created for",
+            ));
         }
         if required > budget {
-            return Err(Error::Budget { requested: required, available: budget });
+            return Err(Error::Budget {
+                requested: required,
+                available: budget,
+            });
         }
         if required == 0 {
-            let ptr = self.buffer.as_ref().map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
+            let ptr = self
+                .buffer
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
             return Ok((ptr, self.capacity()));
         }
         if self.capacity() < required {
             // Free previous buffer in stream order before allocating the larger one.
             self.buffer = None;
             // SAFETY: `required > 0`; `self.stream` matches `stream`; cuSPARSE writes scratch before reading it.
-            self.buffer = Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
+            self.buffer =
+                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
         }
-        let buf = self.buffer.as_ref().ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
+        let buf = self
+            .buffer
+            .as_ref()
+            .ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
         Ok((buf.cu_deviceptr() as *mut c_void, buf.len()))
     }
 }
@@ -432,12 +470,18 @@ mod tests {
             s.name()
         );
         assert_eq!(Status::SUCCESS.name(), "CUSPARSE_STATUS_SUCCESS");
-        assert_eq!(Status::INVALID_VALUE.name(), "CUSPARSE_STATUS_INVALID_VALUE");
+        assert_eq!(
+            Status::INVALID_VALUE.name(),
+            "CUSPARSE_STATUS_INVALID_VALUE"
+        );
     }
 
     #[test]
     fn budget_error_formats_requested_and_available() {
-        let err = Error::Budget { requested: 4096, available: 1024 };
+        let err = Error::Budget {
+            requested: 4096,
+            available: 1024,
+        };
         let msg = err.to_string();
         assert!(msg.contains("4096") && msg.contains("1024"), "{msg}");
     }

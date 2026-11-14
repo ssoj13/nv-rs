@@ -4,7 +4,10 @@ use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 const SPEC: LibSpec = LibSpec {
     name: "cupti",
     headers: &["cupti.h"],
-    sdks: &[Sdk::CudaToolkitSubdir("extras/CUPTI/include"), Sdk::CudaToolkit],
+    sdks: &[
+        Sdk::CudaToolkitSubdir("extras/CUPTI/include"),
+        Sdk::CudaToolkit,
+    ],
     allow_fn: &["^cupti.*"],
     allow_type: &["^CUpti.*"],
     allow_var: &["^CUPTI_.*"],

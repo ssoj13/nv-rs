@@ -13,14 +13,28 @@ use std::ffi::{c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 // Generated code: lint levels differ per header.
-#[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, missing_docs, unnecessary_transmutes, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code,
+    missing_docs,
+    unnecessary_transmutes,
+    clippy::all,
+    clippy::undocumented_unsafe_blocks
+)]
 mod types {
     include!(concat!(env!("OUT_DIR"), "/optix_types.rs"));
 }
 pub use types::*;
 
 /// Where OptiX ships: inside the display driver.
-pub const DLL: DllSpec = DllSpec { lib: "optix", group: Group::DriverStore, windows: &["nvoptix.dll"], linux: &["libnvoptix.so.1"] };
+pub const DLL: DllSpec = DllSpec {
+    lib: "optix",
+    group: Group::DriverStore,
+    windows: &["nvoptix.dll"],
+    linux: &["libnvoptix.so.1"],
+};
 
 /// Entry points (function-table fields) and header sha256 (coverage evidence).
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/optix_inventory.json"));
@@ -32,7 +46,14 @@ pub struct OptixApi {
     pub table: OptixFunctionTable,
 }
 
-type QueryFn = unsafe extern "C" fn(c_int, c_uint, *mut c_void, *mut *const c_void, *mut c_void, usize) -> OptixResult;
+type QueryFn = unsafe extern "C" fn(
+    c_int,
+    c_uint,
+    *mut c_void,
+    *mut *const c_void,
+    *mut c_void,
+    usize,
+) -> OptixResult;
 
 fn loaded() -> &'static Result<Loaded<OptixApi>, LoadError> {
     static API: OnceLock<Result<Loaded<OptixApi>, LoadError>> = OnceLock::new();
@@ -43,7 +64,9 @@ fn open(path: &std::path::Path) -> Result<OptixApi, String> {
     // SAFETY: loading the driver's OptiX library runs only its initialisers.
     let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
     // SAFETY: `optixQueryFunctionTable` has this signature in every OptiX ABI (optix_stubs.h).
-    let query: QueryFn = unsafe { lib.get::<QueryFn>(b"optixQueryFunctionTable\0") }.map(|s| *s).map_err(|e| e.to_string())?;
+    let query: QueryFn = unsafe { lib.get::<QueryFn>(b"optixQueryFunctionTable\0") }
+        .map(|s| *s)
+        .map_err(|e| e.to_string())?;
     let mut table = OptixFunctionTable::default();
     // SAFETY: `table` is a writable buffer of exactly the size passed; no options are given.
     let r = unsafe {
@@ -57,7 +80,9 @@ fn open(path: &std::path::Path) -> Result<OptixApi, String> {
         )
     };
     if r != OptixResult_OPTIX_SUCCESS {
-        return Err(format!("optixQueryFunctionTable(ABI {OPTIX_ABI_VERSION}) returned {r}"));
+        return Err(format!(
+            "optixQueryFunctionTable(ABI {OPTIX_ABI_VERSION}) returned {r}"
+        ));
     }
     Ok(OptixApi { _lib: lib, table })
 }
@@ -78,8 +103,17 @@ mod tests {
 
     #[test]
     fn inventory_lists_table_entry_points() {
-        for f in ["optixDeviceContextCreate", "optixModuleCreate", "optixPipelineCreate", "optixLaunch", "optixAccelBuild"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "optixDeviceContextCreate",
+            "optixModuleCreate",
+            "optixPipelineCreate",
+            "optixLaunch",
+            "optixAccelBuild",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

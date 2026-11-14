@@ -10,7 +10,7 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread::Thread;
 
 use cuda_core::Context as CudaContext;
-use cuda_ext::TextureDesc;
+use cuda_core_ext::TextureDesc;
 use nv_wgpu::{
     Error, InteropBackend, InteropContext, SharedBufferDescriptor, SharedTextureDescriptor,
     aligned_row_pitch, aligned_staging_bytes,
@@ -287,7 +287,8 @@ fn run_buffer_roundtrip(ctx: &InteropContext) {
 
     // 2. wgpu writes pattern_b -> releases & signals sem=2 -> CUDA waits on sem=2 & reads back
     let pattern_b: Vec<u8> = (0..len).map(|i| ((i * 31 + 3) & 0xff) as u8).collect();
-    ctx.queue().write_buffer(shared.wgpu_buffer(), 0, &pattern_b);
+    ctx.queue()
+        .write_buffer(shared.wgpu_buffer(), 0, &pattern_b);
     ctx.queue().submit(std::iter::empty());
     shared
         .release_to_cuda(ctx.queue(), None, Some((&sem, 2)))
@@ -336,9 +337,7 @@ fn run_texture_roundtrip(ctx: &InteropContext) {
         cubemap: false,
         initial_state: wgpu::TextureUses::STORAGE_READ_WRITE,
     };
-    let shared_tex = ctx
-        .create_texture(&desc)
-        .expect("create shared 2D texture");
+    let shared_tex = ctx.create_texture(&desc).expect("create shared 2D texture");
     let _tex_obj = shared_tex
         .cuda_texture_object(TextureDesc::default())
         .expect("cuda texture object");
@@ -372,7 +371,9 @@ fn run_texture_roundtrip(ctx: &InteropContext) {
         readback_texture_via_staging(ctx, shared_tex.wgpu_texture(), format, width, height);
     assert_eq!(got_wgpu, src_pixels, "wgpu must observe CUDA array upload");
 
-    let next_pixels: Vec<u8> = (0..byte_len).map(|i| ((i * 23 + 13) & 0xff) as u8).collect();
+    let next_pixels: Vec<u8> = (0..byte_len)
+        .map(|i| ((i * 23 + 13) & 0xff) as u8)
+        .collect();
     upload_texture_via_staging(
         ctx,
         shared_tex.wgpu_texture(),

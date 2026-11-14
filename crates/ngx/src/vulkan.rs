@@ -1,8 +1,9 @@
 //! Safe Vulkan RAII wrappers for NGX (`NgxVulkan`, `FeatureHandle`).
 //!
-//! **What.** Manages the NGX Vulkan session lifecycle (`NVSDK_NGX_VULKAN_Init_with_ProjectID` /
-//! `NVSDK_NGX_VULKAN_Shutdown1`), parameter bag allocation, scratch-buffer sizing, and feature
-//! creation/evaluation/release (`CreateFeature` / `EvaluateFeature_C` / `ReleaseFeature`).
+//! **What.** Manages the NGX Vulkan session lifecycle (`NVSDK_NGX_VULKAN_Init` /
+//! `NVSDK_NGX_VULKAN_Init_with_ProjectID` / `NVSDK_NGX_VULKAN_Shutdown1`), parameter bag allocation,
+//! scratch-buffer sizing, and feature creation/evaluation/release (`CreateFeature` /
+//! `EvaluateFeature_C` / `ReleaseFeature`).
 //! **Why.** Guarantees deterministic teardown order via `Arc<VulkanSession>`: every
 //! [`Parameters`] and [`FeatureHandle`] holds a reference to the session so `Shutdown1` never
 //! runs while features or parameter bags are still alive.
@@ -126,65 +127,88 @@ impl NgxVulkan {
     ) -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
-            if handles.instance.is_null()
-                || handles.physical_device.is_null()
-                || handles.device.is_null()
-                || handles.get_instance_proc_addr.is_null()
-                || handles.get_device_proc_addr.is_null()
-            {
-                return Err(Error::InvalidArgument(
-                    "VulkanDeviceHandles must not contain null pointers",
-                ));
-            }
-
-            let wide_path: Vec<u16> = app_data_path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
             let engine_version_ptr = project_id
                 .engine_version_cstr()
                 .map_or(c"".as_ptr(), |c| c.as_ptr());
-
-            let vk_instance = handles.instance.cast::<ngx_sys::VkInstance_T>();
-            let vk_pd = handles
-                .physical_device
-                .cast::<ngx_sys::VkPhysicalDevice_T>();
-            let vk_device = handles.device.cast::<ngx_sys::VkDevice_T>();
-            // SAFETY: Caller guarantees `get_instance_proc_addr` is a valid non-null
-            // `PFN_vkGetInstanceProcAddr` function pointer.
-            let gipa: ngx_sys::PFN_vkGetInstanceProcAddr =
-                unsafe { std::mem::transmute(handles.get_instance_proc_addr) };
-            // SAFETY: Caller guarantees `get_device_proc_addr` is a valid non-null
-            // `PFN_vkGetDeviceProcAddr` function pointer.
-            let gdpa: ngx_sys::PFN_vkGetDeviceProcAddr =
-                unsafe { std::mem::transmute(handles.get_device_proc_addr) };
-
-            // SAFETY: All pointers and C strings are valid for the duration of the call;
+            // SAFETY: Caller guarantees `handles` contains live Vulkan handles and valid loader
+            // function pointers; `project_id` C strings and `wide_path` outlive the FFI call.
             // `engineType` is `NVSDK_NGX_ENGINE_TYPE_CUSTOM` per PLAN D13.
-            let rc = unsafe {
-                ngx_sys::NVSDK_NGX_VULKAN_Init_with_ProjectID(
-                    project_id.guid_cstr().as_ptr(),
-                    ngx_sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                    engine_version_ptr,
-                    wide_path.as_ptr(),
-                    vk_instance,
-                    vk_pd,
-                    vk_device,
-                    gipa,
-                    gdpa,
-                    std::ptr::null(),
-                    ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
+            unsafe {
+                init_vulkan_session(
+                    app_data_path,
+                    handles,
+                    "NVSDK_NGX_VULKAN_Init_with_ProjectID",
+                    |wide_path, h| {
+                        ngx_sys::NVSDK_NGX_VULKAN_Init_with_ProjectID(
+                            project_id.guid_cstr().as_ptr(),
+                            ngx_sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                            engine_version_ptr,
+                            wide_path,
+                            h.instance,
+                            h.physical_device,
+                            h.device,
+                            h.gipa,
+                            h.gdpa,
+                            std::ptr::null(),
+                            ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
+                        )
+                    },
                 )
-            };
-            check("NVSDK_NGX_VULKAN_Init_with_ProjectID", rc)?;
-            Ok(Self {
-                session: Arc::new(VulkanSession { device: vk_device }),
-            })
+            }
         }
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (project_id, app_data_path, handles);
+            Err(Error::Unsupported(
+                "NGX is only supported on Windows".into(),
+            ))
+        }
+    }
+
+    /// Initializes NGX on a Vulkan device using an NVIDIA-issued `ApplicationId`
+    /// (`NVSDK_NGX_VULKAN_Init`).
+    ///
+    /// Prefer [`NgxVulkan::init`] with a [`ProjectId`] when no NVIDIA-issued application ID is
+    /// required.
+    ///
+    /// # Safety
+    ///
+    /// `handles` must contain live, valid Vulkan handles (`VkInstance`, `VkPhysicalDevice`,
+    /// `VkDevice`) and valid `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` function pointers
+    /// that outlive the returned [`NgxVulkan`] session and all derived handles.
+    pub unsafe fn init_with_app_id(
+        app_id: u64,
+        app_data_path: &Path,
+        handles: VulkanDeviceHandles,
+    ) -> Result<Self> {
+        #[cfg(target_os = "windows")]
+        {
+            // SAFETY: Caller guarantees `handles` contains live Vulkan handles and valid loader
+            // function pointers; `wide_path` outlives the FFI call.
+            unsafe {
+                init_vulkan_session(
+                    app_data_path,
+                    handles,
+                    "NVSDK_NGX_VULKAN_Init",
+                    |wide_path, h| {
+                        ngx_sys::NVSDK_NGX_VULKAN_Init(
+                            app_id as std::os::raw::c_ulonglong,
+                            wide_path,
+                            h.instance,
+                            h.physical_device,
+                            h.device,
+                            h.gipa,
+                            h.gdpa,
+                            std::ptr::null(),
+                            ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
+                        )
+                    },
+                )
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (app_id, app_data_path, handles);
             Err(Error::Unsupported(
                 "NGX is only supported on Windows".into(),
             ))
@@ -356,6 +380,78 @@ impl FeatureHandle {
             ))
         }
     }
+}
+
+/// Validated and typed Vulkan handles ready for NGX initialization FFI calls.
+#[cfg(target_os = "windows")]
+struct PreparedVulkanHandles {
+    instance: ngx_sys::VkInstance,
+    physical_device: ngx_sys::VkPhysicalDevice,
+    device: ngx_sys::VkDevice,
+    gipa: ngx_sys::PFN_vkGetInstanceProcAddr,
+    gdpa: ngx_sys::PFN_vkGetDeviceProcAddr,
+}
+
+/// Validates `handles`, encodes `app_data_path` as NUL-terminated UTF-16, invokes `init_fn`,
+/// and wraps the resulting `VkDevice` in an RAII [`NgxVulkan`] session.
+///
+/// # Safety
+///
+/// Caller must uphold the same Vulkan handle and loader pointer lifetime guarantees as
+/// [`NgxVulkan::init`] and [`NgxVulkan::init_with_app_id`].
+#[cfg(target_os = "windows")]
+unsafe fn init_vulkan_session(
+    app_data_path: &Path,
+    handles: VulkanDeviceHandles,
+    call_name: &'static str,
+    init_fn: impl FnOnce(*const u16, &PreparedVulkanHandles) -> ngx_sys::NVSDK_NGX_Result,
+) -> Result<NgxVulkan> {
+    if handles.instance.is_null()
+        || handles.physical_device.is_null()
+        || handles.device.is_null()
+        || handles.get_instance_proc_addr.is_null()
+        || handles.get_device_proc_addr.is_null()
+    {
+        return Err(Error::InvalidArgument(
+            "VulkanDeviceHandles must not contain null pointers",
+        ));
+    }
+
+    let wide_path: Vec<u16> = app_data_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let prepared = PreparedVulkanHandles {
+        instance: handles.instance.cast::<ngx_sys::VkInstance_T>(),
+        physical_device: handles
+            .physical_device
+            .cast::<ngx_sys::VkPhysicalDevice_T>(),
+        device: handles.device.cast::<ngx_sys::VkDevice_T>(),
+        // SAFETY: Caller guarantees `get_instance_proc_addr` is a valid non-null
+        // `PFN_vkGetInstanceProcAddr` function pointer.
+        gipa: unsafe {
+            std::mem::transmute::<*const c_void, ngx_sys::PFN_vkGetInstanceProcAddr>(
+                handles.get_instance_proc_addr,
+            )
+        },
+        // SAFETY: Caller guarantees `get_device_proc_addr` is a valid non-null
+        // `PFN_vkGetDeviceProcAddr` function pointer.
+        gdpa: unsafe {
+            std::mem::transmute::<*const c_void, ngx_sys::PFN_vkGetDeviceProcAddr>(
+                handles.get_device_proc_addr,
+            )
+        },
+    };
+
+    let rc = init_fn(wide_path.as_ptr(), &prepared);
+    check(call_name, rc)?;
+    Ok(NgxVulkan {
+        session: Arc::new(VulkanSession {
+            device: prepared.device,
+        }),
+    })
 }
 
 /// Converts a C string pointer array `(ptr, count)` returned by NGX into `Vec<String>`.

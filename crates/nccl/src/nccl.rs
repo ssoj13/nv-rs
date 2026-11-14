@@ -19,7 +19,7 @@ use std::sync::Arc;
 use cuda_core::{Context, DeviceBuffer, DeviceBufferView, Stream};
 use thiserror::Error;
 
-pub use comm::{group, group_end, group_start, AsyncState, Comm, GroupGuard, UniqueId};
+pub use comm::{AsyncState, Comm, GroupGuard, UniqueId, group, group_end, group_start};
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -323,7 +323,10 @@ mod tests {
         assert!(check("ok", 0).is_ok());
         assert!(matches!(
             check("ncclAllReduce", NcclStatus::INVALID_ARGUMENT.0),
-            Err(Error::Status { call: "ncclAllReduce", code: NcclStatus::INVALID_ARGUMENT })
+            Err(Error::Status {
+                call: "ncclAllReduce",
+                code: NcclStatus::INVALID_ARGUMENT
+            })
         ));
 
         assert_eq!(DataType::I8.to_raw(), 0);
@@ -366,12 +369,20 @@ mod tests {
         .unwrap();
         stream.synchronize().unwrap();
         assert_eq!(comm.async_error().unwrap(), AsyncState::Ok);
-        assert_eq!(recv.to_host_vec(&stream).unwrap(), vec![1.5f32, 2.5, 3.5, 4.5]);
+        assert_eq!(
+            recv.to_host_vec(&stream).unwrap(),
+            vec![1.5f32, 2.5, 3.5, 4.5]
+        );
     }
 
     #[test]
     #[ignore = "requires 2+ Linux CUDA GPUs and libnccl"]
     fn t3_multi_rank_all_reduce() {
+        let count = Context::device_count().unwrap();
+        if count < 2 {
+            eprintln!("skipping t3_multi_rank_all_reduce: requires >= 2 GPUs, found {count}");
+            return;
+        }
         let ctx0 = Context::new(0).unwrap();
         let ctx1 = Context::new(1).unwrap();
         let s0 = ctx0.new_stream().unwrap();

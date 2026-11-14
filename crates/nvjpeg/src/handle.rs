@@ -5,7 +5,8 @@
 //! `Arc<Handle>` so the library handle always outlives them.
 
 use crate::{
-    Backend, ChromaSubsampling, Error, ExifOrientation, ImageInfo, ImagePlanesMut, JpegEncoding, OutputFormat, Result, check, ensure_loaded, sys,
+    Backend, ChromaSubsampling, Error, ExifOrientation, ImageInfo, ImagePlanesMut, JpegEncoding,
+    OutputFormat, Result, check, ensure_loaded, sys,
 };
 use cuda_core::{Context, DriverError, Stream};
 use std::ffi::c_int;
@@ -29,8 +30,13 @@ impl Handle {
         cuda.bind_to_thread()?;
         let mut raw: sys::nvjpegHandle_t = std::ptr::null_mut();
         // SAFETY: `cuda` is bound and `raw` is a valid out-pointer.
-        check("nvjpegCreateSimple", unsafe { sys::nvjpegCreateSimple(&mut raw) })?;
-        Ok(Arc::new(Self { raw, cuda: cuda.clone() }))
+        check("nvjpegCreateSimple", unsafe {
+            sys::nvjpegCreateSimple(&mut raw)
+        })?;
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+        }))
     }
 
     /// Creates a handle with an explicit [`Backend`] and `flags` (`nvjpegCreateEx`).
@@ -40,9 +46,18 @@ impl Handle {
         let mut raw: sys::nvjpegHandle_t = std::ptr::null_mut();
         // SAFETY: `cuda` is bound; null allocators select nvJPEG's default CUDA allocators.
         check("nvjpegCreateEx", unsafe {
-            sys::nvjpegCreateEx(backend.to_sys(), std::ptr::null_mut(), std::ptr::null_mut(), flags, &mut raw)
+            sys::nvjpegCreateEx(
+                backend.to_sys(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                flags,
+                &mut raw,
+            )
         })?;
-        Ok(Arc::new(Self { raw, cuda: cuda.clone() }))
+        Ok(Arc::new(Self {
+            raw,
+            cuda: cuda.clone(),
+        }))
     }
 
     /// Returns the raw `nvjpegHandle_t`.
@@ -78,19 +93,37 @@ impl Handle {
             )
         })?;
         Ok(ImageInfo {
-            components: usize::try_from(n_comp).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative component count"))?,
+            components: usize::try_from(n_comp).map_err(|_| {
+                Error::InvalidInput("nvjpegGetImageInfo returned negative component count")
+            })?,
             subsampling: ChromaSubsampling::from_sys(subsampling),
             widths: [
-                u32::try_from(widths[0]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative width"))?,
-                u32::try_from(widths[1]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative width"))?,
-                u32::try_from(widths[2]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative width"))?,
-                u32::try_from(widths[3]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative width"))?,
+                u32::try_from(widths[0]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative width")
+                })?,
+                u32::try_from(widths[1]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative width")
+                })?,
+                u32::try_from(widths[2]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative width")
+                })?,
+                u32::try_from(widths[3]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative width")
+                })?,
             ],
             heights: [
-                u32::try_from(heights[0]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative height"))?,
-                u32::try_from(heights[1]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative height"))?,
-                u32::try_from(heights[2]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative height"))?,
-                u32::try_from(heights[3]).map_err(|_| Error::InvalidInput("nvjpegGetImageInfo returned negative height"))?,
+                u32::try_from(heights[0]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative height")
+                })?,
+                u32::try_from(heights[1]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative height")
+                })?,
+                u32::try_from(heights[2]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative height")
+                })?,
+                u32::try_from(heights[3]).map_err(|_| {
+                    Error::InvalidInput("nvjpegGetImageInfo returned negative height")
+                })?,
             ],
         })
     }
@@ -98,7 +131,9 @@ impl Handle {
     /// Records a teardown error on the CUDA context during `Drop`.
     pub(crate) fn record_drop_err(&self, code: sys::nvjpegStatus_t) {
         if code != sys::nvjpegStatus_t_NVJPEG_STATUS_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+            self.cuda.record_err(Err::<(), _>(DriverError(
+                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+            )));
         }
     }
 }
@@ -129,8 +164,13 @@ impl PinnedBuffer {
     pub fn new(handle: &Arc<Handle>) -> Result<Arc<Self>> {
         let mut raw: sys::nvjpegBufferPinned_t = std::ptr::null_mut();
         // SAFETY: `handle` is live; null allocator uses default pinned allocator.
-        check("nvjpegBufferPinnedCreate", unsafe { sys::nvjpegBufferPinnedCreate(handle.raw(), std::ptr::null_mut(), &mut raw) })?;
-        Ok(Arc::new(Self { raw: Mutex::new(raw), handle: handle.clone() }))
+        check("nvjpegBufferPinnedCreate", unsafe {
+            sys::nvjpegBufferPinnedCreate(handle.raw(), std::ptr::null_mut(), &mut raw)
+        })?;
+        Ok(Arc::new(Self {
+            raw: Mutex::new(raw),
+            handle: handle.clone(),
+        }))
     }
 
     /// Pre-allocates or resizes the pinned buffer to `size` bytes (`nvjpegBufferPinnedResize`).
@@ -138,7 +178,9 @@ impl PinnedBuffer {
         self.handle.cuda().bind_to_thread()?;
         let raw = self.raw.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context.
-        check("nvjpegBufferPinnedResize", unsafe { sys::nvjpegBufferPinnedResize(*raw, size, stream.cu_stream()) })
+        check("nvjpegBufferPinnedResize", unsafe {
+            sys::nvjpegBufferPinnedResize(*raw, size, stream.cu_stream())
+        })
     }
 
     pub(crate) fn raw(&self) -> sys::nvjpegBufferPinned_t {
@@ -173,8 +215,13 @@ impl NvjpegDeviceBuffer {
     pub fn new(handle: &Arc<Handle>) -> Result<Arc<Self>> {
         let mut raw: sys::nvjpegBufferDevice_t = std::ptr::null_mut();
         // SAFETY: `handle` is live; null allocator uses default device allocator.
-        check("nvjpegBufferDeviceCreate", unsafe { sys::nvjpegBufferDeviceCreate(handle.raw(), std::ptr::null_mut(), &mut raw) })?;
-        Ok(Arc::new(Self { raw: Mutex::new(raw), handle: handle.clone() }))
+        check("nvjpegBufferDeviceCreate", unsafe {
+            sys::nvjpegBufferDeviceCreate(handle.raw(), std::ptr::null_mut(), &mut raw)
+        })?;
+        Ok(Arc::new(Self {
+            raw: Mutex::new(raw),
+            handle: handle.clone(),
+        }))
     }
 
     /// Pre-allocates or resizes the device buffer to `size` bytes (`nvjpegBufferDeviceResize`).
@@ -182,7 +229,9 @@ impl NvjpegDeviceBuffer {
         self.handle.cuda().bind_to_thread()?;
         let raw = self.raw.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context.
-        check("nvjpegBufferDeviceResize", unsafe { sys::nvjpegBufferDeviceResize(*raw, size, stream.cu_stream()) })
+        check("nvjpegBufferDeviceResize", unsafe {
+            sys::nvjpegBufferDeviceResize(*raw, size, stream.cu_stream())
+        })
     }
 
     pub(crate) fn raw(&self) -> sys::nvjpegBufferDevice_t {
@@ -218,8 +267,13 @@ impl JpegDecoder {
         handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegJpegDecoder_t = std::ptr::null_mut();
         // SAFETY: `handle` is live on the bound CUDA context and `raw` is a valid out-pointer.
-        check("nvjpegDecoderCreate", unsafe { sys::nvjpegDecoderCreate(handle.raw(), backend.to_sys(), &mut raw) })?;
-        Ok(Arc::new(Self { raw, handle: handle.clone() }))
+        check("nvjpegDecoderCreate", unsafe {
+            sys::nvjpegDecoderCreate(handle.raw(), backend.to_sys(), &mut raw)
+        })?;
+        Ok(Arc::new(Self {
+            raw,
+            handle: handle.clone(),
+        }))
     }
 
     pub(crate) fn raw(&self) -> sys::nvjpegJpegDecoder_t {
@@ -256,14 +310,22 @@ impl DecodeParams {
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
         let mut raw: sys::nvjpegDecodeParams_t = std::ptr::null_mut();
         // SAFETY: `handle` is live and `raw` is a valid out-pointer.
-        check("nvjpegDecodeParamsCreate", unsafe { sys::nvjpegDecodeParamsCreate(handle.raw(), &mut raw) })?;
-        Ok(Self { raw, handle: handle.clone(), output_format: None })
+        check("nvjpegDecodeParamsCreate", unsafe {
+            sys::nvjpegDecodeParamsCreate(handle.raw(), &mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            handle: handle.clone(),
+            output_format: None,
+        })
     }
 
     /// Sets the target output pixel format (`nvjpegDecodeParamsSetOutputFormat`).
     pub fn set_output_format(&mut self, format: OutputFormat) -> Result<()> {
         // SAFETY: `self.raw` is live and `format.to_sys()` is a valid `nvjpegOutputFormat_t`.
-        check("nvjpegDecodeParamsSetOutputFormat", unsafe { sys::nvjpegDecodeParamsSetOutputFormat(self.raw, format.to_sys()) })?;
+        check("nvjpegDecodeParamsSetOutputFormat", unsafe {
+            sys::nvjpegDecodeParamsSetOutputFormat(self.raw, format.to_sys())
+        })?;
         self.output_format = Some(format);
         Ok(())
     }
@@ -300,8 +362,16 @@ impl JpegState {
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
         let mut raw: sys::nvjpegJpegState_t = std::ptr::null_mut();
         // SAFETY: `handle` is live and `raw` is a valid out-pointer.
-        check("nvjpegJpegStateCreate", unsafe { sys::nvjpegJpegStateCreate(handle.raw(), &mut raw) })?;
-        Ok(Self { raw, handle: handle.clone(), decoder: None, _pinned: None, _device: None })
+        check("nvjpegJpegStateCreate", unsafe {
+            sys::nvjpegJpegStateCreate(handle.raw(), &mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            handle: handle.clone(),
+            decoder: None,
+            _pinned: None,
+            _device: None,
+        })
     }
 
     /// Creates a decoupled v2 decoder state (`nvjpegDecoderStateCreate`) that supports
@@ -309,18 +379,30 @@ impl JpegState {
     pub fn with_decoder(decoder: &Arc<JpegDecoder>) -> Result<Self> {
         let mut raw: sys::nvjpegJpegState_t = std::ptr::null_mut();
         // SAFETY: `decoder` and its owning `handle` are live and `raw` is a valid out-pointer.
-        check("nvjpegDecoderStateCreate", unsafe { sys::nvjpegDecoderStateCreate(decoder.handle().raw(), decoder.raw(), &mut raw) })?;
-        Ok(Self { raw, handle: decoder.handle().clone(), decoder: Some(decoder.clone()), _pinned: None, _device: None })
+        check("nvjpegDecoderStateCreate", unsafe {
+            sys::nvjpegDecoderStateCreate(decoder.handle().raw(), decoder.raw(), &mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            handle: decoder.handle().clone(),
+            decoder: Some(decoder.clone()),
+            _pinned: None,
+            _device: None,
+        })
     }
 
     /// Attaches a reusable pinned buffer (`nvjpegStateAttachPinnedBuffer`) to a decoder-bound
     /// state and retains an `Arc` so the buffer cannot be dropped while attached.
     pub fn attach_pinned(&mut self, buf: &Arc<PinnedBuffer>) -> Result<()> {
         if self.decoder.is_none() {
-            return Err(Error::InvalidInput("attach_pinned requires a JpegState created with JpegState::with_decoder"));
+            return Err(Error::InvalidInput(
+                "attach_pinned requires a JpegState created with JpegState::with_decoder",
+            ));
         }
         // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong to live `nvjpegHandle_t`.
-        check("nvjpegStateAttachPinnedBuffer", unsafe { sys::nvjpegStateAttachPinnedBuffer(self.raw, buf.raw()) })?;
+        check("nvjpegStateAttachPinnedBuffer", unsafe {
+            sys::nvjpegStateAttachPinnedBuffer(self.raw, buf.raw())
+        })?;
         self._pinned = Some(buf.clone());
         Ok(())
     }
@@ -329,18 +411,30 @@ impl JpegState {
     /// state and retains an `Arc` so the buffer cannot be dropped while attached.
     pub fn attach_device(&mut self, buf: &Arc<NvjpegDeviceBuffer>) -> Result<()> {
         if self.decoder.is_none() {
-            return Err(Error::InvalidInput("attach_device requires a JpegState created with JpegState::with_decoder"));
+            return Err(Error::InvalidInput(
+                "attach_device requires a JpegState created with JpegState::with_decoder",
+            ));
         }
         // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong to live `nvjpegHandle_t`.
-        check("nvjpegStateAttachDeviceBuffer", unsafe { sys::nvjpegStateAttachDeviceBuffer(self.raw, buf.raw()) })?;
+        check("nvjpegStateAttachDeviceBuffer", unsafe {
+            sys::nvjpegStateAttachDeviceBuffer(self.raw, buf.raw())
+        })?;
         self._device = Some(buf.clone());
         Ok(())
     }
 
     /// Decodes a single JPEG bitstream into `dst` on `stream` (`nvjpegDecode`).
-    pub fn decode(&mut self, data: &[u8], format: OutputFormat, dst: &mut ImagePlanesMut<'_>, stream: &Stream) -> Result<()> {
+    pub fn decode(
+        &mut self,
+        data: &[u8],
+        format: OutputFormat,
+        dst: &mut ImagePlanesMut<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         if self.decoder.is_some() {
-            return Err(Error::InvalidInput("use decode_jpeg for a decoder-bound JpegState"));
+            return Err(Error::InvalidInput(
+                "use decode_jpeg for a decoder-bound JpegState",
+            ));
         }
         if data.is_empty() {
             return Err(Error::InvalidInput("JPEG bitstream is empty"));
@@ -350,23 +444,46 @@ impl JpegState {
         // SAFETY: `data` is valid for `data.len()` bytes, `dst` has validated device plane pointers
         // matching `format`, and `stream` is valid on the bound context.
         check("nvjpegDecode", unsafe {
-            sys::nvjpegDecode(self.handle.raw(), self.raw, data.as_ptr(), data.len(), format.to_sys(), dst.as_mut_raw(), stream.cu_stream())
+            sys::nvjpegDecode(
+                self.handle.raw(),
+                self.raw,
+                data.as_ptr(),
+                data.len(),
+                format.to_sys(),
+                dst.as_mut_raw(),
+                stream.cu_stream(),
+            )
         })
     }
 
     /// Decodes a parsed [`JpegStream`] using the decoupled v2 decoder (`nvjpegDecodeJpeg`).
-    pub fn decode_jpeg(&mut self, jpeg_stream: &JpegStream, params: &DecodeParams, dst: &mut ImagePlanesMut<'_>, stream: &Stream) -> Result<()> {
-        let decoder = self
-            .decoder
-            .as_ref()
-            .ok_or(Error::InvalidInput("decode_jpeg requires a JpegState created with JpegState::with_decoder"))?;
-        let format = params.output_format.ok_or(Error::InvalidInput("DecodeParams output format not set"))?;
+    pub fn decode_jpeg(
+        &mut self,
+        jpeg_stream: &JpegStream,
+        params: &DecodeParams,
+        dst: &mut ImagePlanesMut<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let decoder = self.decoder.as_ref().ok_or(Error::InvalidInput(
+            "decode_jpeg requires a JpegState created with JpegState::with_decoder",
+        ))?;
+        let format = params
+            .output_format
+            .ok_or(Error::InvalidInput("DecodeParams output format not set"))?;
         format.validate_layout(dst.layout())?;
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` is a decoder-bound state, `jpeg_stream` is parsed, `params` has
         // matching output format, `dst` has validated device plane pointers, and `stream` is bound.
         check("nvjpegDecodeJpeg", unsafe {
-            sys::nvjpegDecodeJpeg(self.handle.raw(), decoder.raw(), self.raw, jpeg_stream.raw(), dst.as_mut_raw(), params.raw(), stream.cu_stream())
+            sys::nvjpegDecodeJpeg(
+                self.handle.raw(),
+                decoder.raw(),
+                self.raw,
+                jpeg_stream.raw(),
+                dst.as_mut_raw(),
+                params.raw(),
+                stream.cu_stream(),
+            )
         })
     }
 }
@@ -395,8 +512,13 @@ impl JpegStream {
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
         let mut raw: sys::nvjpegJpegStream_t = std::ptr::null_mut();
         // SAFETY: `handle` is live and `raw` is a valid out-pointer.
-        check("nvjpegJpegStreamCreate", unsafe { sys::nvjpegJpegStreamCreate(handle.raw(), &mut raw) })?;
-        Ok(Self { raw, handle: handle.clone() })
+        check("nvjpegJpegStreamCreate", unsafe {
+            sys::nvjpegJpegStreamCreate(handle.raw(), &mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            handle: handle.clone(),
+        })
     }
 
     /// Parses a JPEG bitstream (`nvjpegJpegStreamParse`).
@@ -406,7 +528,14 @@ impl JpegStream {
         }
         // SAFETY: `self.handle` and `self.raw` are live and `data` is valid for `data.len()` bytes.
         check("nvjpegJpegStreamParse", unsafe {
-            sys::nvjpegJpegStreamParse(self.handle.raw(), data.as_ptr(), data.len(), c_int::from(save_metadata), c_int::from(save_stream), self.raw)
+            sys::nvjpegJpegStreamParse(
+                self.handle.raw(),
+                data.as_ptr(),
+                data.len(),
+                c_int::from(save_metadata),
+                c_int::from(save_stream),
+                self.raw,
+            )
         })
     }
 
@@ -425,7 +554,9 @@ impl JpegStream {
     pub fn dimensions(&self) -> Result<(u32, u32)> {
         let (mut w, mut h) = (0u32, 0u32);
         // SAFETY: `self.raw` is parsed and `w`, `h` are valid out-pointers.
-        check("nvjpegJpegStreamGetFrameDimensions", unsafe { sys::nvjpegJpegStreamGetFrameDimensions(self.raw, &mut w, &mut h) })?;
+        check("nvjpegJpegStreamGetFrameDimensions", unsafe {
+            sys::nvjpegJpegStreamGetFrameDimensions(self.raw, &mut w, &mut h)
+        })?;
         Ok((w, h))
     }
 
@@ -433,7 +564,9 @@ impl JpegStream {
     pub fn components_num(&self) -> Result<u32> {
         let mut n = 0u32;
         // SAFETY: `self.raw` is parsed and `n` is a valid out-pointer.
-        check("nvjpegJpegStreamGetComponentsNum", unsafe { sys::nvjpegJpegStreamGetComponentsNum(self.raw, &mut n) })?;
+        check("nvjpegJpegStreamGetComponentsNum", unsafe {
+            sys::nvjpegJpegStreamGetComponentsNum(self.raw, &mut n)
+        })?;
         Ok(n)
     }
 
@@ -441,7 +574,9 @@ impl JpegStream {
     pub fn chroma_subsampling(&self) -> Result<ChromaSubsampling> {
         let mut css: sys::nvjpegChromaSubsampling_t = 0;
         // SAFETY: `self.raw` is parsed and `css` is a valid out-pointer.
-        check("nvjpegJpegStreamGetChromaSubsampling", unsafe { sys::nvjpegJpegStreamGetChromaSubsampling(self.raw, &mut css) })?;
+        check("nvjpegJpegStreamGetChromaSubsampling", unsafe {
+            sys::nvjpegJpegStreamGetChromaSubsampling(self.raw, &mut css)
+        })?;
         Ok(ChromaSubsampling::from_sys(css))
     }
 
@@ -449,7 +584,9 @@ impl JpegStream {
     pub fn exif_orientation(&self) -> Result<ExifOrientation> {
         let mut ori: sys::nvjpegExifOrientation_t = 0;
         // SAFETY: `self.raw` is parsed and `ori` is a valid out-pointer.
-        check("nvjpegJpegStreamGetExifOrientation", unsafe { sys::nvjpegJpegStreamGetExifOrientation(self.raw, &mut ori) })?;
+        check("nvjpegJpegStreamGetExifOrientation", unsafe {
+            sys::nvjpegJpegStreamGetExifOrientation(self.raw, &mut ori)
+        })?;
         Ok(ExifOrientation::from_sys(ori))
     }
 
@@ -457,7 +594,9 @@ impl JpegStream {
     pub fn sample_precision(&self) -> Result<u32> {
         let mut prec = 0u32;
         // SAFETY: `self.raw` is parsed and `prec` is a valid out-pointer.
-        check("nvjpegJpegStreamGetSamplePrecision", unsafe { sys::nvjpegJpegStreamGetSamplePrecision(self.raw, &mut prec) })?;
+        check("nvjpegJpegStreamGetSamplePrecision", unsafe {
+            sys::nvjpegJpegStreamGetSamplePrecision(self.raw, &mut prec)
+        })?;
         Ok(prec)
     }
 
@@ -465,7 +604,9 @@ impl JpegStream {
     pub fn jpeg_encoding(&self) -> Result<JpegEncoding> {
         let mut enc: sys::nvjpegJpegEncoding_t = 0;
         // SAFETY: `self.raw` is parsed and `enc` is a valid out-pointer.
-        check("nvjpegJpegStreamGetJpegEncoding", unsafe { sys::nvjpegJpegStreamGetJpegEncoding(self.raw, &mut enc) })?;
+        check("nvjpegJpegStreamGetJpegEncoding", unsafe {
+            sys::nvjpegJpegStreamGetJpegEncoding(self.raw, &mut enc)
+        })?;
         Ok(JpegEncoding::from_sys(enc))
     }
 

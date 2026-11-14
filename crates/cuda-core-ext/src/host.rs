@@ -25,7 +25,11 @@ pub struct HostRegistration<'a, T> {
 impl<'a, T: DeviceCopy> HostRegistration<'a, T> {
     /// Page-locks `data`. With `map_to_device`, the memory is also mapped into the device address
     /// space ([`Self::device_ptr`]).
-    pub fn new(ctx: &Arc<Context>, data: &'a mut [T], map_to_device: bool) -> Result<Self, DriverError> {
+    pub fn new(
+        ctx: &Arc<Context>,
+        data: &'a mut [T],
+        map_to_device: bool,
+    ) -> Result<Self, DriverError> {
         let bytes = std::mem::size_of_val(data);
         if bytes == 0 {
             return Err(invalid_value());
@@ -38,7 +42,13 @@ impl<'a, T: DeviceCopy> HostRegistration<'a, T> {
         // SAFETY: `data` is a live, exclusively borrowed host range of `bytes` bytes; it stays
         // borrowed (so neither freed nor moved) until `Drop` unregisters it.
         unsafe { sys::cuMemHostRegister_v2(data.as_mut_ptr().cast(), bytes, flags) }.result()?;
-        let mut reg = Self { ptr: data.as_mut_ptr(), len: data.len(), device_ptr: None, ctx: ctx.clone(), _borrow: PhantomData };
+        let mut reg = Self {
+            ptr: data.as_mut_ptr(),
+            len: data.len(),
+            device_ptr: None,
+            ctx: ctx.clone(),
+            _borrow: PhantomData,
+        };
         if map_to_device {
             let mut dptr: sys::CUdeviceptr = 0;
             // SAFETY: the range was registered with DEVICEMAP just above.
@@ -71,7 +81,9 @@ impl<T> Drop for HostRegistration<'_, T> {
         let ptr = self.ptr;
         // SAFETY: the range was registered by `new`; device work touching it must have completed
         // (the caller's stream contract, as for any host memory handed to CUDA).
-        teardown(&self.ctx, || unsafe { sys::cuMemHostUnregister(ptr.cast()) });
+        teardown(&self.ctx, || unsafe {
+            sys::cuMemHostUnregister(ptr.cast())
+        });
     }
 }
 
@@ -94,14 +106,26 @@ unsafe impl<T: DeviceCopy + Sync> Sync for ManagedBuffer<T> {}
 impl<T: DeviceCopy> ManagedBuffer<T> {
     /// Allocates `len` zeroed values.
     pub fn zeroed(ctx: &Arc<Context>, len: usize) -> Result<Self, DriverError> {
-        let bytes = len.checked_mul(size_of::<T>()).filter(|b| *b > 0).ok_or_else(invalid_value)?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .filter(|b| *b > 0)
+            .ok_or_else(invalid_value)?;
         ctx.bind_to_thread()?;
         let mut ptr: sys::CUdeviceptr = 0;
+        #[cfg(windows)]
+        let flags = sys::CUmemAttach_flags_enum_CU_MEM_ATTACH_GLOBAL as u32;
+        #[cfg(not(windows))]
+        let flags = sys::CUmemAttach_flags_enum_CU_MEM_ATTACH_GLOBAL;
         // SAFETY: valid out-pointer and size; globally attached so every stream may use it.
-        unsafe { sys::cuMemAllocManaged(&mut ptr, bytes, sys::CUmemAttach_flags_enum_CU_MEM_ATTACH_GLOBAL as u32) }.result()?;
+        unsafe { sys::cuMemAllocManaged(&mut ptr, bytes, flags) }.result()?;
         // SAFETY: freshly allocated managed memory of `bytes` bytes, idle and host-accessible.
         unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
-        Ok(Self { ptr, len, ctx: ctx.clone(), _marker: PhantomData })
+        Ok(Self {
+            ptr,
+            len,
+            ctx: ctx.clone(),
+            _marker: PhantomData,
+        })
     }
 
     /// The device address (also the host address: managed memory is unified).

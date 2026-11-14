@@ -1,7 +1,7 @@
 //! Zero-copy CUDA <-> `wgpu` 30 external memory and timeline semaphore interop.
 //!
 //! Why: Bridges `wgpu` rendering/compute pipelines (Vulkan on Windows & Linux,
-//! DX12 on Windows) with CUDA (`cuda-core` + `cuda-ext`) so GPU buffers and
+//! DX12 on Windows) with CUDA (`cuda-core` + `cuda-core-ext`) so GPU buffers and
 //! textures can be produced and consumed in device-local VRAM with zero host
 //! copies and strict GPU-side timeline synchronization.
 //!
@@ -12,14 +12,14 @@
 //!   `wgpu_hal::vulkan::Adapter::open_with_callback`, matches physical GPUs by
 //!   UUID/LUID against CUDA, and composes cleanly with `gpu_info::SharedGpu`.
 //! - [`buffer`]: Zero-copy [`SharedBuffer`] (`wgpu::Buffer` <-> `cuda_core::RawDeviceBuffer`).
-//! - [`texture`]: Zero-copy [`SharedTexture`] (`wgpu::Texture` <-> `cuda_ext::MipmappedArray`),
-//!   exposing [`SharedSurfaceObject`] and [`cuda_ext::TextureObject`] views.
+//! - [`texture`]: Zero-copy [`SharedTexture`] (`wgpu::Texture` <-> `cuda_core_ext::MipmappedArray`),
+//!   exposing [`SharedSurfaceObject`] and [`cuda_core_ext::TextureObject`] views.
 //! - [`sync`]: GPU-side timeline [`InteropSemaphore`] (Vulkan timeline semaphore
 //!   & DX12 shared `ID3D12Fence`).
 //! - [`format`]: Explicit `wgpu::TextureFormat` <-> CUDA/Vulkan/DXGI mapping table
 //!   and 256-byte (`COPY_BYTES_PER_ROW_ALIGNMENT`) staging layout helpers.
 //!
-//! Uses `cuda-core`, `cuda-ext`, `gpu-info-rs`, `wgpu`, `ash`, and OS handle APIs
+//! Uses `cuda-core`, `cuda-core-ext`, `gpu-info-rs`, `wgpu`, `ash`, and OS handle APIs
 //! (`Win32` NT handles on Windows, `OPAQUE_FD` on Unix).
 
 use std::sync::Arc;

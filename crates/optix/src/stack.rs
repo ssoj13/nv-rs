@@ -36,7 +36,15 @@ pub struct StackSizes {
 
 impl From<sys::OptixStackSizes> for StackSizes {
     fn from(s: sys::OptixStackSizes) -> Self {
-        Self { css_rg: s.cssRG, css_ms: s.cssMS, css_ch: s.cssCH, css_ah: s.cssAH, css_is: s.cssIS, css_cc: s.cssCC, dss_dc: s.dssDC }
+        Self {
+            css_rg: s.cssRG,
+            css_ms: s.cssMS,
+            css_ch: s.cssCH,
+            css_ah: s.cssAH,
+            css_is: s.cssIS,
+            css_cc: s.cssCC,
+            dss_dc: s.dssDC,
+        }
     }
 }
 
@@ -52,11 +60,13 @@ pub struct PipelineStack {
 }
 
 fn mul(a: u32, b: u32) -> Result<u32> {
-    a.checked_mul(b).ok_or(Error::Invalid("stack size overflows u32"))
+    a.checked_mul(b)
+        .ok_or(Error::Invalid("stack size overflows u32"))
 }
 
 fn add(a: u32, b: u32) -> Result<u32> {
-    a.checked_add(b).ok_or(Error::Invalid("stack size overflows u32"))
+    a.checked_add(b)
+        .ok_or(Error::Invalid("stack size overflows u32"))
 }
 
 impl StackSizes {
@@ -86,16 +96,28 @@ impl StackSizes {
         // Upper bound for a closest-hit or miss program plus its continuation-callable tree.
         let ch_or_ms = add(self.css_ch.max(self.css_ms), css_cc_tree)?;
         let nested = mul(max_trace_depth.max(1) - 1, ch_or_ms)?;
-        let leaf = mul(max_trace_depth.min(1), ch_or_ms.max(add(self.css_is, self.css_ah)?))?;
+        let leaf = mul(
+            max_trace_depth.min(1),
+            ch_or_ms.max(add(self.css_is, self.css_ah)?),
+        )?;
         add(add(add(self.css_rg, css_cc_tree)?, nested)?, leaf)
     }
 
     /// `optixUtilComputeStackSizes`: stack sizes for trace recursion `max_trace_depth`,
     /// continuation-callable depth `max_cc_depth` and direct-callable depth `max_dc_depth`.
-    pub fn compute(&self, max_trace_depth: u32, max_cc_depth: u32, max_dc_depth: u32) -> Result<PipelineStack> {
+    pub fn compute(
+        &self,
+        max_trace_depth: u32,
+        max_cc_depth: u32,
+        max_dc_depth: u32,
+    ) -> Result<PipelineStack> {
         let dc = mul(max_dc_depth, self.dss_dc)?;
         let continuation = self.continuation(mul(max_cc_depth, self.css_cc)?, max_trace_depth)?;
-        Ok(PipelineStack { direct_from_traversal: dc, direct_from_state: dc, continuation })
+        Ok(PipelineStack {
+            direct_from_traversal: dc,
+            direct_from_state: dc,
+            continuation,
+        })
     }
 
     /// `optixUtilComputeStackSizesDCSplit`: like [`StackSizes::compute`] with the direct
@@ -119,9 +141,18 @@ impl StackSizes {
     /// `optixUtilComputeStackSizesCssCCTree`: like [`StackSizes::compute`] with the
     /// continuation stack of the whole continuation-callable tree given directly (replacing
     /// `self.css_cc` and the depth).
-    pub fn compute_css_cc_tree(&self, css_cc_tree: u32, max_trace_depth: u32, max_dc_depth: u32) -> Result<PipelineStack> {
+    pub fn compute_css_cc_tree(
+        &self,
+        css_cc_tree: u32,
+        max_trace_depth: u32,
+        max_dc_depth: u32,
+    ) -> Result<PipelineStack> {
         let dc = mul(max_dc_depth, self.dss_dc)?;
-        Ok(PipelineStack { direct_from_traversal: dc, direct_from_state: dc, continuation: self.continuation(css_cc_tree, max_trace_depth)? })
+        Ok(PipelineStack {
+            direct_from_traversal: dc,
+            direct_from_state: dc,
+            continuation: self.continuation(css_cc_tree, max_trace_depth)?,
+        })
     }
 }
 
@@ -148,7 +179,11 @@ pub fn simple_path_tracer(
         s2.accumulate(g, pipeline)?;
     }
     let continuation = add(css_rg, css_ms1.max(add(s1.css_ch, css_ms2.max(s2.css_ch))?))?;
-    Ok(PipelineStack { direct_from_traversal: 0, direct_from_state: 0, continuation })
+    Ok(PipelineStack {
+        direct_from_traversal: 0,
+        direct_from_state: 0,
+        continuation,
+    })
 }
 
 impl ProgramGroup {
@@ -165,7 +200,11 @@ impl ProgramGroup {
         // SAFETY: owned group handle; `pipeline` is null or a live pipeline of the same context;
         // `s` is writable.
         check("optixProgramGroupGetStackSize", unsafe {
-            entry!(self.context().table(), optixProgramGroupGetStackSize)(self.raw(), &mut s, pipeline.map_or(std::ptr::null_mut(), Pipeline::raw))
+            entry!(self.context().table(), optixProgramGroupGetStackSize)(
+                self.raw(),
+                &mut s,
+                pipeline.map_or(std::ptr::null_mut(), Pipeline::raw),
+            )
         })?;
         Ok(s.into())
     }
@@ -174,6 +213,11 @@ impl ProgramGroup {
 impl Pipeline {
     /// Applies computed stack sizes with traversable graph depth `max_graph_depth`.
     pub fn set_stack(&self, stack: PipelineStack, max_graph_depth: u32) -> Result<()> {
-        self.set_stack_size(stack.direct_from_traversal, stack.direct_from_state, stack.continuation, max_graph_depth)
+        self.set_stack_size(
+            stack.direct_from_traversal,
+            stack.direct_from_state,
+            stack.continuation,
+            max_graph_depth,
+        )
     }
 }

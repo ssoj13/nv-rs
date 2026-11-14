@@ -1,7 +1,10 @@
 //! GPU tests (T2) for `nvenc`: run with `cargo test -p nvenc -- --include-ignored`.
 
 use cuda_core::Context;
-use nvenc::{BufferFormat, Codec as EncCodec, EncodeFlags, EncodeInput, EncodeSession, InputBuffer, OutputBitstream, Preset, SessionConfig, Tuning};
+use nvenc::{
+    BufferFormat, Codec as EncCodec, EncodeFlags, EncodeInput, EncodeSession, InputBuffer,
+    OutputBitstream, Preset, SessionConfig, Tuning,
+};
 
 #[test]
 #[ignore = "GPU: needs NVIDIA driver with NVENC; run with --ignored"]
@@ -29,7 +32,8 @@ fn encode_synthetic_nv12_h264_hevc_av1() {
         cfg.encode_config = Some(preset);
         session.initialize(&cfg).expect("initialize encoder");
 
-        let mut input = InputBuffer::new(&session, width, height, BufferFormat::Nv12).expect("input buffer");
+        let mut input =
+            InputBuffer::new(&session, width, height, BufferFormat::Nv12).expect("input buffer");
         let mut output = OutputBitstream::new(&session).expect("output bitstream");
         let mut total_bytes = 0usize;
 
@@ -47,13 +51,24 @@ fn encode_synthetic_nv12_h264_hevc_av1() {
                 }
                 let uv_offset = (height as usize) * pitch;
                 for y in 0..(height as usize / 2) {
-                    let row = &mut slice[uv_offset + y * pitch..uv_offset + y * pitch + width as usize];
+                    let row =
+                        &mut slice[uv_offset + y * pitch..uv_offset + y * pitch + width as usize];
                     row.fill(128);
                 }
             }
-            let flags = EncodeFlags { force_idr: frame_idx == 0, output_sps_pps: frame_idx == 0, ..Default::default() };
+            let flags = EncodeFlags {
+                force_idr: frame_idx == 0,
+                output_sps_pps: frame_idx == 0,
+                ..Default::default()
+            };
             session
-                .encode_picture(EncodeInput::Buffer(&input), &mut output, frame_idx, u64::from(frame_idx), flags)
+                .encode_picture(
+                    EncodeInput::Buffer(&input),
+                    &mut output,
+                    frame_idx,
+                    u64::from(frame_idx),
+                    flags,
+                )
                 .expect("encode_picture");
             let pkt = output.lock().expect("lock bitstream");
             total_bytes += pkt.data().len();

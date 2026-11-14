@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cuda_core::{Context, DeviceBuffer, Stream};
 use nvcomp_sys as sys;
 
-use crate::{check_bitcomp, same_ctx, within, BitcompMode, Error, Result};
+use crate::{BitcompMode, Error, Result, check_bitcomp, same_ctx, within};
 
 /// Element type for native Bitcomp plans (`bitcompDataType_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,7 +116,9 @@ impl BitcompPlan {
         algo: BitcompAlgo,
     ) -> Result<Self> {
         if uncompressed_bytes == 0 || !uncompressed_bytes.is_multiple_of(dtype.elem_bytes()) {
-            return Err(Error::Invalid("bitcomp input size must be non-zero and element-aligned"));
+            return Err(Error::Invalid(
+                "bitcomp input size must be non-zero and element-aligned",
+            ));
         }
         sys::load()?;
         ctx.bind_to_thread()?;
@@ -132,7 +134,12 @@ impl BitcompPlan {
             )
         };
         check_bitcomp("bitcompCreatePlan", status)?;
-        Ok(Self { raw, ctx: ctx.clone(), uncompressed_bytes, stream: None })
+        Ok(Self {
+            raw,
+            ctx: ctx.clone(),
+            uncompressed_bytes,
+            stream: None,
+        })
     }
 
     /// Binds `stream` to this Bitcomp plan.
@@ -148,7 +155,11 @@ impl BitcompPlan {
 
     fn ensure_stream(&mut self, stream: &Arc<Stream>) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
-        if self.stream.as_ref().is_some_and(|bound| bound.cu_stream() == stream.cu_stream()) {
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|bound| bound.cu_stream() == stream.cu_stream())
+        {
             self.ctx.bind_to_thread()?;
             return Ok(());
         }
@@ -166,7 +177,9 @@ impl BitcompPlan {
     ) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
         if !Arc::ptr_eq(input.context(), &self.ctx) || !Arc::ptr_eq(output.context(), &self.ctx) {
-            return Err(Error::Invalid("bitcomp input/output belongs to another context"));
+            return Err(Error::Invalid(
+                "bitcomp input/output belongs to another context",
+            ));
         }
         if input.num_bytes() != self.uncompressed_bytes {
             return Err(Error::Invalid("bitcomp input size does not match plan"));
@@ -174,10 +187,14 @@ impl BitcompPlan {
         let max_out = Self::max_buflen(self.uncompressed_bytes)?;
         within(budget, max_out)?;
         if output.num_bytes() < max_out {
-            return Err(Error::Invalid("bitcomp output buffer smaller than bitcompMaxBuflen"));
+            return Err(Error::Invalid(
+                "bitcomp output buffer smaller than bitcompMaxBuflen",
+            ));
         }
         if !output.cu_deviceptr().is_multiple_of(8) {
-            return Err(Error::Invalid("bitcomp output buffer must be 64-bit aligned"));
+            return Err(Error::Invalid(
+                "bitcomp output buffer must be 64-bit aligned",
+            ));
         }
         self.ensure_stream(stream)?;
         // SAFETY: context and stream are bound, input/output extents and 64-bit alignment checked.
@@ -200,13 +217,19 @@ impl BitcompPlan {
     ) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
         if !Arc::ptr_eq(input.context(), &self.ctx) || !Arc::ptr_eq(output.context(), &self.ctx) {
-            return Err(Error::Invalid("bitcomp input/output belongs to another context"));
+            return Err(Error::Invalid(
+                "bitcomp input/output belongs to another context",
+            ));
         }
         if !input.cu_deviceptr().is_multiple_of(8) {
-            return Err(Error::Invalid("bitcomp compressed input must be 64-bit aligned"));
+            return Err(Error::Invalid(
+                "bitcomp compressed input must be 64-bit aligned",
+            ));
         }
         if output.num_bytes() < self.uncompressed_bytes {
-            return Err(Error::Invalid("bitcomp output buffer smaller than plan uncompressed_bytes"));
+            return Err(Error::Invalid(
+                "bitcomp output buffer smaller than plan uncompressed_bytes",
+            ));
         }
         self.ensure_stream(stream)?;
         // SAFETY: context and stream are bound and buffer extents/alignment were verified.
@@ -245,6 +268,9 @@ mod tests {
     fn t0_bitcomp_dtype_mapping() {
         assert_eq!(BitcompDataType::U32.elem_bytes(), 4);
         assert_eq!(BitcompDataType::F64.elem_bytes(), 8);
-        assert_eq!(BitcompAlgo::Default.to_sys(), sys::bitcompAlgorithm_t_BITCOMP_DEFAULT_ALGO);
+        assert_eq!(
+            BitcompAlgo::Default.to_sys(),
+            sys::bitcompAlgorithm_t_BITCOMP_DEFAULT_ALGO
+        );
     }
 }

@@ -13,7 +13,10 @@
 //!
 //! **Used by** [`crate::ops`].
 
-use crate::{DataType, DiagType, Error, FillMode, IndexBase, IndexType, Order, Result, check, ensure_loaded, sys, teardown};
+use crate::{
+    DataType, DiagType, Error, FillMode, IndexBase, IndexType, Order, Result, check, ensure_loaded,
+    sys, teardown,
+};
 use cuda_core::{Context, DeviceBuffer};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -106,7 +109,9 @@ pub fn validate_csr(
     value_type: DataType,
 ) -> Result<()> {
     if rows < 0 || cols < 0 || nnz < 0 {
-        return Err(Error::InvalidInput("CSR rows, cols, and nnz must be non-negative"));
+        return Err(Error::InvalidInput(
+            "CSR rows, cols, and nnz must be non-negative",
+        ));
     }
     let req_off = (rows as usize)
         .checked_add(1)
@@ -119,13 +124,19 @@ pub fn validate_csr(
         .checked_mul(value_type.byte_size())
         .ok_or(Error::InvalidInput("CSR values byte size overflow"))?;
     if row_offsets_bytes < req_off {
-        return Err(Error::InvalidInput("CSR row_offsets buffer smaller than (rows + 1) elements"));
+        return Err(Error::InvalidInput(
+            "CSR row_offsets buffer smaller than (rows + 1) elements",
+        ));
     }
     if col_ind_bytes < req_col {
-        return Err(Error::InvalidInput("CSR col_ind buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "CSR col_ind buffer smaller than nnz elements",
+        ));
     }
     if values_bytes < req_val {
-        return Err(Error::InvalidInput("CSR values buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "CSR values buffer smaller than nnz elements",
+        ));
     }
     Ok(())
 }
@@ -144,7 +155,9 @@ pub fn validate_csc(
     value_type: DataType,
 ) -> Result<()> {
     if rows < 0 || cols < 0 || nnz < 0 {
-        return Err(Error::InvalidInput("CSC rows, cols, and nnz must be non-negative"));
+        return Err(Error::InvalidInput(
+            "CSC rows, cols, and nnz must be non-negative",
+        ));
     }
     let req_off = (cols as usize)
         .checked_add(1)
@@ -157,13 +170,19 @@ pub fn validate_csc(
         .checked_mul(value_type.byte_size())
         .ok_or(Error::InvalidInput("CSC values byte size overflow"))?;
     if col_offsets_bytes < req_off {
-        return Err(Error::InvalidInput("CSC col_offsets buffer smaller than (cols + 1) elements"));
+        return Err(Error::InvalidInput(
+            "CSC col_offsets buffer smaller than (cols + 1) elements",
+        ));
     }
     if row_ind_bytes < req_row {
-        return Err(Error::InvalidInput("CSC row_ind buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "CSC row_ind buffer smaller than nnz elements",
+        ));
     }
     if values_bytes < req_val {
-        return Err(Error::InvalidInput("CSC values buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "CSC values buffer smaller than nnz elements",
+        ));
     }
     Ok(())
 }
@@ -181,7 +200,9 @@ pub fn validate_coo(
     value_type: DataType,
 ) -> Result<()> {
     if rows < 0 || cols < 0 || nnz < 0 {
-        return Err(Error::InvalidInput("COO rows, cols, and nnz must be non-negative"));
+        return Err(Error::InvalidInput(
+            "COO rows, cols, and nnz must be non-negative",
+        ));
     }
     let req_idx = (nnz as usize)
         .checked_mul(idx_type.byte_size())
@@ -190,13 +211,19 @@ pub fn validate_coo(
         .checked_mul(value_type.byte_size())
         .ok_or(Error::InvalidInput("COO values byte size overflow"))?;
     if row_ind_bytes < req_idx {
-        return Err(Error::InvalidInput("COO row_ind buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "COO row_ind buffer smaller than nnz elements",
+        ));
     }
     if col_ind_bytes < req_idx {
-        return Err(Error::InvalidInput("COO col_ind buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "COO col_ind buffer smaller than nnz elements",
+        ));
     }
     if values_bytes < req_val {
-        return Err(Error::InvalidInput("COO values buffer smaller than nnz elements"));
+        return Err(Error::InvalidInput(
+            "COO values buffer smaller than nnz elements",
+        ));
     }
     Ok(())
 }
@@ -214,17 +241,23 @@ pub fn validate_blocked_ell(
     value_type: DataType,
 ) -> Result<()> {
     if rows < 0 || cols < 0 || block_size <= 0 || ell_cols < 0 {
-        return Err(Error::InvalidInput("Blocked-ELL requires non-negative dimensions and block_size > 0"));
+        return Err(Error::InvalidInput(
+            "Blocked-ELL requires non-negative dimensions and block_size > 0",
+        ));
     }
     if rows % block_size != 0 || cols % block_size != 0 || ell_cols % block_size != 0 {
-        return Err(Error::InvalidInput("Blocked-ELL rows, cols, and ell_cols must be multiples of block_size"));
+        return Err(Error::InvalidInput(
+            "Blocked-ELL rows, cols, and ell_cols must be multiples of block_size",
+        ));
     }
     let block_rows = (rows / block_size) as usize;
     let block_ell_cols = (ell_cols / block_size) as usize;
     let req_col = block_rows
         .checked_mul(block_ell_cols)
         .and_then(|n| n.checked_mul(idx_type.byte_size()))
-        .ok_or(Error::InvalidInput("Blocked-ELL col_ind byte size overflow"))?;
+        .ok_or(Error::InvalidInput(
+            "Blocked-ELL col_ind byte size overflow",
+        ))?;
     let req_val = (rows as usize)
         .checked_mul(ell_cols as usize)
         .and_then(|n| n.checked_mul(value_type.byte_size()))
@@ -239,16 +272,27 @@ pub fn validate_blocked_ell(
 }
 
 /// Validates dense matrix dimensions and leading dimension before calling `cusparseCreateDnMat`.
-pub fn validate_dn_mat(rows: i64, cols: i64, ld: i64, order: Order, values_bytes: usize, value_type: DataType) -> Result<()> {
+pub fn validate_dn_mat(
+    rows: i64,
+    cols: i64,
+    ld: i64,
+    order: Order,
+    values_bytes: usize,
+    value_type: DataType,
+) -> Result<()> {
     if rows < 0 || cols < 0 || ld <= 0 {
-        return Err(Error::InvalidInput("dense matrix requires non-negative rows/cols and ld > 0"));
+        return Err(Error::InvalidInput(
+            "dense matrix requires non-negative rows/cols and ld > 0",
+        ));
     }
     let (major_dim, minor_dim) = match order {
         Order::Col => (cols, rows),
         Order::Row => (rows, cols),
     };
     if ld < minor_dim {
-        return Err(Error::InvalidInput("dense matrix leading dimension ld is smaller than minor extent"));
+        return Err(Error::InvalidInput(
+            "dense matrix leading dimension ld is smaller than minor extent",
+        ));
     }
     let req = if major_dim == 0 || minor_dim == 0 {
         0
@@ -259,7 +303,9 @@ pub fn validate_dn_mat(rows: i64, cols: i64, ld: i64, order: Order, values_bytes
             .ok_or(Error::InvalidInput("dense matrix byte size overflow"))?
     };
     if values_bytes < req {
-        return Err(Error::InvalidInput("dense matrix device buffer smaller than required ld * major_dim"));
+        return Err(Error::InvalidInput(
+            "dense matrix device buffer smaller than required ld * major_dim",
+        ));
     }
     Ok(())
 }
@@ -308,7 +354,17 @@ impl SpMatDescr {
             .len()
             .checked_mul(std::mem::size_of::<V>())
             .ok_or(Error::InvalidInput("CSR values byte size overflow"))?;
-        validate_csr(rows, cols, nnz, row_bytes, col_bytes, val_bytes, R::INDEX_TYPE, C::INDEX_TYPE, V::DATA_TYPE)?;
+        validate_csr(
+            rows,
+            cols,
+            nnz,
+            row_bytes,
+            col_bytes,
+            val_bytes,
+            R::INDEX_TYPE,
+            C::INDEX_TYPE,
+            V::DATA_TYPE,
+        )?;
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpMatDescr_t = std::ptr::null_mut();
@@ -328,7 +384,15 @@ impl SpMatDescr {
                 V::DATA_TYPE.to_sys(),
             )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), rows, cols, nnz, format: SparseFormat::Csr, value_type: V::DATA_TYPE })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            rows,
+            cols,
+            nnz,
+            format: SparseFormat::Csr,
+            value_type: V::DATA_TYPE,
+        })
     }
 
     /// Creates an empty CSR descriptor (null pointers, `nnz = 0`) to be populated by `SpGemm` copy.
@@ -342,7 +406,9 @@ impl SpMatDescr {
         value_type: DataType,
     ) -> Result<Self> {
         if rows < 0 || cols < 0 {
-            return Err(Error::InvalidInput("CSR rows and cols must be non-negative"));
+            return Err(Error::InvalidInput(
+                "CSR rows and cols must be non-negative",
+            ));
         }
         ensure_loaded()?;
         cuda.bind_to_thread()?;
@@ -363,7 +429,15 @@ impl SpMatDescr {
                 value_type.to_sys(),
             )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), rows, cols, nnz: 0, format: SparseFormat::Csr, value_type })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            rows,
+            cols,
+            nnz: 0,
+            format: SparseFormat::Csr,
+            value_type,
+        })
     }
 
     /// Creates a CSC sparse matrix descriptor from typed device buffers.
@@ -394,7 +468,17 @@ impl SpMatDescr {
             .len()
             .checked_mul(std::mem::size_of::<V>())
             .ok_or(Error::InvalidInput("CSC values byte size overflow"))?;
-        validate_csc(rows, cols, nnz, col_bytes, row_bytes, val_bytes, C::INDEX_TYPE, R::INDEX_TYPE, V::DATA_TYPE)?;
+        validate_csc(
+            rows,
+            cols,
+            nnz,
+            col_bytes,
+            row_bytes,
+            val_bytes,
+            C::INDEX_TYPE,
+            R::INDEX_TYPE,
+            V::DATA_TYPE,
+        )?;
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpMatDescr_t = std::ptr::null_mut();
@@ -414,7 +498,15 @@ impl SpMatDescr {
                 V::DATA_TYPE.to_sys(),
             )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), rows, cols, nnz, format: SparseFormat::Csc, value_type: V::DATA_TYPE })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            rows,
+            cols,
+            nnz,
+            format: SparseFormat::Csc,
+            value_type: V::DATA_TYPE,
+        })
     }
 
     /// Creates a COO sparse matrix descriptor from typed device buffers.
@@ -445,7 +537,16 @@ impl SpMatDescr {
             .len()
             .checked_mul(std::mem::size_of::<V>())
             .ok_or(Error::InvalidInput("COO values byte size overflow"))?;
-        validate_coo(rows, cols, nnz, row_bytes, col_bytes, val_bytes, I::INDEX_TYPE, V::DATA_TYPE)?;
+        validate_coo(
+            rows,
+            cols,
+            nnz,
+            row_bytes,
+            col_bytes,
+            val_bytes,
+            I::INDEX_TYPE,
+            V::DATA_TYPE,
+        )?;
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpMatDescr_t = std::ptr::null_mut();
@@ -464,7 +565,15 @@ impl SpMatDescr {
                 V::DATA_TYPE.to_sys(),
             )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), rows, cols, nnz, format: SparseFormat::Coo, value_type: V::DATA_TYPE })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            rows,
+            cols,
+            nnz,
+            format: SparseFormat::Coo,
+            value_type: V::DATA_TYPE,
+        })
     }
 
     /// Creates a Blocked-ELLPACK sparse matrix descriptor from typed device buffers.
@@ -483,10 +592,13 @@ impl SpMatDescr {
         values: &DeviceBuffer<V>,
         idx_base: IndexBase,
     ) -> Result<Self> {
-        let col_bytes = col_ind
-            .len()
-            .checked_mul(std::mem::size_of::<I>())
-            .ok_or(Error::InvalidInput("Blocked-ELL col_ind byte size overflow"))?;
+        let col_bytes =
+            col_ind
+                .len()
+                .checked_mul(std::mem::size_of::<I>())
+                .ok_or(Error::InvalidInput(
+                    "Blocked-ELL col_ind byte size overflow",
+                ))?;
         let val_bytes = values
             .len()
             .checked_mul(std::mem::size_of::<V>())
@@ -494,7 +606,16 @@ impl SpMatDescr {
         let nnz = rows
             .checked_mul(ell_cols)
             .ok_or(Error::InvalidInput("Blocked-ELL nnz overflow"))?;
-        validate_blocked_ell(rows, cols, block_size, ell_cols, col_bytes, val_bytes, I::INDEX_TYPE, V::DATA_TYPE)?;
+        validate_blocked_ell(
+            rows,
+            cols,
+            block_size,
+            ell_cols,
+            col_bytes,
+            val_bytes,
+            I::INDEX_TYPE,
+            V::DATA_TYPE,
+        )?;
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseSpMatDescr_t = std::ptr::null_mut();
@@ -519,7 +640,10 @@ impl SpMatDescr {
             rows,
             cols,
             nnz,
-            format: SparseFormat::BlockedEll { block_size, ell_cols },
+            format: SparseFormat::BlockedEll {
+                block_size,
+                ell_cols,
+            },
             value_type: V::DATA_TYPE,
         })
     }
@@ -537,7 +661,9 @@ impl SpMatDescr {
         values: &DeviceBuffer<V>,
     ) -> Result<()> {
         if self.format != SparseFormat::Csr {
-            return Err(Error::InvalidInput("set_csr_pointers requires a CSR descriptor"));
+            return Err(Error::InvalidInput(
+                "set_csr_pointers requires a CSR descriptor",
+            ));
         }
         let row_bytes = row_offsets
             .len()
@@ -551,7 +677,17 @@ impl SpMatDescr {
             .len()
             .checked_mul(std::mem::size_of::<V>())
             .ok_or(Error::InvalidInput("CSR values byte size overflow"))?;
-        validate_csr(self.rows, self.cols, nnz, row_bytes, col_bytes, val_bytes, R::INDEX_TYPE, C::INDEX_TYPE, V::DATA_TYPE)?;
+        validate_csr(
+            self.rows,
+            self.cols,
+            nnz,
+            row_bytes,
+            col_bytes,
+            val_bytes,
+            R::INDEX_TYPE,
+            C::INDEX_TYPE,
+            V::DATA_TYPE,
+        )?;
         // SAFETY: `self.raw` is a valid CSR descriptor and buffers are validated and live on `self.cuda`.
         check("cusparseCsrSetPointers", unsafe {
             sys::cusparseCsrSetPointers(
@@ -569,7 +705,9 @@ impl SpMatDescr {
     pub fn query_size(&self) -> Result<(i64, i64, i64)> {
         let (mut r, mut c, mut n) = (0i64, 0i64, 0i64);
         // SAFETY: `self.raw` is valid and out-pointers are non-null.
-        check("cusparseSpMatGetSize", unsafe { sys::cusparseSpMatGetSize(self.raw.cast_const(), &mut r, &mut c, &mut n) })?;
+        check("cusparseSpMatGetSize", unsafe {
+            sys::cusparseSpMatGetSize(self.raw.cast_const(), &mut r, &mut c, &mut n)
+        })?;
         Ok((r, c, n))
     }
 
@@ -672,16 +810,30 @@ impl DnVecDescr {
     /// # Safety
     ///
     /// `values` must remain allocated and valid on `cuda` for as long as this descriptor is used.
-    pub unsafe fn new<V: SparseScalar>(cuda: &Arc<Context>, values: &DeviceBuffer<V>) -> Result<Self> {
-        let len = i64::try_from(values.len()).map_err(|_| Error::InvalidInput("dense vector length exceeds i64::MAX"))?;
+    pub unsafe fn new<V: SparseScalar>(
+        cuda: &Arc<Context>,
+        values: &DeviceBuffer<V>,
+    ) -> Result<Self> {
+        let len = i64::try_from(values.len())
+            .map_err(|_| Error::InvalidInput("dense vector length exceeds i64::MAX"))?;
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let mut raw: sys::cusparseDnVecDescr_t = std::ptr::null_mut();
         // SAFETY: `values` is a live device buffer of `len` elements of `V::DATA_TYPE`.
         check("cusparseCreateDnVec", unsafe {
-            sys::cusparseCreateDnVec(&mut raw, len, values.cu_deviceptr() as *mut c_void, V::DATA_TYPE.to_sys())
+            sys::cusparseCreateDnVec(
+                &mut raw,
+                len,
+                values.cu_deviceptr() as *mut c_void,
+                V::DATA_TYPE.to_sys(),
+            )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), len, value_type: V::DATA_TYPE })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            len,
+            value_type: V::DATA_TYPE,
+        })
     }
 
     /// Raw `cusparseDnVecDescr_t`.
@@ -772,7 +924,15 @@ impl DnMatDescr {
                 order.to_sys(),
             )
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), rows, cols, ld, order, value_type: V::DATA_TYPE })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            rows,
+            cols,
+            ld,
+            order,
+            value_type: V::DATA_TYPE,
+        })
     }
 
     /// Raw `cusparseDnMatDescr_t`.
@@ -831,31 +991,110 @@ mod tests {
     #[test]
     fn csr_validation_rejects_negative_and_undersized_buffers() {
         assert!(matches!(
-            validate_csr(-1, 3, 2, 16, 8, 8, IndexType::I32, IndexType::I32, DataType::F32),
+            validate_csr(
+                -1,
+                3,
+                2,
+                16,
+                8,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            ),
             Err(Error::InvalidInput(_))
         ));
         // 3 rows needs (3+1)*4 = 16 bytes for row_offsets
         assert!(matches!(
-            validate_csr(3, 3, 2, 12, 8, 8, IndexType::I32, IndexType::I32, DataType::F32),
+            validate_csr(
+                3,
+                3,
+                2,
+                12,
+                8,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            ),
             Err(Error::InvalidInput(_))
         ));
         // nnz=2 needs 2*4 = 8 bytes for col_ind and values
         assert!(matches!(
-            validate_csr(3, 3, 2, 16, 4, 8, IndexType::I32, IndexType::I32, DataType::F32),
+            validate_csr(
+                3,
+                3,
+                2,
+                16,
+                4,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            ),
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
-            validate_csr(3, 3, 2, 16, 8, 4, IndexType::I32, IndexType::I32, DataType::F32),
+            validate_csr(
+                3,
+                3,
+                2,
+                16,
+                8,
+                4,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            ),
             Err(Error::InvalidInput(_))
         ));
-        assert!(validate_csr(3, 3, 2, 16, 8, 8, IndexType::I32, IndexType::I32, DataType::F32).is_ok());
+        assert!(
+            validate_csr(
+                3,
+                3,
+                2,
+                16,
+                8,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn csc_and_coo_validation_checks() {
         // CSC: 4 cols needs (4+1)*4 = 20 bytes
-        assert!(validate_csc(3, 4, 2, 16, 8, 8, IndexType::I32, IndexType::I32, DataType::F32).is_err());
-        assert!(validate_csc(3, 4, 2, 20, 8, 8, IndexType::I32, IndexType::I32, DataType::F32).is_ok());
+        assert!(
+            validate_csc(
+                3,
+                4,
+                2,
+                16,
+                8,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            )
+            .is_err()
+        );
+        assert!(
+            validate_csc(
+                3,
+                4,
+                2,
+                20,
+                8,
+                8,
+                IndexType::I32,
+                IndexType::I32,
+                DataType::F32
+            )
+            .is_ok()
+        );
         // COO: nnz=5 needs 5*8=40 bytes for I64 indices and 5*8=40 bytes for F64 values
         assert!(validate_coo(4, 4, 5, 32, 40, 40, IndexType::I64, DataType::F64).is_err());
         assert!(validate_coo(4, 4, 5, 40, 40, 40, IndexType::I64, DataType::F64).is_ok());

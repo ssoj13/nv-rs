@@ -28,8 +28,8 @@ use nvcomp_sys as sys;
 use thiserror::Error;
 
 pub use batched::{
-    compress_batched_async, decompress_batched_async, query_decompress_sizes_async,
-    BatchedCompressReceipt, BatchedDecompressReceipt,
+    BatchedCompressReceipt, BatchedDecompressReceipt, compress_batched_async,
+    decompress_batched_async, query_decompress_sizes_async,
 };
 pub use bitcomp::{BitcompAlgo, BitcompDataType, BitcompPlan};
 pub use format::{
@@ -188,14 +188,19 @@ pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
 
 pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Result<()> {
     if !Arc::ptr_eq(stream, expected) {
-        return Err(Error::Invalid("staging/scratch buffer belongs to a different CUDA stream"));
+        return Err(Error::Invalid(
+            "staging/scratch buffer belongs to a different CUDA stream",
+        ));
     }
     Ok(())
 }
 
 pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
     match budget {
-        Some(available) if peak > available => Err(Error::Budget { requested: peak, available }),
+        Some(available) if peak > available => Err(Error::Budget {
+            requested: peak,
+            available,
+        }),
         _ => Ok(()),
     }
 }
@@ -211,8 +216,14 @@ mod tests {
         assert!(!NvcompStatus::INVALID_VALUE.is_success());
         assert!(check("ok", sys::nvcompStatus_t_nvcompSuccess).is_ok());
         assert!(matches!(
-            check("nvcompBatchedLZ4CompressAsync", sys::nvcompStatus_t_nvcompErrorAlignment),
-            Err(Error::Status { call: "nvcompBatchedLZ4CompressAsync", .. })
+            check(
+                "nvcompBatchedLZ4CompressAsync",
+                sys::nvcompStatus_t_nvcompErrorAlignment
+            ),
+            Err(Error::Status {
+                call: "nvcompBatchedLZ4CompressAsync",
+                ..
+            })
         ));
 
         assert!(BitcompStatus::SUCCESS.is_success());
@@ -220,14 +231,20 @@ mod tests {
         assert!(check_bitcomp("bitcompCreatePlan", sys::bitcompResult_t_BITCOMP_SUCCESS).is_ok());
         assert!(matches!(
             check_bitcomp("bitcompCreatePlan", -1),
-            Err(Error::BitcompStatus { call: "bitcompCreatePlan", code: BitcompStatus(-1) })
+            Err(Error::BitcompStatus {
+                call: "bitcompCreatePlan",
+                code: BitcompStatus(-1)
+            })
         ));
 
         assert!(within(None, usize::MAX).is_ok());
         assert!(within(Some(4096), 4096).is_ok());
         assert!(matches!(
             within(Some(4096), 8192),
-            Err(Error::Budget { requested: 8192, available: 4096 })
+            Err(Error::Budget {
+                requested: 8192,
+                available: 4096
+            })
         ));
     }
 
@@ -254,9 +271,12 @@ mod tests {
         ] {
             let format = Format::default_for(kind);
             let mut mgr =
-                CompressionManager::new(&stream, format, 16 * 1024, Some(512 * 1024 * 1024)).unwrap();
+                CompressionManager::new(&stream, format, 16 * 1024, Some(512 * 1024 * 1024))
+                    .unwrap();
             let compressed = mgr.compress_async(&stream, &dev_in).unwrap();
-            let dev_out = mgr.decompress_to_buffer_async(&stream, &compressed).unwrap();
+            let dev_out = mgr
+                .decompress_to_buffer_async(&stream, &compressed)
+                .unwrap();
             stream.synchronize().unwrap();
             let host_out = dev_out.to_host_vec(&stream).unwrap();
             assert_eq!(host_out, host_in, "roundtrip mismatch for {kind:?}");

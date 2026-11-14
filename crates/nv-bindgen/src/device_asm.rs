@@ -142,18 +142,30 @@ pub fn scan(file: &str, text: &str) -> Result<Scan, ScanError> {
     let mut from = 0;
     while let Some((start, body_start, volatile)) = next_asm(&text, from) {
         let line = text[..start].matches('\n').count() + 1;
-        let err = |why: String| ScanError::Parse { file: file.to_owned(), line, why };
-        let end = matching_paren(&text, body_start - 1).ok_or_else(|| err("unbalanced asm parentheses".into()))?;
+        let err = |why: String| ScanError::Parse {
+            file: file.to_owned(),
+            line,
+            why,
+        };
+        let end = matching_paren(&text, body_start - 1)
+            .ok_or_else(|| err("unbalanced asm parentheses".into()))?;
         let body = &text[body_start..end];
         from = end;
         let sections = split_sections(body);
         let (pieces, macro_param) = template_pieces(sections[0]).map_err(err)?;
-        let outputs = sections.get(1).map_or(Ok(Vec::new()), |s| constraints(s, true)).map_err(err)?;
-        let inputs = sections.get(2).map_or(Ok(Vec::new()), |s| constraints(s, false)).map_err(err)?;
+        let outputs = sections
+            .get(1)
+            .map_or(Ok(Vec::new()), |s| constraints(s, true))
+            .map_err(err)?;
+        let inputs = sections
+            .get(2)
+            .map_or(Ok(Vec::new()), |s| constraints(s, false))
+            .map_err(err)?;
         let templates = match macro_param {
             None => vec![pieces.concat_with("")],
             Some(param) => {
-                let args = macro_args(&text, start, &param).ok_or_else(|| err(format!("no invocations for macro parameter #{param}")))?;
+                let args = macro_args(&text, start, &param)
+                    .ok_or_else(|| err(format!("no invocations for macro parameter #{param}")))?;
                 args.iter().map(|a| pieces.concat_with(a)).collect()
             }
         };
@@ -164,15 +176,34 @@ pub fn scan(file: &str, text: &str) -> Result<Scan, ScanError> {
             };
             // GCC rule: an asm statement without outputs is implicitly volatile.
             let volatile = volatile || outputs.is_empty();
-            let new = Intrinsic { name: name.clone(), template, outputs: outputs.clone(), inputs: inputs.clone(), volatile, sites: 1 };
+            let new = Intrinsic {
+                name: name.clone(),
+                template,
+                outputs: outputs.clone(),
+                inputs: inputs.clone(),
+                volatile,
+                sites: 1,
+            };
             match scan.intrinsics.get_mut(&name) {
                 None => {
                     scan.intrinsics.insert(name, new);
                 }
                 Some(old) => {
-                    let shape = |i: &Intrinsic| format!("{:?} -> {:?} volatile={} `{}`", i.inputs, i.outputs, i.volatile, normalize(&i.template));
+                    let shape = |i: &Intrinsic| {
+                        format!(
+                            "{:?} -> {:?} volatile={} `{}`",
+                            i.inputs,
+                            i.outputs,
+                            i.volatile,
+                            normalize(&i.template)
+                        )
+                    };
                     if shape(old) != shape(&new) {
-                        return Err(ScanError::Conflict { name, a: shape(old), b: shape(&new) });
+                        return Err(ScanError::Conflict {
+                            name,
+                            a: shape(old),
+                            b: shape(&new),
+                        });
                     }
                     old.sites += 1;
                 }
@@ -203,7 +234,10 @@ fn next_asm(text: &str, mut from: usize) -> Option<(usize, usize, bool)> {
         let s = from + p;
         from = s + 3;
         let word_start = s == 0 || !(b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_');
-        if !word_start || b.get(s + 3).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+        if !word_start
+            || b.get(s + 3)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
             continue;
         }
         let mut j = skip_ws(text, s + 3);
@@ -317,7 +351,10 @@ fn template_pieces(section: &str) -> Result<(Pieces, Option<String>), String> {
             pieces.push(String::new());
             i = e;
         } else {
-            return Err(format!("unexpected `{}` in asm template", &section[i..(i + 20).min(section.len())]));
+            return Err(format!(
+                "unexpected `{}` in asm template",
+                &section[i..(i + 20).min(section.len())]
+            ));
         }
     }
     Ok((Pieces(pieces), param))
@@ -357,7 +394,12 @@ fn constraints(section: &str, outputs: bool) -> Result<Vec<Reg>, String> {
         let letter = match (outputs, c.strip_prefix('=')) {
             (true, Some(l)) => l,
             (false, None) if !c.starts_with('+') => c,
-            _ => return Err(format!("unsupported constraint \"{c}\" in {} operands", if outputs { "output" } else { "input" })),
+            _ => {
+                return Err(format!(
+                    "unsupported constraint \"{c}\" in {} operands",
+                    if outputs { "output" } else { "input" }
+                ));
+            }
         };
         let mut it = letter.chars();
         let reg = match (it.next(), it.next()) {
@@ -394,8 +436,12 @@ fn macro_args(text: &str, at: usize, param: &str) -> Option<Vec<String>> {
         let s = from + p;
         from = s + name.len();
         let rest = text[from..].trim_start();
-        let Some(rest) = rest.strip_prefix('(') else { continue };
-        let Some(close) = rest.find(')') else { continue };
+        let Some(rest) = rest.strip_prefix('(') else {
+            continue;
+        };
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
         let arg = rest[..close].trim();
         if arg != param && !arg.is_empty() {
             args.push(arg.to_owned());
@@ -415,33 +461,82 @@ pub fn emit(scan: &Scan, header: &str, ptx_asm: &str) -> String {
     let mut s = String::new();
     for i in scan.intrinsics.values() {
         let fname = i.name.trim_start_matches("_optix_");
-        let params: Vec<String> = i.inputs.iter().enumerate().map(|(k, r)| format!("a{k}: {}", r.rust())).collect();
+        let params: Vec<String> = i
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(k, r)| format!("a{k}: {}", r.rust()))
+            .collect();
         let ret = match i.outputs.as_slice() {
             [] => String::new(),
             [one] => format!(" -> {}", one.rust()),
-            many if many.iter().all(|r| *r == many[0]) => format!(" -> [{}; {}]", many[0].rust(), many.len()),
-            many => format!(" -> ({})", many.iter().map(|r| r.rust()).collect::<Vec<_>>().join(", ")),
+            many if many.iter().all(|r| *r == many[0]) => {
+                format!(" -> [{}; {}]", many[0].rust(), many.len())
+            }
+            many => format!(
+                " -> ({})",
+                many.iter().map(|r| r.rust()).collect::<Vec<_>>().join(", ")
+            ),
         };
-        let _ = writeln!(s, "/// `{}` ({header}, {} call site{}).", i.name, i.sites, if i.sites == 1 { "" } else { "s" });
-        let _ = writeln!(s, "///\n/// # Safety\n///\n/// Valid only in the OptiX program types the OptiX documentation lists for this intrinsic.");
-        let _ = writeln!(s, "#[inline(always)]\n#[allow(clippy::too_many_arguments)]\npub unsafe fn {fname}({}){ret} {{", params.join(", "));
+        let _ = writeln!(
+            s,
+            "/// `{}` ({header}, {} call site{}).",
+            i.name,
+            i.sites,
+            if i.sites == 1 { "" } else { "s" }
+        );
+        let _ = writeln!(
+            s,
+            "///\n/// # Safety\n///\n/// Valid only in the OptiX program types the OptiX documentation lists for this intrinsic."
+        );
+        let _ = writeln!(
+            s,
+            "#[inline(always)]\n#[allow(clippy::too_many_arguments)]\npub unsafe fn {fname}({}){ret} {{",
+            params.join(", ")
+        );
         for (k, r) in i.outputs.iter().enumerate() {
             let _ = writeln!(s, "    let o{k}: {};", r.rust());
         }
-        let mut ops: Vec<String> = i.outputs.iter().enumerate().map(|(k, r)| format!("out(\"={}\") o{k}", r.letter())).collect();
-        ops.extend(i.inputs.iter().enumerate().map(|(k, r)| format!("in(\"{}\") a{k}", r.letter())));
+        let mut ops: Vec<String> = i
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(k, r)| format!("out(\"={}\") o{k}", r.letter()))
+            .collect();
+        ops.extend(
+            i.inputs
+                .iter()
+                .enumerate()
+                .map(|(k, r)| format!("in(\"{}\") a{k}", r.letter())),
+        );
         if !i.volatile {
             ops.push("options(register_only)".into());
         }
-        let _ = writeln!(s, "    // SAFETY: the header's own inline PTX for this intrinsic; the caller upholds the program-type contract.");
-        let _ = writeln!(s, "    unsafe {{ {ptx_asm}!({:?}, {}) }};", i.template, ops.join(", "));
+        let _ = writeln!(
+            s,
+            "    // SAFETY: the header's own inline PTX for this intrinsic; the caller upholds the program-type contract."
+        );
+        let _ = writeln!(
+            s,
+            "    unsafe {{ {ptx_asm}!({:?}, {}) }};",
+            i.template,
+            ops.join(", ")
+        );
         match i.outputs.len() {
             0 => {}
             1 => s.push_str("    o0\n"),
             n => {
-                let list = (0..n).map(|k| format!("o{k}")).collect::<Vec<_>>().join(", ");
+                let list = (0..n)
+                    .map(|k| format!("o{k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let all_same = i.outputs.iter().all(|r| *r == i.outputs[0]);
-                let _ = writeln!(s, "    {}{list}{}", if all_same { "[" } else { "(" }, if all_same { "]" } else { ")" });
+                let _ = writeln!(
+                    s,
+                    "    {}{list}{}",
+                    if all_same { "[" } else { "(" },
+                    if all_same { "]" } else { ")" }
+                );
             }
         }
         s.push_str("}\n\n");
@@ -493,7 +588,15 @@ static void acc() { asm( "call (), _optix_reduce, (%0);" : : "l"( p ) ); }
         let names: Vec<_> = s.intrinsics.keys().cloned().collect();
         assert_eq!(
             names,
-            ["_optix_get_attribute_0", "_optix_get_attribute_1", "_optix_get_launch_index_x", "_optix_get_tri", "_optix_reduce", "_optix_set_payload", "_optix_terminate_ray"]
+            [
+                "_optix_get_attribute_0",
+                "_optix_get_attribute_1",
+                "_optix_get_launch_index_x",
+                "_optix_get_tri",
+                "_optix_reduce",
+                "_optix_set_payload",
+                "_optix_terminate_ray"
+            ]
         );
         let tri = &s.intrinsics["_optix_get_tri"];
         assert_eq!(tri.template, "call (%0, %1, %2), _optix_get_tri, (%3, %4);");
@@ -503,8 +606,14 @@ static void acc() { asm( "call (), _optix_reduce, (%0);" : : "l"( p ) ); }
         let set = &s.intrinsics["_optix_set_payload"];
         assert!(set.volatile);
         assert_eq!(set.sites, 2);
-        assert!(s.intrinsics["_optix_reduce"].volatile, "no outputs: implicitly volatile");
-        assert_eq!(s.intrinsics["_optix_get_attribute_1"].template, "call (%0), _optix_get_attribute_1, ();");
+        assert!(
+            s.intrinsics["_optix_reduce"].volatile,
+            "no outputs: implicitly volatile"
+        );
+        assert_eq!(
+            s.intrinsics["_optix_get_attribute_1"].template,
+            "call (%0), _optix_get_attribute_1, ();"
+        );
         assert_eq!(s.plain_ptx, ["cvta.to.global.u64 %0, %1;"]);
     }
 
@@ -525,18 +634,30 @@ static void acc() { asm( "call (), _optix_reduce, (%0);" : : "l"( p ) ); }
     fn emits_wrappers_with_matching_types() {
         let s = scan("fake.h", HEADER).expect("scan");
         let src = emit(&s, "fake.h", "ptx_asm");
-        assert!(src.contains("pub unsafe fn get_tri(a0: u64, a1: f32) -> (f32, f32, u32) {"), "{src}");
+        assert!(
+            src.contains("pub unsafe fn get_tri(a0: u64, a1: f32) -> (f32, f32, u32) {"),
+            "{src}"
+        );
         assert!(src.contains("pub unsafe fn get_launch_index_x() -> u32 {"));
         assert!(src.contains("pub unsafe fn set_payload(a0: u32, a1: u32) {"));
-        assert!(src.contains(r#"out("=r") o0, options(register_only)"#), "pure getters are register_only");
-        assert!(src.contains(r#"in("r") a1) }"#), "volatile statements keep side effects");
+        assert!(
+            src.contains(r#"out("=r") o0, options(register_only)"#),
+            "pure getters are register_only"
+        );
+        assert!(
+            src.contains(r#"in("r") a1) }"#),
+            "volatile statements keep side effects"
+        );
         syn::parse_file(&src.replace("ptx_asm!", "dummy!")).expect("valid Rust");
     }
 }
 
 /// The OptiX device headers the wrappers come from, relative to the SDK's `include/`.
-pub const OPTIX_DEVICE_HEADERS: &[&str] =
-    &["internal/optix_device_impl.h", "internal/optix_device_impl_transformations.h", "internal/optix_device_impl_coop_vec.h"];
+pub const OPTIX_DEVICE_HEADERS: &[&str] = &[
+    "internal/optix_device_impl.h",
+    "internal/optix_device_impl_transformations.h",
+    "internal/optix_device_impl_coop_vec.h",
+];
 
 /// Scans the OptiX device headers under `include_dir` into one [`Scan`] and checks coverage:
 /// every `_optix_*` name in them must have a wrapper (macro bases such as
@@ -547,9 +668,13 @@ pub fn scan_optix(include_dir: &std::path::Path) -> Result<(Scan, Vec<(String, S
     let mut universe = BTreeSet::new();
     for h in OPTIX_DEVICE_HEADERS {
         let path = include_dir.join(h);
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         use sha2::Digest;
-        hashes.push((h.to_string(), format!("{:x}", sha2::Sha256::digest(text.as_bytes()))));
+        hashes.push((
+            h.to_string(),
+            format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+        ));
         universe.extend(names(&text));
         let s = scan(h, &text).map_err(|e| e.to_string())?;
         all.plain_ptx.extend(s.plain_ptx);
@@ -583,9 +708,15 @@ mod optix_sdk {
         let (scan, _) = super::scan_optix(&optix.include_dir()).expect("full coverage");
         let n = scan.intrinsics.len();
         eprintln!("{n} intrinsics; plain PTX helpers: {:?}", scan.plain_ptx);
-        let widest = scan.intrinsics.values().map(|i| i.inputs.len()).max().unwrap_or(0);
+        let widest = scan
+            .intrinsics
+            .values()
+            .map(|i| i.inputs.len())
+            .max()
+            .unwrap_or(0);
         eprintln!("widest input list: {widest}");
         assert!(n >= 190, "{n}");
-        syn::parse_file(&super::emit(&scan, "optix", "ptx_asm").replace("ptx_asm!", "dummy!")).expect("valid Rust");
+        syn::parse_file(&super::emit(&scan, "optix", "ptx_asm").replace("ptx_asm!", "dummy!"))
+            .expect("valid Rust");
     }
 }

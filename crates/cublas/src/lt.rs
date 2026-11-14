@@ -95,8 +95,13 @@ impl LtHandle {
         cuda.bind_to_thread()?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `cuda` is bound and alive; `raw` is a valid out-pointer.
-        check_lt("cublasLtCreate", unsafe { lt_sys::cublasLtCreate(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        check_lt("cublasLtCreate", unsafe {
+            lt_sys::cublasLtCreate(&mut raw)
+        })?;
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Returns the raw `cublasLtHandle_t`.
@@ -140,14 +145,19 @@ impl LtHandle {
             )
         })?;
         if count <= 0 || result.raw.state != lt_sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS {
-            return Err(Error::Invalid("cublasLtMatmulAlgoGetHeuristic found no supported algorithm"));
+            return Err(Error::Invalid(
+                "cublasLtMatmulAlgoGetHeuristic found no supported algorithm",
+            ));
         }
         Ok(result)
     }
 
     /// Queries up to `out.capacity()` heuristic algorithms into `out` (or resizes `out` to
     /// `max_results`), returning the number of valid entries written.
-    #[expect(clippy::too_many_arguments, reason = "cublasLtMatmulAlgoGetHeuristic requires desc, 4 layouts, pref, max_results, and output vec")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cublasLtMatmulAlgoGetHeuristic requires desc, 4 layouts, pref, max_results, and output vec"
+    )]
     pub fn matmul_heuristics(
         &self,
         desc: &MatmulDesc,
@@ -164,7 +174,8 @@ impl LtHandle {
             return Ok(0);
         }
         self.cuda.bind_to_thread()?;
-        let req = i32::try_from(max_results).map_err(|_| Error::Invalid("max_results exceeds i32::MAX"))?;
+        let req = i32::try_from(max_results)
+            .map_err(|_| Error::Invalid("max_results exceeds i32::MAX"))?;
         out.resize(max_results, HeuristicResult::zeroed());
         let mut count = 0i32;
         // SAFETY: `HeuristicResult` is `#[repr(transparent)]` over `cublasLtMatmulHeuristicResult_t`,
@@ -197,7 +208,10 @@ impl LtHandle {
     /// `alpha` and `beta` must point to valid scale values matching `desc`'s scale type and
     /// pointer mode. `a`, `b`, `c`, and `d` must hold at least the byte extents described by
     /// `a_desc`, `b_desc`, `c_desc`, and `d_desc`.
-    #[expect(clippy::too_many_arguments, reason = "cublasLtMatmul requires descriptors, buffers, algo, scratch, and stream")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cublasLtMatmul requires descriptors, buffers, algo, scratch, and stream"
+    )]
     pub unsafe fn matmul_with_scratch(
         &self,
         stream: &Stream,
@@ -217,10 +231,14 @@ impl LtHandle {
         budget: usize,
     ) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
-            return Err(Error::Invalid("stream belongs to a different CUDA context than LtHandle"));
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than LtHandle",
+            ));
         }
         if !std::ptr::eq(stream, &**scratch.stream()) {
-            return Err(Error::Invalid("scratch stream does not match matmul execution stream"));
+            return Err(Error::Invalid(
+                "scratch stream does not match matmul execution stream",
+            ));
         }
         if alpha.is_null() || beta.is_null() {
             return Err(Error::Invalid("alpha and beta pointers must be non-null"));
@@ -253,7 +271,10 @@ impl LtHandle {
     }
 
     /// Convenience `f32` matmul with host scalars `alpha` and `beta` and caller-owned [`Scratch`].
-    #[expect(clippy::too_many_arguments, reason = "cublasLtMatmul convenience wrapper")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cublasLtMatmul convenience wrapper"
+    )]
     pub fn matmul_f32(
         &self,
         stream: &Stream,
@@ -273,27 +294,37 @@ impl LtHandle {
         budget: usize,
     ) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
-            return Err(Error::Invalid("stream belongs to a different CUDA context than LtHandle"));
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than LtHandle",
+            ));
         }
         if !std::ptr::eq(stream, &**scratch.stream()) {
-            return Err(Error::Invalid("scratch stream does not match matmul execution stream"));
+            return Err(Error::Invalid(
+                "scratch stream does not match matmul execution stream",
+            ));
         }
         if desc.pointer_mode != PointerMode::Host || desc.scale != DataType::F32 {
-            return Err(Error::Invalid("matmul_f32 requires PointerMode::Host and DataType::F32 scale"));
+            return Err(Error::Invalid(
+                "matmul_f32 requires PointerMode::Host and DataType::F32 scale",
+            ));
         }
         if a_desc.dtype != DataType::F32
             || b_desc.dtype != DataType::F32
             || c_desc.dtype != DataType::F32
             || d_desc.dtype != DataType::F32
         {
-            return Err(Error::Invalid("matmul_f32 requires DataType::F32 for all matrix layouts"));
+            return Err(Error::Invalid(
+                "matmul_f32 requires DataType::F32 for all matrix layouts",
+            ));
         }
         if a.len() < a_desc.min_elems()?
             || b.len() < b_desc.min_elems()?
             || c.len() < c_desc.min_elems()?
             || d.len() < d_desc.min_elems()?
         {
-            return Err(Error::Invalid("device buffer smaller than required MatrixLayout extent"));
+            return Err(Error::Invalid(
+                "device buffer smaller than required MatrixLayout extent",
+            ));
         }
         let ws_bytes = heuristic.workspace_size();
         let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, budget)?;
@@ -331,7 +362,10 @@ impl Drop for LtHandle {
                 let code = unsafe { lt_sys::cublasLtDestroy(self.raw) };
                 teardown_lt(&self.cuda, code);
             } else {
-                teardown_lt(&self.cuda, lt_sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED);
+                teardown_lt(
+                    &self.cuda,
+                    lt_sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED,
+                );
             }
             self.raw = std::ptr::null_mut();
         }
@@ -358,7 +392,12 @@ impl MatmulDesc {
         check_lt("cublasLtMatmulDescCreate", unsafe {
             lt_sys::cublasLtMatmulDescCreate(&mut raw, compute.raw_lt(), scale.raw_lt())
         })?;
-        Ok(Self { raw, cuda: cuda.clone(), scale, pointer_mode: PointerMode::Host })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            scale,
+            pointer_mode: PointerMode::Host,
+        })
     }
 
     /// Sets the transpose operation for matrix A (`CUBLASLT_MATMUL_DESC_TRANSA`).
@@ -449,9 +488,17 @@ unsafe impl Send for MatrixLayout {}
 
 impl MatrixLayout {
     /// Creates a matrix layout descriptor for `rows x cols` with leading dimension `ld`.
-    pub fn new(cuda: &Arc<Context>, dtype: DataType, rows: u64, cols: u64, ld: i64) -> Result<Self> {
+    pub fn new(
+        cuda: &Arc<Context>,
+        dtype: DataType,
+        rows: u64,
+        cols: u64,
+        ld: i64,
+    ) -> Result<Self> {
         if rows == 0 || cols == 0 || ld <= 0 {
-            return Err(Error::Invalid("matrix layout requires positive rows, cols, and ld"));
+            return Err(Error::Invalid(
+                "matrix layout requires positive rows, cols, and ld",
+            ));
         }
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
@@ -491,7 +538,9 @@ impl MatrixLayout {
     /// Sets batched count and strided batch offset in elements.
     pub fn set_batch(&mut self, batch_count: i32, strided_offset: i64) -> Result<()> {
         if batch_count <= 0 || strided_offset < 0 {
-            return Err(Error::Invalid("batch_count must be positive and strided_offset non-negative"));
+            return Err(Error::Invalid(
+                "batch_count must be positive and strided_offset non-negative",
+            ));
         }
         // SAFETY: `batch_count` is `int32_t` as documented for `CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT`.
         check_lt("cublasLtMatrixLayoutSetAttribute", unsafe {
@@ -518,16 +567,21 @@ impl MatrixLayout {
 
     /// Minimum required element count for buffers bound to this layout.
     pub fn min_elems(&self) -> Result<usize> {
-        let ld = u64::try_from(self.ld).map_err(|_| Error::Invalid("negative leading dimension"))?;
+        let ld =
+            u64::try_from(self.ld).map_err(|_| Error::Invalid("negative leading dimension"))?;
         let matrix_span = match self.order {
             Order::Row => self.rows.checked_mul(ld),
-            Order::Col | Order::Col32 | Order::Col44r28c | Order::Col322r4r4 => self.cols.checked_mul(ld),
+            Order::Col | Order::Col32 | Order::Col44r28c | Order::Col322r4r4 => {
+                self.cols.checked_mul(ld)
+            }
         }
         .ok_or(Error::Invalid("matrix layout element count overflow"))?;
         let batch_span = ((self.batch_count - 1) as u64)
             .checked_mul(self.strided_offset as u64)
             .ok_or(Error::Invalid("matrix layout batch offset overflow"))?;
-        let total = matrix_span.checked_add(batch_span).ok_or(Error::Invalid("matrix layout total extent overflow"))?;
+        let total = matrix_span
+            .checked_add(batch_span)
+            .ok_or(Error::Invalid("matrix layout total extent overflow"))?;
         usize::try_from(total).map_err(|_| Error::Invalid("matrix layout extent exceeds usize"))
     }
 }
@@ -561,7 +615,10 @@ impl Preference {
         check_lt("cublasLtMatmulPreferenceCreate", unsafe {
             lt_sys::cublasLtMatmulPreferenceCreate(&mut raw)
         })?;
-        Ok(Self { raw, cuda: cuda.clone() })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Sets the maximum workspace size in bytes (`CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`).
@@ -599,7 +656,9 @@ pub struct HeuristicResult {
 impl HeuristicResult {
     fn zeroed() -> Self {
         // SAFETY: `cublasLtMatmulHeuristicResult_t` is plain C POD data; zeroing is valid.
-        Self { raw: unsafe { std::mem::zeroed() } }
+        Self {
+            raw: unsafe { std::mem::zeroed() },
+        }
     }
 
     /// Returns `true` when this heuristic entry succeeded (`CUBLAS_STATUS_SUCCESS`).

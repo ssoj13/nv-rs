@@ -18,7 +18,7 @@ use crate::descriptor::{
 };
 use crate::handle::Handle;
 use crate::scratch::Scratch;
-use crate::{check, record_teardown, same_ctx, DataType, DeviceSpan, Error, Result};
+use crate::{DataType, DeviceSpan, Error, Result, check, record_teardown, same_ctx};
 
 /// Softmax algorithm selection (`cudnnSoftmaxAlgorithm_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,9 +78,7 @@ impl BatchNormMode {
         match self {
             Self::PerActivation => sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_PER_ACTIVATION,
             Self::Spatial => sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_SPATIAL,
-            Self::SpatialPersistent => {
-                sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_SPATIAL_PERSISTENT
-            }
+            Self::SpatialPersistent => sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_SPATIAL_PERSISTENT,
         }
     }
 }
@@ -121,7 +119,9 @@ fn check_tensor_buf<B: DeviceSpan + ?Sized>(
     label: &'static str,
 ) -> Result<()> {
     if !Arc::ptr_eq(desc.context(), ctx) || !Arc::ptr_eq(buf.context(), ctx) {
-        return Err(Error::Invalid("tensor descriptor or device buffer belongs to another context"));
+        return Err(Error::Invalid(
+            "tensor descriptor or device buffer belongs to another context",
+        ));
     }
     if buf.num_bytes() < desc.size_in_bytes() {
         return Err(Error::Invalid(label));
@@ -135,10 +135,14 @@ fn check_filter_buf<B: DeviceSpan + ?Sized>(
     buf: &B,
 ) -> Result<()> {
     if !Arc::ptr_eq(desc.context(), ctx) || !Arc::ptr_eq(buf.context(), ctx) {
-        return Err(Error::Invalid("filter descriptor or weight buffer belongs to another context"));
+        return Err(Error::Invalid(
+            "filter descriptor or weight buffer belongs to another context",
+        ));
     }
     if buf.num_bytes() < desc.size_in_bytes() {
-        return Err(Error::Invalid("filter buffer smaller than descriptor size_in_bytes"));
+        return Err(Error::Invalid(
+            "filter buffer smaller than descriptor size_in_bytes",
+        ));
     }
     Ok(())
 }
@@ -148,7 +152,12 @@ fn check_mut_tensor_buf<T>(
     desc: &TensorDescriptor,
     buf: &DeviceBuffer<T>,
 ) -> Result<()> {
-    check_tensor_buf(ctx, desc, buf, "output buffer smaller than descriptor size_in_bytes")
+    check_tensor_buf(
+        ctx,
+        desc,
+        buf,
+        "output buffer smaller than descriptor size_in_bytes",
+    )
 }
 
 /// Queries the forward convolution workspace size in bytes for `algo`.
@@ -218,9 +227,16 @@ where
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
     if !Arc::ptr_eq(conv_desc.context(), &ctx) {
-        return Err(Error::Invalid("convolution descriptor belongs to another context"));
+        return Err(Error::Invalid(
+            "convolution descriptor belongs to another context",
+        ));
     }
-    check_tensor_buf(&ctx, x_desc, x, "input buffer smaller than descriptor size_in_bytes")?;
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
     check_filter_buf(&ctx, w_desc, w)?;
     check_mut_tensor_buf(&ctx, y_desc, y)?;
 
@@ -276,9 +292,16 @@ where
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
     if !Arc::ptr_eq(act_desc.context(), &ctx) {
-        return Err(Error::Invalid("activation descriptor belongs to another context"));
+        return Err(Error::Invalid(
+            "activation descriptor belongs to another context",
+        ));
     }
-    check_tensor_buf(&ctx, x_desc, x, "input buffer smaller than descriptor size_in_bytes")?;
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
     check_mut_tensor_buf(&ctx, y_desc, y)?;
     handle.ensure_stream(stream)?;
 
@@ -324,9 +347,16 @@ where
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
     if !Arc::ptr_eq(pool_desc.context(), &ctx) {
-        return Err(Error::Invalid("pooling descriptor belongs to another context"));
+        return Err(Error::Invalid(
+            "pooling descriptor belongs to another context",
+        ));
     }
-    check_tensor_buf(&ctx, x_desc, x, "input buffer smaller than descriptor size_in_bytes")?;
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
     check_mut_tensor_buf(&ctx, y_desc, y)?;
     handle.ensure_stream(stream)?;
 
@@ -372,7 +402,12 @@ where
 {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    check_tensor_buf(&ctx, x_desc, x, "input buffer smaller than descriptor size_in_bytes")?;
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
     check_mut_tensor_buf(&ctx, y_desc, y)?;
     handle.ensure_stream(stream)?;
 
@@ -452,10 +487,25 @@ where
     }
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    check_tensor_buf(&ctx, x_desc, x, "input buffer smaller than descriptor size_in_bytes")?;
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
     check_mut_tensor_buf(&ctx, y_desc, y)?;
-    check_tensor_buf(&ctx, bn_param_desc, scale, "bn scale buffer smaller than descriptor")?;
-    check_tensor_buf(&ctx, bn_param_desc, bias, "bn bias buffer smaller than descriptor")?;
+    check_tensor_buf(
+        &ctx,
+        bn_param_desc,
+        scale,
+        "bn scale buffer smaller than descriptor",
+    )?;
+    check_tensor_buf(
+        &ctx,
+        bn_param_desc,
+        bias,
+        "bn bias buffer smaller than descriptor",
+    )?;
     check_tensor_buf(
         &ctx,
         bn_param_desc,
@@ -508,9 +558,18 @@ mod tests {
         let f64_scale = ScalePair::new(DataType::F64, 1.5, 0.25);
         assert!(matches!(f64_scale, ScalePair::F64([a, b]) if a == 1.5 && b == 0.25));
 
-        assert_eq!(SoftmaxAlgo::Accurate.to_sys(), sys::cudnnSoftmaxAlgorithm_t_CUDNN_SOFTMAX_ACCURATE);
-        assert_eq!(SoftmaxMode::Channel.to_sys(), sys::cudnnSoftmaxMode_t_CUDNN_SOFTMAX_MODE_CHANNEL);
-        assert_eq!(BatchNormMode::Spatial.to_sys(), sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_SPATIAL);
+        assert_eq!(
+            SoftmaxAlgo::Accurate.to_sys(),
+            sys::cudnnSoftmaxAlgorithm_t_CUDNN_SOFTMAX_ACCURATE
+        );
+        assert_eq!(
+            SoftmaxMode::Channel.to_sys(),
+            sys::cudnnSoftmaxMode_t_CUDNN_SOFTMAX_MODE_CHANNEL
+        );
+        assert_eq!(
+            BatchNormMode::Spatial.to_sys(),
+            sys::cudnnBatchNormMode_t_CUDNN_BATCHNORM_SPATIAL
+        );
     }
 
     #[test]
@@ -521,7 +580,9 @@ mod tests {
         let mut handle = Handle::new(&ctx).unwrap();
         handle.set_stream(&stream).unwrap();
 
-        let x_desc = TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, [1, 2, 2, 2]).unwrap();
+        let x_desc =
+            TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, [1, 2, 2, 2])
+                .unwrap();
         let pool_desc = PoolingDescriptor::new_2d(
             &ctx,
             crate::PoolingMode::Max,
@@ -533,12 +594,25 @@ mod tests {
         .unwrap();
         let pool_dims = pool_desc.output_dim_4d(&x_desc).unwrap();
         assert_eq!(pool_dims, [1, 2, 1, 1]);
-        let y_pool_desc = TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, pool_dims).unwrap();
+        let y_pool_desc =
+            TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, pool_dims)
+                .unwrap();
 
         let x_host: [f32; 8] = [1.0, 4.0, 2.0, 3.0, -1.0, 0.0, 5.0, 2.0];
         let x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
         let mut pool_out = DeviceBuffer::<f32>::zeroed(&stream, 2).unwrap();
-        pooling_forward(&mut handle, &stream, &pool_desc, 1.0, &x_desc, &x_dev, 0.0, &y_pool_desc, &mut pool_out).unwrap();
+        pooling_forward(
+            &mut handle,
+            &stream,
+            &pool_desc,
+            1.0,
+            &x_desc,
+            &x_dev,
+            0.0,
+            &y_pool_desc,
+            &mut pool_out,
+        )
+        .unwrap();
 
         let mut sm_out = DeviceBuffer::<f32>::zeroed(&stream, 2).unwrap();
         softmax_forward(

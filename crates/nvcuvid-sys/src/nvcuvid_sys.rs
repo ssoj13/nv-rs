@@ -23,8 +23,16 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["cuvidCreateDecoder", "cuvidDecodePicture", "cuvidCreateVideoParser", "cuvidGetDecoderCaps"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "cuvidCreateDecoder",
+            "cuvidDecodePicture",
+            "cuvidCreateVideoParser",
+            "cuvidGetDecoderCaps",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

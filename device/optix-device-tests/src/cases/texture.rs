@@ -1,5 +1,5 @@
 //! Case `texture`: `cuda-tex-device` fetches and surface accesses from plain CUDA kernels
-//! (no OptiX), launched with cuda-core on objects made by `cuda-ext`.
+//! (no OptiX), launched with cuda-core on objects made by `cuda-core-ext`.
 //!
 //! - `tex2d` point and linear on an 8x8 RGBA f32 array (unnormalized coordinates, clamp) and
 //!   `tex2d_gather` (channel 0, CUDA's texel order) against a CPU bilinear reference;
@@ -21,7 +21,7 @@
 use super::common::{Ctx, Gpu, R, close, same, subset_ptx};
 use cuda_core::{Function, Module, launch_kernel_on_stream};
 use cuda_device::{cuda_module, kernel, thread};
-use cuda_ext::{Array, ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, SurfaceObject, TextureDesc, TextureObject, TilePool};
+use cuda_core_ext::{Array, ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, SurfaceObject, TextureDesc, TextureObject, TilePool};
 use cuda_tex_device as tx;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -406,7 +406,7 @@ fn surfaces<T: bytemuck::Pod + Mk + PartialEq + std::fmt::Debug>(g: &Gpu, m: &Ar
 
 /// Runs the sparse-residency case.
 pub fn sparse(g: &Gpu) -> R {
-    if !cuda_ext::sparse_arrays_supported(&g.cuda).ctx("sparse attribute")? {
+    if !cuda_core_ext::sparse_arrays_supported(&g.cuda).ctx("sparse attribute")? {
         return Err("CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED is 0 on this device".into());
     }
     let s = &g.stream;

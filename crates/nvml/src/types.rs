@@ -45,7 +45,10 @@ pub(crate) fn encode_c_buf<const N: usize>(s: &str, label: &'static str) -> Resu
 
 /// Validates a GPU or MIG UUID string before passing it to `nvmlDeviceGetHandleByUUID`.
 pub(crate) fn validate_uuid(uuid: &str) -> Result<()> {
-    if uuid.is_empty() || uuid.as_bytes().contains(&0) || uuid.len() >= sys::NVML_DEVICE_UUID_V2_BUFFER_SIZE as usize {
+    if uuid.is_empty()
+        || uuid.as_bytes().contains(&0)
+        || uuid.len() >= sys::NVML_DEVICE_UUID_V2_BUFFER_SIZE as usize
+    {
         return Err(Error::InvalidInput("invalid UUID length or interior NUL"));
     }
     if !(uuid.starts_with("GPU-") || uuid.starts_with("MIG-")) {
@@ -69,7 +72,11 @@ pub struct PciBusId {
 
 impl fmt::Display for PciBusId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}:{:02x}:{:02x}.{:x}", self.domain, self.bus, self.device, self.function)
+        write!(
+            f,
+            "{:08x}:{:02x}:{:02x}.{:x}",
+            self.domain, self.bus, self.device, self.function
+        )
     }
 }
 
@@ -77,20 +84,44 @@ impl FromStr for PciBusId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let (domain_s, rest) = s.split_once(':').ok_or(Error::InvalidInput("PCI bus ID missing domain ':'"))?;
-        let (bus_s, rest) = rest.split_once(':').ok_or(Error::InvalidInput("PCI bus ID missing bus ':'"))?;
-        let (dev_s, func_s) = rest.split_once('.').ok_or(Error::InvalidInput("PCI bus ID missing function '.'"))?;
-        if domain_s.is_empty() || domain_s.len() > 8 || bus_s.is_empty() || bus_s.len() > 2 || dev_s.is_empty() || dev_s.len() > 2 || func_s.len() != 1 {
+        let (domain_s, rest) = s
+            .split_once(':')
+            .ok_or(Error::InvalidInput("PCI bus ID missing domain ':'"))?;
+        let (bus_s, rest) = rest
+            .split_once(':')
+            .ok_or(Error::InvalidInput("PCI bus ID missing bus ':'"))?;
+        let (dev_s, func_s) = rest
+            .split_once('.')
+            .ok_or(Error::InvalidInput("PCI bus ID missing function '.'"))?;
+        if domain_s.is_empty()
+            || domain_s.len() > 8
+            || bus_s.is_empty()
+            || bus_s.len() > 2
+            || dev_s.is_empty()
+            || dev_s.len() > 2
+            || func_s.len() != 1
+        {
             return Err(Error::InvalidInput("invalid PCI bus ID field width"));
         }
-        let domain = u32::from_str_radix(domain_s, 16).map_err(|_| Error::InvalidInput("invalid PCI domain hex"))?;
-        let bus = u8::from_str_radix(bus_s, 16).map_err(|_| Error::InvalidInput("invalid PCI bus hex"))?;
-        let device = u8::from_str_radix(dev_s, 16).map_err(|_| Error::InvalidInput("invalid PCI device hex"))?;
-        let function = u8::from_str_radix(func_s, 16).map_err(|_| Error::InvalidInput("invalid PCI function hex"))?;
+        let domain = u32::from_str_radix(domain_s, 16)
+            .map_err(|_| Error::InvalidInput("invalid PCI domain hex"))?;
+        let bus = u8::from_str_radix(bus_s, 16)
+            .map_err(|_| Error::InvalidInput("invalid PCI bus hex"))?;
+        let device = u8::from_str_radix(dev_s, 16)
+            .map_err(|_| Error::InvalidInput("invalid PCI device hex"))?;
+        let function = u8::from_str_radix(func_s, 16)
+            .map_err(|_| Error::InvalidInput("invalid PCI function hex"))?;
         if device > 31 || function > 7 {
-            return Err(Error::InvalidInput("PCI device (>31) or function (>7) out of range"));
+            return Err(Error::InvalidInput(
+                "PCI device (>31) or function (>7) out of range",
+            ));
         }
-        Ok(Self { domain, bus, device, function })
+        Ok(Self {
+            domain,
+            bus,
+            device,
+            function,
+        })
     }
 }
 
@@ -209,11 +240,17 @@ pub enum TemperatureThreshold {
 impl TemperatureThreshold {
     pub(crate) const fn to_raw(self) -> sys::nvmlTemperatureThresholds_t {
         match self {
-            Self::Shutdown => sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_SHUTDOWN,
-            Self::Slowdown => sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_SLOWDOWN,
+            Self::Shutdown => {
+                sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_SHUTDOWN
+            }
+            Self::Slowdown => {
+                sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_SLOWDOWN
+            }
             Self::MemMax => sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_MEM_MAX,
             Self::GpuMax => sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_GPU_MAX,
-            Self::AcousticCurr => sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_ACOUSTIC_CURR,
+            Self::AcousticCurr => {
+                sys::nvmlTemperatureThresholds_enum_NVML_TEMPERATURE_THRESHOLD_ACOUSTIC_CURR
+            }
         }
     }
 }

@@ -10,7 +10,7 @@
 //! `_optix_tex_footprint_2d*_v2` intrinsics as their bit patterns (`.b32`), `coarse` as `0`/`1`, and
 //! the result and flag as 64-bit generic addresses the intrinsic stores to.
 //! **Used by** OptiX programs doing texture-space shading or demand-loaded textures; texture handles
-//! come from the host crate `cuda-ext` (`TextureObject::handle`).
+//! come from the host crate `cuda-core-ext` (`TextureObject::handle`).
 
 use crate::raw;
 

@@ -99,29 +99,42 @@ impl Subscriber {
     pub fn new(cuda: &Arc<Context>, callback: Box<CallbackFn>) -> Result<Self> {
         ensure_loaded()?;
         cuda.bind_to_thread()?;
-        let inner = Box::into_raw(Box::new(SubscriberInner { cb: callback, panic_msg: Mutex::new(None) }));
+        let inner = Box::into_raw(Box::new(SubscriberInner {
+            cb: callback,
+            panic_msg: Mutex::new(None),
+        }));
         let mut raw: sys::CUpti_SubscriberHandle = std::ptr::null_mut();
         // SAFETY: `callback_trampoline` is `extern "C"` with `catch_unwind`, and `inner` stays
         // alive until after `cuptiUnsubscribe` in `Drop`.
-        let rc = unsafe { sys::cuptiSubscribe(&mut raw, Some(callback_trampoline), inner.cast::<c_void>()) };
+        let rc = unsafe {
+            sys::cuptiSubscribe(&mut raw, Some(callback_trampoline), inner.cast::<c_void>())
+        };
         if rc != sys::CUptiResult_CUPTI_SUCCESS {
             // SAFETY: `cuptiSubscribe` failed so CUPTI does not hold `inner`; reclaim it now.
             drop(unsafe { Box::from_raw(inner) });
             return check("cuptiSubscribe", rc).map(|()| unreachable!());
         }
-        Ok(Self { raw, inner, cuda: cuda.clone() })
+        Ok(Self {
+            raw,
+            inner,
+            cuda: cuda.clone(),
+        })
     }
 
     /// Enables or disables all callbacks in `domain` (`cuptiEnableDomain`).
     pub fn enable_domain(&self, domain: CallbackDomain, enable: bool) -> Result<()> {
         // SAFETY: `self.raw` is a live subscriber handle.
-        check("cuptiEnableDomain", unsafe { sys::cuptiEnableDomain(u32::from(enable), self.raw, domain.to_sys()) })
+        check("cuptiEnableDomain", unsafe {
+            sys::cuptiEnableDomain(u32::from(enable), self.raw, domain.to_sys())
+        })
     }
 
     /// Enables or disables a single callback `cbid` in `domain` (`cuptiEnableCallback`).
     pub fn enable_callback(&self, domain: CallbackDomain, cbid: u32, enable: bool) -> Result<()> {
         // SAFETY: `self.raw` is a live subscriber handle.
-        check("cuptiEnableCallback", unsafe { sys::cuptiEnableCallback(u32::from(enable), self.raw, domain.to_sys(), cbid) })
+        check("cuptiEnableCallback", unsafe {
+            sys::cuptiEnableCallback(u32::from(enable), self.raw, domain.to_sys(), cbid)
+        })
     }
 
     /// Returns an error if the Rust callback panicked during an earlier CUPTI invocation.
@@ -143,7 +156,9 @@ impl Drop for Subscriber {
             // CUPTI will not invoke `callback_trampoline` after this call returns.
             let rc = unsafe { sys::cuptiUnsubscribe(self.raw) };
             if rc != sys::CUptiResult_CUPTI_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
         if !self.inner.is_null() {
@@ -158,10 +173,14 @@ pub fn callback_name(domain: CallbackDomain, cbid: u32) -> Result<String> {
     ensure_loaded()?;
     let mut ptr = std::ptr::null();
     // SAFETY: `ptr` is a valid out-pointer; CUPTI writes a static NUL-terminated string.
-    check("cuptiGetCallbackName", unsafe { sys::cuptiGetCallbackName(domain.to_sys(), cbid, &mut ptr) })?;
+    check("cuptiGetCallbackName", unsafe {
+        sys::cuptiGetCallbackName(domain.to_sys(), cbid, &mut ptr)
+    })?;
     if ptr.is_null() {
         return Ok(String::new());
     }
     // SAFETY: `ptr` is non-null and NUL-terminated.
-    Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Ok(unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned())
 }

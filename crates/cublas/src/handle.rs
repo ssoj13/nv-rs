@@ -275,7 +275,11 @@ impl Handle {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `cuda` is bound and alive; `raw` is a valid out-pointer.
         check("cublasCreate_v2", unsafe { sys::cublasCreate_v2(&mut raw) })?;
-        Ok(Self { raw, cuda: cuda.clone(), pointer_mode: Cell::new(PointerMode::Host) })
+        Ok(Self {
+            raw,
+            cuda: cuda.clone(),
+            pointer_mode: Cell::new(PointerMode::Host),
+        })
     }
 
     /// Returns the raw `cublasHandle_t`.
@@ -293,18 +297,24 @@ impl Handle {
     /// Binds `stream` to this handle. Fails if `stream` belongs to a different CUDA context.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
-            return Err(Error::Invalid("stream belongs to a different CUDA context than the cuBLAS handle"));
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than the cuBLAS handle",
+            ));
         }
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.raw` and `stream.cu_stream()` belong to the same live context.
-        check("cublasSetStream_v2", unsafe { sys::cublasSetStream_v2(self.raw, stream.cu_stream()) })
+        check("cublasSetStream_v2", unsafe {
+            sys::cublasSetStream_v2(self.raw, stream.cu_stream())
+        })
     }
 
     /// Sets whether scalar `alpha`/`beta` arguments live on host or device memory.
     pub fn set_pointer_mode(&self, mode: PointerMode) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.raw` is a live cuBLAS handle.
-        check("cublasSetPointerMode_v2", unsafe { sys::cublasSetPointerMode_v2(self.raw, mode.raw()) })?;
+        check("cublasSetPointerMode_v2", unsafe {
+            sys::cublasSetPointerMode_v2(self.raw, mode.raw())
+        })?;
         self.pointer_mode.set(mode);
         Ok(())
     }
@@ -323,7 +333,9 @@ impl Handle {
         self.cuda.bind_to_thread()?;
         let mut mode = 0;
         // SAFETY: `self.raw` is live and `mode` is a valid out-pointer.
-        check("cublasGetPointerMode_v2", unsafe { sys::cublasGetPointerMode_v2(self.raw, &mut mode) })?;
+        check("cublasGetPointerMode_v2", unsafe {
+            sys::cublasGetPointerMode_v2(self.raw, &mut mode)
+        })?;
         PointerMode::from_raw(mode)
     }
 
@@ -331,7 +343,9 @@ impl Handle {
     pub fn set_math_mode(&self, mode: MathMode) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.raw` is a live cuBLAS handle.
-        check("cublasSetMathMode", unsafe { sys::cublasSetMathMode(self.raw, mode.raw()) })
+        check("cublasSetMathMode", unsafe {
+            sys::cublasSetMathMode(self.raw, mode.raw())
+        })
     }
 
     /// Queries the current math acceleration mode.
@@ -339,7 +353,9 @@ impl Handle {
         self.cuda.bind_to_thread()?;
         let mut mode = 0;
         // SAFETY: `self.raw` is live and `mode` is a valid out-pointer.
-        check("cublasGetMathMode", unsafe { sys::cublasGetMathMode(self.raw, &mut mode) })?;
+        check("cublasGetMathMode", unsafe {
+            sys::cublasGetMathMode(self.raw, &mut mode)
+        })?;
         Ok(MathMode::from_raw(mode))
     }
 
@@ -350,14 +366,18 @@ impl Handle {
         self.set_stream(&stream)?;
         let (ptr, cap) = scratch.reserve(&stream, bytes, budget)?;
         // SAFETY: `self.raw` is live; `ptr` is valid for `cap` device bytes on `stream` (or null/0).
-        check("cublasSetWorkspace_v2", unsafe { sys::cublasSetWorkspace_v2(self.raw, ptr, cap) })
+        check("cublasSetWorkspace_v2", unsafe {
+            sys::cublasSetWorkspace_v2(self.raw, ptr, cap)
+        })
     }
 
     /// Detaches any user-supplied workspace from this handle.
     pub fn clear_workspace(&self) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: passing null/0 clears the user workspace on a live handle.
-        check("cublasSetWorkspace_v2", unsafe { sys::cublasSetWorkspace_v2(self.raw, std::ptr::null_mut(), 0) })
+        check("cublasSetWorkspace_v2", unsafe {
+            sys::cublasSetWorkspace_v2(self.raw, std::ptr::null_mut(), 0)
+        })
     }
 
     /// Returns the cuBLAS library version reported by `cublasGetVersion_v2`.
@@ -365,7 +385,9 @@ impl Handle {
         self.cuda.bind_to_thread()?;
         let mut v = 0;
         // SAFETY: `self.raw` is live and `v` is a valid out-pointer.
-        check("cublasGetVersion_v2", unsafe { sys::cublasGetVersion_v2(self.raw, &mut v) })?;
+        check("cublasGetVersion_v2", unsafe {
+            sys::cublasGetVersion_v2(self.raw, &mut v)
+        })?;
         Ok(v)
     }
 }
@@ -378,7 +400,10 @@ impl Drop for Handle {
                 let code = unsafe { sys::cublasDestroy_v2(self.raw) };
                 teardown(&self.cuda, code);
             } else {
-                teardown(&self.cuda, sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED);
+                teardown(
+                    &self.cuda,
+                    sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED,
+                );
             }
             self.raw = std::ptr::null_mut();
         }

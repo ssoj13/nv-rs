@@ -12,7 +12,10 @@
 //! them with [`Pipeline::set_stack_from_depths`], or compute exact sizes with `stack.rs`
 //! ([`crate::StackSizes`]) and apply them with [`Pipeline::set_stack_size`].
 
-use crate::{DeviceContext, Error, LOG_BYTES, PipelineOptions, ProgramGroup, Result, ShaderBindingTable, check, check_log, entry, module::log_text, sys};
+use crate::{
+    DeviceContext, Error, LOG_BYTES, PipelineOptions, ProgramGroup, Result, ShaderBindingTable,
+    check, check_log, entry, module::log_text, sys,
+};
 use cuda_core::bytemuck::Pod;
 use cuda_core::{DeviceBuffer, Stream};
 use std::ffi::{CString, c_void};
@@ -39,7 +42,13 @@ pub struct LinkOptions {
 impl Default for LinkOptions {
     /// Raygen traces, no callables, graph depth from the pipeline's graph flags.
     fn default() -> Self {
-        Self { max_trace_depth: 1, max_cc_depth: 0, max_dc_depth_from_state: 0, max_dc_depth_from_traversal: 0, max_graph_depth: 0 }
+        Self {
+            max_trace_depth: 1,
+            max_cc_depth: 0,
+            max_dc_depth_from_state: 0,
+            max_dc_depth_from_traversal: 0,
+            max_graph_depth: 0,
+        }
     }
 }
 
@@ -70,7 +79,12 @@ unsafe impl Sync for Pipeline {}
 
 impl Pipeline {
     /// Links `groups`. Returns the pipeline and the linker log.
-    pub fn new(ctx: &Arc<DeviceContext>, options: &PipelineOptions, link: LinkOptions, groups: &[Arc<ProgramGroup>]) -> Result<(Self, String)> {
+    pub fn new(
+        ctx: &Arc<DeviceContext>,
+        options: &PipelineOptions,
+        link: LinkOptions,
+        groups: &[Arc<ProgramGroup>],
+    ) -> Result<(Self, String)> {
         if groups.iter().any(|g| !Arc::ptr_eq(g.context(), ctx)) {
             return Err(Error::Invalid("pipeline mixes device contexts"));
         }
@@ -78,26 +92,53 @@ impl Pipeline {
         let pco = options.to_sys()?;
         let plo = link.to_sys();
         let raw_groups: Vec<sys::OptixProgramGroup> = groups.iter().map(|g| g.raw()).collect();
-        let n = u32::try_from(raw_groups.len()).map_err(|_| Error::Invalid("too many program groups"))?;
+        let n = u32::try_from(raw_groups.len())
+            .map_err(|_| Error::Invalid("too many program groups"))?;
         let mut log = vec![0u8; LOG_BYTES];
         let mut log_len = log.len();
         let mut raw = std::ptr::null_mut();
         ctx.cuda().bind_to_thread()?;
         // SAFETY: options, group handles and log buffer outlive the call.
         let code = unsafe {
-            entry!(t, optixPipelineCreate)(ctx.raw(), &pco, &plo, raw_groups.as_ptr(), n, log.as_mut_ptr().cast(), &mut log_len, &mut raw)
+            entry!(t, optixPipelineCreate)(
+                ctx.raw(),
+                &pco,
+                &plo,
+                raw_groups.as_ptr(),
+                n,
+                log.as_mut_ptr().cast(),
+                &mut log_len,
+                &mut raw,
+            )
         };
         check_log("optixPipelineCreate", code, &log, log_len)?;
-        let pipeline = Self { raw, params_size: options.params_size, ctx: ctx.clone(), _groups: groups.to_vec() };
+        let pipeline = Self {
+            raw,
+            params_size: options.params_size,
+            ctx: ctx.clone(),
+            _groups: groups.to_vec(),
+        };
         Ok((pipeline, log_text(&log, log_len)))
     }
 
     /// Sets the stack sizes (bytes) and the maximum traversable graph depth (2 for one IAS over
     /// GASes, 1 for a single GAS). See [`crate::StackSizes`] for computing them.
-    pub fn set_stack_size(&self, direct_from_traversal: u32, direct_from_state: u32, continuation: u32, max_graph_depth: u32) -> Result<()> {
+    pub fn set_stack_size(
+        &self,
+        direct_from_traversal: u32,
+        direct_from_state: u32,
+        continuation: u32,
+        max_graph_depth: u32,
+    ) -> Result<()> {
         // SAFETY: owned pipeline handle.
         check("optixPipelineSetStackSize", unsafe {
-            entry!(self.ctx.table(), optixPipelineSetStackSize)(self.raw, direct_from_traversal, direct_from_state, continuation, max_graph_depth)
+            entry!(self.ctx.table(), optixPipelineSetStackSize)(
+                self.raw,
+                direct_from_traversal,
+                direct_from_state,
+                continuation,
+                max_graph_depth,
+            )
         })
     }
 
@@ -128,17 +169,36 @@ impl Pipeline {
     /// stay valid until the launch completes on `stream`. `params` and `sbt` themselves must also
     /// outlive the launch (synchronize `stream` before dropping them, or drop them after later
     /// work on it).
-    pub unsafe fn launch(&self, stream: &Stream, params: &DeviceBuffer<u8>, sbt: &ShaderBindingTable, dims: [u32; 3]) -> Result<()> {
+    pub unsafe fn launch(
+        &self,
+        stream: &Stream,
+        params: &DeviceBuffer<u8>,
+        sbt: &ShaderBindingTable,
+        dims: [u32; 3],
+    ) -> Result<()> {
         if params.len() != self.params_size {
-            return Err(Error::Invalid("launch-parameter buffer size differs from PipelineOptions::params_size"));
+            return Err(Error::Invalid(
+                "launch-parameter buffer size differs from PipelineOptions::params_size",
+            ));
         }
         if dims.contains(&0) || dims.iter().map(|d| u64::from(*d)).product::<u64>() > 1 << 30 {
-            return Err(Error::Invalid("launch dimensions must be non-zero with at most 2^30 invocations"));
+            return Err(Error::Invalid(
+                "launch dimensions must be non-zero with at most 2^30 invocations",
+            ));
         }
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: the caller upholds the layout and lifetime contract above; the handles are owned.
         check("optixLaunch", unsafe {
-            entry!(self.ctx.table(), optixLaunch)(self.raw, stream.cu_stream(), params.cu_deviceptr(), params.len(), sbt.raw(), dims[0], dims[1], dims[2])
+            entry!(self.ctx.table(), optixLaunch)(
+                self.raw,
+                stream.cu_stream(),
+                params.cu_deviceptr(),
+                params.len(),
+                sbt.raw(),
+                dims[0],
+                dims[1],
+                dims[2],
+            )
         })
     }
 
@@ -148,25 +208,49 @@ impl Pipeline {
     ///
     /// `mem` is host or device memory as `kind` says, valid for `size` bytes (read or written as
     /// `kind` says) until the copy completes on `stream`.
-    unsafe fn symbol_copy(&self, stream: &Stream, name: &str, offset: usize, mem: *mut c_void, size: usize, kind: sys::OptixPipelineSymbolMemcpyKind) -> Result<()> {
+    unsafe fn symbol_copy(
+        &self,
+        stream: &Stream,
+        name: &str,
+        offset: usize,
+        mem: *mut c_void,
+        size: usize,
+        kind: sys::OptixPipelineSymbolMemcpyKind,
+    ) -> Result<()> {
         if size == 0 {
             return Err(Error::Invalid("symbol copy of zero bytes"));
         }
         if stream.context().cu_ctx() != self.ctx.cuda().cu_ctx() {
-            return Err(Error::Invalid("stream belongs to another CUDA context than the pipeline"));
+            return Err(Error::Invalid(
+                "stream belongs to another CUDA context than the pipeline",
+            ));
         }
         let name = CString::new(name).map_err(|_| Error::Invalid("symbol name contains NUL"))?;
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: owned pipeline; NUL-terminated name alive for the call; `mem` per the caller.
         check("optixPipelineSymbolMemcpyAsync", unsafe {
-            entry!(self.ctx.table(), optixPipelineSymbolMemcpyAsync)(self.raw, name.as_ptr(), mem, size, offset, kind, stream.cu_stream())
+            entry!(self.ctx.table(), optixPipelineSymbolMemcpyAsync)(
+                self.raw,
+                name.as_ptr(),
+                mem,
+                size,
+                offset,
+                kind,
+                stream.cu_stream(),
+            )
         })
     }
 
     /// Writes `value` into device global `name` at byte `offset`, ordered on `stream`; returns
     /// once the copy is done (it synchronizes `stream`). Launches on other streams that read the
     /// global race with the write.
-    pub fn write_symbol<T: Pod>(&self, stream: &Stream, name: &str, offset: usize, value: &T) -> Result<()> {
+    pub fn write_symbol<T: Pod>(
+        &self,
+        stream: &Stream,
+        name: &str,
+        offset: usize,
+        value: &T,
+    ) -> Result<()> {
         let staged = Box::new(*value);
         // SAFETY: `staged` is `size_of::<T>()` readable host bytes, kept alive until the stream
         // has synchronized (or leaked if that fails, as the copy may still be reading it).
@@ -217,7 +301,13 @@ impl Pipeline {
     /// # Safety
     ///
     /// `src` must stay alive and unmodified until the copy completes on `stream`.
-    pub unsafe fn write_symbol_from(&self, stream: &Stream, name: &str, offset: usize, src: &DeviceBuffer<u8>) -> Result<()> {
+    pub unsafe fn write_symbol_from(
+        &self,
+        stream: &Stream,
+        name: &str,
+        offset: usize,
+        src: &DeviceBuffer<u8>,
+    ) -> Result<()> {
         // SAFETY: a device pointer to `src.len()` bytes, kept valid by the caller.
         unsafe {
             self.symbol_copy(
@@ -237,7 +327,13 @@ impl Pipeline {
     /// # Safety
     ///
     /// `dst` must stay alive and must not be accessed until the copy completes on `stream`.
-    pub unsafe fn read_symbol_into(&self, stream: &Stream, name: &str, offset: usize, dst: &mut DeviceBuffer<u8>) -> Result<()> {
+    pub unsafe fn read_symbol_into(
+        &self,
+        stream: &Stream,
+        name: &str,
+        offset: usize,
+        dst: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
         // SAFETY: a device pointer to `dst.len()` writable bytes, kept valid by the caller.
         unsafe {
             self.symbol_copy(

@@ -1,4 +1,15 @@
-# Handoff — nv-rs (2026-11-13)
+# Handoff — nv-rs (2026-11-14)
+
+## Wave 2 & Corporate Release Readiness — 2026-11-14
+
+- **Host Toolchain (`1.99.1`)**: `rust-toolchain.toml` unified to `1.99.1` across host and device workspaces.
+- **`bootstrap.py`**: Adapted for `nv-rs` (stdlib-only Python 3) with `d s` / `d dl` SDK provisioning (10 SDKs, depth-3 `NV_SDK_DIRS` scan, safe archive extraction) and `b` / `t` / `c` / `s` / `cl` / `x` workspace commands.
+- **`crates/ngx` (D13 confirmed & implemented)**: Full safe NGX/DLSS wrapper (`NgxVulkan::init` via `Init_with_ProjectID` and `NgxVulkan::init_with_app_id` via `ApplicationId`, `Parameters`, `FeatureHandle`), verified on Windows and Linux WSL2, with `ngx-sys` Linux x86_64 preparation.
+- **`cufile` & `nccl` (WSL2)**: Verified on Linux WSL2; `nccl` `t3_multi_rank_all_reduce` updated to skip cleanly when `< 2` GPUs are present.
+- **Crate Rename & Prebuilt Fallback**: `cuda-ext` renamed to `cuda-core-ext`; `nv-bindgen` prebuilt bindings fallback (`NV_RS_USE_PREBUILT=1`, `NV_RS_PREBUILT_DIR`, `crates/<crate>/prebuilt/<target_triple>/`) and `xtask` staging added.
+- **Corporate Release Readiness (M4)**: Updated `README.md`, `Cargo.toml` `[workspace.package]` (`version = "0.1.0"`, `authors = ["NVIDIA Corporation"]`, `keywords`, `categories`), `PLAN.md`, `HANDOFF.md`, `TODO.md`; created `CONTRIBUTING.md`, `SECURITY.md`, and `deny.toml`.
+
+---
 
 ## Wave 1 Completion Checkpoint — 2026-11-13 / 2026-11-14 (GPU Verified)
 

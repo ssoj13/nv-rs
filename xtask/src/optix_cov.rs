@@ -28,7 +28,10 @@ use std::path::{Path, PathBuf};
 
 /// `OptixFunctionTable` fields that are reserved slots, not API: no public meaning to wrap.
 const HOST_ALLOW: &[(&str, &str)] = &[
-    ("optixStub", "placeholder slot inside the table; OptiX defines no function for it"),
+    (
+        "optixStub",
+        "placeholder slot inside the table; OptiX defines no function for it",
+    ),
     ("stub1", "reserved slot; OptiX defines no function for it"),
     ("stub2", "reserved slot; OptiX defines no function for it"),
 ];
@@ -54,7 +57,11 @@ fn strip_comments(src: &str) -> String {
 /// The trailing identifier of `s` (`"static void optixTrace"` -> `"optixTrace"`).
 fn last_ident(s: &str) -> &str {
     let t = s.trim_end();
-    let start = t.char_indices().rev().find(|(_, c)| !is_ident(*c)).map_or(0, |(i, c)| i + c.len_utf8());
+    let start = t
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_ident(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
     &t[start..]
 }
 
@@ -136,9 +143,13 @@ fn fn_ptr_at(b: &[u8], open: usize) -> Option<(String, usize)> {
 
 /// The fields of `OptixFunctionTable` in declaration order (every `( *name )(` of the struct body).
 pub fn table_fields(header: &str) -> Result<Vec<String>, String> {
-    let start = header.find("typedef struct OptixFunctionTable").ok_or("`typedef struct OptixFunctionTable` not found")?;
+    let start = header
+        .find("typedef struct OptixFunctionTable")
+        .ok_or("`typedef struct OptixFunctionTable` not found")?;
     let rest = &header[start..];
-    let end = rest.find("} OptixFunctionTable;").ok_or("end of `OptixFunctionTable` not found")?;
+    let end = rest
+        .find("} OptixFunctionTable;")
+        .ok_or("end of `OptixFunctionTable` not found")?;
     let body = strip_comments(&rest[..end]);
     let b = body.as_bytes();
     let mut out = Vec::new();
@@ -193,7 +204,11 @@ fn dot_access(src: &str, field: &str) -> bool {
 pub fn host_refs(src: &str, fields: &[String]) -> BTreeSet<String> {
     let src = strip_comments(src);
     let args = entry_args(&src);
-    fields.iter().filter(|f| args.contains(f.as_str()) || dot_access(&src, f)).cloned().collect()
+    fields
+        .iter()
+        .filter(|f| args.contains(f.as_str()) || dot_access(&src, f))
+        .cloned()
+        .collect()
 }
 
 /// `API_MAP.toml` value: one path or several.
@@ -232,12 +247,15 @@ fn split_path(p: &str) -> Result<(&str, &str), String> {
 
 /// `s` starts with `ident` and the identifier does not continue.
 fn starts_with_ident(s: &str, ident: &str) -> bool {
-    s.strip_prefix(ident).is_some_and(|r| !r.chars().next().is_some_and(is_ident))
+    s.strip_prefix(ident)
+        .is_some_and(|r| !r.chars().next().is_some_and(is_ident))
 }
 
 /// A row of a function-generating macro table: `name -> ty = raw;` or `name = raw, conv -> ty;`.
 fn macro_row(line: &str, item: &str) -> bool {
-    let Some(rest) = line.strip_prefix(item) else { return false };
+    let Some(rest) = line.strip_prefix(item) else {
+        return false;
+    };
     if rest.chars().next().is_some_and(is_ident) {
         return false;
     }
@@ -245,7 +263,9 @@ fn macro_row(line: &str, item: &str) -> bool {
     if rest.starts_with("->") {
         return true;
     }
-    let Some(r) = rest.strip_prefix('=') else { return false };
+    let Some(r) = rest.strip_prefix('=') else {
+        return false;
+    };
     let r = r.trim_start();
     let end = r.find(|c: char| !is_ident(c)).unwrap_or(r.len());
     end > 0 && r[end..].trim_start().starts_with(',')
@@ -253,15 +273,23 @@ fn macro_row(line: &str, item: &str) -> bool {
 
 /// `item` is defined in comment-stripped module source `src`.
 fn item_exists(src: &str, item: &str) -> bool {
-    const KINDS: [&str; 8] = ["fn ", "mod ", "struct ", "enum ", "trait ", "type ", "const ", "static "];
+    const KINDS: [&str; 8] = [
+        "fn ", "mod ", "struct ", "enum ", "trait ", "type ", "const ", "static ",
+    ];
     src.lines().map(str::trim_start).any(|line| {
         if let Some(rest) = line.strip_prefix("pub ") {
-            let after = ["const unsafe ", "unsafe ", "const "].iter().find_map(|q| rest.strip_prefix(q)).unwrap_or(rest);
+            let after = ["const unsafe ", "unsafe ", "const "]
+                .iter()
+                .find_map(|q| rest.strip_prefix(q))
+                .unwrap_or(rest);
             if let Some(r) = rest.strip_prefix("use ") {
                 return contains_word(r, item);
             }
             return [rest, after].iter().any(|cand| {
-                KINDS.iter().any(|k| cand.strip_prefix(k).is_some_and(|r| starts_with_ident(r.trim_start(), item)))
+                KINDS.iter().any(|k| {
+                    cand.strip_prefix(k)
+                        .is_some_and(|r| starts_with_ident(r.trim_start(), item))
+                })
             });
         }
         if let Some(r) = line.strip_prefix("macro_rules!") {
@@ -310,14 +338,20 @@ pub fn check_map(
                     continue;
                 }
             };
-            let src = cache.entry(module.to_string()).or_insert_with(|| module_src(module));
+            let src = cache
+                .entry(module.to_string())
+                .or_insert_with(|| module_src(module));
             match src.as_deref() {
                 None => {
-                    problems.push(format!("device: `{name}` -> `{p}`: module `{module}` has no source file"));
+                    problems.push(format!(
+                        "device: `{name}` -> `{p}`: module `{module}` has no source file"
+                    ));
                     ok = false;
                 }
                 Some(s) if !item_exists(s, item) => {
-                    problems.push(format!("device: `{name}` -> `{p}`: no item `{item}` in module `{module}`"));
+                    problems.push(format!(
+                        "device: `{name}` -> `{p}`: no item `{item}` in module `{module}`"
+                    ));
                     ok = false;
                 }
                 Some(_) => {}
@@ -328,9 +362,15 @@ pub fn check_map(
         }
     }
     for name in map.keys().filter(|n| !api.contains(*n)) {
-        problems.push(format!("device: stale API_MAP entry `{name}` (not in optix_device.h)"));
+        problems.push(format!(
+            "device: stale API_MAP entry `{name}` (not in optix_device.h)"
+        ));
     }
-    MapReport { covered, total: api.len(), problems }
+    MapReport {
+        covered,
+        total: api.len(),
+        problems,
+    }
 }
 
 /// `name` is called as `raw::name` or passed to a macro table as `... = name;` / `... = name,`.
@@ -339,7 +379,11 @@ fn raw_used(src: &str, name: &str) -> bool {
         || src.match_indices(name).any(|(i, _)| {
             let before = src[..i].trim_end();
             let rest = &src[i + name.len()..];
-            let operator_char = before.chars().rev().nth(1).is_some_and(|c| "=!<>+-*/%&|^".contains(c));
+            let operator_char = before
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| "=!<>+-*/%&|^".contains(c));
             before.ends_with('=')
                 && !operator_char
                 && !rest.chars().next().is_some_and(is_ident)
@@ -363,7 +407,12 @@ pub struct RawReport {
 /// `optix-device` source, `macros_src` the macro crate's (which names its intrinsics as string
 /// literals, e.g. `"call_direct_callable"`).
 pub fn raw_report(names: &BTreeSet<String>, dev_src: &str, macros_src: &str) -> RawReport {
-    let mut rep = RawReport { total: names.len(), used: 0, allowed: Vec::new(), missing: Vec::new() };
+    let mut rep = RawReport {
+        total: names.len(),
+        used: 0,
+        allowed: Vec::new(),
+        missing: Vec::new(),
+    };
     for full in names {
         let short = full.strip_prefix("_optix_").unwrap_or(full);
         if raw_used(dev_src, short) || contains_word(macros_src, &format!("\"{short}\"")) {
@@ -384,8 +433,14 @@ fn module_file(root: &Path, module: &str) -> Option<PathBuf> {
     }
     let dev = root.join("device");
     Some(match module {
-        "macros" => dev.join("optix-device-macros").join("src").join("optix_device_macros.rs"),
-        "cuda_tex" => dev.join("cuda-tex-device").join("src").join("cuda_tex_device.rs"),
+        "macros" => dev
+            .join("optix-device-macros")
+            .join("src")
+            .join("optix_device_macros.rs"),
+        "cuda_tex" => dev
+            .join("cuda-tex-device")
+            .join("src")
+            .join("cuda_tex_device.rs"),
         m => dev.join("optix-device").join("src").join(format!("{m}.rs")),
     })
 }
@@ -396,14 +451,25 @@ fn read(path: &Path) -> Result<String, String> {
 
 /// Runs the three checks; `Ok` carries the summary, `Err` the summary plus every failure.
 pub fn run(root: &Path) -> Result<String, String> {
-    let optix = vcv_rs::optix::detect_optix().ok_or("OptiX SDK not found (vcv-rs: OPTIX_ROOT / OptiX_INSTALL_DIR / default install dir)")?;
+    let optix = vcv_rs::optix::detect_optix().ok_or(
+        "OptiX SDK not found (vcv-rs: OPTIX_ROOT / OptiX_INSTALL_DIR / default install dir)",
+    )?;
     let inc = optix.include_dir();
     let mut problems: Vec<String> = Vec::new();
 
     // 1. Device API.
     let api = device_api(&read(&inc.join("optix_device.h"))?);
-    let map = parse_map(&read(&root.join("device").join("optix-device").join("API_MAP.toml"))?)?;
-    let mut load = |m: &str| module_file(root, m).and_then(|p| std::fs::read_to_string(p).ok()).map(|s| strip_comments(&s));
+    let map = parse_map(&read(
+        &root
+            .join("device")
+            .join("optix-device")
+            .join("API_MAP.toml"),
+    )?)?;
+    let mut load = |m: &str| {
+        module_file(root, m)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| strip_comments(&s))
+    };
     let dev = check_map(&api, &map, &mut load);
     problems.extend(dev.problems);
 
@@ -413,10 +479,15 @@ pub fn run(root: &Path) -> Result<String, String> {
     let used = host_refs(&host_src, &fields);
     for (name, _) in HOST_ALLOW {
         if !fields.iter().any(|f| f == name) {
-            problems.push(format!("host: allowlisted `{name}` is not an OptixFunctionTable field"));
+            problems.push(format!(
+                "host: allowlisted `{name}` is not an OptixFunctionTable field"
+            ));
         }
     }
-    let wrappable: Vec<&String> = fields.iter().filter(|f| !HOST_ALLOW.iter().any(|(n, _)| *n == f.as_str())).collect();
+    let wrappable: Vec<&String> = fields
+        .iter()
+        .filter(|f| !HOST_ALLOW.iter().any(|(n, _)| *n == f.as_str()))
+        .collect();
     let mut host_used = 0;
     for f in &wrappable {
         if used.contains(f.as_str()) {
@@ -430,11 +501,18 @@ pub fn run(root: &Path) -> Result<String, String> {
     let raw = match nv_bindgen::device_asm::scan_optix(&inc) {
         Ok((scan, _)) => {
             let names: BTreeSet<String> = scan.intrinsics.keys().cloned().collect();
-            let dev_src = strip_comments(&read_tree(&root.join("device").join("optix-device").join("src")));
-            let macros_src = strip_comments(&read_tree(&root.join("device").join("optix-device-macros").join("src")));
+            let dev_src = strip_comments(&read_tree(
+                &root.join("device").join("optix-device").join("src"),
+            ));
+            let macros_src = strip_comments(&read_tree(
+                &root.join("device").join("optix-device-macros").join("src"),
+            ));
             let rep = raw_report(&names, &dev_src, &macros_src);
             for m in &rep.missing {
-                problems.push(format!("raw: `{m}` is not used as `raw::{}` by optix-device (only reachable raw)", m.trim_start_matches("_optix_")));
+                problems.push(format!(
+                    "raw: `{m}` is not used as `raw::{}` by optix-device (only reachable raw)",
+                    m.trim_start_matches("_optix_")
+                ));
             }
             Some(rep)
         }
@@ -489,7 +567,15 @@ static inline int optixHostSide( int x );
     #[test]
     fn device_parser_handles_overloads_split_lines_and_either_qualifier_order() {
         let got: Vec<String> = device_api(HEADER).into_iter().collect();
-        assert_eq!(got, ["optixGetGASPointerFromHandle", "optixGetPayload_7", "optixTexFootprint2DLod", "optixTrace"]);
+        assert_eq!(
+            got,
+            [
+                "optixGetGASPointerFromHandle",
+                "optixGetPayload_7",
+                "optixTexFootprint2DLod",
+                "optixTrace"
+            ]
+        );
     }
 
     const TABLE: &str = "\
@@ -508,14 +594,19 @@ OptixResult ( *optixOutsideTheStruct )( void );
 
     #[test]
     fn table_parser_reads_only_struct_fields_in_order() {
-        assert_eq!(table_fields(TABLE).expect("parses"), ["optixGetErrorName", "optixStub", "optixBuild", "stub1"]);
+        assert_eq!(
+            table_fields(TABLE).expect("parses"),
+            ["optixGetErrorName", "optixStub", "optixBuild", "stub1"]
+        );
         assert!(table_fields("nothing here").is_err());
         assert!(table_fields("typedef struct OptixFunctionTable { ").is_err());
     }
 
     #[test]
     fn host_refs_accept_entry_calls_and_member_access_but_not_comments() {
-        let fields: Vec<String> = ["optixA", "optixB", "optixC", "optixD", "optixAB"].map(String::from).to_vec();
+        let fields: Vec<String> = ["optixA", "optixB", "optixC", "optixD", "optixAB"]
+            .map(String::from)
+            .to_vec();
         let src = "\
 unsafe { entry!(ctx.table(), optixA)(ctx.raw(), f(1, 2)) }
 if let Some(d) = self.ctx.table().optixB { d(1) }
@@ -560,7 +651,15 @@ pub const IDENTITY: u32 = 1;
 
     #[test]
     fn items_are_found_as_pub_fns_reexports_macros_and_macro_rows_only() {
-        for ok in ["launch_index", "const_one", "reexported", "getters", "ray_tmin", "triangle_vertices", "IDENTITY"] {
+        for ok in [
+            "launch_index",
+            "const_one",
+            "reexported",
+            "getters",
+            "ray_tmin",
+            "triangle_vertices",
+            "IDENTITY",
+        ] {
             assert!(item_exists(MODULE, ok), "{ok}");
         }
         for bad in ["private_one", "launch", "m0z", "get_ray_tmin", "nope"] {
@@ -570,25 +669,51 @@ pub const IDENTITY: u32 = 1;
 
     #[test]
     fn map_check_reports_missing_wrong_stale_and_bad_paths() {
-        let api: BTreeSet<String> = ["optixA", "optixB", "optixC", "optixD", "optixE"].map(String::from).into();
+        let api: BTreeSet<String> = ["optixA", "optixB", "optixC", "optixD", "optixE"]
+            .map(String::from)
+            .into();
         let mut map = BTreeMap::new();
-        map.insert("optixA".to_string(), vec!["state::launch_index".to_string()]);
+        map.insert(
+            "optixA".to_string(),
+            vec!["state::launch_index".to_string()],
+        );
         map.insert("optixB".to_string(), vec!["state::missing_fn".to_string()]);
         map.insert("optixC".to_string(), vec!["nomod::x".to_string()]);
         map.insert("optixD".to_string(), vec!["bad".to_string()]);
-        map.insert("optixStale".to_string(), vec!["state::launch_index".to_string()]);
+        map.insert(
+            "optixStale".to_string(),
+            vec!["state::launch_index".to_string()],
+        );
         let mut load = |m: &str| (m == "state").then(|| MODULE.to_string());
         let rep = check_map(&api, &map, &mut load);
         assert_eq!((rep.covered, rep.total), (1, 5));
         assert_eq!(rep.problems.len(), 5, "{:?}", rep.problems);
-        for needle in ["no item `missing_fn`", "module `nomod` has no source", "not `<module>::<item>`", "no API_MAP entry for `optixE`", "stale API_MAP entry `optixStale`"] {
-            assert!(rep.problems.iter().any(|p| p.contains(needle)), "{needle}: {:?}", rep.problems);
+        for needle in [
+            "no item `missing_fn`",
+            "module `nomod` has no source",
+            "not `<module>::<item>`",
+            "no API_MAP entry for `optixE`",
+            "stale API_MAP entry `optixStale`",
+        ] {
+            assert!(
+                rep.problems.iter().any(|p| p.contains(needle)),
+                "{needle}: {:?}",
+                rep.problems
+            );
         }
     }
 
     #[test]
     fn raw_usage_sees_calls_macro_rows_and_macro_crate_literals() {
-        let names: BTreeSet<String> = ["_optix_get_a", "_optix_get_b", "_optix_get_c", "_optix_call_x", "_optix_get_ab"].map(String::from).into();
+        let names: BTreeSet<String> = [
+            "_optix_get_a",
+            "_optix_get_b",
+            "_optix_get_c",
+            "_optix_call_x",
+            "_optix_get_ab",
+        ]
+        .map(String::from)
+        .into();
         let dev = "unsafe { raw::get_a(1) }\nx -> u32 = get_b; valid: \"y\"\nif q >= get_ab; \n";
         let mac = "expand(input, \"call_x\")";
         let rep = raw_report(&names, dev, mac);

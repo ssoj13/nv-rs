@@ -4,7 +4,9 @@
 //! and restart intervals, encodes planar or interleaved device images on a `Stream`, and
 //! retrieves the compressed JPEG bitstream into a caller-owned `Vec<u8>` (zero-alloc on reuse).
 
-use crate::{ChromaSubsampling, Error, Handle, ImagePlanes, InputFormat, JpegEncoding, Result, check, sys};
+use crate::{
+    ChromaSubsampling, Error, Handle, ImagePlanes, InputFormat, JpegEncoding, Result, check, sys,
+};
 use cuda_core::Stream;
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -24,8 +26,13 @@ impl EncoderParams {
         handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegEncoderParams_t = std::ptr::null_mut();
         // SAFETY: `handle` and `stream` are valid on the bound context.
-        check("nvjpegEncoderParamsCreate", unsafe { sys::nvjpegEncoderParamsCreate(handle.raw(), &mut raw, stream.cu_stream()) })?;
-        Ok(Self { raw, handle: handle.clone() })
+        check("nvjpegEncoderParamsCreate", unsafe {
+            sys::nvjpegEncoderParamsCreate(handle.raw(), &mut raw, stream.cu_stream())
+        })?;
+        Ok(Self {
+            raw,
+            handle: handle.clone(),
+        })
     }
 
     /// Sets JPEG quality in `1..=100` (`nvjpegEncoderParamsSetQuality`).
@@ -35,15 +42,23 @@ impl EncoderParams {
         }
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` and `stream` are live.
-        check("nvjpegEncoderParamsSetQuality", unsafe { sys::nvjpegEncoderParamsSetQuality(self.raw, c_int::from(quality), stream.cu_stream()) })
+        check("nvjpegEncoderParamsSetQuality", unsafe {
+            sys::nvjpegEncoderParamsSetQuality(self.raw, c_int::from(quality), stream.cu_stream())
+        })
     }
 
     /// Sets output chroma subsampling (`nvjpegEncoderParamsSetSamplingFactors`).
-    pub fn set_sampling_factors(&mut self, subsampling: ChromaSubsampling, stream: &Stream) -> Result<()> {
+    pub fn set_sampling_factors(
+        &mut self,
+        subsampling: ChromaSubsampling,
+        stream: &Stream,
+    ) -> Result<()> {
         let css = subsampling.to_sys()?;
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` and `stream` are live.
-        check("nvjpegEncoderParamsSetSamplingFactors", unsafe { sys::nvjpegEncoderParamsSetSamplingFactors(self.raw, css, stream.cu_stream()) })
+        check("nvjpegEncoderParamsSetSamplingFactors", unsafe {
+            sys::nvjpegEncoderParamsSetSamplingFactors(self.raw, css, stream.cu_stream())
+        })
     }
 
     /// Sets JPEG encoding mode (`nvjpegEncoderParamsSetEncoding`).
@@ -51,7 +66,9 @@ impl EncoderParams {
         let enc = encoding.to_sys()?;
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` and `stream` are live.
-        check("nvjpegEncoderParamsSetEncoding", unsafe { sys::nvjpegEncoderParamsSetEncoding(self.raw, enc, stream.cu_stream()) })
+        check("nvjpegEncoderParamsSetEncoding", unsafe {
+            sys::nvjpegEncoderParamsSetEncoding(self.raw, enc, stream.cu_stream())
+        })
     }
 
     /// Enables or disables optimized Huffman tables (`nvjpegEncoderParamsSetOptimizedHuffman`).
@@ -59,7 +76,11 @@ impl EncoderParams {
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` and `stream` are live.
         check("nvjpegEncoderParamsSetOptimizedHuffman", unsafe {
-            sys::nvjpegEncoderParamsSetOptimizedHuffman(self.raw, c_int::from(optimized), stream.cu_stream())
+            sys::nvjpegEncoderParamsSetOptimizedHuffman(
+                self.raw,
+                c_int::from(optimized),
+                stream.cu_stream(),
+            )
         })
     }
 
@@ -67,16 +88,26 @@ impl EncoderParams {
     pub fn set_restart_interval(&mut self, interval: u32, stream: &Stream) -> Result<()> {
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `self.raw` and `stream` are live.
-        check("nvjpegEncoderParamsSetRestartInterval", unsafe { sys::nvjpegEncoderParamsSetRestartInterval(self.raw, interval, stream.cu_stream()) })
+        check("nvjpegEncoderParamsSetRestartInterval", unsafe {
+            sys::nvjpegEncoderParamsSetRestartInterval(self.raw, interval, stream.cu_stream())
+        })
     }
 
     /// Returns the worst-case compressed bitstream size (`nvjpegEncodeGetBufferSize`).
     pub fn max_bitstream_size(&self, width: u32, height: u32) -> Result<usize> {
-        let w = i32::try_from(width).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
-        let h = i32::try_from(height).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
+        let w = i32::try_from(width)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
+        let h = i32::try_from(height)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
         let mut len = 0usize;
         // SAFETY: `self.handle`, `self.raw`, and `len` are valid.
-        check("nvjpegEncodeGetBufferSize", unsafe { sys::nvjpegEncodeGetBufferSize(self.handle.raw(), self.raw, w, h, &mut len) })?;
+        check("nvjpegEncodeGetBufferSize", unsafe {
+            sys::nvjpegEncodeGetBufferSize(self.handle.raw(), self.raw, w, h, &mut len)
+        })?;
         Ok(len)
     }
 
@@ -110,8 +141,13 @@ impl EncoderState {
         handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegEncoderState_t = std::ptr::null_mut();
         // SAFETY: `handle` and `stream` are valid on the bound context.
-        check("nvjpegEncoderStateCreate", unsafe { sys::nvjpegEncoderStateCreate(handle.raw(), &mut raw, stream.cu_stream()) })?;
-        Ok(Self { raw, handle: handle.clone() })
+        check("nvjpegEncoderStateCreate", unsafe {
+            sys::nvjpegEncoderStateCreate(handle.raw(), &mut raw, stream.cu_stream())
+        })?;
+        Ok(Self {
+            raw,
+            handle: handle.clone(),
+        })
     }
 
     /// Encodes an RGB/BGR/YUV image on `stream` (`nvjpegEncodeImage`).
@@ -124,13 +160,28 @@ impl EncoderState {
         height: u32,
         stream: &Stream,
     ) -> Result<()> {
-        let w = i32::try_from(width).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
-        let h = i32::try_from(height).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
+        let w = i32::try_from(width)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
+        let h = i32::try_from(height)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
         format.validate_layout(src.layout(), width, height)?;
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `src` has validated device plane pointers matching `format`, and `params`/`stream` are live.
         check("nvjpegEncodeImage", unsafe {
-            sys::nvjpegEncodeImage(self.handle.raw(), self.raw, params.raw(), src.as_raw(), format.to_sys(), w, h, stream.cu_stream())
+            sys::nvjpegEncodeImage(
+                self.handle.raw(),
+                self.raw,
+                params.raw(),
+                src.as_raw(),
+                format.to_sys(),
+                w,
+                h,
+                stream.cu_stream(),
+            )
         })
     }
 
@@ -145,13 +196,28 @@ impl EncoderState {
         stream: &Stream,
     ) -> Result<()> {
         let css = subsampling.to_sys()?;
-        let w = i32::try_from(width).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
-        let h = i32::try_from(height).ok().filter(|&v| v > 0).ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
+        let w = i32::try_from(width)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("width must be 1..=i32::MAX"))?;
+        let h = i32::try_from(height)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
         InputFormat::Yuv.validate_layout(src.layout(), width, height)?;
         self.handle.cuda().bind_to_thread()?;
         // SAFETY: `src` has validated planar YUV device pointers, and `params`/`stream` are live.
         check("nvjpegEncodeYUV", unsafe {
-            sys::nvjpegEncodeYUV(self.handle.raw(), self.raw, params.raw(), src.as_raw(), css, w, h, stream.cu_stream())
+            sys::nvjpegEncodeYUV(
+                self.handle.raw(),
+                self.raw,
+                params.raw(),
+                src.as_raw(),
+                css,
+                w,
+                h,
+                stream.cu_stream(),
+            )
         })
     }
 
@@ -161,7 +227,13 @@ impl EncoderState {
         let mut len = 0usize;
         // SAFETY: null `data` queries the exact encoded bitstream length.
         check("nvjpegEncodeRetrieveBitstream", unsafe {
-            sys::nvjpegEncodeRetrieveBitstream(self.handle.raw(), self.raw, std::ptr::null_mut(), &mut len, stream.cu_stream())
+            sys::nvjpegEncodeRetrieveBitstream(
+                self.handle.raw(),
+                self.raw,
+                std::ptr::null_mut(),
+                &mut len,
+                stream.cu_stream(),
+            )
         })?;
         out.resize(len, 0);
         if len == 0 {
@@ -169,7 +241,13 @@ impl EncoderState {
         }
         // SAFETY: `out` has `len` bytes matching the query above.
         check("nvjpegEncodeRetrieveBitstream", unsafe {
-            sys::nvjpegEncodeRetrieveBitstream(self.handle.raw(), self.raw, out.as_mut_ptr(), &mut len, stream.cu_stream())
+            sys::nvjpegEncodeRetrieveBitstream(
+                self.handle.raw(),
+                self.raw,
+                out.as_mut_ptr(),
+                &mut len,
+                stream.cu_stream(),
+            )
         })?;
         out.truncate(len);
         Ok(())

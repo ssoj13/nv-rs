@@ -29,7 +29,7 @@ impl Drop for GreenOwner {
         // SAFETY: owned handle; the Context and streams holding this owner are already gone.
         if let Err(e) = unsafe { sys::cuGreenCtxDestroy(self.raw) }.result() {
             // No Context remains to record on: the error is reported, not swallowed.
-            eprintln!("cuda-ext: cuGreenCtxDestroy failed: {e}");
+            eprintln!("cuda-core-ext: cuGreenCtxDestroy failed: {e}");
         }
     }
 }
@@ -76,8 +76,19 @@ impl GreenContext {
         self.ctx.bind_to_thread()?;
         let mut raw: sys::CUstream = std::ptr::null_mut();
         // SAFETY: valid out-pointer and green context.
-        unsafe { sys::cuGreenCtxStreamCreate(&mut raw, self.green.raw, sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING, 0) }.result()?;
-        let owner = Arc::new(StreamOwner { raw, ctx: self.ctx.clone() });
+        unsafe {
+            sys::cuGreenCtxStreamCreate(
+                &mut raw,
+                self.green.raw,
+                sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                0,
+            )
+        }
+        .result()?;
+        let owner = Arc::new(StreamOwner {
+            raw,
+            ctx: self.ctx.clone(),
+        });
         // SAFETY: `raw` is a live stream of this context; `owner` destroys it when the last holder
         // drops, so it outlives the returned Stream.
         Ok(unsafe { Stream::borrow_with_owner(raw.cast(), &self.ctx, owner) })
@@ -95,20 +106,48 @@ pub fn split_sms(device: &Context, min_sms: u32) -> Result<Vec<GreenContext>, Dr
     // SAFETY: zeroed resource, filled by the driver.
     let mut whole: sys::CUdevResource = unsafe { std::mem::zeroed() };
     // SAFETY: valid out-pointer and device.
-    unsafe { sys::cuDeviceGetDevResource(dev, &mut whole, sys::CUdevResourceType_CU_DEV_RESOURCE_TYPE_SM) }.result()?;
+    unsafe {
+        sys::cuDeviceGetDevResource(
+            dev,
+            &mut whole,
+            sys::CUdevResourceType_CU_DEV_RESOURCE_TYPE_SM,
+        )
+    }
+    .result()?;
 
     let mut groups = 0u32;
     // SAFETY: a null result pointer asks only for the group count.
-    unsafe { sys::cuDevSmResourceSplitByCount(std::ptr::null_mut(), &mut groups, &whole, std::ptr::null_mut(), 0, min_sms) }.result()?;
+    unsafe {
+        sys::cuDevSmResourceSplitByCount(
+            std::ptr::null_mut(),
+            &mut groups,
+            &whole,
+            std::ptr::null_mut(),
+            0,
+            min_sms,
+        )
+    }
+    .result()?;
     if groups == 0 {
         return Err(invalid_value());
     }
     // SAFETY: zeroed resources, filled by the driver.
-    let mut parts: Vec<sys::CUdevResource> = (0..groups).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut parts: Vec<sys::CUdevResource> =
+        (0..groups).map(|_| unsafe { std::mem::zeroed() }).collect();
     // SAFETY: zeroed remainder, filled by the driver.
     let mut remainder: sys::CUdevResource = unsafe { std::mem::zeroed() };
     // SAFETY: `parts` holds `groups` entries as the count query reported.
-    unsafe { sys::cuDevSmResourceSplitByCount(parts.as_mut_ptr(), &mut groups, &whole, &mut remainder, 0, min_sms) }.result()?;
+    unsafe {
+        sys::cuDevSmResourceSplitByCount(
+            parts.as_mut_ptr(),
+            &mut groups,
+            &whole,
+            &mut remainder,
+            0,
+            min_sms,
+        )
+    }
+    .result()?;
 
     let mut out = Vec::with_capacity(groups as usize);
     for part in parts.iter_mut().take(groups as usize) {
@@ -118,16 +157,26 @@ pub fn split_sms(device: &Context, min_sms: u32) -> Result<Vec<GreenContext>, Dr
         // SAFETY: one valid resource.
         unsafe { sys::cuDevResourceGenerateDesc(&mut desc, part, 1) }.result()?;
         let mut green: sys::CUgreenCtx = std::ptr::null_mut();
+        #[cfg(windows)]
+        let flags = sys::CUgreenCtxCreate_flags_CU_GREEN_CTX_DEFAULT_STREAM as u32;
+        #[cfg(not(windows))]
+        let flags = sys::CUgreenCtxCreate_flags_CU_GREEN_CTX_DEFAULT_STREAM;
         // SAFETY: descriptor generated above for this device.
-        unsafe { sys::cuGreenCtxCreate(&mut green, desc, dev, sys::CUgreenCtxCreate_flags_CU_GREEN_CTX_DEFAULT_STREAM as u32) }.result()?;
+        unsafe { sys::cuGreenCtxCreate(&mut green, desc, dev, flags) }.result()?;
         let owner = Arc::new(GreenOwner { raw: green });
         let mut cu_ctx: sys::CUcontext = std::ptr::null_mut();
         // SAFETY: live green context, valid out-pointer.
         unsafe { sys::cuCtxFromGreenCtx(&mut cu_ctx, green) }.result()?;
         // SAFETY: `cu_ctx` is the green context's context on `dev`; `owner` destroys the green
         // context only after this Context (and everything derived from it) is gone.
-        let ctx = unsafe { Context::borrow_with_owner(cu_ctx.cast(), dev, device.ordinal(), owner.clone()) };
-        out.push(GreenContext { ctx, green: owner, sm_count });
+        let ctx = unsafe {
+            Context::borrow_with_owner(cu_ctx.cast(), dev, device.ordinal(), owner.clone())
+        };
+        out.push(GreenContext {
+            ctx,
+            green: owner,
+            sm_count,
+        });
     }
     Ok(out)
 }

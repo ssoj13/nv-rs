@@ -21,17 +21,17 @@
 //! channels; the element type keeps the first one, two or four, as CUDA's `__convert` does.
 //! Surface functions without `_mode` use CUDA's default boundary mode, `.trap`.
 //! **Used by** device crates of nv-rs (OptiX programs and kernels); handles come from the host
-//! crate `cuda-ext` (`TextureObject::handle`, `SurfaceObject::handle`).
+//! crate `cuda-core-ext` (`TextureObject::handle`, `SurfaceObject::handle`).
 
 #![no_std]
 
 use cuda_device::ptx_asm;
 use sealed::{Scalar, SurfBits, TexBits};
 
-/// A texture object handle (`cudaTextureObject_t`), from `cuda_ext::TextureObject::handle`.
+/// A texture object handle (`cudaTextureObject_t`), from `cuda_core_ext::TextureObject::handle`.
 pub type TexObject = u64;
 
-/// A surface object handle (`cudaSurfaceObject_t`), from `cuda_ext::SurfaceObject::handle`.
+/// A surface object handle (`cudaSurfaceObject_t`), from `cuda_core_ext::SurfaceObject::handle`.
 pub type SurfObject = u64;
 
 /// What a surface access outside the array does (`cudaSurfaceBoundaryMode`).

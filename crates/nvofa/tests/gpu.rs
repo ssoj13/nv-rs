@@ -3,7 +3,10 @@
 //! Run with `cargo test -p nvofa -- --include-ignored`.
 
 use cuda_core::Context;
-use nvofa::{BufferDesc, BufferFormat, BufferUsage, CudaBufferType, ExecuteParams, FlowVector, GridSize, InitConfig, OfBuffer, OpticalFlowSession, PerfLevel};
+use nvofa::{
+    BufferDesc, BufferFormat, BufferUsage, CudaBufferType, ExecuteParams, FlowVector, GridSize,
+    InitConfig, OfBuffer, OpticalFlowSession, PerfLevel,
+};
 
 #[test]
 #[ignore = "GPU: needs Turing+ NVIDIA GPU with Optical Flow; run with --ignored"]
@@ -19,7 +22,9 @@ fn optical_flow_detects_synthetic_shift() {
     let mut cfg = InitConfig::new(width, height, GridSize::Four, BufferFormat::Grayscale8);
     cfg.perf_level = PerfLevel::Slow;
     session.init(&cfg).expect("init NVOFA");
-    session.set_io_streams(&stream, &stream).expect("set_io_streams");
+    session
+        .set_io_streams(&stream, &stream)
+        .expect("set_io_streams");
 
     let in_desc = BufferDesc {
         width,
@@ -35,9 +40,12 @@ fn optical_flow_detects_synthetic_shift() {
         format: BufferFormat::Short2,
     };
 
-    let buf_cur = OfBuffer::new(&session, in_desc, CudaBufferType::CuDevicePtr).expect("input buffer");
-    let buf_ref = OfBuffer::new(&session, in_desc, CudaBufferType::CuDevicePtr).expect("reference buffer");
-    let mut buf_out = OfBuffer::new(&session, out_desc, CudaBufferType::CuDevicePtr).expect("output buffer");
+    let buf_cur =
+        OfBuffer::new(&session, in_desc, CudaBufferType::CuDevicePtr).expect("input buffer");
+    let buf_ref =
+        OfBuffer::new(&session, in_desc, CudaBufferType::CuDevicePtr).expect("reference buffer");
+    let mut buf_out =
+        OfBuffer::new(&session, out_desc, CudaBufferType::CuDevicePtr).expect("output buffer");
 
     let mut img_cur = vec![0u8; (width * height) as usize];
     let mut img_ref = vec![0u8; (width * height) as usize];
@@ -62,8 +70,12 @@ fn optical_flow_detects_synthetic_shift() {
         }
     }
 
-    buf_cur.upload_plane0(&stream, width as usize, height as usize, &img_cur).expect("upload cur");
-    buf_ref.upload_plane0(&stream, width as usize, height as usize, &img_ref).expect("upload ref");
+    buf_cur
+        .upload_plane0(&stream, width as usize, height as usize, &img_cur)
+        .expect("upload cur");
+    buf_ref
+        .upload_plane0(&stream, width as usize, height as usize, &img_ref)
+        .expect("upload ref");
 
     let mut exec = ExecuteParams {
         input_frame: &buf_cur,
@@ -77,7 +89,9 @@ fn optical_flow_detects_synthetic_shift() {
     session.execute(&mut exec).expect("execute NVOFA");
 
     let mut flow = vec![FlowVector::default(); (grid_w * grid_h) as usize];
-    buf_out.download_flow_vectors(&stream, &mut flow).expect("download flow");
+    buf_out
+        .download_flow_vectors(&stream, &mut flow)
+        .expect("download flow");
 
     // Sample interior region away from borders to avoid boundary clamping.
     let mut sum_x = 0.0f64;
@@ -93,6 +107,12 @@ fn optical_flow_detects_synthetic_shift() {
     }
     let mean_x = sum_x / (count as f64);
     let mean_y = sum_y / (count as f64);
-    assert!((mean_x - f64::from(shift_x)).abs() < 2.0, "expected dx ~ {shift_x}, got {mean_x:.2}");
-    assert!((mean_y - f64::from(shift_y)).abs() < 2.0, "expected dy ~ {shift_y}, got {mean_y:.2}");
+    assert!(
+        (mean_x - f64::from(shift_x)).abs() < 2.0,
+        "expected dx ~ {shift_x}, got {mean_x:.2}"
+    );
+    assert!(
+        (mean_y - f64::from(shift_y)).abs() < 2.0,
+        "expected dy ~ {shift_y}, got {mean_y:.2}"
+    );
 }

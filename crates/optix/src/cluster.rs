@@ -37,13 +37,21 @@ pub struct ClusterFlags(pub u32);
 
 impl ClusterFlags {
     /// No preference.
-    pub const NONE: Self = Self(sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_NONE as u32);
+    pub const NONE: Self =
+        Self(sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_NONE as u32);
     /// Favour trace speed.
-    pub const PREFER_FAST_TRACE: Self = Self(sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_TRACE as u32);
+    pub const PREFER_FAST_TRACE: Self = Self(
+        sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_TRACE as u32,
+    );
     /// Favour build speed.
-    pub const PREFER_FAST_BUILD: Self = Self(sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_BUILD as u32);
+    pub const PREFER_FAST_BUILD: Self = Self(
+        sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_PREFER_FAST_BUILD as u32,
+    );
     /// Arguments may reference opacity micromaps.
-    pub const ALLOW_OPACITY_MICROMAPS: Self = Self(sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_ALLOW_OPACITY_MICROMAPS as u32);
+    pub const ALLOW_OPACITY_MICROMAPS: Self = Self(
+        sys::OptixClusterAccelBuildFlags_OPTIX_CLUSTER_ACCEL_BUILD_FLAG_ALLOW_OPACITY_MICROMAPS
+            as u32,
+    );
 
     fn raw(self) -> sys::OptixClusterAccelBuildFlags {
         self.0 as sys::OptixClusterAccelBuildFlags
@@ -91,9 +99,15 @@ pub enum ClusterMode {
 impl ClusterMode {
     fn raw(self) -> sys::OptixClusterAccelBuildMode {
         match self {
-            Self::Implicit => sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS,
-            Self::Explicit => sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_EXPLICIT_DESTINATIONS,
-            Self::GetSizes => sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_GET_SIZES,
+            Self::Implicit => {
+                sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_IMPLICIT_DESTINATIONS
+            }
+            Self::Explicit => {
+                sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_EXPLICIT_DESTINATIONS
+            }
+            Self::GetSizes => {
+                sys::OptixClusterAccelBuildMode_OPTIX_CLUSTER_ACCEL_BUILD_MODE_GET_SIZES
+            }
         }
     }
 }
@@ -201,16 +215,23 @@ impl ClusterInput {
     /// Maximum number of arguments one build reads.
     pub fn max_args(&self) -> u32 {
         match self {
-            Self::ClustersFromTriangles(l) | Self::TemplatesFromTriangles(l) | Self::ClustersFromTemplates(l) => l.max_args,
+            Self::ClustersFromTriangles(l)
+            | Self::TemplatesFromTriangles(l)
+            | Self::ClustersFromTemplates(l) => l.max_args,
             Self::TemplatesFromGrids(l) => l.max_args,
             Self::GasesFromClusters(l) => l.max_args,
         }
     }
 
     fn to_sys(self) -> sys::OptixClusterAccelBuildInput {
-        let mut raw = sys::OptixClusterAccelBuildInput { type_: self.kind().raw(), ..Default::default() };
+        let mut raw = sys::OptixClusterAccelBuildInput {
+            type_: self.kind().raw(),
+            ..Default::default()
+        };
         match self {
-            Self::ClustersFromTriangles(l) | Self::TemplatesFromTriangles(l) | Self::ClustersFromTemplates(l) => {
+            Self::ClustersFromTriangles(l)
+            | Self::TemplatesFromTriangles(l)
+            | Self::ClustersFromTemplates(l) => {
                 raw.__bindgen_anon_1.triangles = sys::OptixClusterAccelBuildInputTriangles {
                     flags: l.flags.raw(),
                     maxArgCount: l.max_args,
@@ -272,13 +293,29 @@ macro_rules! cluster_arg {
 }
 
 // u32 id, u32 flags, u32 bitfield, u32 primitive info, 4 x u16 strides, 6 x u64 pointers.
-cluster_arg!(sys::OptixClusterAccelBuildInputTrianglesArgs, 72, ClustersFromTriangles | TemplatesFromTriangles);
+cluster_arg!(
+    sys::OptixClusterAccelBuildInputTrianglesArgs,
+    72,
+    ClustersFromTriangles | TemplatesFromTriangles
+);
 // u32 id, u32 flags, u32 primitive info, u32 bitfield, 2 x u8 dimensions, u16 reserved.
-cluster_arg!(sys::OptixClusterAccelBuildInputGridsArgs, 20, TemplatesFromGrids);
+cluster_arg!(
+    sys::OptixClusterAccelBuildInputGridsArgs,
+    20,
+    TemplatesFromGrids
+);
 // 2 x u32 offsets, 2 x u64 pointers, 2 x u32 stride/reserved.
-cluster_arg!(sys::OptixClusterAccelBuildInputTemplatesArgs, 32, ClustersFromTemplates);
+cluster_arg!(
+    sys::OptixClusterAccelBuildInputTemplatesArgs,
+    32,
+    ClustersFromTemplates
+);
 // 2 x u32 count/stride, u64 pointer.
-cluster_arg!(sys::OptixClusterAccelBuildInputClustersArgs, 16, GasesFromClusters);
+cluster_arg!(
+    sys::OptixClusterAccelBuildInputClustersArgs,
+    16,
+    GasesFromClusters
+);
 
 /// Device-resident arguments of a cluster build, with an optional device-side argument count.
 pub struct ClusterArgs<T: ClusterArg> {
@@ -296,7 +333,13 @@ impl<T: ClusterArg> ClusterArgs<T> {
         let len = count(args.len(), "too many cluster arguments")?;
         // SAFETY: every `ClusterArg` type has no padding (asserted with its impl).
         let buffer = unsafe { upload(stream, args) }?;
-        Ok(Self { buffer, len, count: None, stream: Some(stream.clone()), _t: PhantomData })
+        Ok(Self {
+            buffer,
+            len,
+            count: None,
+            stream: Some(stream.clone()),
+            _t: PhantomData,
+        })
     }
 
     /// Wraps arguments a kernel writes: `buffer` holds `len` values of `T`; `count`, if given,
@@ -307,14 +350,28 @@ impl<T: ClusterArg> ClusterArgs<T> {
     /// Before any build reads them (written earlier or ordered before the build's stream),
     /// `buffer` must hold `len` valid `T` values and `count` a value no greater than the build's
     /// `max_args` or `len`.
-    pub unsafe fn from_device(buffer: DeviceBuffer<u8>, len: u32, count: Option<DeviceBuffer<u32>>) -> Result<Self> {
+    pub unsafe fn from_device(
+        buffer: DeviceBuffer<u8>,
+        len: u32,
+        count: Option<DeviceBuffer<u32>>,
+    ) -> Result<Self> {
         if (len as usize).checked_mul(size_of::<T>()) != Some(buffer.len()) {
-            return Err(Error::Invalid("cluster argument buffer size is not len * size_of::<T>()"));
+            return Err(Error::Invalid(
+                "cluster argument buffer size is not len * size_of::<T>()",
+            ));
         }
         if count.as_ref().is_some_and(|c| c.len() != 1) {
-            return Err(Error::Invalid("cluster argument count buffer holds exactly one u32"));
+            return Err(Error::Invalid(
+                "cluster argument count buffer holds exactly one u32",
+            ));
         }
-        Ok(Self { buffer, len, count, stream: None, _t: PhantomData })
+        Ok(Self {
+            buffer,
+            len,
+            count,
+            stream: None,
+            _t: PhantomData,
+        })
     }
 
     /// The argument bytes (for kernels that rewrite them in place).
@@ -368,7 +425,14 @@ fn zeroed_async<T: DeviceCopy>(stream: &Arc<Stream>, len: usize) -> Result<Devic
     // have a valid all-zero representation.
     let buffer = unsafe { DeviceBuffer::<T>::uninitialized_async(stream, len.max(1)) }?;
     // SAFETY: `buffer` holds `num_bytes` bytes in the stream's context.
-    unsafe { cuda_core::memory::memset_d8_async(buffer.cu_deviceptr(), 0, buffer.num_bytes(), stream.cu_stream()) }?;
+    unsafe {
+        cuda_core::memory::memset_d8_async(
+            buffer.cu_deviceptr(),
+            0,
+            buffer.num_bytes(),
+            stream.cu_stream(),
+        )
+    }?;
     Ok(buffer)
 }
 
@@ -385,22 +449,42 @@ pub struct ClusterAccel {
 
 impl ClusterAccel {
     /// Conservative sizes of a build of `input` in `mode` (`optixClusterAccelComputeMemoryUsage`).
-    pub fn memory_usage(ctx: &DeviceContext, mode: ClusterMode, input: &ClusterInput) -> Result<ClusterSizes> {
+    pub fn memory_usage(
+        ctx: &DeviceContext,
+        mode: ClusterMode,
+        input: &ClusterInput,
+    ) -> Result<ClusterSizes> {
         let raw = input.to_sys();
         let mut sizes = sys::OptixAccelBufferSizes::default();
         ctx.cuda().bind_to_thread()?;
         // SAFETY: `raw` lives for the call; `sizes` is writable.
         check("optixClusterAccelComputeMemoryUsage", unsafe {
-            entry!(ctx.table(), optixClusterAccelComputeMemoryUsage)(ctx.raw(), mode.raw(), &raw, &mut sizes)
+            entry!(ctx.table(), optixClusterAccelComputeMemoryUsage)(
+                ctx.raw(),
+                mode.raw(),
+                &raw,
+                &mut sizes,
+            )
         })?;
-        Ok(ClusterSizes { output: sizes.outputSizeInBytes, temp: sizes.tempSizeInBytes })
+        Ok(ClusterSizes {
+            output: sizes.outputSizeInBytes,
+            temp: sizes.tempSizeInBytes,
+        })
     }
 
     /// Validation shared by every mode.
-    fn check_args<T: ClusterArg>(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, input: &ClusterInput, args: &ClusterArgs<T>, refs: &ClusterRefs<'_>) -> Result<usize> {
+    fn check_args<T: ClusterArg>(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        input: &ClusterInput,
+        args: &ClusterArgs<T>,
+        refs: &ClusterRefs<'_>,
+    ) -> Result<usize> {
         same_ctx(stream, ctx)?;
         if !T::accepts(input.kind()) {
-            return Err(Error::Invalid("cluster argument type does not match the build kind"));
+            return Err(Error::Invalid(
+                "cluster argument type does not match the build kind",
+            ));
         }
         let n = input.max_args();
         if n == 0 {
@@ -408,13 +492,28 @@ impl ClusterAccel {
         }
         // Without a device count OptiX reads `max_args` arguments; with one it reads up to that.
         if args.len < n {
-            return Err(Error::Invalid("cluster argument buffer holds fewer than max_args arguments"));
+            return Err(Error::Invalid(
+                "cluster argument buffer holds fewer than max_args arguments",
+            ));
         }
-        if args.stream.as_ref().is_some_and(|s| !Arc::ptr_eq(s, stream)) {
-            return Err(Error::Invalid("cluster arguments were uploaded on a different stream than the build"));
+        if args
+            .stream
+            .as_ref()
+            .is_some_and(|s| !Arc::ptr_eq(s, stream))
+        {
+            return Err(Error::Invalid(
+                "cluster arguments were uploaded on a different stream than the build",
+            ));
         }
-        if refs.clusters.iter().any(|c| !Arc::ptr_eq(&c.ctx, ctx)) || refs.micromaps.iter().any(|m| !Arc::ptr_eq(m.context(), ctx)) {
-            return Err(Error::Invalid("cluster references from another device context"));
+        if refs.clusters.iter().any(|c| !Arc::ptr_eq(&c.ctx, ctx))
+            || refs
+                .micromaps
+                .iter()
+                .any(|m| !Arc::ptr_eq(m.context(), ctx))
+        {
+            return Err(Error::Invalid(
+                "cluster references from another device context",
+            ));
         }
         Ok(n as usize)
     }
@@ -423,7 +522,13 @@ impl ClusterAccel {
     ///
     /// `desc` names buffers sized for `input`, ordered on `stream`; the arguments are valid per
     /// the public builds' contract.
-    unsafe fn run<T: ClusterArg>(ctx: &DeviceContext, stream: &Stream, desc: &sys::OptixClusterAccelBuildModeDesc, input: &ClusterInput, args: &ClusterArgs<T>) -> Result<()> {
+    unsafe fn run<T: ClusterArg>(
+        ctx: &DeviceContext,
+        stream: &Stream,
+        desc: &sys::OptixClusterAccelBuildModeDesc,
+        input: &ClusterInput,
+        args: &ClusterArgs<T>,
+    ) -> Result<()> {
         let raw = input.to_sys();
         ctx.cuda().bind_to_thread()?;
         // SAFETY: per the contract; `desc` and `raw` live for the call.
@@ -450,18 +555,45 @@ impl ClusterAccel {
     /// `stream`, and within the counts and limits of `input`; a device count must not exceed
     /// `max_args`. Every CLAS, template and micromap array the arguments reference must be in
     /// `opts.refs` so the result keeps it alive.
-    pub unsafe fn build<T: ClusterArg>(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, input: &ClusterInput, args: &ClusterArgs<T>, opts: ClusterOptions<'_>) -> Result<Arc<Self>> {
+    pub unsafe fn build<T: ClusterArg>(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        input: &ClusterInput,
+        args: &ClusterArgs<T>,
+        opts: ClusterOptions<'_>,
+    ) -> Result<Arc<Self>> {
         let n = Self::check_args(ctx, stream, input, args, &opts.refs)?;
         let sizes = Self::memory_usage(ctx, ClusterMode::Implicit, input)?;
-        let arrays = n.saturating_mul(size_of::<u64>()).saturating_add(if opts.sizes { n.saturating_mul(size_of::<u32>()) } else { 0 });
-        within(opts.budget, scratch.growth(sizes.temp).saturating_add(sizes.output).saturating_add(arrays))?;
+        let arrays = n
+            .saturating_mul(size_of::<u64>())
+            .saturating_add(if opts.sizes {
+                n.saturating_mul(size_of::<u32>())
+            } else {
+                0
+            });
+        within(
+            opts.budget,
+            scratch
+                .growth(sizes.temp)
+                .saturating_add(sizes.output)
+                .saturating_add(arrays),
+        )?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.temp)?;
         // SAFETY: OptiX writes the objects before anything reads them; the accel alignment
         // covers CLAS and GAS (128 bytes) and templates (32 bytes).
-        let buffer = unsafe { alloc(stream, sizes.output, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
+        let buffer =
+            unsafe { alloc(stream, sizes.output, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
         let handles = zeroed_async::<u64>(stream, n)?;
-        let out_sizes = if opts.sizes { Some(zeroed_async::<u32>(stream, n)?) } else { None };
-        let mut desc = sys::OptixClusterAccelBuildModeDesc { mode: ClusterMode::Implicit.raw(), ..Default::default() };
+        let out_sizes = if opts.sizes {
+            Some(zeroed_async::<u32>(stream, n)?)
+        } else {
+            None
+        };
+        let mut desc = sys::OptixClusterAccelBuildModeDesc {
+            mode: ClusterMode::Implicit.raw(),
+            ..Default::default()
+        };
         desc.__bindgen_anon_1.implicitDest = sys::OptixClusterAccelBuildModeDescImplicitDest {
             outputBuffer: buffer.cu_deviceptr(),
             outputBufferSizeInBytes: buffer.len(),
@@ -470,11 +602,22 @@ impl ClusterAccel {
             outputHandlesBuffer: handles.cu_deviceptr(),
             outputHandlesStrideInBytes: size_of::<u64>() as u32,
             outputSizesBuffer: out_sizes.as_ref().map_or(0, |s| s.cu_deviceptr()),
-            outputSizesStrideInBytes: if out_sizes.is_some() { size_of::<u32>() as u32 } else { 0 },
+            outputSizesStrideInBytes: if out_sizes.is_some() {
+                size_of::<u32>() as u32
+            } else {
+                0
+            },
         };
         // SAFETY: buffers sized by OptiX for `input`; arguments per the forwarded contract.
         unsafe { Self::run(ctx, stream, &desc, input, args) }?;
-        Ok(Arc::new(Self::make(ctx, input.kind(), buffer, handles, out_sizes, &opts.refs)))
+        Ok(Arc::new(Self::make(
+            ctx,
+            input.kind(),
+            buffer,
+            handles,
+            out_sizes,
+            &opts.refs,
+        )))
     }
 
     /// Writes each object's exact output size (one `u32` per argument, `max_args` entries) for
@@ -484,13 +627,28 @@ impl ClusterAccel {
     ///
     /// As [`ClusterAccel::build`] for the arguments; read the sizes on `stream` or after
     /// synchronizing it.
-    pub unsafe fn get_sizes<T: ClusterArg>(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>, scratch: &mut Scratch, input: &ClusterInput, args: &ClusterArgs<T>, budget: Option<usize>) -> Result<DeviceBuffer<u32>> {
+    pub unsafe fn get_sizes<T: ClusterArg>(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        input: &ClusterInput,
+        args: &ClusterArgs<T>,
+        budget: Option<usize>,
+    ) -> Result<DeviceBuffer<u32>> {
         let n = Self::check_args(ctx, stream, input, args, &ClusterRefs::default())?;
         let sizes = Self::memory_usage(ctx, ClusterMode::GetSizes, input)?;
-        within(budget, scratch.growth(sizes.temp).saturating_add(n.saturating_mul(size_of::<u32>())))?;
+        within(
+            budget,
+            scratch
+                .growth(sizes.temp)
+                .saturating_add(n.saturating_mul(size_of::<u32>())),
+        )?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.temp)?;
         let out = zeroed_async::<u32>(stream, n)?;
-        let mut desc = sys::OptixClusterAccelBuildModeDesc { mode: ClusterMode::GetSizes.raw(), ..Default::default() };
+        let mut desc = sys::OptixClusterAccelBuildModeDesc {
+            mode: ClusterMode::GetSizes.raw(),
+            ..Default::default()
+        };
         desc.__bindgen_anon_1.getSize = sys::OptixClusterAccelBuildModeDescGetSize {
             outputSizesBuffer: out.cu_deviceptr(),
             outputSizesStrideInBytes: size_of::<u32>() as u32,
@@ -521,34 +679,67 @@ impl ClusterAccel {
     ) -> Result<Arc<Self>> {
         let n = Self::check_args(ctx, stream, input, args, &opts.refs)?;
         if args.count.is_some() {
-            return Err(Error::Invalid("explicit builds build exactly sizes.len() arguments; give no device count"));
+            return Err(Error::Invalid(
+                "explicit builds build exactly sizes.len() arguments; give no device count",
+            ));
         }
         if sizes.len() != n {
-            return Err(Error::Invalid("explicit builds need one size per argument (max_args)"));
+            return Err(Error::Invalid(
+                "explicit builds need one size per argument (max_args)",
+            ));
         }
         let align = sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT as usize;
         let mut offsets = Vec::with_capacity(n);
         let mut total = 0usize;
         for s in sizes {
             offsets.push(total);
-            total = (*s as usize).checked_next_multiple_of(align).and_then(|s| total.checked_add(s)).ok_or(Error::Invalid("explicit cluster output size overflows usize"))?;
+            total = (*s as usize)
+                .checked_next_multiple_of(align)
+                .and_then(|s| total.checked_add(s))
+                .ok_or(Error::Invalid(
+                    "explicit cluster output size overflows usize",
+                ))?;
         }
         let temp_size = Self::memory_usage(ctx, ClusterMode::Explicit, input)?.temp;
-        let arrays = n.saturating_mul(size_of::<u64>()).saturating_add(if opts.sizes { n.saturating_mul(size_of::<u32>()) } else { 0 });
-        within(opts.budget, scratch.growth(temp_size).saturating_add(total).saturating_add(arrays))?;
+        let arrays = n
+            .saturating_mul(size_of::<u64>())
+            .saturating_add(if opts.sizes {
+                n.saturating_mul(size_of::<u32>())
+            } else {
+                0
+            });
+        within(
+            opts.budget,
+            scratch
+                .growth(temp_size)
+                .saturating_add(total)
+                .saturating_add(arrays),
+        )?;
         let (temp, temp_len) = scratch.reserve(stream, temp_size)?;
         // SAFETY: OptiX writes every object before anything reads it.
         let buffer = unsafe { alloc(stream, total, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
         // Each destination keeps the buffer's alignment: offsets are multiples of it.
-        let dests: Vec<u64> = offsets.iter().map(|o| buffer.cu_deviceptr() + *o as u64).collect();
+        let dests: Vec<u64> = offsets
+            .iter()
+            .map(|o| buffer.cu_deviceptr() + *o as u64)
+            .collect();
         // The destination array is also the handle array, which the header allows ("can be the
         // same as destAddresses"): in explicit mode the driver leaves the handle array untouched
         // for CLAS outputs (observed: OptiX 9.1, sm_86), whose handle is the destination address,
         // and overwrites it with the traversable handle for GAS outputs.
         // SAFETY: `u64` has no padding.
-        let handles = unsafe { upload(stream, &dests) }?.cast_chunks::<u64>().map_err(|_| Error::Invalid("destination array is not u64-aligned"))?;
-        let out_sizes = if opts.sizes { Some(zeroed_async::<u32>(stream, n)?) } else { None };
-        let mut desc = sys::OptixClusterAccelBuildModeDesc { mode: ClusterMode::Explicit.raw(), ..Default::default() };
+        let handles = unsafe { upload(stream, &dests) }?
+            .cast_chunks::<u64>()
+            .map_err(|_| Error::Invalid("destination array is not u64-aligned"))?;
+        let out_sizes = if opts.sizes {
+            Some(zeroed_async::<u32>(stream, n)?)
+        } else {
+            None
+        };
+        let mut desc = sys::OptixClusterAccelBuildModeDesc {
+            mode: ClusterMode::Explicit.raw(),
+            ..Default::default()
+        };
         desc.__bindgen_anon_1.explicitDest = sys::OptixClusterAccelBuildModeDescExplicitDest {
             tempBuffer: temp,
             tempBufferSizeInBytes: temp_len,
@@ -557,17 +748,43 @@ impl ClusterAccel {
             outputHandlesBuffer: handles.cu_deviceptr(),
             outputHandlesStrideInBytes: size_of::<u64>() as u32,
             outputSizesBuffer: out_sizes.as_ref().map_or(0, |s| s.cu_deviceptr()),
-            outputSizesStrideInBytes: if out_sizes.is_some() { size_of::<u32>() as u32 } else { 0 },
+            outputSizesStrideInBytes: if out_sizes.is_some() {
+                size_of::<u32>() as u32
+            } else {
+                0
+            },
         };
         // SAFETY: each destination has its object's reported size (contract) inside `buffer`;
         // the destination/handle array is owned by the result; arguments per the forwarded
         // contract.
         unsafe { Self::run(ctx, stream, &desc, input, args) }?;
-        Ok(Arc::new(Self::make(ctx, input.kind(), buffer, handles, out_sizes, &opts.refs)))
+        Ok(Arc::new(Self::make(
+            ctx,
+            input.kind(),
+            buffer,
+            handles,
+            out_sizes,
+            &opts.refs,
+        )))
     }
 
-    fn make(ctx: &Arc<DeviceContext>, kind: ClusterKind, buffer: DeviceBuffer<u8>, handles: DeviceBuffer<u64>, sizes: Option<DeviceBuffer<u32>>, refs: &ClusterRefs<'_>) -> Self {
-        Self { kind, buffer, handles, sizes, _clusters: refs.clusters.to_vec(), _micromaps: refs.micromaps.to_vec(), ctx: ctx.clone() }
+    fn make(
+        ctx: &Arc<DeviceContext>,
+        kind: ClusterKind,
+        buffer: DeviceBuffer<u8>,
+        handles: DeviceBuffer<u64>,
+        sizes: Option<DeviceBuffer<u32>>,
+        refs: &ClusterRefs<'_>,
+    ) -> Self {
+        Self {
+            kind,
+            buffer,
+            handles,
+            sizes,
+            _clusters: refs.clusters.to_vec(),
+            _micromaps: refs.micromaps.to_vec(),
+            ctx: ctx.clone(),
+        }
     }
 
     /// What was built.
@@ -600,12 +817,18 @@ impl ClusterAccel {
     /// handle back (synchronizes `stream`, which must be the build stream or ordered after it).
     pub fn child(self: &Arc<Self>, stream: &Stream, index: usize) -> Result<crate::Child> {
         if self.kind != ClusterKind::GasesFromClusters {
-            return Err(Error::Invalid("only GasesFromClusters builds produce traversable GASes"));
+            return Err(Error::Invalid(
+                "only GasesFromClusters builds produce traversable GASes",
+            ));
         }
         let handles = self.handles.to_host_vec(stream)?;
-        let handle = *handles.get(index).ok_or(Error::Invalid("cluster GAS index out of range"))?;
+        let handle = *handles
+            .get(index)
+            .ok_or(Error::Invalid("cluster GAS index out of range"))?;
         if handle == 0 {
-            return Err(Error::Invalid("cluster GAS slot was not built (past the device count)"));
+            return Err(Error::Invalid(
+                "cluster GAS slot was not built (past the device count)",
+            ));
         }
         Ok(crate::Child::Cluster(self.clone(), handle))
     }

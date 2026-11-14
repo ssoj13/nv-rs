@@ -14,7 +14,7 @@ use cuda_core::{Context, DeviceBuffer, Stream};
 use crate::batched::{aligned_stride, compress_batched_async, decompress_batched_async};
 use crate::format::{DecompressBackend, Format};
 use crate::scratch::BatchStaging;
-use crate::{same_stream, within, Error, Result};
+use crate::{Error, Result, same_stream, within};
 
 /// Chunk layout metadata describing a compressed payload stored in a caller-owned buffer.
 #[derive(Clone, Debug)]
@@ -109,7 +109,9 @@ impl CompressionManager {
             return Err(Error::Invalid("cannot compress an empty buffer"));
         }
         if !chunk_size.is_multiple_of(input_align.max(1)) && total_bytes > chunk_size {
-            return Err(Error::Invalid("chunk_size must be a multiple of nvCOMP input alignment"));
+            return Err(Error::Invalid(
+                "chunk_size must be a multiple of nvCOMP input alignment",
+            ));
         }
         out.clear();
         let mut offset = 0usize;
@@ -146,7 +148,12 @@ impl CompressionManager {
         same_stream(stream, self.staging.stream())?;
         let total = input.num_bytes();
         let alignments = self.format.compress_alignments()?;
-        Self::plan_chunks(total, self.chunk_size, alignments.input, &mut self.in_ranges_scratch)?;
+        Self::plan_chunks(
+            total,
+            self.chunk_size,
+            alignments.input,
+            &mut self.in_ranges_scratch,
+        )?;
 
         let max_chunk = self.chunk_size.min(total);
         let max_out_chunk = self.format.max_output_chunk_bytes(max_chunk)?;
@@ -155,7 +162,9 @@ impl CompressionManager {
         let out_bytes = num_chunks
             .checked_mul(slot_stride)
             .ok_or(Error::Invalid("compressed output size overflow"))?;
-        let temp_bytes = self.format.compress_temp_bytes(num_chunks, max_chunk, total, stream)?;
+        let temp_bytes = self
+            .format
+            .compress_temp_bytes(num_chunks, max_chunk, total, stream)?;
         let staging_grow = self.staging.growth(num_chunks, temp_bytes);
         within(self.budget, out_bytes.saturating_add(staging_grow))?;
 
@@ -163,7 +172,10 @@ impl CompressionManager {
         let mut output = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, out_bytes) }?;
         let remaining_budget = self.budget.map(|b| b.saturating_sub(out_bytes));
         let layout = self.compress_into_inner(stream, input, &mut output, remaining_budget)?;
-        Ok(CompressedBuffer { data: output, layout })
+        Ok(CompressedBuffer {
+            data: output,
+            layout,
+        })
     }
 
     /// Compresses `input` into a caller-owned `output` buffer (zero device allocations once
@@ -236,10 +248,14 @@ impl CompressionManager {
     ) -> Result<usize> {
         same_stream(stream, self.staging.stream())?;
         if compressed.layout.format.kind() != self.format.kind() {
-            return Err(Error::Invalid("compressed payload format does not match manager format"));
+            return Err(Error::Invalid(
+                "compressed payload format does not match manager format",
+            ));
         }
         if output.num_bytes() < compressed.layout.uncompressed_bytes {
-            return Err(Error::Invalid("decompression output buffer smaller than uncompressed_bytes"));
+            return Err(Error::Invalid(
+                "decompression output buffer smaller than uncompressed_bytes",
+            ));
         }
         let receipt = decompress_batched_async(
             stream,
@@ -264,7 +280,9 @@ impl CompressionManager {
     ) -> Result<DeviceBuffer<u8>> {
         same_stream(stream, self.staging.stream())?;
         if compressed.layout.format.kind() != self.format.kind() {
-            return Err(Error::Invalid("compressed payload format does not match manager format"));
+            return Err(Error::Invalid(
+                "compressed payload format does not match manager format",
+            ));
         }
         let num_chunks = compressed.layout.compressed_ranges.len();
         let max_chunk = compressed
@@ -288,8 +306,12 @@ impl CompressionManager {
         // SAFETY: `output` is completely overwritten by `decompress_into_with_budget_async` before return.
         let mut output = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, out_bytes) }?;
         let remaining_budget = self.budget.map(|b| b.saturating_sub(out_bytes));
-        let written =
-            self.decompress_into_with_budget_async(stream, compressed, &mut output, remaining_budget)?;
+        let written = self.decompress_into_with_budget_async(
+            stream,
+            compressed,
+            &mut output,
+            remaining_budget,
+        )?;
         if written != compressed.layout.uncompressed_bytes {
             return Err(Error::Invalid("decompressed byte count mismatch"));
         }

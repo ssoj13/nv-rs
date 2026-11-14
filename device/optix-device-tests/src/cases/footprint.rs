@@ -1,5 +1,5 @@
 //! Case `footprint`: texture footprints (`optix_device::footprint`) from an OptiX raygen over a
-//! 256x256, 9-level mipmapped texture (`cuda-ext`).
+//! 256x256, 9-level mipmapped texture (`cuda-core-ext`).
 //!
 //! Each raygen thread runs one probe from a host table: `tex_footprint_2d` (non-mipmapped
 //! semantics: level 0, one level), `tex_footprint_2d_lod` at integer and fractional levels with
@@ -12,7 +12,7 @@
 use super::common::{Ctx, Gpu, R, ensure, opts, same};
 use bytemuck::{Pod, Zeroable};
 use cuda_device::{ConstantMemory, constant, cuda_module, kernel};
-use cuda_ext::{ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, TextureDesc, TextureObject};
+use cuda_core_ext::{ArrayDesc, ArrayFormat, FilterMode, MipmappedArray, TextureDesc, TextureObject};
 use optix::{HitGroup, LinkOptions, ProgramGroup, SbtRecord, ShaderBindingTable};
 use optix_device::footprint::{self as fp, Footprint2d, TexInfo};
 use optix_device::state;

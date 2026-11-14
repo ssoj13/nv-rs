@@ -20,7 +20,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty workspace for FFT plans on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buffer: None }
+        Self {
+            stream: stream.clone(),
+            buffer: None,
+        }
     }
 
     /// Creates a workspace pre-allocated to `bytes` if `bytes <= budget`.
@@ -44,12 +47,22 @@ impl Scratch {
 
     /// Ensures at least `bytes` of workspace are available on `stream`, admitting the request
     /// against `budget`.
-    pub(crate) fn reserve(&mut self, stream: &Arc<Stream>, bytes: usize, budget: usize) -> Result<*mut c_void> {
+    pub(crate) fn reserve(
+        &mut self,
+        stream: &Arc<Stream>,
+        bytes: usize,
+        budget: usize,
+    ) -> Result<*mut c_void> {
         if !Arc::ptr_eq(stream, &self.stream) {
-            return Err(Error::Invalid("scratch used on a different stream than it was created for"));
+            return Err(Error::Invalid(
+                "scratch used on a different stream than it was created for",
+            ));
         }
         if bytes > budget {
-            return Err(Error::Budget { requested: bytes, available: budget });
+            return Err(Error::Budget {
+                requested: bytes,
+                available: budget,
+            });
         }
         if bytes == 0 {
             return Ok(std::ptr::null_mut());
@@ -59,7 +72,10 @@ impl Scratch {
             // SAFETY: cuFFT workspace is scratch memory written before being read.
             self.buffer = Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes)? });
         }
-        let buf = self.buffer.as_ref().ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
+        let buf = self
+            .buffer
+            .as_ref()
+            .ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
         Ok((buf.cu_deviceptr() as usize) as *mut c_void)
     }
 }

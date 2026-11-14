@@ -114,13 +114,21 @@ impl AlignedBufferPool {
     /// minimum 4096 bytes) and retains up to `max_pooled` free buffers.
     pub fn new(buf_bytes: usize, max_pooled: usize) -> Self {
         let aligned_bytes = buf_bytes.max(4096).div_ceil(8) * 8;
-        Self { buf_bytes: aligned_bytes, max_pooled, free: Vec::new(), in_flight: HashMap::new() }
+        Self {
+            buf_bytes: aligned_bytes,
+            max_pooled,
+            free: Vec::new(),
+            in_flight: HashMap::new(),
+        }
     }
 
     /// Acquires an 8-byte-aligned buffer pointer and byte capacity, reusing a pooled buffer if
     /// available.
     pub fn acquire(&mut self) -> (*mut u8, usize) {
-        let mut buf = self.free.pop().unwrap_or_else(|| vec![0u64; self.buf_bytes / 8].into_boxed_slice());
+        let mut buf = self
+            .free
+            .pop()
+            .unwrap_or_else(|| vec![0u64; self.buf_bytes / 8].into_boxed_slice());
         let ptr = buf.as_mut_ptr().cast::<u8>();
         let len = buf.len() * 8;
         self.in_flight.insert(ptr as usize, buf);
@@ -174,7 +182,11 @@ fn state() -> &'static Mutex<ActivityState> {
     })
 }
 
-unsafe extern "C" fn buffer_requested(buffer: *mut *mut u8, size: *mut usize, max_num_records: *mut usize) {
+unsafe extern "C" fn buffer_requested(
+    buffer: *mut *mut u8,
+    size: *mut usize,
+    max_num_records: *mut usize,
+) {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if buffer.is_null() || size.is_null() || max_num_records.is_null() {
             return;
@@ -190,7 +202,8 @@ unsafe extern "C" fn buffer_requested(buffer: *mut *mut u8, size: *mut usize, ma
     }));
     if let Err(payload) = res {
         let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
-        st.panic_msg.get_or_insert_with(|| panic_payload_to_string(payload));
+        st.panic_msg
+            .get_or_insert_with(|| panic_payload_to_string(payload));
     }
 }
 
@@ -212,7 +225,8 @@ unsafe extern "C" fn buffer_completed(
             let mut record_ptr: *mut sys::CUpti_Activity = std::ptr::null_mut();
             loop {
                 // SAFETY: `buffer` is valid for `valid_size` bytes until this callback returns.
-                let rc = unsafe { sys::cuptiActivityGetNextRecord(buffer, valid_size, &mut record_ptr) };
+                let rc =
+                    unsafe { sys::cuptiActivityGetNextRecord(buffer, valid_size, &mut record_ptr) };
                 if rc == sys::CUptiResult_CUPTI_SUCCESS && !record_ptr.is_null() {
                     // SAFETY: `record_ptr` points to a valid `CUpti_Activity` header.
                     let kind = unsafe { (*record_ptr).kind };
@@ -236,23 +250,30 @@ unsafe extern "C" fn buffer_completed(
     }));
     if let Err(payload) = res {
         let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
-        st.panic_msg.get_or_insert_with(|| panic_payload_to_string(payload));
+        st.panic_msg
+            .get_or_insert_with(|| panic_payload_to_string(payload));
         if !buffer.is_null() {
             st.pool.release(buffer);
         }
     }
 }
 
-fn decode_record(record_ptr: *mut sys::CUpti_Activity, kind: sys::CUpti_ActivityKind) -> ActivityRecord {
+fn decode_record(
+    record_ptr: *mut sys::CUpti_Activity,
+    kind: sys::CUpti_ActivityKind,
+) -> ActivityRecord {
     match kind {
-        sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_KERNEL | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL => {
+        sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_KERNEL
+        | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL => {
             // SAFETY: `kind` guarantees the record is `CUpti_ActivityKernel12`.
             let k = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityKernel12>() };
             let name = if k.name.is_null() {
                 String::new()
             } else {
                 // SAFETY: `k.name` is a NUL-terminated static/interned string from CUPTI.
-                unsafe { CStr::from_ptr(k.name) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(k.name) }
+                    .to_string_lossy()
+                    .into_owned()
             };
             ActivityRecord::Kernel {
                 name,
@@ -277,7 +298,8 @@ fn decode_record(record_ptr: *mut sys::CUpti_Activity, kind: sys::CUpti_Activity
                 stream_id: m.streamId,
             }
         }
-        sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME => {
+        sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER
+        | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME => {
             // SAFETY: `kind` guarantees the record is `CUpti_ActivityAPI`.
             let a = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityAPI>() };
             ActivityRecord::Api {
@@ -312,14 +334,19 @@ impl ActivityProfiler {
             })?;
             st.registered = true;
         }
-        Ok(Self { cuda: cuda.clone(), enabled: Vec::new() })
+        Ok(Self {
+            cuda: cuda.clone(),
+            enabled: Vec::new(),
+        })
     }
 
     /// Enables collection for `kind` (`cuptiActivityEnable`).
     pub fn enable(&mut self, kind: ActivityKind) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
-        check("cuptiActivityEnable", unsafe { sys::cuptiActivityEnable(kind.to_sys()) })?;
+        check("cuptiActivityEnable", unsafe {
+            sys::cuptiActivityEnable(kind.to_sys())
+        })?;
         if !self.enabled.contains(&kind) {
             self.enabled.push(kind);
         }
@@ -330,7 +357,9 @@ impl ActivityProfiler {
     pub fn disable(&mut self, kind: ActivityKind) -> Result<()> {
         self.cuda.bind_to_thread()?;
         // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
-        check("cuptiActivityDisable", unsafe { sys::cuptiActivityDisable(kind.to_sys()) })?;
+        check("cuptiActivityDisable", unsafe {
+            sys::cuptiActivityDisable(kind.to_sys())
+        })?;
         self.enabled.retain(|&k| k != kind);
         Ok(())
     }
@@ -338,9 +367,15 @@ impl ActivityProfiler {
     /// Flushes all pending activity records (`cuptiActivityFlushAll`), surfacing any callback panic.
     pub fn flush(&self, forced: bool) -> Result<()> {
         self.cuda.bind_to_thread()?;
-        let flag = if forced { sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32 } else { 0 };
+        let flag = if forced {
+            sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32
+        } else {
+            0
+        };
         // SAFETY: `flag` is 0 or `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
-        check("cuptiActivityFlushAll", unsafe { sys::cuptiActivityFlushAll(flag) })?;
+        check("cuptiActivityFlushAll", unsafe {
+            sys::cuptiActivityFlushAll(flag)
+        })?;
         self.check_callback_panic()
     }
 
@@ -376,13 +411,21 @@ impl Drop for ActivityProfiler {
             // SAFETY: `kind` was previously enabled by this profiler.
             let rc = unsafe { sys::cuptiActivityDisable(kind.to_sys()) };
             if rc != sys::CUptiResult_CUPTI_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+                self.cuda.record_err(Err::<(), _>(DriverError(
+                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+                )));
             }
         }
         // SAFETY: forced flush on teardown ensures CUPTI returns all in-flight buffers to the pool.
-        let rc = unsafe { sys::cuptiActivityFlushAll(sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32) };
+        let rc = unsafe {
+            sys::cuptiActivityFlushAll(
+                sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32,
+            )
+        };
         if rc != sys::CUptiResult_CUPTI_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+            self.cuda.record_err(Err::<(), _>(DriverError(
+                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+            )));
         }
     }
 }

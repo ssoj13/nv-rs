@@ -76,7 +76,8 @@ impl Device {
     pub fn serial(&self) -> Result<String> {
         let mut buf = [0 as c_char; sys::NVML_DEVICE_SERIAL_BUFFER_SIZE as usize];
         // SAFETY: `self.raw` is valid and `buf` is a writable buffer of `buf.len()` bytes.
-        let code = unsafe { sys::nvmlDeviceGetSerial(self.raw, buf.as_mut_ptr(), buf.len() as u32) };
+        let code =
+            unsafe { sys::nvmlDeviceGetSerial(self.raw, buf.as_mut_ptr(), buf.len() as u32) };
         check("nvmlDeviceGetSerial", code)?;
         Ok(decode_c_buf(&buf))
     }
@@ -85,7 +86,8 @@ impl Device {
     pub fn vbios_version(&self) -> Result<String> {
         let mut buf = [0 as c_char; sys::NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE as usize];
         // SAFETY: `self.raw` is valid and `buf` is a writable buffer of `buf.len()` bytes.
-        let code = unsafe { sys::nvmlDeviceGetVbiosVersion(self.raw, buf.as_mut_ptr(), buf.len() as u32) };
+        let code =
+            unsafe { sys::nvmlDeviceGetVbiosVersion(self.raw, buf.as_mut_ptr(), buf.len() as u32) };
         check("nvmlDeviceGetVbiosVersion", code)?;
         Ok(decode_c_buf(&buf))
     }
@@ -104,7 +106,8 @@ impl Device {
         let mut major = 0i32;
         let mut minor = 0i32;
         // SAFETY: `self.raw` is valid and `major`/`minor` are valid out-pointers.
-        let code = unsafe { sys::nvmlDeviceGetCudaComputeCapability(self.raw, &mut major, &mut minor) };
+        let code =
+            unsafe { sys::nvmlDeviceGetCudaComputeCapability(self.raw, &mut major, &mut minor) };
         check("nvmlDeviceGetCudaComputeCapability", code)?;
         Ok((major, minor))
     }
@@ -160,7 +163,12 @@ impl Device {
         check("nvmlDeviceGetMemoryInfo", code)?;
         // SAFETY: `nvmlDeviceGetMemoryInfo` succeeded and initialized `v1`.
         let v1 = unsafe { v1.assume_init() };
-        Ok(MemoryInfo { total: v1.total, free: v1.free, used: v1.used, reserved: None })
+        Ok(MemoryInfo {
+            total: v1.total,
+            free: v1.free,
+            used: v1.used,
+            reserved: None,
+        })
     }
 
     /// Queries BAR1 memory usage (`nvmlDeviceGetBAR1MemoryInfo`).
@@ -171,7 +179,11 @@ impl Device {
         check("nvmlDeviceGetBAR1MemoryInfo", code)?;
         // SAFETY: `nvmlDeviceGetBAR1MemoryInfo` succeeded and initialized `raw`.
         let raw = unsafe { raw.assume_init() };
-        Ok(Bar1MemoryInfo { total: raw.bar1Total, free: raw.bar1Free, used: raw.bar1Used })
+        Ok(Bar1MemoryInfo {
+            total: raw.bar1Total,
+            free: raw.bar1Free,
+            used: raw.bar1Used,
+        })
     }
 
     /// Queries GPU and memory controller utilization (`nvmlDeviceGetUtilizationRates`).
@@ -182,7 +194,10 @@ impl Device {
         check("nvmlDeviceGetUtilizationRates", code)?;
         // SAFETY: `nvmlDeviceGetUtilizationRates` succeeded and initialized `raw`.
         let raw = unsafe { raw.assume_init() };
-        Ok(Utilization { gpu: raw.gpu, memory: raw.memory })
+        Ok(Utilization {
+            gpu: raw.gpu,
+            memory: raw.memory,
+        })
     }
 
     /// Queries NVENC hardware encoder utilization (`nvmlDeviceGetEncoderUtilization`).
@@ -191,10 +206,17 @@ impl Device {
         let mut sampling_period_us = 0u32;
         // SAFETY: `self.raw` is valid and both out-pointers are valid.
         let code = unsafe {
-            sys::nvmlDeviceGetEncoderUtilization(self.raw, &mut utilization, &mut sampling_period_us)
+            sys::nvmlDeviceGetEncoderUtilization(
+                self.raw,
+                &mut utilization,
+                &mut sampling_period_us,
+            )
         };
         check("nvmlDeviceGetEncoderUtilization", code)?;
-        Ok(CodecUtilization { utilization, sampling_period_us })
+        Ok(CodecUtilization {
+            utilization,
+            sampling_period_us,
+        })
     }
 
     /// Queries NVDEC hardware decoder utilization (`nvmlDeviceGetDecoderUtilization`).
@@ -203,10 +225,17 @@ impl Device {
         let mut sampling_period_us = 0u32;
         // SAFETY: `self.raw` is valid and both out-pointers are valid.
         let code = unsafe {
-            sys::nvmlDeviceGetDecoderUtilization(self.raw, &mut utilization, &mut sampling_period_us)
+            sys::nvmlDeviceGetDecoderUtilization(
+                self.raw,
+                &mut utilization,
+                &mut sampling_period_us,
+            )
         };
         check("nvmlDeviceGetDecoderUtilization", code)?;
-        Ok(CodecUtilization { utilization, sampling_period_us })
+        Ok(CodecUtilization {
+            utilization,
+            sampling_period_us,
+        })
     }
 
     /// Queries the current GPU die temperature in degrees Celsius (`nvmlDeviceGetTemperature`).
@@ -228,7 +257,8 @@ impl Device {
     pub fn temperature_threshold(&self, kind: TemperatureThreshold) -> Result<u32> {
         let mut temp = 0u32;
         // SAFETY: `self.raw` is valid and `temp` is a valid out-pointer.
-        let code = unsafe { sys::nvmlDeviceGetTemperatureThreshold(self.raw, kind.to_raw(), &mut temp) };
+        let code =
+            unsafe { sys::nvmlDeviceGetTemperatureThreshold(self.raw, kind.to_raw(), &mut temp) };
         check("nvmlDeviceGetTemperatureThreshold", code)?;
         Ok(temp)
     }
@@ -360,7 +390,8 @@ impl Device {
             });
         }
         // SAFETY: `self.raw` is valid and `reasons` is a valid out-pointer.
-        let code = unsafe { sys::nvmlDeviceGetCurrentClocksThrottleReasons(self.raw, &mut reasons) };
+        let code =
+            unsafe { sys::nvmlDeviceGetCurrentClocksThrottleReasons(self.raw, &mut reasons) };
         check("nvmlDeviceGetCurrentClocksThrottleReasons", code)?;
         Ok(reasons)
     }
@@ -373,7 +404,10 @@ impl Device {
         let code = unsafe { sys::nvmlDeviceGetEccMode(self.raw, &mut current, &mut pending) };
         check("nvmlDeviceGetEccMode", code)?;
         let enabled = sys::nvmlEnableState_enum_NVML_FEATURE_ENABLED;
-        Ok(EccMode { current: current == enabled, pending: pending == enabled })
+        Ok(EccMode {
+            current: current == enabled,
+            pending: pending == enabled,
+        })
     }
 
     /// Queries total ECC error counts (`nvmlDeviceGetTotalEccErrors`).
@@ -468,7 +502,9 @@ impl Device {
                 std::ptr::null_mut()
             } else {
                 // SAFETY: `nvmlProcessInfo_t` is a plain C POD struct of integers.
-                scratch.raw.resize(count as usize, unsafe { std::mem::zeroed() });
+                scratch
+                    .raw
+                    .resize(count as usize, unsafe { std::mem::zeroed() });
                 scratch.raw.as_mut_ptr()
             };
             let code = f(self.raw, &mut count, ptr);
@@ -484,7 +520,10 @@ impl Device {
             return Err(crate::Error::Status { call, status });
         }
 
-        Err(crate::Error::Status { call, status: Status::INSUFFICIENT_SIZE })
+        Err(crate::Error::Status {
+            call,
+            status: Status::INSUFFICIENT_SIZE,
+        })
     }
 
     /// Queries current PCIe link generation (`nvmlDeviceGetCurrPcieLinkGeneration`).
@@ -527,7 +566,8 @@ impl Device {
     pub fn pcie_throughput_kbps(&self, counter: PcieCounter) -> Result<u32> {
         let mut kbps = 0u32;
         // SAFETY: `self.raw` is valid and `kbps` is a valid out-pointer.
-        let code = unsafe { sys::nvmlDeviceGetPcieThroughput(self.raw, counter.to_raw(), &mut kbps) };
+        let code =
+            unsafe { sys::nvmlDeviceGetPcieThroughput(self.raw, counter.to_raw(), &mut kbps) };
         check("nvmlDeviceGetPcieThroughput", code)?;
         Ok(kbps)
     }
@@ -563,7 +603,8 @@ impl Device {
     pub fn nvlink_capability(&self, link: u32, cap: NvLinkCapability) -> Result<bool> {
         let mut res = 0u32;
         // SAFETY: `self.raw` is valid and `res` is a valid out-pointer.
-        let code = unsafe { sys::nvmlDeviceGetNvLinkCapability(self.raw, link, cap.to_raw(), &mut res) };
+        let code =
+            unsafe { sys::nvmlDeviceGetNvLinkCapability(self.raw, link, cap.to_raw(), &mut res) };
         check("nvmlDeviceGetNvLinkCapability", code)?;
         Ok(res != 0)
     }

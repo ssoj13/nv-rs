@@ -52,7 +52,12 @@ impl ExternalMemory {
     /// # Safety
     /// `handle` must refer to a live memory object of at least `size` bytes on `ctx`'s device,
     /// exported with the matching handle type.
-    pub unsafe fn import(ctx: &Arc<Context>, handle: MemoryHandle, size: u64, dedicated: bool) -> Result<Arc<Self>, DriverError> {
+    pub unsafe fn import(
+        ctx: &Arc<Context>,
+        handle: MemoryHandle,
+        size: u64,
+        dedicated: bool,
+    ) -> Result<Arc<Self>, DriverError> {
         ctx.bind_to_thread()?;
         // SAFETY: an all-zero descriptor is the documented starting point; fields are set below.
         let mut desc: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC = unsafe { std::mem::zeroed() };
@@ -62,7 +67,8 @@ impl ExternalMemory {
                 desc.handle.win32.handle = h;
             }
             MemoryHandle::OpaqueFd(fd) => {
-                desc.type_ = sys::CUexternalMemoryHandleType_enum_CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+                desc.type_ =
+                    sys::CUexternalMemoryHandleType_enum_CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
                 desc.handle.fd = fd;
             }
             MemoryHandle::D3d12Resource(h) => {
@@ -73,16 +79,25 @@ impl ExternalMemory {
                 desc.handle.win32.handle = h;
             }
             MemoryHandle::D3d12Heap(h) => {
-                desc.type_ = sys::CUexternalMemoryHandleType_enum_CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP;
+                desc.type_ =
+                    sys::CUexternalMemoryHandleType_enum_CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP;
                 desc.handle.win32.handle = h;
             }
         }
         desc.size = size;
-        desc.flags = if dedicated { sys::CUDA_EXTERNAL_MEMORY_DEDICATED } else { 0 };
+        desc.flags = if dedicated {
+            sys::CUDA_EXTERNAL_MEMORY_DEDICATED
+        } else {
+            0
+        };
         let mut raw: sys::CUexternalMemory = std::ptr::null_mut();
         // SAFETY: valid out-pointer and descriptor; the caller vouches for the handle.
         unsafe { sys::cuImportExternalMemory(&mut raw, &desc) }.result()?;
-        Ok(Arc::new(Self { raw, size, ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            raw,
+            size,
+            ctx: ctx.clone(),
+        }))
     }
 
     /// The imported size in bytes.
@@ -96,7 +111,11 @@ impl ExternalMemory {
     }
 
     /// `bytes` bytes at `offset` as a device buffer. The buffer keeps this object alive.
-    pub fn mapped_buffer(self: &Arc<Self>, offset: u64, bytes: u64) -> Result<RawDeviceBuffer, DriverError> {
+    pub fn mapped_buffer(
+        self: &Arc<Self>,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<RawDeviceBuffer, DriverError> {
         if bytes == 0 || offset.checked_add(bytes).is_none_or(|end| end > self.size) {
             return Err(invalid_value());
         }
@@ -109,12 +128,24 @@ impl ExternalMemory {
         // SAFETY: the range was checked against the imported size; valid out-pointer.
         unsafe { sys::cuExternalMemoryGetMappedBuffer(&mut ptr, self.raw, &desc) }.result()?;
         let len = usize::try_from(bytes).map_err(|_| invalid_value())?;
-        Ok(RawDeviceBuffer::foreign(Arc::new(MappedBuffer { ptr, len, memory: self.clone() }), len))
+        Ok(RawDeviceBuffer::foreign(
+            Arc::new(MappedBuffer {
+                ptr,
+                len,
+                memory: self.clone(),
+            }),
+            len,
+        ))
     }
 
     /// The memory at `offset` as a mipmapped array of `levels` levels described by `desc`
     /// (the layout must match how the exporter created its image).
-    pub fn mapped_mipmapped_array(self: &Arc<Self>, offset: u64, desc: &ArrayDesc, levels: u32) -> Result<MipmappedArray, DriverError> {
+    pub fn mapped_mipmapped_array(
+        self: &Arc<Self>,
+        offset: u64,
+        desc: &ArrayDesc,
+        levels: u32,
+    ) -> Result<MipmappedArray, DriverError> {
         if levels == 0 || offset >= self.size {
             return Err(invalid_value());
         }
@@ -127,7 +158,13 @@ impl ExternalMemory {
         let mut raw: sys::CUmipmappedArray = std::ptr::null_mut();
         // SAFETY: valid descriptor and out-pointer.
         unsafe { sys::cuExternalMemoryGetMappedMipmappedArray(&mut raw, self.raw, &d) }.result()?;
-        Ok(MipmappedArray::from_owned_raw(raw, *desc, levels, &self.ctx, Some(self.clone())))
+        Ok(MipmappedArray::from_owned_raw(
+            raw,
+            *desc,
+            levels,
+            &self.ctx,
+            Some(self.clone()),
+        ))
     }
 }
 
@@ -202,7 +239,10 @@ impl ExternalSemaphore {
     ///
     /// # Safety
     /// `handle` must refer to a live semaphore / fence of the stated kind on `ctx`'s device.
-    pub unsafe fn import(ctx: &Arc<Context>, handle: SemaphoreHandle) -> Result<Arc<Self>, DriverError> {
+    pub unsafe fn import(
+        ctx: &Arc<Context>,
+        handle: SemaphoreHandle,
+    ) -> Result<Arc<Self>, DriverError> {
         ctx.bind_to_thread()?;
         // SAFETY: zeroed descriptor, then the handle.
         let mut desc: sys::CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC = unsafe { std::mem::zeroed() };
@@ -236,7 +276,11 @@ impl ExternalSemaphore {
         let mut raw: sys::CUexternalSemaphore = std::ptr::null_mut();
         // SAFETY: valid descriptor and out-pointer; the caller vouches for the handle.
         unsafe { sys::cuImportExternalSemaphore(&mut raw, &desc) }.result()?;
-        Ok(Arc::new(Self { raw, valued, ctx: ctx.clone() }))
+        Ok(Arc::new(Self {
+            raw,
+            valued,
+            ctx: ctx.clone(),
+        }))
     }
 
     /// Whether the semaphore carries a value (timeline / fence) rather than a binary state.
@@ -255,7 +299,8 @@ impl ExternalSemaphore {
         let mut p: sys::CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS = unsafe { std::mem::zeroed() };
         p.params.fence.value = value;
         // SAFETY: one semaphore, one params entry, a stream of this context.
-        unsafe { sys::cuSignalExternalSemaphoresAsync(&self.raw, &p, 1, stream.cu_stream()) }.result()
+        unsafe { sys::cuSignalExternalSemaphoresAsync(&self.raw, &p, 1, stream.cu_stream()) }
+            .result()
     }
 
     /// Enqueues a wait on `stream` until a timeline / fence reaches `value`, or a binary
@@ -278,6 +323,8 @@ impl Drop for ExternalSemaphore {
         let raw = self.raw;
         // SAFETY: the semaphore is owned here; pending stream operations keep the driver object
         // alive internally until they complete.
-        teardown(&self.ctx, || unsafe { sys::cuDestroyExternalSemaphore(raw) });
+        teardown(&self.ctx, || unsafe {
+            sys::cuDestroyExternalSemaphore(raw)
+        });
     }
 }

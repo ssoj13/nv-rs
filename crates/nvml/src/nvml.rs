@@ -52,7 +52,10 @@ mod tests {
         assert!(Status::FUNCTION_NOT_FOUND.is_function_not_found());
 
         assert_eq!(Status::SUCCESS.known_name(), Some("NVML_SUCCESS"));
-        assert_eq!(Status::NOT_SUPPORTED.known_name(), Some("NVML_ERROR_NOT_SUPPORTED"));
+        assert_eq!(
+            Status::NOT_SUPPORTED.known_name(),
+            Some("NVML_ERROR_NOT_SUPPORTED")
+        );
 
         let unknown = Status(9999);
         assert_eq!(unknown.known_name(), None);
@@ -89,7 +92,10 @@ mod tests {
         assert!(validate_uuid("").is_err());
         assert!(validate_uuid("12345678-1234-1234-1234-1234567890ab").is_err());
         assert!(validate_uuid("GPU-abc\0def").is_err());
-        let oversized = format!("GPU-{}", "a".repeat(sys::NVML_DEVICE_UUID_V2_BUFFER_SIZE as usize));
+        let oversized = format!(
+            "GPU-{}",
+            "a".repeat(sys::NVML_DEVICE_UUID_V2_BUFFER_SIZE as usize)
+        );
         assert!(validate_uuid(&oversized).is_err());
     }
 
@@ -169,7 +175,10 @@ mod tests {
         let (cuda_maj, cuda_min) = nvml.cuda_driver_version().expect("CUDA driver version");
         assert!(!driver.is_empty());
         assert!(!nvml_ver.is_empty());
-        assert!(cuda_maj >= 11, "unexpected CUDA major {cuda_maj}.{cuda_min}");
+        assert!(
+            cuda_maj >= 11,
+            "unexpected CUDA major {cuda_maj}.{cuda_min}"
+        );
 
         let devices = nvml.devices().expect("enumerate devices");
         assert!(!devices.is_empty(), "expected at least one NVIDIA GPU");
@@ -187,7 +196,9 @@ mod tests {
         let by_uuid = nvml.device_by_uuid(&uuid).expect("lookup by UUID");
         assert_eq!(by_uuid.index().expect("uuid index"), idx);
         let parsed_bus = PciBusId::from_str(&pci.bus_id).expect("parse NVML PCI bus ID");
-        let by_pci = nvml.device_by_pci_bus_id(&parsed_bus).expect("lookup by PCI bus ID");
+        let by_pci = nvml
+            .device_by_pci_bus_id(&parsed_bus)
+            .expect("lookup by PCI bus ID");
         assert_eq!(by_pci.index().expect("pci index"), idx);
 
         let mem = dev.memory_info().expect("memory info");
@@ -222,7 +233,9 @@ mod tests {
         let limit = dev.power_limit_mw().expect("power limit");
         assert!(power > 0 && limit >= power / 2);
 
-        let gfx_clk = dev.clock_mhz(ClockDomain::Graphics).expect("graphics clock");
+        let gfx_clk = dev
+            .clock_mhz(ClockDomain::Graphics)
+            .expect("graphics clock");
         let mem_clk = dev.clock_mhz(ClockDomain::Memory).expect("memory clock");
         assert!(gfx_clk > 0 && mem_clk > 0);
 
@@ -240,8 +253,11 @@ mod tests {
         // Process queries must succeed even if empty.
         let mut scratch = ProcessScratch::new();
         let mut procs = Vec::new();
-        dev.compute_running_processes_into(&mut scratch, &mut procs).expect("compute processes");
-        let _gfx_procs = dev.graphics_running_processes().expect("graphics processes");
+        dev.compute_running_processes_into(&mut scratch, &mut procs)
+            .expect("compute processes");
+        let _gfx_procs = dev
+            .graphics_running_processes()
+            .expect("graphics processes");
 
         // NVLink is absent on GeForce RTX 3080 Ti; verify graceful NOT_SUPPORTED or Ok.
         match dev.nvlink_state(0) {

@@ -17,7 +17,10 @@
 
 use crate::context::creation_flags;
 use crate::module::{CompileOpts, log_text};
-use crate::{DeviceContext, Error, LOG_BYTES, Module, ModuleOptions, PipelineOptions, Result, check, entry, sys};
+use crate::{
+    DeviceContext, Error, LOG_BYTES, Module, ModuleOptions, PipelineOptions, Result, check, entry,
+    sys,
+};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -77,7 +80,9 @@ impl Drop for LogBuf {
         // SAFETY: both pointers come from `Box::into_raw` in `new` with these exact types and
         // sizes and are released only here.
         unsafe {
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.cap)));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.ptr, self.cap,
+            )));
             drop(Box::from_raw(self.len));
         }
     }
@@ -98,7 +103,12 @@ impl Shared {
     /// Remembers the first failure code (later ones are consequences).
     fn fail(&self, code: sys::OptixResult) {
         // A lost exchange means an earlier failure is already recorded, which is the one to keep.
-        let _first_kept = self.failure.compare_exchange(sys::OptixResult_OPTIX_SUCCESS, code, Ordering::AcqRel, Ordering::Acquire);
+        let _first_kept = self.failure.compare_exchange(
+            sys::OptixResult_OPTIX_SUCCESS,
+            code,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     fn ctx(&self) -> &Arc<DeviceContext> {
@@ -133,7 +143,12 @@ impl Module {
     /// Starts a task-based compile of PTX text or OptiX-IR bytes (copied; OptiX reads them while
     /// tasks run). Returns the pending module and the first task; execute it, and every task it
     /// returns, then call [`PendingModule::finish`].
-    pub fn with_tasks(ctx: &Arc<DeviceContext>, module: &ModuleOptions<'_>, pipeline: &PipelineOptions, code: &[u8]) -> Result<(PendingModule, Task)> {
+    pub fn with_tasks(
+        ctx: &Arc<DeviceContext>,
+        module: &ModuleOptions<'_>,
+        pipeline: &PipelineOptions,
+        code: &[u8],
+    ) -> Result<(PendingModule, Task)> {
         let opts = CompileOpts::new(ctx, module, pipeline)?;
         let code: Box<[u8]> = code.into();
         let log = LogBuf::new();
@@ -158,11 +173,26 @@ impl Module {
         if r != sys::OptixResult_OPTIX_SUCCESS {
             // SAFETY: the create call returned; no task exists, so nothing writes the log.
             let text = unsafe { log.text() };
-            return Err(Error::Optix { call: "optixModuleCreateWithTasks", code: r, log: text });
+            return Err(Error::Optix {
+                call: "optixModuleCreateWithTasks",
+                code: r,
+                log: text,
+            });
         }
         let module = Module::wrap(raw, ctx, opts.base.clone());
-        let shared = Arc::new(Shared { module, gate: RwLock::new(()), failure: AtomicI32::new(sys::OptixResult_OPTIX_SUCCESS), log, _code: code, _opts: opts });
-        let task = Task { raw: first, state: TaskState::Pending, shared: shared.clone() };
+        let shared = Arc::new(Shared {
+            module,
+            gate: RwLock::new(()),
+            failure: AtomicI32::new(sys::OptixResult_OPTIX_SUCCESS),
+            log,
+            _code: code,
+            _opts: opts,
+        });
+        let task = Task {
+            raw: first,
+            state: TaskState::Pending,
+            shared: shared.clone(),
+        };
         Ok((PendingModule { shared }, task))
     }
 }
@@ -173,15 +203,30 @@ impl PendingModule {
         let mut s = 0;
         // SAFETY: the module is alive (held by `shared`); documented thread safe.
         check("optixModuleGetCompilationState", unsafe {
-            entry!(self.shared.ctx().table(), optixModuleGetCompilationState)(self.shared.module.raw(), &mut s)
+            entry!(self.shared.ctx().table(), optixModuleGetCompilationState)(
+                self.shared.module.raw(),
+                &mut s,
+            )
         })?;
         Ok(match s {
-            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_NOT_STARTED => CompileState::NotStarted,
-            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_STARTED => CompileState::Started,
-            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_IMPENDING_FAILURE => CompileState::ImpendingFailure,
+            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_NOT_STARTED => {
+                CompileState::NotStarted
+            }
+            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_STARTED => {
+                CompileState::Started
+            }
+            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_IMPENDING_FAILURE => {
+                CompileState::ImpendingFailure
+            }
             sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_FAILED => CompileState::Failed,
-            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_COMPLETED => CompileState::Completed,
-            _ => return Err(Error::Invalid("OptiX reported an unknown module compile state")),
+            sys::OptixModuleCompileState_OPTIX_MODULE_COMPILE_STATE_COMPLETED => {
+                CompileState::Completed
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "OptiX reported an unknown module compile state",
+                ));
+            }
         })
     }
 
@@ -189,17 +234,29 @@ impl PendingModule {
     /// `OPTIX_ERROR_CREATION_CANCELED` without work; `block` waits until that is in effect.
     /// Safe from any thread.
     pub fn cancel(&self, block: bool) -> Result<()> {
-        let _running = self.shared.gate.read().map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
-        self.shared.fail(sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED);
+        let _running = self
+            .shared
+            .gate
+            .read()
+            .map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
+        self.shared
+            .fail(sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED);
         // SAFETY: the module is alive; documented thread safe.
         check("optixModuleCancelCreation", unsafe {
-            entry!(self.shared.ctx().table(), optixModuleCancelCreation)(self.shared.module.raw(), creation_flags(block))
+            entry!(self.shared.ctx().table(), optixModuleCancelCreation)(
+                self.shared.module.raw(),
+                creation_flags(block),
+            )
         })
     }
 
     /// The compiler log so far; waits for running tasks to return first.
     pub fn log(&self) -> Result<String> {
-        let _exclusive = self.shared.gate.write().map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
+        let _exclusive = self
+            .shared
+            .gate
+            .write()
+            .map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
         // SAFETY: the write side excludes every task call, so OptiX is not writing the log.
         Ok(unsafe { self.shared.log.text() })
     }
@@ -215,32 +272,61 @@ impl PendingModule {
             CompileState::Failed | CompileState::ImpendingFailure => {
                 let code = match self.shared.failure.load(Ordering::Acquire) {
                     // No task reported an error, so the context-wide cancel stopped it.
-                    sys::OptixResult_OPTIX_SUCCESS => sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED,
+                    sys::OptixResult_OPTIX_SUCCESS => {
+                        sys::OptixResult_OPTIX_ERROR_CREATION_CANCELED
+                    }
                     c => c,
                 };
-                Err(Error::Optix { call: "optixModuleCreateWithTasks", code, log: self.log()? })
+                Err(Error::Optix {
+                    call: "optixModuleCreateWithTasks",
+                    code,
+                    log: self.log()?,
+                })
             }
-            CompileState::NotStarted | CompileState::Started => Err(Error::Invalid("module compile has tasks still to run")),
+            CompileState::NotStarted | CompileState::Started => {
+                Err(Error::Invalid("module compile has tasks still to run"))
+            }
         }
     }
 }
 
 impl Task {
     fn require(&self, want: TaskState, msg: &'static str) -> Result<()> {
-        if self.state == want { Ok(()) } else { Err(Error::Invalid(msg)) }
+        if self.state == want {
+            Ok(())
+        } else {
+            Err(Error::Invalid(msg))
+        }
     }
 
     /// Wraps the follow-up tasks OptiX wrote, or records the failure.
-    fn follow_ups(&self, call: &'static str, code: sys::OptixResult, mut new: Vec<sys::OptixTask>, n: u32) -> Result<Vec<Task>> {
+    fn follow_ups(
+        &self,
+        call: &'static str,
+        code: sys::OptixResult,
+        mut new: Vec<sys::OptixTask>,
+        n: u32,
+    ) -> Result<Vec<Task>> {
         if code != sys::OptixResult_OPTIX_SUCCESS {
             // Follow-ups of a failed task are left to `optixModuleDestroy`; OptiX does not
             // require running them once the compile is failing.
             self.shared.fail(code);
             // The per-task log is the module log; `PendingModule::finish` reports it.
-            return Err(Error::Optix { call, code, log: String::new() });
+            return Err(Error::Optix {
+                call,
+                code,
+                log: String::new(),
+            });
         }
         new.truncate(n as usize);
-        Ok(new.into_iter().map(|raw| Task { raw, state: TaskState::Pending, shared: self.shared.clone() }).collect())
+        Ok(new
+            .into_iter()
+            .map(|raw| Task {
+                raw,
+                state: TaskState::Pending,
+                shared: self.shared.clone(),
+            })
+            .collect())
     }
 
     /// Runs the task (`optixTaskExecute`); returns up to `max_new` follow-up tasks, each to be
@@ -250,11 +336,22 @@ impl Task {
         let mut new = vec![std::ptr::null_mut(); max_new as usize];
         let mut n = 0;
         let code = {
-            let _running = self.shared.gate.read().map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
+            let _running = self
+                .shared
+                .gate
+                .read()
+                .map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
             self.shared.ctx().cuda().bind_to_thread()?;
             // SAFETY: the module (and the code/log OptiX uses) live in `shared`; `new` holds
             // `max_new` writable slots; the gate's read side keeps the host off the log.
-            unsafe { entry!(self.shared.ctx().table(), optixTaskExecute)(self.raw, new.as_mut_ptr(), max_new, &mut n) }
+            unsafe {
+                entry!(self.shared.ctx().table(), optixTaskExecute)(
+                    self.raw,
+                    new.as_mut_ptr(),
+                    max_new,
+                    &mut n,
+                )
+            }
         };
         self.state = TaskState::Executed;
         self.follow_ups("optixTaskExecute", code, new, n)
@@ -273,7 +370,10 @@ impl Task {
     /// The executed task's output for an external cache (`optixTaskSerializeOutput`); empty for
     /// a non-serializable task. Only after [`Task::execute`], not after [`Task::deserialize`].
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        self.require(TaskState::Executed, "only an executed task can be serialized")?;
+        self.require(
+            TaskState::Executed,
+            "only an executed task can be serialized",
+        )?;
         let f = entry!(self.shared.ctx().table(), optixTaskSerializeOutput);
         self.two_call("optixTaskSerializeOutput", |p, s| {
             // SAFETY: live, executed task; `p` is null or `*s` writable bytes.
@@ -282,8 +382,16 @@ impl Task {
     }
 
     /// Size query then fill, as the serialization calls expect.
-    fn two_call(&self, call: &'static str, f: impl Fn(*mut std::ffi::c_void, *mut usize) -> sys::OptixResult) -> Result<Vec<u8>> {
-        let _running = self.shared.gate.read().map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
+    fn two_call(
+        &self,
+        call: &'static str,
+        f: impl Fn(*mut std::ffi::c_void, *mut usize) -> sys::OptixResult,
+    ) -> Result<Vec<u8>> {
+        let _running = self
+            .shared
+            .gate
+            .read()
+            .map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
         let mut size = 0usize;
         check(call, f(std::ptr::null_mut(), &mut size))?;
         let mut out = vec![0u8; size];
@@ -303,11 +411,22 @@ impl Task {
         let mut new = vec![std::ptr::null_mut(); max_new as usize];
         let mut n = 0;
         let code = {
-            let _running = self.shared.gate.read().map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
+            let _running = self
+                .shared
+                .gate
+                .read()
+                .map_err(|_| Error::Invalid("module task gate poisoned by a panic"))?;
             self.shared.ctx().cuda().bind_to_thread()?;
             // SAFETY: as in `execute`; `data` is readable for its length during the call.
             unsafe {
-                entry!(self.shared.ctx().table(), optixTaskDeserializeOutput)(self.raw, data.as_ptr().cast(), data.len(), new.as_mut_ptr(), max_new, &mut n)
+                entry!(self.shared.ctx().table(), optixTaskDeserializeOutput)(
+                    self.raw,
+                    data.as_ptr().cast(),
+                    data.len(),
+                    new.as_mut_ptr(),
+                    max_new,
+                    &mut n,
+                )
             }
         };
         self.state = TaskState::Deserialized;

@@ -3,7 +3,8 @@
 
 use cuda_core::{Context, DeviceBuffer};
 use cusparse::{
-    DataType, DiagType, DnMatDescr, DnVecDescr, Error, FillMode, Handle, IndexBase, IndexType, Op, Order, Scratch, SpGemm, SpGemmAlg, SpMatDescr, SpMmAlg, SpMvAlg, SpSm, SpSmAlg, SpSv, SpSvAlg,
+    DataType, DiagType, DnMatDescr, DnVecDescr, Error, FillMode, Handle, IndexBase, IndexType, Op,
+    Order, Scratch, SpGemm, SpGemmAlg, SpMatDescr, SpMmAlg, SpMvAlg, SpSm, SpSmAlg, SpSv, SpSvAlg,
     spmm, spmv,
 };
 
@@ -25,7 +26,9 @@ fn spmv_csr_f32_matches_reference() {
     let y = DeviceBuffer::from_host(&stream, &[10.0f32, 20.0, 30.0]).expect("y");
 
     // SAFETY: all device buffers stay alive across `spmv` and `stream.synchronize()`.
-    let mat_a = unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }.expect("mat_a");
+    let mat_a =
+        unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }
+            .expect("mat_a");
     // SAFETY: `x` stays alive across `spmv` and `stream.synchronize()`.
     let vec_x = unsafe { DnVecDescr::new(&cuda, &x) }.expect("vec_x");
     // SAFETY: `y` stays alive across `spmv` and `stream.synchronize()`.
@@ -50,8 +53,15 @@ fn spmv_csr_f32_matches_reference() {
 
     let got = y.to_host_vec(&stream).expect("read y");
     let expected = [19.0f32, 22.0, 53.0];
-    let max_err = got.iter().zip(expected.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_err < 1e-5, "got={got:?}, expected={expected:?}, max_err={max_err}");
+    let max_err = got
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-5,
+        "got={got:?}, expected={expected:?}, max_err={max_err}"
+    );
 }
 
 #[test]
@@ -72,7 +82,9 @@ fn spmm_csr_f32_matches_reference() {
     let c = DeviceBuffer::zeroed(&stream, 6).expect("c");
 
     // SAFETY: buffers outlive `spmm` and `synchronize`.
-    let mat_a = unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }.expect("mat_a");
+    let mat_a =
+        unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }
+            .expect("mat_a");
     // SAFETY: `b` outlives `spmm`.
     let mat_b = unsafe { DnMatDescr::new(&cuda, 3, 2, 3, &b, Order::Col) }.expect("mat_b");
     // SAFETY: `c` outlives `spmm`.
@@ -98,8 +110,15 @@ fn spmm_csr_f32_matches_reference() {
 
     let got = c.to_host_vec(&stream).expect("read c");
     let expected = [7.0f32, 6.0, 19.0, 16.0, 15.0, 46.0];
-    let max_err = got.iter().zip(expected.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    assert!(max_err < 1e-5, "got={got:?}, expected={expected:?}, max_err={max_err}");
+    let max_err = got
+        .iter()
+        .zip(expected.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-5,
+        "got={got:?}, expected={expected:?}, max_err={max_err}"
+    );
 }
 
 #[test]
@@ -120,10 +139,21 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
     let b_val = DeviceBuffer::from_host(&stream, &[4.0f32, 5.0, 6.0]).expect("b_val");
 
     // SAFETY: buffers outlive `spgemm` phases and `synchronize`.
-    let mat_a = unsafe { SpMatDescr::csr(&cuda, 2, 2, 3, &a_row, &a_col, &a_val, IndexBase::Zero) }.expect("mat_a");
+    let mat_a = unsafe { SpMatDescr::csr(&cuda, 2, 2, 3, &a_row, &a_col, &a_val, IndexBase::Zero) }
+        .expect("mat_a");
     // SAFETY: buffers outlive `spgemm` phases.
-    let mat_b = unsafe { SpMatDescr::csr(&cuda, 2, 2, 3, &b_row, &b_col, &b_val, IndexBase::Zero) }.expect("mat_b");
-    let mut mat_c = SpMatDescr::csr_empty(&cuda, 2, 2, IndexType::I32, IndexType::I32, IndexBase::Zero, DataType::F32).expect("mat_c");
+    let mat_b = unsafe { SpMatDescr::csr(&cuda, 2, 2, 3, &b_row, &b_col, &b_val, IndexBase::Zero) }
+        .expect("mat_b");
+    let mut mat_c = SpMatDescr::csr_empty(
+        &cuda,
+        2,
+        2,
+        IndexType::I32,
+        IndexType::I32,
+        IndexBase::Zero,
+        DataType::F32,
+    )
+    .expect("mat_c");
 
     let budget = 64 * 1024 * 1024;
     let est_bytes = spgemm
@@ -160,7 +190,10 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
             &mut tiny_scratch,
             0,
         );
-        assert!(matches!(denied, Err(Error::Budget { .. })), "expected Budget error, got {denied:?}");
+        assert!(
+            matches!(denied, Err(Error::Budget { .. })),
+            "expected Budget error, got {denied:?}"
+        );
     }
 
     spgemm
@@ -209,8 +242,15 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
 
     let vals = c_val.to_host_vec(&stream).expect("read c_val");
     let expected = [14.0f32, 12.0, 15.0, 18.0];
-    let max_err = vals.iter().zip(expected.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    assert!(max_err < 1e-5, "got={vals:?}, expected={expected:?}, max_err={max_err}");
+    let max_err = vals
+        .iter()
+        .zip(expected.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-5,
+        "got={vals:?}, expected={expected:?}, max_err={max_err}"
+    );
 }
 
 #[test]
@@ -230,9 +270,13 @@ fn spsv_and_spsm_lower_triangular_solve() {
     let y = DeviceBuffer::<f32>::zeroed(&stream, 3).expect("y");
 
     // SAFETY: buffers outlive `SpSv` and `synchronize`.
-    let mut mat_l = unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }.expect("mat_l");
+    let mut mat_l =
+        unsafe { SpMatDescr::csr(&cuda, 3, 3, 5, &row_off, &col_ind, &values, IndexBase::Zero) }
+            .expect("mat_l");
     mat_l.set_fill_mode(FillMode::Lower).expect("fill lower");
-    mat_l.set_diag_type(DiagType::NonUnit).expect("diag non-unit");
+    mat_l
+        .set_diag_type(DiagType::NonUnit)
+        .expect("diag non-unit");
     // SAFETY: `x` outlives `SpSv`.
     let vec_x = unsafe { DnVecDescr::new(&cuda, &x) }.expect("vec_x");
     // SAFETY: `y` outlives `SpSv`.
@@ -253,12 +297,25 @@ fn spsv_and_spsm_lower_triangular_solve() {
         64 * 1024 * 1024,
     )
     .expect("spsv prepare");
-    spsv.solve(&handle, &stream, Op::NonTranspose, &1.0f32, &mat_l, &vec_x, &mut vec_y, DataType::F32, SpSvAlg::Default)
-        .expect("spsv solve");
+    spsv.solve(
+        &handle,
+        &stream,
+        Op::NonTranspose,
+        &1.0f32,
+        &mat_l,
+        &vec_x,
+        &mut vec_y,
+        DataType::F32,
+        SpSvAlg::Default,
+    )
+    .expect("spsv solve");
     stream.synchronize().expect("sync");
 
     let got = y.to_host_vec(&stream).expect("read y");
-    let max_err = got.iter().map(|v| (*v - 2.0f32).abs()).fold(0.0f32, f32::max);
+    let max_err = got
+        .iter()
+        .map(|v| (*v - 2.0f32).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_err < 1e-5, "SpSV got={got:?}, max_err={max_err}");
 
     // SpSM with 2 RHS columns: B = [[4, 2], [8, 4], [12, 6]] -> C = [[2, 1], [2, 1], [2, 1]]
@@ -302,6 +359,10 @@ fn spsv_and_spsm_lower_triangular_solve() {
 
     let got_c = c.to_host_vec(&stream).expect("read c");
     let expected_c = [2.0f32, 2.0, 2.0, 1.0, 1.0, 1.0];
-    let max_err_c = got_c.iter().zip(expected_c.iter()).map(|(u, v)| (u - v).abs()).fold(0.0f32, f32::max);
+    let max_err_c = got_c
+        .iter()
+        .zip(expected_c.iter())
+        .map(|(u, v)| (u - v).abs())
+        .fold(0.0f32, f32::max);
     assert!(max_err_c < 1e-5, "SpSM got={got_c:?}, max_err={max_err_c}");
 }

@@ -3,16 +3,22 @@
 
 use cuda_core::{Context, DeviceBuffer};
 use nvjpeg::{
-    Backend, ChromaSubsampling, DecodeParams, EncoderParams, EncoderState, ExifOrientation, Handle, ImagePlanes, ImagePlanesMut, InputFormat,
-    JpegDecoder, JpegEncoding, JpegState, JpegStream, NvjpegDeviceBuffer, OutputFormat, PinnedBuffer,
+    Backend, ChromaSubsampling, DecodeParams, EncoderParams, EncoderState, ExifOrientation, Handle,
+    ImagePlanes, ImagePlanesMut, InputFormat, JpegDecoder, JpegEncoding, JpegState, JpegStream,
+    NvjpegDeviceBuffer, OutputFormat, PinnedBuffer,
 };
 
 fn psnr_u8(a: &[u8], b: &[u8]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let mse: f64 = a.iter().zip(b.iter()).map(|(&x, &y)| {
-        let d = f64::from(x) - f64::from(y);
-        d * d
-    }).sum::<f64>() / a.len() as f64;
+    let mse: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = f64::from(x) - f64::from(y);
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64;
     if mse == 0.0 {
         return f64::INFINITY;
     }
@@ -43,12 +49,17 @@ fn encode_decode_psnr_interleaved_and_planar() {
 
     let mut params = EncoderParams::new(&handle, &stream).expect("params");
     params.set_quality(95, &stream).expect("quality");
-    params.set_sampling_factors(ChromaSubsampling::Yuv444, &stream).expect("444");
-    params.set_encoding(JpegEncoding::BaselineDct, &stream).expect("baseline");
+    params
+        .set_sampling_factors(ChromaSubsampling::Yuv444, &stream)
+        .expect("444");
+    params
+        .set_encoding(JpegEncoding::BaselineDct, &stream)
+        .expect("baseline");
     assert!(params.max_bitstream_size(w, h).expect("max_bitstream_size") > 0);
 
     let mut enc = EncoderState::new(&handle, &stream).expect("encoder");
-    enc.encode_image(&params, &src_planes, InputFormat::Rgbi, w, h, &stream).expect("encode");
+    enc.encode_image(&params, &src_planes, InputFormat::Rgbi, w, h, &stream)
+        .expect("encode");
     let jpeg = enc.retrieve_bitstream(&stream).expect("bitstream");
     assert!(jpeg.starts_with(&[0xFF, 0xD8]), "expected JPEG SOI marker");
 
@@ -63,10 +74,19 @@ fn encode_decode_psnr_interleaved_and_planar() {
     jstream.parse(&jpeg, true, false).expect("parse");
     assert_eq!(jstream.dimensions().expect("dims"), (w, h));
     assert_eq!(jstream.components_num().expect("comps"), 3);
-    assert_eq!(jstream.chroma_subsampling().expect("css"), ChromaSubsampling::Yuv444);
-    assert_eq!(jstream.exif_orientation().expect("exif"), ExifOrientation::Unknown);
+    assert_eq!(
+        jstream.chroma_subsampling().expect("css"),
+        ChromaSubsampling::Yuv444
+    );
+    assert_eq!(
+        jstream.exif_orientation().expect("exif"),
+        ExifOrientation::Unknown
+    );
     assert_eq!(jstream.sample_precision().expect("prec"), 8);
-    assert_eq!(jstream.jpeg_encoding().expect("enc"), JpegEncoding::BaselineDct);
+    assert_eq!(
+        jstream.jpeg_encoding().expect("enc"),
+        JpegEncoding::BaselineDct
+    );
 
     // Decode interleaved with decoupled v2 decoder and attached pinned/device buffers.
     let pinned = PinnedBuffer::new(&handle).expect("pinned");
@@ -80,11 +100,16 @@ fn encode_decode_psnr_interleaved_and_planar() {
     dec.attach_device(&dev_scratch).expect("attach device");
 
     let mut dec_params = DecodeParams::new(&handle).expect("DecodeParams");
-    dec_params.set_output_format(OutputFormat::Rgbi).expect("set_output_format rgbi");
+    dec_params
+        .set_output_format(OutputFormat::Rgbi)
+        .expect("set_output_format rgbi");
 
-    let mut dst_rgbi = DeviceBuffer::from_host(&stream, &vec![0u8; rgb_host.len()]).expect("dst_rgbi");
-    let mut dst_planes = ImagePlanesMut::interleaved(&mut dst_rgbi, w, h, 3, (w * 3) as usize).expect("dst_planes");
-    dec.decode_jpeg(&jstream, &dec_params, &mut dst_planes, &stream).expect("decode rgbi");
+    let mut dst_rgbi =
+        DeviceBuffer::from_host(&stream, &vec![0u8; rgb_host.len()]).expect("dst_rgbi");
+    let mut dst_planes =
+        ImagePlanesMut::interleaved(&mut dst_rgbi, w, h, 3, (w * 3) as usize).expect("dst_planes");
+    dec.decode_jpeg(&jstream, &dec_params, &mut dst_planes, &stream)
+        .expect("decode rgbi");
     stream.synchronize().expect("sync");
 
     let decoded_rgbi = dst_rgbi.to_host_vec(&stream).expect("readback rgbi");
@@ -92,18 +117,25 @@ fn encode_decode_psnr_interleaved_and_planar() {
     assert!(psnr > 35.0, "interleaved decode PSNR {psnr:.2} dB too low");
 
     // Decode planar RGB.
-    dec_params.set_output_format(OutputFormat::Rgb).expect("set_output_format rgb");
+    dec_params
+        .set_output_format(OutputFormat::Rgb)
+        .expect("set_output_format rgb");
     let plane_bytes = (w * h) as usize;
     let mut r_dev = DeviceBuffer::from_host(&stream, &vec![0u8; plane_bytes]).expect("r");
     let mut g_dev = DeviceBuffer::from_host(&stream, &vec![0u8; plane_bytes]).expect("g");
     let mut b_dev = DeviceBuffer::from_host(&stream, &vec![0u8; plane_bytes]).expect("b");
     let mut planar_dst = ImagePlanesMut::planar3(
-        [(&mut r_dev, w as usize, w, h), (&mut g_dev, w as usize, w, h), (&mut b_dev, w as usize, w, h)],
+        [
+            (&mut r_dev, w as usize, w, h),
+            (&mut g_dev, w as usize, w, h),
+            (&mut b_dev, w as usize, w, h),
+        ],
         w,
         h,
     )
     .expect("planar_dst");
-    dec.decode_jpeg(&jstream, &dec_params, &mut planar_dst, &stream).expect("decode planar");
+    dec.decode_jpeg(&jstream, &dec_params, &mut planar_dst, &stream)
+        .expect("decode planar");
     stream.synchronize().expect("sync planar");
 
     let r_host = r_dev.to_host_vec(&stream).expect("r readback");

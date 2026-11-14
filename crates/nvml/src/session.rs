@@ -44,7 +44,9 @@ impl Nvml {
         // SAFETY: `nvmlInit_v2` takes no pointers and initializes NVML's refcounted session.
         let code = unsafe { sys::nvmlInit_v2() };
         check("nvmlInit_v2", code)?;
-        Ok(Self { session: Arc::new(NvmlSession) })
+        Ok(Self {
+            session: Arc::new(NvmlSession),
+        })
     }
 
     /// Loads NVML and initializes a session with explicit `NVML_INIT_FLAG_*` flags
@@ -54,7 +56,9 @@ impl Nvml {
         // SAFETY: `nvmlInitWithFlags` takes a bitmask of `NVML_INIT_FLAG_*` and initializes NVML.
         let code = unsafe { sys::nvmlInitWithFlags(flags) };
         check("nvmlInitWithFlags", code)?;
-        Ok(Self { session: Arc::new(NvmlSession) })
+        Ok(Self {
+            session: Arc::new(NvmlSession),
+        })
     }
 
     /// Queries the display driver version string (`nvmlSystemGetDriverVersion`).
@@ -113,7 +117,10 @@ impl Nvml {
         // SAFETY: NVML is initialized and `raw` is a valid out-pointer.
         let code = unsafe { sys::nvmlDeviceGetHandleByIndex_v2(index, &mut raw) };
         check("nvmlDeviceGetHandleByIndex_v2", code)?;
-        Ok(Device { _session: Arc::clone(&self.session), raw })
+        Ok(Device {
+            _session: Arc::clone(&self.session),
+            raw,
+        })
     }
 
     /// Acquires a [`Device`] handle by GPU or MIG UUID (`nvmlDeviceGetHandleByUUID`).
@@ -127,7 +134,10 @@ impl Nvml {
         // SAFETY: NVML is initialized, `buf` is NUL-terminated, and `raw` is a valid out-pointer.
         let code = unsafe { sys::nvmlDeviceGetHandleByUUID(buf.as_ptr(), &mut raw) };
         check("nvmlDeviceGetHandleByUUID", code)?;
-        Ok(Device { _session: Arc::clone(&self.session), raw })
+        Ok(Device {
+            _session: Arc::clone(&self.session),
+            raw,
+        })
     }
 
     /// Acquires a [`Device`] handle by PCI bus ID (`domain:bus:device.function`)
@@ -142,7 +152,10 @@ impl Nvml {
         // SAFETY: NVML is initialized, `buf` is NUL-terminated, and `raw` is a valid out-pointer.
         let code = unsafe { sys::nvmlDeviceGetHandleByPciBusId_v2(buf.as_ptr(), &mut raw) };
         check("nvmlDeviceGetHandleByPciBusId_v2", code)?;
-        Ok(Device { _session: Arc::clone(&self.session), raw })
+        Ok(Device {
+            _session: Arc::clone(&self.session),
+            raw,
+        })
     }
 
     /// Enumerates all accessible [`Device`]s (`0..device_count()`).

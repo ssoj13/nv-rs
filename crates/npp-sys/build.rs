@@ -5,7 +5,12 @@
 use nv_bindgen::{ExportPart, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const PARTS: &[ExportPart] = &[
-    ExportPart { name: "nppc", api_type: "NppcApi", loader_fn: "nppc_api", header_files: &["nppcore.h"] },
+    ExportPart {
+        name: "nppc",
+        api_type: "NppcApi",
+        loader_fn: "nppc_api",
+        header_files: &["nppcore.h"],
+    },
     ExportPart {
         name: "npps",
         api_type: "NppsApi",
@@ -19,7 +24,12 @@ const PARTS: &[ExportPart] = &[
             "npps_statistics_functions.h",
         ],
     },
-    ExportPart { name: "nppisu", api_type: "NppisuApi", loader_fn: "nppisu_api", header_files: &["nppi_support_functions.h"] },
+    ExportPart {
+        name: "nppisu",
+        api_type: "NppisuApi",
+        loader_fn: "nppisu_api",
+        header_files: &["nppi_support_functions.h"],
+    },
     ExportPart {
         name: "nppidei",
         api_type: "NppideiApi",
@@ -32,22 +42,42 @@ const PARTS: &[ExportPart] = &[
         loader_fn: "nppial_api",
         header_files: &["nppi_arithmetic_and_logical_operations.h"],
     },
-    ExportPart { name: "nppicc", api_type: "NppiccApi", loader_fn: "nppicc_api", header_files: &["nppi_color_conversion.h"] },
+    ExportPart {
+        name: "nppicc",
+        api_type: "NppiccApi",
+        loader_fn: "nppicc_api",
+        header_files: &["nppi_color_conversion.h"],
+    },
     ExportPart {
         name: "nppitc",
         api_type: "NppitcApi",
         loader_fn: "nppitc_api",
         header_files: &["nppi_threshold_and_compare_operations.h"],
     },
-    ExportPart { name: "nppim", api_type: "NppimApi", loader_fn: "nppim_api", header_files: &["nppi_morphological_operations.h"] },
-    ExportPart { name: "nppif", api_type: "NppifApi", loader_fn: "nppif_api", header_files: &["nppi_filtering_functions.h"] },
+    ExportPart {
+        name: "nppim",
+        api_type: "NppimApi",
+        loader_fn: "nppim_api",
+        header_files: &["nppi_morphological_operations.h"],
+    },
+    ExportPart {
+        name: "nppif",
+        api_type: "NppifApi",
+        loader_fn: "nppif_api",
+        header_files: &["nppi_filtering_functions.h"],
+    },
     ExportPart {
         name: "nppist",
         api_type: "NppistApi",
         loader_fn: "nppist_api",
         header_files: &["nppi_statistics_functions.h", "nppi_linear_transforms.h"],
     },
-    ExportPart { name: "nppig", api_type: "NppigApi", loader_fn: "nppig_api", header_files: &["nppi_geometry_transforms.h"] },
+    ExportPart {
+        name: "nppig",
+        api_type: "NppigApi",
+        loader_fn: "nppig_api",
+        header_files: &["nppi_geometry_transforms.h"],
+    },
 ];
 
 const SPEC: LibSpec = LibSpec {

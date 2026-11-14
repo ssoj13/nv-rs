@@ -22,7 +22,10 @@ mod tests {
     #[test]
     fn inventory_lists_the_core_entry_points() {
         for f in ["cusolverDnCreate", "cusolverSpCreate", "cusolverRfCreate"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

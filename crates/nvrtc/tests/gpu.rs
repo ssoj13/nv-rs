@@ -29,7 +29,8 @@ fn version_and_supported_archs() {
 #[ignore = "GPU"]
 fn compile_ptx_inspect_and_launch_kernel() {
     let mut prog = Program::new(SAXPY_SRC, Some("saxpy.cu"), &[]).expect("create program");
-    prog.add_name_expression("&saxpy<float>").expect("add_name_expression");
+    prog.add_name_expression("&saxpy<float>")
+        .expect("add_name_expression");
     let opts = CompileOptions::new().std("c++17").line_info();
     let _log = prog.compile(&opts).expect("compile");
 
@@ -37,8 +38,14 @@ fn compile_ptx_inspect_and_launch_kernel() {
     // Template __global__ instantiations emit `.weak .entry` rather than `.visible .entry`.
     assert!(ptx_text.contains(".entry"), "PTX missing .entry");
     let lowered = prog.lowered_name("&saxpy<float>").expect("lowered_name");
-    assert!(ptx_text.contains(&lowered), "PTX missing lowered name {lowered}");
-    assert!(prog.cubin().expect("cubin query").is_none(), "virtual arch produces PTX only");
+    assert!(
+        ptx_text.contains(&lowered),
+        "PTX missing lowered name {lowered}"
+    );
+    assert!(
+        prog.cubin().expect("cubin query").is_none(),
+        "virtual arch produces PTX only"
+    );
 
     let ptx_bytes = prog.ptx().expect("ptx bytes");
     let ctx = Context::new(0).expect("CUDA device 0");
@@ -56,13 +63,21 @@ fn compile_ptx_inspect_and_launch_kernel() {
     let mut module: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `ptx_bytes` is NUL-terminated PTX from NVRTC and `module` is a valid out-pointer.
     let res = unsafe { cu::cuModuleLoadData(&mut module, ptx_bytes.as_ptr().cast()) };
-    assert_eq!(res, cu::cudaError_enum_CUDA_SUCCESS, "cuModuleLoadData failed");
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleLoadData failed"
+    );
 
     let lowered_c = CString::new(lowered).expect("cstr");
     let mut func: cu::CUfunction = std::ptr::null_mut();
     // SAFETY: `module` is loaded and `lowered_c` is NUL-terminated.
     let res = unsafe { cu::cuModuleGetFunction(&mut func, module, lowered_c.as_ptr()) };
-    assert_eq!(res, cu::cudaError_enum_CUDA_SUCCESS, "cuModuleGetFunction failed");
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleGetFunction failed"
+    );
 
     let mut x_ptr = x_dev.cu_deviceptr();
     let mut y_ptr = y_dev.cu_deviceptr();
@@ -78,8 +93,26 @@ fn compile_ptx_inspect_and_launch_kernel() {
     ];
     // SAFETY: `func` matches the 5-argument signature of `saxpy<float>`, and all device buffers
     // outlive the `stream.synchronize()` below.
-    let res = unsafe { cu::cuLaunchKernel(func, 1, 1, 1, n as u32, 1, 1, 0, stream.cu_stream(), params.as_mut_ptr(), std::ptr::null_mut()) };
-    assert_eq!(res, cu::cudaError_enum_CUDA_SUCCESS, "cuLaunchKernel failed");
+    let res = unsafe {
+        cu::cuLaunchKernel(
+            func,
+            1,
+            1,
+            1,
+            n as u32,
+            1,
+            1,
+            0,
+            stream.cu_stream(),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuLaunchKernel failed"
+    );
     stream.synchronize().expect("sync");
 
     // SAFETY: `module` is no longer in use after `stream.synchronize()`.
@@ -88,7 +121,10 @@ fn compile_ptx_inspect_and_launch_kernel() {
     let got = out_dev.to_host_vec(&stream).expect("readback");
     for (i, &val) in got.iter().enumerate() {
         let expected = a * x_host[i] + y_host[i];
-        assert!((val - expected).abs() < 1e-5, "idx {i}: got {val}, expected {expected}");
+        assert!(
+            (val - expected).abs() < 1e-5,
+            "idx {i}: got {val}, expected {expected}"
+        );
     }
 }
 
@@ -98,7 +134,9 @@ fn compile_error_surfaces_build_log() {
     let mut prog = Program::new("__global__ void bad( { }", Some("bad.cu"), &[]).expect("create");
     let err = prog.compile(&CompileOptions::new()).expect_err("must fail");
     match err {
-        Error::Compilation { log, .. } => assert!(!log.is_empty(), "expected non-empty compiler log"),
+        Error::Compilation { log, .. } => {
+            assert!(!log.is_empty(), "expected non-empty compiler log")
+        }
         other => panic!("expected Error::Compilation, got {other:?}"),
     }
 }
@@ -107,10 +145,18 @@ fn compile_error_surfaces_build_log() {
 #[ignore = "GPU"]
 fn compile_cubin_for_supported_sm() {
     let archs = nvrtc::supported_archs().expect("archs");
-    assert!(!archs.is_empty(), "expected at least one supported NVRTC arch");
+    assert!(
+        !archs.is_empty(),
+        "expected at least one supported NVRTC arch"
+    );
     let sm = format!("sm_{}", archs[0]);
-    let mut prog = Program::new("extern \"C\" __global__ void noop() {}", None, &[]).expect("create");
-    prog.compile(&CompileOptions::new().arch(&sm)).expect("compile sm");
-    let cubin = prog.cubin().expect("cubin").expect("sm_XX should emit cubin");
+    let mut prog =
+        Program::new("extern \"C\" __global__ void noop() {}", None, &[]).expect("create");
+    prog.compile(&CompileOptions::new().arch(&sm))
+        .expect("compile sm");
+    let cubin = prog
+        .cubin()
+        .expect("cubin")
+        .expect("sm_XX should emit cubin");
     assert!(cubin.starts_with(b"\x7fELF"), "expected ELF cubin header");
 }

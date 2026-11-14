@@ -53,11 +53,17 @@ mod tests {
         let e1 = Error::Unavailable("missing cufft64_12.dll".into());
         assert!(e1.to_string().contains("missing cufft64_12.dll"));
 
-        let e2 = Error::Cufft { call: "cufftExecC2C", code: FftResult::EXEC_FAILED };
+        let e2 = Error::Cufft {
+            call: "cufftExecC2C",
+            code: FftResult::EXEC_FAILED,
+        };
         let msg2 = e2.to_string();
         assert!(msg2.contains("cufftExecC2C") && msg2.contains("CUFFT_EXEC_FAILED"));
 
-        let e3 = Error::Budget { requested: 8192, available: 512 };
+        let e3 = Error::Budget {
+            requested: 8192,
+            available: 512,
+        };
         assert!(e3.to_string().contains("8192") && e3.to_string().contains("512"));
 
         let e4 = Error::Invalid("bad rank");
@@ -83,19 +89,34 @@ mod tests {
         let bad_rank = ManyDesc { rank: 4, ..valid };
         assert!(matches!(bad_rank.validate(), Err(Error::Invalid(_))));
 
-        let bad_dim = ManyDesc { n: [16, 0, 0], ..valid };
+        let bad_dim = ManyDesc {
+            n: [16, 0, 0],
+            ..valid
+        };
         assert!(matches!(bad_dim.validate(), Err(Error::Invalid(_))));
 
-        let bad_stride = ManyDesc { istride: 0, ..valid };
+        let bad_stride = ManyDesc {
+            istride: 0,
+            ..valid
+        };
         assert!(matches!(bad_stride.validate(), Err(Error::Invalid(_))));
 
         let bad_dist = ManyDesc { idist: 0, ..valid };
         assert!(matches!(bad_dist.validate(), Err(Error::Invalid(_))));
 
         assert_eq!(dense_io_elems(&[16], 2, FftType::R2C).unwrap(), (32, 18));
-        assert_eq!(dense_io_elems(&[8, 16], 1, FftType::D2Z).unwrap(), (128, 72));
-        assert_eq!(dense_io_elems(&[8, 16], 1, FftType::C2R).unwrap(), (72, 128));
-        assert!(matches!(dense_io_elems(&[0], 1, FftType::C2C), Err(Error::Invalid(_))));
+        assert_eq!(
+            dense_io_elems(&[8, 16], 1, FftType::D2Z).unwrap(),
+            (128, 72)
+        );
+        assert_eq!(
+            dense_io_elems(&[8, 16], 1, FftType::C2R).unwrap(),
+            (72, 128)
+        );
+        assert!(matches!(
+            dense_io_elems(&[0], 1, FftType::C2C),
+            Err(Error::Invalid(_))
+        ));
 
         // embed[0] is ignored by cuFFT, so rank=1 n=[1024] with inembed=[1] still requires 1024 elems
         let rank1_small_embed0 = ManyDesc {
@@ -113,7 +134,10 @@ mod tests {
         assert_eq!(rank1_small_embed0.min_io_elems().unwrap(), (1024, 1024));
 
         // inner embed[1] < n[1] must be rejected
-        let bad_inner_embed = ManyDesc { inembed: Some([16, 16, 1]), ..valid };
+        let bad_inner_embed = ManyDesc {
+            inembed: Some([16, 16, 1]),
+            ..valid
+        };
         assert!(matches!(bad_inner_embed.validate(), Err(Error::Invalid(_))));
     }
 
@@ -134,20 +158,42 @@ mod tests {
             assert!(matches!(err, Err(Error::Budget { .. })));
         }
 
-        let plan = Plan::plan_1d(&ctx, n as i32, FftType::C2C, 1, 16 * 1024 * 1024, &mut scratch).unwrap();
-        let input_host: Vec<Complex32> = (0..n).map(|i| Complex32::new((i as f32 * 0.1).sin(), (i as f32 * 0.2).cos())).collect();
-        let time_energy: f64 = input_host.iter().map(|c| f64::from(c.re()).powi(2) + f64::from(c.im()).powi(2)).sum();
+        let plan = Plan::plan_1d(
+            &ctx,
+            n as i32,
+            FftType::C2C,
+            1,
+            16 * 1024 * 1024,
+            &mut scratch,
+        )
+        .unwrap();
+        let input_host: Vec<Complex32> = (0..n)
+            .map(|i| Complex32::new((i as f32 * 0.1).sin(), (i as f32 * 0.2).cos()))
+            .collect();
+        let time_energy: f64 = input_host
+            .iter()
+            .map(|c| f64::from(c.re()).powi(2) + f64::from(c.im()).powi(2))
+            .sum();
 
         let in_dev = cuda_core::DeviceBuffer::from_host(&stream, &input_host).unwrap();
         let mut freq_dev = cuda_core::DeviceBuffer::<Complex32>::zeroed(&stream, n).unwrap();
         let mut back_dev = cuda_core::DeviceBuffer::<Complex32>::zeroed(&stream, n).unwrap();
 
-        plan.exec_c2c(&stream, &in_dev, &mut freq_dev, Direction::Forward).unwrap();
+        plan.exec_c2c(&stream, &in_dev, &mut freq_dev, Direction::Forward)
+            .unwrap();
         let freq_host = freq_dev.to_host_vec(&stream).unwrap();
-        let freq_energy: f64 = freq_host.iter().map(|c| f64::from(c.re()).powi(2) + f64::from(c.im()).powi(2)).sum::<f64>() / (n as f64);
-        assert!((time_energy - freq_energy).abs() < 1e-3, "Parseval mismatch: {time_energy} vs {freq_energy}");
+        let freq_energy: f64 = freq_host
+            .iter()
+            .map(|c| f64::from(c.re()).powi(2) + f64::from(c.im()).powi(2))
+            .sum::<f64>()
+            / (n as f64);
+        assert!(
+            (time_energy - freq_energy).abs() < 1e-3,
+            "Parseval mismatch: {time_energy} vs {freq_energy}"
+        );
 
-        plan.exec_c2c(&stream, &freq_dev, &mut back_dev, Direction::Inverse).unwrap();
+        plan.exec_c2c(&stream, &freq_dev, &mut back_dev, Direction::Inverse)
+            .unwrap();
         let back_host = back_dev.to_host_vec(&stream).unwrap();
         for (orig, rec) in input_host.iter().zip(back_host.iter()) {
             assert!((orig.re() - rec.re() / (n as f32)).abs() < 1e-4);
@@ -156,14 +202,33 @@ mod tests {
 
         // 2D R2C / C2R roundtrip
         let (nx, ny) = (16usize, 16usize);
-        let plan_fwd = Plan::plan_2d(&ctx, nx as i32, ny as i32, FftType::R2C, 16 * 1024 * 1024, &mut scratch).unwrap();
-        let plan_inv = Plan::plan_2d(&ctx, nx as i32, ny as i32, FftType::C2R, 16 * 1024 * 1024, &mut scratch).unwrap();
+        let plan_fwd = Plan::plan_2d(
+            &ctx,
+            nx as i32,
+            ny as i32,
+            FftType::R2C,
+            16 * 1024 * 1024,
+            &mut scratch,
+        )
+        .unwrap();
+        let plan_inv = Plan::plan_2d(
+            &ctx,
+            nx as i32,
+            ny as i32,
+            FftType::C2R,
+            16 * 1024 * 1024,
+            &mut scratch,
+        )
+        .unwrap();
         let real_host: Vec<f32> = (0..(nx * ny)).map(|i| ((i % 7) as f32) * 0.25).collect();
         let real_dev = cuda_core::DeviceBuffer::from_host(&stream, &real_host).unwrap();
-        let mut spec_dev = cuda_core::DeviceBuffer::<Complex32>::zeroed(&stream, nx * (ny / 2 + 1)).unwrap();
+        let mut spec_dev =
+            cuda_core::DeviceBuffer::<Complex32>::zeroed(&stream, nx * (ny / 2 + 1)).unwrap();
         let mut rec_dev = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, nx * ny).unwrap();
 
-        plan_fwd.exec_r2c(&stream, &real_dev, &mut spec_dev).unwrap();
+        plan_fwd
+            .exec_r2c(&stream, &real_dev, &mut spec_dev)
+            .unwrap();
         plan_inv.exec_c2r(&stream, &spec_dev, &mut rec_dev).unwrap();
         let rec_host = rec_dev.to_host_vec(&stream).unwrap();
         let scale = (nx * ny) as f32;

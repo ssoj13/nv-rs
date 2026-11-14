@@ -3,7 +3,7 @@
 //! **What.** Generated at build time by `nv-bindgen` from the installed CUDA Toolkit
 //! (cusparse.h; headers are never committed). Each shim loads the toolkit's
 //! library on first use through `nv-loader` and returns `cusparseStatus_t_CUSPARSE_STATUS_NOT_INITIALIZED` when it is absent or
-//! `cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic. 
+//! `cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cusparse` crate; call [`load`] for a diagnosable load error.
 
 use nv_loader::{DllSpec, Group};
@@ -22,7 +22,10 @@ mod tests {
     #[test]
     fn inventory_lists_the_core_entry_points() {
         for f in ["cusparseCreate", "cusparseSpMV", "cusparseSetStream"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

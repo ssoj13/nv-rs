@@ -25,7 +25,14 @@ pub fn sparse_arrays_supported(ctx: &Context) -> Result<bool, DriverError> {
     ctx.bind_to_thread()?;
     let mut v = 0;
     // SAFETY: valid attribute and out-pointer; the device belongs to `ctx`.
-    unsafe { sys::cuDeviceGetAttribute(&mut v, sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED, ctx.cu_device()) }.result()?;
+    unsafe {
+        sys::cuDeviceGetAttribute(
+            &mut v,
+            sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED,
+            ctx.cu_device(),
+        )
+    }
+    .result()?;
     Ok(v != 0)
 }
 
@@ -64,15 +71,32 @@ impl Array {
     /// Maps the level-0 region at `origin` (x, y in elements) of `extent` (width, height) onto
     /// `pool` at byte `pool_offset`, ordered on `stream`. Origin and extent must be multiples of
     /// the tile extent and inside the array; the pool range must hold the tiles' bytes.
-    pub fn map_tiles(&self, stream: &Stream, origin: [u32; 2], extent: [u32; 2], pool: &TilePool, pool_offset: u64) -> Result<(), DriverError> {
+    pub fn map_tiles(
+        &self,
+        stream: &Stream,
+        origin: [u32; 2],
+        extent: [u32; 2],
+        pool: &TilePool,
+        pool_offset: u64,
+    ) -> Result<(), DriverError> {
         let tiles = self.check_region(origin, extent)?;
         let p = self.sparse_properties()?;
-        let tile_bytes = u64::from(p.tile[0]) * u64::from(p.tile[1]) * u64::from(p.tile[2].max(1)) * self.desc().element_bytes() as u64;
+        let tile_bytes = u64::from(p.tile[0])
+            * u64::from(p.tile[1])
+            * u64::from(p.tile[2].max(1))
+            * self.desc().element_bytes() as u64;
         if tile_bytes != pool.tile_bytes {
             return Err(invalid_value());
         }
-        let bytes = tiles.checked_mul(pool.tile_bytes).ok_or_else(invalid_value)?;
-        if !pool_offset.is_multiple_of(pool.tile_bytes) || pool_offset.checked_add(bytes).is_none_or(|end| end > pool.size as u64) || !Arc::ptr_eq(&pool.ctx, self.context()) {
+        let bytes = tiles
+            .checked_mul(pool.tile_bytes)
+            .ok_or_else(invalid_value)?;
+        if !pool_offset.is_multiple_of(pool.tile_bytes)
+            || pool_offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > pool.size as u64)
+            || !Arc::ptr_eq(&pool.ctx, self.context())
+        {
             return Err(invalid_value());
         }
         let mut info = self.map_info(origin, extent);
@@ -84,7 +108,12 @@ impl Array {
 
     /// Unmaps the level-0 region at `origin` of `extent`, ordered on `stream` (same alignment
     /// rules as [`Array::map_tiles`]).
-    pub fn unmap_tiles(&self, stream: &Stream, origin: [u32; 2], extent: [u32; 2]) -> Result<(), DriverError> {
+    pub fn unmap_tiles(
+        &self,
+        stream: &Stream,
+        origin: [u32; 2],
+        extent: [u32; 2],
+    ) -> Result<(), DriverError> {
         self.check_region(origin, extent)?;
         let mut info = self.map_info(origin, extent);
         info.memOperationType = sys::CUmemOperationType_enum_CU_MEM_OPERATION_TYPE_UNMAP;
@@ -102,7 +131,13 @@ impl Array {
         let mut tiles = 1u64;
         for a in 0..2 {
             let t = p.tile[a];
-            if t == 0 || extent[a] == 0 || !origin[a].is_multiple_of(t) || !extent[a].is_multiple_of(t) || u64::from(origin[a]) + u64::from(extent[a]) > size[a].next_multiple_of(u64::from(t)) {
+            if t == 0
+                || extent[a] == 0
+                || !origin[a].is_multiple_of(t)
+                || !extent[a].is_multiple_of(t)
+                || u64::from(origin[a]) + u64::from(extent[a])
+                    > size[a].next_multiple_of(u64::from(t))
+            {
                 return Err(invalid_value());
             }
             tiles *= u64::from(extent[a] / t);
@@ -115,7 +150,8 @@ impl Array {
         let mut info: sys::CUarrayMapInfo = unsafe { std::mem::zeroed() };
         info.resourceType = sys::CUresourcetype_enum_CU_RESOURCE_TYPE_ARRAY;
         info.resource.array = self.cu_array();
-        info.subresourceType = sys::CUarraySparseSubresourceType_enum_CU_ARRAY_SPARSE_SUBRESOURCE_TYPE_SPARSE_LEVEL;
+        info.subresourceType =
+            sys::CUarraySparseSubresourceType_enum_CU_ARRAY_SPARSE_SUBRESOURCE_TYPE_SPARSE_LEVEL;
         info.subresource.sparseLevel = sys::CUarrayMapInfo_st__bindgen_ty_2__bindgen_ty_1 {
             level: 0,
             layer: 0,
@@ -171,15 +207,30 @@ impl TilePool {
         prop.allocFlags.usage = sys::CU_MEM_CREATE_USAGE_TILE_POOL as u16;
         let mut gran = 0usize;
         // SAFETY: valid property and out-pointer.
-        unsafe { sys::cuMemGetAllocationGranularity(&mut gran, &prop, sys::CUmemAllocationGranularity_flags_enum_CU_MEM_ALLOC_GRANULARITY_MINIMUM) }.result()?;
-        let size = tiles.checked_mul(TILE).ok_or_else(invalid_value)?.next_multiple_of(gran.max(TILE));
+        unsafe {
+            sys::cuMemGetAllocationGranularity(
+                &mut gran,
+                &prop,
+                sys::CUmemAllocationGranularity_flags_enum_CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+        }
+        .result()?;
+        let size = tiles
+            .checked_mul(TILE)
+            .ok_or_else(invalid_value)?
+            .next_multiple_of(gran.max(TILE));
         if tiles == 0 {
             return Err(invalid_value());
         }
         let mut handle = 0;
         // SAFETY: valid property and out-pointer; `size` is a multiple of the granularity.
         unsafe { sys::cuMemCreate(&mut handle, size, &prop, 0) }.result()?;
-        Ok(Self { handle, size, tile_bytes: TILE as u64, ctx: ctx.clone() })
+        Ok(Self {
+            handle,
+            size,
+            tile_bytes: TILE as u64,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Bytes in the pool.

@@ -33,55 +33,130 @@ mod tests {
     #[test]
     fn inventory_covers_public_host_api() {
         let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
-        let symbols = inventory.get("symbols").and_then(Value::as_array).expect("symbols array");
+        let symbols = inventory
+            .get("symbols")
+            .and_then(Value::as_array)
+            .expect("symbols array");
         for name in [
-            "ncclGetVersion", "pncclGetVersion", "ncclGetUniqueId", "pncclGetUniqueId",
-            "ncclGetErrorString", "pncclGetErrorString", "ncclGetLastError", "pncclGetLastError",
-            "ncclCommInitAll", "pncclCommInitAll", "ncclCommInitRank", "pncclCommInitRank",
-            "ncclCommDestroy", "pncclCommDestroy", "ncclAllReduce", "pncclAllReduce",
-            "ncclAllReduceConfig", "pncclAllReduceConfig", "ncclGroupStart", "pncclGroupStart",
-            "ncclGroupEnd", "pncclGroupEnd", "ncclCommWindowRegister", "pncclCommWindowRegister",
-            "ncclPutSignal", "pncclPutSignal", "ncclWaitSignal", "pncclWaitSignal",
-            "ncclParamBind", "pncclParamBind", "ncclParamDumpAll", "pncclParamDumpAll",
-            "ncclResetDebugInit", "pncclResetDebugInit",
-            "ncclCommQueryProperties", "ncclDevCommCreate", "ncclDevCommDestroy",
-            "ncclGetLsaMultimemDevicePointer", "ncclGetMultimemDevicePointer",
-            "ncclGetLsaDevicePointer", "ncclGetPeerDevicePointer",
-            "ncclGetMultimemDeviceLeInfo", "ncclGetCftDeviceLeInfo", "ncclGetPeerDeviceLeInfo",
-            "ncclLsaBarrierCreateRequirement", "ncclGinBarrierCreateRequirement",
-            "ncclCftBarrierCreateRequirement", "ncclLLA2ACreateRequirement",
-            "ncclLLA2ACalcSlots", "ncclTeamCft", "ncclTeamCftMultimem", "ncclTeamLsa",
-            "ncclTeamRail", "ncclTeamRankToLsa", "ncclTeamRankToWorld", "ncclTeamWorld",
+            "ncclGetVersion",
+            "pncclGetVersion",
+            "ncclGetUniqueId",
+            "pncclGetUniqueId",
+            "ncclGetErrorString",
+            "pncclGetErrorString",
+            "ncclGetLastError",
+            "pncclGetLastError",
+            "ncclCommInitAll",
+            "pncclCommInitAll",
+            "ncclCommInitRank",
+            "pncclCommInitRank",
+            "ncclCommDestroy",
+            "pncclCommDestroy",
+            "ncclAllReduce",
+            "pncclAllReduce",
+            "ncclAllReduceConfig",
+            "pncclAllReduceConfig",
+            "ncclGroupStart",
+            "pncclGroupStart",
+            "ncclGroupEnd",
+            "pncclGroupEnd",
+            "ncclCommWindowRegister",
+            "pncclCommWindowRegister",
+            "ncclPutSignal",
+            "pncclPutSignal",
+            "ncclWaitSignal",
+            "pncclWaitSignal",
+            "ncclParamBind",
+            "pncclParamBind",
+            "ncclParamDumpAll",
+            "pncclParamDumpAll",
+            "ncclResetDebugInit",
+            "pncclResetDebugInit",
+            "ncclCommQueryProperties",
+            "ncclDevCommCreate",
+            "ncclDevCommDestroy",
+            "ncclGetLsaMultimemDevicePointer",
+            "ncclGetMultimemDevicePointer",
+            "ncclGetLsaDevicePointer",
+            "ncclGetPeerDevicePointer",
+            "ncclGetMultimemDeviceLeInfo",
+            "ncclGetCftDeviceLeInfo",
+            "ncclGetPeerDeviceLeInfo",
+            "ncclLsaBarrierCreateRequirement",
+            "ncclGinBarrierCreateRequirement",
+            "ncclCftBarrierCreateRequirement",
+            "ncclLLA2ACreateRequirement",
+            "ncclLLA2ACalcSlots",
+            "ncclTeamCft",
+            "ncclTeamCftMultimem",
+            "ncclTeamLsa",
+            "ncclTeamRail",
+            "ncclTeamRankToLsa",
+            "ncclTeamRankToWorld",
+            "ncclTeamWorld",
         ] {
-            assert!(symbols.iter().any(|symbol| symbol.as_str() == Some(name)), "{name} missing");
+            assert!(
+                symbols.iter().any(|symbol| symbol.as_str() == Some(name)),
+                "{name} missing"
+            );
         }
-        let unshimmed = inventory.get("unshimmed").and_then(Value::as_array).expect("unshimmed array");
-        let names: Vec<&str> = unshimmed.iter().map(|value| value.as_str().expect("entry point name")).collect();
-        assert_eq!(names, [
-            "ncclLLA2ACalcSlots", "ncclParamDumpAll", "ncclResetDebugInit",
-            "ncclTeamCft", "ncclTeamCftMultimem", "ncclTeamLsa", "ncclTeamRail",
-            "ncclTeamRankToLsa", "ncclTeamRankToWorld", "ncclTeamWorld",
-            "pncclParamDumpAll", "pncclResetDebugInit",
-        ]);
+        let unshimmed = inventory
+            .get("unshimmed")
+            .and_then(Value::as_array)
+            .expect("unshimmed array");
+        let names: Vec<&str> = unshimmed
+            .iter()
+            .map(|value| value.as_str().expect("entry point name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "ncclLLA2ACalcSlots",
+                "ncclParamDumpAll",
+                "ncclResetDebugInit",
+                "ncclTeamCft",
+                "ncclTeamCftMultimem",
+                "ncclTeamLsa",
+                "ncclTeamRail",
+                "ncclTeamRankToLsa",
+                "ncclTeamRankToWorld",
+                "ncclTeamWorld",
+                "pncclParamDumpAll",
+                "pncclResetDebugInit",
+            ]
+        );
     }
 
     #[test]
     fn cuda_types_are_shared() {
         let _: cudaStream_t = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
-        let location: cuda_bindings::CUmemLocationType = cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE;
-        let segment = ncclSegmentWindow { memType: location, ..Default::default() };
-        assert_eq!(segment.memType, cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE);
+        let location: cuda_bindings::CUmemLocationType =
+            cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE;
+        let segment = ncclSegmentWindow {
+            memType: location,
+            ..Default::default()
+        };
+        assert_eq!(
+            segment.memType,
+            cuda_bindings::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE
+        );
     }
 
     #[test]
     fn host_queries_are_checked() {
         let _: unsafe fn(i32, i32) -> Result<i32, nv_loader::CallError> = ncclLLA2ACalcSlots;
-        let _: unsafe fn(ncclComm_t, ncclCftTeamMode_t) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamCft;
-        let _: unsafe fn(ncclComm_t) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamCftMultimem;
+        let _: unsafe fn(
+            ncclComm_t,
+            ncclCftTeamMode_t,
+        ) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamCft;
+        let _: unsafe fn(ncclComm_t) -> Result<ncclTeam_t, nv_loader::CallError> =
+            ncclTeamCftMultimem;
         let _: unsafe fn(ncclComm_t) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamLsa;
         let _: unsafe fn(ncclComm_t) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamRail;
-        let _: unsafe fn(ncclComm_t, ncclTeam_t, i32) -> Result<i32, nv_loader::CallError> = ncclTeamRankToLsa;
-        let _: unsafe fn(ncclComm_t, ncclTeam_t, i32) -> Result<i32, nv_loader::CallError> = ncclTeamRankToWorld;
+        let _: unsafe fn(ncclComm_t, ncclTeam_t, i32) -> Result<i32, nv_loader::CallError> =
+            ncclTeamRankToLsa;
+        let _: unsafe fn(ncclComm_t, ncclTeam_t, i32) -> Result<i32, nv_loader::CallError> =
+            ncclTeamRankToWorld;
         let _: unsafe fn(ncclComm_t) -> Result<ncclTeam_t, nv_loader::CallError> = ncclTeamWorld;
         let _: unsafe fn() -> Result<(), nv_loader::CallError> = ncclParamDumpAll;
         let _: unsafe fn() -> Result<(), nv_loader::CallError> = pncclParamDumpAll;
@@ -96,16 +171,22 @@ mod tests {
         let mut version = 0;
         let mut profiling_version = 0;
         // SAFETY: both version pointers refer to writable, aligned integers for each call.
-        assert_eq!(unsafe { ncclGetVersion(&mut version) }, ncclResult_t_ncclSuccess);
+        let version_status = unsafe { ncclGetVersion(&mut version) };
+        assert_eq!(version_status, ncclResult_t_ncclSuccess);
         // SAFETY: profiling_version is writable and valid for the call.
-        assert_eq!(unsafe { pncclGetVersion(&mut profiling_version) }, ncclResult_t_ncclSuccess);
-        assert_eq!(version, i32::try_from(NCCL_VERSION_CODE).expect("header version fits C int"));
+        let profiling_status = unsafe { pncclGetVersion(&mut profiling_version) };
+        assert_eq!(profiling_status, ncclResult_t_ncclSuccess);
+        assert_eq!(
+            version,
+            i32::try_from(NCCL_VERSION_CODE).expect("header version fits C int")
+        );
         assert_eq!(profiling_version, version);
         // SAFETY: a valid status is passed; NCCL returns a library-owned NUL-terminated string.
         let text = unsafe { ncclGetErrorString(ncclResult_t_ncclSuccess) };
         assert!(!text.is_null(), "success status string was not reported");
         // SAFETY: the documented string is NUL-terminated and the loader retains its library.
-        assert!(!unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes().is_empty());
+        let text_cstr = unsafe { std::ffi::CStr::from_ptr(text) };
+        assert!(!text_cstr.to_bytes().is_empty());
     }
 
     #[derive(Debug)]
@@ -139,8 +220,16 @@ mod tests {
     ) -> Cleanup<E> {
         if !work_ok {
             let status = abort();
-            let completion = if status == ncclResult_t_ncclSuccess { Some(synchronize()) } else { None };
-            return Cleanup { completion, destroy: None, abort: Some(status) };
+            let completion = if status == ncclResult_t_ncclSuccess {
+                Some(synchronize())
+            } else {
+                None
+            };
+            return Cleanup {
+                completion,
+                destroy: None,
+                abort: Some(status),
+            };
         }
         let completion = synchronize();
         let (destroy, abort) = if completion.is_ok() {
@@ -150,7 +239,11 @@ mod tests {
         } else {
             (None, Some(abort()))
         };
-        Cleanup { completion: Some(completion), destroy, abort }
+        Cleanup {
+            completion: Some(completion),
+            destroy,
+            abort,
+        }
     }
 
     #[test]
@@ -162,21 +255,52 @@ mod tests {
             (false, true, success, failure, &["abort"][..]),
             (true, true, success, success, &["sync", "destroy"][..]),
             (true, false, success, success, &["sync", "abort"][..]),
-            (true, true, failure, success, &["sync", "destroy", "abort"][..]),
+            (
+                true,
+                true,
+                failure,
+                success,
+                &["sync", "destroy", "abort"][..],
+            ),
             (true, false, success, failure, &["sync", "abort"][..]),
         ] {
             let calls = std::cell::RefCell::new(Vec::new());
             let cleanup = finish_comm(
                 work_ok,
-                || { calls.borrow_mut().push("sync"); if sync_ok { Ok(()) } else { Err("sync failed") } },
-                || { calls.borrow_mut().push("destroy"); destroy_status },
-                || { calls.borrow_mut().push("abort"); abort_status },
+                || {
+                    calls.borrow_mut().push("sync");
+                    if sync_ok { Ok(()) } else { Err("sync failed") }
+                },
+                || {
+                    calls.borrow_mut().push("destroy");
+                    destroy_status
+                },
+                || {
+                    calls.borrow_mut().push("abort");
+                    abort_status
+                },
             );
             assert_eq!(calls.borrow().as_slice(), order);
-            assert_eq!(cleanup.completion, order.contains(&"sync").then_some(if sync_ok { Ok(()) } else { Err("sync failed") }));
-            assert_eq!(cleanup.destroy, order.contains(&"destroy").then_some(destroy_status));
-            assert_eq!(cleanup.abort, order.contains(&"abort").then_some(abort_status));
-            assert_eq!(cleanup.succeeded(), work_ok && sync_ok && destroy_status == success);
+            assert_eq!(
+                cleanup.completion,
+                order.contains(&"sync").then_some(if sync_ok {
+                    Ok(())
+                } else {
+                    Err("sync failed")
+                })
+            );
+            assert_eq!(
+                cleanup.destroy,
+                order.contains(&"destroy").then_some(destroy_status)
+            );
+            assert_eq!(
+                cleanup.abort,
+                order.contains(&"abort").then_some(abort_status)
+            );
+            assert_eq!(
+                cleanup.succeeded(),
+                work_ok && sync_ok && destroy_status == success
+            );
         }
     }
 
@@ -217,8 +341,14 @@ mod tests {
             // SAFETY: failed initialization produced a non-null partial communicator owned here.
             unsafe { ncclCommAbort(comm) }
         });
-        assert_eq!(initialized, ncclResult_t_ncclSuccess, "initialize one rank; partial abort: {partial_abort:?}");
-        assert!(!comm.is_null(), "successful initialization returned no communicator");
+        assert_eq!(
+            initialized, ncclResult_t_ncclSuccess,
+            "initialize one rank; partial abort: {partial_abort:?}"
+        );
+        assert!(
+            !comm.is_null(),
+            "successful initialization returned no communicator"
+        );
         let work = (|| -> Result<(), String> {
             for count in [1_usize, values.len()] {
                 // SAFETY: both allocations contain count i32 values, belong to the current
@@ -228,17 +358,24 @@ mod tests {
                     ncclAllReduce(
                         input.cu_deviceptr() as *const std::ffi::c_void,
                         output.cu_deviceptr() as *mut std::ffi::c_void,
-                        count, ncclDataType_t_ncclInt32, ncclRedOp_t_ncclSum,
-                        comm, stream.cu_stream(),
+                        count,
+                        ncclDataType_t_ncclInt32,
+                        ncclRedOp_t_ncclSum,
+                        comm,
+                        stream.cu_stream(),
                     )
                 };
                 if status != ncclResult_t_ncclSuccess {
                     return Err(format!("all-reduce of {count} values failed with {status}"));
                 }
                 stream.synchronize().map_err(|error| error.to_string())?;
-                let actual = output.to_host_vec(&stream).map_err(|error| error.to_string())?;
+                let actual = output
+                    .to_host_vec(&stream)
+                    .map_err(|error| error.to_string())?;
                 if actual.get(..count) != values.get(..count) {
-                    return Err(format!("one-rank result differs for count {count}: {actual:?}"));
+                    return Err(format!(
+                        "one-rank result differs for count {count}: {actual:?}"
+                    ));
                 }
             }
             Ok(())
@@ -251,6 +388,9 @@ mod tests {
             // SAFETY: abort releases this unique communicator before failed work can block a wait.
             || unsafe { ncclCommAbort(comm) },
         );
-        assert!(work.is_ok() && cleanup.succeeded(), "work: {work:?}; cleanup: {cleanup:?}");
+        assert!(
+            work.is_ok() && cleanup.succeeded(),
+            "work: {work:?}; cleanup: {cleanup:?}"
+        );
     }
 }

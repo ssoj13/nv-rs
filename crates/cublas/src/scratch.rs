@@ -22,7 +22,10 @@ pub struct Scratch {
 impl Scratch {
     /// Creates an empty workspace for operations on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self { stream: stream.clone(), buffer: None }
+        Self {
+            stream: stream.clone(),
+            buffer: None,
+        }
     }
 
     /// Creates a workspace pre-allocated to `bytes` if `bytes <= budget`.
@@ -49,12 +52,22 @@ impl Scratch {
     ///
     /// Returns `(device_ptr_as_void, allocated_bytes)`. When `bytes == 0`, returns `(null, 0)`
     /// without allocating.
-    pub(crate) fn reserve(&mut self, stream: &Stream, bytes: usize, budget: usize) -> Result<(*mut c_void, usize)> {
+    pub(crate) fn reserve(
+        &mut self,
+        stream: &Stream,
+        bytes: usize,
+        budget: usize,
+    ) -> Result<(*mut c_void, usize)> {
         if !std::ptr::eq(stream, &*self.stream) {
-            return Err(Error::Invalid("scratch used on a different stream than it was created for"));
+            return Err(Error::Invalid(
+                "scratch used on a different stream than it was created for",
+            ));
         }
         if bytes > budget {
-            return Err(Error::Budget { requested: bytes, available: budget });
+            return Err(Error::Budget {
+                requested: bytes,
+                available: budget,
+            });
         }
         if bytes == 0 {
             return Ok((std::ptr::null_mut(), 0));
@@ -63,9 +76,13 @@ impl Scratch {
             // Drop the old buffer first; its stream-ordered free executes after prior work on `stream`.
             self.buffer = None;
             // SAFETY: cuBLAS/cuBLASLt workspace is scratch memory written before being read.
-            self.buffer = Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, bytes)? });
+            self.buffer =
+                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, bytes)? });
         }
-        let buf = self.buffer.as_ref().ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
+        let buf = self
+            .buffer
+            .as_ref()
+            .ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
         Ok(((buf.cu_deviceptr() as usize) as *mut c_void, buf.len()))
     }
 }

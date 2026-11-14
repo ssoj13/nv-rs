@@ -44,8 +44,17 @@ mod tests {
 
     #[test]
     fn inventory_covers_every_family() {
-        for f in ["nppGetLibVersion", "nppsAdd_32f_Ctx", "nppiFilter_8u_C1R_Ctx", "nppiResize_8u_C1R_Ctx", "nppiMean_8u_C1R_Ctx"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "nppGetLibVersion",
+            "nppsAdd_32f_Ctx",
+            "nppiFilter_8u_C1R_Ctx",
+            "nppiResize_8u_C1R_Ctx",
+            "nppiMean_8u_C1R_Ctx",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 

@@ -8,9 +8,9 @@ use cuda_core::{Context, DeviceBuffer, Stream};
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
 
+use crate::{DataType, DeviceSpan, Error, NcclStatus, RedOp, Result, same_ctx};
 #[cfg(target_os = "linux")]
 use crate::{check, record_teardown};
-use crate::{same_ctx, DataType, DeviceSpan, Error, NcclStatus, RedOp, Result};
 
 /// Opaque 128-byte NCCL communicator rendezvous identifier (`ncclUniqueId`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,7 +174,9 @@ pub struct Comm {
 unsafe impl Send for Comm {}
 
 fn check_elem_span(count: usize, dtype: DataType, bytes: usize, label: &'static str) -> Result<()> {
-    let needed = count.checked_mul(dtype.elem_bytes()).ok_or(Error::Invalid("element count overflow"))?;
+    let needed = count
+        .checked_mul(dtype.elem_bytes())
+        .ok_or(Error::Invalid("element count overflow"))?;
     if bytes < needed {
         return Err(Error::Invalid(label));
     }
@@ -187,7 +189,9 @@ impl Comm {
     /// Each context must represent a distinct CUDA device.
     pub fn init_all(contexts: &[Arc<Context>]) -> Result<Vec<Self>> {
         if contexts.is_empty() {
-            return Err(Error::Invalid("init_all requires at least one CUDA context"));
+            return Err(Error::Invalid(
+                "init_all requires at least one CUDA context",
+            ));
         }
         let ndev = contexts.len();
         let _ = i32::try_from(ndev).map_err(|_| Error::Invalid("too many ranks for i32"))?;
@@ -220,8 +224,12 @@ impl Comm {
             }
 
             let mut out = Vec::with_capacity(ndev);
-            for (idx, ((raw, ctx), &device)) in
-                raw_comms.iter().copied().zip(contexts.iter()).zip(devs.iter()).enumerate()
+            for (idx, ((raw, ctx), &device)) in raw_comms
+                .iter()
+                .copied()
+                .zip(contexts.iter())
+                .zip(devs.iter())
+                .enumerate()
             {
                 let rank = match Self::query_rank(raw) {
                     Ok(r) => r,
@@ -237,7 +245,13 @@ impl Comm {
                         return Err(err);
                     }
                 };
-                out.push(Self { raw: Some(raw), ctx: ctx.clone(), nranks: ndev, rank, device });
+                out.push(Self {
+                    raw: Some(raw),
+                    ctx: ctx.clone(),
+                    nranks: ndev,
+                    rank,
+                    device,
+                });
             }
             Ok(out)
         }
@@ -272,7 +286,13 @@ impl Comm {
                 nccl_sys::ncclCommInitRank(&mut raw, nranks_i, unique_id.to_sys(), rank_i)
             };
             check("ncclCommInitRank", status)?;
-            Ok(Self { raw: Some(raw), ctx: ctx.clone(), nranks, rank, device })
+            Ok(Self {
+                raw: Some(raw),
+                ctx: ctx.clone(),
+                nranks,
+                rank,
+                device,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -285,7 +305,9 @@ impl Comm {
     fn query_rank(raw: nccl_sys::ncclComm_t) -> Result<usize> {
         let mut r = 0i32;
         // SAFETY: `raw` is an initialized communicator.
-        check("ncclCommUserRank", unsafe { nccl_sys::ncclCommUserRank(raw, &mut r) })?;
+        check("ncclCommUserRank", unsafe {
+            nccl_sys::ncclCommUserRank(raw, &mut r)
+        })?;
         usize::try_from(r).map_err(|_| Error::Invalid("negative rank returned by NCCL"))
     }
 
@@ -313,10 +335,14 @@ impl Comm {
     pub fn query_count(&self) -> Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let mut c = 0i32;
             // SAFETY: `raw` is live.
-            check("ncclCommCount", unsafe { nccl_sys::ncclCommCount(raw, &mut c) })?;
+            check("ncclCommCount", unsafe {
+                nccl_sys::ncclCommCount(raw, &mut c)
+            })?;
             usize::try_from(c).map_err(|_| Error::Invalid("negative comm count"))
         }
         #[cfg(not(target_os = "linux"))]
@@ -329,7 +355,9 @@ impl Comm {
     pub fn async_error(&self) -> Result<AsyncState> {
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let mut async_err: nccl_sys::ncclResult_t = 0;
             // SAFETY: `raw` is live and `async_err` is a stack out-pointer.
             let status = unsafe { nccl_sys::ncclCommGetAsyncError(raw, &mut async_err) };
@@ -360,7 +388,11 @@ impl Comm {
                 None
             } else {
                 // SAFETY: non-null return is a valid NUL-terminated C string.
-                Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+                Some(
+                    unsafe { std::ffi::CStr::from_ptr(ptr) }
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -460,14 +492,28 @@ impl Comm {
     {
         same_ctx(stream, &self.ctx)?;
         if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
-            return Err(Error::Invalid("all_reduce buffers belong to another CUDA context"));
+            return Err(Error::Invalid(
+                "all_reduce buffers belong to another CUDA context",
+            ));
         }
-        check_elem_span(count, dtype, send.num_bytes(), "send buffer smaller than count * dtype")?;
-        check_elem_span(count, dtype, recv.num_bytes(), "recv buffer smaller than count * dtype")?;
+        check_elem_span(
+            count,
+            dtype,
+            send.num_bytes(),
+            "send buffer smaller than count * dtype",
+        )?;
+        check_elem_span(
+            count,
+            dtype,
+            recv.num_bytes(),
+            "recv buffer smaller than count * dtype",
+        )?;
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: context is bound, buffers satisfy byte spans and belong to `self.ctx`.
             let status = unsafe {
@@ -511,27 +557,45 @@ impl Comm {
             return Err(Error::Invalid("broadcast root out of range"));
         }
         if !Arc::ptr_eq(recv.context(), &self.ctx) {
-            return Err(Error::Invalid("recv buffer belongs to another CUDA context"));
+            return Err(Error::Invalid(
+                "recv buffer belongs to another CUDA context",
+            ));
         }
-        check_elem_span(count, dtype, recv.num_bytes(), "recv buffer smaller than count * dtype")?;
+        check_elem_span(
+            count,
+            dtype,
+            recv.num_bytes(),
+            "recv buffer smaller than count * dtype",
+        )?;
 
         let send_ptr = match send {
             Some(s) => {
                 if !Arc::ptr_eq(s.context(), &self.ctx) {
-                    return Err(Error::Invalid("send buffer belongs to another CUDA context"));
+                    return Err(Error::Invalid(
+                        "send buffer belongs to another CUDA context",
+                    ));
                 }
-                check_elem_span(count, dtype, s.num_bytes(), "send buffer smaller than count * dtype")?;
+                check_elem_span(
+                    count,
+                    dtype,
+                    s.num_bytes(),
+                    "send buffer smaller than count * dtype",
+                )?;
                 s.cu_deviceptr()
             }
             None if self.rank == root => {
-                return Err(Error::Invalid("broadcast root rank must provide send buffer"));
+                return Err(Error::Invalid(
+                    "broadcast root rank must provide send buffer",
+                ));
             }
             None => 0,
         };
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let root_i = i32::try_from(root).map_err(|_| Error::Invalid("root exceeds i32"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: root send span and all-rank recv span validated above.
@@ -581,16 +645,30 @@ impl Comm {
             return Err(Error::Invalid("reduce root out of range"));
         }
         if !Arc::ptr_eq(send.context(), &self.ctx) {
-            return Err(Error::Invalid("send buffer belongs to another CUDA context"));
+            return Err(Error::Invalid(
+                "send buffer belongs to another CUDA context",
+            ));
         }
-        check_elem_span(count, dtype, send.num_bytes(), "send buffer smaller than count * dtype")?;
+        check_elem_span(
+            count,
+            dtype,
+            send.num_bytes(),
+            "send buffer smaller than count * dtype",
+        )?;
 
         let recv_ptr = match recv {
             Some(r) => {
                 if !Arc::ptr_eq(r.context(), &self.ctx) {
-                    return Err(Error::Invalid("recv buffer belongs to another CUDA context"));
+                    return Err(Error::Invalid(
+                        "recv buffer belongs to another CUDA context",
+                    ));
                 }
-                check_elem_span(count, dtype, r.num_bytes(), "recv buffer smaller than count * dtype")?;
+                check_elem_span(
+                    count,
+                    dtype,
+                    r.num_bytes(),
+                    "recv buffer smaller than count * dtype",
+                )?;
                 r.cu_deviceptr()
             }
             None if self.rank == root => {
@@ -601,7 +679,9 @@ impl Comm {
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let root_i = i32::try_from(root).map_err(|_| Error::Invalid("root exceeds i32"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: send span and root recv span validated above.
@@ -641,10 +721,13 @@ impl Comm {
     {
         same_ctx(stream, &self.ctx)?;
         if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
-            return Err(Error::Invalid("all_gather buffers belong to another CUDA context"));
+            return Err(Error::Invalid(
+                "all_gather buffers belong to another CUDA context",
+            ));
         }
-        let total_recv =
-            send_count.checked_mul(self.nranks).ok_or(Error::Invalid("recv count overflow"))?;
+        let total_recv = send_count
+            .checked_mul(self.nranks)
+            .ok_or(Error::Invalid("recv count overflow"))?;
         check_elem_span(
             send_count,
             dtype,
@@ -660,7 +743,9 @@ impl Comm {
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: send and `nranks`-scaled recv byte spans verified above.
             let status = unsafe {
@@ -697,10 +782,13 @@ impl Comm {
     {
         same_ctx(stream, &self.ctx)?;
         if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
-            return Err(Error::Invalid("reduce_scatter buffers belong to another CUDA context"));
+            return Err(Error::Invalid(
+                "reduce_scatter buffers belong to another CUDA context",
+            ));
         }
-        let total_send =
-            recv_count.checked_mul(self.nranks).ok_or(Error::Invalid("send count overflow"))?;
+        let total_send = recv_count
+            .checked_mul(self.nranks)
+            .ok_or(Error::Invalid("send count overflow"))?;
         check_elem_span(
             total_send,
             dtype,
@@ -716,7 +804,9 @@ impl Comm {
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: `nranks`-scaled send and recv byte spans verified above.
             let status = unsafe {
@@ -756,13 +846,22 @@ impl Comm {
             return Err(Error::Invalid("send peer rank out of range"));
         }
         if !Arc::ptr_eq(send.context(), &self.ctx) {
-            return Err(Error::Invalid("send buffer belongs to another CUDA context"));
+            return Err(Error::Invalid(
+                "send buffer belongs to another CUDA context",
+            ));
         }
-        check_elem_span(count, dtype, send.num_bytes(), "send buffer smaller than count * dtype")?;
+        check_elem_span(
+            count,
+            dtype,
+            send.num_bytes(),
+            "send buffer smaller than count * dtype",
+        )?;
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let peer_i = i32::try_from(peer).map_err(|_| Error::Invalid("peer exceeds i32"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: send span and peer validated above.
@@ -801,13 +900,22 @@ impl Comm {
             return Err(Error::Invalid("recv peer rank out of range"));
         }
         if !Arc::ptr_eq(recv.context(), &self.ctx) {
-            return Err(Error::Invalid("recv buffer belongs to another CUDA context"));
+            return Err(Error::Invalid(
+                "recv buffer belongs to another CUDA context",
+            ));
         }
-        check_elem_span(count, dtype, recv.num_bytes(), "recv buffer smaller than count * dtype")?;
+        check_elem_span(
+            count,
+            dtype,
+            recv.num_bytes(),
+            "recv buffer smaller than count * dtype",
+        )?;
 
         #[cfg(target_os = "linux")]
         {
-            let raw = self.raw.ok_or(Error::Invalid("communicator already destroyed"))?;
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
             let peer_i = i32::try_from(peer).map_err(|_| Error::Invalid("peer exceeds i32"))?;
             self.ctx.bind_to_thread()?;
             // SAFETY: recv span and peer validated above.

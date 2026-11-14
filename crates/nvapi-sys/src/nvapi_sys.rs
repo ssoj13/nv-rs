@@ -23,8 +23,16 @@ mod tests {
 
     #[test]
     fn inventory_lists_the_core_entry_points() {
-        for f in ["NvAPI_Initialize", "NvAPI_Unload", "NvAPI_EnumPhysicalGPUs", "NvAPI_GPU_GetFullName"] {
-            assert!(INVENTORY.contains(&format!("\"{f}\"")), "{f} missing from the inventory");
+        for f in [
+            "NvAPI_Initialize",
+            "NvAPI_Unload",
+            "NvAPI_EnumPhysicalGPUs",
+            "NvAPI_GPU_GetFullName",
+        ] {
+            assert!(
+                INVENTORY.contains(&format!("\"{f}\"")),
+                "{f} missing from the inventory"
+            );
         }
     }
 
@@ -35,9 +43,13 @@ mod tests {
         // SAFETY: documented NVAPI sequence with valid out-pointers; Initialize precedes use.
         unsafe {
             assert_eq!(NvAPI_Initialize(), _NvAPI_Status_NVAPI_OK);
-            let mut handles: [NvPhysicalGpuHandle; NVAPI_MAX_PHYSICAL_GPUS as usize] = [std::ptr::null_mut(); NVAPI_MAX_PHYSICAL_GPUS as usize];
+            let mut handles: [NvPhysicalGpuHandle; NVAPI_MAX_PHYSICAL_GPUS as usize] =
+                [std::ptr::null_mut(); NVAPI_MAX_PHYSICAL_GPUS as usize];
             let mut count = 0u32;
-            assert_eq!(NvAPI_EnumPhysicalGPUs(handles.as_mut_ptr(), &mut count), _NvAPI_Status_NVAPI_OK);
+            assert_eq!(
+                NvAPI_EnumPhysicalGPUs(handles.as_mut_ptr(), &mut count),
+                _NvAPI_Status_NVAPI_OK
+            );
             assert!(count >= 1);
             assert_eq!(NvAPI_Unload(), _NvAPI_Status_NVAPI_OK);
         }

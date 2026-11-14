@@ -120,7 +120,10 @@ pub(crate) fn check(call: &'static str, code: sys::cufftResult_t) -> Result<()> 
     if code == sys::cufftResult_t_CUFFT_SUCCESS {
         Ok(())
     } else {
-        Err(Error::Cufft { call, code: FftResult(code) })
+        Err(Error::Cufft {
+            call,
+            code: FftResult(code),
+        })
     }
 }
 
@@ -128,6 +131,8 @@ pub(crate) fn check(call: &'static str, code: sys::cufftResult_t) -> Result<()> 
 #[inline]
 pub(crate) fn teardown(ctx: &Context, code: sys::cufftResult_t) {
     if code != sys::cufftResult_t_CUFFT_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+        ctx.record_err(Err::<(), _>(DriverError(
+            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
+        )));
     }
 }

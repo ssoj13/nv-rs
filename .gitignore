@@ -2,3 +2,4 @@ target/
 target-build.log
 target-run.log
 spikes/**/Cargo.lock
+.sdk/

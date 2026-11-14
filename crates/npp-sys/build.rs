@@ -2,7 +2,7 @@
 //!
 //! The header-to-DLL map was read from the DLLs' export tables (CUDA 13.3): every header's
 //! functions live in exactly one DLL; `nppi_linear_transforms.h` ships in `nppist`.
-use nv_bindgen::{ExportPart, LibSpec, Sdk, Shape};
+use nv_bindgen::{ExportPart, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const PARTS: &[ExportPart] = &[
     ExportPart { name: "nppc", api_type: "NppcApi", loader_fn: "nppc_api", header_files: &["nppcore.h"] },
@@ -63,9 +63,11 @@ const SPEC: LibSpec = LibSpec {
     opaque_types: &[],
     shape: Shape::SplitExports {
         parts: PARTS,
-        status_types: &["NppStatus"],
-        not_loaded: "NppStatus_NPP_ERROR",
-        missing_symbol: "NppStatus_NPP_NOT_IMPLEMENTED_ERROR",
+        returns: &[ReturnPolicy {
+            types: &["NppStatus"],
+            not_loaded: "NppStatus_NPP_ERROR",
+            missing_symbol: "NppStatus_NPP_NOT_IMPLEMENTED_ERROR",
+        }],
     },
 };
 

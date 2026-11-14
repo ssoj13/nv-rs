@@ -1,5 +1,5 @@
 //! Generates the cupti bindings from the CUDA Toolkit (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "cupti",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "CuptiApi",
         loader_fn: "cupti_api",
-        status_types: &["CUptiResult"],
-        not_loaded: "CUptiResult_CUPTI_ERROR_NOT_INITIALIZED",
-        missing_symbol: "CUptiResult_CUPTI_ERROR_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["CUptiResult"],
+            not_loaded: "CUptiResult_CUPTI_ERROR_NOT_INITIALIZED",
+            missing_symbol: "CUptiResult_CUPTI_ERROR_NOT_SUPPORTED",
+        }],
     },
 };
 

@@ -92,6 +92,40 @@ pub enum LoadError {
     },
 }
 
+/// Why an entry point without a native failure sentinel could not be called.
+///
+/// Library causes are borrowed from the cached table. Symbol diagnostics are boxed only on
+/// failure, keeping successful checked results compact and free of allocations.
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
+    /// The library could not be loaded; preserves its original diagnostic.
+    #[error("{0}")]
+    Load(#[source] &'static LoadError),
+    /// The library loaded but the requested entry point was unavailable.
+    #[error(transparent)]
+    Symbol(Box<SymbolError>),
+}
+
+/// Cold diagnostic for an unavailable native entry point.
+#[derive(Debug, thiserror::Error)]
+#[error("{lib}: symbol {symbol} is unavailable")]
+pub struct SymbolError {
+    /// The library's binding name.
+    pub lib: &'static str,
+    /// The exact native entry-point name.
+    pub symbol: &'static str,
+    /// The dynamic loader's cause, or `None` when a query interface returned null.
+    #[source]
+    pub source: Option<&'static libloading::Error>,
+}
+
+impl CallError {
+    /// Constructs the boxed symbol diagnostic on a generated call's failure branch.
+    pub fn symbol(lib: &'static str, symbol: &'static str, source: Option<&'static libloading::Error>) -> Self {
+        Self::Symbol(Box::new(SymbolError { lib, symbol, source }))
+    }
+}
+
 fn show_paths(paths: &[PathBuf]) -> String {
     paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
@@ -195,11 +229,11 @@ pub fn candidates(spec: &DllSpec) -> Vec<PathBuf> {
 
 /// Candidate paths for `spec` as seen through `probe`, most preferred first.
 ///
-/// On Linux the sonames are returned as bare names: the dynamic linker's own search
-/// (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL) is the authority there.
+/// On Linux an SDK's discovered runtime directory precedes bare sonames. The dynamic linker's
+/// own search (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL) follows that hint.
 pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
     if !cfg!(windows) {
-        return spec.linux.iter().map(PathBuf::from).collect();
+        return linux_candidates(spec);
     }
     let dirs = search_dirs(probe, spec.group);
     let mut out: Vec<PathBuf> = Vec::new();
@@ -224,6 +258,16 @@ pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
         }
     }
     out.dedup();
+    out
+}
+
+/// Linux SDK hints come from the discovery owner; retain the dynamic linker's sonames after them.
+fn linux_candidates(spec: &DllSpec) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Group::Sdk { hint: Some(dir), .. } = spec.group {
+        out.extend(spec.linux.iter().map(|soname| Path::new(dir).join(soname)));
+    }
+    out.extend(spec.linux.iter().map(PathBuf::from));
     out
 }
 
@@ -266,7 +310,7 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
 
 /// Opens the first candidate for which `open` succeeds.
 ///
-/// `open` receives a path (Windows: an existing file; Linux: a soname for the dynamic linker) and
+/// `open` receives a path (Windows: an existing file; Linux: an SDK path or linker soname) and
 /// returns the loaded value or a reason it was rejected (wrong ABI, missing entry point, ...).
 pub fn open_first<T>(spec: &DllSpec, open: impl FnMut(&Path) -> Result<T, String>) -> Result<Loaded<T>, LoadError> {
     open_first_with(&SystemProbe, spec, open)
@@ -524,6 +568,45 @@ macro_rules! split_exports_sys {
             pub use $part::shims::*;
         )+
     };
+}
+
+#[cfg(test)]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn checked_error_layout_stays_within_pointer_word_budget() {
+        let word = std::mem::size_of::<usize>();
+        let error = std::mem::size_of::<CallError>();
+        let result = std::mem::size_of::<Result<usize, CallError>>();
+        let diagnostic = std::mem::size_of::<SymbolError>();
+        println!("pointer={word} CallError={error} Result<usize, CallError>={result} SymbolError={diagnostic}");
+        // Each error variant carries one pointer plus a discriminant; a checked usize result
+        // needs at most one further word. The cold two-name diagnostic stays behind the box.
+        assert!(error <= 2 * word, "CallError grew to {error} bytes");
+        assert!(result <= 3 * word, "checked result grew to {result} bytes");
+        assert!(diagnostic > error, "the diagnostic must remain outside the compact error");
+    }
+
+    #[test]
+    fn linux_sdk_hint_supports_a_versioned_soname_without_an_unversioned_link() {
+        let spec = DllSpec {
+            lib: "nccl",
+            group: Group::Sdk { root_var: "NCCL_ROOT", hint: Some("/sdk/nccl/lib") },
+            windows: &[],
+            linux: &["libnccl.so.2"],
+        };
+        assert_eq!(linux_candidates(&spec), [PathBuf::from("/sdk/nccl/lib/libnccl.so.2"), PathBuf::from("libnccl.so.2")]);
+    }
+
+    #[test]
+    fn linux_driver_toolkit_and_unhinted_sdk_keep_bare_sonames() {
+        let spec = DllSpec { lib: "test", group: Group::Driver, windows: &[], linux: &["libtest.so.2", "libtest.so"] };
+        let expected = [PathBuf::from("libtest.so.2"), PathBuf::from("libtest.so")];
+        for group in [Group::Driver, Group::DriverStore, Group::Toolkit, Group::Sdk { root_var: "TEST_ROOT", hint: None }] {
+            assert_eq!(linux_candidates(&DllSpec { group, ..spec }), expected);
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

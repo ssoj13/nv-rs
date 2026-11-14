@@ -1,5 +1,5 @@
 //! Generates the nvrtc bindings from the CUDA Toolkit (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvrtc",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "NvrtcApi",
         loader_fn: "nvrtc_api",
-        status_types: &["nvrtcResult"],
-        not_loaded: "nvrtcResult_NVRTC_ERROR_INTERNAL_ERROR",
-        missing_symbol: "nvrtcResult_NVRTC_ERROR_INTERNAL_ERROR",
+        returns: &[ReturnPolicy {
+            types: &["nvrtcResult"],
+            not_loaded: "nvrtcResult_NVRTC_ERROR_INTERNAL_ERROR",
+            missing_symbol: "nvrtcResult_NVRTC_ERROR_INTERNAL_ERROR",
+        }],
     },
 };
 

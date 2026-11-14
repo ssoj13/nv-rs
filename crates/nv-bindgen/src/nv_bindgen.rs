@@ -35,6 +35,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use syn::{Expr, Fields, GenericArgument, Item, ItemStruct, PathArguments, ReturnType, Type, TypeBareFn};
 
@@ -77,13 +78,8 @@ pub enum Shape {
         /// Name of the sys crate's loader function the shims call; it must return
         /// `Result<&'static <api_type>, _>` (`"nvml_api"`).
         loader_fn: &'static str,
-        /// The library's status type names as they appear in signatures (`"nvmlReturn_t"`).
-        /// Functions returning one of these get shims that return the two codes below.
-        status_types: &'static [&'static str],
-        /// Expression returned when the library could not be loaded.
-        not_loaded: &'static str,
-        /// Expression returned when the library loaded but lacks this symbol.
-        missing_symbol: &'static str,
+        /// Return-type-specific expressions used when loading or symbol lookup fails.
+        returns: &'static [ReturnPolicy<'static>],
     },
     /// One library split over several DLLs (NPP: `nppc`, `nppial`, ... `npps`): shared types, and
     /// per DLL its own loading struct and shims. Each part takes the functions declared in its
@@ -91,12 +87,8 @@ pub enum Shape {
     SplitExports {
         /// One entry per DLL.
         parts: &'static [ExportPart],
-        /// Status type names as they appear in signatures.
-        status_types: &'static [&'static str],
-        /// Expression returned when a part's library could not be loaded.
-        not_loaded: &'static str,
-        /// Expression returned when a part's library lacks a symbol.
-        missing_symbol: &'static str,
+        /// Return-type-specific expressions used when loading or symbol lookup fails.
+        returns: &'static [ReturnPolicy<'static>],
     },
     /// The DLL exports one query function returning entry points by numeric id (NVAPI:
     /// `nvapi_QueryInterface(id)`, ids listed in `nvapi_interface.h`). Shims resolve each function
@@ -107,12 +99,8 @@ pub enum Shape {
         /// Name of the sys crate's loader function; it returns the loaded query entry point
         /// (`Result<&'static nv_loader::QueryInterface, _>`).
         loader_fn: &'static str,
-        /// Status type names as they appear in signatures.
-        status_types: &'static [&'static str],
-        /// Expression returned when the library could not be loaded.
-        not_loaded: &'static str,
-        /// Expression returned when the query has no entry point for the id.
-        missing_symbol: &'static str,
+        /// Return-type-specific expressions used when loading or symbol lookup fails.
+        returns: &'static [ReturnPolicy<'static>],
     },
     /// The SDK ships only static libraries (NGX: `nvsdk_ngx_d.lib`), so entry points are plain
     /// `extern "C"` declarations linked at build time against the SDK's `lib` directory (from
@@ -213,6 +201,28 @@ pub enum Error {
         /// What was wrong.
         msg: String,
     },
+    /// The requested Rust target cannot select a native SDK architecture.
+    #[error("{lib}: unsupported SDK target architecture {arch}")]
+    UnsupportedTarget {
+        /// The library.
+        lib: &'static str,
+        /// The requested architecture.
+        arch: String,
+    },
+    /// A discovered path cannot be represented in Cargo or libclang arguments.
+    #[error("{lib}: SDK path is not Unicode or contains a line break/NUL: {path:?}")]
+    InvalidSdkPath {
+        /// The library.
+        lib: &'static str,
+        /// The unusable path.
+        path: PathBuf,
+    },
+    /// A static-only SDK has no native link-library directory for the selected target.
+    #[error("{lib}: the SDK provides no native link-library directory for this target")]
+    MissingLinkDirectory {
+        /// The library.
+        lib: &'static str,
+    },
     /// Writing the output failed.
     #[error("{lib}: writing {path}: {source}")]
     Io {
@@ -258,8 +268,10 @@ pub struct Inventory {
     pub headers: Vec<HeaderHash>,
     /// Every entry point, sorted.
     pub symbols: Vec<String>,
-    /// Entry points that got no shim because their return type has no failure value (neither a
-    /// status type, a pointer, nor `void`); a safe wrapper must load them explicitly.
+    /// Entry points without a native C ABI shim. Functions without a native failure value
+    /// receive a checked Rust-ABI function returning `Result`; query functions without an id
+    /// remain unreachable. Only configured return policies and pointers retain their C ABI;
+    /// `void` functions return checked `Result<(), nv_loader::CallError>` values.
     pub unshimmed: Vec<String>,
 }
 
@@ -278,13 +290,13 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     for var in rerun_vars(spec) {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    // The DLL directory of the first SDK that ships DLLs, for `nv_loader::Group::Sdk::hint`.
-    let sdk_bin = spec.sdks.iter().find_map(|s| match s {
-        Sdk::Nv(kind) => vcv_rs::nvsdk::detect(*kind).and_then(|i| i.bin_dir),
-        _ => None,
-    });
-    println!("cargo:rustc-env=NV_RS_SDK_BIN={}", sdk_bin.map(|p| p.display().to_string()).unwrap_or_default());
-    let include_dirs = sdk_include_dirs(spec)?;
+    // One discovery snapshot supplies both the headers and their matching native libraries.
+    let SdkPaths { includes: include_dirs, nvidia } = sdk_paths(spec)?;
+    let runtime = match nvidia.iter().find_map(|sdk| sdk.runtime_dir.as_deref()) {
+        Some(path) => sdk_path_str(spec.name, path)?,
+        None => "",
+    };
+    println!("cargo:rustc-env=NV_RS_SDK_BIN={runtime}");
     let system_dirs = system_include_dirs();
     let out = bindings(spec, &include_dirs, &system_dirs)?;
 
@@ -300,11 +312,12 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         for l in system_libs {
             println!("cargo:rustc-link-lib=dylib={l}");
         }
-        for s in spec.sdks {
-            if let Sdk::Nv(kind) = s
-                && let Some(lib_dir) = vcv_rs::nvsdk::detect(*kind).and_then(|i| i.lib_dir)
-            {
-                println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        if !link_libs.is_empty() && nvidia.iter().all(|sdk| sdk.lib_dir.is_none()) {
+            return Err(Error::MissingLinkDirectory { lib: spec.name });
+        }
+        for sdk in &nvidia {
+            if let Some(lib_dir) = &sdk.lib_dir {
+                println!("cargo:rustc-link-search=native={}", sdk_path_str(spec.name, lib_dir)?);
             }
         }
         for l in link_libs {
@@ -339,7 +352,7 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
     for var in rerun_vars(spec) {
         println!("cargo:rerun-if-env-changed={var}");
     }
-    let include_dirs = sdk_include_dirs(spec)?;
+    let include_dirs = sdk_paths(spec)?.includes;
     let mut wrapper = String::new();
     for name in spec.headers {
         let path = find_header(&include_dirs, name).ok_or_else(|| Error::HeaderNotFound {
@@ -362,7 +375,7 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
         b = b.clang_arg(format!("-I{}", d.display()));
     }
     for d in system_include_dirs() {
-        b = b.clang_arg(format!("-idirafter{}", d.display()));
+        b = b.clang_arg(format!("-idirafter{}", sdk_path_str(spec.name, &d)?));
     }
     for a in spec.clang_args {
         b = b.clang_arg(*a);
@@ -379,6 +392,9 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
 /// Runs bindgen for `spec` against explicit include directories (`include_dirs` searched first,
 /// `system_dirs` after libclang's own). Pure apart from reading headers.
 pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf]) -> Result<Output, Error> {
+    for path in include_dirs.iter().chain(system_dirs) {
+        sdk_path_str(spec.name, path)?;
+    }
     let mut headers = Vec::new();
     let mut wrapper = String::new();
     for name in spec.headers {
@@ -491,17 +507,15 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
     let mut symbols = Vec::new();
     let mut unshimmed = Vec::new();
     match spec.shape {
-        Shape::Exports { status_types, not_loaded, missing_symbol, .. }
-        | Shape::SplitExports { status_types, not_loaded, missing_symbol, .. } => {
-            let codes = StatusCodes { types: status_types, not_loaded, missing_symbol };
+        Shape::Exports { returns, .. } | Shape::SplitExports { returns, .. } => {
             for (stem, api_type, loader_fn, api) in apis {
-                let generated = shims(spec.name, &api, api_type, loader_fn, &codes)?;
+                let generated = shims(spec.name, &api, api_type, loader_fn, returns)?;
                 symbols.extend(inventory(spec.name, &api, api_type)?);
                 unshimmed.extend(generated.unshimmed);
                 parts.push(GeneratedPart { stem, api: Some(api), shims: generated.source });
             }
         }
-        Shape::QueryInterface { interface_header, status_types, not_loaded, missing_symbol, .. } => {
+        Shape::QueryInterface { interface_header, returns, .. } => {
             let path = find_header(include_dirs, interface_header).ok_or_else(|| Error::HeaderNotFound {
                 lib: spec.name,
                 header: interface_header.to_string(),
@@ -509,9 +523,8 @@ pub fn bindings(spec: &LibSpec, include_dirs: &[PathBuf], system_dirs: &[PathBuf
             })?;
             let text = std::fs::read_to_string(&path).map_err(|source| Error::Io { lib: spec.name, path, source })?;
             let ids = interface_ids(&text);
-            let codes = StatusCodes { types: status_types, not_loaded, missing_symbol };
             for (stem, _, loader_fn, api) in apis {
-                let generated = query_shims(spec.name, &api, loader_fn, &ids, &codes)?;
+                let generated = query_shims(spec.name, &api, loader_fn, &ids, returns)?;
                 symbols.extend(generated.bound);
                 unshimmed.extend(generated.unshimmed);
                 parts.push(GeneratedPart { stem, api: None, shims: generated.source });
@@ -576,33 +589,31 @@ pub fn interface_ids(text: &str) -> Vec<(String, u32)> {
 /// Query-interface shims plus what they cover.
 #[derive(Debug)]
 pub struct QueryShims {
-    /// The shim source.
+    /// The generated function source.
     pub source: String,
-    /// Functions that got a shim (declared in the headers and listed with an id), sorted.
+    /// Reachable functions (declared in the headers and listed with an id), sorted.
     pub bound: Vec<String>,
-    /// Functions declared without an id or without a failure value, sorted.
+    /// Functions without a native C ABI shim: no id or no native failure value.
     pub unshimmed: Vec<String>,
 }
 
-/// Shims that resolve each declared function through the library's query entry point.
+/// Functions that resolve each declared entry point through the library's query.
 ///
-/// `loader_fn()` returns the loaded `nv_loader::QueryInterface`; a null result for the function's id
-/// returns `codes.missing_symbol`, a failed load returns `codes.not_loaded` (pointer and `void`
-/// returns fall back as in [`shims`]). Functions declared in the headers but absent from the id
-/// table cannot be reached and are listed in [`QueryShims::unshimmed`].
+/// Configured return policies and pointers preserve the native C ABI. Other known-id
+/// functions use their original name with a Rust ABI and return `Result<T, nv_loader::CallError>`.
+/// Functions absent from the id table cannot be reached and remain only in `unshimmed`.
 pub fn query_shims(
     lib: &'static str,
     signatures_source: &str,
     loader_fn: &str,
     ids: &[(String, u32)],
-    codes: &StatusCodes<'_>,
+    returns: &[ReturnPolicy<'_>],
 ) -> Result<QueryShims, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let file = syn::parse_file(signatures_source).map_err(|e| gen_err(e.to_string()))?;
     let sigs = find_struct(&file, QI_SIGNATURES).ok_or_else(|| gen_err(format!("no struct {QI_SIGNATURES}")))?;
     let loader = format_ident!("{loader_fn}");
-    let not_loaded: Expr = syn::parse_str(codes.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
-    let missing: Expr = syn::parse_str(codes.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+    let policies = parse_return_policies(lib, returns)?;
     let Fields::Named(fields) = &sigs.fields else {
         return Err(gen_err(format!("{QI_SIGNATURES} has no named fields")));
     };
@@ -616,40 +627,25 @@ pub fn query_shims(
             unshimmed.push(name.to_string());
             continue;
         };
-        let Some(fb) = fallback(&bare.output, codes.types) else {
+        let fb = fallback(&bare.output, &policies);
+        if fb.is_none() {
             unshimmed.push(name.to_string());
-            continue;
-        };
-        let (on_missing, on_not_loaded) = match fb {
-            Fallback::Status => (quote!(#missing), quote!(#not_loaded)),
-            Fallback::Null { mutable: false } => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
-            Fallback::Null { mutable: true } => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
-            Fallback::Unit => (quote!(()), quote!(())),
-        };
-        let args: Vec<(proc_macro2::Ident, TokenStream)> = bare
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, arg)| {
-                let n = arg.name.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(|| format_ident!("arg_{i}"));
-                let ty = &arg.ty;
-                (n.clone(), quote!(#n: #ty))
-            })
-            .collect();
+        }
+        let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(None));
+        let WrapperPlan { abi, ret, on_missing, on_not_loaded, checked } = plan;
+        let args = shim_args(bare);
         let names = args.iter().map(|(n, _)| n);
         let defs = args.iter().map(|(_, d)| d);
-        let ret = match &bare.output {
-            ReturnType::Default => quote!(),
-            ReturnType::Type(_, ty) => quote!(-> #ty),
-        };
+        let call = quote!(unsafe { __nv_fn(#(#names),*) });
+        let result = if checked { quote!(::core::result::Result::Ok(#call)) } else { call };
         let fn_ty = bare;
         let id_lit = proc_macro2::Literal::u32_suffixed(id);
         fns.push(quote! {
             #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
             #[inline]
-            pub unsafe extern "C" fn #name(#(#defs),*) #ret {
-                // Safety argument: the query returns the driver's implementation of exactly this
-                // id, whose signature the header declares; the library stays loaded for the process.
+            pub unsafe #abi fn #name(#(#defs),*) #ret {
+                // SAFETY: the header declares this exact id's signature and the query's library
+                // remains loaded for the process; the caller upholds the native call contract.
                 match #loader() {
                     Ok(__nv_qi) => {
                         let __nv_ptr = unsafe { (__nv_qi.query)(#id_lit) };
@@ -657,10 +653,10 @@ pub fn query_shims(
                             #on_missing
                         } else {
                             let __nv_fn = unsafe { ::core::mem::transmute::<*mut ::core::ffi::c_void, #fn_ty>(__nv_ptr) };
-                            unsafe { __nv_fn(#(#names),*) }
+                            #result
                         }
                     }
-                    Err(_) => #on_not_loaded,
+                    Err(__nv_error) => #on_not_loaded,
                 }
             }
         });
@@ -683,65 +679,136 @@ fn regex_escape(s: &str) -> String {
     })
 }
 
-/// How a library reports failure through its return values.
+/// How one or more native return types report unavailable-library and missing-symbol errors.
 #[derive(Clone, Copy, Debug)]
-pub struct StatusCodes<'a> {
-    /// Status type names as they appear in signatures.
+pub struct ReturnPolicy<'a> {
+    /// Exact final type identifiers as they appear in generated signatures.
     pub types: &'a [&'a str],
-    /// Returned when the library could not be loaded.
+    /// Rust expression returned when the library could not be loaded.
     pub not_loaded: &'a str,
-    /// Returned when the symbol is missing.
+    /// Rust expression returned when the symbol is missing.
     pub missing_symbol: &'a str,
 }
 
-/// Generated shims plus the entry points that could not get one.
+struct ParsedReturnPolicy<'a> {
+    types: &'a [&'a str],
+    not_loaded: Expr,
+    missing_symbol: Expr,
+}
+
+/// Validate and parse once, before visiting any entry points.
+fn parse_return_policies<'a>(lib: &'static str, returns: &[ReturnPolicy<'a>]) -> Result<Vec<ParsedReturnPolicy<'a>>, Error> {
+    let gen_err = |msg: String| Error::Generated { lib, msg };
+    let mut names = Vec::new();
+    let mut parsed = Vec::with_capacity(returns.len());
+    for policy in returns {
+        if policy.types.is_empty() {
+            return Err(gen_err("return policy has no types".into()));
+        }
+        for name in policy.types {
+            syn::parse_str::<proc_macro2::Ident>(name).map_err(|e| gen_err(format!("return type {name:?}: {e}")))?;
+            if names.contains(name) {
+                return Err(gen_err(format!("duplicate return policy for {name}")));
+            }
+            names.push(*name);
+        }
+        let not_loaded = syn::parse_str(policy.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
+        let missing_symbol = syn::parse_str(policy.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+        parsed.push(ParsedReturnPolicy { types: policy.types, not_loaded, missing_symbol });
+    }
+    Ok(parsed)
+}
+
+/// Generated function source plus entries without native C ABI shims.
 #[derive(Debug)]
 pub struct Shims {
-    /// The shim source.
+    /// Native shims and checked Rust-ABI functions.
     pub source: String,
-    /// Sorted names of functions without a failure value (see [`Inventory::unshimmed`]).
+    /// Sorted names of functions without a native failure value (see [`Inventory::unshimmed`]).
     pub unshimmed: Vec<String>,
 }
 
-/// What a shim returns when the call cannot be made, decided by the return type.
-enum Fallback {
-    /// The library's own codes.
-    Status,
+/// Native failure values, when the return contract defines one.
+enum Fallback<'a> {
+    /// Expressions from the matching policy.
+    Policy { not_loaded: &'a Expr, missing_symbol: &'a Expr },
     /// A null pointer (`*const` / `*mut`).
     Null { mutable: bool },
-    /// Nothing (`void`).
-    Unit,
 }
 
-fn fallback(ret: &ReturnType, status_types: &[&str]) -> Option<Fallback> {
+fn fallback<'a>(ret: &ReturnType, policies: &'a [ParsedReturnPolicy<'_>]) -> Option<Fallback<'a>> {
     match ret {
-        ReturnType::Default => Some(Fallback::Unit),
+        ReturnType::Default => None,
         ReturnType::Type(_, ty) => match ty.as_ref() {
             Type::Ptr(p) => Some(Fallback::Null { mutable: p.mutability.is_some() }),
             Type::Path(p) => {
                 let last = p.path.segments.last()?.ident.to_string();
-                status_types.iter().any(|s| *s == last).then_some(Fallback::Status)
+                policies.iter().find(|policy| policy.types.contains(&last.as_str())).map(|policy| {
+                    Fallback::Policy { not_loaded: &policy.not_loaded, missing_symbol: &policy.missing_symbol }
+                })
             }
             _ => None,
         },
     }
 }
 
-/// Panic-free `extern "C"` shims for the function-pointer fields of `api_type` in `api_source`.
+struct WrapperPlan {
+    abi: TokenStream,
+    ret: TokenStream,
+    on_missing: TokenStream,
+    on_not_loaded: TokenStream,
+    checked: bool,
+}
+
+/// The same ABI and failure-value decision for exports and query-interface functions.
+fn wrapper_plan(ret: &ReturnType, fb: Option<Fallback<'_>>, lib: &'static str, name: &proc_macro2::Ident, source: TokenStream) -> WrapperPlan {
+    let native_ret = match ret {
+        ReturnType::Default => quote!(),
+        ReturnType::Type(_, ty) => quote!(-> #ty),
+    };
+    let (on_missing, on_not_loaded) = match fb {
+        Some(Fallback::Policy { not_loaded, missing_symbol }) => (quote!(#missing_symbol), quote!(#not_loaded)),
+        Some(Fallback::Null { mutable: false }) => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
+        Some(Fallback::Null { mutable: true }) => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
+        None => {
+            let ty = match ret {
+                ReturnType::Default => quote!(()),
+                ReturnType::Type(_, ty) => quote!(#ty),
+            };
+            return WrapperPlan {
+                abi: quote!(),
+                ret: quote!(-> ::core::result::Result<#ty, nv_loader::CallError>),
+                on_missing: quote!(::core::result::Result::Err(nv_loader::CallError::symbol(
+                    #lib, stringify!(#name), #source,
+                ))),
+                on_not_loaded: quote!(::core::result::Result::Err(nv_loader::CallError::Load(__nv_error))),
+                checked: true,
+            };
+        }
+    };
+    WrapperPlan { abi: quote!(extern "C"), ret: native_ret, on_missing, on_not_loaded, checked: false }
+}
+
+/// Keep C parameter names intact; unnamed parameters receive deterministic private names.
+fn shim_args(bare: &TypeBareFn) -> Vec<(proc_macro2::Ident, TokenStream)> {
+    bare.inputs.iter().enumerate().map(|(i, arg)| {
+        let name = arg.name.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(|| format_ident!("arg_{i}"));
+        let ty = &arg.ty;
+        (name.clone(), quote!(#name: #ty))
+    }).collect()
+}
+
+/// Panic-free functions for the function-pointer fields of `api_type`.
 ///
-/// Each shim calls `loader_fn()`. What it returns when the call cannot be made depends on the
-/// return type: a status type returns `codes.not_loaded` / `codes.missing_symbol`, a pointer
-/// returns null, `void` returns nothing; any other return type has no failure value, so no shim
-/// is generated and the name is reported in [`Shims::unshimmed`]. `extern "C"` (not `"C-unwind"`)
-/// so a shim coerces to a C function pointer; unwinding out of it would abort, hence no panic path
-/// exists in the body.
-pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &str, codes: &StatusCodes<'_>) -> Result<Shims, Error> {
+/// Policies and pointers preserve the native C ABI. Functions without a native failure
+/// value use their original name with a Rust ABI and return `Result<T, nv_loader::CallError>`.
+/// They remain in [`Shims::unshimmed`] because no native C ABI shim exists.
+pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &str, returns: &[ReturnPolicy<'_>]) -> Result<Shims, Error> {
     let gen_err = |msg: String| Error::Generated { lib, msg };
     let file = syn::parse_file(api_source).map_err(|e| gen_err(e.to_string()))?;
     let api = find_struct(&file, api_type).ok_or_else(|| gen_err(format!("no struct {api_type}")))?;
     let loader = format_ident!("{loader_fn}");
-    let not_loaded: Expr = syn::parse_str(codes.not_loaded).map_err(|e| gen_err(format!("not_loaded: {e}")))?;
-    let missing: Expr = syn::parse_str(codes.missing_symbol).map_err(|e| gen_err(format!("missing_symbol: {e}")))?;
+    let policies = parse_return_policies(lib, returns)?;
 
     let Fields::Named(fields) = &api.fields else {
         return Err(gen_err(format!("{api_type} has no named fields")));
@@ -750,46 +817,29 @@ pub fn shims(lib: &'static str, api_source: &str, api_type: &str, loader_fn: &st
     let fns: Vec<TokenStream> = fields.named.iter().filter_map(|field| {
         let name = field.ident.as_ref()?;
         let bare = result_bare_fn(&field.ty)?;
-        let Some(fb) = fallback(&bare.output, codes.types) else {
+        let fb = fallback(&bare.output, &policies);
+        if fb.is_none() {
             unshimmed.push(name.to_string());
-            return None;
-        };
-        let (on_missing, on_not_loaded) = match fb {
-            Fallback::Status => (quote!(#missing), quote!(#not_loaded)),
-            Fallback::Null { mutable: false } => (quote!(::core::ptr::null()), quote!(::core::ptr::null())),
-            Fallback::Null { mutable: true } => (quote!(::core::ptr::null_mut()), quote!(::core::ptr::null_mut())),
-            Fallback::Unit => (quote!(()), quote!(())),
-        };
-        let args: Vec<(proc_macro2::Ident, TokenStream)> = bare
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, arg)| {
-                let n = arg.name.as_ref().map(|(id, _)| id.clone()).unwrap_or_else(|| format_ident!("arg_{i}"));
-                let ty = &arg.ty;
-                (n.clone(), quote!(#n: #ty))
-            })
-            .collect();
+        }
+        let plan = wrapper_plan(&bare.output, fb, lib, name, quote!(Some(__nv_error)));
+        let WrapperPlan { abi, ret, on_missing, on_not_loaded, checked } = plan;
+        let args = shim_args(bare);
         let names = args.iter().map(|(n, _)| n);
         let defs = args.iter().map(|(_, d)| d);
-        let ret = match &bare.output {
-            ReturnType::Default => quote!(),
-            ReturnType::Type(_, ty) => quote!(-> #ty),
-        };
+        let call = quote!(unsafe { (*__nv_fn)(#(#names),*) });
+        let result = if checked { quote!(::core::result::Result::Ok(#call)) } else { call };
         Some(quote! {
             #[allow(non_snake_case, clippy::missing_safety_doc, clippy::too_many_arguments)]
             #[inline]
-            pub unsafe extern "C" fn #name(#(#defs),*) #ret {
+            pub unsafe #abi fn #name(#(#defs),*) #ret {
                 match #loader() {
-                    // Safety argument (comments do not survive prettyplease, so it lives here):
-                    // the caller upholds the C function's contract, and the pointer was resolved
-                    // from the loaded library that `api` keeps alive for the process.
-                    // `__nv_*` names: C parameters such as `f` or `api` must not shadow them.
+                    // SAFETY: the caller upholds the native contract and the pointer's library
+                    // remains loaded for the process. Private names avoid C parameter shadowing.
                     Ok(__nv_api) => match &__nv_api.#name {
-                        Ok(__nv_fn) => unsafe { (*__nv_fn)(#(#names),*) },
-                        Err(_) => #on_missing,
+                        Ok(__nv_fn) => #result,
+                        Err(__nv_error) => #on_missing,
                     },
-                    Err(_) => #on_not_loaded,
+                    Err(__nv_error) => #on_not_loaded,
                 }
             }
         })
@@ -946,12 +996,19 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
     let mut vars = Vec::new();
     for sdk in spec.sdks {
         match sdk {
-            Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => vars.extend(["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT", "CUDA_TOOLKIT_ROOT_DIR"]),
-            Sdk::Optix => vars.extend(["OPTIX_ROOT", "OptiX_INSTALL_DIR", "OPTIX_PATH"]),
+            Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => {
+                vars.extend(vcv_rs::cuda::root_vars());
+                vars.extend(["PATH", "ProgramFiles"]);
+            }
+            Sdk::Optix => {
+                vars.extend(vcv_rs::optix::root_vars());
+                vars.push("ProgramData");
+            }
             Sdk::EnvRoot(v) | Sdk::EnvRootSubdir { var: v, .. } => vars.push(v),
             Sdk::Nv(kind) => {
                 vars.extend(kind.root_vars());
-                vars.extend(["NV_SDK_DIRS", "CUDA_PATH"]);
+                vars.extend(vcv_rs::cuda::root_vars());
+                vars.extend(["NV_SDK_DIRS", "PATH", "ProgramFiles", "ProgramData"]);
             }
             Sdk::CrateDir(_) => {}
         }
@@ -959,9 +1016,33 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
     vars
 }
 
-/// The `include/` directory of every SDK in `spec`, located through vcv-rs.
-fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
+/// A single discovery result keeps a library's headers and runtime/link paths together.
+struct SdkPaths {
+    includes: Vec<PathBuf>,
+    nvidia: Vec<vcv_rs::nvsdk::SdkInfo>,
+}
+
+fn sdk_path_str<'a>(lib: &'static str, path: &'a Path) -> Result<&'a str, Error> {
+    match path.to_str() {
+        Some(text) if !text.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) => Ok(text),
+        _ => Err(Error::InvalidSdkPath { lib, path: path.to_path_buf() }),
+    }
+}
+
+fn sdk_target_arch(lib: &'static str, requested: Option<&OsStr>) -> Result<vcv_rs::Arch, Error> {
+    match requested {
+        Some(value) => value.to_str().and_then(vcv_rs::Arch::from_target_arch)
+            .ok_or_else(|| Error::UnsupportedTarget { lib, arch: value.to_string_lossy().into_owned() }),
+        None => vcv_rs::Arch::native()
+            .ok_or_else(|| Error::UnsupportedTarget { lib, arch: std::env::consts::ARCH.to_string() }),
+    }
+}
+
+/// Locate every SDK once; consumers must not rediscover a different runtime after binding.
+fn sdk_paths(spec: &LibSpec) -> Result<SdkPaths, Error> {
     let mut dirs = Vec::new();
+    let mut nvidia = Vec::new();
+    let cargo_arch = std::env::var_os("CARGO_CFG_TARGET_ARCH");
     for sdk in spec.sdks {
         let dir = match sdk {
             Sdk::CudaToolkit => vcv_rs::detect_cuda().map(|c| c.include_dir()).ok_or_else(|| Error::SdkNotFound {
@@ -969,14 +1050,23 @@ fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
                 sdk: "CUDA Toolkit".into(),
                 hint: "set CUDA_PATH or install the toolkit".into(),
             })?,
-            Sdk::Nv(kind) => vcv_rs::nvsdk::detect(*kind).map(|s| s.include_dir).ok_or_else(|| Error::SdkNotFound {
-                lib: spec.name,
-                sdk: kind.name().into(),
-                hint: format!(
-                    "set {} or NV_SDK_DIRS, or install it under %ProgramFiles%\\NVIDIA",
-                    kind.root_vars().first().copied().unwrap_or("its root variable")
-                ),
-            })?,
+            Sdk::Nv(kind) => {
+                let target = sdk_target_arch(spec.name, cargo_arch.as_deref())?;
+                let info = vcv_rs::nvsdk::detect(*kind, target).ok_or_else(|| Error::SdkNotFound {
+                    lib: spec.name,
+                    sdk: kind.name().into(),
+                    hint: match kind.requested_root() {
+                        Some(request) => format!("configured {}={:?} is not usable for {target}", request.variable, request.path),
+                        None => format!("check {:?} or NV_SDK_DIRS for a native SDK on {}", kind.root_vars(), std::env::consts::OS),
+                    },
+                })?;
+                for path in [&info.runtime_dir, &info.lib_dir].into_iter().flatten() {
+                    sdk_path_str(spec.name, path)?;
+                }
+                let include = info.include_dir.clone();
+                nvidia.push(info);
+                include
+            },
             Sdk::CudaToolkitSubdir(rel) => vcv_rs::detect_cuda().map(|c| c.root.join(rel)).ok_or_else(|| Error::SdkNotFound {
                 lib: spec.name,
                 sdk: "CUDA Toolkit".into(),
@@ -999,11 +1089,12 @@ fn sdk_include_dirs(spec: &LibSpec) -> Result<Vec<PathBuf>, Error> {
                 .map(|m| Path::new(&m).join(rel))
                 .ok_or_else(|| Error::SdkNotFound { lib: spec.name, sdk: (*rel).to_string(), hint: "CARGO_MANIFEST_DIR unset".into() })?,
         };
+        sdk_path_str(spec.name, &dir)?;
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
-    Ok(dirs)
+    Ok(SdkPaths { includes: dirs, nvidia })
 }
 
 /// MSVC + Windows SDK + UCRT include directories from vcv-rs, so libclang finds `stddef.h` & co.
@@ -1042,9 +1133,23 @@ mod tests {
         shape: Shape::Exports {
             api_type: "FakeApi",
             loader_fn: "fake_api",
-            status_types: &["fakeStatus"],
-            not_loaded: "fakeStatus_enum_FAKE_ERROR_NOT_LOADED",
-            missing_symbol: "fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL",
+            returns: &[
+                ReturnPolicy {
+                    types: &["fakeStatus"],
+                    not_loaded: "fakeStatus_enum_FAKE_ERROR_NOT_LOADED",
+                    missing_symbol: "fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL",
+                },
+                ReturnPolicy {
+                    types: &["fakeIoStatus"],
+                    not_loaded: "fakeIoStatus { err: FAKE_IO_NOT_LOADED as i32, cuda: 0 }",
+                    missing_symbol: "fakeIoStatus { err: FAKE_IO_MISSING as i32, cuda: 0 }",
+                },
+                ReturnPolicy {
+                    types: &["fakeCount"],
+                    not_loaded: "-(FAKE_IO_NOT_LOADED as fakeCount)",
+                    missing_symbol: "-(FAKE_IO_MISSING as fakeCount)",
+                },
+            ],
         },
     };
 
@@ -1053,20 +1158,76 @@ mod tests {
     }
 
     #[test]
+    fn bindings_reject_paths_before_clang_or_header_lookup() {
+        for bad in ["SDK\ninclude", "SDK\rinclude", "SDK\0include"] {
+            let paths = [PathBuf::from(bad)];
+            for (includes, system) in [(paths.as_slice(), &[][..]), (&[][..], paths.as_slice())] {
+                assert!(matches!(bindings(&FAKE, includes, system), Err(Error::InvalidSdkPath { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_rebuild_inputs_follow_discovery_aliases() {
+        let spec = LibSpec {
+            sdks: &[Sdk::CudaToolkit, Sdk::Optix, Sdk::Nv(Kind::Nvcomp)],
+            ..FAKE
+        };
+        let vars = rerun_vars(&spec);
+        for input in vcv_rs::cuda::root_vars().iter()
+            .chain(vcv_rs::optix::root_vars())
+            .chain(Kind::Nvcomp.root_vars())
+            .copied()
+            .chain(["NV_SDK_DIRS", "PATH", "ProgramFiles", "ProgramData"])
+        {
+            assert!(vars.contains(&input), "discovery input {input} must rerun generation");
+        }
+    }
+
+    #[test]
+    fn sdk_target_selection_is_explicit_and_checked() {
+        for (name, expected) in [
+            ("x86_64", vcv_rs::Arch::X64),
+            ("x86", vcv_rs::Arch::X86),
+            ("aarch64", vcv_rs::Arch::Arm64),
+        ] {
+            assert_eq!(sdk_target_arch("fake", Some(OsStr::new(name))).expect("supported target"), expected);
+        }
+        assert!(matches!(sdk_target_arch("fake", Some(OsStr::new("riscv64"))), Err(Error::UnsupportedTarget { .. })));
+        assert_eq!(sdk_target_arch("fake", None).expect("native target"), vcv_rs::Arch::native().expect("supported test host"));
+    }
+
+    #[test]
+    fn sdk_paths_cannot_inject_cargo_instructions() {
+        assert_eq!(sdk_path_str("fake", Path::new("SDK with spaces/include")).expect("ordinary path"), "SDK with spaces/include");
+        for bad in ["SDK\ninclude", "SDK\rinclude", "SDK\0include"] {
+            assert!(matches!(sdk_path_str("fake", Path::new(bad)), Err(Error::InvalidSdkPath { .. })));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(matches!(sdk_path_str("fake", Path::new(OsStr::from_bytes(b"SDK\xff/include"))), Err(Error::InvalidSdkPath { .. })));
+        }
+    }
+
+    #[test]
     fn exports_produce_shims_for_allowlisted_functions_only() {
         let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
         assert_eq!(
             out.inventory.symbols,
-            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeReset", "fakeShadow", "fakeVersionNumber"]
+            ["fakeCtxCreate", "fakeErrorString", "fakeGetCount", "fakeInit", "fakeIo", "fakeMissingNumber", "fakeReset", "fakeShadow", "fakeStore", "fakeTransfer", "fakeVersionNumber"]
         );
-        // An `int` return has no failure value: reported, never shimmed with a made-up code.
-        assert_eq!(out.inventory.unshimmed, ["fakeVersionNumber"]);
+        // These have checked Rust wrappers, never native C shims with made-up return values.
+        assert_eq!(out.inventory.unshimmed, ["fakeMissingNumber", "fakeReset", "fakeStore", "fakeVersionNumber"]);
         assert_eq!(out.parts.len(), 1, "a single-DLL library has one part");
         let shims = &out.parts[0].shims;
-        for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount", "fakeErrorString", "fakeReset"] {
+        for f in ["fakeInit", "fakeCtxCreate", "fakeGetCount", "fakeErrorString"] {
             assert!(shims.contains(&format!("pub unsafe extern \"C\" fn {f}(")), "shim for {f}");
         }
-        assert!(!shims.contains("fn fakeVersionNumber("));
+        assert!(shims.contains("pub unsafe fn fakeVersionNumber("));
+        assert!(shims.contains("pub unsafe fn fakeReset("));
+        assert!(shims.contains("pub unsafe fn fakeStore("));
+        assert!(!shims.contains("pub unsafe extern \"C\" fn fakeVersionNumber("));
         // A pointer return falls back to null, not to a status code of the wrong type.
         assert!(shims.contains("::core::ptr::null()"), "{shims}");
         assert!(!shims.contains("notFakeHelper"), "allowlist must exclude other functions");
@@ -1113,9 +1274,11 @@ mod tests {
             positive_enums: &[],
             shape: Shape::SplitExports {
                 parts: PARTS,
-                status_types: &["splitStatus"],
-                not_loaded: "splitStatus_enum_SPLIT_NOT_LOADED",
-                missing_symbol: "splitStatus_enum_SPLIT_MISSING",
+                returns: &[ReturnPolicy {
+                    types: &["splitStatus"],
+                    not_loaded: "splitStatus_enum_SPLIT_NOT_LOADED",
+                    missing_symbol: "splitStatus_enum_SPLIT_MISSING",
+                }],
             },
             ..FAKE
         };
@@ -1143,16 +1306,18 @@ mod tests {
             shape: Shape::QueryInterface {
                 interface_header: "qi_interface.h",
                 loader_fn: "qi_api",
-                status_types: &["qiStatus"],
-                not_loaded: "_qiStatus_QI_LIBRARY_NOT_FOUND",
-                missing_symbol: "_qiStatus_QI_NO_IMPLEMENTATION",
+                returns: &[ReturnPolicy {
+                    types: &["qiStatus"],
+                    not_loaded: "_qiStatus_QI_LIBRARY_NOT_FOUND",
+                    missing_symbol: "_qiStatus_QI_NO_IMPLEMENTATION",
+                }],
             },
             ..FAKE
         };
         let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("qi fixture binds");
-        assert_eq!(out.inventory.symbols, ["qiGetValue", "qiInitialize"]);
-        // Declared but absent from the id table: unreachable, so reported, never shimmed.
-        assert_eq!(out.inventory.unshimmed, ["qiNotInTable"]);
+        assert_eq!(out.inventory.symbols, ["qiAbsentNumber", "qiGetValue", "qiInitialize", "qiMissingStore", "qiStore", "qiVersionNumber"]);
+        // Checked numeric/void functions plus the declaration lacking a query id have no C shim.
+        assert_eq!(out.inventory.unshimmed, ["qiAbsentNumber", "qiMissingStore", "qiNotInTable", "qiStore", "qiVersionNumber"]);
         let part = &out.parts[0];
         assert!(part.api.is_none(), "query-interface libraries need no loading struct");
         assert!(part.shims.contains("0x150e828u32") || part.shims.contains("22079528u32"), "{}", part.shims);
@@ -1179,6 +1344,53 @@ mod tests {
         assert_eq!(
             signature_types("t", src, "Api").expect("parses"),
             ["cudaStream_t", "cufftHandle", "cufftResult", "libraryPropertyType"]
+        );
+    }
+
+    fn assert_invalid_return_policies(returns: &[ReturnPolicy<'_>], expected: &str) {
+        let api = r#"pub struct Api { pub value: Result<unsafe extern "C" fn() -> Status, ::libloading::Error> }"#;
+        let error = shims("invalid", api, "Api", "loader", returns).expect_err("invalid recipe must be rejected");
+        match error {
+            Error::Generated { lib, msg } => {
+                assert_eq!(lib, "invalid");
+                assert!(msg.contains(expected), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn return_policies_reject_empty_type_lists() {
+        assert_invalid_return_policies(&[ReturnPolicy { types: &[], not_loaded: "1", missing_symbol: "2" }], "no types");
+    }
+
+    #[test]
+    fn return_policies_reject_duplicate_type_names() {
+        let policy = ReturnPolicy { types: &["Status"], not_loaded: "1", missing_symbol: "2" };
+        assert_invalid_return_policies(&[policy, policy], "duplicate return policy for Status");
+        assert_invalid_return_policies(
+            &[ReturnPolicy { types: &["Status", "Status"], ..policy }],
+            "duplicate return policy for Status",
+        );
+    }
+
+    #[test]
+    fn return_policies_reject_invalid_type_identifiers() {
+        assert_invalid_return_policies(
+            &[ReturnPolicy { types: &["Not::AnIdentifier"], not_loaded: "1", missing_symbol: "2" }],
+            "return type",
+        );
+    }
+
+    #[test]
+    fn return_policies_reject_malformed_failure_expressions() {
+        assert_invalid_return_policies(
+            &[ReturnPolicy { types: &["Status"], not_loaded: "{", missing_symbol: "2" }],
+            "not_loaded",
+        );
+        assert_invalid_return_policies(
+            &[ReturnPolicy { types: &["Status"], not_loaded: "1", missing_symbol: "{" }],
+            "missing_symbol",
         );
     }
 

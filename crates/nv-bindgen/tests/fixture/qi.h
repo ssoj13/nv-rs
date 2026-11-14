@@ -3,3 +3,7 @@ typedef enum _qiStatus { QI_OK = 0, QI_LIBRARY_NOT_FOUND = -2, QI_NO_IMPLEMENTAT
 qiStatus qiInitialize(void);
 qiStatus qiGetValue(int* f, int api);
 qiStatus qiNotInTable(void);
+int qiVersionNumber(void);
+int qiAbsentNumber(void);
+void qiStore(int* value);
+void qiMissingStore(int* value);

@@ -1,0 +1,91 @@
+//! Raw nvCOMP C API, generated from the installed SDK by `nv-bindgen`.
+//!
+//! The public umbrella and native bitcomp C headers supply the types and entry points;
+//! proprietary headers and generated bindings are never committed. The shared `nv-loader`
+//! keeps the runtime library alive, resolves calls lazily, and exposes [`load`] for diagnostics.
+//! CUDA streams are the same `cuda_bindings::CUstream_st` used by `cuda-core`.
+//! Used by nv-rs consumers needing batched compression, checksums, or native bitcomp.
+
+use nv_loader::{DllSpec, Group};
+
+nv_loader::exports_sys! {
+    lib: "nvcomp",
+    api: NvcompApi,
+    loader: nvcomp_api,
+    dll: DllSpec {
+        lib: "nvcomp",
+        group: Group::Sdk {
+            root_var: "NVCOMP_ROOT",
+            hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
+        },
+        windows: &["nvcomp64_*"],
+        linux: &["libnvcomp.so"],
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn inventory_covers_public_families() {
+        let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
+        let symbols = inventory.get("symbols").and_then(Value::as_array).expect("symbols array");
+        for name in [
+            "nvcompGetProperties",
+            "nvcompGetStatusString",
+            "nvcompBatchedANSCompressAsync",
+            "nvcompBatchedBitcompCompressAsync",
+            "nvcompBatchedCascadedCompressAsync",
+            "nvcompBatchedCRC32Async",
+            "nvcompBatchedDeflateCompressAsync",
+            "nvcompBatchedGdeflateCompressAsync",
+            "nvcompBatchedGzipCompressAsync",
+            "nvcompBatchedLZ4CompressAsync",
+            "nvcompBatchedSnappyCompressAsync",
+            "nvcompBatchedZstdCompressAsync",
+            "bitcompCreatePlan",
+            "bitcompHostUncompress",
+            "bitcompMaxBuflen",
+        ] {
+            assert!(symbols.iter().any(|symbol| symbol.as_str() == Some(name)), "{name} missing");
+        }
+        let unshimmed = inventory.get("unshimmed").and_then(Value::as_array).expect("unshimmed array");
+        assert_eq!(unshimmed.len(), 1, "unexpected missing native shims: {unshimmed:?}");
+        assert_eq!(unshimmed.first().and_then(Value::as_str), Some("bitcompMaxBuflen"));
+    }
+
+    #[test]
+    fn streams_are_cuda_bindings_streams() {
+        let _: cudaStream_t = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
+    }
+
+    #[test]
+    #[ignore = "runtime: needs the installed nvCOMP library; run with --ignored"]
+    fn native_buffer_bound_is_reported() {
+        let query: unsafe fn(usize) -> Result<usize, nv_loader::CallError> = bitcompMaxBuflen;
+        for input_bytes in [0, 1, 4096] {
+            // SAFETY: this size query takes no pointers and has no input-size precondition.
+            let bound = unsafe { query(input_bytes) }.expect("native bitcomp bound is available");
+            assert!(bound >= input_bytes, "bound {bound} is smaller than input {input_bytes}");
+        }
+    }
+
+    #[test]
+    #[ignore = "runtime: needs the installed nvCOMP library; run with --ignored"]
+    fn properties_are_reported() {
+        load().expect("nvcomp loads");
+        let mut properties = nvcompProperties_t::default();
+        // SAFETY: properties is a valid, aligned output object for the duration of the call.
+        assert_eq!(unsafe { nvcompGetProperties(&mut properties) }, nvcompStatus_t_nvcompSuccess);
+        assert!(properties.version > 0, "library version was not reported");
+        assert!(properties.cudart_version > 0, "CUDA runtime version was not reported");
+        // SAFETY: the header accepts a valid status value and returns a library-owned C string.
+        let text = unsafe { nvcompGetStatusString(nvcompStatus_t_nvcompSuccess) };
+        assert!(!text.is_null(), "success status string was not reported");
+        // SAFETY: nvCOMP guarantees a NUL-terminated string, and load keeps its library alive.
+        let text = unsafe { std::ffi::CStr::from_ptr(text) };
+        assert!(!text.to_bytes().is_empty(), "success status string is empty");
+    }
+}

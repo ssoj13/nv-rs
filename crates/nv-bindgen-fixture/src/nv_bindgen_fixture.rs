@@ -43,6 +43,11 @@ pub mod qi {
                 let mut v = 0;
                 // C parameters named `f` and `api` must not shadow the shim's bindings.
                 assert_eq!(qiGetValue(&mut v, 1), _qiStatus_QI_LIBRARY_NOT_FOUND);
+                let error = qiVersionNumber().expect_err("the query library is absent");
+                assert!(matches!(error, nv_loader::CallError::Load(_)));
+                assert!(std::error::Error::source(&error).is_some());
+                let error = qiStore(&mut v).expect_err("the query library is absent");
+                assert!(matches!(error, nv_loader::CallError::Load(_)));
             }
         }
     }
@@ -51,6 +56,7 @@ pub mod qi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nv_loader::CallError;
 
     #[test]
     fn a_missing_library_is_a_typed_load_error() {
@@ -59,25 +65,174 @@ mod tests {
 
     #[test]
     fn status_shims_return_the_not_loaded_code() {
-        // SAFETY: the shims never reach C code here; the library is absent.
+        // SAFETY: no native library exists, so the generated functions take their load-error arms.
         unsafe {
             assert_eq!(fakeInit(0), fakeStatus_enum_FAKE_ERROR_NOT_LOADED);
-            // C parameters named `f` and `api` must not shadow the shim's own bindings.
             assert_eq!(fakeShadow(1, 2), fakeStatus_enum_FAKE_ERROR_NOT_LOADED);
+            let status = fakeIo();
+            assert_eq!((status.err, status.cuda), (FAKE_IO_NOT_LOADED as i32, 0));
+            assert_eq!(fakeTransfer(), -(FAKE_IO_NOT_LOADED as fakeCount));
         }
     }
 
     #[test]
     fn pointer_and_void_shims_fall_back_without_panicking() {
-        // SAFETY: as above.
+        // SAFETY: no native library exists; no C code runs.
         unsafe {
             assert!(fakeErrorString(0).is_null());
-            fakeReset();
+            let error = fakeReset().expect_err("void calls report an unavailable library");
+            assert!(matches!(error, CallError::Load(_)));
         }
     }
 
     #[test]
-    fn functions_without_a_failure_value_are_reported_not_shimmed() {
-        assert!(INVENTORY.contains("\"unshimmed\": [\n    \"fakeVersionNumber\"\n  ]"), "{INVENTORY}");
+    fn checked_functions_preserve_load_errors_and_have_a_rust_abi() {
+        let _: unsafe fn() -> Result<std::ffi::c_int, CallError> = fakeVersionNumber;
+        let _: unsafe fn() -> Result<(), CallError> = fakeReset;
+        let _: unsafe fn(*mut std::ffi::c_int) -> Result<(), CallError> = fakeStore;
+        let _: unsafe extern "C" fn() -> fakeIoStatus = fakeIo;
+        let _: unsafe extern "C" fn() -> fakeCount = fakeTransfer;
+        // SAFETY: no native library exists; no C code runs.
+        let error = unsafe { fakeVersionNumber() }.expect_err("the library is absent");
+        assert!(matches!(error, CallError::Load(_)));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(INVENTORY.contains("\"unshimmed\": [\n    \"fakeMissingNumber\",\n    \"fakeReset\",\n    \"fakeStore\",\n    \"fakeVersionNumber\"\n  ]"), "{INVENTORY}");
+    }
+
+    #[cfg(windows)]
+    fn current_process() -> libloading::Library {
+        libloading::os::windows::Library::this().expect("the running executable has a module handle").into()
+    }
+
+    #[cfg(unix)]
+    fn current_process() -> libloading::Library {
+        libloading::os::unix::Library::this().into()
+    }
+
+    unsafe extern "C" fn shadow(f: std::ffi::c_int, api: std::ffi::c_int) -> fakeStatus {
+        if f == 7 && api == 11 { fakeStatus_enum_FAKE_SUCCESS } else { fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL }
+    }
+
+    unsafe extern "C" fn version() -> std::ffi::c_int {
+        FAKE_VERSION as std::ffi::c_int
+    }
+
+    unsafe extern "C" fn store(value: *mut std::ffi::c_int) {
+        // SAFETY: the fixture callers provide a writable, aligned integer for this call.
+        unsafe { value.write(FAKE_VERSION as std::ffi::c_int) };
+    }
+
+    fn present_api() -> Result<&'static api::FakeApi, &'static nv_loader::LoadError> {
+        static API: std::sync::OnceLock<api::FakeApi> = std::sync::OnceLock::new();
+        Ok(API.get_or_init(|| {
+            // SAFETY: this is the running executable, not a newly loaded foreign library.
+            // Only explicit test function pointers below may run; the failure fields are replaced.
+            let mut api = unsafe { api::FakeApi::from_library(current_process()) }.expect("optional symbols do not reject a library");
+            api.fakeInit = Err(libloading::Error::DlSymUnknown);
+            api.fakeCtxCreate = Err(libloading::Error::DlSymUnknown);
+            api.fakeGetCount = Err(libloading::Error::DlSymUnknown);
+            api.fakeErrorString = Err(libloading::Error::DlSymUnknown);
+            api.fakeReset = Err(libloading::Error::DlSymUnknown);
+            api.fakeIo = Err(libloading::Error::DlSymUnknown);
+            api.fakeTransfer = Err(libloading::Error::DlSymUnknown);
+            api.fakeMissingNumber = Err(libloading::Error::DlSymUnknown);
+            api.fakeShadow = Ok(shadow);
+            api.fakeVersionNumber = Ok(version);
+            api.fakeStore = Ok(store);
+            api
+        }))
+    }
+
+    // prettyplease removes generated SAFETY comments; the shared generator owns the invariant.
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    mod present {
+        use super::present_api as fake_api;
+        use super::super::types::*;
+        include!(concat!(env!("OUT_DIR"), "/fake_shims.rs"));
+    }
+
+    #[test]
+    fn mixed_return_policies_preserve_missing_symbol_errors() {
+        // SAFETY: every missing field below contains an explicit error; no C code runs.
+        unsafe {
+            assert_eq!(present::fakeInit(0), fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL);
+            assert_eq!(present::fakeCtxCreate(std::ptr::null_mut(), 0), fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL);
+            assert_eq!(present::fakeGetCount(std::ptr::null_mut()), fakeStatus_enum_FAKE_ERROR_MISSING_SYMBOL);
+            assert!(present::fakeErrorString(0).is_null());
+            let error = present::fakeReset().expect_err("void calls report missing symbols");
+            assert!(std::error::Error::source(&error).expect("loader cause").is::<libloading::Error>());
+            let CallError::Symbol(diagnostic) = error else { panic!("expected a missing void symbol") };
+            assert_eq!(diagnostic.symbol, "fakeReset");
+            let status = present::fakeIo();
+            assert_eq!((status.err, status.cuda), (FAKE_IO_MISSING as i32, 0));
+            assert_eq!(present::fakeTransfer(), -(FAKE_IO_MISSING as fakeCount));
+            let error = present::fakeMissingNumber().expect_err("the field contains an error");
+            let source = std::error::Error::source(&error).expect("the loader's cause is preserved");
+            assert!(source.is::<libloading::Error>(), "the original cause must pass through the boxed diagnostic");
+            let CallError::Symbol(diagnostic) = error else { panic!("expected a missing-symbol diagnostic") };
+            assert_eq!((diagnostic.lib, diagnostic.symbol), ("fake", "fakeMissingNumber"));
+            assert!(matches!(diagnostic.source, Some(libloading::Error::DlSymUnknown)));
+        }
+    }
+
+    #[test]
+    fn generated_native_and_checked_functions_forward_success() {
+        // SAFETY: the test table contains the exact signatures of these local functions.
+        unsafe {
+            assert_eq!(present::fakeShadow(7, 11), fakeStatus_enum_FAKE_SUCCESS);
+            assert_eq!(present::fakeVersionNumber().expect("local pointer exists"), FAKE_VERSION as std::ffi::c_int);
+            let mut value = 0;
+            present::fakeStore(&mut value).expect("local void pointer exists");
+            assert_eq!(value, FAKE_VERSION as std::ffi::c_int);
+        }
+    }
+
+    struct Query {
+        query: unsafe extern "C" fn(u32) -> *mut std::ffi::c_void,
+    }
+
+    unsafe extern "C" fn query(id: u32) -> *mut std::ffi::c_void {
+        match id {
+            0x1234_5678 => version as *const () as *mut std::ffi::c_void,
+            0x1234_5680 => store as *const () as *mut std::ffi::c_void,
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    fn present_query() -> Result<&'static Query, &'static nv_loader::LoadError> {
+        static QUERY: Query = Query { query };
+        Ok(&QUERY)
+    }
+
+    // Same generated-code boundary as exports_sys!/query_interface_sys!, without hiding test code.
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    mod present_qi {
+        use crate::qi::*;
+        use super::present_query as qi_api;
+        include!(concat!(env!("OUT_DIR"), "/qi_shims.rs"));
+    }
+
+    #[test]
+    fn checked_query_functions_distinguish_null_from_success() {
+        let _: unsafe fn() -> Result<std::ffi::c_int, CallError> = present_qi::qiVersionNumber;
+        let _: unsafe fn(*mut std::ffi::c_int) -> Result<(), CallError> = present_qi::qiStore;
+        // SAFETY: fixture ids map only to the exact local version/store functions or null.
+        unsafe {
+            assert_eq!(present_qi::qiVersionNumber().expect("known id"), FAKE_VERSION as std::ffi::c_int);
+            let error = present_qi::qiAbsentNumber().expect_err("the query returns null");
+            assert!(std::error::Error::source(&error).is_none());
+            let CallError::Symbol(diagnostic) = error else { panic!("expected a null-query diagnostic") };
+            assert_eq!((diagnostic.lib, diagnostic.symbol), ("qi", "qiAbsentNumber"));
+            assert!(diagnostic.source.is_none());
+            assert_eq!(present_qi::qiInitialize(), qi::_qiStatus_QI_NO_IMPLEMENTATION);
+            assert_eq!(present_qi::qiGetValue(std::ptr::null_mut(), 0), qi::_qiStatus_QI_NO_IMPLEMENTATION);
+            let mut value = 0;
+            present_qi::qiStore(&mut value).expect("known void id");
+            assert_eq!(value, FAKE_VERSION as std::ffi::c_int);
+            let error = present_qi::qiMissingStore(&mut value).expect_err("the void query returns null");
+            assert!(std::error::Error::source(&error).is_none());
+            let CallError::Symbol(diagnostic) = error else { panic!("expected a missing void query") };
+            assert_eq!(diagnostic.symbol, "qiMissingStore");
+        }
     }
 }

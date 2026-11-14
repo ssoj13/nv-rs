@@ -1,6 +1,47 @@
 # Handoff — nv-rs (2026-11-13)
 
-## State
+## Transfer checkpoint — 2026-11-13 (Codex)
+
+**Status: paused by owner for an environment change.** All task agents have stopped/completed; do not resume implementation automatically. The owner explicitly requested updating progress and pushing the unfinished source checkpoint to main.
+
+- vcv-rs checkpoint is published on main at `a8cab6688c1ef01f1067ea3d150ad7283e1367cb`.
+- Both host and device Cargo.lock files now resolve that exact vcv-rs revision. Metadata-only commands succeeded: `cargo +1.98.0 update -p vcv-rs` and `cargo +1.99.1 update --manifest-path device/Cargo.toml -p vcv-rs`. They added object 0.40.0, removed unused optional CLI dependencies, and recorded the three written host sys crates; no compile/test result follows.
+- nv-rs D01/D02 source remains **unreviewed and untested**. M2 is open. Historical M1/M3/M4/M5 and prior 18-library results below do not validate this checkpoint.
+- vcv-rs D11 reached a 225-ID source-only static closure. Added ID226 (real COFF/ELF archive test) has not been formatted after insertion, independently reviewed or executed.
+- vcv-rs D12 has 125 IDs; the full review is incomplete. **Known defect remains:** fmt_ps accepts oversized Windows/.NET environment keys/values/joined lists and may fail after earlier assignments. D13's 110-ID independent review remains pending.
+- No Windows/Linux build, check, test, shell round trip, seeded mutant or GPU gate ran for this wave. Platform gates are 0/2.
+- Durable transfer records, exact continuation, source hashes and unexecuted validation scripts are in sibling [vcv-rs HANDOFF.md](../vcv-rs/HANDOFF.md) and its `docs/mastermind/evidence/2026-11-13-transfer/`. SDK binaries and proprietary headers were excluded.
+- Recovery documentation-agent OAuth failure produced no result; root wrote this checkpoint. No new agent or chat-wait loop was started after stop.
+
+After the owner resumes: repair/review the vcv-rs length boundary, review ID226 and complete D12/D13/seam reviews; commit/push any new edits before every build/check/test. Root monitors CPU/RAM/GPU/other builds and serializes both platform gates under the existing build-lock override. Then verify nv-rs consumers and finish M2 NCCL/nvCOMP/cuFile reviews and supported-platform gates. Preserve separate NCCL multi-GPU and native-Linux cuFile/storage requirements.
+
+
+## Historical checkpoint (superseded above)
+
+
+## Recovery checkpoint (2026-11-13, 22:35–22:37 UTC)
+
+The previous handoff was last modified at 19:40:44 UTC. Source edits continued through
+21:58:52 UTC and TODO/domain-index updates through 22:24:17 UTC, so the checkpoint below
+supersedes its next steps. Historical milestone results are retained separately.
+
+- nv-rs: `main` at `8b7e13ccc90340bf7c1385878fd0b5e82c30afe0`; the snapshot before recovery
+  documentation edits had 23 modified tracked files (805 insertions, 265 deletions), untracked
+  TODO/domain docs and nine source files in `nvcomp-sys`, `nccl-sys` and `cufile-sys`.
+- D01/D02 source and NCCL cleanup/checked-return fixtures are written; fresh review, publication
+  and compiler/test/GPU gates remain pending. See [TODO.md](TODO.md) and the
+  [domain index](docs/mastermind/MASTERMIND_INDEX.md).
+- vcv-rs: `main` at `6eb28c0a4c78a5b34771dbfbb5b14742ecb696ca` with uncommitted changes.
+  Its Windows/Linux D11/D12/D13 work is the immediate dependency.
+- One nv-rs worktree and no `cargo`/`rustc` processes were observed. No build, check or test
+  ran during recovery; inspected logs established no gate evidence for this wave.
+- Queried workspace memory had no summary/items; queried OMH modes/recent-files were empty.
+  GitNexus recommends `reanalyze_unstaged`: its 20:12:48 UTC index predates source edits.
+- vcv-rs advisor artifact `.omh/artifacts/ask/claude-20261113-210117.md` records exit code 1
+  from a weekly usage limit, so it supplies no independent review verdict. The older
+  `target-run.log` success is historical evidence, not a current M2 gate.
+
+## Historical milestone evidence
 
 - Spikes S1a (OptiX runs a Rust raygen from cuda-oxide), S2 (Vulkan buffer shared by wgpu and
   CUDA with a timeline semaphore), S3 (one generator + one loader for nvml/optix/cufft): all PASS.
@@ -15,7 +56,7 @@
   SBT, launch, HDR/AOV denoiser); 11 GPU tests on the S1b PTX. Details in PLAN.md §8.
 - **M3 done**: `crates/cuda-ext` (external memory/semaphores, arrays, textures, surfaces, host
   registration, managed memory, UUID/LUID, green contexts); 7 GPU tests incl. a Vulkan round trip.
-- **M2 nearly done** — 18 sys crates build, load and pass their tests on this machine (counts in
+- **M2 prior baseline** — 18 sys crates built, loaded and passed their tests on this machine (counts in
   COVERAGE.md): nvml, optix, cufft, cublas, cublaslt, cusparse, cusolver, cusolvermg, nvjpeg,
   nvrtc, cupti, nvcuvid, nvenc, npp (11 DLLs), cudnn, nvapi, nvofa, ngx. Generator shapes:
   exports, split exports (NPP), query interface (NVAPI), function table (OptiX, NVENC, NVOFA),
@@ -25,23 +66,32 @@
 
 ## Next
 
-1. Remaining M2: **nvCOMP** (not installed on this machine), **NCCL** and **cuFile** (Linux only:
-   WSL2 for NCCL, native Linux / RunPod for cuFile).
-2. Fork `main` is `42cc04eda` (our OptiX patches + nvidia/main `7a7d160ea`); offer the patches
-   upstream (FORK.md lists them).
-3. M6 `nv-wgpu` on top of cuda-ext; M10 render-rs `pt-optix` on `optix` + `optix-device`.
+1. Complete [vcv-rs Windows/Linux support](../vcv-rs/TODO.md). Repair/re-review the four open
+   D11 findings reported by the work queue: OptiX fixture ownership, NGX runtime names/package
+   paths, nested Windows NGX import libraries and Windows CUDA .LIB case handling. Obtain fresh
+   D11/D12/D13 reviews.
+2. Finish coherent source edits, then commit and push every involved repository to `main`
+   with DCO sign-off before any build, check or test. Consume the pushed vcv-rs revision.
+3. Root monitors CPU/RAM/GPU load and other builds, then runs serialized platform, fixture,
+   compiler/test and mutant gates. The owner's build-lock override remains in force; no
+   replacement lock is required. Refresh the source graph and record exact evidence.
+4. Complete M2 **nvCOMP**, **NCCL** and **cuFile** reviews, coverage and supported-platform
+   gates. Keep NCCL multi-GPU and native-Linux cuFile/storage validation separate.
+5. Continue M6 `nv-wgpu`, then M10 render-rs `pt-optix` as planned. The historical fork revision
+   is `42cc04eda` (nvidia/main `7a7d160ea`); D5 authorizes fork patches, not an upstream PR.
 
 ## Building
 
 - SDKs unpacked outside the standard folders: set `NV_SDK_DIRS` (here
   `C:\projects\projects.rust.cg\nv`, holding OptiX, Video Codec, NVAPI, Streamline/NGX).
 - `ngx-sys` needs `VULKAN_SDK`.
-- Commit and push before running tests; one build at a time (shared machine). The full workspace
-  test run takes over 10 minutes here — run it in the background.
+- Commit and push every involved repository to `main` before any build, check or test; one
+  build at a time after root checks machine load and other builds. The prior full workspace
+  test run took over 10 minutes here — run long gates in the background.
 
 ## Open items
 
-- fork patch still to write: `#[device(export_name)]` (callables, M5);
+- reconcile the prior pending `#[device(export_name)]` item with the M5 completion claim and actual fork API; recovery did not resolve this evidence conflict;
 - reconcile D6 with the fork's committed `cuda-bindings/generated/`;
 - types shared between toolkit libraries (cuSOLVER pulls its own copy of cuBLAS/cuSPARSE handle
   types) should be re-used across sys crates, like CUDA types are from `cuda-bindings`;

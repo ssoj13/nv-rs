@@ -1,6 +1,6 @@
 //! Generates the cuFFT bindings from the CUDA Toolkit's `cufft.h` (nv-bindgen, PLAN.md §3).
 //! `cudaStream_t` resolves to `cuda_bindings::CUstream_st`, so streams are one type across nv-rs.
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "cufft",
@@ -16,9 +16,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "CufftApi",
         loader_fn: "cufft_api",
-        status_types: &["cufftResult", "cufftResult_t"],
-        not_loaded: "cufftResult_t_CUFFT_SETUP_FAILED",
-        missing_symbol: "cufftResult_t_CUFFT_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["cufftResult", "cufftResult_t"],
+            not_loaded: "cufftResult_t_CUFFT_SETUP_FAILED",
+            missing_symbol: "cufftResult_t_CUFFT_NOT_SUPPORTED",
+        }],
     },
 };
 

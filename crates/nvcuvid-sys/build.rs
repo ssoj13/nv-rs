@@ -1,7 +1,7 @@
 //! Generates the NVDEC (nvcuvid) bindings from the Video Codec SDK's `Interface/nvcuvid.h`.
 //! The SDK (a zip with no installer) is located by vcv-rs: `VIDEO_CODEC_SDK_ROOT` or `NV_SDK_DIRS`. CUDA types
 //! (`CUresult`, `CUcontext`, `CUstream`) are the `cuda-bindings` ones.
-use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
+use nv_bindgen::{Kind, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvcuvid",
@@ -17,9 +17,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "NvcuvidApi",
         loader_fn: "nvcuvid_api",
-        status_types: &["CUresult"],
-        not_loaded: "cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_INITIALIZED",
-        missing_symbol: "cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_FOUND",
+        returns: &[ReturnPolicy {
+            types: &["CUresult"],
+            not_loaded: "cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_INITIALIZED",
+            missing_symbol: "cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_FOUND",
+        }],
     },
 };
 

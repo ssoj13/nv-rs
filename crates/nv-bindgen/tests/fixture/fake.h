@@ -6,8 +6,12 @@ typedef enum fakeStatus_enum {
 } fakeStatus;
 
 typedef struct fakeCtx_st* fakeCtx;
+typedef struct { int err; int cuda; } fakeIoStatus;
+typedef long fakeCount;
 
 #define FAKE_VERSION 4200
+#define FAKE_IO_NOT_LOADED 13
+#define FAKE_IO_MISSING 17
 
 fakeStatus fakeInit(unsigned int flags);
 fakeStatus fakeCtxCreate(fakeCtx* out, int device);
@@ -16,4 +20,8 @@ int notFakeHelper(void);
 fakeStatus fakeShadow(int f, int api);
 const char* fakeErrorString(fakeStatus status);
 void fakeReset(void);
+void fakeStore(int* value);
 int fakeVersionNumber(void);
+int fakeMissingNumber(void);
+fakeIoStatus fakeIo(void);
+fakeCount fakeTransfer(void);

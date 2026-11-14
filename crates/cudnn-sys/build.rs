@@ -1,6 +1,6 @@
 //! Generates the cuDNN bindings from the cuDNN SDK (located by vcv-rs; the `include/<cuda>` folder
 //! matching the installed CUDA Toolkit) plus the toolkit headers it includes (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
+use nv_bindgen::{Kind, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "cudnn",
@@ -16,9 +16,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "CudnnApi",
         loader_fn: "cudnn_api",
-        status_types: &["cudnnStatus_t"],
-        not_loaded: "cudnnStatus_t_CUDNN_STATUS_NOT_INITIALIZED",
-        missing_symbol: "cudnnStatus_t_CUDNN_STATUS_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["cudnnStatus_t"],
+            not_loaded: "cudnnStatus_t_CUDNN_STATUS_NOT_INITIALIZED",
+            missing_symbol: "cudnnStatus_t_CUDNN_STATUS_NOT_SUPPORTED",
+        }],
     },
 };
 

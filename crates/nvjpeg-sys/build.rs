@@ -1,5 +1,5 @@
 //! Generates the nvjpeg bindings from the CUDA Toolkit (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvjpeg",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "NvjpegApi",
         loader_fn: "nvjpeg_api",
-        status_types: &["nvjpegStatus_t"],
-        not_loaded: "nvjpegStatus_t_NVJPEG_STATUS_NOT_INITIALIZED",
-        missing_symbol: "nvjpegStatus_t_NVJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["nvjpegStatus_t"],
+            not_loaded: "nvjpegStatus_t_NVJPEG_STATUS_NOT_INITIALIZED",
+            missing_symbol: "nvjpegStatus_t_NVJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED",
+        }],
     },
 };
 

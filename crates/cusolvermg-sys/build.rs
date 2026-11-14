@@ -1,5 +1,5 @@
 //! Generates the cusolvermg bindings from the CUDA Toolkit (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "cusolvermg",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "CusolverMgApi",
         loader_fn: "cusolvermg_api",
-        status_types: &["cusolverStatus_t"],
-        not_loaded: "cusolverStatus_t_CUSOLVER_STATUS_NOT_INITIALIZED",
-        missing_symbol: "cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["cusolverStatus_t"],
+            not_loaded: "cusolverStatus_t_CUSOLVER_STATUS_NOT_INITIALIZED",
+            missing_symbol: "cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED",
+        }],
     },
 };
 

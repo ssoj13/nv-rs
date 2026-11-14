@@ -1,5 +1,5 @@
 //! Generates the cusparse bindings from the CUDA Toolkit (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "cusparse",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "CusparseApi",
         loader_fn: "cusparse_api",
-        status_types: &["cusparseStatus_t"],
-        not_loaded: "cusparseStatus_t_CUSPARSE_STATUS_NOT_INITIALIZED",
-        missing_symbol: "cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED",
+        returns: &[ReturnPolicy {
+            types: &["cusparseStatus_t"],
+            not_loaded: "cusparseStatus_t_CUSPARSE_STATUS_NOT_INITIALIZED",
+            missing_symbol: "cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED",
+        }],
     },
 };
 

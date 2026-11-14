@@ -1,0 +1,26 @@
+[package]
+name = "nvcomp-sys"
+description = "Raw nvCOMP C bindings, generated from the installed SDK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+path = "src/nvcomp_sys.rs"
+
+[dependencies]
+nv-loader.workspace = true
+libloading.workspace = true
+cuda-bindings.workspace = true
+
+[build-dependencies]
+nv-bindgen.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

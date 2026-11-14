@@ -1,5 +1,5 @@
 //! Generates the NVML bindings from the CUDA Toolkit's `nvml.h` (nv-bindgen, PLAN.md §3).
-use nv_bindgen::{LibSpec, Sdk, Shape};
+use nv_bindgen::{LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvml",
@@ -15,9 +15,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::Exports {
         api_type: "NvmlApi",
         loader_fn: "nvml_api",
-        status_types: &["nvmlReturn_t"],
-        not_loaded: "nvmlReturn_enum_NVML_ERROR_LIBRARY_NOT_FOUND",
-        missing_symbol: "nvmlReturn_enum_NVML_ERROR_FUNCTION_NOT_FOUND",
+        returns: &[ReturnPolicy {
+            types: &["nvmlReturn_t"],
+            not_loaded: "nvmlReturn_enum_NVML_ERROR_LIBRARY_NOT_FOUND",
+            missing_symbol: "nvmlReturn_enum_NVML_ERROR_FUNCTION_NOT_FOUND",
+        }],
     },
 };
 

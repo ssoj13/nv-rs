@@ -1,0 +1,26 @@
+[package]
+name = "cufile-sys"
+description = "Raw cuFile C bindings (Linux), generated from the installed CUDA Toolkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+path = "src/cufile_sys.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nv-loader.workspace = true
+libloading.workspace = true
+cuda-bindings.workspace = true
+
+[build-dependencies]
+nv-bindgen.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

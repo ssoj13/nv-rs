@@ -1,6 +1,6 @@
 //! Generates the NVAPI bindings from the NVAPI SDK (`nvapi.h`, located by vcv-rs: `NVAPI_ROOT`,
 //! the standard folders or `NV_SDK_DIRS`). Function ids come from the SDK's `nvapi_interface.h`.
-use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
+use nv_bindgen::{Kind, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {
     name: "nvapi",
@@ -23,9 +23,11 @@ const SPEC: LibSpec = LibSpec {
     shape: Shape::QueryInterface {
         interface_header: "nvapi_interface.h",
         loader_fn: "nvapi_api",
-        status_types: &["NvAPI_Status"],
-        not_loaded: "_NvAPI_Status_NVAPI_LIBRARY_NOT_FOUND",
-        missing_symbol: "_NvAPI_Status_NVAPI_NO_IMPLEMENTATION",
+        returns: &[ReturnPolicy {
+            types: &["NvAPI_Status"],
+            not_loaded: "_NvAPI_Status_NVAPI_LIBRARY_NOT_FOUND",
+            missing_symbol: "_NvAPI_Status_NVAPI_NO_IMPLEMENTATION",
+        }],
     },
 };
 

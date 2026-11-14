@@ -1,12 +1,31 @@
 # nv-rs — plan
 
+## Transfer checkpoint — 2026-11-13 (Codex)
+
+**Status: paused by owner for an environment change.** All task agents have stopped/completed; do not resume implementation automatically. The owner explicitly requested updating progress and pushing the unfinished source checkpoint to main.
+
+- vcv-rs checkpoint is published on main at `a8cab6688c1ef01f1067ea3d150ad7283e1367cb`.
+- Both host and device Cargo.lock files now resolve that exact vcv-rs revision. Metadata-only commands succeeded: `cargo +1.98.0 update -p vcv-rs` and `cargo +1.99.1 update --manifest-path device/Cargo.toml -p vcv-rs`. They added object 0.40.0, removed unused optional CLI dependencies, and recorded the three written host sys crates; no compile/test result follows.
+- nv-rs D01/D02 source remains **unreviewed and untested**. M2 is open. Historical M1/M3/M4/M5 and prior 18-library results below do not validate this checkpoint.
+- vcv-rs D11 reached a 225-ID source-only static closure. Added ID226 (real COFF/ELF archive test) has not been formatted after insertion, independently reviewed or executed.
+- vcv-rs D12 has 125 IDs; the full review is incomplete. **Known defect remains:** fmt_ps accepts oversized Windows/.NET environment keys/values/joined lists and may fail after earlier assignments. D13's 110-ID independent review remains pending.
+- No Windows/Linux build, check, test, shell round trip, seeded mutant or GPU gate ran for this wave. Platform gates are 0/2.
+- Durable transfer records, exact continuation, source hashes and unexecuted validation scripts are in sibling [vcv-rs HANDOFF.md](../vcv-rs/HANDOFF.md) and its `docs/mastermind/evidence/2026-11-13-transfer/`. SDK binaries and proprietary headers were excluded.
+- Recovery documentation-agent OAuth failure produced no result; root wrote this checkpoint. No new agent or chat-wait loop was started after stop.
+
+After the owner resumes: repair/review the vcv-rs length boundary, review ID226 and complete D12/D13/seam reviews; commit/push any new edits before every build/check/test. Root monitors CPU/RAM/GPU/other builds and serializes both platform gates under the existing build-lock override. Then verify nv-rs consumers and finish M2 NCCL/nvCOMP/cuFile reviews and supported-platform gates. Preserve separate NCCL multi-GPU and native-Linux cuFile/storage requirements.
+
+
+## Historical checkpoint (superseded above)
+
+
 Rust access to the whole NVIDIA library family (driver, CUDA Toolkit, SDKs), OptiX device code
 in Rust through cuda-oxide, and CUDA <-> wgpu interop. Built on the `cuda-rust_b` fork
 (`ssh://git@github.com/ssoj13/cuda-rust_b.git`, checked out at
-`C:\projects\projects.rust.cg\nv\cuda-oxide-windows`). Intended to be shown to NVIDIA, so it
+`C:\projects\projects.rust.cg\nv\cuda-rust_b-optix`, verified at `42cc04eda` on 2026-11-13). Intended to be shown to NVIDIA, so it
 follows `NVIDIA/cuda-rust` conventions throughout.
 
-Status: plan only. No code yet.
+Status: implementation is in progress. [TODO.md](TODO.md) and the [domain index](docs/mastermind/MASTERMIND_INDEX.md) track the current unverified M2 wave; [HANDOFF.md](HANDOFF.md) preserves prior milestone evidence. Dated results and prerequisite inventories below are historical snapshots, not checks of the current source.
 
 ## 1. Decisions
 
@@ -317,7 +336,7 @@ orchestrator runs one build/test gate per wave.
 3. The generated coverage matrix with evidence.
 4. The cuda-oxide fork patches (`ptx_asm!` arity, `#[device(export_name)]`, texture intrinsics shard).
 
-## 11. Prerequisites to install
+## 11. Original prerequisite inventory (historical)
 
 - OptiX SDK 9.x (headers only; set `OPTIX_ROOT`). Not installed yet.
 - Video Codec SDK (present: `C:\projects\projects.rust.cg\nv\Video_Codec_SDK_13.1.15`).

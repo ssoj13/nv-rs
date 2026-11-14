@@ -111,10 +111,8 @@ mod tests {
         load().expect("nvcomp loads");
         let mut properties = nvcompProperties_t::default();
         // SAFETY: properties is a valid, aligned output object for the duration of the call.
-        assert_eq!(
-            unsafe { nvcompGetProperties(&mut properties) },
-            nvcompStatus_t_nvcompSuccess
-        );
+        let status = unsafe { nvcompGetProperties(&mut properties) };
+        assert_eq!(status, nvcompStatus_t_nvcompSuccess);
         assert!(properties.version > 0, "library version was not reported");
         assert!(
             properties.cudart_version > 0,

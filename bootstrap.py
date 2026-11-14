@@ -310,6 +310,7 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         archive_type="manual",
         manual_url="https://developer.nvidia.com/optical-flow-sdk",
         manual_note="Auth-gated NVIDIA Developer portal; extract under NV_SDK_DIRS",
+        system_globs=(r"C:\Program Files\NVIDIA\Optical_Flow_SDK*", r"C:\Program Files\NVIDIA\OpticalFlow*", "/opt/*optical*"),
     ),
     SdkSpec(
         key="videocodec",
@@ -321,6 +322,7 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         archive_type="manual",
         manual_url="https://developer.nvidia.com/nvidia-video-codec-sdk/download",
         manual_note="Auth-gated NVIDIA Developer portal; extract under NV_SDK_DIRS",
+        system_globs=(r"C:\Program Files\NVIDIA\Video_Codec_SDK*", "/opt/*video*codec*"),
     ),
     SdkSpec(
         key="nvcomp",
@@ -638,6 +640,26 @@ def cmd_deps_dl(args: argparse.Namespace) -> int:
 # ==============================================================================
 
 
+def _cargo_env() -> dict[str, str]:
+    """Populate NV_SDK_DIRS and detected SDK root variables for child Cargo invocations."""
+    env: dict[str, str] = {}
+    if DEFAULT_SDK_DIR.is_dir():
+        existing = parse_nv_sdk_dirs()
+        if DEFAULT_SDK_DIR not in existing:
+            paths = [str(DEFAULT_SDK_DIR), *(str(p) for p in existing)]
+            env["NV_SDK_DIRS"] = os.pathsep.join(paths)
+    host_os = platform.system()
+    for spec in SDK_SPECS:
+        if host_os not in spec.platforms or not spec.env_vars:
+            continue
+        if any(os.environ.get(v, "").strip() for v in spec.env_vars):
+            continue
+        path, source = detect_sdk(spec)
+        if path is not None and source == "system":
+            env[spec.env_vars[0]] = str(path)
+    return env
+
+
 def cmd_build(args: argparse.Namespace, passthrough: list[str]) -> int:
     if not check_cargo():
         return 1
@@ -656,7 +678,7 @@ def cmd_build(args: argparse.Namespace, passthrough: list[str]) -> int:
         cmd.append("--workspace")
     cmd.extend(passthrough)
 
-    code, _, ms = run(cmd)
+    code, _, ms = run(cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"build {'OK' if code == 0 else 'FAILED'} ({fmt_time(ms)})")
     return code
 
@@ -690,7 +712,7 @@ def cmd_test(args: argparse.Namespace, passthrough: list[str]) -> int:
         cmd.append("--")
         cmd.extend(test_tail)
 
-    code, _, ms = run(cmd)
+    code, _, ms = run(cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"test {'OK' if code == 0 else 'FAILED'} ({fmt_time(ms)})")
     return code
 
@@ -715,7 +737,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         clippy_cmd.append("--workspace")
     clippy_cmd.extend(["--all-targets", "--", "-D", "warnings"])
 
-    code, _, ms = run(clippy_cmd)
+    code, _, ms = run(clippy_cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"cargo clippy ({fmt_time(ms)})")
     return code
 

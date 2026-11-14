@@ -656,9 +656,8 @@ pub struct HeuristicResult {
 impl HeuristicResult {
     fn zeroed() -> Self {
         // SAFETY: `cublasLtMatmulHeuristicResult_t` is plain C POD data; zeroing is valid.
-        Self {
-            raw: unsafe { std::mem::zeroed() },
-        }
+        let raw = unsafe { std::mem::zeroed() };
+        Self { raw }
     }
 
     /// Returns `true` when this heuristic entry succeeded (`CUBLAS_STATUS_SUCCESS`).

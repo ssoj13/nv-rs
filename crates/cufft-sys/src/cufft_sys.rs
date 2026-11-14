@@ -47,10 +47,8 @@ mod tests {
         load().expect("cufft loads");
         let mut v = 0;
         // SAFETY: valid out-pointer.
-        assert_eq!(
-            unsafe { cufftGetVersion(&mut v) },
-            cufftResult_t_CUFFT_SUCCESS
-        );
+        let status = unsafe { cufftGetVersion(&mut v) };
+        assert_eq!(status, cufftResult_t_CUFFT_SUCCESS);
         assert!(v >= 11000, "{v}");
     }
 }

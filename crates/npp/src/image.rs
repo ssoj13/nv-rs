@@ -105,13 +105,14 @@ pub enum Interpolation {
 }
 
 impl Interpolation {
+    #[allow(clippy::unnecessary_cast)]
     fn to_sys(self) -> i32 {
         match self {
-            Self::Nearest => sys::NppiInterpolationMode_NPPI_INTER_NN,
-            Self::Linear => sys::NppiInterpolationMode_NPPI_INTER_LINEAR,
-            Self::Cubic => sys::NppiInterpolationMode_NPPI_INTER_CUBIC,
-            Self::Super => sys::NppiInterpolationMode_NPPI_INTER_SUPER,
-            Self::Lanczos => sys::NppiInterpolationMode_NPPI_INTER_LANCZOS,
+            Self::Nearest => sys::NppiInterpolationMode_NPPI_INTER_NN as i32,
+            Self::Linear => sys::NppiInterpolationMode_NPPI_INTER_LINEAR as i32,
+            Self::Cubic => sys::NppiInterpolationMode_NPPI_INTER_CUBIC as i32,
+            Self::Super => sys::NppiInterpolationMode_NPPI_INTER_SUPER as i32,
+            Self::Lanczos => sys::NppiInterpolationMode_NPPI_INTER_LANCZOS as i32,
         }
     }
 }

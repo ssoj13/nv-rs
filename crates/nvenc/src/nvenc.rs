@@ -468,17 +468,24 @@ pub struct EncodeFlags {
     pub output_sps_pps: bool,
 }
 
+const fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
+    #[allow(clippy::unnecessary_cast)]
+    {
+        flag as u32
+    }
+}
+
 impl EncodeFlags {
     const fn to_bits(self) -> u32 {
         let mut bits = 0u32;
         if self.force_intra {
-            bits |= sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEINTRA as u32;
+            bits |= pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEINTRA);
         }
         if self.force_idr {
-            bits |= sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEIDR as u32;
+            bits |= pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEIDR);
         }
         if self.output_sps_pps {
-            bits |= sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32;
+            bits |= pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_OUTPUT_SPSPPS);
         }
         bits
     }
@@ -740,7 +747,7 @@ impl EncodeSession {
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_PIC_PARAMS`.
         let mut pic: sys::NV_ENC_PIC_PARAMS = unsafe { zeroed() };
         pic.version = VER_PIC_PARAMS;
-        pic.encodePicFlags = sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_EOS as u32;
+        pic.encodePicFlags = pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_EOS);
         // SAFETY: `self.raw` is initialized; EOS requires no input/output buffers.
         let status = unsafe { encode_fn(self.raw, &mut pic) };
         check("nvEncEncodePicture(EOS)", status, Some(self.raw), self.list)

@@ -7,6 +7,7 @@
 //! `NVAPI_NO_IMPLEMENTATION` when this driver has no entry for the id. Windows only (NVAPI does not
 //! exist elsewhere; on other targets `load()` reports `NotFound`).
 //! **Used by** a future safe `nvapi` crate (driver settings, GPU topology, D3D extensions).
+#![cfg(target_os = "windows")]
 
 use nv_loader::{DllSpec, Group};
 

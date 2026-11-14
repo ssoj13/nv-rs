@@ -31,6 +31,27 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn inventory_covers_core_api() {
+        let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
+        let symbols = inventory
+            .get("symbols")
+            .and_then(Value::as_array)
+            .expect("symbols array");
+        for name in [
+            "ncclGetVersion",
+            "ncclCommInitAll",
+            "ncclAllReduce",
+            "ncclGroupStart",
+        ] {
+            assert!(
+                symbols.iter().any(|symbol| symbol.as_str() == Some(name)),
+                "{name} missing"
+            );
+        }
+    }
+
+    #[cfg(nccl_has_device)]
+    #[test]
     fn inventory_covers_public_host_api() {
         let inventory: Value = serde_json::from_str(INVENTORY).expect("valid generated inventory");
         let symbols = inventory
@@ -127,6 +148,7 @@ mod tests {
         );
     }
 
+    #[cfg(nccl_has_device)]
     #[test]
     fn cuda_types_are_shared() {
         let _: cudaStream_t = std::ptr::null_mut::<cuda_bindings::CUstream_st>();
@@ -142,6 +164,7 @@ mod tests {
         );
     }
 
+    #[cfg(nccl_has_device)]
     #[test]
     fn host_queries_are_checked() {
         let _: unsafe fn(i32, i32) -> Result<i32, nv_loader::CallError> = ncclLLA2ACalcSlots;

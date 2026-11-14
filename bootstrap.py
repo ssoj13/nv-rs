@@ -290,7 +290,7 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         display="Vulkan SDK",
         env_vars=("VULKAN_SDK",),
         subdir="vulkan",
-        marker_paths=("Include/vulkan/vulkan.h", "include/vulkan/vulkan.h"),
+        marker_paths=("Include/vulkan/vulkan.h", "include/vulkan/vulkan.h", "x86_64/include/vulkan/vulkan.h"),
         url=_VULKAN_URL,
         archive_type=_VULKAN_ARC,
         manual_url="https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe",
@@ -545,7 +545,7 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
     elif archive_type in ("tar.xz", "tar.gz"):
         if not IS_WINDOWS and shutil.which("tar"):
             dst_resolved.mkdir(parents=True, exist_ok=True)
-            cmd = ["tar", "-xf", str(archive), "-C", str(dst_resolved)]
+            cmd = ["tar", "--no-same-owner", "-xf", str(archive), "-C", str(dst_resolved)]
             if strip_top:
                 cmd.append("--strip-components=1")
             subprocess.run(cmd, check=True)
@@ -652,6 +652,9 @@ def cmd_deps_dl(args: argparse.Namespace) -> int:
 def _cargo_env() -> dict[str, str]:
     """Populate NV_SDK_DIRS and detected SDK root variables for child Cargo invocations."""
     env: dict[str, str] = {}
+    # Large generated sys crates (notably npp-sys) can overflow rustc's default LLVM DWARF stack on Linux.
+    if not os.environ.get("RUST_MIN_STACK"):
+        env["RUST_MIN_STACK"] = "67108864"
     if DEFAULT_SDK_DIR.is_dir():
         existing = parse_nv_sdk_dirs()
         if DEFAULT_SDK_DIR not in existing:
@@ -665,6 +668,8 @@ def _cargo_env() -> dict[str, str]:
             continue
         path, source = detect_sdk(spec)
         if path is not None and source in ("system", "local:.sdk"):
+            if spec.key == "vulkan" and (path / "x86_64" / "include" / "vulkan" / "vulkan.h").is_file():
+                path = path / "x86_64"
             env[spec.env_vars[0]] = str(path)
     return env
 

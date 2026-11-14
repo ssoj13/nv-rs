@@ -41,12 +41,12 @@ fn append_cuda12_compat() -> Result<(), Box<dyn std::error::Error>> {
     let mut extra_types = String::new();
     if !types_src.contains("nvjpegOutputFormat_t_NVJPEG_OUTPUT_UNCHANGEDI:") {
         extra_types.push_str(
-            "\npub const nvjpegOutputFormat_t_NVJPEG_OUTPUT_UNCHANGEDI: nvjpegOutputFormat_t = 10;\n",
+            "\n/// Compatibility constant for CUDA < 13 (unsupported at runtime on CUDA 12.x).\npub const nvjpegOutputFormat_t_NVJPEG_OUTPUT_UNCHANGEDI: nvjpegOutputFormat_t = 10;\n",
         );
     }
     if !types_src.contains("nvjpegInputFormat_t_NVJPEG_INPUT_YUV:") {
         extra_types.push_str(
-            "\npub const nvjpegInputFormat_t_NVJPEG_INPUT_YUV: nvjpegInputFormat_t = 1;\n",
+            "\n/// Compatibility constant for CUDA < 13.\npub const nvjpegInputFormat_t_NVJPEG_INPUT_YUV: nvjpegInputFormat_t = 1;\n",
         );
     }
     if !extra_types.is_empty() {
@@ -62,6 +62,7 @@ fn append_cuda12_compat() -> Result<(), Box<dyn std::error::Error>> {
         let mut f = std::fs::OpenOptions::new().append(true).open(&shims_path)?;
         f.write_all(
             br#"
+/// Compatibility stub for CUDA < 13 where `nvjpegEncoderParamsSetRestartInterval` is absent.
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn nvjpegEncoderParamsSetRestartInterval(
     _encoder_params: nvjpegEncoderParams_t,

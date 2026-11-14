@@ -189,8 +189,8 @@ impl DeviceContext {
         Ok(value)
     }
 
-    fn flag(&self, property: sys::OptixDeviceProperty, standard: c_int) -> Result<bool> {
-        Ok(self.prop(property)? & standard as u32 != 0)
+    fn flag(&self, property: sys::OptixDeviceProperty, standard: u32) -> Result<bool> {
+        Ok(self.prop(property)? & standard != 0)
     }
 
     /// Largest `LinkOptions::max_trace_depth` (`OPTIX_DEVICE_PROPERTY_LIMIT_MAX_TRACE_DEPTH`).
@@ -248,26 +248,30 @@ impl DeviceContext {
     /// `optixReorder` really reorders threads (false: it is a legal no-op)
     /// (`OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING`, flag `STANDARD`).
     pub fn shader_reordering(&self) -> Result<bool> {
+        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING,
-            sys::OptixDevicePropertyShaderExecutionReorderingFlags_OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING_FLAG_STANDARD,
+            sys::OptixDevicePropertyShaderExecutionReorderingFlags_OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING_FLAG_STANDARD as u32,
         )
     }
 
     /// Cooperative vectors are supported (`OPTIX_DEVICE_PROPERTY_COOP_VEC`, flag `STANDARD`).
     pub fn coop_vec(&self) -> Result<bool> {
+        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_COOP_VEC,
-            sys::OptixDevicePropertyCoopVecFlags_OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD,
+            sys::OptixDevicePropertyCoopVecFlags_OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD
+                as u32,
         )
     }
 
     /// Cluster acceleration structure builds are supported (`OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL`,
     /// flag `STANDARD`).
     pub fn cluster_accel(&self) -> Result<bool> {
+        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL,
-            sys::OptixDevicePropertyClusterAccelFlags_OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL_FLAG_STANDARD,
+            sys::OptixDevicePropertyClusterAccelFlags_OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL_FLAG_STANDARD as u32,
         )
     }
 

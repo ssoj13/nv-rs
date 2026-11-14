@@ -9,6 +9,7 @@
 //! machine with an NVIDIA RTX GPU and an OptiX 9.1 driver. Geometry is checked by tracing the
 //! `fixtures/s1b.ptx` raygen over it and comparing the hit mask with an analytic one (see
 //! `common/mod.rs`).
+#![cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
 
 mod common;
 

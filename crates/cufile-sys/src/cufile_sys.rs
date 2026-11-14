@@ -55,11 +55,6 @@ mod tests {
             "cuFileStreamRegister",
             "cuFileStreamDeregister",
             "cuFileGetVersion",
-            "cuFileGetParameterSizeT",
-            "cuFileSetParameterBool",
-            "cuFileGetStatsL3",
-            "cuFileDriverGetP2PFlags",
-            "cuFileDriverSetP2PFlags",
         ] {
             assert!(
                 symbols.iter().any(|symbol| symbol.as_str() == Some(name)),

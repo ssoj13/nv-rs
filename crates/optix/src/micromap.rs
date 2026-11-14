@@ -43,9 +43,11 @@ impl MicromapFormat {
     }
 
     fn from_raw(raw: u16) -> Option<Self> {
+        let raw_u32 = u32::from(raw);
+        #[allow(clippy::unnecessary_cast)]
         [Self::TwoState, Self::FourState]
             .into_iter()
-            .find(|f| f.raw() == i32::from(raw))
+            .find(|f| f.raw() as u32 == raw_u32)
     }
 
     fn bits(self) -> u64 {

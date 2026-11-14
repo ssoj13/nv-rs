@@ -3,17 +3,27 @@
 //! which `nvsdk_ngx_vk.h` expects to be included first.
 use nv_bindgen::{Kind, LibSpec, Sdk, Shape};
 
-fn spec_for_shape(shape: Shape) -> LibSpec {
+const SDKS_WINDOWS: &[Sdk] = &[
+    Sdk::Nv(Kind::Ngx),
+    Sdk::EnvRootSubdir {
+        var: "VULKAN_SDK",
+        subdir: "Include",
+    },
+];
+
+const SDKS_UNIX: &[Sdk] = &[
+    Sdk::Nv(Kind::Ngx),
+    Sdk::EnvRootSubdir {
+        var: "VULKAN_SDK",
+        subdir: "include",
+    },
+];
+
+fn spec_for_shape(shape: Shape, sdks: &'static [Sdk]) -> LibSpec {
     LibSpec {
         name: "ngx",
         headers: &["vulkan/vulkan.h", "nvsdk_ngx.h", "nvsdk_ngx_vk.h"],
-        sdks: &[
-            Sdk::Nv(Kind::Ngx),
-            Sdk::EnvRootSubdir {
-                var: "VULKAN_SDK",
-                subdir: "Include",
-            },
-        ],
+        sdks,
         allow_fn: &["^NVSDK_NGX_.*"],
         allow_type: &["^NVSDK_NGX.*", "^_?NVSDK.*"],
         allow_var: &["^NVSDK_NGX.*"],
@@ -41,10 +51,13 @@ fn main() {
         ("windows", _) => {
             // NGX ships only static libraries; `_d` is the /MD (dynamic CRT) build Rust's MSVC
             // target uses. `nvsdk_ngx_d` reads the registry (advapi32) and window ownership (user32).
-            let spec = spec_for_shape(Shape::StaticLink {
-                link_libs: &["nvsdk_ngx_d"],
-                system_libs: &["advapi32", "user32"],
-            });
+            let spec = spec_for_shape(
+                Shape::StaticLink {
+                    link_libs: &["nvsdk_ngx_d"],
+                    system_libs: &["advapi32", "user32"],
+                },
+                SDKS_WINDOWS,
+            );
             match nv_bindgen::generate(&spec) {
                 Ok(_) => println!("cargo::rustc-cfg=has_ngx_sdk"),
                 Err(e) => {
@@ -54,10 +67,13 @@ fn main() {
             }
         }
         ("linux", "x86_64") => {
-            let spec = spec_for_shape(Shape::StaticLink {
-                link_libs: &["nvsdk_ngx"],
-                system_libs: &["dl", "stdc++"],
-            });
+            let spec = spec_for_shape(
+                Shape::StaticLink {
+                    link_libs: &["nvsdk_ngx"],
+                    system_libs: &["dl", "stdc++"],
+                },
+                SDKS_UNIX,
+            );
             match nv_bindgen::generate(&spec) {
                 Ok(_) => println!("cargo::rustc-cfg=has_ngx_sdk"),
                 Err(e) => {

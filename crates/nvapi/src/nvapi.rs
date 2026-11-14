@@ -330,6 +330,7 @@ impl PhysicalGpu {
         }
         #[cfg(not(windows))]
         {
+            let _ = kind;
             Err(Error::UnsupportedPlatform)
         }
     }
@@ -621,6 +622,7 @@ mod tests {
         assert!(matches!(NvApi::init(), Err(Error::UnsupportedPlatform)));
     }
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "GPU: needs the NVIDIA Windows driver; run via xtask gpu-test"]
     fn live_rtx_3080_ti_nvapi_queries() {

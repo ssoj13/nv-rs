@@ -22,6 +22,7 @@
 //!
 //! **Device code** is written in Rust with cuda-oxide; nv-rs spike S1b traces from a Rust
 //! raygen. **Used by** render-rs and the nv-rs OptiX tests.
+#![cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
 
 pub mod accel;
 pub mod cluster;

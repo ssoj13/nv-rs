@@ -11,6 +11,7 @@
 
 use std::fmt;
 
+#[cfg(windows)]
 use crate::sys;
 
 /// Raw NVAPI return code (`NvAPI_Status`), preserved as a `Copy` integer newtype.

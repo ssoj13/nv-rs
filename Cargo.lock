@@ -877,6 +877,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ngx"
+version = "0.0.0"
+dependencies = [
+ "ngx-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "ngx-sys"
 version = "0.0.0"
 dependencies = [

@@ -172,7 +172,7 @@ impl DriverSession {
             cufile_sys::load()?;
             // SAFETY: `cuFileUseCount` reads process-global state without dereferencing arguments.
             let count = unsafe { cufile_sys::cuFileUseCount()? };
-            Ok(i64::from(count))
+            Ok(count)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -734,7 +734,7 @@ impl FileHandle {
                             buf_off,
                         )
                     };
-                    decode_io_ret("cuFileRead", ret)
+                    decode_io_ret("cuFileRead", ret?)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -789,7 +789,7 @@ impl FileHandle {
                             buf_off,
                         )
                     };
-                    decode_io_ret("cuFileWrite", ret)
+                    decode_io_ret("cuFileWrite", ret?)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {

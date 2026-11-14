@@ -62,7 +62,7 @@ mod tests {
         }
         let unshimmed = inventory.get("unshimmed").and_then(Value::as_array).expect("unshimmed array");
         let names: Vec<&str> = unshimmed.iter().map(|value| value.as_str().expect("entry point name")).collect();
-        assert_eq!(names, ["cuFileBatchIODestroy", "cuFileHandleDeregister", "cuFileUseCount"]);
+        assert_eq!(names, ["cuFileBatchIODestroy", "cuFileHandleDeregister", "cuFileRead", "cuFileUseCount", "cuFileWrite"]);
     }
 
     #[test]

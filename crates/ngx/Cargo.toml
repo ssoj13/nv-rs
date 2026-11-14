@@ -1,0 +1,20 @@
+[package]
+name = "ngx"
+description = "Safe NVIDIA NGX (DLSS) wrapper over ngx-sys: ProjectId, parameters, and Vulkan RAII handles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/ngx.rs"
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ngx-sys = { path = "../ngx-sys" }
+
+[lints]
+workspace = true

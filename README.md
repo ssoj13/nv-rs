@@ -41,10 +41,16 @@ A man who cannot provision his own bench cannot trust his own builds.
 
 ```bash
 python bootstrap.py          # show all commands and examples
+python bootstrap.py i deps   # Linux sys pkgs + public SDKs into .sdk/ + manual SDK setup guide
+python bootstrap.py d sys -y # install Linux build/runtime packages only (apt/dnf/pacman)
 python bootstrap.py d s      # inspect detected SDKs (env vars, .sdk/, NV_SDK_DIRS, system paths)
 python bootstrap.py d dl     # download & unpack public SDKs into .sdk/
 python bootstrap.py s        # toolchain, git HEAD, and SDK summary
 ```
+
+On a clean Ubuntu/Debian host, `d sys` / `i deps` installs `build-essential`, `clang`,
+`libclang-dev`, `pkg-config`, `libssl-dev`, `xz-utils`, `curl`, `ca-certificates`, and
+`libvulkan1` (pass `--nccl` to include `libnccl-dev`).
 
 Public SDKs (`nvcomp`, `nvapi`, `cudnn`, `ngx`, `optix` headers, Linux `vulkan`, Linux `nccl`)
 pull straight into `.sdk/` (git-ignored). Installer or NVIDIA Developer portal SDKs require

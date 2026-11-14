@@ -58,8 +58,14 @@ COMMANDS (short or long):
         Forward arguments to `cargo xtask <args...>` (e.g. `coverage check`, `coverage optix`).
     d,  deps <subcmd>
         Manage native SDK dependencies:
-          d s,  deps status          Inspect detected SDKs and NV_SDK_DIRS.
-          d dl, deps dl [opts]       Download/extract public SDKs into .sdk (or --dir).
+          d s,   deps status         Inspect detected SDKs and NV_SDK_DIRS.
+          d dl,  deps dl [opts]      Download/extract public SDKs into .sdk (or --dir).
+          d sys, deps sys [opts]     Install Linux system build/runtime packages (apt/dnf/pacman).
+    i,  install [deps|sys] [opts]
+        Provision host dependencies end-to-end:
+          i deps [opts]              Install Linux system packages, download public SDKs,
+                                     and print step-by-step setup guides for manual SDKs.
+          i sys  [opts]              Alias for `deps sys`.
     h,  help
         Print this help screen and exit 0.
 
@@ -76,6 +82,14 @@ DEPS DL OPTIONS:
     --force                  Re-download/re-extract even if already present.
     --allow-manual           Skip auth-gated SDKs with notice instead of failing.
 
+INSTALL / DEPS SYS OPTIONS:
+    -y, --yes                Non-interactive install (pass -y/--noconfirm to package manager).
+    --nccl                   Also install system libnccl-dev (Linux apt).
+    --dry-run                Preview package manager commands and SDK downloads.
+    --dir <path>             Target SDK root for `i deps` (default: <repo>/.sdk).
+    --only <sdk>             Filter SDKs for `i deps`, comma-separated or repeatable.
+    --force                  Re-download/re-extract public SDKs during `i deps`.
+
 EXAMPLES:
     python bootstrap.py                          Print this help screen
     python bootstrap.py b                        Build workspace (release)
@@ -87,6 +101,9 @@ EXAMPLES:
     python bootstrap.py d s                      Inspect detected SDKs & NV_SDK_DIRS
     python bootstrap.py d dl --dry-run           Preview public SDK downloads
     python bootstrap.py d dl --only optix,nvcomp --allow-manual
+    python bootstrap.py i deps                   Install Linux sys pkgs + public SDKs + manual guide
+    python bootstrap.py i deps --dry-run         Preview full dependency provisioning
+    python bootstrap.py d sys -y --nccl          Install Linux build/runtime deps + libnccl-dev
 """
 
 
@@ -639,8 +656,200 @@ def cmd_deps_dl(args: argparse.Namespace) -> int:
                 return 1
 
     if manual_failures > 0:
+        _print_manual_sdk_guide(sdk_root, only_set)
         err(f"{manual_failures} SDK(s) require manual download (pass --allow-manual to skip them).")
         return 1
+    return 0
+
+
+def _print_manual_sdk_guide(sdk_root: Path, only_set: set[str] | None = None) -> None:
+    """Print step-by-step setup instructions for missing, auth-gated, or dynamic-URL SDKs."""
+    host_os = platform.system()
+    candidates: list[SdkSpec] = []
+    for spec in SDK_SPECS:
+        if host_os not in spec.platforms:
+            continue
+        if only_set and spec.key.lower() not in only_set:
+            continue
+        existing, _ = detect_sdk(spec, sdk_root)
+        if existing is None:
+            candidates.append(spec)
+
+    if not candidates:
+        return
+
+    header("Manual SDK Setup Guide")
+    print(f"  {C.DIM}The following SDKs require manual download, login, or an OS installer.{C.RST}")
+    print(f"  {C.DIM}Or set NV_RS_USE_PREBUILT=1 if you only need prebuilt bindings without headers.{C.RST}\n")
+
+    for spec in candidates:
+        target_dir = sdk_root / spec.subdir
+        reason = (
+            "Requires NVIDIA Developer login / manual archive"
+            if spec.url is None and "developer.nvidia.com" in (spec.manual_url or "")
+            else "OS installer / system-wide package"
+            if spec.url is None
+            else "Dynamic/latest URL (or auto-download failed)"
+        )
+        print(f"  {C.YLW}* {spec.display} ({spec.key}){C.RST}")
+        print(f"    Why      : {reason}")
+        if spec.manual_url:
+            print(f"    Download : {spec.manual_url}")
+        elif spec.url:
+            print(f"    Download : {spec.url}")
+        print(f"    Target   : {target_dir}  (or system install / custom path)")
+        print(f"    Markers  : {', '.join(spec.marker_paths)}")
+        print(f"    Env vars : {', '.join(spec.env_vars)} (or NV_SDK_DIRS={sdk_root})")
+        if spec.manual_note:
+            print(f"    Note     : {spec.manual_note}")
+        print()
+
+
+def _linux_pkg_commands(with_nccl: bool, yes: bool) -> tuple[str | None, list[list[str]], list[str]]:
+    """Return (package_manager, commands, package_list) for the current Linux host."""
+    if shutil.which("apt-get"):
+        pkgs = [
+            "build-essential",
+            "clang",
+            "libclang-dev",
+            "pkg-config",
+            "libssl-dev",
+            "xz-utils",
+            "curl",
+            "ca-certificates",
+            "libvulkan1",
+        ]
+        if with_nccl:
+            pkgs.append("libnccl-dev")
+        install_cmd = ["apt-get", "install"] + (["-y"] if yes else []) + pkgs
+        return "apt-get", [["apt-get", "update"], install_cmd], pkgs
+
+    if shutil.which("dnf"):
+        pkgs = [
+            "gcc",
+            "gcc-c++",
+            "make",
+            "clang",
+            "clang-devel",
+            "pkgconf-pkg-config",
+            "openssl-devel",
+            "xz",
+            "curl",
+            "ca-certificates",
+            "vulkan-loader",
+        ]
+        install_cmd = ["dnf", "install"] + (["-y"] if yes else []) + pkgs
+        return "dnf", [install_cmd], pkgs
+
+    if shutil.which("pacman"):
+        pkgs = [
+            "base-devel",
+            "clang",
+            "pkgconf",
+            "openssl",
+            "xz",
+            "curl",
+            "ca-certificates",
+            "vulkan-icd-loader",
+        ]
+        install_cmd = ["pacman", "-S", "--needed"] + (["--noconfirm"] if yes else []) + pkgs
+        return "pacman", [install_cmd], pkgs
+
+    return None, [], [
+        "gcc/g++ (build-essential)",
+        "clang + libclang-dev",
+        "pkg-config",
+        "libssl-dev (openssl-devel)",
+        "xz-utils (xz)",
+        "curl + ca-certificates",
+        "libvulkan1 (vulkan-loader)",
+        *(["libnccl-dev"] if with_nccl else []),
+    ]
+
+
+def cmd_deps_sys(dry_run: bool = False, yes: bool = False, with_nccl: bool = False) -> int:
+    """Install or explain OS-level build/runtime system packages."""
+    header("System Dependencies")
+    if not IS_LINUX:
+        if IS_WINDOWS:
+            step("Windows detected -- no system package manager step required here.")
+            print("  Manual prerequisites for Windows builds:")
+            print("    - Visual Studio Build Tools 2022+ (Desktop development with C++ / MSVC)")
+            print("    - LLVM / libclang (for bindgen, or set NV_RS_USE_PREBUILT=1)")
+            print("    - CUDA Toolkit & Vulkan SDK installers (see manual guide below)")
+        elif IS_MACOS:
+            step("macOS detected -- NVIDIA CUDA host targets are not supported.")
+            print("  Host prerequisites: Xcode Command Line Tools (`xcode-select --install`) and LLVM.")
+        else:
+            warn(f"Unsupported OS ({platform.system()}) for automatic system package install.")
+        return 0
+
+    mgr, cmds, pkgs = _linux_pkg_commands(with_nccl=with_nccl, yes=yes)
+    if not mgr:
+        warn("No supported Linux package manager found (apt-get, dnf, pacman).")
+        print("  Install the equivalent packages manually:")
+        for p in pkgs:
+            print(f"    - {p}")
+        return 0
+
+    need_sudo = hasattr(os, "geteuid") and os.geteuid() != 0
+    prefix: list[str] = []
+    if need_sudo:
+        if not shutil.which("sudo"):
+            err("Not running as root and `sudo` is not installed.")
+            print("  Run the following commands as root:")
+            for c in cmds:
+                print(f"    {' '.join(c)}")
+            return 1
+        prefix = ["sudo"]
+
+    step(f"Package manager: {mgr} ({len(pkgs)} packages)")
+    for raw_cmd in cmds:
+        full_cmd = prefix + raw_cmd
+        if dry_run:
+            step(f"[DRY-RUN] {' '.join(full_cmd)}")
+            continue
+        step(f"Running: {' '.join(full_cmd)}")
+        code, _, ms = run(full_cmd, capture=False)
+        if code != 0:
+            err(f"Command failed (exit {code}, {fmt_time(ms)}): {' '.join(full_cmd)}")
+            return code
+
+    if not dry_run:
+        ok("System dependencies installed")
+    return 0
+
+
+def cmd_install(sub: str, args: argparse.Namespace) -> int:
+    """Handle `i` / `install` commands (`deps`, `sys`)."""
+    if sub == "sys":
+        return cmd_deps_sys(dry_run=args.dry_run, yes=args.yes, with_nccl=args.nccl)
+
+    rc = cmd_deps_sys(dry_run=args.dry_run, yes=args.yes, with_nccl=args.nccl)
+    if rc != 0:
+        return rc
+
+    dl_ns = argparse.Namespace(
+        dir=args.dir,
+        only=args.only,
+        dry_run=args.dry_run,
+        force=args.force,
+        allow_manual=True,
+    )
+    rc = cmd_deps_dl(dl_ns)
+    if rc != 0:
+        return rc
+
+    sdk_root = Path(args.dir).resolve()
+    only_set: set[str] = set()
+    for item in args.only:
+        for part in item.split(","):
+            p = part.strip().lower()
+            if p:
+                only_set.add(p)
+
+    cmd_deps_status(sdk_root)
+    _print_manual_sdk_guide(sdk_root, only_set or None)
     return 0
 
 
@@ -882,8 +1091,36 @@ def main() -> int:
             p.add_argument("--force", action="store_true", help="Re-download existing SDKs")
             p.add_argument("--allow-manual", action="store_true", help="Skip auth-gated SDKs")
             return cmd_deps_dl(p.parse_args(sub_rest))
+        if sub == "sys":
+            p = argparse.ArgumentParser(prog="bootstrap.py deps sys")
+            p.add_argument("--dry-run", action="store_true", help="Preview package manager commands")
+            p.add_argument("-y", "--yes", action="store_true", help="Non-interactive install")
+            p.add_argument("--nccl", action="store_true", help="Also install libnccl-dev (Linux apt)")
+            ns = p.parse_args(sub_rest)
+            return cmd_deps_sys(dry_run=ns.dry_run, yes=ns.yes, with_nccl=ns.nccl)
         err(f"Unknown deps subcommand: {sub}")
         return 2
+
+    if cmd in ("i", "install"):
+        if rest and rest[0] in ("h", "help", "-h", "--help"):
+            print(HELP_TEXT)
+            return 0
+        if not rest or rest[0].startswith("-"):
+            sub, sub_rest = "deps", rest
+        elif rest[0] in ("deps", "sys"):
+            sub, sub_rest = rest[0], rest[1:]
+        else:
+            err(f"Unknown install subcommand: {rest[0]} (expected `deps` or `sys`)")
+            return 2
+
+        p = argparse.ArgumentParser(prog=f"bootstrap.py install {sub}")
+        p.add_argument("--dir", default=str(DEFAULT_SDK_DIR), help="Target SDK directory")
+        p.add_argument("--only", action="append", default=[], help="Filter SDK(s)")
+        p.add_argument("--dry-run", action="store_true", help="Preview without modifying system")
+        p.add_argument("--force", action="store_true", help="Re-download existing public SDKs")
+        p.add_argument("-y", "--yes", action="store_true", help="Non-interactive package install")
+        p.add_argument("--nccl", action="store_true", help="Also install libnccl-dev (Linux apt)")
+        return cmd_install(sub, p.parse_args(sub_rest))
 
     err(f"Unknown command: {cmd}")
     print(HELP_TEXT)

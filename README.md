@@ -46,10 +46,35 @@ python bootstrap.py d dl     # download & unpack public SDKs into .sdk/
 python bootstrap.py s        # toolchain, git HEAD, and SDK summary
 ```
 
-Public SDKs (`nvcomp`, `nvapi`, `cudnn`, `ngx`, Linux `vulkan`) pull straight into `.sdk/`
-(git-ignored). Auth-gated or installer SDKs (`cuda`, `opticalflow`, `videocodec`, Windows
-`vulkan`) report their exact URLs and expected layout. Point `NV_SDK_DIRS` at `.sdk` (or your
-own SDK directory) when building crates that use them.
+Public SDKs (`nvcomp`, `nvapi`, `cudnn`, `ngx`, `optix` headers, Linux `vulkan`, Linux `nccl`)
+pull straight into `.sdk/` (git-ignored). Installer or NVIDIA Developer portal SDKs require
+a one-time manual download/install:
+
+| SDK | `d dl` | Where to get it | Env var or `.sdk/` layout |
+|---|---|---|---|
+| **CUDA Toolkit** (`13.x`) | Manual | [CUDA Downloads](https://developer.download.nvidia.com/compute/cuda/13.3.1/network_installers/cuda_13.3.1_windows_network.exe) | `CUDA_PATH` (default `/usr/local/cuda` or `%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v13.x`) |
+| **OptiX** (`9.x`) | Auto (`optix-dev`) / Installer | [OptiX SDK](https://developer.nvidia.com/rtx/ray-tracing/optix) | `OPTIX_ROOT` or `.sdk/optix` (`include/optix.h`) |
+| **Vulkan SDK** | Auto (Linux) / Installer (Win) | [LunarG Win](https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe) / [Linux](https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz) | `VULKAN_SDK` or `.sdk/vulkan` |
+| **Video Codec SDK** (`nvenc`/`nvdec`) | Manual (login) | [Video Codec SDK](https://developer.nvidia.com/nvidia-video-codec-sdk/download) | `VIDEO_CODEC_SDK_ROOT` or unpack into `.sdk/videocodec/` (`Interface/nvEncodeAPI.h`, `Lib/`) |
+| **Optical Flow SDK** (`nvofa`) | Manual (login) | [Optical Flow SDK](https://developer.nvidia.com/optical-flow-sdk) | `OPTICAL_FLOW_SDK_ROOT` or unpack into `.sdk/opticalflow/` (`NvOFInterface/nvOpticalFlowCommon.h`) |
+| **nvCOMP** (`6.0+`) | Auto (`d dl`) | [nvCOMP redist](https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/redistrib_6.0.0.json) | `NV_SDK_DIRS=.sdk` or `NVCOMP_ROOT` |
+| **NVAPI** (Windows) | Auto (`d dl`) | [NVIDIA/nvapi](https://github.com/NVIDIA/nvapi) | `NV_SDK_DIRS=.sdk` or `NVAPI_ROOT` |
+| **cuDNN** (`9.x`) | Auto (`d dl`) | [cuDNN redist](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/redistrib_9.28.1.json) | `NV_SDK_DIRS=.sdk` or `CUDNN_ROOT` |
+| **NGX / DLSS** | Auto (`d dl`) | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk` or `NGX_SDK_ROOT` |
+| **NCCL** (Linux) | Auto / `apt` | [NVIDIA/nccl](https://github.com/NVIDIA/nccl) or `libnccl-dev` (`>= 2.31` for `nccl_device/core.h`) | `NCCL_ROOT` or `/usr/include/nccl.h` |
+
+Point `NV_SDK_DIRS` at `.sdk` (or your own SDK root) when building crates that depend on
+unpacked SDKs:
+
+```powershell
+$env:NV_SDK_DIRS = "$PWD\.sdk"
+```
+
+```bash
+# Linux / WSL2 (use a separate target dir on ext4 for speed)
+export NV_SDK_DIRS="$PWD/.sdk"
+export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
+```
 
 ### Prebuilt Bindings Fallback
 

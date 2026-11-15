@@ -9,7 +9,7 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'nv-rs',
-			description: 'Direct, honest Rust bindings for the NVIDIA library stack',
+			description: 'Direct, safe Rust bindings for the NVIDIA library stack',
 			social: [
 				{
 					icon: 'github',

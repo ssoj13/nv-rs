@@ -24,7 +24,7 @@ Using NVIDIA's native ecosystem from Rust usually runs into four walls:
 4. **Raw FFI is noisy, but heavy wrappers hide the metal.**
    In graphics, compute, and video pipelines, you want RAII safety and typed `Result`s — without losing control over streams, memory lifetimes, or zero-copy interop with `wgpu`.
 
-`nv-rs` solves all four with a clean split between **declarative build-time codegen**, **explicit runtime loading**, and **thin, honest safe wrappers**.
+`nv-rs` solves all four with a clean split between **declarative build-time codegen**, **explicit runtime loading**, and **thin, zero-overhead safe wrappers**.
 
 ---
 

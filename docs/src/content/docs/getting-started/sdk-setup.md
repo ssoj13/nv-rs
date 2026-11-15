@@ -40,7 +40,7 @@ Public SDKs pull directly into `.sdk/` via `d dl`. Installer-based or NVIDIA Dev
 | **nvCOMP** (`6.0+`) | Auto (`d dl`) | [nvCOMP redist](https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/redistrib_6.0.0.json) | `NV_SDK_DIRS=.sdk` or `NVCOMP_ROOT` |
 | **NVAPI** (Windows) | Auto (`d dl`) | [NVIDIA/nvapi](https://github.com/NVIDIA/nvapi) | `NV_SDK_DIRS=.sdk` or `NVAPI_ROOT` |
 | **cuDNN** (`9.x`) | Auto (`d dl`) | [cuDNN redist](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/redistrib_9.28.1.json) | `NV_SDK_DIRS=.sdk` or `CUDNN_ROOT` |
-| **NGX / DLSS** | Auto (`d dl`) | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk` or `NGX_SDK_ROOT` |
+| **NGX / DLSS** | Auto (`d dl`) / Streamline | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk`, `NGX_SDK_ROOT`, or `C:\Program Files\NVIDIA\Streamline\external\ngx-sdk` |
 | **NCCL** (Linux) | Auto (`d dl`) / `apt` | [NVIDIA/nccl](https://github.com/NVIDIA/nccl) or `libnccl-dev` (`>= 2.31` for `nccl_device/core.h`) | `NCCL_ROOT` or `/usr/include/nccl.h` |
 
 ## Environment Variables
@@ -67,9 +67,10 @@ If you prefer individual overrides instead of `NV_SDK_DIRS`, set the per-SDK var
 `nv-rs` pins the host Rust toolchain to `1.99.1` and treats all warnings as errors:
 
 ```bash
-python bootstrap.py c        # cargo fmt --all --check + clippy --workspace --all-targets -- -D warnings
-python bootstrap.py t        # workspace tests (-d for debug, -p <crate> to scope, --gpu for #[ignore])
-python bootstrap.py b        # workspace build (--release by default; -d for debug)
+python bootstrap.py c            # cargo fmt --all --check + clippy --workspace --all-targets -- -D warnings
+python bootstrap.py t            # workspace tests (-d for debug, -p <crate> to scope, --gpu for #[ignore])
+python bootstrap.py b            # workspace build (--release by default; -d for debug)
+python bootstrap.py b -p nv-demo # build the full-stack nv-demo showcase
 ```
 
 If a build host lacks SDK headers or `libclang`, see [Prebuilt Bindings](/getting-started/prebuilt-bindings/).

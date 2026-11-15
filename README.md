@@ -104,7 +104,7 @@ a one-time manual download/install:
 | **nvCOMP** (`6.0+`) | Auto (`d dl`) | [nvCOMP redist](https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/redistrib_6.0.0.json) | `NV_SDK_DIRS=.sdk` or `NVCOMP_ROOT` |
 | **NVAPI** (Windows) | Auto (`d dl`) | [NVIDIA/nvapi](https://github.com/NVIDIA/nvapi) | `NV_SDK_DIRS=.sdk` or `NVAPI_ROOT` |
 | **cuDNN** (`9.x`) | Auto (`d dl`) | [cuDNN redist](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/redistrib_9.28.1.json) | `NV_SDK_DIRS=.sdk` or `CUDNN_ROOT` |
-| **NGX / DLSS** | Auto (`d dl`) | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk` or `NGX_SDK_ROOT` |
+| **NGX / DLSS** | Auto (`d dl`) / Streamline | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk`, `NGX_SDK_ROOT`, or `C:\Program Files\NVIDIA\Streamline\external\ngx-sdk` |
 | **NCCL** (Linux) | Auto / `apt` | [NVIDIA/nccl](https://github.com/NVIDIA/nccl) or `libnccl-dev` (`>= 2.31` for `nccl_device/core.h`) | `NCCL_ROOT` or `/usr/include/nccl.h` |
 
 Point `NV_SDK_DIRS` at `.sdk` (or your own SDK root) when building crates that depend on
@@ -138,9 +138,10 @@ Never ship an unverified build. Pin the host toolchain to `1.99.1` and treat war
 structural failures:
 
 ```bash
-python bootstrap.py c        # cargo fmt --all --check + clippy --workspace --all-targets -- -D warnings
-python bootstrap.py t        # workspace tests (-d for debug, -p <crate> to scope, --gpu for #[ignore])
-python bootstrap.py b        # workspace build (--release by default; -d for debug)
+python bootstrap.py c            # cargo fmt --all --check + clippy --workspace --all-targets -- -D warnings
+python bootstrap.py t            # workspace tests (-d for debug, -p <crate> to scope, --gpu for #[ignore])
+python bootstrap.py b            # workspace build (--release by default; -d for debug)
+python bootstrap.py b -p nv-demo # build the full-stack nv-demo showcase
 ```
 
 Or invoke Cargo directly:
@@ -155,12 +156,13 @@ with an NVIDIA GPU.
 
 ---
 
-## Interactive RTX Demo (`demo/`)
+## Interactive RTX Demo (`crates/nv-demo/`)
 
-An excluded standalone showcase (`demo/`, binary `nv-demo`, also built by default via `python bootstrap.py b`) combining **OptiX 9** ray tracing (RT Cores via custom AABB fractal primitives — Mandelbulb, Mandelbox, KIFS Octahedron — plus a triangle checkerboard floor), **OptiX AI Denoiser**, **NVRTC** runtime `.cu` -> PTX compilation, zero-copy **`nv-wgpu`** (`SharedBuffer` -> `wgpu::Texture`), an **`egui-wgpu`** interactive orbit/SpaceSim viewport, and live **NVML** GPU telemetry:
+A full-stack showcase (`crates/nv-demo/`, binary `nv-demo`) combining **OptiX 9** multi-instance IAS ray tracing (checkerboard floor, custom AABB fractal primitives — Mandelbulb, Mandelbox, KIFS Octahedron — dielectric glass sphere, and emissive neon accent), **`TemporalAov`** AI denoising with 5 AOVs and interactive A/B split, **`nvrtc`** live `.cu` -> PTX shader hot-reload, **`cufft`** 2D FFT optical diffraction bloom, **`nvjpeg`/`nvenc`** zero-copy JPEG & H.264 export, zero-copy **`nv-wgpu`** (`SharedBuffer` -> `wgpu::Texture`), an **`egui-wgpu`** docked viewport (`F` aim, `A` fit all, `RMB` fly), and **`nvml`/`cupti`/`ngx`** telemetry:
 
 ```powershell
-$env:NV_SDK_DIRS = "$PWD\.sdk"   # or set OPTIX_ROOT / CUDA_PATH
+$env:NV_SDK_DIRS = "$PWD\.sdk"   # or set OPTIX_ROOT / CUDA_PATH / NGX_SDK_ROOT
+python bootstrap.py b -p nv-demo
 cargo run -p nv-demo --release
 ```
 

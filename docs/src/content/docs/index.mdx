@@ -8,6 +8,9 @@ hero:
     - text: Getting Started
       link: /getting-started/overview/
       icon: right-arrow
+    - text: nv-demo Showcase
+      link: /crates/nv-demo/
+      icon: rocket
     - text: GitHub
       link: https://github.com/ssoj13/nv-rs
       icon: external
@@ -42,5 +45,8 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   </Card>
   <Card title="Device & Tooling" icon="wrench">
     `device/optix-device`, `device/cuda-tex-device` (`cuda-oxide` device workspaces), `xtask` (`coverage collect|generate|check`, `prebuilt`), and `bootstrap.py` for SDK provisioning and verification.
+  </Card>
+  <Card title="nv-demo Full-Stack Showcase" icon="star">
+    Interactive **OptiX 9** multi-instance path tracer (`floor`, fractal AABB, glass sphere, neon accent) with `TemporalAov` denoising, 5 AOVs, A/B split, `nvrtc` shader hot-reload, `cufft` FFT bloom, `nvjpeg`/`nvenc` export, and `nvml`/`cupti`/`ngx` telemetry.
   </Card>
 </CardGrid>

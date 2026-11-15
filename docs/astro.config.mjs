@@ -4,6 +4,8 @@ import starlight from '@astrojs/starlight';
 
 // https://astro.build/config
 export default defineConfig({
+	site: 'https://ssoj13.github.io',
+	base: '/nv-rs',
 	integrations: [
 		starlight({
 			title: 'nv-rs',

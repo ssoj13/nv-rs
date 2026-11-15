@@ -17,7 +17,15 @@ explicit typed errors. If a DLL or shared object is missing, you get a clean `Er
 surprise panic.
 
 For architecture decisions, current state, and coverage numbers, read the ship's log:
-[PLAN.md](PLAN.md), [HANDOFF.md](HANDOFF.md), [TODO.md](TODO.md), and [COVERAGE.md](COVERAGE.md).
+[PLAN.md](PLAN.md) and [COVERAGE.md](COVERAGE.md).
+
+Host crates and Python bindings (`nv_rs`) build directly against upstream
+[`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust). The `device/` workspace temporarily
+tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs
+[#1818](https://github.com/NVIDIA/cuda-rust/pull/1818),
+[#1819](https://github.com/NVIDIA/cuda-rust/pull/1819),
+[#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and
+[#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
 
 ---
 

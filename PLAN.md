@@ -14,6 +14,9 @@
 
 ## 2. Remaining / Open Items
 
+- [ ] **Upstream `NVIDIA/cuda-rust` PRs for `device/` (`cuda-oxide`)**:
+  - Host crates (`cuda-bindings`, `cuda-core`, `cuda-async`) already build against upstream `NVIDIA/cuda-rust`.
+  - `device/` temporarily points to `https://github.com/ssoj13/cuda-rust_b.git` pending upstream merge of PRs [#1818](https://github.com/NVIDIA/cuda-rust/pull/1818), [#1819](https://github.com/NVIDIA/cuda-rust/pull/1819), [#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and [#1821](https://github.com/NVIDIA/cuda-rust/pull/1821).
 - [ ] **Multi-GPU & Native Linux Hardware Gates (RunPod / Bare-Metal Linux)**:
   - `nccl` `t3_multi_rank_all_reduce` (requires `>= 2` GPUs; currently skips cleanly on single-GPU hosts).
   - `cufile` native Linux GPUDirect Storage (GDS) hardware path (WSL2 runs `PosixFallback`).

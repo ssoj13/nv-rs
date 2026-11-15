@@ -16,5 +16,5 @@ path = "src/s2_wgpu_cuda_share.rs"
 gpu-info-rs = { path = "../../../gpu-info-rs", default-features = false, features = ["wgpu"] }
 wgpu = "30"
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
-cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-core = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
 pollster = "0.4"

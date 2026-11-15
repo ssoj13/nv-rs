@@ -56,8 +56,8 @@ the NVIDIA-on-Rust gap once and for all across the entire stack.
    [#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and
    [#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
 
-For architecture decisions, current state, and symbol/GPU-test coverage numbers, see
-[PLAN.md](PLAN.md) and [COVERAGE.md](COVERAGE.md).
+For architecture decisions, current state, recent changes, and symbol/GPU-test coverage numbers, see
+[PLAN.md](PLAN.md), [CHANGELOG.md](CHANGELOG.md), and [COVERAGE.md](COVERAGE.md).
 
 ---
 
@@ -71,7 +71,7 @@ For architecture decisions, current state, and symbol/GPU-test coverage numbers,
 | **Imaging, Video & Graphics** | `npp` (`npp-sys`), `nvjpeg` (`nvjpeg-sys`), `nvdec` (`nvcuvid-sys`), `nvenc` (`nvenc-sys`), `nvofa` (`nvofa-sys`), `optix` (`optix-sys`), `ngx` (`ngx-sys` — statically linked per PLAN D15; DLSS-SR/RR safe wrapper supporting both `Init_with_ProjectID` and `ApplicationId` per D13) |
 | **AI, Storage, Comms & Mgmt** | `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), `nvapi` (`nvapi-sys`, Windows) |
 | **Device & Tooling** | `device/optix-device`, `device/cuda-tex-device`, `xtask` (`coverage collect\|generate\|check`, `prebuilt`) |
-| **Python & Docs** | `python/nv-py` (`nv_rs` via PyO3/`maturin`: 24 submodules, DLPack/`__cuda_array_interface__`/Buffer Protocol, `nv_rs.diag`), `docs/` (Astro + Starlight) |
+| **Python & Docs** | `python/nv-py` (`nv_rs` via PyO3/`maturin`: 25 submodules, DLPack/`__cuda_array_interface__`/Buffer Protocol, `nv_rs.diag`), `docs/` (Astro + Starlight) |
 
 ---
 

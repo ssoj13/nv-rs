@@ -23,7 +23,7 @@ sidebar:
   - `Shape::StaticLink` — emits Cargo static/system link directives (`link_libs`, `system_libs`) for static-only SDKs such as NGX.
   - `Shape::FunctionTable` — types and constants only, for libraries whose entry points live in a runtime function table struct (OptiX, NVENC).
 
-For `Exports`, `SplitExports`, and `QueryInterface`, `ReturnPolicy` defines the exact Rust expressions returned when a library is not loaded (`not_loaded`) or a symbol is missing (`missing_symbol`). Functions whose return type has no `ReturnPolicy` (including `void` functions) receive a Rust-ABI wrapper returning `Result<_, nv_loader::CallError>` and are recorded in `Inventory::unshimmed`.
+For `Exports`, `SplitExports`, and `QueryInterface`, `ReturnPolicy` defines the exact Rust expressions returned when a library is not loaded (`not_loaded`) or a symbol is missing (`missing_symbol`). Functions whose return type has no `ReturnPolicy` (including `void` functions) receive a Rust-ABI wrapper returning `Result<_, nv_loader::CallError>` and are recorded in `Inventory::unshimmed`. Every `unsafe` block emitted into `<name>_shims.rs` carries an explicit `// SAFETY:` comment so generated shims pass `#![deny(clippy::undocumented_unsafe_blocks)]` without blanket Clippy suppressions.
 
 `nv_bindgen::device_asm` provides the device-side counterpart: it scans OptiX device headers for inline PTX statements and emits `cuda_device::ptx_asm!` wrappers for `cuda-oxide`.
 

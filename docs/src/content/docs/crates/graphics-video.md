@@ -50,7 +50,7 @@ Safe NVIDIA NGX (DLSS) wrapper over `ngx-sys`.
 
 Safe NVENC hardware video encoder wrapper over `nvenc-sys` and `cuda-core` (H.264, HEVC, AV1).
 
-- **Session lifecycle**: `EncodeSession` opens an NVENC session bound to a `cuda_core::Context`, queries capabilities (`EncodeSession::caps`) and preset configs (`EncodeSession::preset_config`), initializes the encoder (`EncodeSession::initialize`), and encodes frames or flushes EOS with zero per-frame heap allocations.
+- **Session lifecycle**: `EncodeSession` opens an NVENC session bound to a `cuda_core::Context`, serializes all NVENC API calls and `Drop` paths through an internal `Mutex<()>` for sound `Sync` sharing, queries capabilities (`EncodeSession::caps`) and preset configs (`EncodeSession::preset_config`), initializes the encoder (`EncodeSession::initialize`), and encodes frames or flushes EOS with zero per-frame heap allocations.
 - **Input & output buffers**: `InputBuffer` / `InputLock` (host-accessible driver-allocated buffers), `RegisteredResource` / `MappedResource` (zero-copy CUDA device-pointer or CUDA-array input registration), and `OutputBitstream` / `BitstreamLock` (yielding `&[u8]` encoded packets).
 - **GUIDs (`guid`)**: Authoritative H.264, HEVC, AV1, profile, and `P1`–`P7` preset GUIDs.
 

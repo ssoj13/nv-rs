@@ -40,6 +40,7 @@ cargo +1.99.1 test --workspace --lib
 
 ### GPU & Cross-Platform Verification
 
+- **CI workflow** (`.github/workflows/ci.yml`): Runs on `ubuntu-latest` and `windows-latest` for every push to `main` and pull request, verifying `cargo fmt --all -- --check`, `cargo clippy -- -D warnings`, `cargo test` on SDK-free core crates (`nv-loader`, `nv-bindgen`, `nv-bindgen-fixture`), and Python stub parity (`python -m unittest python/nv-py/tests/test_stub_sync.py -v`).
 - **GPU integration tests**: Tests requiring a physical NVIDIA GPU or runtime driver are marked `#[ignore]`. Run them serialized on a GPU-equipped host via `python bootstrap.py t --gpu`, `cargo xtask gpu-test`, or `cargo +1.99.1 test -- --ignored`.
 - **WSL2 / Linux verification**: When modifying Linux-targeted crates (`nccl`, `cufile`, `nv-loader`, `nv-bindgen`, `nv-wgpu`, `ngx`), run `fmt`, `clippy --workspace --all-targets -- -D warnings`, and `test --workspace --lib` inside WSL2 or native Linux in addition to Windows.
 

@@ -1,6 +1,6 @@
 ---
 title: Python Bindings Overview & Installation
-description: Building, installing, and using the nv_rs Python bindings with maturin, bootstrap.py, and the 24-submodule NVIDIA Rust stack.
+description: Building, installing, and using the nv_rs Python bindings with maturin, bootstrap.py, and the 25-submodule NVIDIA Rust stack.
 ---
 
 `nv_rs` provides Python bindings (built with PyO3 and `maturin`) for the `nv-rs` NVIDIA Rust stack, exposing zero-copy GPU buffers, CUDA runtime/driver primitives, NVML, NVRTC, nvCOMP, nvJPEG, NVENC/NVDEC, cuBLAS/cuDNN/cuFFT, and built-in diagnostics.

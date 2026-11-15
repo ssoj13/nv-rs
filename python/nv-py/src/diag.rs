@@ -69,6 +69,12 @@ fn clear_events() {
     diag::clear_events();
 }
 
+/// Registers an additional directory to search when loading NVIDIA shared libraries.
+#[pyfunction]
+fn add_dll_directory(path: std::path::PathBuf) {
+    nv_loader::add_search_dir(&path);
+}
+
 /// Probes all known NVIDIA libraries without loading them into the process.
 #[pyfunction]
 fn probe_libraries(py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -239,6 +245,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stats, &m)?)?;
     m.add_function(wrap_pyfunction!(events, &m)?)?;
     m.add_function(wrap_pyfunction!(clear_events, &m)?)?;
+    m.add_function(wrap_pyfunction!(add_dll_directory, &m)?)?;
     m.add_function(wrap_pyfunction!(probe_libraries, &m)?)?;
     m.add_function(wrap_pyfunction!(doctor, &m)?)?;
     m.add_class::<TraceGuard>()?;

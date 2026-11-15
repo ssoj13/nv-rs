@@ -17,6 +17,7 @@ toml.workspace = true
 thiserror.workspace = true
 # Optix coverage gate: SDK location (vcv-rs) and the `_optix_*` intrinsic scanner (nv-bindgen).
 nv-bindgen.workspace = true
+nv-loader = { path = "../crates/nv-loader" }
 vcv-rs.workspace = true
 
 [lints]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from . import _nv_rs
 from ._nv_rs import (
     __version__,
@@ -31,6 +33,17 @@ from ._nv_rs import (
     optix,
     wgpu,
 )
+
+
+_DLL_DIR_HANDLES: list[object] = []
+
+
+def add_dll_directory(path: str | os.PathLike[str]) -> None:
+    """Register an additional directory for loading NVIDIA shared libraries/DLLs."""
+    p = os.fspath(path)
+    diag.add_dll_directory(p)
+    if os.name == "nt" and hasattr(os, "add_dll_directory") and os.path.isdir(p):
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(os.path.abspath(p)))
 
 
 def trace(level: str = "trace", print_on_exit: bool = True) -> diag.TraceGuard:
@@ -87,6 +100,7 @@ __all__ = [
     "nvrtc",
     "optix",
     "wgpu",
+    "add_dll_directory",
     "trace",
     "format_doctor",
 ]

@@ -23,6 +23,21 @@ for name, entry in libs.items():
     print(name, entry["present"], entry.get("path"))
 ```
 
+## Custom DLL Search Directories (`add_dll_directory`)
+
+If CUDA Toolkit or SDK libraries live outside standard system locations, register extra search directories before loading any `nv_rs` submodule:
+
+```python
+import nv_rs
+
+nv_rs.add_dll_directory(r"C:\path\to\cuda\bin\x64")
+# Also exposed on the diagnostics submodule:
+nv_rs.diag.add_dll_directory(r"C:\path\to\cudnn\bin")
+```
+
+- `nv_rs.add_dll_directory(path)` accepts `str | os.PathLike[str]`, forwards the path to `nv_rs.diag.add_dll_directory` (which calls `nv_loader::add_search_dir`), and on Windows also calls `os.add_dll_directory` (retaining the handle) when the directory exists so transitive DLL dependencies resolve.
+- `nv_rs.diag.add_dll_directory(path)` registers the directory directly in `nv_loader` without calling `os.add_dll_directory`.
+
 ## Diagnostic Levels, Stats & Events
 
 Control verbosity and inspect recorded diagnostic events and counters:

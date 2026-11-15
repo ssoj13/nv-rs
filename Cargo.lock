@@ -4362,6 +4362,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "nv-bindgen",
+ "nv-loader",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

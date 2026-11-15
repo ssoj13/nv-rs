@@ -68,7 +68,10 @@ pub struct DllSpec {
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     /// No candidate file exists.
-    #[error("{lib}: not found (searched {})", show_paths(.tried))]
+    #[error(
+        "{lib}: not found (searched {}); place the library next to the executable, set NV_DLL_DIRS, or add its directory to PATH",
+        show_paths(.tried)
+    )]
     NotFound {
         /// The library.
         lib: &'static str,
@@ -287,13 +290,82 @@ pub fn candidates(spec: &DllSpec) -> Vec<PathBuf> {
     candidates_with(&SystemProbe, spec)
 }
 
+static EXTRA_SEARCH_DIRS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// Registers an extra directory to search before standard toolkit, SDK, or `PATH` locations.
+///
+/// Empty paths and duplicates are ignored.
+pub fn add_search_dir(dir: impl AsRef<Path>) {
+    let path = dir.as_ref();
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let mut dirs = EXTRA_SEARCH_DIRS.write().unwrap_or_else(|e| e.into_inner());
+    let owned = path.to_path_buf();
+    if !dirs.contains(&owned) {
+        dirs.push(owned);
+    }
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+fn extra_search_dirs(probe: &dyn Probe) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(env_dirs) = probe.env("NV_DLL_DIRS") {
+        for dir in std::env::split_paths(&env_dirs) {
+            push_unique_dir(&mut dirs, dir);
+        }
+    }
+    let registered = EXTRA_SEARCH_DIRS.read().unwrap_or_else(|e| e.into_inner());
+    for dir in registered.iter() {
+        push_unique_dir(&mut dirs, dir.clone());
+    }
+    dirs
+}
+
+fn push_toolkit_root(dirs: &mut Vec<PathBuf>, root: &Path) {
+    // CUDA 13 moved DLLs into `bin\x64` while 12.x keeps them in `bin`; CUPTI ships under
+    // `extras\CUPTI\lib64`.
+    for dir in [
+        root.join("bin").join("x64"),
+        root.join("bin"),
+        root.join("extras").join("CUPTI").join("lib64"),
+    ] {
+        push_unique_dir(dirs, dir);
+    }
+}
+
+fn cuda_version_dirs(probe: &dyn Probe, cuda_base: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<(Vec<u32>, String)> = probe
+        .list_dir(cuda_base)
+        .into_iter()
+        .filter_map(|name| {
+            let rest = name.strip_prefix('v').or_else(|| name.strip_prefix('V'))?;
+            let parts: Vec<u32> = rest
+                .split('.')
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect();
+            Some((parts, name))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    entries
+        .into_iter()
+        .map(|(_, name)| cuda_base.join(name))
+        .collect()
+}
+
 /// Candidate paths for `spec` as seen through `probe`, most preferred first.
 ///
 /// On Linux an SDK's discovered runtime directory precedes bare sonames. The dynamic linker's
 /// own search (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL) follows that hint.
 pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
     if !cfg!(windows) {
-        return linux_candidates(spec);
+        return linux_candidates_with(probe, spec);
     }
     let dirs = search_dirs(probe, spec.group);
     let mut out: Vec<PathBuf> = Vec::new();
@@ -321,16 +393,55 @@ pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
     out
 }
 
-/// Linux SDK hints come from the discovery owner; retain the dynamic linker's sonames after them.
-fn linux_candidates(spec: &DllSpec) -> Vec<PathBuf> {
+/// Linux candidate paths: extra search dirs, runtime env roots, build hints, then bare sonames.
+fn linux_candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
+    const TOOLKIT_VARS: [&str; 4] = [
+        "CUDA_PATH",
+        "CUDA_HOME",
+        "CUDA_ROOT",
+        "CUDA_TOOLKIT_ROOT_DIR",
+    ];
     let mut out = Vec::new();
-    if let Group::Sdk {
-        hint: Some(dir), ..
-    } = spec.group
-    {
-        out.extend(spec.linux.iter().map(|soname| Path::new(dir).join(soname)));
+    for dir in extra_search_dirs(probe) {
+        for soname in spec.linux {
+            push_unique_dir(&mut out, dir.join(soname));
+        }
     }
-    out.extend(spec.linux.iter().map(PathBuf::from));
+    match spec.group {
+        Group::Sdk { root_var, hint } => {
+            if let Some(root) = probe.env(root_var) {
+                let root = Path::new(&root);
+                for sub in ["lib64", "lib"] {
+                    let dir = root.join(sub);
+                    for soname in spec.linux {
+                        push_unique_dir(&mut out, dir.join(soname));
+                    }
+                }
+            }
+            if let Some(dir) = hint {
+                for soname in spec.linux {
+                    push_unique_dir(&mut out, Path::new(dir).join(soname));
+                }
+            }
+        }
+        Group::Toolkit => {
+            for var in TOOLKIT_VARS {
+                if let Some(root) = probe.env(var) {
+                    let root = Path::new(&root);
+                    for sub in ["lib64", "lib"] {
+                        let dir = root.join(sub);
+                        for soname in spec.linux {
+                            push_unique_dir(&mut out, dir.join(soname));
+                        }
+                    }
+                }
+            }
+        }
+        Group::Driver | Group::DriverStore => {}
+    }
+    for soname in spec.linux {
+        push_unique_dir(&mut out, PathBuf::from(soname));
+    }
     out
 }
 
@@ -344,14 +455,24 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
     .join("System32");
     match group {
         Group::Driver => vec![system32],
-        // NVIDIA's own order: System32 first (older drivers copied it there), then the adapters.
-        Group::DriverStore => std::iter::once(system32)
-            .chain(probe.display_driver_dirs())
-            .collect(),
+        // NVIDIA's own order: System32 first (older drivers copied it there), then the adapters,
+        // then any user-supplied extra directories.
+        Group::DriverStore => {
+            let mut dirs = vec![system32];
+            for dir in probe.display_driver_dirs() {
+                push_unique_dir(&mut dirs, dir);
+            }
+            for dir in extra_search_dirs(probe) {
+                push_unique_dir(&mut dirs, dir);
+            }
+            dirs
+        }
         Group::Toolkit => {
-            // The variables vcv-rs and cudarc honour, in the same order; CUDA 13 moved DLLs into
-            // bin\x64 while 12.x keeps them in bin, so both are searched.
-            let mut dirs = Vec::new();
+            let mut dirs = extra_search_dirs(probe);
+            if let Some(exe) = probe.exe_dir() {
+                push_unique_dir(&mut dirs, exe);
+            }
+            // The variables vcv-rs and cudarc honour, in the same order.
             for var in [
                 "CUDA_PATH",
                 "CUDA_HOME",
@@ -359,36 +480,73 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
                 "CUDA_TOOLKIT_ROOT_DIR",
             ] {
                 if let Some(root) = probe.env(var) {
-                    let root = PathBuf::from(root);
-                    // CUPTI ships its DLLs under extras\CUPTI\lib64, outside bin.
-                    for dir in [
-                        root.join("bin").join("x64"),
-                        root.join("bin"),
-                        root.join("extras").join("CUPTI").join("lib64"),
-                    ] {
-                        if !dirs.contains(&dir) {
-                            dirs.push(dir);
-                        }
-                    }
+                    push_toolkit_root(&mut dirs, Path::new(&root));
+                }
+            }
+            let program_files = probe
+                .env("ProgramFiles")
+                .unwrap_or_else(|| r"C:\Program Files".to_string());
+            let cuda_base = PathBuf::from(program_files)
+                .join("NVIDIA GPU Computing Toolkit")
+                .join("CUDA");
+            for ver_dir in cuda_version_dirs(probe, &cuda_base) {
+                push_toolkit_root(&mut dirs, &ver_dir);
+            }
+            if let Some(path_var) = probe.env("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    push_unique_dir(&mut dirs, dir);
                 }
             }
             dirs
         }
         Group::Sdk { root_var, hint } => {
-            let mut dirs: Vec<PathBuf> = probe.exe_dir().into_iter().collect();
+            let mut dirs = extra_search_dirs(probe);
+            if let Some(exe) = probe.exe_dir() {
+                push_unique_dir(&mut dirs, exe);
+            }
             if let Some(root) = probe.env(root_var) {
                 let root = PathBuf::from(root);
-                dirs.extend([
+                for dir in [
                     root.join("bin").join("x64"),
                     root.join("bin"),
                     root.join("lib"),
-                ]);
+                ] {
+                    push_unique_dir(&mut dirs, dir);
+                }
             }
-            dirs.extend(hint.map(PathBuf::from));
-            dirs.dedup();
+            if let Some(dir) = hint {
+                push_unique_dir(&mut dirs, PathBuf::from(dir));
+            }
+            if let Some(path_var) = probe.env("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    push_unique_dir(&mut dirs, dir);
+                }
+            }
             dirs
         }
     }
+}
+
+/// Opens a dynamic library at `path`.
+///
+/// On Windows, tries `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`
+/// (`0x0000_1100`) so transitive DLL dependencies next to `path` resolve without mutating
+/// `PATH`, falling back to [`libloading::Library::new`] on error.
+pub fn open_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    #[cfg(windows)]
+    {
+        // `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`
+        const SEARCH_FLAGS: u32 = 0x0000_1100;
+        if let Ok(lib) = unsafe {
+            // SAFETY: loading a dynamic library executes only its loader initialisers; the
+            // `LOAD_LIBRARY_SEARCH_*` flags restrict dependency resolution to safe directories.
+            libloading::os::windows::Library::load_with_flags(path, SEARCH_FLAGS)
+        } {
+            return Ok(lib.into());
+        }
+    }
+    // SAFETY: loading a dynamic library executes only its loader initialisers.
+    unsafe { libloading::Library::new(path) }
 }
 
 /// Opens the first candidate for which `open` succeeds.
@@ -529,10 +687,14 @@ macro_rules! exports_sys {
                 ::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>,
             > = ::std::sync::OnceLock::new();
             API.get_or_init(|| {
-                // SAFETY: opening the library runs only its loader initialisers; symbols are
-                // resolved lazily and a missing one becomes an `Err` field, not a crash.
                 $crate::open_first(&DLL, |p| {
-                    unsafe { api::$api::new(p) }.map_err(|e| e.to_string())
+                    $crate::open_library(p)
+                        .and_then(|lib| unsafe {
+                            // SAFETY: opening the library runs only its loader initialisers; symbols
+                            // are resolved lazily and a missing one becomes an `Err` field, not a crash.
+                            api::$api::from_library(lib)
+                        })
+                        .map_err(|e| e.to_string())
                 })
             })
         }
@@ -594,8 +756,7 @@ impl QueryInterface {
     /// # Safety
     /// `symbol` must name a function with the signature `void* (unsigned int)`.
     pub unsafe fn open(path: &Path, symbol: &[u8]) -> Result<Self, String> {
-        // SAFETY: loading the library runs only its initialisers.
-        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
+        let lib = open_library(path).map_err(|e| e.to_string())?;
         // SAFETY: the caller guarantees the symbol's signature.
         let query =
             unsafe { lib.get::<unsafe extern "C" fn(u32) -> *mut core::ffi::c_void>(symbol) }
@@ -718,9 +879,15 @@ macro_rules! split_exports_sys {
                     static API: ::std::sync::OnceLock<::core::result::Result<$crate::Loaded<api::$api>, $crate::LoadError>> =
                         ::std::sync::OnceLock::new();
                     API.get_or_init(|| {
-                        // SAFETY: opening the library runs only its loader initialisers; symbols
-                        // are resolved lazily and a missing one becomes an `Err` field.
-                        $crate::open_first(&DLL, |p| unsafe { api::$api::new(p) }.map_err(|e| e.to_string()))
+                        $crate::open_first(&DLL, |p| {
+                            $crate::open_library(p)
+                                .and_then(|lib| unsafe {
+                                    // SAFETY: opening the library runs only its loader initialisers;
+                                    // symbols are resolved lazily and a missing one becomes an `Err` field.
+                                    api::$api::from_library(lib)
+                                })
+                                .map_err(|e| e.to_string())
+                        })
                     })
                 }
 
@@ -740,7 +907,81 @@ macro_rules! split_exports_sys {
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// Serializes tests that mutate `EXTRA_SEARCH_DIRS` against tests that assert exact lists.
+    static EXTRA_DIRS_GATE: RwLock<()> = RwLock::new(());
+
+    pub(super) fn read_extra_dirs_gate() -> RwLockReadGuard<'static, ()> {
+        EXTRA_DIRS_GATE.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) struct ExtraDirsGuard {
+        _lock: RwLockWriteGuard<'static, ()>,
+    }
+
+    impl ExtraDirsGuard {
+        pub(super) fn new() -> Self {
+            let lock = EXTRA_DIRS_GATE.write().unwrap_or_else(|e| e.into_inner());
+            EXTRA_SEARCH_DIRS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ExtraDirsGuard {
+        fn drop(&mut self) {
+            EXTRA_SEARCH_DIRS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+    }
+
+    /// A machine described by maps instead of a real filesystem and registry.
+    #[derive(Default)]
+    pub(super) struct Fake {
+        pub(super) env: HashMap<&'static str, &'static str>,
+        pub(super) dirs: HashMap<PathBuf, Vec<&'static str>>,
+        pub(super) drivers: Vec<PathBuf>,
+        pub(super) exe: Option<PathBuf>,
+    }
+
+    impl Probe for Fake {
+        fn exe_dir(&self) -> Option<PathBuf> {
+            self.exe.clone()
+        }
+        fn env(&self, name: &str) -> Option<String> {
+            self.env.get(name).map(|s| (*s).to_string())
+        }
+        fn is_file(&self, path: &Path) -> bool {
+            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                return false;
+            };
+            self.dirs
+                .get(dir)
+                .is_some_and(|files| files.iter().any(|f| *f == name.to_string_lossy()))
+        }
+        fn list_dir(&self, dir: &Path) -> Vec<String> {
+            self.dirs
+                .get(dir)
+                .map(|f| f.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default()
+        }
+        fn display_driver_dirs(&self) -> Vec<PathBuf> {
+            self.drivers.clone()
+        }
+    }
+}
+
+#[cfg(test)]
 mod linux_tests {
+    use super::test_support::{Fake, read_extra_dirs_gate};
     use super::*;
 
     #[test]
@@ -764,6 +1005,7 @@ mod linux_tests {
 
     #[test]
     fn linux_sdk_hint_supports_a_versioned_soname_without_an_unversioned_link() {
+        let _gate = read_extra_dirs_gate();
         let spec = DllSpec {
             lib: "nccl",
             group: Group::Sdk {
@@ -774,7 +1016,7 @@ mod linux_tests {
             linux: &["libnccl.so.2"],
         };
         assert_eq!(
-            linux_candidates(&spec),
+            linux_candidates_with(&Fake::default(), &spec),
             [
                 PathBuf::from("/sdk/nccl/lib/libnccl.so.2"),
                 PathBuf::from("libnccl.so.2")
@@ -784,6 +1026,7 @@ mod linux_tests {
 
     #[test]
     fn linux_driver_toolkit_and_unhinted_sdk_keep_bare_sonames() {
+        let _gate = read_extra_dirs_gate();
         let spec = DllSpec {
             lib: "test",
             group: Group::Driver,
@@ -791,6 +1034,7 @@ mod linux_tests {
             linux: &["libtest.so.2", "libtest.so"],
         };
         let expected = [PathBuf::from("libtest.so.2"), PathBuf::from("libtest.so")];
+        let fake = Fake::default();
         for group in [
             Group::Driver,
             Group::DriverStore,
@@ -800,8 +1044,56 @@ mod linux_tests {
                 hint: None,
             },
         ] {
-            assert_eq!(linux_candidates(&DllSpec { group, ..spec }), expected);
+            assert_eq!(
+                linux_candidates_with(&fake, &DllSpec { group, ..spec }),
+                expected
+            );
         }
+    }
+
+    #[test]
+    fn linux_candidates_with_checks_extra_dirs_runtime_roots_and_hints() {
+        let _gate = read_extra_dirs_gate();
+        let mut fake = Fake::default();
+        fake.env.insert("NV_DLL_DIRS", "/custom/lib");
+        fake.env.insert("NCCL_ROOT", "/opt/nccl");
+        fake.env.insert("CUDA_PATH", "/usr/local/cuda");
+
+        let sdk_spec = DllSpec {
+            lib: "nccl",
+            group: Group::Sdk {
+                root_var: "NCCL_ROOT",
+                hint: Some("/build/nccl/lib"),
+            },
+            windows: &[],
+            linux: &["libnccl.so.2"],
+        };
+        assert_eq!(
+            linux_candidates_with(&fake, &sdk_spec),
+            vec![
+                PathBuf::from("/custom/lib/libnccl.so.2"),
+                PathBuf::from("/opt/nccl/lib64/libnccl.so.2"),
+                PathBuf::from("/opt/nccl/lib/libnccl.so.2"),
+                PathBuf::from("/build/nccl/lib/libnccl.so.2"),
+                PathBuf::from("libnccl.so.2"),
+            ]
+        );
+
+        let toolkit_spec = DllSpec {
+            lib: "cufft",
+            group: Group::Toolkit,
+            windows: &[],
+            linux: &["libcufft.so.11"],
+        };
+        assert_eq!(
+            linux_candidates_with(&fake, &toolkit_spec),
+            vec![
+                PathBuf::from("/custom/lib/libcufft.so.11"),
+                PathBuf::from("/usr/local/cuda/lib64/libcufft.so.11"),
+                PathBuf::from("/usr/local/cuda/lib/libcufft.so.11"),
+                PathBuf::from("libcufft.so.11"),
+            ]
+        );
     }
 
     #[test]
@@ -814,6 +1106,9 @@ mod linux_tests {
 
         let load_err = CallError::Load(&LOAD_ERR);
         assert!(load_err.to_string().starts_with("fake: not found"));
+        let msg = load_err.to_string();
+        assert!(msg.contains("NV_DLL_DIRS"), "{msg}");
+        assert!(msg.contains("PATH"), "{msg}");
         let load_cause = std::error::Error::source(&load_err).expect("load cause");
         assert!(
             load_cause.is::<LoadError>(),
@@ -843,43 +1138,8 @@ mod linux_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use super::test_support::{ExtraDirsGuard, Fake, read_extra_dirs_gate};
     use super::*;
-    use std::collections::HashMap;
-
-    /// A machine described by maps instead of a real filesystem and registry.
-    #[derive(Default)]
-    struct Fake {
-        env: HashMap<&'static str, &'static str>,
-        dirs: HashMap<PathBuf, Vec<&'static str>>,
-        drivers: Vec<PathBuf>,
-        exe: Option<PathBuf>,
-    }
-
-    impl Probe for Fake {
-        fn exe_dir(&self) -> Option<PathBuf> {
-            self.exe.clone()
-        }
-        fn env(&self, name: &str) -> Option<String> {
-            self.env.get(name).map(|s| (*s).to_string())
-        }
-        fn is_file(&self, path: &Path) -> bool {
-            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-                return false;
-            };
-            self.dirs
-                .get(dir)
-                .is_some_and(|files| files.iter().any(|f| *f == name.to_string_lossy()))
-        }
-        fn list_dir(&self, dir: &Path) -> Vec<String> {
-            self.dirs
-                .get(dir)
-                .map(|f| f.iter().map(|s| (*s).to_string()).collect())
-                .unwrap_or_default()
-        }
-        fn display_driver_dirs(&self) -> Vec<PathBuf> {
-            self.drivers.clone()
-        }
-    }
 
     const CUFFT: DllSpec = DllSpec {
         lib: "cufft",
@@ -896,6 +1156,7 @@ mod tests {
 
     #[test]
     fn toolkit_prefix_scan_prefers_the_highest_suffix_and_skips_other_libraries() {
+        let _gate = read_extra_dirs_gate();
         // Mutation that reddens this: drop the reverse sort (11 before 12) or the `.dll` filter
         // (the `.lib`/`cufftw` neighbours become candidates).
         let mut fake = Fake::default();
@@ -921,6 +1182,7 @@ mod tests {
 
     #[test]
     fn driver_store_searches_system32_before_the_adapter_folders() {
+        let _gate = read_extra_dirs_gate();
         let mut fake = Fake::default();
         fake.env.insert("SystemRoot", r"C:\Windows");
         fake.drivers = vec![PathBuf::from(r"C:\DS\nv_a"), PathBuf::from(r"C:\DS\nv_b")];
@@ -937,6 +1199,7 @@ mod tests {
 
     #[test]
     fn open_first_skips_missing_files_and_reports_rejections() {
+        let _gate = read_extra_dirs_gate();
         let mut fake = Fake::default();
         fake.env.insert("SystemRoot", r"C:\Windows");
         fake.drivers = vec![PathBuf::from(r"C:\DS\old"), PathBuf::from(r"C:\DS\new")];
@@ -969,6 +1232,7 @@ mod tests {
 
     #[test]
     fn nothing_present_is_not_found_with_every_searched_path() {
+        let _gate = read_extra_dirs_gate();
         let mut fake = Fake::default();
         fake.env.insert("SystemRoot", r"C:\Windows");
         let err = open_first_with(&fake, &OPTIX, |_| Ok(())).expect_err("nothing installed");
@@ -980,6 +1244,7 @@ mod tests {
 
     #[test]
     fn an_unset_sdk_root_is_never_guessed() {
+        let _gate = read_extra_dirs_gate();
         let spec = DllSpec {
             lib: "cudnn",
             group: Group::Sdk {
@@ -994,6 +1259,7 @@ mod tests {
 
     #[test]
     fn sdk_dlls_are_searched_next_to_the_exe_then_root_then_build_hint() {
+        let _gate = read_extra_dirs_gate();
         let spec = DllSpec {
             lib: "cudnn",
             group: Group::Sdk {
@@ -1018,6 +1284,98 @@ mod tests {
                 PathBuf::from(r"C:\app\cudnn64_9.dll"),
                 PathBuf::from(r"C:\cudnn\bin\x64\cudnn64_9.dll"),
                 PathBuf::from(r"C:\hint\bin\cudnn64_9.dll"),
+            ]
+        );
+    }
+
+    #[test]
+    fn nv_dll_dirs_env_is_searched_before_exe_and_toolkit_root() {
+        let _gate = read_extra_dirs_gate();
+        let mut fake = Fake {
+            exe: Some(PathBuf::from(r"C:\app")),
+            ..Fake::default()
+        };
+        fake.env
+            .insert("NV_DLL_DIRS", r"C:\override_a;C:\override_b");
+        fake.env.insert("CUDA_PATH", r"C:\cuda");
+        for dir in [
+            r"C:\override_a",
+            r"C:\override_b",
+            r"C:\app",
+            r"C:\cuda\bin\x64",
+        ] {
+            fake.dirs.insert(PathBuf::from(dir), vec!["cufft64_12.dll"]);
+        }
+        let got = candidates_with(&fake, &CUFFT);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(r"C:\override_a\cufft64_12.dll"),
+                PathBuf::from(r"C:\override_b\cufft64_12.dll"),
+                PathBuf::from(r"C:\app\cufft64_12.dll"),
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_12.dll"),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_search_dir_deduplicates_and_ignores_empty_paths() {
+        let _guard = ExtraDirsGuard::new();
+        add_search_dir("");
+        add_search_dir(r"C:\prog_extra");
+        add_search_dir(r"C:\prog_extra");
+
+        let mut fake = Fake {
+            exe: Some(PathBuf::from(r"C:\app")),
+            ..Fake::default()
+        };
+        fake.dirs
+            .insert(PathBuf::from(r"C:\prog_extra"), vec!["cufft64_12.dll"]);
+        fake.dirs
+            .insert(PathBuf::from(r"C:\app"), vec!["cufft64_12.dll"]);
+        let got = candidates_with(&fake, &CUFFT);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(r"C:\prog_extra\cufft64_12.dll"),
+                PathBuf::from(r"C:\app\cufft64_12.dll"),
+            ]
+        );
+    }
+
+    #[test]
+    fn toolkit_searches_exe_dir_program_files_descending_and_path() {
+        let _gate = read_extra_dirs_gate();
+        let mut fake = Fake {
+            exe: Some(PathBuf::from(r"C:\app")),
+            ..Fake::default()
+        };
+        fake.env.insert("ProgramFiles", r"C:\Program Files");
+        fake.env.insert("PATH", r"C:\from_path");
+        fake.dirs.insert(
+            PathBuf::from(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"),
+            vec!["v12.6", "v13.0", "other"],
+        );
+        for dir in [
+            r"C:\app",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\x64",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
+            r"C:\from_path",
+        ] {
+            fake.dirs.insert(PathBuf::from(dir), vec!["cufft64_12.dll"]);
+        }
+        let got = candidates_with(&fake, &CUFFT);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(r"C:\app\cufft64_12.dll"),
+                PathBuf::from(
+                    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\x64\cufft64_12.dll"
+                ),
+                PathBuf::from(
+                    r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin\cufft64_12.dll"
+                ),
+                PathBuf::from(r"C:\from_path\cufft64_12.dll"),
             ]
         );
     }

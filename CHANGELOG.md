@@ -8,6 +8,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## [Unreleased]
 
 ### Added
+- **`nv-loader` DLL discovery & `open_library`** (`crates/nv-loader/src/nv_loader.rs`): Added `nv_loader::add_search_dir`, `NV_DLL_DIRS` support, expanded `Group::Toolkit` / `Group::Sdk` / `Group::DriverStore` search order (`exe_dir`, `%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*`, `PATH`, and Linux runtime `root_var` / `CUDA_PATH` resolution in `linux_candidates_with`), `nv_loader::open_library` (`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` with `Library::new` fallback), and actionable `LoadError::NotFound` hints.
+- **`nv_rs.add_dll_directory`** (`python/nv-py/`): Added `nv_rs.add_dll_directory(path)` and `nv_rs.diag.add_dll_directory(path)` to register extra DLL search directories at runtime (also calling `os.add_dll_directory` on Windows).
+- **`cargo xtask stage-dlls`** (`xtask/src/stage_dlls.rs`): Added `cargo xtask stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]` to stage redistributable NVIDIA runtime DLLs into a target directory.
 - **GitHub Actions CI** (`.github/workflows/ci.yml`): Automated `ubuntu-latest` and `windows-latest` checks running `cargo fmt --all -- --check`, `cargo clippy` (`-D warnings`), `cargo test` on SDK-free core crates (`nv-loader`, `nv-bindgen`, `nv-bindgen-fixture`), and Python stub synchronization tests.
 - **Python stub parity tests** (`python/nv-py/tests/test_stub_sync.py`): Verifies that all 25 submodules and `__version__` exported by `python/nv-py/src/lib.rs` match `__init__.pyi`, `__init__.py`, and `pyproject.toml`.
 - **Starlight documentation & GitHub Pages** (`docs/`, `.github/workflows/pages.yml`): Full documentation site covering architecture, `nv-loader`, `nv-bindgen`, `cuda-core-ext`, `nv-wgpu`, all wrapped NVIDIA crates, `nv-demo`, and the `nv_rs` Python API, published at <https://ssoj13.github.io/nv-rs/>.

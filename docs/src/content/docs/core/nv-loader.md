@@ -21,24 +21,28 @@ pub struct DllSpec {
 ```
 
 - On **Windows**, `windows` entries are exact file names or `prefix*` patterns (for example `cublas64_13*` or `cufft64_12*`); matching `.dll` files in a searched directory are ordered highest name first.
-- On **Linux**, `linux` sonames are tried in order through the dynamic linker (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL), preceded by any discovered SDK runtime directory.
+- On **Linux**, `linux_candidates_with` emits paths from `extra_search_dirs` (`NV_DLL_DIRS` and `nv_loader::add_search_dir`), runtime `root_var` / `CUDA_PATH` (`CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT`, `CUDA_TOOLKIT_ROOT_DIR`) `lib64`/`lib` subdirectories, and any build-time `hint` (for `Group::Sdk`), followed by bare `linux` sonames resolved through the dynamic linker (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL).
 
 `Group` controls where `candidates` / `candidates_with` searches:
 
 | Variant | Where it searches |
 | --- | --- |
 | `Group::Driver` | Display driver libraries in `System32` (Windows) or the system library path (`nvml`, `nvEncodeAPI64`, `nvcuvid`, `nvofapi64`, `nvapi64`). |
-| `Group::DriverStore` | Driver-store-only libraries (`nvoptix`, `nvngx`): `System32` first, then each display-class adapter's `OpenGLDriverName` directory from the Windows registry (`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}`). |
-| `Group::Toolkit` | CUDA Toolkit libraries under the toolkit root (`cufft64_12`, `nvrtc64_130_0`). |
-| `Group::Sdk { root_var, hint }` | Separately installed SDKs (`cuDNN`, `nvCOMP`, etc.): executable directory (`exe_dir`) first, then `<root_var>/bin[/x64]` and `<root_var>/lib`, then `hint` (an `Option<&'static str>` baked at build time via `nv_loader::hint(env!("NV_RS_SDK_BIN"))`). |
+| `Group::DriverStore` | Driver-store-only libraries (`nvoptix`, `nvngx`): `System32` first, then each display-class adapter's `OpenGLDriverName` directory from the Windows registry (`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}`), then `extra_search_dirs` (`NV_DLL_DIRS` and `nv_loader::add_search_dir`). |
+| `Group::Toolkit` | CUDA Toolkit libraries (`cufft64_12`, `nvrtc64_130_0`): on Windows, `extra_search_dirs`, `exe_dir`, `CUDA_PATH` / `CUDA_HOME` / `CUDA_ROOT` / `CUDA_TOOLKIT_ROOT_DIR` (`bin\x64`, `bin`, `extras\CUPTI\lib64`), `%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v*` (highest version first), then `PATH`; on Linux, `extra_search_dirs`, `CUDA_PATH` / `CUDA_HOME` / `CUDA_ROOT` / `CUDA_TOOLKIT_ROOT_DIR` (`lib64`, `lib`), then bare sonames. |
+| `Group::Sdk { root_var, hint }` | Separately installed SDKs (`cuDNN`, `nvCOMP`, etc.): on Windows, `extra_search_dirs`, `exe_dir`, `<root_var>/bin[/x64]` and `<root_var>/lib`, `hint` (an `Option<&'static str>` baked at build time via `nv_loader::hint(env!("NV_RS_SDK_BIN"))`), then `PATH`; on Linux, `extra_search_dirs`, `<root_var>/lib64` and `<root_var>/lib`, `hint`, then bare sonames. |
+
+Extra search directories (`extra_search_dirs`) can be supplied at runtime either via the `NV_DLL_DIRS` environment variable (parsed with `std::env::split_paths`) or programmatically via `nv_loader::add_search_dir(dir)` before libraries are loaded.
 
 Discovery reads the environment, filesystem, registry, and executable path through the `Probe` trait (`SystemProbe` in production; mock implementations in unit tests).
 
 ## Loading and Typed Errors
 
+`open_library(path)` opens a dynamic library at `path`. On Windows, it tries `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (`0x0000_1100`) so transitive DLL dependencies next to `path` resolve without mutating `PATH`, falling back to `libloading::Library::new` on error; on non-Windows platforms it delegates to `libloading::Library::new`. Generated `exports_sys!`, `split_exports_sys!`, and `QueryInterface::open` loaders use `open_library`.
+
 `open_first(spec, open)` (and `open_first_with(probe, spec, open)`) walks `candidates` in priority order and returns `Result<Loaded<T>, LoadError>`, where `Loaded<T>` pairs the constructed `value: T` with the `path: PathBuf` that produced it.
 
-- `LoadError::NotFound { lib, tried }` — no candidate file existed; lists every searched `PathBuf`.
+- `LoadError::NotFound { lib, tried }` — no candidate file existed; lists every searched `PathBuf` and includes an actionable hint to place the library next to the executable, set `NV_DLL_DIRS`, or add its directory to `PATH`.
 - `LoadError::Rejected { lib, failures }` — candidates existed, but every one was rejected by the dynamic linker or constructor; records each `(PathBuf, String)` failure.
 - `LoadError::RuntimeTooOld { lib, required, found }` — returned by `check_version(lib, required, found)` when a loaded library reports an older version than the bindings require.
 

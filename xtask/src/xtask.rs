@@ -24,6 +24,7 @@
 
 mod optix_cov;
 mod prebuilt;
+mod stage_dlls;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -45,8 +46,10 @@ enum Error {
     Optix(String),
     #[error("{0}")]
     Prebuilt(String),
+    #[error("{0}")]
+    StageDlls(String),
     #[error(
-        "usage: cargo xtask <coverage <collect|generate|check|optix> | prebuilt [--out <dir>] [--target <triple>] | stage-prebuilt [--out <dir>] [--target <triple>]>"
+        "usage: cargo xtask <coverage <collect|generate|check|optix> | prebuilt [--out <dir>] [--target <triple>] | stage-prebuilt [--out <dir>] [--target <triple>] | stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]>"
     )]
     Usage,
 }
@@ -123,6 +126,10 @@ fn main() -> ExitCode {
         ["prebuilt" | "stage-prebuilt", rest @ ..] => {
             let refs: Vec<&str> = rest.to_vec();
             prebuilt::run(&root, &refs).map_err(Error::Prebuilt)
+        }
+        ["stage-dlls", rest @ ..] => {
+            let refs: Vec<&str> = rest.to_vec();
+            stage_dlls::run(&refs).map_err(Error::StageDlls)
         }
         _ => Err(Error::Usage),
     };

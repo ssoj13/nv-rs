@@ -680,6 +680,10 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         ],
     )
     .expect("floor verts");
+    let tri_build_opts = BuildOptions {
+        random_vertex_access: true,
+        ..BuildOptions::default()
+    };
     let floor_gas = Accel::triangles(
         &optix_ctx,
         &stream,
@@ -688,7 +692,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             flags: &[GeometryFlags::DISABLE_ANYHIT],
             ..TriangleMesh::new(&floor_verts)
         }],
-        BuildOptions::default(),
+        tri_build_opts.clone(),
     )
     .expect("floor GAS");
 
@@ -721,7 +725,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             flags: &[GeometryFlags::DISABLE_ANYHIT],
             ..TriangleMesh::new(&sphere_verts)
         }],
-        BuildOptions::default(),
+        tri_build_opts.clone(),
     )
     .expect("glass GAS");
 
@@ -736,7 +740,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             flags: &[GeometryFlags::DISABLE_ANYHIT],
             ..TriangleMesh::new(&ring_verts)
         }],
-        BuildOptions::default(),
+        tri_build_opts,
     )
     .expect("neon GAS");
 

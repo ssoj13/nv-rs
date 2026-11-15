@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{CString, c_void};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -16,6 +17,9 @@ use optix::{
     LinkOptions, Module, ModuleOptions, Params as DenoiserParams, Pipeline, PipelineOptions,
     ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
 };
+
+use crate::fft_bloom::FftBloomPass;
+use crate::gpu_export::{VideoRecorder, save_jpeg_from_rgba8};
 
 const RAYTRACER_CU: &str = include_str!("../shaders/raytracer.cu");
 const TONEMAP_CU: &str = include_str!("../shaders/tonemap.cu");
@@ -63,7 +67,19 @@ struct LaunchParams {
     sky_params: [f32; 4],
     accum_count: u32,
     _pad0: [u32; 3],
+    out_motion_f32: u64,
+    out_depth_f32: u64,
+    prev_cam_pos: [f32; 4],
+    prev_cam_forward: [f32; 4],
+    prev_cam_right: [f32; 4],
+    prev_cam_up: [f32; 4],
+    sat_pos: [f32; 4],
+    glass_params: [f32; 4],
+    aov_mode: u32,
+    _pad1: [u32; 3],
 }
+
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 432);
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct DemoSettings {
@@ -130,9 +146,29 @@ pub struct DemoSettings {
     pub aov_mode: u32,
     pub render_scale: f32,
     pub denoiser_on: bool,
+    pub temporal_denoise: bool,
     pub shadows_on: bool,
     pub auto_rotate: bool,
     pub spin_speed: f32,
+    // Multi-instance Scene (Glass Satellite + Neon Accent)
+    pub sat_on: bool,
+    pub sat_orbit: bool,
+    pub sat_radius: f32,
+    pub sat_orbit_radius: f32,
+    pub sat_height: f32,
+    pub glass_ior: f32,
+    pub glass_absorb: f32,
+    pub glass_roughness: f32,
+    pub neon_on: bool,
+    // FFT Bloom (cuFFT)
+    pub bloom_on: bool,
+    pub bloom_threshold: f32,
+    pub bloom_intensity: f32,
+    pub bloom_blades: u32,
+    // A/B Split Comparison
+    pub split_on: bool,
+    pub split_x: f32,
+    pub right_is_aov: u32,
 }
 
 impl Default for DemoSettings {
@@ -194,9 +230,26 @@ impl Default for DemoSettings {
             aov_mode: 0,
             render_scale: 1.0,
             denoiser_on: false,
+            temporal_denoise: false,
             shadows_on: true,
             auto_rotate: false,
             spin_speed: 0.045,
+            sat_on: true,
+            sat_orbit: true,
+            sat_radius: 0.36,
+            sat_orbit_radius: 1.65,
+            sat_height: 0.25,
+            glass_ior: 1.52,
+            glass_absorb: 0.45,
+            glass_roughness: 0.02,
+            neon_on: true,
+            bloom_on: false,
+            bloom_threshold: 1.25,
+            bloom_intensity: 0.35,
+            bloom_blades: 6,
+            split_on: false,
+            split_x: 0.5,
+            right_is_aov: 0,
         }
     }
 }
@@ -226,6 +279,15 @@ pub enum RenderCmd {
         buf_idx: usize,
         gen_id: u64,
     },
+    SaveJpeg {
+        path: PathBuf,
+        quality: u8,
+    },
+    ToggleRecord {
+        path: PathBuf,
+        fps: u32,
+    },
+    ReloadShader,
     Shutdown,
 }
 
@@ -236,6 +298,11 @@ pub struct FrameReady {
     pub total_samples: u32,
     pub rt_ms: f32,
     pub denoise_ms: f32,
+    pub bloom_ms: f32,
+    pub tonemap_ms: f32,
+    pub is_recording: bool,
+    pub record_frames: u64,
+    pub status_msg: Option<String>,
 }
 
 struct TonemapKernel {
@@ -256,18 +323,26 @@ struct OptixRig {
     stream: Arc<Stream>,
     _optix_ctx: Arc<DeviceContext>,
     _scratch: Scratch,
-    _floor_gas: Arc<Accel>,
-    _fractal_gas: Arc<Accel>,
+    floor_gas: Arc<Accel>,
+    fractal_gas: Arc<Accel>,
+    glass_gas: Arc<Accel>,
+    neon_gas: Arc<Accel>,
     ias: Arc<Accel>,
     pipeline: Pipeline,
     sbt: ShaderBindingTable,
     denoiser: Denoiser,
+    denoiser_is_temporal: bool,
+    temporal_has_prev: bool,
     color_f32: DeviceBuffer<[f32; 4]>,
     albedo_f32: DeviceBuffer<[f32; 4]>,
     normal_f32: DeviceBuffer<[f32; 4]>,
     denoised_f32: DeviceBuffer<[f32; 4]>,
+    prev_denoised_f32: DeviceBuffer<[f32; 4]>,
+    motion_f32: DeviceBuffer<[f32; 2]>,
+    depth_f32: DeviceBuffer<f32>,
     params_buf: DeviceBuffer<u8>,
     tonemap: TonemapKernel,
+    bloom: Option<FftBloomPass>,
 }
 
 fn find_optix_include() -> Option<String> {
@@ -308,7 +383,7 @@ fn find_cuda_include() -> Option<String> {
     None
 }
 
-fn compile_ptx(src: &str, name: &str, include_optix: bool) -> Vec<u8> {
+fn try_compile_ptx(src: &str, name: &str, include_optix: bool) -> Result<Vec<u8>, String> {
     let mut opts = nvrtc::CompileOptions::new()
         .arch("compute_75")
         .std("c++17")
@@ -323,23 +398,239 @@ fn compile_ptx(src: &str, name: &str, include_optix: bool) -> Vec<u8> {
         }
     }
 
-    let mut prog = nvrtc::Program::new(src, Some(name), &[]).expect("nvrtcProgram");
+    let mut prog = nvrtc::Program::new(src, Some(name), &[])
+        .map_err(|e| format!("NVRTC program {name} failed: {e}"))?;
     prog.compile(&opts)
-        .unwrap_or_else(|e| panic!("NVRTC compile {name} failed: {e}"));
-    let mut bytes = prog.ptx().expect("NVRTC ptx");
+        .map_err(|e| format!("NVRTC compile {name} failed: {e}"))?;
+    let mut bytes = prog
+        .ptx()
+        .map_err(|e| format!("NVRTC ptx {name} failed: {e}"))?;
     if bytes.last() != Some(&0) {
         bytes.push(0);
     }
-    bytes
+    Ok(bytes)
 }
 
-fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
+fn build_optix_pipeline(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Stream,
+    rt_ptx: &[u8],
+) -> Result<(Pipeline, ShaderBindingTable), String> {
+    let mut opts = PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8)
+        .map_err(|e| format!("PipelineOptions: {e}"))?;
+    opts.attribute_values = 4;
+    opts.primitive_types = 0; // custom AABB + triangles
+    let (module, _) = Module::new(optix_ctx, &ModuleOptions::default(), &opts, rt_ptx)
+        .map_err(|e| format!("Module::new: {e}"))?;
+
+    let raygen = ProgramGroup::raygen(&module, "__raygen__render")
+        .map_err(|e| format!("raygen: {e}"))?;
+    let miss = ProgramGroup::miss(&module, "__miss__miss")
+        .map_err(|e| format!("miss: {e}"))?;
+    let miss_shadow = ProgramGroup::miss(&module, "__miss__shadow")
+        .map_err(|e| format!("miss_shadow: {e}"))?;
+    let hit_floor = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__hit")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_floor: {e}"))?;
+    let hit_fractal = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__fractal")),
+            intersection: Some((&module, "__intersection__fractal")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_fractal: {e}"))?;
+
+    let (pipeline, _) = Pipeline::new(
+        optix_ctx,
+        &opts,
+        LinkOptions::default(),
+        &[
+            raygen.clone(),
+            miss.clone(),
+            miss_shadow.clone(),
+            hit_floor.clone(),
+            hit_fractal.clone(),
+        ],
+    )
+    .map_err(|e| format!("Pipeline::new: {e}"))?;
+
+    let sbt = ShaderBindingTable::new(
+        stream,
+        &SbtRecord::new(&raygen, 0u32).map_err(|e| format!("sbt raygen: {e}"))?,
+        &[
+            SbtRecord::new(&miss, 0u32).map_err(|e| format!("sbt miss0: {e}"))?,
+            SbtRecord::new(&miss_shadow, 0u32).map_err(|e| format!("sbt miss1: {e}"))?,
+        ],
+        &[
+            SbtRecord::new(&hit_floor, 0u32).map_err(|e| format!("sbt hit0: {e}"))?,
+            SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
+        ],
+    )
+    .map_err(|e| format!("SBT::new: {e}"))?;
+
+    Ok((pipeline, sbt))
+}
+
+fn create_denoiser(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Arc<Stream>,
+    width: u32,
+    height: u32,
+    temporal: bool,
+) -> (Denoiser, bool) {
+    if temporal
+        && let Ok(d) = Denoiser::new(
+            optix_ctx,
+            stream,
+            DenoiserOptions {
+                model: DenoiserModel::TemporalAov,
+                albedo: true,
+                normal: true,
+                ..Default::default()
+            },
+            width,
+            height,
+        )
+    {
+        return (d, true);
+    }
+    let d = Denoiser::new(
+        optix_ctx,
+        stream,
+        DenoiserOptions {
+            model: DenoiserModel::Hdr,
+            albedo: true,
+            normal: true,
+            ..Default::default()
+        },
+        width,
+        height,
+    )
+    .expect("Denoiser");
+    (d, false)
+}
+
+fn build_uv_sphere(stacks: u32, slices: u32) -> Vec<[f32; 3]> {
+    use std::f32::consts::{PI, TAU};
+    let mut tris = Vec::with_capacity((stacks * slices * 6) as usize);
+    let pt = |i: u32, j: u32| -> [f32; 3] {
+        let phi = PI * (i as f32 / stacks as f32);
+        let theta = TAU * (j as f32 / slices as f32);
+        let s = phi.sin();
+        [s * theta.cos(), phi.cos(), s * theta.sin()]
+    };
+    for i in 0..stacks {
+        for j in 0..slices {
+            let p00 = pt(i, j);
+            let p10 = pt(i + 1, j);
+            let p11 = pt(i + 1, j + 1);
+            let p01 = pt(i, j + 1);
+            if i > 0 {
+                tris.extend_from_slice(&[p00, p11, p01]);
+            }
+            if i + 1 < stacks {
+                tris.extend_from_slice(&[p00, p10, p11]);
+            }
+        }
+    }
+    tris
+}
+
+fn build_torus_ring(major_r: f32, minor_r: f32, segs: u32, tube_segs: u32) -> Vec<[f32; 3]> {
+    use std::f32::consts::TAU;
+    let mut tris = Vec::with_capacity((segs * tube_segs * 6) as usize);
+    let pt = |i: u32, j: u32| -> [f32; 3] {
+        let u = TAU * (i as f32 / segs as f32);
+        let v = TAU * (j as f32 / tube_segs as f32);
+        let r = major_r + minor_r * v.cos();
+        [r * u.cos(), minor_r * v.sin(), r * u.sin()]
+    };
+    for i in 0..segs {
+        for j in 0..tube_segs {
+            let p00 = pt(i, j);
+            let p10 = pt(i + 1, j);
+            let p11 = pt(i + 1, j + 1);
+            let p01 = pt(i, j + 1);
+            tris.extend_from_slice(&[p00, p10, p11, p00, p11, p01]);
+        }
+    }
+    tris
+}
+
+struct SceneGas<'a> {
+    floor: &'a Arc<Accel>,
+    fractal: &'a Arc<Accel>,
+    glass: &'a Arc<Accel>,
+    neon: &'a Arc<Accel>,
+}
+
+struct SceneState {
+    sat_pos: [f32; 3],
+    sat_radius: f32,
+    sat_on: bool,
+    neon_on: bool,
+}
+
+fn build_ias(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    gas: SceneGas<'_>,
+    state: SceneState,
+) -> Arc<Accel> {
+    let mut instances = Vec::with_capacity(4);
+    let mut i0 = Instance::new(gas.floor);
+    i0.id = 0;
+    i0.sbt_offset = 0;
+    instances.push(i0);
+
+    let mut i1 = Instance::new(gas.fractal);
+    i1.id = 1;
+    i1.sbt_offset = 1;
+    instances.push(i1);
+
+    if state.sat_on {
+        let r = state.sat_radius.max(0.05);
+        let mut i2 = Instance::new(gas.glass);
+        i2.id = 2;
+        i2.sbt_offset = 0;
+        i2.transform = [
+            r, 0.0, 0.0, state.sat_pos[0],
+            0.0, r, 0.0, state.sat_pos[1],
+            0.0, 0.0, r, state.sat_pos[2],
+        ];
+        instances.push(i2);
+    }
+
+    if state.neon_on {
+        let mut i3 = Instance::new(gas.neon);
+        i3.id = 3;
+        i3.sbt_offset = 0;
+        i3.transform = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, -1.24,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        instances.push(i3);
+    }
+
+    Accel::instances(optix_ctx, stream, scratch, &instances, BuildOptions::default()).expect("IAS")
+}
+
+fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
     let stream = cuda.default_stream();
     let optix_ctx = DeviceContext::new(cuda, None, 0, false).expect("OptiX DeviceContext");
     let mut scratch = Scratch::new(&stream);
 
-    let rt_ptx = compile_ptx(RAYTRACER_CU, "raytracer.cu", true);
-    let tm_ptx = compile_ptx(TONEMAP_CU, "tonemap.cu", false);
+    let rt_ptx = try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true).expect("raytracer.cu PTX");
+    let tm_ptx = try_compile_ptx(TONEMAP_CU, "tonemap.cu", false).expect("tonemap.cu PTX");
     let mut cu_mod: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `tm_ptx` is NUL-terminated PTX compiled by NVRTC on the current context.
     let res = unsafe { cu::cuModuleLoadData(&mut cu_mod, tm_ptx.as_ptr().cast()) };
@@ -358,61 +649,7 @@ fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
         func: cu_func,
     };
 
-    let mut opts =
-        PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8).expect("opts");
-    opts.attribute_values = 4;
-    opts.primitive_types = 0; // custom AABB + triangles
-    let (module, _) =
-        Module::new(&optix_ctx, &ModuleOptions::default(), &opts, &rt_ptx).expect("module");
-
-    let raygen = ProgramGroup::raygen(&module, "__raygen__render").expect("raygen");
-    let miss = ProgramGroup::miss(&module, "__miss__miss").expect("miss");
-    let miss_shadow = ProgramGroup::miss(&module, "__miss__shadow").expect("miss_shadow");
-    let hit_floor = ProgramGroup::hit_group(
-        &optix_ctx,
-        HitGroup {
-            closest_hit: Some((&module, "__closesthit__hit")),
-            ..Default::default()
-        },
-    )
-    .expect("hit_floor");
-    let hit_fractal = ProgramGroup::hit_group(
-        &optix_ctx,
-        HitGroup {
-            closest_hit: Some((&module, "__closesthit__fractal")),
-            intersection: Some((&module, "__intersection__fractal")),
-            ..Default::default()
-        },
-    )
-    .expect("hit_fractal");
-
-    let (pipeline, _) = Pipeline::new(
-        &optix_ctx,
-        &opts,
-        LinkOptions::default(),
-        &[
-            raygen.clone(),
-            miss.clone(),
-            miss_shadow.clone(),
-            hit_floor.clone(),
-            hit_fractal.clone(),
-        ],
-    )
-    .expect("pipeline");
-
-    let sbt = ShaderBindingTable::new(
-        &stream,
-        &SbtRecord::new(&raygen, 0u32).expect("rg"),
-        &[
-            SbtRecord::new(&miss, 0u32).expect("m0"),
-            SbtRecord::new(&miss_shadow, 0u32).expect("m1"),
-        ],
-        &[
-            SbtRecord::new(&hit_floor, 0u32).expect("h0"),
-            SbtRecord::new(&hit_fractal, 0u32).expect("h1"),
-        ],
-    )
-    .expect("sbt");
+    let (pipeline, sbt) = build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
     let floor_verts = DeviceBuffer::from_host(
@@ -457,83 +694,117 @@ fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
     )
     .expect("fractal GAS");
 
-    let mut i0 = Instance::new(&floor_gas);
-    i0.id = 0;
-    i0.sbt_offset = 0;
-    let mut i1 = Instance::new(&fractal_gas);
-    i1.id = 1;
-    i1.sbt_offset = 1;
-    let ias = Accel::instances(
+    // Glass satellite sphere (unit sphere, transformed via IAS)
+    let sphere_tris = build_uv_sphere(24, 36);
+    let sphere_verts = DeviceBuffer::from_host(&stream, &sphere_tris).expect("sphere verts");
+    let glass_gas = Accel::triangles(
         &optix_ctx,
         &stream,
         &mut scratch,
-        &[i0, i1],
+        &[TriangleMesh {
+            flags: &[GeometryFlags::DISABLE_ANYHIT],
+            ..TriangleMesh::new(&sphere_verts)
+        }],
         BuildOptions::default(),
     )
-    .expect("IAS");
+    .expect("glass GAS");
 
-    let denoiser = Denoiser::new(
+    // Emissive neon accent ring around the stage
+    let ring_tris = build_torus_ring(1.95, 0.045, 72, 14);
+    let ring_verts = DeviceBuffer::from_host(&stream, &ring_tris).expect("ring verts");
+    let neon_gas = Accel::triangles(
         &optix_ctx,
         &stream,
-        DenoiserOptions {
-            model: DenoiserModel::Hdr,
-            albedo: true,
-            normal: true,
-            ..Default::default()
+        &mut scratch,
+        &[TriangleMesh {
+            flags: &[GeometryFlags::DISABLE_ANYHIT],
+            ..TriangleMesh::new(&ring_verts)
+        }],
+        BuildOptions::default(),
+    )
+    .expect("neon GAS");
+
+    let sat_pos = [initial_settings.sat_orbit_radius, initial_settings.sat_height, 0.0];
+    let ias = build_ias(
+        &optix_ctx,
+        &stream,
+        &mut scratch,
+        SceneGas {
+            floor: &floor_gas,
+            fractal: &fractal_gas,
+            glass: &glass_gas,
+            neon: &neon_gas,
         },
+        SceneState {
+            sat_pos,
+            sat_radius: initial_settings.sat_radius,
+            sat_on: initial_settings.sat_on,
+            neon_on: initial_settings.neon_on,
+        },
+    );
+
+    let (denoiser, denoiser_is_temporal) = create_denoiser(
+        &optix_ctx,
+        &stream,
         DEFAULT_W,
         DEFAULT_H,
-    )
-    .expect("Denoiser");
+        initial_settings.temporal_denoise,
+    );
 
     let n = (DEFAULT_W * DEFAULT_H) as usize;
     let color_f32 = DeviceBuffer::zeroed(&stream, n).expect("color_f32");
     let albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("albedo_f32");
     let normal_f32 = DeviceBuffer::zeroed(&stream, n).expect("normal_f32");
     let denoised_f32 = DeviceBuffer::zeroed(&stream, n).expect("denoised_f32");
+    let prev_denoised_f32 = DeviceBuffer::zeroed(&stream, n).expect("prev_denoised_f32");
+    let motion_f32 = DeviceBuffer::zeroed(&stream, n).expect("motion_f32");
+    let depth_f32 = DeviceBuffer::zeroed(&stream, n).expect("depth_f32");
     let params_buf =
         DeviceBuffer::zeroed(&stream, std::mem::size_of::<LaunchParams>()).expect("params");
+    let bloom = FftBloomPass::new(cuda).ok();
     stream.synchronize().expect("init sync");
 
     OptixRig {
         stream,
         _optix_ctx: optix_ctx,
         _scratch: scratch,
-        _floor_gas: floor_gas,
-        _fractal_gas: fractal_gas,
+        floor_gas,
+        fractal_gas,
+        glass_gas,
+        neon_gas,
         ias,
         pipeline,
         sbt,
         denoiser,
+        denoiser_is_temporal,
+        temporal_has_prev: false,
         color_f32,
         albedo_f32,
         normal_f32,
         denoised_f32,
+        prev_denoised_f32,
+        motion_f32,
+        depth_f32,
         params_buf,
         tonemap,
+        bloom,
     }
 }
 
-fn resize_rig(rig: &mut OptixRig, width: u32, height: u32) {
+fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     rig.stream.synchronize().expect("pre-resize sync");
     let n = (width * height) as usize;
     rig.color_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("color_f32 resize");
     rig.albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("albedo_f32 resize");
     rig.normal_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("normal_f32 resize");
     rig.denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("denoised_f32 resize");
-    rig.denoiser = Denoiser::new(
-        &rig._optix_ctx,
-        &rig.stream,
-        DenoiserOptions {
-            model: DenoiserModel::Hdr,
-            albedo: true,
-            normal: true,
-            ..Default::default()
-        },
-        width,
-        height,
-    )
-    .expect("Denoiser resize");
+    rig.prev_denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("prev_denoised_f32 resize");
+    rig.motion_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("motion_f32 resize");
+    rig.depth_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("depth_f32 resize");
+    let (denoiser, is_temporal) = create_denoiser(&rig._optix_ctx, &rig.stream, width, height, temporal);
+    rig.denoiser = denoiser;
+    rig.denoiser_is_temporal = is_temporal;
+    rig.temporal_has_prev = false;
     rig.stream.synchronize().expect("resize sync");
 }
 
@@ -550,7 +821,7 @@ pub fn spawn_render_thread(
         .name("optix-render".to_string())
         .spawn(move || {
             cuda.bind_to_thread().expect("cuda bind_to_thread on render thread");
-            let mut rig = init_optix(&cuda);
+            let mut rig = init_optix(&cuda, &initial_settings);
             let mut cur_w = DEFAULT_W;
             let mut cur_h = DEFAULT_H;
             let mut cur_gen: u64 = 0;
@@ -558,23 +829,37 @@ pub fn spawn_render_thread(
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut settings = initial_settings;
             let mut camera = initial_camera;
+            let mut prev_camera = initial_camera;
             let mut accum_count: u32 = 0;
             let mut frame_index: u32 = 0;
             let mut spin_angle: f32 = 0.0;
+            let mut sat_angle: f32 = 0.0;
+            let mut last_ias_state = (
+                settings.sat_on,
+                settings.neon_on,
+                [settings.sat_orbit_radius, settings.sat_height, 0.0, settings.sat_radius],
+            );
             let mut last_tick = Instant::now();
+            let mut pending_jpeg: Option<(PathBuf, u8)> = None;
+            let mut recorder: Option<VideoRecorder> = None;
+            let mut pending_status: Option<String> = None;
 
             loop {
                 let mut should_exit = false;
                 let apply_cmd = |cmd: RenderCmd,
-                                     rig: &mut OptixRig,
-                                     cur_w: &mut u32,
-                                     cur_h: &mut u32,
-                                     cur_gen: &mut u64,
-                                     buf_ptrs: &mut [u64; 2],
-                                     free_bufs: &mut VecDeque<usize>,
-                                     settings: &mut DemoSettings,
-                                     camera: &mut CameraFrame,
-                                     accum_count: &mut u32|
+                                 cuda: &Arc<CudaContext>,
+                                 rig: &mut OptixRig,
+                                 cur_w: &mut u32,
+                                 cur_h: &mut u32,
+                                 cur_gen: &mut u64,
+                                 buf_ptrs: &mut [u64; 2],
+                                 free_bufs: &mut VecDeque<usize>,
+                                 settings: &mut DemoSettings,
+                                 camera: &mut CameraFrame,
+                                 accum_count: &mut u32,
+                                 pending_jpeg: &mut Option<(PathBuf, u8)>,
+                                 recorder: &mut Option<VideoRecorder>,
+                                 pending_status: &mut Option<String>|
                  -> bool {
                     match cmd {
                         RenderCmd::Update {
@@ -582,16 +867,15 @@ pub fn spawn_render_thread(
                             camera: c,
                             reset_accum,
                         } => {
-                            let only_aov_or_exp = s.aov_mode != settings.aov_mode
-                                || (s.exposure - settings.exposure).abs() > 1e-6;
-                            let only_non_accum = only_aov_or_exp
-                                && {
-                                    let mut tmp = *s;
-                                    tmp.aov_mode = settings.aov_mode;
-                                    tmp.exposure = settings.exposure;
-                                    tmp == *settings
-                                }
-                                && c == *camera;
+                            let mut tmp = *s;
+                            tmp.exposure = settings.exposure;
+                            tmp.split_on = settings.split_on;
+                            tmp.split_x = settings.split_x;
+                            tmp.right_is_aov = settings.right_is_aov;
+                            if s.aov_mode < 3 && settings.aov_mode < 3 {
+                                tmp.aov_mode = settings.aov_mode;
+                            }
+                            let only_non_accum = tmp == *settings && c == *camera;
                             if reset_accum || (!only_non_accum && (*s != *settings || c != *camera))
                             {
                                 *accum_count = 0;
@@ -606,8 +890,12 @@ pub fn spawn_render_thread(
                             buf_ptrs: new_ptrs,
                             gen_id,
                         } => {
+                            if let Some(rec) = recorder.take() {
+                                let _ = rec.finish();
+                                *pending_status = Some("Recording stopped on resize".to_string());
+                            }
                             if width != *cur_w || height != *cur_h {
-                                resize_rig(rig, width, height);
+                                resize_rig(rig, width, height, settings.temporal_denoise);
                                 *cur_w = width;
                                 *cur_h = height;
                             }
@@ -625,13 +913,67 @@ pub fn spawn_render_thread(
                             }
                             false
                         }
-                        RenderCmd::Shutdown => true,
+                        RenderCmd::SaveJpeg { path, quality } => {
+                            *pending_jpeg = Some((path, quality));
+                            *accum_count = (*accum_count).min(settings.max_accum.saturating_sub(1));
+                            false
+                        }
+                        RenderCmd::ToggleRecord { path, fps } => {
+                            if let Some(rec) = recorder.take() {
+                                let frames = rec.frame_count();
+                                *pending_status = Some(match rec.finish() {
+                                    Ok(n) => format!("Saved video ({n} frames)"),
+                                    Err(e) => format!("Video finish failed ({frames}f): {e}"),
+                                });
+                            } else {
+                                match VideoRecorder::start(cuda, *cur_w, *cur_h, fps, &path) {
+                                    Ok(rec) => {
+                                        *recorder = Some(rec);
+                                        *pending_status =
+                                            Some(format!("Recording to {}", path.display()));
+                                    }
+                                    Err(e) => {
+                                        *pending_status = Some(format!("Record start failed: {e}"));
+                                    }
+                                }
+                            }
+                            false
+                        }
+                        RenderCmd::ReloadShader => {
+                            let disk_path = PathBuf::from("crates/nv-demo/shaders/raytracer.cu");
+                            let res = std::fs::read_to_string(&disk_path)
+                                .map_err(|e| format!("Read {}: {e}", disk_path.display()))
+                                .and_then(|src| try_compile_ptx(&src, "raytracer.cu", true))
+                                .and_then(|ptx| {
+                                    build_optix_pipeline(&rig._optix_ctx, &rig.stream, &ptx)
+                                });
+                            match res {
+                                Ok((pipeline, sbt)) => {
+                                    let _ = rig.stream.synchronize();
+                                    rig.pipeline = pipeline;
+                                    rig.sbt = sbt;
+                                    *accum_count = 0;
+                                    *pending_status = Some("Shader hot-reloaded".to_string());
+                                }
+                                Err(e) => {
+                                    *pending_status = Some(format!("Hot-reload failed: {e}"));
+                                }
+                            }
+                            false
+                        }
+                        RenderCmd::Shutdown => {
+                            if let Some(rec) = recorder.take() {
+                                let _ = rec.finish();
+                            }
+                            true
+                        }
                     }
                 };
 
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     if apply_cmd(
                         cmd,
+                        &cuda,
                         &mut rig,
                         &mut cur_w,
                         &mut cur_h,
@@ -641,6 +983,9 @@ pub fn spawn_render_thread(
                         &mut settings,
                         &mut camera,
                         &mut accum_count,
+                        &mut pending_jpeg,
+                        &mut recorder,
+                        &mut pending_status,
                     ) {
                         should_exit = true;
                         break;
@@ -651,6 +996,10 @@ pub fn spawn_render_thread(
                 }
 
                 let converged = !settings.auto_rotate
+                    && !(settings.sat_on && settings.sat_orbit)
+                    && recorder.is_none()
+                    && pending_jpeg.is_none()
+                    && pending_status.is_none()
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
 
@@ -659,6 +1008,7 @@ pub fn spawn_render_thread(
                         Ok(cmd) => {
                             if apply_cmd(
                                 cmd,
+                                &cuda,
                                 &mut rig,
                                 &mut cur_w,
                                 &mut cur_h,
@@ -668,6 +1018,9 @@ pub fn spawn_render_thread(
                                 &mut settings,
                                 &mut camera,
                                 &mut accum_count,
+                                &mut pending_jpeg,
+                                &mut recorder,
+                                &mut pending_status,
                             ) {
                                 break;
                             }
@@ -687,6 +1040,54 @@ pub fn spawn_render_thread(
                 if settings.auto_rotate {
                     spin_angle += dt * settings.spin_speed;
                     accum_count = 0;
+                }
+                if settings.sat_on && settings.sat_orbit {
+                    sat_angle += dt * 0.65;
+                    accum_count = 0;
+                }
+
+                let sat_xyz = [
+                    settings.sat_orbit_radius * sat_angle.cos(),
+                    settings.sat_height + 0.12 * (sat_angle * 2.0).sin(),
+                    settings.sat_orbit_radius * sat_angle.sin(),
+                ];
+                let ias_state = (
+                    settings.sat_on,
+                    settings.neon_on,
+                    [sat_xyz[0], sat_xyz[1], sat_xyz[2], settings.sat_radius],
+                );
+                if ias_state != last_ias_state {
+                    rig.ias = build_ias(
+                        &rig._optix_ctx,
+                        &rig.stream,
+                        &mut rig._scratch,
+                        SceneGas {
+                            floor: &rig.floor_gas,
+                            fractal: &rig.fractal_gas,
+                            glass: &rig.glass_gas,
+                            neon: &rig.neon_gas,
+                        },
+                        SceneState {
+                            sat_pos: sat_xyz,
+                            sat_radius: settings.sat_radius,
+                            sat_on: settings.sat_on,
+                            neon_on: settings.neon_on,
+                        },
+                    );
+                    last_ias_state = ias_state;
+                }
+
+                if settings.temporal_denoise != rig.denoiser_is_temporal {
+                    let (d, is_t) = create_denoiser(
+                        &rig._optix_ctx,
+                        &rig.stream,
+                        cur_w,
+                        cur_h,
+                        settings.temporal_denoise,
+                    );
+                    rig.denoiser = d;
+                    rig.denoiser_is_temporal = is_t;
+                    rig.temporal_has_prev = false;
                 }
 
                 let (fractal_p0, fractal_p1, fractal_p2, fractal_p3) = match settings.fractal_kind {
@@ -800,7 +1201,43 @@ pub fn spawn_render_thread(
                     sky_params: [settings.sky_intensity, 1.0, settings.horizon_haze, 0.0],
                     accum_count,
                     _pad0: [0; 3],
+                    out_motion_f32: rig.motion_f32.cu_deviceptr(),
+                    out_depth_f32: rig.depth_f32.cu_deviceptr(),
+                    prev_cam_pos: [prev_camera.eye[0], prev_camera.eye[1], prev_camera.eye[2], 0.0],
+                    prev_cam_forward: [
+                        prev_camera.fwd[0],
+                        prev_camera.fwd[1],
+                        prev_camera.fwd[2],
+                        0.0,
+                    ],
+                    prev_cam_right: [
+                        prev_camera.right[0],
+                        prev_camera.right[1],
+                        prev_camera.right[2],
+                        0.0,
+                    ],
+                    prev_cam_up: [
+                        prev_camera.up[0],
+                        prev_camera.up[1],
+                        prev_camera.up[2],
+                        prev_camera.tan_half_fov,
+                    ],
+                    sat_pos: [
+                        sat_xyz[0],
+                        sat_xyz[1],
+                        sat_xyz[2],
+                        if settings.sat_on { settings.sat_radius } else { 0.0 },
+                    ],
+                    glass_params: [
+                        settings.glass_ior,
+                        settings.glass_absorb,
+                        settings.glass_roughness,
+                        if settings.sat_on { 1.0 } else { 0.0 },
+                    ],
+                    aov_mode: settings.aov_mode,
+                    _pad1: [0; 3],
                 };
+                prev_camera = camera;
                 rig.params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
                     .expect("params upload");
@@ -821,15 +1258,31 @@ pub fn spawn_render_thread(
 
                 let (final_f32_ptr, denoise_ms) = if settings.denoiser_on && settings.aov_mode == 0 {
                     let t_den = Instant::now();
+                    let flow_img = if rig.denoiser_is_temporal {
+                        Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
+                    } else {
+                        None
+                    };
                     let guides = Guides {
                         albedo: Some(Image::new(&rig.albedo_f32, cur_w, cur_h).expect("albedo")),
                         normal: Some(Image::new(&rig.normal_f32, cur_w, cur_h).expect("normal")),
+                        flow: flow_img,
                         ..Default::default()
+                    };
+                    let prev_img = if rig.denoiser_is_temporal {
+                        let prev_buf = if rig.temporal_has_prev {
+                            &rig.prev_denoised_f32
+                        } else {
+                            &rig.color_f32
+                        };
+                        Some(Image::new(prev_buf, cur_w, cur_h).expect("prev"))
+                    } else {
+                        None
                     };
                     let layer = Layer {
                         input: Image::new(&rig.color_f32, cur_w, cur_h).expect("in"),
                         output: Image::new(&rig.denoised_f32, cur_w, cur_h).expect("out"),
-                        previous: None,
+                        previous: prev_img,
                         aov: AovType::Beauty,
                     };
                     // SAFETY: all denoiser input/output/guide images outlive `synchronize`.
@@ -838,6 +1291,20 @@ pub fn spawn_render_thread(
                             .invoke(&rig.stream, &guides, &[layer], DenoiserParams::default())
                     }
                     .expect("denoiser invoke");
+                    if rig.denoiser_is_temporal {
+                        // SAFETY: `denoised_f32` and `prev_denoised_f32` have identical byte size on `rig.stream`.
+                        let cp_res = unsafe {
+                            cu::cuMemcpyDtoDAsync_v2(
+                                rig.prev_denoised_f32.cu_deviceptr(),
+                                rig.denoised_f32.cu_deviceptr(),
+                                rig.denoised_f32.num_bytes(),
+                                rig.stream.cu_stream(),
+                            )
+                        };
+                        if cp_res == cu::cudaError_enum_CUDA_SUCCESS {
+                            rig.temporal_has_prev = true;
+                        }
+                    }
                     rig.stream.synchronize().expect("den sync");
                     (
                         rig.denoised_f32.cu_deviceptr(),
@@ -847,6 +1314,27 @@ pub fn spawn_render_thread(
                     (rig.color_f32.cu_deviceptr(), 0.0)
                 };
 
+                let bloom_ms = if settings.bloom_on && settings.aov_mode == 0 {
+                    if let Some(ref mut bloom) = rig.bloom {
+                        bloom
+                            .apply(
+                                &rig.stream,
+                                final_f32_ptr,
+                                cur_w,
+                                cur_h,
+                                settings.bloom_threshold,
+                                settings.bloom_intensity,
+                                settings.bloom_blades,
+                            )
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                let t_tm = Instant::now();
                 let mut src_ptr = match settings.aov_mode {
                     1 => rig.albedo_f32.cu_deviceptr(),
                     2 => rig.normal_f32.cu_deviceptr(),
@@ -857,18 +1345,36 @@ pub fn spawn_render_thread(
                 let mut h = cur_h;
                 let mut exposure = settings.exposure;
                 let mut aov_mode = settings.aov_mode;
-                let mut kernel_args: [*mut c_void; 6] = [
+                let mut right_ptr: u64 = if settings.split_on {
+                    match settings.right_is_aov {
+                        1 => rig.albedo_f32.cu_deviceptr(),
+                        2 => rig.normal_f32.cu_deviceptr(),
+                        _ => rig.color_f32.cu_deviceptr(),
+                    }
+                } else {
+                    0
+                };
+                let mut split_x: f32 = if settings.split_on {
+                    settings.split_x.clamp(0.0, 1.0)
+                } else {
+                    -1.0
+                };
+                let mut right_is_aov: i32 = settings.right_is_aov as i32;
+                let mut kernel_args: [*mut c_void; 9] = [
                     (&raw mut src_ptr).cast(),
                     (&raw mut dst_ptr).cast(),
                     (&raw mut w).cast(),
                     (&raw mut h).cast(),
                     (&raw mut exposure).cast(),
                     (&raw mut aov_mode).cast(),
+                    (&raw mut right_ptr).cast(),
+                    (&raw mut split_x).cast(),
+                    (&raw mut right_is_aov).cast(),
                 ];
                 let gx = cur_w.div_ceil(16);
                 let gy = cur_h.div_ceil(16);
-                // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32)` and all
-                // pointers/buffers remain valid through `stream.synchronize()`.
+                // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32, float4*, f32, i32)`
+                // and all pointers/buffers remain valid through `stream.synchronize()`.
                 let res = unsafe {
                     cu::cuLaunchKernel(
                         rig.tonemap.func,
@@ -890,6 +1396,33 @@ pub fn spawn_render_thread(
                     "tonemap cuLaunchKernel failed"
                 );
                 rig.stream.synchronize().expect("tonemap sync");
+                let tonemap_ms = t_tm.elapsed().as_secs_f32() * 1000.0;
+
+                if let Some((jpeg_path, quality)) = pending_jpeg.take() {
+                    pending_status = Some(
+                        match save_jpeg_from_rgba8(
+                            &cuda,
+                            &rig.stream,
+                            buf_ptrs[buf_idx],
+                            cur_w,
+                            cur_h,
+                            &jpeg_path,
+                            quality,
+                        ) {
+                            Ok(()) => format!("Saved {}", jpeg_path.display()),
+                            Err(e) => format!("JPEG failed: {e}"),
+                        },
+                    );
+                }
+
+                if let Some(ref mut rec) = recorder
+                    && let Err(e) = rec.push_frame(&rig.stream, buf_ptrs[buf_idx])
+                {
+                    pending_status = Some(format!("Video encode error: {e}"));
+                    if let Some(failed) = recorder.take() {
+                        let _ = failed.finish();
+                    }
+                }
 
                 accum_count = accum_count.saturating_add(1);
                 frame_index = frame_index.wrapping_add(1);
@@ -902,6 +1435,11 @@ pub fn spawn_render_thread(
                         total_samples: accum_count.saturating_mul(settings.spp),
                         rt_ms,
                         denoise_ms,
+                        bloom_ms,
+                        tonemap_ms,
+                        is_recording: recorder.is_some(),
+                        record_frames: recorder.as_ref().map_or(0, VideoRecorder::frame_count),
+                        status_msg: pending_status.take(),
                     })
                     .is_err()
                 {

@@ -5,12 +5,20 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[features]
+ngx = ["dep:ngx"]
+
 [dependencies]
 nv-wgpu = { path = "../nv-wgpu" }
 nv-loader = { path = "../nv-loader" }
 optix = { path = "../optix" }
 nvrtc = { path = "../nvrtc" }
 nvml = { path = "../nvml" }
+cufft = { path = "../cufft" }
+nvjpeg = { path = "../nvjpeg" }
+nvenc = { path = "../nvenc" }
+cupti = { path = "../cupti" }
+ngx = { path = "../ngx", optional = true }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-core-ext = { path = "../cuda-core-ext" }

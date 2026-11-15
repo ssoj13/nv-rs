@@ -7,6 +7,9 @@
 mod camera_core;
 #[allow(unexpected_cfgs, dead_code, unused_imports, deprecated, clippy::all)]
 mod camera_egui;
+mod fft_bloom;
+mod gpu_export;
+mod profiler;
 mod renderer;
 mod ui;
 
@@ -27,11 +30,12 @@ mod demo_app {
     use crate::camera_core::{
         CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, NavPrefs, ViewportSize,
     };
+    use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
         CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd,
         align_render_size, spawn_render_thread,
     };
-    use crate::ui::{DockTab, GpuTelemetry, UiContext, default_dock_state, dock_style, install_fonts};
+    use crate::ui::{DockTab, UiContext, default_dock_state, dock_style, install_fonts};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
     use nv_wgpu::{InteropContext, SharedBuffer, SharedBufferDescriptor};
@@ -61,6 +65,7 @@ mod demo_app {
         render_thread: Option<JoinHandle<()>>,
         nvml_dev: Option<nvml::Device>,
         _nvml: Option<&'static nvml::Nvml>,
+        profiler: Profiler,
         telemetry: GpuTelemetry,
         last_telemetry_at: Instant,
         last_frame_at: Instant,
@@ -68,7 +73,11 @@ mod demo_app {
         total_samples: u32,
         rt_ms: f32,
         denoise_ms: f32,
+        bloom_ms: f32,
+        tonemap_ms: f32,
         fps: f32,
+        is_recording: bool,
+        record_frames: u64,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         cam_driver: CameraDriver,
@@ -209,7 +218,8 @@ mod demo_app {
                 .ok()
                 .map(|n| Box::leak(Box::new(n)) as &'static nvml::Nvml);
             let nvml_dev = nvml_lib.and_then(|n| n.device_by_index(0).ok());
-            let telemetry = read_telemetry(&nvml_dev);
+            let mut profiler = Profiler::new(Some(interop.cuda_context()));
+            let telemetry = profiler.read_telemetry(nvml_dev.as_ref());
 
             let dock_state = default_dock_state();
             let dock_style = dock_style(&egui_ctx);
@@ -239,6 +249,7 @@ mod demo_app {
                 render_thread: Some(render_thread),
                 nvml_dev,
                 _nvml: nvml_lib,
+                profiler,
                 telemetry,
                 last_telemetry_at: Instant::now(),
                 last_frame_at: Instant::now(),
@@ -246,7 +257,11 @@ mod demo_app {
                 total_samples: 0,
                 rt_ms: 0.0,
                 denoise_ms: 0.0,
+                bloom_ms: 0.0,
+                tonemap_ms: 0.0,
                 fps: 60.0,
+                is_recording: false,
+                record_frames: 0,
                 settings,
                 last_sent_settings: settings,
                 cam_driver,
@@ -284,7 +299,8 @@ mod demo_app {
             self.fps = self.fps * 0.9 + (1.0 / dt) * 0.1;
 
             if self.last_telemetry_at.elapsed().as_secs_f32() > 0.35 {
-                self.telemetry = read_telemetry(&self.nvml_dev);
+                self.profiler
+                    .update_telemetry(self.nvml_dev.as_ref(), &mut self.telemetry);
                 self.last_telemetry_at = now;
             }
 
@@ -305,6 +321,20 @@ mod demo_app {
                 self.total_samples = msg.total_samples;
                 self.rt_ms = msg.rt_ms;
                 self.denoise_ms = msg.denoise_ms;
+                self.bloom_ms = msg.bloom_ms;
+                self.tonemap_ms = msg.tonemap_ms;
+                self.is_recording = msg.is_recording;
+                self.record_frames = msg.record_frames;
+                if let Some(status) = msg.status_msg {
+                    self.last_saved_msg = Some(status);
+                }
+                self.profiler.record_frame(
+                    msg.rt_ms,
+                    msg.denoise_ms,
+                    msg.bloom_ms,
+                    msg.tonemap_ms,
+                    self.fps,
+                );
                 self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
             }
 
@@ -312,6 +342,9 @@ mod demo_app {
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let mut reset_accum_requested = false;
             let mut save_png_requested = false;
+            let mut save_jpeg_requested = false;
+            let mut toggle_record_requested = false;
+            let mut reload_shader_requested = false;
             let mut ui_ctx = UiContext {
                 settings: &mut self.settings,
                 display_tex_id: self.display_tex_id,
@@ -326,14 +359,22 @@ mod demo_app {
                 cam_scheme: &mut self.cam_scheme,
                 cam_feel: &mut self.cam_feel,
                 telemetry: &self.telemetry,
+                timings: &self.profiler.timings,
                 accum_count: self.accum_count,
                 total_samples: self.total_samples,
                 rt_ms: self.rt_ms,
                 denoise_ms: self.denoise_ms,
+                bloom_ms: self.bloom_ms,
+                tonemap_ms: self.tonemap_ms,
                 fps: self.fps,
+                is_recording: self.is_recording,
+                record_frames: self.record_frames,
                 viewport_focused: &mut self.viewport_focused,
                 reset_accum_requested: &mut reset_accum_requested,
                 save_png_requested: &mut save_png_requested,
+                save_jpeg_requested: &mut save_jpeg_requested,
+                toggle_record_requested: &mut toggle_record_requested,
+                reload_shader_requested: &mut reload_shader_requested,
                 last_saved_msg: self.last_saved_msg.as_deref(),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
@@ -390,6 +431,29 @@ mod demo_app {
                     self.render_w,
                     self.render_h,
                 ));
+            }
+            if save_jpeg_requested && self.has_frame {
+                let dir = std::path::Path::new("renders");
+                let _ = std::fs::create_dir_all(dir);
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = dir.join(format!("nv-demo-{ts}.jpg"));
+                let _ = self.cmd_tx.send(RenderCmd::SaveJpeg { path, quality: 92 });
+            }
+            if toggle_record_requested {
+                let dir = std::path::Path::new("renders");
+                let _ = std::fs::create_dir_all(dir);
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = dir.join(format!("nv-demo-{ts}.h264"));
+                let _ = self.cmd_tx.send(RenderCmd::ToggleRecord { path, fps: 60 });
+            }
+            if reload_shader_requested {
+                let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
             }
 
             // 4. Push camera/settings updates to render thread only when changed.
@@ -596,36 +660,6 @@ mod demo_app {
             right: [right.x, right.y, right.z],
             up: [up.x, up.y, up.z],
             tan_half_fov,
-        }
-    }
-
-    fn read_telemetry(dev: &Option<nvml::Device>) -> GpuTelemetry {
-        if let Some(d) = dev {
-            let gpu_name = d.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
-            let temp_c = d.temperature_gpu().unwrap_or(0);
-            let util_gpu = d.utilization_rates().map(|u| u.gpu).unwrap_or(0);
-            let (vram_used_mib, vram_total_mib) = d
-                .memory_info()
-                .map(|m| (m.used / (1024 * 1024), m.total / (1024 * 1024)))
-                .unwrap_or((0, 0));
-            let power_w = d.power_usage_mw().unwrap_or(0) as f32 / 1000.0;
-            GpuTelemetry {
-                gpu_name,
-                temp_c,
-                util_gpu,
-                vram_used_mib,
-                vram_total_mib,
-                power_w,
-            }
-        } else {
-            GpuTelemetry {
-                gpu_name: "NVML unavailable".to_string(),
-                temp_c: 0,
-                util_gpu: 0,
-                vram_used_mib: 0,
-                vram_total_mib: 0,
-                power_w: 0.0,
-            }
         }
     }
 

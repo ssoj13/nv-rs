@@ -8,20 +8,12 @@ use egui_phosphor::regular as ic;
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
+use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::DemoSettings;
 
 const LABEL_W: f32 = 86.0;
 const VAL_W: f32 = 64.0;
 const ROW_H: f32 = 20.0;
-
-pub struct GpuTelemetry {
-    pub gpu_name: String,
-    pub temp_c: u32,
-    pub util_gpu: u32,
-    pub vram_used_mib: u64,
-    pub vram_total_mib: u64,
-    pub power_w: f32,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
@@ -83,14 +75,22 @@ pub struct UiContext<'a> {
     pub cam_scheme: &'a mut NavScheme,
     pub cam_feel: &'a mut NavFeel,
     pub telemetry: &'a GpuTelemetry,
+    pub timings: &'a FrameTimings,
     pub accum_count: u32,
     pub total_samples: u32,
     pub rt_ms: f32,
     pub denoise_ms: f32,
+    pub bloom_ms: f32,
+    pub tonemap_ms: f32,
     pub fps: f32,
+    pub is_recording: bool,
+    pub record_frames: u64,
     pub viewport_focused: &'a mut bool,
     pub reset_accum_requested: &'a mut bool,
     pub save_png_requested: &'a mut bool,
+    pub save_jpeg_requested: &'a mut bool,
+    pub toggle_record_requested: &'a mut bool,
+    pub reload_shader_requested: &'a mut bool,
     pub last_saved_msg: Option<&'a str>,
 }
 
@@ -137,7 +137,6 @@ impl UiContext<'_> {
         let w = avail.x.min(avail.y * aspect).max(64.0);
         let h = (w / aspect).max(64.0);
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
-        let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         let img_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(w, h));
         ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         ui.painter().image(
@@ -147,53 +146,82 @@ impl UiContext<'_> {
             Color32::WHITE,
         );
 
-        *self.viewport_focused = resp.hovered() || resp.dragged();
-        let df = crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0);
+        let mut split_dragging = false;
+        if self.settings.split_on && img_rect.width() > 8.0 {
+            let sx = img_rect.left() + img_rect.width() * self.settings.split_x.clamp(0.02, 0.98);
+            let handle_rect = egui::Rect::from_center_size(
+                egui::pos2(sx, img_rect.center().y),
+                egui::vec2(14.0, img_rect.height()),
+            );
+            let split_resp = ui.interact(handle_rect, ui.id().with("split-handle"), Sense::drag());
+            if split_resp.hovered() || split_resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if split_resp.dragged() {
+                split_dragging = true;
+                if let Some(pos) = split_resp.interact_pointer_pos() {
+                    self.settings.split_x =
+                        ((pos.x - img_rect.left()) / img_rect.width()).clamp(0.02, 0.98);
+                }
+            }
+            let knob = egui::Rect::from_center_size(
+                egui::pos2(sx, img_rect.center().y),
+                egui::vec2(10.0, 26.0),
+            );
+            ui.painter()
+                .rect_filled(knob, 4.0, Color32::from_rgba_unmultiplied(235, 240, 245, 220));
+        }
 
-        let kb_free = !ui.ctx().egui_wants_keyboard_input();
-        let rmb_down = ui.input(|i| i.pointer.secondary_down());
-        let f_pressed = kb_free && *self.viewport_focused && ui.input(|i| i.key_pressed(egui::Key::F));
-        let a_pressed = kb_free
-            && *self.viewport_focused
-            && !rmb_down
-            && ui.input(|i| i.key_pressed(egui::Key::A));
+        let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
+        *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
+        if !split_dragging {
+            let df = crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0);
+            let kb_free = !ui.ctx().egui_wants_keyboard_input();
+            let rmb_down = ui.input(|i| i.pointer.secondary_down());
+            let f_pressed =
+                kb_free && *self.viewport_focused && ui.input(|i| i.key_pressed(egui::Key::F));
+            let a_pressed = kb_free
+                && *self.viewport_focused
+                && !rmb_down
+                && ui.input(|i| i.key_pressed(egui::Key::A));
 
-        if df.requests.frame_selected || f_pressed {
-            let cur = self.cam_driver.controller().pose();
-            let dist = cur.eye.length().max(0.25);
-            let fwd = if cur.eye.length_squared() > 1e-6 {
-                -cur.eye.normalize()
+            if df.requests.frame_selected || f_pressed {
+                let cur = self.cam_driver.controller().pose();
+                let dist = cur.eye.length().max(0.25);
+                let fwd = if cur.eye.length_squared() > 1e-6 {
+                    -cur.eye.normalize()
+                } else {
+                    -glam::Vec3::Z
+                };
+                let aimed = CameraPose::from_eye_forward_up(
+                    cur.eye,
+                    fwd,
+                    glam::Vec3::Y,
+                    cur.fov_y,
+                    cur.znear,
+                    cur.zfar,
+                );
+                self.cam_driver.controller_mut().set_pose(aimed);
+                self.cam_driver.controller_mut().set_orbit_distance(dist);
+                *self.cam_pose = self.cam_driver.controller().pose();
+            } else if a_pressed {
+                let ext = 1.35 * self.settings.obj_scale.max(0.25);
+                self.cam_driver.controller_mut().apply_intent(
+                    CameraIntent::FrameBounds {
+                        min: glam::Vec3::splat(-ext),
+                        max: glam::Vec3::splat(ext),
+                        margin: 1.2,
+                    },
+                    1.0 / 60.0,
+                    ViewportSize::new(self.render_w, self.render_h),
+                );
+                *self.cam_pose = self.cam_driver.controller().pose();
+            } else if df.requests.home {
+                self.cam_driver.controller_mut().set_pose(self.cam_home);
+                *self.cam_pose = self.cam_home;
             } else {
-                -glam::Vec3::Z
-            };
-            let aimed = CameraPose::from_eye_forward_up(
-                cur.eye,
-                fwd,
-                glam::Vec3::Y,
-                cur.fov_y,
-                cur.znear,
-                cur.zfar,
-            );
-            self.cam_driver.controller_mut().set_pose(aimed);
-            self.cam_driver.controller_mut().set_orbit_distance(dist);
-            *self.cam_pose = self.cam_driver.controller().pose();
-        } else if a_pressed {
-            let ext = 1.35 * self.settings.obj_scale.max(0.25);
-            self.cam_driver.controller_mut().apply_intent(
-                CameraIntent::FrameBounds {
-                    min: glam::Vec3::splat(-ext),
-                    max: glam::Vec3::splat(ext),
-                    margin: 1.2,
-                },
-                1.0 / 60.0,
-                ViewportSize::new(self.render_w, self.render_h),
-            );
-            *self.cam_pose = self.cam_driver.controller().pose();
-        } else if df.requests.home {
-            self.cam_driver.controller_mut().set_pose(self.cam_home);
-            *self.cam_pose = self.cam_home;
-        } else {
-            *self.cam_pose = df.pose;
+                *self.cam_pose = df.pose;
+            }
         }
 
         // Compact bottom-left status badge inside viewport
@@ -201,6 +229,8 @@ impl UiContext<'_> {
         let aov_tag = match self.settings.aov_mode {
             1 => "ALBEDO",
             2 => "NORMAL",
+            3 => "DEPTH",
+            4 => "MOTION",
             _ => "BEAUTY",
         };
         let status = if self.settings.auto_rotate {
@@ -391,6 +421,48 @@ impl UiContext<'_> {
         prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
 
         ui.add_space(6.0);
+        section_header(ui, ic::GLOBE, "Scene");
+        prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
+        if s.sat_on {
+            prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
+            prop_slider_f32(ui, "Sat Radius", &mut s.sat_radius, 0.12..=0.80, 2, false);
+            prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
+            prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=2.50, 2, false);
+        }
+        prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
+
+        ui.add_space(6.0);
+        section_header(ui, ic::SUN_DIM, "FFT Bloom (cuFFT)");
+        prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
+        if s.bloom_on {
+            prop_slider_f32(ui, "Threshold", &mut s.bloom_threshold, 0.2..=5.0, 2, false);
+            prop_slider_f32(ui, "Intensity", &mut s.bloom_intensity, 0.0..=2.0, 2, false);
+            prop_slider_u32(ui, "Blades", &mut s.bloom_blades, 3..=12, false);
+        }
+
+        ui.add_space(6.0);
+        section_header(ui, ic::COLUMNS, "A/B Split");
+        prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
+        if s.split_on {
+            prop_slider_f32(ui, "Split X", &mut s.split_x, 0.02..=0.98, 2, false);
+            prop_row(ui, "Right AOV", |ui| {
+                let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (mode, lbl) in [(0u32, "Raw"), (1u32, "Albedo"), (2u32, "Normal")] {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H],
+                            egui::Button::selectable(s.right_is_aov == mode, lbl),
+                        )
+                        .clicked()
+                    {
+                        s.right_is_aov = mode;
+                    }
+                }
+            });
+        }
+
+        ui.add_space(6.0);
         section_header(ui, ic::SPARKLE, "Path Tracer");
         prop_row(ui, "Scale", |ui| {
             let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
@@ -406,9 +478,15 @@ impl UiContext<'_> {
             }
         });
         prop_row(ui, "AOV", |ui| {
-            let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
+            let w = ((ui.available_width() - 16.0) / 5.0).max(28.0);
             ui.spacing_mut().item_spacing.x = 4.0;
-            for (mode, lbl) in [(0u32, "Beauty"), (1u32, "Albedo"), (2u32, "Normal")] {
+            for (mode, lbl) in [
+                (0u32, "Beauty"),
+                (1u32, "Albedo"),
+                (2u32, "Normal"),
+                (3u32, "Depth"),
+                (4u32, "Motion"),
+            ] {
                 if ui
                     .add_sized([w, ROW_H], egui::Button::selectable(s.aov_mode == mode, lbl))
                     .clicked()
@@ -422,19 +500,25 @@ impl UiContext<'_> {
         prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=0.5, 3, false);
 
         ui.add_space(4.0);
-        equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
                 ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.shadows_on, "Shadows"));
             }
             1 => {
                 ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"));
             }
+            2 => {
+                ui.add_sized(
+                    [w, ROW_H],
+                    egui::Checkbox::new(&mut s.temporal_denoise, "Temporal AI"),
+                );
+            }
             _ => {
                 ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
             }
         });
         ui.add_space(4.0);
-        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
                 if ui
                     .add_sized(
@@ -446,7 +530,7 @@ impl UiContext<'_> {
                     *self.reset_accum_requested = true;
                 }
             }
-            _ => {
+            1 => {
                 if ui
                     .add_sized(
                         [w, ROW_H + 2.0],
@@ -457,7 +541,41 @@ impl UiContext<'_> {
                     *self.save_png_requested = true;
                 }
             }
+            2 => {
+                if ui
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
+                    )
+                    .clicked()
+                {
+                    *self.save_jpeg_requested = true;
+                }
+            }
+            _ => {
+                let rec_lbl = if self.is_recording {
+                    format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
+                } else {
+                    format!("{}  Record H.264", ic::VIDEO_CAMERA)
+                };
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
+                    .clicked()
+                {
+                    *self.toggle_record_requested = true;
+                }
+            }
         });
+        ui.add_space(3.0);
+        if ui
+            .add_sized(
+                [ui.available_width(), ROW_H + 2.0],
+                egui::Button::new(format!("{}  Hot-Reload Shader (NVRTC)", ic::LIGHTNING)),
+            )
+            .clicked()
+        {
+            *self.reload_shader_requested = true;
+        }
         if let Some(msg) = self.last_saved_msg {
             ui.label(
                 RichText::new(msg)
@@ -576,6 +694,11 @@ impl UiContext<'_> {
         );
         stat_row(
             ui,
+            "Bloom / TM",
+            &format!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms),
+        );
+        stat_row(
+            ui,
             "Accum",
             &format!(
                 "{} / {} ({} spp)",
@@ -593,10 +716,51 @@ impl UiContext<'_> {
         );
         stat_row(
             ui,
+            "Clocks",
+            &format!(
+                "{} / {} MHz",
+                self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
+            ),
+        );
+        stat_row(
+            ui,
             "Temp / Load",
             &format!("{} C / {} %", self.telemetry.temp_c, self.telemetry.util_gpu),
         );
         stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
+        stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
+        stat_row(ui, "NGX", &self.telemetry.ngx_status);
+
+        ui.add_space(6.0);
+        section_header(ui, ic::CHART_LINE, "Performance");
+        sparkline_row(
+            ui,
+            "RT ms",
+            &self.timings.rt_ms,
+            Color32::from_rgb(138, 173, 244),
+            "ms",
+        );
+        sparkline_row(
+            ui,
+            "Denoise ms",
+            &self.timings.denoise_ms,
+            Color32::from_rgb(166, 209, 137),
+            "ms",
+        );
+        sparkline_row(
+            ui,
+            "Bloom ms",
+            &self.timings.bloom_ms,
+            Color32::from_rgb(238, 212, 159),
+            "ms",
+        );
+        sparkline_row(
+            ui,
+            "FPS",
+            &self.timings.fps,
+            Color32::from_rgb(198, 160, 246),
+            "",
+        );
     }
 }
 
@@ -741,6 +905,52 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
                     .monospace()
                     .size(11.5)
                     .color(Color32::from_rgb(220, 226, 236)),
+            );
+        });
+    });
+}
+
+fn sparkline_row(
+    ui: &mut Ui,
+    label: &str,
+    ring: &RingBuffer<HISTORY_LEN>,
+    color: Color32,
+    unit: &str,
+) {
+    prop_row(ui, label, |ui| {
+        let val_w = 52.0;
+        let gap = 6.0;
+        let plot_w = (ui.available_width() - val_w - gap).max(40.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, ROW_H - 2.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(16, 18, 22));
+
+        let n = ring.len();
+        if n >= 2 {
+            let (min_v, max_v) = ring.min_max();
+            let span = (max_v - min_v).max(1e-3);
+            let mut pts = Vec::with_capacity(n);
+            let denom = (n - 1) as f32;
+            for (i, v) in ring.iter().enumerate() {
+                let x = rect.left() + 2.0 + (rect.width() - 4.0) * (i as f32 / denom);
+                let norm = ((v - min_v) / span).clamp(0.0, 1.0);
+                let y = rect.bottom() - 2.0 - (rect.height() - 4.0) * norm;
+                pts.push(egui::pos2(x, y));
+            }
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
+        }
+
+        let txt = if unit.is_empty() {
+            format!("{:.0}", ring.latest())
+        } else {
+            format!("{:.1} {unit}", ring.latest())
+        };
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new(txt)
+                    .monospace()
+                    .size(11.0)
+                    .color(color),
             );
         });
     });

@@ -29,6 +29,16 @@ struct Params {
     float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, pad]
     unsigned int accum_count;
     unsigned int _pad0[3];
+    unsigned long long out_motion_f32;
+    unsigned long long out_depth_f32;
+    float prev_cam_pos[4];
+    float prev_cam_forward[4];
+    float prev_cam_right[4];
+    float prev_cam_up[4];
+    float sat_pos[4];      // [x, y, z, radius/enable]
+    float glass_params[4]; // [ior, absorption, roughness, enable]
+    unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion
+    unsigned int _pad1[3];
 };
 
 extern "C" {
@@ -400,6 +410,15 @@ extern "C" __global__ void __raygen__render() {
     float3 accum_col = make_float3(0.0f, 0.0f, 0.0f);
     float3 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
     float3 first_normal = make_float3(0.0f, 0.0f, 1.0f);
+    float first_depth = 1e6f;
+    float2 first_motion = make_float2(0.0f, 0.0f);
+
+    float3 prev_pos = make_f3(params.prev_cam_pos);
+    float3 prev_fwd = make_f3(params.prev_cam_forward);
+    float3 prev_rgt = make_f3(params.prev_cam_right);
+    float3 prev_up  = make_f3(params.prev_cam_up);
+    float prev_tan_fov = params.prev_cam_up[3];
+    bool has_prev_cam = (prev_tan_fov > 1e-5f);
 
     for (unsigned int s = 0; s < spp; ++s) {
         float jx = rand01(seed) - 0.5f;
@@ -441,13 +460,25 @@ extern "C" __global__ void __raygen__render() {
                 if (bounce == 0 && s == 0) {
                     first_albedo = sky;
                     first_normal = make_float3(-dir.x, -dir.y, -dir.z);
+                    first_depth = 1e6f;
+                    if (has_prev_cam) {
+                        float pz = f3_dot(dir, prev_fwd);
+                        if (pz > 1e-4f) {
+                            float px_ndc = f3_dot(dir, prev_rgt) / (pz * aspect * prev_tan_fov);
+                            float py_ndc = f3_dot(dir, prev_up)  / (pz * prev_tan_fov);
+                            float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
+                            float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
+                            first_motion = make_float2(prev_x - ((float)idx.x + 0.5f), prev_y - ((float)idx.y + 0.5f));
+                        }
+                    }
                 }
                 break;
             }
 
             float hit_t = __uint_as_float(p1);
-            float3 n = make_float3(__uint_as_float(p2), __uint_as_float(p3), __uint_as_float(p4));
-            if (f3_dot(n, dir) > 0.0f) n = f3_mul(n, -1.0f);
+            float3 geom_n = make_float3(__uint_as_float(p2), __uint_as_float(p3), __uint_as_float(p4));
+            bool entering = f3_dot(geom_n, dir) < 0.0f;
+            float3 n = entering ? geom_n : f3_mul(geom_n, -1.0f);
             float3 base_col = make_float3(
                 (float)(p5 & 0xFFu) / 255.0f,
                 (float)((p5 >> 8u) & 0xFFu) / 255.0f,
@@ -455,6 +486,86 @@ extern "C" __global__ void __raygen__render() {
             );
             unsigned int inst_id = p6;
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
+
+            if (bounce == 0 && s == 0) {
+                first_depth = hit_t;
+                if (has_prev_cam) {
+                    float3 rel = f3_sub(hit_pos, prev_pos);
+                    float pz = f3_dot(rel, prev_fwd);
+                    if (pz > 1e-4f) {
+                        float px_ndc = f3_dot(rel, prev_rgt) / (pz * aspect * prev_tan_fov);
+                        float py_ndc = f3_dot(rel, prev_up)  / (pz * prev_tan_fov);
+                        float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
+                        float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
+                        first_motion = make_float2(prev_x - ((float)idx.x + 0.5f), prev_y - ((float)idx.y + 0.5f));
+                    }
+                }
+            }
+
+            if (inst_id == 2u) {
+                // Dielectric glass sphere: Beer-Lambert absorption + Schlick Fresnel + refraction/reflection
+                float ior = fmaxf(1.05f, params.glass_params[0]);
+                float absorb = fmaxf(0.0f, params.glass_params[1]);
+                float g_rough = fmaxf(0.0f, fminf(0.5f, params.glass_params[2]));
+                if (!entering && absorb > 0.0f) {
+                    // Subtle cyan-emerald optical glass absorption
+                    float3 sigma = make_float3(0.85f * absorb, 0.22f * absorb, 0.14f * absorb);
+                    throughput = f3_mul3(throughput, make_float3(
+                        expf(-sigma.x * hit_t),
+                        expf(-sigma.y * hit_t),
+                        expf(-sigma.z * hit_t)
+                    ));
+                }
+                if (bounce == 0 && s == 0) {
+                    first_albedo = make_float3(0.92f, 0.97f, 1.0f);
+                    first_normal = n;
+                }
+                float eta = entering ? (1.0f / ior) : ior;
+                float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
+                float r0 = (1.0f - ior) / (1.0f + ior);
+                r0 = r0 * r0;
+                float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
+                float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
+                bool tir = sin2_t > 1.0f;
+
+                if (tir || rand01(seed) < fresnel) {
+                    float3 refl = f3_reflect(dir, n);
+                    if (g_rough > 1e-4f) {
+                        refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), g_rough)));
+                    }
+                    dir = refl;
+                    origin = f3_add(hit_pos, f3_mul(n, 0.002f));
+                } else {
+                    float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
+                    float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
+                    if (g_rough > 1e-4f) {
+                        refr = f3_norm(f3_add(refr, f3_mul(sample_cosine_hemisphere(refr, seed), g_rough)));
+                    }
+                    dir = refr;
+                    origin = f3_sub(hit_pos, f3_mul(n, 0.002f));
+                }
+                continue;
+            }
+
+            if (inst_id == 3u) {
+                // Emissive neon accent ring/sphere
+                float pulse = 0.85f + 0.15f * sinf(params.time * 2.5f);
+                float angle = atan2f(hit_pos.z, hit_pos.x);
+                float mix_t = 0.5f + 0.5f * sinf(angle * 2.0f + params.time * 1.2f);
+                float3 neon_a = make_float3(0.15f, 1.85f, 1.45f);
+                float3 neon_b = make_float3(1.65f, 0.35f, 1.85f);
+                float3 emission = f3_mul(f3_add(f3_mul(neon_a, 1.0f - mix_t), f3_mul(neon_b, mix_t)), pulse * 2.2f);
+                sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
+                if (bounce == 0 && s == 0) {
+                    first_albedo = make_float3(
+                        fminf(1.0f, emission.x * 0.45f),
+                        fminf(1.0f, emission.y * 0.45f),
+                        fminf(1.0f, emission.z * 0.45f)
+                    );
+                    first_normal = n;
+                }
+                break;
+            }
 
             float metallic = 0.0f;
             float rough = params.sun_dir[3];
@@ -552,8 +663,29 @@ extern "C" __global__ void __raygen__render() {
 
     float inv_spp = 1.0f / (float)spp;
     float3 final_col = f3_mul(accum_col, inv_spp);
+    if (params.aov_mode == 1u) {
+        final_col = first_albedo;
+    } else if (params.aov_mode == 2u) {
+        final_col = first_normal;
+    } else if (params.aov_mode == 3u) {
+        float dv = (first_depth > 1e5f) ? 0.0f : (1.0f / (1.0f + first_depth * 0.15f));
+        final_col = make_float3(dv, dv, dv);
+    } else if (params.aov_mode == 4u) {
+        float mag = sqrtf(first_motion.x * first_motion.x + first_motion.y * first_motion.y);
+        final_col = make_float3(
+            fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.x * 0.05f)),
+            fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.y * 0.05f)),
+            fminf(1.0f, mag * 0.05f)
+        );
+    }
 
     unsigned int out_idx = idx.y * params.width + idx.x;
+    if (params.out_motion_f32 != 0ull) {
+        ((float2*)params.out_motion_f32)[out_idx] = first_motion;
+    }
+    if (params.out_depth_f32 != 0ull) {
+        ((float*)params.out_depth_f32)[out_idx] = first_depth;
+    }
     float4* color_buf  = (float4*)params.out_color_f32;
     float4* albedo_buf = (float4*)params.out_albedo_f32;
     float4* normal_buf = (float4*)params.out_normal_f32;

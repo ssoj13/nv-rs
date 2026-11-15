@@ -392,6 +392,7 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         archive_type="zip",
         manual_url="https://github.com/NVIDIA/DLSS",
         manual_note="Public NVIDIA/DLSS repository",
+        system_globs=(r"C:\Program Files\NVIDIA\Streamline\external\ngx-sdk",),
     ),
     SdkSpec(
         key="nccl",

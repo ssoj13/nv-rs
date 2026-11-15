@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 # Spikes are throwaway proofs with their own toolchains and lockfiles; `device` is the cuda-oxide
 # device-code workspace (its own toolchain).
-exclude = ["spikes", "device"]
+exclude = ["spikes", "device", "python"]
 
 [workspace.package]
 version = "0.1.0"

@@ -3,3 +3,6 @@ target-build.log
 target-run.log
 spikes/**/Cargo.lock
 .sdk/
+docs/node_modules/
+docs/dist/
+docs/.astro/

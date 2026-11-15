@@ -1,0 +1,46 @@
+---
+title: nv-rs
+description: Direct, honest Rust bindings for the NVIDIA library stack.
+template: splash
+hero:
+  tagline: Direct, honest Rust bindings for the NVIDIA library stack — CUDA Toolkit libraries, OptiX, display/management APIs, video, compression, DLSS/NGX, CUDA &lt;-&gt; wgpu interop, and Rust device code.
+  actions:
+    - text: Getting Started
+      link: /getting-started/overview/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/ssoj13/nv-rs
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+`nv-rs` is NVIDIA's multi-crate Rust workspace (Rust 2024 edition, Apache-2.0) built on `cuda-bindings` and `cuda-core`.
+
+- **Supported host targets**: **Windows** (`x86_64`, `aarch64`) and **Linux** (`x86_64`, `aarch64`).
+- **No bundled SDKs**: Every `*-sys` crate reads headers from your installed SDKs at build time via `vcv-rs` — or falls back to prebuilt bindings when headers or `libclang` are unavailable (`NV_RS_USE_PREBUILT=1`).
+- **Explicit runtime loading**: Shared loader (`nv-loader`) with typed errors when a DLL or shared object is missing, never a surprise panic.
+
+## Workspace Layers
+
+<CardGrid>
+  <Card title="Infrastructure" icon="setting">
+    `nv-loader` (shared runtime loader, `exports_sys!` / `split_exports_sys!` / `query_interface_sys!`), `nv-bindgen` (declarative `LibSpec` generator + prebuilt fallback), and `nv-bindgen-fixture`.
+  </Card>
+  <Card title="Interop & Extensions" icon="puzzle">
+    `cuda-core-ext` (external memory/semaphores, arrays, textures/surfaces, green contexts) and `nv-wgpu` (zero-copy CUDA &lt;-&gt; `wgpu` buffer/texture/semaphore interop).
+  </Card>
+  <Card title="Linear Algebra & Math" icon="rocket">
+    `cublas` (`cublas-sys`, `cublaslt-sys`), `cufft` (`cufft-sys`), `curand`, `cusolver` (`cusolver-sys`, `cusolvermg-sys`), and `cusparse` (`cusparse-sys`).
+  </Card>
+  <Card title="Imaging, Video & Graphics" icon="laptop">
+    `npp` (`npp-sys`), `nvjpeg` (`nvjpeg-sys`), `nvdec` (`nvcuvid-sys`), `nvenc` (`nvenc-sys`), `nvofa` (`nvofa-sys`), `optix` (`optix-sys`), and `ngx` (`ngx-sys`, statically linked with DLSS-SR/RR safe wrappers).
+  </Card>
+  <Card title="AI, Storage, Comms & Mgmt" icon="list-format">
+    `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), and `nvapi` (`nvapi-sys`, Windows).
+  </Card>
+  <Card title="Device & Tooling" icon="wrench">
+    `device/optix-device`, `device/cuda-tex-device` (`cuda-oxide` device workspaces), `xtask` (`coverage collect|generate|check`, `prebuilt`), and `bootstrap.py` for SDK provisioning and verification.
+  </Card>
+</CardGrid>

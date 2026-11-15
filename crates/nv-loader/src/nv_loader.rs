@@ -22,6 +22,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+pub mod diag;
 
 /// Where a library ships, which decides where it is searched for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,6 +408,7 @@ pub fn open_first_with<T>(
     spec: &DllSpec,
     mut open: impl FnMut(&Path) -> Result<T, String>,
 ) -> Result<Loaded<T>, LoadError> {
+    let t0 = Instant::now();
     let all = candidates_with(probe, spec);
     let present: Vec<PathBuf> = if cfg!(windows) {
         all.iter().filter(|p| probe.is_file(p)).cloned().collect()
@@ -412,22 +416,39 @@ pub fn open_first_with<T>(
         all.clone()
     };
     if present.is_empty() {
-        return Err(LoadError::NotFound {
+        let err = LoadError::NotFound {
             lib: spec.lib,
             tried: all,
-        });
+        };
+        diag::record_lib_load(
+            spec.lib,
+            None,
+            Some(&err.to_string()),
+            t0.elapsed().as_nanos() as u64,
+        );
+        return Err(err);
     }
     let mut failures = Vec::new();
     for path in present {
         match open(&path) {
-            Ok(value) => return Ok(Loaded { value, path }),
+            Ok(value) => {
+                diag::record_lib_load(spec.lib, Some(&path), None, t0.elapsed().as_nanos() as u64);
+                return Ok(Loaded { value, path });
+            }
             Err(reason) => failures.push((path, reason)),
         }
     }
-    Err(LoadError::Rejected {
+    let err = LoadError::Rejected {
         lib: spec.lib,
         failures,
-    })
+    };
+    diag::record_lib_load(
+        spec.lib,
+        None,
+        Some(&err.to_string()),
+        t0.elapsed().as_nanos() as u64,
+    );
+    Err(err)
 }
 
 /// A loaded library value and the file it came from (reported by diagnostics and evidence).

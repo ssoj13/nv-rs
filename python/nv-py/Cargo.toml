@@ -1,0 +1,55 @@
+[package]
+name = "nv-py"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+name = "_nv_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py311", "generate-import-lib"] }
+thiserror = "2"
+
+nv-loader = { path = "../../crates/nv-loader" }
+cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-bindings = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+nvml = { path = "../../crates/nvml" }
+nvrtc = { path = "../../crates/nvrtc" }
+nvcomp = { path = "../../crates/nvcomp" }
+nvjpeg = { path = "../../crates/nvjpeg" }
+cublas = { path = "../../crates/cublas" }
+cufft = { path = "../../crates/cufft" }
+curand = { path = "../../crates/curand" }
+nvenc = { path = "../../crates/nvenc" }
+nvdec = { path = "../../crates/nvdec" }
+nvofa = { path = "../../crates/nvofa" }
+cusparse = { path = "../../crates/cusparse" }
+cusolver = { path = "../../crates/cusolver" }
+cudnn = { path = "../../crates/cudnn" }
+cudnn-sys = { path = "../../crates/cudnn-sys" }
+optix = { path = "../../crates/optix" }
+npp = { path = "../../crates/npp" }
+ngx = { path = "../../crates/ngx" }
+cupti = { path = "../../crates/cupti" }
+cuda-core-ext = { path = "../../crates/cuda-core-ext" }
+nv-wgpu = { path = "../../crates/nv-wgpu" }
+wgpu = "30"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nccl = { path = "../../crates/nccl" }
+cufile = { path = "../../crates/cufile" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nvapi = { path = "../../crates/nvapi" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"

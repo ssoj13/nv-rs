@@ -66,6 +66,11 @@ COMMANDS (short or long):
           i deps [opts]              Install Linux system packages, download public SDKs,
                                      and print step-by-step setup guides for manual SDKs.
           i sys  [opts]              Alias for `deps sys`.
+    py  <dev|build|test> [opts]
+        Build and test the Python API (`python/nv-py`) via `maturin` and `pytest`:
+          py dev   [--release]       Editable install into active Python env (`maturin develop`).
+          py build [--release]       Build abi3 wheel (`maturin build`).
+          py test  [--release]       Run `py dev` + `pytest` on `python/nv-py/tests`.
     h,  help
         Print this help screen and exit 0.
 
@@ -104,6 +109,7 @@ EXAMPLES:
     python bootstrap.py i deps                   Install Linux sys pkgs + public SDKs + manual guide
     python bootstrap.py i deps --dry-run         Preview full dependency provisioning
     python bootstrap.py d sys -y --nccl          Install Linux build/runtime deps + libnccl-dev
+    python bootstrap.py py test                  Build Python bindings (`maturin`) & run pytest
 """
 
 
@@ -853,6 +859,62 @@ def cmd_install(sub: str, args: argparse.Namespace) -> int:
     return 0
 
 
+def _python_env(base_env: dict[str, str]) -> dict[str, str]:
+    """Ensure CONDA_PREFIX / VIRTUAL_ENV is populated so maturin locates the active interpreter."""
+    env = dict(base_env)
+    if not env.get("VIRTUAL_ENV") and not env.get("CONDA_PREFIX"):
+        py_exe = Path(sys.executable).resolve()
+        env_root = py_exe.parent.parent if py_exe.parent.name.lower() in ("bin", "scripts") else py_exe.parent
+        env["CONDA_PREFIX"] = str(env_root)
+    return env
+
+
+def cmd_py(sub: str, release: bool) -> int:
+    """Build and test the `nv-py` Python bindings via `maturin` and `pytest`."""
+    py_dir = ROOT_DIR / "python" / "nv-py"
+    manifest = py_dir / "Cargo.toml"
+    if not manifest.is_file():
+        err(f"Python crate not found: {manifest}")
+        return 1
+    if not which("maturin"):
+        err("`maturin` not found on PATH -- install with `pip install maturin`")
+        return 1
+
+    env = _python_env(_cargo_env())
+    if sub in ("dev", "test"):
+        header("Python API: maturin develop")
+        cmd = ["maturin", "develop", "--manifest-path", str(manifest)]
+        if release:
+            cmd.append("--release")
+        code, _, ms = run(cmd, cwd=py_dir, env=env)
+        if code != 0:
+            err(f"maturin develop failed ({fmt_time(ms)})")
+            return code
+        ok(f"maturin develop ({fmt_time(ms)})")
+
+    if sub == "build":
+        header("Python API: maturin build")
+        cmd = ["maturin", "build", "--manifest-path", str(manifest)]
+        if release:
+            cmd.append("--release")
+        code, _, ms = run(cmd, cwd=py_dir, env=env)
+        if code != 0:
+            err(f"maturin build failed ({fmt_time(ms)})")
+            return code
+        ok(f"maturin build ({fmt_time(ms)})")
+
+    if sub == "test":
+        header("Python API: pytest")
+        tests_dir = py_dir / "tests"
+        code, _, ms = run([sys.executable, "-m", "pytest", "-v", str(tests_dir)], cwd=py_dir, env=env)
+        if code != 0:
+            err(f"pytest failed ({fmt_time(ms)})")
+            return code
+        ok(f"pytest ({fmt_time(ms)})")
+
+    return 0
+
+
 # ==============================================================================
 # Build / Test / Check / Status / Clean / Xtask
 # ==============================================================================
@@ -1121,6 +1183,19 @@ def main() -> int:
         p.add_argument("-y", "--yes", action="store_true", help="Non-interactive package install")
         p.add_argument("--nccl", action="store_true", help="Also install libnccl-dev (Linux apt)")
         return cmd_install(sub, p.parse_args(sub_rest))
+
+    if cmd == "py":
+        if not rest or rest[0] in ("h", "help", "-h", "--help"):
+            print(HELP_TEXT)
+            return 0
+        sub = rest[0]
+        if sub not in ("dev", "build", "test"):
+            err(f"Unknown py subcommand: {sub} (expected `dev`, `build`, or `test`)")
+            return 2
+        p = argparse.ArgumentParser(prog=f"bootstrap.py py {sub}")
+        p.add_argument("--release", action="store_true", help="Build Python extension in release mode")
+        ns = p.parse_args(rest[1:])
+        return cmd_py(sub, release=ns.release)
 
     err(f"Unknown command: {cmd}")
     print(HELP_TEXT)

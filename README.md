@@ -1,77 +1,48 @@
-# nv-rs
+# nv-rs — Unified NVIDIA Stack for Rust & Python
 
 *A driver panic is the mind-killer; check the `Result`, verify the SDK, and let the rays pass through.*
 
 [![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://ssoj13.github.io/nv-rs/) — **<https://ssoj13.github.io/nv-rs/>**
 
-`nv-rs` is a multi-crate Rust workspace (and Python package `nv_rs`) providing unified, safe,
-and runtime-resilient access to the NVIDIA library stack — CUDA Toolkit libraries, OptiX,
-display/management APIs, video, compression, DLSS/NGX, CUDA ↔ `wgpu` zero-copy interop, Rust
-device code for OptiX via `cuda-oxide`, and zero-copy Python bindings — built directly on
-[`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust) (`cuda-bindings`, `cuda-core`,
-`cuda-async`).
+`nv-rs` is an independent, multi-crate **NVIDIA GPU stack for Rust** (with Python bindings `nv_rs`) built directly on top of [`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust) (`cuda-bindings`, `cuda-core`, `cuda-async`). Across **47 host crates**, **2 `cuda-oxide` device crates**, an interactive **OptiX 9 + `wgpu` showcase (`nv-demo`)**, and **25 Python submodules**, it provides panic-free runtime discovery, build-time binding generation without committed proprietary headers, safe Rust wrappers, and zero-copy GPU/graphics/Python interop.
 
 Supported host targets: **Windows** (`x86_64`, `aarch64`) and **Linux** (`x86_64`, `aarch64`).
 
 ---
 
-## Why `nv-rs` Exists
+## Origin & Why `nv-rs` Exists
 
-This project started while building `render-rs`, which needed direct **OptiX** access from Rust
-to accelerate ray tracing. Instead of writing a narrow one-off wrapper, the goal became to solve
-the NVIDIA-on-Rust gap once and for all across the entire stack.
+`nv-rs` started out of a practical bottleneck: making the **`render-rs`** renderer fast enough for **`squarebob`**. Achieving the required ray-tracing throughput meant using **NVIDIA OptiX**, which had no clean, composable Rust ecosystem story on top of modern CUDA Rust bindings.
 
-### The Gap in the Ecosystem
+Instead of writing another isolated, incompatible `*-sys` wrapper:
 
-- **`NVIDIA/cuda-rust` covers the core, not the stack:** `cuda-bindings`, `cuda-core`, and
-  `cuda-async` provide a solid foundation for CUDA Driver/Runtime and `cutile`, but leave out
-  OptiX, cuDNN, cuBLAS/cuBLASLt, cuSPARSE, cuSOLVER, cuFFT, cuRAND, NPP, nvJPEG, Video Codec
-  (`nvenc`/`nvdec`), Optical Flow (`nvofa`), DLSS/NGX, `nvCOMP`, `cuFile` (GPUDirect Storage),
-  `NCCL`, `NVRTC`, `CUPTI`, `NVML`, `NVAPI`, and CUDA ↔ `wgpu` interop.
-- **Fragmented third-party crates don't compose:** standalone wrappers define incompatible
-  `CUstream` / `CUcontext` types, hardcode SDK paths, or panic when a driver/DLL is absent.
-- **OptiX device code in Rust needed compiler fixes:** compiling Rust kernels to OptiX PTX
-  with `cuda-oxide` hit real gaps (`ptx_asm!` input arity for cooperative vectors,
-  `#[export_name]` on device globals, SBT callable rooting, and 64-bit pointers across all
-  address spaces).
+- **`NVIDIA/cuda-rust` provides the core, not the stack:** `cuda-bindings`, `cuda-core`, and `cuda-async` establish the foundation for CUDA Driver/Runtime and `cutile`, while leaving out OptiX, cuDNN, cuBLAS, cuFFT, cuSPARSE, cuSOLVER, cuRAND, NPP, nvJPEG, Video Codec (`nvenc`/`nvdec`), Optical Flow (`nvofa`), DLSS/NGX, `nvCOMP`, `cuFile` (GPUDirect Storage), `NCCL`, `NVRTC`, `CUPTI`, `NVML`, `NVAPI`, and CUDA ↔ `wgpu` interop.
+- **Fragmented wrappers don't compose:** standalone crates define incompatible `CUstream` / `CUcontext` handles, hardcode SDK paths, commit vendor headers, or panic when a DLL/driver is absent.
+- **Rust OptiX device code hit real compiler gaps:** compiling Rust kernels to OptiX PTX via `cuda-oxide` uncovered missing `ptx_asm!` input arity for cooperative vectors, `#[export_name]` on device globals, SBT callable rooting, and 64-bit pointer handling across address spaces.
 
-### What `nv-rs` Solves
+### Architectural Pillars
 
-1. **One `CUstream` / `CUcontext` spine:** every crate builds directly on `NVIDIA/cuda-rust`,
-   so buffers, streams, events, and contexts pass seamlessly between `cublas`, `optix`, `cudnn`,
-   `nvenc`, `nv-wgpu`, and `cuda-core-ext`.
-2. **Zero-copy graphics & Python interop:** `nv-wgpu` shares Vulkan (`OPAQUE_WIN32` /
-   `OPAQUE_FD`) and DX12 resources with CUDA; `nv_rs` (PyO3 + `maturin`) exposes all modules to
-   Python with DLPack, `__cuda_array_interface__`, and Buffer Protocol support.
-3. **No committed proprietary headers (`nv-loader` + `nv-bindgen`):** every `*-sys` crate
-   generates bindings at build time from your installed SDKs via
-   [`vcv-rs`](https://github.com/ssoj13/vcv-rs) (or falls back to prebuilt bindings via
-   `NV_RS_USE_PREBUILT=1`), and loads DLLs/SOs dynamically with typed `Result` errors — never a
-   surprise panic.
-4. **Upstream-first:** host crates and `nv_rs` already build directly against upstream
-   [`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust). The `device/` workspace
-   temporarily tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs
-   [#1818](https://github.com/NVIDIA/cuda-rust/pull/1818),
-   [#1819](https://github.com/NVIDIA/cuda-rust/pull/1819),
-   [#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and
-   [#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
-
-For architecture decisions, current state, recent changes, and symbol/GPU-test coverage numbers, see
-[PLAN.md](PLAN.md), [CHANGELOG.md](CHANGELOG.md), and [COVERAGE.md](COVERAGE.md).
+1. **Single `CUstream` / `CUcontext` Spine:** every crate builds directly on `NVIDIA/cuda-rust`, so device buffers, streams, events, and contexts pass seamlessly between `optix`, `cublas`, `cudnn`, `cufft`, `nvenc`, `nv-wgpu`, and `cuda-core-ext`.
+2. **No Committed Proprietary Headers (`nv-bindgen` + `vcv-rs`):** every `*-sys` crate generates bindings at build time from your installed SDKs via [`vcv-rs`](https://github.com/ssoj13/vcv-rs) (or falls back to prebuilt artifacts with `NV_RS_USE_PREBUILT=1`), emitting `// SAFETY:`-annotated shims that pass `#![deny(clippy::undocumented_unsafe_blocks)]`.
+3. **Panic-Free Runtime Discovery & Transitive Loading (`nv-loader`):** twenty-plus NVIDIA libraries ship across `System32`, Windows `DriverStore`, CUDA Toolkit, and standalone SDKs. `nv-loader` replaces per-crate `libloading` boilerplate with deterministic discovery (`NV_DLL_DIRS`, `nv_loader::add_search_dir`, `exe_dir`, `CUDA_PATH`, standard Windows CUDA folders, `PATH`, and Linux runtime `root_var` resolution), Windows `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` transitive loading, and typed `LoadError` / `CallError` diagnostics — plus `cargo xtask stage-dlls` for deployment bundling.
+4. **Zero-Copy Graphics & Python Interop:** `nv-wgpu` shares Vulkan (`OPAQUE_WIN32` / `OPAQUE_FD`) and DX12 resources with CUDA; `nv_rs` (PyO3 + `maturin`) exposes 25 submodules to Python with DLPack, `__cuda_array_interface__`, Buffer Protocol, `nv_rs.add_dll_directory`, and `nv_rs.diag`.
+5. **Upstream-First:** all host crates and `nv_rs` already build directly against upstream [`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust). Only the `device/` workspace temporarily tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs [#1818](https://github.com/NVIDIA/cuda-rust/pull/1818), [#1819](https://github.com/NVIDIA/cuda-rust/pull/1819), [#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and [#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
 
 ---
 
-## What Is in the Hangar
+## What Is in the Stack
 
 | Layer | Crates |
 |---|---|
-| **Infrastructure** | `nv-loader` (shared runtime loader, `exports_sys!` / `split_exports_sys!` / `query_interface_sys!`), `nv-bindgen` (declarative `LibSpec` generator + prebuilt fallback), `nv-bindgen-fixture` |
-| **Interop & Extensions** | `cuda-core-ext` (external memory/semaphores, arrays, textures/surfaces, green contexts), `nv-wgpu` (zero-copy CUDA ↔ `wgpu` buffer/texture/semaphore interop) |
-| **Linear Algebra & Math** | `cublas` (`cublas-sys`, `cublaslt-sys`), `cufft` (`cufft-sys`), `curand`, `cusolver` (`cusolver-sys`, `cusolvermg-sys`), `cusparse` (`cusparse-sys`) |
-| **Imaging, Video & Graphics** | `npp` (`npp-sys`), `nvjpeg` (`nvjpeg-sys`), `nvdec` (`nvcuvid-sys`), `nvenc` (`nvenc-sys`), `nvofa` (`nvofa-sys`), `optix` (`optix-sys`), `ngx` (`ngx-sys` — statically linked per PLAN D15; DLSS-SR/RR safe wrapper supporting both `Init_with_ProjectID` and `ApplicationId` per D13) |
-| **AI, Storage, Comms & Mgmt** | `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), `nvapi` (`nvapi-sys`, Windows) |
-| **Device & Tooling** | `device/optix-device`, `device/cuda-tex-device`, `xtask` (`coverage collect\|generate\|check`, `prebuilt`) |
-| **Python & Docs** | `python/nv-py` (`nv_rs` via PyO3/`maturin`: 25 submodules, DLPack/`__cuda_array_interface__`/Buffer Protocol, `nv_rs.diag`), `docs/` (Astro + Starlight) |
+| **Core Infrastructure** | `nv-loader` (shared runtime loader, `NV_DLL_DIRS`, `add_search_dir`, `open_library`, `exports_sys!` / `split_exports_sys!` / `query_interface_sys!`), `nv-bindgen` (declarative `LibSpec` + `// SAFETY:` shims + prebuilt fallback), `nv-bindgen-fixture` |
+| **Interop & Extensions** | `cuda-core-ext` (external memory/semaphores, CUDA arrays, textures/surfaces, green contexts), `nv-wgpu` (zero-copy CUDA ↔ `wgpu` buffer/texture/semaphore interop) |
+| **Math & Linear Algebra** | `cublas` (`cublas-sys`, `cublaslt-sys`), `cufft` (`cufft-sys`), `curand`, `cusolver` (`cusolver-sys`, `cusolvermg-sys`), `cusparse` (`cusparse-sys`) |
+| **Ray Tracing, Imaging & Video** | `optix` (`optix-sys`), `ngx` (`ngx-sys`, DLSS-SR/RR via `Init_with_ProjectID` & `ApplicationId` + Streamline SDK discovery), `npp` (`npp-sys`), `nvjpeg` (`nvjpeg-sys`), `nvdec` (`nvcuvid-sys`), `nvenc` (`nvenc-sys`, `Mutex`-synchronized `EncodeSession`), `nvofa` (`nvofa-sys`) |
+| **AI, Compression, Storage & Telemetry** | `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), `nvapi` (`nvapi-sys`, Windows) |
+| **Device, Demo & Tooling** | `device/optix-device`, `device/cuda-tex-device`, `crates/nv-demo` (OptiX 9 + `wgpu` + `egui` showcase), `xtask` (`coverage collect\|generate\|check\|optix`, `prebuilt`, `stage-dlls`) |
+| **Python & Docs** | `python/nv-py` (`nv_rs`: 25 submodules, DLPack/`__cuda_array_interface__`/Buffer Protocol, `nv_rs.add_dll_directory`, `nv_rs.diag`), `docs/` (Astro + Starlight) |
+
+See [PLAN.md](PLAN.md), [CHANGELOG.md](CHANGELOG.md), and [COVERAGE.md](COVERAGE.md) (generated by `cargo xtask coverage generate` from `coverage/` inventories and GPU test records) for architecture decisions and symbol-level coverage.
 
 ---
 
@@ -88,56 +59,43 @@ python bootstrap.py d dl     # download & unpack public SDKs into .sdk/
 python bootstrap.py s        # toolchain, git HEAD, and SDK summary
 ```
 
-On a clean Ubuntu/Debian host, `d sys` / `i deps` installs `build-essential`, `clang`,
-`libclang-dev`, `pkg-config`, `libssl-dev`, `xz-utils`, `curl`, `ca-certificates`, and
-`libvulkan1` (pass `--nccl` to include `libnccl-dev`).
+Public SDKs (`nvcomp`, `nvapi`, `cudnn`, `ngx`, `optix` headers, Linux `vulkan`, Linux `nccl`) unpack straight into `.sdk/` (git-ignored). Portal-gated SDKs require a one-time install or download:
 
-Public SDKs (`nvcomp`, `nvapi`, `cudnn`, `ngx`, `optix` headers, Linux `vulkan`, Linux `nccl`)
-pull straight into `.sdk/` (git-ignored). Installer or NVIDIA Developer portal SDKs require
-a one-time manual download/install:
-
-| SDK | `d dl` | Where to get it | Env var or `.sdk/` layout |
+| SDK | `d dl` | Source | Env var or `.sdk/` layout |
 |---|---|---|---|
 | **CUDA Toolkit** (`13.x`) | Manual | [CUDA Downloads](https://developer.download.nvidia.com/compute/cuda/13.3.1/network_installers/cuda_13.3.1_windows_network.exe) | `CUDA_PATH` (default `/usr/local/cuda` or `%ProgramFiles%\NVIDIA GPU Computing Toolkit\CUDA\v13.x`) |
 | **OptiX** (`9.x`) | Auto (`optix-dev`) / Installer | [OptiX SDK](https://developer.nvidia.com/rtx/ray-tracing/optix) | `OPTIX_ROOT` or `.sdk/optix` (`include/optix.h`) |
 | **Vulkan SDK** | Auto (Linux) / Installer (Win) | [LunarG Win](https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe) / [Linux](https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz) | `VULKAN_SDK` or `.sdk/vulkan` |
-| **Video Codec SDK** (`nvenc`/`nvdec`) | Manual (login) | [Video Codec SDK](https://developer.nvidia.com/nvidia-video-codec-sdk/download) | `VIDEO_CODEC_SDK_ROOT` or unpack into `.sdk/videocodec/` (`Interface/nvEncodeAPI.h`, `Lib/`) |
-| **Optical Flow SDK** (`nvofa`) | Manual (login) | [Optical Flow SDK](https://developer.nvidia.com/optical-flow-sdk) | `OPTICAL_FLOW_SDK_ROOT` or unpack into `.sdk/opticalflow/` (`NvOFInterface/nvOpticalFlowCommon.h`) |
+| **Video Codec SDK** (`nvenc`/`nvdec`) | Manual (login) | [Video Codec SDK](https://developer.nvidia.com/nvidia-video-codec-sdk/download) | `VIDEO_CODEC_SDK_ROOT` or `.sdk/videocodec/` (`Interface/nvEncodeAPI.h`, `Lib/`) |
+| **Optical Flow SDK** (`nvofa`) | Manual (login) | [Optical Flow SDK](https://developer.nvidia.com/optical-flow-sdk) | `OPTICAL_FLOW_SDK_ROOT` or `.sdk/opticalflow/` (`NvOFInterface/nvOpticalFlowCommon.h`) |
 | **nvCOMP** (`6.0+`) | Auto (`d dl`) | [nvCOMP redist](https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/redistrib_6.0.0.json) | `NV_SDK_DIRS=.sdk` or `NVCOMP_ROOT` |
 | **NVAPI** (Windows) | Auto (`d dl`) | [NVIDIA/nvapi](https://github.com/NVIDIA/nvapi) | `NV_SDK_DIRS=.sdk` or `NVAPI_ROOT` |
 | **cuDNN** (`9.x`) | Auto (`d dl`) | [cuDNN redist](https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/redistrib_9.28.1.json) | `NV_SDK_DIRS=.sdk` or `CUDNN_ROOT` |
 | **NGX / DLSS** | Auto (`d dl`) / Streamline | [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) | `NV_SDK_DIRS=.sdk`, `NGX_SDK_ROOT`, or `C:\Program Files\NVIDIA\Streamline\external\ngx-sdk` |
-| **NCCL** (Linux) | Auto / `apt` | [NVIDIA/nccl](https://github.com/NVIDIA/nccl) or `libnccl-dev` (`>= 2.31` for `nccl_device/core.h`) | `NCCL_ROOT` or `/usr/include/nccl.h` |
+| **NCCL** (Linux) | Auto / `apt` | [NVIDIA/nccl](https://github.com/NVIDIA/nccl) or `libnccl-dev` (`>= 2.31`) | `NCCL_ROOT` or `/usr/include/nccl.h` |
 
-Point `NV_SDK_DIRS` at `.sdk` (or your own SDK root) when building crates that depend on
-unpacked SDKs:
+Point `NV_SDK_DIRS` at `.sdk` when building:
 
 ```powershell
 $env:NV_SDK_DIRS = "$PWD\.sdk"
 ```
 
 ```bash
-# Linux / WSL2 (use a separate target dir on ext4 for speed)
 export NV_SDK_DIRS="$PWD/.sdk"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}"
 ```
 
-### Prebuilt Bindings Fallback
+### Runtime DLL / SO Deployment & Prebuilt Bindings
 
-When SDK headers or `libclang` are not installed on a build host, `nv-bindgen` can fall back to
-pre-generated bindings (`{name}_types.rs`, `{name}_shims.rs`, `{name}_inventory.json`):
-
-- Set `NV_RS_USE_PREBUILT=1` to force prebuilt bindings.
-- Set `NV_RS_PREBUILT_DIR` to point at a directory of prebuilt artifacts, or place them under
-  `crates/<crate>/prebuilt/<target_triple>/`.
-- Stage prebuilt artifacts from a machine with SDK headers installed via `cargo xtask prebuilt`.
+- **Runtime discovery:** set `NV_DLL_DIRS` (`;` on Windows, `:` on Linux) or call `nv_loader::add_search_dir(...)` / `nv_rs.add_dll_directory(...)` to add custom plugin or app directories.
+- **Staging redistributables:** `cargo xtask stage-dlls --out <dir>` collects detected Toolkit and SDK shared libraries into a distribution directory.
+- **Prebuilt bindings fallback:** set `NV_RS_USE_PREBUILT=1` (and optionally `NV_RS_PREBUILT_DIR`) or stage artifacts via `cargo xtask prebuilt` to build without local SDK headers or `libclang`.
 
 ---
 
 ## Building & Verification
 
-Never ship an unverified build. Pin the host toolchain to `1.99.1` and treat warnings as
-structural failures:
+Host toolchain is pinned in `rust-toolchain.toml` (`1.99.1`), with `#![deny(clippy::all)]`, `#![deny(clippy::undocumented_unsafe_blocks)]`, and `#![deny(unsafe_op_in_unsafe_fn)]`:
 
 ```bash
 python bootstrap.py c            # cargo fmt --all --check + clippy --workspace --all-targets -- -D warnings
@@ -146,21 +104,13 @@ python bootstrap.py b            # workspace build (--release by default; -d for
 python bootstrap.py b -p nv-demo # build the full-stack nv-demo showcase
 ```
 
-Or invoke Cargo directly:
-
-```bash
-cargo +1.99.1 clippy --workspace --all-targets -- -D warnings
-cargo +1.99.1 test --workspace --lib
-```
-
-GPU and runtime-driver tests are marked `#[ignore]`; run them with `-- --ignored` on a box
-with an NVIDIA GPU.
+GPU integration tests are marked `#[ignore]` and run via `-- --ignored` (or `python bootstrap.py t --gpu`) on an NVIDIA GPU host.
 
 ---
 
 ## Interactive RTX Demo (`crates/nv-demo/`)
 
-A full-stack showcase (`crates/nv-demo/`, binary `nv-demo`) combining **OptiX 9** multi-instance IAS ray tracing (checkerboard floor, custom AABB fractal primitives — Mandelbulb, Mandelbox, KIFS Octahedron — dielectric glass sphere, and emissive neon accent), **`TemporalAov`** AI denoising with 5 AOVs and interactive A/B split, **`nvrtc`** live `.cu` -> PTX shader hot-reload, **`cufft`** 2D FFT optical diffraction bloom, **`nvjpeg`/`nvenc`** zero-copy JPEG & H.264 export, zero-copy **`nv-wgpu`** (`SharedBuffer` -> `wgpu::Texture`), an **`egui-wgpu`** docked viewport (`F` aim, `A` fit all, `RMB` fly), and **`nvml`/`cupti`/`ngx`** telemetry:
+A full-stack showcase (`crates/nv-demo/`, binary `nv-demo`) combining **OptiX 9** multi-instance IAS ray tracing (checkerboard floor, custom AABB fractal primitives — Mandelbulb, Mandelbox, KIFS Octahedron — dielectric glass sphere, and emissive neon accent), **`TemporalAov`** AI denoising with 5 AOVs and interactive A/B split, **`nvrtc`** live `.cu` → PTX shader hot-reload, **`cufft`** 2D FFT optical diffraction bloom, **`nvjpeg`/`nvenc`** zero-copy JPEG & H.264 export, zero-copy **`nv-wgpu`** (`SharedBuffer` → `wgpu::Texture`), an **`egui-wgpu`** docked viewport (`F` aim, `A` fit all, `RMB` fly), and **`nvml`/`cupti`/`ngx`** telemetry:
 
 ```powershell
 $env:NV_SDK_DIRS = "$PWD\.sdk"   # or set OPTIX_ROOT / CUDA_PATH / NGX_SDK_ROOT
@@ -173,9 +123,6 @@ cargo run -p nv-demo --release
 ## Conventions & Governance
 
 - **License**: Apache-2.0.
-- **NGX / DLSS Notice**: `ngx-sys` and `ngx` only bind the SDK. Applications that redistribute
-  NVIDIA DLSS DLLs (`nvngx_dlss*.dll`) remain responsible for NVIDIA RTX SDK licence
-  compliance and pre-release notification.
-- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off (`git commit -s`),
-  CLA requirements, and Windows/WSL2 verification gates.
-- **Security**: See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+- **NGX / DLSS Notice**: `ngx-sys` and `ngx` only bind the SDK. Applications that redistribute NVIDIA DLSS DLLs (`nvngx_dlss*.dll`) remain responsible for NVIDIA RTX SDK licence compliance and pre-release notification.
+- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off (`git commit -s`), CLA requirements, and Windows/WSL2 verification gates.
+- **Security**: See [SECURITY.md](SECURITY.md) for private vulnerability reporting.

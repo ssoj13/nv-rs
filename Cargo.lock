@@ -1956,6 +1956,7 @@ dependencies = [
  "nvml",
  "nvrtc",
  "optix",
+ "png",
  "wgpu",
  "winit",
 ]

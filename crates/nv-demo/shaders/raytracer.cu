@@ -9,9 +9,9 @@ struct Params {
     unsigned int height;
     unsigned int frame_index;
     unsigned int spp;
-    float cam_pos[4];     // xyz, pad
+    float cam_pos[4];     // xyz, aperture in .w
     float cam_forward[4]; // xyz, pad
-    float cam_right[4];   // xyz, pad
+    float cam_right[4];   // xyz, focus_dist in .w
     float cam_up[4];      // xyz, tan_half_fov in .w
     float sun_dir[4];     // xyz, roughness in .w
     float fractal_p0[4];  // [power/scale, bailout, fold_limit/julia_mode, min_radius]
@@ -388,6 +388,19 @@ extern "C" __global__ void __raygen__render() {
             f3_add(f3_mul(cam_rgt, u * aspect * tan_fov), f3_mul(cam_up, v * tan_fov))
         ));
         float3 origin = cam_pos;
+        float aperture = params.cam_pos[3];
+        float focus_dist = params.cam_right[3];
+        if (aperture > 1e-5f && focus_dist > 0.05f) {
+            float r = sqrtf(rand01(seed)) * aperture;
+            float phi = 6.28318530718f * rand01(seed);
+            float3 lens_off = f3_add(
+                f3_mul(cam_rgt, r * cosf(phi)),
+                f3_mul(cam_up, r * sinf(phi))
+            );
+            float3 focus_pt = f3_add(cam_pos, f3_mul(dir, focus_dist));
+            origin = f3_add(cam_pos, lens_off);
+            dir = f3_norm(f3_sub(focus_pt, origin));
+        }
 
         float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
         float3 sample_col = make_float3(0.0f, 0.0f, 0.0f);

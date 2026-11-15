@@ -8,7 +8,7 @@ use egui_phosphor::regular as ic;
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
-use crate::renderer::{DemoSettings, RENDER_H, RENDER_W};
+use crate::renderer::DemoSettings;
 
 const LABEL_W: f32 = 86.0;
 const VAL_W: f32 = 64.0;
@@ -72,6 +72,9 @@ pub fn dock_style(ctx: &egui::Context) -> Style {
 pub struct UiContext<'a> {
     pub settings: &'a mut DemoSettings,
     pub display_tex_id: egui::TextureId,
+    pub render_w: u32,
+    pub render_h: u32,
+    pub desired_vp_size: &'a mut (f32, f32),
     pub cam_driver: &'a mut CameraDriver,
     pub cam_home: CameraPose,
     pub cam_pose: &'a mut CameraPose,
@@ -87,6 +90,8 @@ pub struct UiContext<'a> {
     pub fps: f32,
     pub viewport_focused: &'a mut bool,
     pub reset_accum_requested: &'a mut bool,
+    pub save_png_requested: &'a mut bool,
+    pub last_saved_msg: Option<&'a str>,
 }
 
 impl TabViewer for UiContext<'_> {
@@ -123,7 +128,12 @@ impl TabViewer for UiContext<'_> {
 impl UiContext<'_> {
     fn ui_viewport(&mut self, ui: &mut Ui) {
         let avail = ui.available_size();
-        let aspect = RENDER_W as f32 / RENDER_H as f32;
+        let ppp = ui.ctx().pixels_per_point();
+        *self.desired_vp_size = (
+            (avail.x * ppp).max(256.0),
+            (avail.y * ppp).max(144.0),
+        );
+        let aspect = self.render_w as f32 / self.render_h as f32;
         let w = avail.x.min(avail.y * aspect).max(64.0);
         let h = (w / aspect).max(64.0);
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
@@ -143,14 +153,30 @@ impl UiContext<'_> {
 
         // Compact bottom-left status badge inside viewport
         let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
+        let aov_tag = match self.settings.aov_mode {
+            1 => "ALBEDO",
+            2 => "NORMAL",
+            _ => "BEAUTY",
+        };
         let status = if self.settings.auto_rotate {
-            format!("{} SPIN  |  {} GUI FPS  |  {:.1} ms RT", ic::ARROWS_CLOCKWISE, self.fps.round() as u32, self.rt_ms)
+            format!(
+                "{} SPIN  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
+                ic::ARROWS_CLOCKWISE,
+                self.render_w,
+                self.render_h,
+                aov_tag,
+                self.fps.round() as u32,
+                self.rt_ms
+            )
         } else {
             format!(
-                "{} {} / {} spp  |  {} FPS  |  {:.1} ms RT",
+                "{} {}/{} spp  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
                 ic::STACK,
                 self.total_samples,
                 self.settings.max_accum.saturating_mul(self.settings.spp),
+                self.render_w,
+                self.render_h,
+                aov_tag,
                 self.fps.round() as u32,
                 self.rt_ms
             )
@@ -171,11 +197,72 @@ impl UiContext<'_> {
 
     fn ui_fractal(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
+        section_header(ui, ic::SPARKLE, "Presets");
+        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
+            0 => {
+                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb")).clicked() {
+                    s.fractal_kind = 0;
+                    s.bulb_power = 8.0;
+                    s.bulb_julia = false;
+                    s.metallic = 0.78;
+                    s.roughness = 0.14;
+                    s.palette_shift = 0.08;
+                    s.sun_azimuth = 36.0;
+                    s.sun_elevation = 42.0;
+                }
+            }
+            1 => {
+                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box")).clicked() {
+                    s.fractal_kind = 1;
+                    s.box_scale = -2.0;
+                    s.box_fold = 1.0;
+                    s.metallic = 0.92;
+                    s.roughness = 0.10;
+                    s.palette_shift = 0.45;
+                    s.sun_azimuth = -45.0;
+                    s.sun_elevation = 35.0;
+                }
+            }
+            2 => {
+                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS")).clicked() {
+                    s.fractal_kind = 2;
+                    s.kifs_scale = 2.0;
+                    s.kifs_rot1 = 18.0;
+                    s.kifs_rot2 = -12.0;
+                    s.metallic = 0.65;
+                    s.roughness = 0.22;
+                    s.palette_shift = 0.72;
+                    s.sun_azimuth = 55.0;
+                    s.sun_elevation = 28.0;
+                }
+            }
+            _ => {
+                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral")).clicked() {
+                    s.fractal_kind = 0;
+                    s.bulb_power = 7.0;
+                    s.bulb_julia = true;
+                    s.bulb_c = [-0.22, 0.62, 0.18];
+                    s.metallic = 0.30;
+                    s.roughness = 0.26;
+                    s.palette_shift = 0.22;
+                }
+            }
+        });
+        ui.add_space(6.0);
+
         section_header(ui, ic::CUBE, "Formula");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut s.fractal_kind, 0, "Mandelbulb");
-            ui.selectable_value(&mut s.fractal_kind, 1, "Mandelbox");
-            ui.selectable_value(&mut s.fractal_kind, 2, "KIFS Octa");
+        equal_grid(ui, 3, 3, |ui, idx, w| {
+            let (kind, label) = match idx {
+                0 => (0u32, "Mandelbulb"),
+                1 => (1u32, "Mandelbox"),
+                _ => (2u32, "KIFS Octa"),
+            };
+            if ui
+                .add_sized([w, ROW_H + 2.0], egui::Button::selectable(s.fractal_kind == kind, label))
+                .clicked()
+            {
+                s.fractal_kind = kind;
+            }
         });
         ui.add_space(4.0);
 
@@ -225,9 +312,16 @@ impl UiContext<'_> {
 
         section_header(ui, ic::SUN, "Sky & Lighting");
         prop_slider_f32(ui, "Sun Power", &mut s.sun_intensity, 0.0..=4.0, 2, false);
+        prop_slider_f32(ui, "Sun Azimuth", &mut s.sun_azimuth, -180.0..=180.0, 1, false);
+        prop_slider_f32(ui, "Sun Elev", &mut s.sun_elevation, 2.0..=88.0, 1, false);
         prop_slider_f32(ui, "Sky Power", &mut s.sky_intensity, 0.1..=2.0, 2, false);
         prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
         prop_slider_f32(ui, "Exposure", &mut s.exposure, 0.25..=2.0, 2, false);
+
+        ui.add_space(6.0);
+        section_header(ui, ic::APERTURE, "Lens DoF");
+        prop_slider_f32(ui, "Aperture", &mut s.aperture, 0.0..=0.12, 3, false);
+        prop_slider_f32(ui, "Focus Dist", &mut s.focus_dist, 0.5..=12.0, 2, false);
 
         ui.add_space(6.0);
         section_header(ui, ic::SQUARES_FOUR, "Scratched Metal Floor");
@@ -238,22 +332,78 @@ impl UiContext<'_> {
 
         ui.add_space(6.0);
         section_header(ui, ic::SPARKLE, "Path Tracer");
+        prop_row(ui, "Scale", |ui| {
+            let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
+                let selected = (s.render_scale - val).abs() < 0.05;
+                if ui
+                    .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
+                    .clicked()
+                {
+                    s.render_scale = val;
+                }
+            }
+        });
+        prop_row(ui, "AOV", |ui| {
+            let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (mode, lbl) in [(0u32, "Beauty"), (1u32, "Albedo"), (2u32, "Normal")] {
+                if ui
+                    .add_sized([w, ROW_H], egui::Button::selectable(s.aov_mode == mode, lbl))
+                    .clicked()
+                {
+                    s.aov_mode = mode;
+                }
+            }
+        });
         prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
         prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
         prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=0.5, 3, false);
 
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut s.shadows_on, "Shadows");
-            ui.checkbox(&mut s.denoiser_on, "AI Denoise");
-            ui.checkbox(&mut s.auto_rotate, "Spin");
+        equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+            0 => {
+                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.shadows_on, "Shadows"));
+            }
+            1 => {
+                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"));
+            }
+            _ => {
+                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
+            }
         });
         ui.add_space(4.0);
-        if ui
-            .button(format!("{}  Reset Accumulation", ic::ARROWS_CLOCKWISE))
-            .clicked()
-        {
-            *self.reset_accum_requested = true;
+        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+            0 => {
+                if ui
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE)),
+                    )
+                    .clicked()
+                {
+                    *self.reset_accum_requested = true;
+                }
+            }
+            _ => {
+                if ui
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
+                    )
+                    .clicked()
+                {
+                    *self.save_png_requested = true;
+                }
+            }
+        });
+        if let Some(msg) = self.last_saved_msg {
+            ui.label(
+                RichText::new(msg)
+                    .size(11.0)
+                    .color(Color32::from_rgb(166, 209, 137)),
+            );
         }
     }
 
@@ -319,28 +469,46 @@ impl UiContext<'_> {
         }
 
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button(format!("{}  Home", ic::HOUSE)).clicked() {
-                self.cam_driver.controller_mut().set_pose(self.cam_home);
-                *self.cam_pose = self.cam_home;
+        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+            0 => {
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new(format!("{}  Home", ic::HOUSE)))
+                    .clicked()
+                {
+                    self.cam_driver.controller_mut().set_pose(self.cam_home);
+                    *self.cam_pose = self.cam_home;
+                }
             }
-            if ui.button(format!("{}  Frame", ic::CROSSHAIR)).clicked() {
-                self.cam_driver.controller_mut().apply_intent(
-                    CameraIntent::FrameBounds {
-                        min: glam::Vec3::splat(-1.25),
-                        max: glam::Vec3::splat(1.25),
-                        margin: 1.2,
-                    },
-                    1.0 / 60.0,
-                    ViewportSize::new(RENDER_W, RENDER_H),
-                );
-                *self.cam_pose = self.cam_driver.controller().pose();
+            _ => {
+                if ui
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(format!("{}  Frame", ic::CROSSHAIR)),
+                    )
+                    .clicked()
+                {
+                    self.cam_driver.controller_mut().apply_intent(
+                        CameraIntent::FrameBounds {
+                            min: glam::Vec3::splat(-1.25),
+                            max: glam::Vec3::splat(1.25),
+                            margin: 1.2,
+                        },
+                        1.0 / 60.0,
+                        ViewportSize::new(self.render_w, self.render_h),
+                    );
+                    *self.cam_pose = self.cam_driver.controller().pose();
+                }
             }
         });
 
         ui.add_space(6.0);
         section_header(ui, ic::GAUGE, "Telemetry");
         stat_row(ui, "GPU", &self.telemetry.gpu_name);
+        stat_row(
+            ui,
+            "Resolution",
+            &format!("{} x {}", self.render_w, self.render_h),
+        );
         stat_row(
             ui,
             "GUI / RT",
@@ -381,25 +549,49 @@ fn section_header(ui: &mut Ui, icon: &str, title: &str) {
     ui.add_space(2.0);
 }
 
+fn equal_grid(ui: &mut Ui, cols: usize, count: usize, mut item_ui: impl FnMut(&mut Ui, usize, f32)) {
+    let gap = 4.0;
+    let total_w = ui.available_width();
+    let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(24.0);
+    let mut idx = 0;
+    while idx < count {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for _ in 0..cols {
+                if idx < count {
+                    item_ui(ui, idx, cell_w);
+                    idx += 1;
+                }
+            }
+        });
+    }
+}
+
 fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(LABEL_W, ROW_H),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.label(
-                    RichText::new(label)
-                        .size(12.0)
-                        .color(Color32::from_rgb(188, 194, 206)),
-                );
-            },
-        );
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width().max(60.0), ROW_H),
-            Layout::left_to_right(Align::Center),
-            add_contents,
-        );
-    });
+    let total_w = ui.available_width().max(LABEL_W + 80.0);
+    let gap = 6.0;
+    ui.allocate_ui_with_layout(
+        egui::vec2(total_w, ROW_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let (label_rect, _) =
+                ui.allocate_exact_size(egui::vec2(LABEL_W, ROW_H), Sense::hover());
+            ui.painter().text(
+                egui::pos2(label_rect.left(), label_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                Color32::from_rgb(188, 194, 206),
+            );
+            let rem_w = (total_w - LABEL_W - gap).max(60.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(rem_w, ROW_H),
+                Layout::left_to_right(Align::Center),
+                add_contents,
+            );
+        },
+    );
 }
 
 fn prop_slider_f32(
@@ -411,21 +603,22 @@ fn prop_slider_f32(
     log: bool,
 ) {
     prop_row(ui, label, |ui| {
-        let track_w = (ui.available_width() - VAL_W - 6.0).max(40.0);
+        let gap = 6.0;
+        let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
+        ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_sized(
-                [VAL_W, ROW_H],
-                egui::DragValue::new(val)
-                    .range(range)
-                    .fixed_decimals(decimals)
-                    .speed(0.005),
-            );
-        });
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+        ui.add_sized(
+            [VAL_W, ROW_H],
+            egui::DragValue::new(val)
+                .range(range)
+                .fixed_decimals(decimals)
+                .speed(0.005),
+        );
     });
 }
 
@@ -437,18 +630,19 @@ fn prop_slider_u32(
     log: bool,
 ) {
     prop_row(ui, label, |ui| {
-        let track_w = (ui.available_width() - VAL_W - 6.0).max(40.0);
+        let gap = 6.0;
+        let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
+        ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_sized(
-                [VAL_W, ROW_H],
-                egui::DragValue::new(val).range(range).speed(1.0),
-            );
-        });
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+        ui.add_sized(
+            [VAL_W, ROW_H],
+            egui::DragValue::new(val).range(range).speed(1.0),
+        );
     });
 }
 

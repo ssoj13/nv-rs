@@ -28,7 +28,8 @@ mod demo_app {
         CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, NavPrefs, ViewportSize,
     };
     use crate::renderer::{
-        CameraFrame, DemoSettings, FrameReady, RENDER_H, RENDER_W, RenderCmd, spawn_render_thread,
+        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd,
+        align_render_size, spawn_render_thread,
     };
     use crate::ui::{DockTab, GpuTelemetry, UiContext, default_dock_state, dock_style, install_fonts};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
@@ -44,10 +45,17 @@ mod demo_app {
         egui_winit: egui_winit::State,
         egui_renderer: egui_wgpu::Renderer,
         shared_rgba: [SharedBuffer; 2],
+        retired_buffers: Vec<(u64, [SharedBuffer; 2])>,
+        buf_gen: u64,
+        render_w: u32,
+        render_h: u32,
+        desired_vp_size: (f32, f32),
+        last_resize_at: Instant,
         front_buf_idx: usize,
         has_frame: bool,
         display_texture: wgpu::Texture,
         display_tex_id: egui::TextureId,
+        last_saved_msg: Option<String>,
         cmd_tx: Sender<RenderCmd>,
         frame_rx: Receiver<FrameReady>,
         render_thread: Option<JoinHandle<()>>,
@@ -159,7 +167,7 @@ mod demo_app {
                     margin: 1.2,
                 },
                 1.0 / 60.0,
-                ViewportSize::new(RENDER_W, RENDER_H),
+                ViewportSize::new(DEFAULT_W, DEFAULT_H),
             );
             let cam_home = cam_driver.controller().pose();
             let cam_pose = cam_home;
@@ -178,33 +186,9 @@ mod demo_app {
             );
 
             // Double-buffered CUDA<->wgpu SharedBuffers so GUI 60 FPS never stalls on OptiX.
-            let byte_size = u64::from(RENDER_W * RENDER_H * 4);
-            let make_shared = |label| {
-                interop
-                    .create_buffer(&SharedBufferDescriptor {
-                        label: Some(label),
-                        size: byte_size,
-                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
-                    })
-                    .expect("SharedBuffer")
-            };
-            let shared_rgba = [make_shared("optix-rgba8-0"), make_shared("optix-rgba8-1")];
+            let (shared_rgba, display_texture) =
+                allocate_render_targets(&interop, DEFAULT_W, DEFAULT_H);
             let buf_ptrs = [shared_rgba[0].cu_deviceptr(), shared_rgba[1].cu_deviceptr()];
-
-            let display_texture = interop.device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("optix-viewport"),
-                size: wgpu::Extent3d {
-                    width: RENDER_W,
-                    height: RENDER_H,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
             let view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let display_tex_id = egui_renderer.register_native_texture(
                 interop.device(),
@@ -239,10 +223,17 @@ mod demo_app {
                 egui_winit,
                 egui_renderer,
                 shared_rgba,
+                retired_buffers: Vec::new(),
+                buf_gen: 0,
+                render_w: DEFAULT_W,
+                render_h: DEFAULT_H,
+                desired_vp_size: (DEFAULT_W as f32, DEFAULT_H as f32),
+                last_resize_at: Instant::now(),
                 front_buf_idx: 0,
                 has_frame: false,
                 display_texture,
                 display_tex_id,
+                last_saved_msg: None,
                 cmd_tx,
                 frame_rx,
                 render_thread: Some(render_thread),
@@ -299,8 +290,14 @@ mod demo_app {
 
             // 1. Drain completed frames from the async OptiX render thread.
             while let Ok(msg) = self.frame_rx.try_recv() {
+                if msg.gen_id != self.buf_gen {
+                    continue;
+                }
                 if self.has_frame && self.front_buf_idx != msg.buf_idx {
-                    let _ = self.cmd_tx.send(RenderCmd::ReturnBuffer(self.front_buf_idx));
+                    let _ = self.cmd_tx.send(RenderCmd::ReturnBuffer {
+                        buf_idx: self.front_buf_idx,
+                        gen_id: self.buf_gen,
+                    });
                 }
                 self.front_buf_idx = msg.buf_idx;
                 self.has_frame = true;
@@ -308,14 +305,19 @@ mod demo_app {
                 self.total_samples = msg.total_samples;
                 self.rt_ms = msg.rt_ms;
                 self.denoise_ms = msg.denoise_ms;
+                self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
             }
 
             // 2. Docked egui pass (60 FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let mut reset_accum_requested = false;
+            let mut save_png_requested = false;
             let mut ui_ctx = UiContext {
                 settings: &mut self.settings,
                 display_tex_id: self.display_tex_id,
+                render_w: self.render_w,
+                render_h: self.render_h,
+                desired_vp_size: &mut self.desired_vp_size,
                 cam_driver: &mut self.cam_driver,
                 cam_home: self.cam_home,
                 cam_pose: &mut self.cam_pose,
@@ -331,12 +333,64 @@ mod demo_app {
                 fps: self.fps,
                 viewport_focused: &mut self.viewport_focused,
                 reset_accum_requested: &mut reset_accum_requested,
+                save_png_requested: &mut save_png_requested,
+                last_saved_msg: self.last_saved_msg.as_deref(),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                 DockArea::new(&mut self.dock_state)
                     .style(self.dock_style.clone())
+                    .show_close_buttons(false)
+                    .show_leaf_close_all_buttons(false)
+                    .show_leaf_collapse_buttons(false)
                     .show_inside(ui, &mut ui_ctx);
             });
+
+            // 3. Dynamic viewport resolution resize (debounced 120ms to avoid thrashing on drag).
+            let (target_w, target_h) = align_render_size(
+                self.desired_vp_size.0,
+                self.desired_vp_size.1,
+                self.settings.render_scale,
+            );
+            if (target_w != self.render_w || target_h != self.render_h)
+                && self.last_resize_at.elapsed().as_millis() >= 120
+            {
+                self.last_resize_at = Instant::now();
+                let (new_shared, new_tex) =
+                    allocate_render_targets(&self.interop, target_w, target_h);
+                let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
+                let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                    self.interop.device(),
+                    &new_view,
+                    wgpu::FilterMode::Linear,
+                    self.display_tex_id,
+                );
+                let old_shared = std::mem::replace(&mut self.shared_rgba, new_shared);
+                self.retired_buffers.push((self.buf_gen, old_shared));
+                self.display_texture = new_tex;
+                self.render_w = target_w;
+                self.render_h = target_h;
+                self.buf_gen = self.buf_gen.wrapping_add(1);
+                self.has_frame = false;
+                self.front_buf_idx = 0;
+                self.accum_count = 0;
+                self.total_samples = 0;
+                let _ = self.cmd_tx.send(RenderCmd::Resize {
+                    width: target_w,
+                    height: target_h,
+                    buf_ptrs: new_ptrs,
+                    gen_id: self.buf_gen,
+                });
+            }
+
+            if save_png_requested && self.has_frame {
+                self.last_saved_msg = Some(save_front_png(
+                    &self.interop,
+                    self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
+                    self.render_w,
+                    self.render_h,
+                ));
+            }
 
             // 4. Push camera/settings updates to render thread only when changed.
             let cam_frame = pose_to_frame(self.cam_pose);
@@ -395,8 +449,8 @@ mod demo_app {
                         buffer: self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
                         layout: wgpu::TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: Some(RENDER_W * 4),
-                            rows_per_image: Some(RENDER_H),
+                            bytes_per_row: Some(self.render_w * 4),
+                            rows_per_image: Some(self.render_h),
                         },
                     },
                     wgpu::TexelCopyTextureInfo {
@@ -406,8 +460,8 @@ mod demo_app {
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::Extent3d {
-                        width: RENDER_W,
-                        height: RENDER_H,
+                        width: self.render_w,
+                        height: self.render_h,
                         depth_or_array_layers: 1,
                     },
                 );
@@ -457,6 +511,76 @@ mod demo_app {
             self.interop.queue().submit(Some(encoder.finish()));
             self.interop.queue().present(frame);
             self.window.request_redraw();
+        }
+    }
+
+    fn allocate_render_targets(
+        interop: &InteropContext,
+        width: u32,
+        height: u32,
+    ) -> ([SharedBuffer; 2], wgpu::Texture) {
+        let byte_size = u64::from(width * height * 4);
+        let make_shared = |label| {
+            interop
+                .create_buffer(&SharedBufferDescriptor {
+                    label: Some(label),
+                    size: byte_size,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+                })
+                .expect("SharedBuffer")
+        };
+        let shared = [make_shared("optix-rgba8-0"), make_shared("optix-rgba8-1")];
+        let tex = interop.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("optix-viewport"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        (shared, tex)
+    }
+
+    fn save_front_png(interop: &InteropContext, dev_ptr: u64, width: u32, height: u32) -> String {
+        let byte_len = (width * height * 4) as usize;
+        let mut host = vec![0u8; byte_len];
+        interop
+            .cuda_context()
+            .bind_to_thread()
+            .expect("cuda bind_to_thread for save_png");
+        // SAFETY: `dev_ptr` points to a `SharedBuffer` of `byte_len` bytes on the active context.
+        let res = unsafe {
+            cuda_bindings::cuMemcpyDtoH_v2(host.as_mut_ptr().cast(), dev_ptr, byte_len)
+        };
+        if res != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+            return format!("CUDA readback failed ({res:?})");
+        }
+        let dir = std::path::Path::new("renders");
+        let _ = std::fs::create_dir_all(dir);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("nv-demo-{ts}.png"));
+        let Ok(file) = std::fs::File::create(&path) else {
+            return format!("Failed to create {}", path.display());
+        };
+        let w = std::io::BufWriter::new(file);
+        let mut enc = png::Encoder::new(w, width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        match enc
+            .write_header()
+            .and_then(|mut writer| writer.write_image_data(&host))
+        {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("PNG encode failed: {e}"),
         }
     }
 

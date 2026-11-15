@@ -24,3 +24,4 @@ egui-phosphor = "0.14"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33.2"
+png = "0.18"

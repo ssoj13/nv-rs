@@ -20,8 +20,17 @@ use optix::{
 const RAYTRACER_CU: &str = include_str!("../shaders/raytracer.cu");
 const TONEMAP_CU: &str = include_str!("../shaders/tonemap.cu");
 
-pub const RENDER_W: u32 = 896;
-pub const RENDER_H: u32 = 512;
+pub const DEFAULT_W: u32 = 896;
+pub const DEFAULT_H: u32 = 512;
+
+/// Aligns width to a multiple of 64 (256-byte `wgpu` row alignment) and height to even.
+pub fn align_render_size(vp_w: f32, vp_h: f32, scale: f32) -> (u32, u32) {
+    let w = ((vp_w * scale).round() as i32).clamp(256, 3840) as u32;
+    let h = ((vp_h * scale).round() as i32).clamp(144, 2160) as u32;
+    let w_aligned = (w & !63).max(256);
+    let h_aligned = (h & !1).max(144);
+    (w_aligned, h_aligned)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -87,6 +96,8 @@ pub struct DemoSettings {
     pub trap_scale: f32,
     pub palette_shift: f32,
     pub sun_intensity: f32,
+    pub sun_azimuth: f32,
+    pub sun_elevation: f32,
     // Sky & Floor
     pub sky_intensity: f32,
     pub horizon_haze: f32,
@@ -94,11 +105,15 @@ pub struct DemoSettings {
     pub floor_scratch: f32,
     pub floor_scale: f32,
     pub floor_metallic: f32,
-    // Rendering
+    // Rendering & Lens
     pub roughness: f32,
     pub exposure: f32,
+    pub aperture: f32,
+    pub focus_dist: f32,
     pub spp: u32,
     pub max_accum: u32,
+    pub aov_mode: u32,
+    pub render_scale: f32,
     pub denoiser_on: bool,
     pub shadows_on: bool,
     pub auto_rotate: bool,
@@ -135,6 +150,8 @@ impl Default for DemoSettings {
             trap_scale: 0.85,
             palette_shift: 0.0,
             sun_intensity: 1.45,
+            sun_azimuth: 32.0,
+            sun_elevation: 48.0,
             sky_intensity: 0.78,
             horizon_haze: 1.0,
             floor_roughness: 0.22,
@@ -143,8 +160,12 @@ impl Default for DemoSettings {
             floor_metallic: 0.85,
             roughness: 0.18,
             exposure: 0.92,
+            aperture: 0.0,
+            focus_dist: 3.2,
             spp: 1,
             max_accum: 256,
+            aov_mode: 0,
+            render_scale: 1.0,
             denoiser_on: false,
             shadows_on: true,
             auto_rotate: false,
@@ -168,12 +189,22 @@ pub enum RenderCmd {
         camera: CameraFrame,
         reset_accum: bool,
     },
-    ReturnBuffer(usize),
+    Resize {
+        width: u32,
+        height: u32,
+        buf_ptrs: [u64; 2],
+        gen_id: u64,
+    },
+    ReturnBuffer {
+        buf_idx: usize,
+        gen_id: u64,
+    },
     Shutdown,
 }
 
 pub struct FrameReady {
     pub buf_idx: usize,
+    pub gen_id: u64,
     pub accum_count: u32,
     pub total_samples: u32,
     pub rt_ms: f32,
@@ -423,12 +454,12 @@ fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
             normal: true,
             ..Default::default()
         },
-        RENDER_W,
-        RENDER_H,
+        DEFAULT_W,
+        DEFAULT_H,
     )
     .expect("Denoiser");
 
-    let n = (RENDER_W * RENDER_H) as usize;
+    let n = (DEFAULT_W * DEFAULT_H) as usize;
     let color_f32 = DeviceBuffer::zeroed(&stream, n).expect("color_f32");
     let albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("albedo_f32");
     let normal_f32 = DeviceBuffer::zeroed(&stream, n).expect("normal_f32");
@@ -456,9 +487,32 @@ fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
     }
 }
 
+fn resize_rig(rig: &mut OptixRig, width: u32, height: u32) {
+    rig.stream.synchronize().expect("pre-resize sync");
+    let n = (width * height) as usize;
+    rig.color_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("color_f32 resize");
+    rig.albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("albedo_f32 resize");
+    rig.normal_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("normal_f32 resize");
+    rig.denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("denoised_f32 resize");
+    rig.denoiser = Denoiser::new(
+        &rig._optix_ctx,
+        &rig.stream,
+        DenoiserOptions {
+            model: DenoiserModel::Hdr,
+            albedo: true,
+            normal: true,
+            ..Default::default()
+        },
+        width,
+        height,
+    )
+    .expect("Denoiser resize");
+    rig.stream.synchronize().expect("resize sync");
+}
+
 pub fn spawn_render_thread(
     cuda: Arc<CudaContext>,
-    buf_ptrs: [u64; 2],
+    initial_buf_ptrs: [u64; 2],
     initial_settings: DemoSettings,
     initial_camera: CameraFrame,
 ) -> (Sender<RenderCmd>, Receiver<FrameReady>, JoinHandle<()>) {
@@ -470,6 +524,10 @@ pub fn spawn_render_thread(
         .spawn(move || {
             cuda.bind_to_thread().expect("cuda bind_to_thread on render thread");
             let mut rig = init_optix(&cuda);
+            let mut cur_w = DEFAULT_W;
+            let mut cur_h = DEFAULT_H;
+            let mut cur_gen: u64 = 0;
+            let mut buf_ptrs = initial_buf_ptrs;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut settings = initial_settings;
             let mut camera = initial_camera;
@@ -479,30 +537,86 @@ pub fn spawn_render_thread(
             let mut last_tick = Instant::now();
 
             loop {
-                // Drain any pending commands from the 60 FPS GUI thread.
                 let mut should_exit = false;
-                while let Ok(cmd) = cmd_rx.try_recv() {
+                let apply_cmd = |cmd: RenderCmd,
+                                     rig: &mut OptixRig,
+                                     cur_w: &mut u32,
+                                     cur_h: &mut u32,
+                                     cur_gen: &mut u64,
+                                     buf_ptrs: &mut [u64; 2],
+                                     free_bufs: &mut VecDeque<usize>,
+                                     settings: &mut DemoSettings,
+                                     camera: &mut CameraFrame,
+                                     accum_count: &mut u32|
+                 -> bool {
                     match cmd {
                         RenderCmd::Update {
                             settings: s,
                             camera: c,
                             reset_accum,
                         } => {
-                            if reset_accum || *s != settings || c != camera {
-                                accum_count = 0;
+                            let only_aov_or_exp = s.aov_mode != settings.aov_mode
+                                || (s.exposure - settings.exposure).abs() > 1e-6;
+                            let only_non_accum = only_aov_or_exp
+                                && {
+                                    let mut tmp = *s;
+                                    tmp.aov_mode = settings.aov_mode;
+                                    tmp.exposure = settings.exposure;
+                                    tmp == *settings
+                                }
+                                && c == *camera;
+                            if reset_accum || (!only_non_accum && (*s != *settings || c != *camera))
+                            {
+                                *accum_count = 0;
                             }
-                            settings = *s;
-                            camera = c;
+                            *settings = *s;
+                            *camera = c;
+                            false
                         }
-                        RenderCmd::ReturnBuffer(idx) => {
-                            if !free_bufs.contains(&idx) {
-                                free_bufs.push_back(idx);
+                        RenderCmd::Resize {
+                            width,
+                            height,
+                            buf_ptrs: new_ptrs,
+                            gen_id,
+                        } => {
+                            if width != *cur_w || height != *cur_h {
+                                resize_rig(rig, width, height);
+                                *cur_w = width;
+                                *cur_h = height;
                             }
+                            *buf_ptrs = new_ptrs;
+                            *cur_gen = gen_id;
+                            free_bufs.clear();
+                            free_bufs.push_back(0);
+                            free_bufs.push_back(1);
+                            *accum_count = 0;
+                            false
                         }
-                        RenderCmd::Shutdown => {
-                            should_exit = true;
-                            break;
+                        RenderCmd::ReturnBuffer { buf_idx, gen_id } => {
+                            if gen_id == *cur_gen && !free_bufs.contains(&buf_idx) {
+                                free_bufs.push_back(buf_idx);
+                            }
+                            false
                         }
+                        RenderCmd::Shutdown => true,
+                    }
+                };
+
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    if apply_cmd(
+                        cmd,
+                        &mut rig,
+                        &mut cur_w,
+                        &mut cur_h,
+                        &mut cur_gen,
+                        &mut buf_ptrs,
+                        &mut free_bufs,
+                        &mut settings,
+                        &mut camera,
+                        &mut accum_count,
+                    ) {
+                        should_exit = true;
+                        break;
                     }
                 }
                 if should_exit {
@@ -513,26 +627,25 @@ pub fn spawn_render_thread(
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
 
-                // If converged or waiting for a free double-buffer slot, block without spinning.
                 if converged || free_bufs.is_empty() {
                     match cmd_rx.recv() {
-                        Ok(RenderCmd::Update {
-                            settings: s,
-                            camera: c,
-                            reset_accum,
-                        }) => {
-                            if reset_accum || *s != settings || c != camera {
-                                accum_count = 0;
+                        Ok(cmd) => {
+                            if apply_cmd(
+                                cmd,
+                                &mut rig,
+                                &mut cur_w,
+                                &mut cur_h,
+                                &mut cur_gen,
+                                &mut buf_ptrs,
+                                &mut free_bufs,
+                                &mut settings,
+                                &mut camera,
+                                &mut accum_count,
+                            ) {
+                                break;
                             }
-                            settings = *s;
-                            camera = c;
                         }
-                        Ok(RenderCmd::ReturnBuffer(idx)) => {
-                            if !free_bufs.contains(&idx) {
-                                free_bufs.push_back(idx);
-                            }
-                        }
-                        Ok(RenderCmd::Shutdown) | Err(_) => break,
+                        Err(_) => break,
                     }
                     continue;
                 }
@@ -592,20 +705,31 @@ pub fn spawn_render_thread(
                     ),
                 };
 
+                let az = settings.sun_azimuth.to_radians();
+                let el = settings.sun_elevation.to_radians();
+                let sun_x = el.cos() * az.sin();
+                let sun_y = el.sin();
+                let sun_z = el.cos() * az.cos();
+
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
                     out_normal_f32: rig.normal_f32.cu_deviceptr(),
                     handle: rig.ias.handle(),
-                    width: RENDER_W,
-                    height: RENDER_H,
+                    width: cur_w,
+                    height: cur_h,
                     frame_index,
                     spp: settings.spp,
-                    cam_pos: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
+                    cam_pos: [camera.eye[0], camera.eye[1], camera.eye[2], settings.aperture],
                     cam_forward: [camera.fwd[0], camera.fwd[1], camera.fwd[2], 0.0],
-                    cam_right: [camera.right[0], camera.right[1], camera.right[2], 0.0],
+                    cam_right: [
+                        camera.right[0],
+                        camera.right[1],
+                        camera.right[2],
+                        settings.focus_dist,
+                    ],
                     cam_up: [camera.up[0], camera.up[1], camera.up[2], camera.tan_half_fov],
-                    sun_dir: [0.55, 0.85, 0.35, settings.roughness],
+                    sun_dir: [sun_x, sun_y, sun_z, settings.roughness],
                     fractal_p0,
                     fractal_p1,
                     fractal_p2,
@@ -646,27 +770,23 @@ pub fn spawn_render_thread(
                         &rig.stream,
                         &rig.params_buf,
                         &rig.sbt,
-                        [RENDER_W, RENDER_H, 1],
+                        [cur_w, cur_h, 1],
                     )
                 }
                 .expect("optix launch");
                 rig.stream.synchronize().expect("rt sync");
                 let rt_ms = t_rt.elapsed().as_secs_f32() * 1000.0;
 
-                let (final_f32_ptr, denoise_ms) = if settings.denoiser_on {
+                let (final_f32_ptr, denoise_ms) = if settings.denoiser_on && settings.aov_mode == 0 {
                     let t_den = Instant::now();
                     let guides = Guides {
-                        albedo: Some(
-                            Image::new(&rig.albedo_f32, RENDER_W, RENDER_H).expect("albedo"),
-                        ),
-                        normal: Some(
-                            Image::new(&rig.normal_f32, RENDER_W, RENDER_H).expect("normal"),
-                        ),
+                        albedo: Some(Image::new(&rig.albedo_f32, cur_w, cur_h).expect("albedo")),
+                        normal: Some(Image::new(&rig.normal_f32, cur_w, cur_h).expect("normal")),
                         ..Default::default()
                     };
                     let layer = Layer {
-                        input: Image::new(&rig.color_f32, RENDER_W, RENDER_H).expect("in"),
-                        output: Image::new(&rig.denoised_f32, RENDER_W, RENDER_H).expect("out"),
+                        input: Image::new(&rig.color_f32, cur_w, cur_h).expect("in"),
+                        output: Image::new(&rig.denoised_f32, cur_w, cur_h).expect("out"),
                         previous: None,
                         aov: AovType::Beauty,
                     };
@@ -685,21 +805,27 @@ pub fn spawn_render_thread(
                     (rig.color_f32.cu_deviceptr(), 0.0)
                 };
 
-                let mut src_ptr = final_f32_ptr;
+                let mut src_ptr = match settings.aov_mode {
+                    1 => rig.albedo_f32.cu_deviceptr(),
+                    2 => rig.normal_f32.cu_deviceptr(),
+                    _ => final_f32_ptr,
+                };
                 let mut dst_ptr = buf_ptrs[buf_idx];
-                let mut w = RENDER_W;
-                let mut h = RENDER_H;
+                let mut w = cur_w;
+                let mut h = cur_h;
                 let mut exposure = settings.exposure;
-                let mut kernel_args: [*mut c_void; 5] = [
+                let mut aov_mode = settings.aov_mode;
+                let mut kernel_args: [*mut c_void; 6] = [
                     (&raw mut src_ptr).cast(),
                     (&raw mut dst_ptr).cast(),
                     (&raw mut w).cast(),
                     (&raw mut h).cast(),
                     (&raw mut exposure).cast(),
+                    (&raw mut aov_mode).cast(),
                 ];
-                let gx = RENDER_W.div_ceil(16);
-                let gy = RENDER_H.div_ceil(16);
-                // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32)` and all
+                let gx = cur_w.div_ceil(16);
+                let gy = cur_h.div_ceil(16);
+                // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32)` and all
                 // pointers/buffers remain valid through `stream.synchronize()`.
                 let res = unsafe {
                     cu::cuLaunchKernel(
@@ -729,6 +855,7 @@ pub fn spawn_render_thread(
                 if frame_tx
                     .send(FrameReady {
                         buf_idx,
+                        gen_id: cur_gen,
                         accum_count,
                         total_samples: accum_count.saturating_mul(settings.spp),
                         rt_ms,

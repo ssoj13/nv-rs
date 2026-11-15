@@ -1,6 +1,6 @@
 # nv-rs
 
-An armed engineer checks his tooling before he draws.
+*A driver panic is the mind-killer; check the `Result`, verify the SDK, and let the rays pass through.*
 
 `nv-rs` is a multi-crate Rust workspace (and Python package `nv_rs`) providing unified, safe,
 and runtime-resilient access to the NVIDIA library stack — CUDA Toolkit libraries, OptiX,
@@ -75,7 +75,6 @@ For architecture decisions, current state, and symbol/GPU-test coverage numbers,
 
 ## Provisioning SDKs (`bootstrap.py`)
 
-A man who cannot provision his own bench cannot trust his own builds.
 `bootstrap.py` is stdlib-only Python 3; running it bare prints help and exits cleanly (`0`):
 
 ```bash

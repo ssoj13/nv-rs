@@ -96,6 +96,7 @@ enum BufferNativeBacking {
     Vulkan {
         vk: Arc<VkBufferBacking>,
         barrier_runner: Box<VkBarrierRunner>,
+        barrier_queue: Option<vk::Queue>,
     },
     #[cfg(windows)]
     Dx12 {
@@ -131,9 +132,18 @@ impl SharedBuffer {
         cuda_ctx: &Arc<Context>,
         desc: &SharedBufferDescriptor<'_>,
     ) -> Result<Self> {
+        Self::create_with_barrier_queue(device, cuda_ctx, desc, None)
+    }
+
+    pub(crate) fn create_with_barrier_queue(
+        device: &wgpu::Device,
+        cuda_ctx: &Arc<Context>,
+        desc: &SharedBufferDescriptor<'_>,
+        barrier_queue: Option<vk::Queue>,
+    ) -> Result<Self> {
         validate_buffer_descriptor(desc)?;
         match verify_device_interop_support(device)? {
-            InteropBackend::Vulkan => Self::create_vulkan(device, cuda_ctx, desc),
+            InteropBackend::Vulkan => Self::create_vulkan(device, cuda_ctx, desc, barrier_queue),
             #[cfg(windows)]
             InteropBackend::Dx12 => Self::create_dx12(device, cuda_ctx, desc),
         }
@@ -143,6 +153,7 @@ impl SharedBuffer {
         device: &wgpu::Device,
         cuda_ctx: &Arc<Context>,
         desc: &SharedBufferDescriptor<'_>,
+        barrier_queue: Option<vk::Queue>,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
         let hal_dev =
@@ -256,6 +267,7 @@ impl SharedBuffer {
             backing: BufferNativeBacking::Vulkan {
                 vk: vk_backing,
                 barrier_runner,
+                barrier_queue,
             },
             size: desc.size,
         })
@@ -433,7 +445,11 @@ impl SharedBuffer {
         signal: Option<(&InteropSemaphore, u64)>,
     ) -> Result<()> {
         match &self.backing {
-            BufferNativeBacking::Vulkan { vk, barrier_runner } => {
+            BufferNativeBacking::Vulkan {
+                vk,
+                barrier_runner,
+                barrier_queue,
+            } => {
                 let wgpu_family = barrier_runner.queue_family();
                 let (src_family, dst_family, src_access, dst_access) = if acquire_to_wgpu {
                     (
@@ -481,7 +497,7 @@ impl SharedBuffer {
                     None => None,
                 };
 
-                crate::platform::with_vk_queue(queue, |raw_q| {
+                crate::platform::with_barrier_vk_queue(queue, *barrier_queue, |raw_q| {
                     barrier_runner.submit_buffer_barrier(
                         raw_q,
                         vk::PipelineStageFlags::ALL_COMMANDS,

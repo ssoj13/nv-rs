@@ -62,6 +62,7 @@ pub struct InteropContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     cuda_ctx: Arc<Context>,
+    vulkan_barrier_queue: Option<ash::vk::Queue>,
 }
 
 impl std::fmt::Debug for InteropContext {
@@ -88,6 +89,7 @@ impl InteropContext {
             device,
             queue,
             cuda_ctx,
+            vulkan_barrier_queue: None,
         })
     }
 
@@ -106,6 +108,7 @@ impl InteropContext {
             device,
             queue,
             cuda_ctx,
+            vulkan_barrier_queue: None,
         })
     }
 
@@ -135,7 +138,16 @@ impl InteropContext {
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             cuda_ctx,
+            vulkan_barrier_queue: None,
         })
+    }
+
+    /// Configures a dedicated Vulkan barrier queue `(family, index)` (in `wgpu`'s
+    /// queue family, distinct from `wgpu`'s own queue) for ownership/layout barriers.
+    pub fn with_vulkan_barrier_queue(mut self, family: u32, index: u32) -> Result<Self> {
+        let vk_q = platform::resolve_vulkan_barrier_queue(&self.device, family, index)?;
+        self.vulkan_barrier_queue = Some(vk_q);
+        Ok(self)
     }
 
     /// Returns the verified graphics interop backend (`Vulkan` or Windows `Dx12`).
@@ -170,11 +182,39 @@ impl InteropContext {
 
     /// Creates a zero-copy [`SharedBuffer`] shared between `wgpu` and CUDA.
     pub fn create_buffer(&self, desc: &SharedBufferDescriptor<'_>) -> Result<SharedBuffer> {
-        SharedBuffer::create(&self.device, &self.cuda_ctx, desc)
+        SharedBuffer::create_with_barrier_queue(
+            &self.device,
+            &self.cuda_ctx,
+            desc,
+            self.vulkan_barrier_queue,
+        )
     }
 
     /// Creates a zero-copy [`SharedTexture`] shared between `wgpu` and CUDA.
     pub fn create_texture(&self, desc: &SharedTextureDescriptor<'_>) -> Result<SharedTexture> {
-        SharedTexture::create(&self.device, &self.queue, &self.cuda_ctx, desc)
+        SharedTexture::create_with_barrier_queue(
+            &self.device,
+            &self.queue,
+            &self.cuda_ctx,
+            desc,
+            self.vulkan_barrier_queue,
+        )
+    }
+
+    /// Returns `true` when this context has a dedicated Vulkan barrier queue
+    /// configured so ownership barriers do not submit on `wgpu`'s queue.
+    #[must_use]
+    pub fn has_dedicated_vulkan_barrier_queue(&self) -> bool {
+        self.vulkan_barrier_queue.is_some()
+    }
+
+    /// Flushes optional staged wait/signal semaphore operations on `wgpu`'s queue
+    /// via `wgpu::Queue::submit(empty)` (thread-safe with other `wgpu::Queue::submit` callers).
+    pub fn flush_wgpu_wait_signal(
+        &self,
+        wait: Option<(&InteropSemaphore, u64)>,
+        signal: Option<(&InteropSemaphore, u64)>,
+    ) -> Result<()> {
+        platform::flush_wgpu_wait_signal(&self.queue, wait, signal)
     }
 }

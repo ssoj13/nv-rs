@@ -190,6 +190,7 @@ enum TextureNativeBacking {
     Vulkan {
         vk: Arc<VkImageBacking>,
         barrier_runner: Box<VkBarrierRunner>,
+        barrier_queue: Option<vk::Queue>,
         mip_level_count: u32,
         array_layers: u32,
     },
@@ -236,11 +237,27 @@ impl SharedTexture {
         cuda_ctx: &Arc<Context>,
         desc: &SharedTextureDescriptor<'_>,
     ) -> Result<Self> {
+        Self::create_with_barrier_queue(device, queue, cuda_ctx, desc, None)
+    }
+
+    pub(crate) fn create_with_barrier_queue(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cuda_ctx: &Arc<Context>,
+        desc: &SharedTextureDescriptor<'_>,
+        barrier_queue: Option<vk::Queue>,
+    ) -> Result<Self> {
         let (mapping, array_desc) = validate_texture_descriptor(desc)?;
         match verify_device_interop_support(device)? {
-            InteropBackend::Vulkan => {
-                Self::create_vulkan(device, queue, cuda_ctx, desc, mapping, array_desc)
-            }
+            InteropBackend::Vulkan => Self::create_vulkan(
+                device,
+                queue,
+                cuda_ctx,
+                desc,
+                mapping,
+                array_desc,
+                barrier_queue,
+            ),
             #[cfg(windows)]
             InteropBackend::Dx12 => Self::create_dx12(device, cuda_ctx, desc, mapping, array_desc),
         }
@@ -253,6 +270,7 @@ impl SharedTexture {
         desc: &SharedTextureDescriptor<'_>,
         mapping: FormatMapping,
         array_desc: ArrayDesc,
+        barrier_queue: Option<vk::Queue>,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
         let hal_dev =
@@ -391,7 +409,7 @@ impl SharedTexture {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(vk_img)
                 .subresource_range(subresource);
-            crate::platform::with_vk_queue(queue, |raw_q| {
+            crate::platform::with_barrier_vk_queue(queue, barrier_queue, |raw_q| {
                 barrier_runner.submit_image_barrier(
                     raw_q,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -457,6 +475,7 @@ impl SharedTexture {
             backing: TextureNativeBacking::Vulkan {
                 vk: vk_backing,
                 barrier_runner,
+                barrier_queue,
                 mip_level_count: desc.mip_level_count,
                 array_layers,
             },
@@ -725,6 +744,7 @@ impl SharedTexture {
             TextureNativeBacking::Vulkan {
                 vk,
                 barrier_runner,
+                barrier_queue,
                 mip_level_count,
                 array_layers,
             } => {
@@ -782,7 +802,7 @@ impl SharedTexture {
                     None => None,
                 };
 
-                crate::platform::with_vk_queue(queue, |raw_q| {
+                crate::platform::with_barrier_vk_queue(queue, *barrier_queue, |raw_q| {
                     barrier_runner.submit_image_barrier(
                         raw_q,
                         vk::PipelineStageFlags::ALL_COMMANDS,

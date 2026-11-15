@@ -427,12 +427,34 @@ pub(crate) fn queue_backend_kind(queue: &wgpu::Queue) -> wgpu::Backend {
     wgpu::Backend::Noop
 }
 
+/// Resolves a dedicated Vulkan barrier `vk::Queue` `(family, index)` on `device`.
+/// Submitting ownership/layout barriers on this queue (same family as `wgpu`, distinct
+/// `VkQueue` handle) avoids `VUID-vkQueueSubmit-queue-06445` races against
+/// `wgpu::Queue::submit` / `SurfaceTexture::present` on other threads.
+pub(crate) fn resolve_vulkan_barrier_queue(
+    device: &wgpu::Device,
+    family: u32,
+    index: u32,
+) -> Result<vk::Queue> {
+    // SAFETY: Read-only lookup of a queue created alongside `device`.
+    let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
+        expected: "Vulkan",
+        found: device.adapter_info().backend,
+    })?;
+    // SAFETY: Caller guarantees `(family, index)` was created with this logical Vulkan device.
+    Ok(unsafe { hal_dev.raw_device().get_device_queue(family, index) })
+}
+
 /// Acquires `nv-wgpu`'s internal Vulkan queue-submission serializer and invokes `f`
-/// with the raw `vk::Queue` extracted from `queue`.
+/// with `dedicated` if provided, otherwise the raw `vk::Queue` extracted from `queue`.
 ///
 /// This prevents concurrent `VkBarrierRunner` submissions across `SharedBuffer` /
 /// `SharedTexture` instances from racing on `vkQueueSubmit` (`VUID-vkQueueSubmit-queue-06445`).
-pub(crate) fn with_vk_queue<F, R>(queue: &wgpu::Queue, f: F) -> Result<R>
+pub(crate) fn with_barrier_vk_queue<F, R>(
+    queue: &wgpu::Queue,
+    dedicated: Option<vk::Queue>,
+    f: F,
+) -> Result<R>
 where
     F: FnOnce(vk::Queue) -> Result<R>,
 {
@@ -441,6 +463,9 @@ where
         .map_err(|_| Error::InvalidHandle {
             source_api: "VK_QUEUE_SUBMIT_LOCK mutex poisoned",
         })?;
+    if let Some(raw_q) = dedicated {
+        return f(raw_q);
+    }
     // SAFETY: Inspects Vulkan HAL queue handle; caller serializes against external `wgpu::Queue::submit`.
     let hal_q = unsafe { queue.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
         expected: "Vulkan",
@@ -451,7 +476,6 @@ where
 
 /// Flushes optional staged wait and signal operations through `wgpu::Queue::submit(empty)`
 /// so `wgpu`'s pending writes flush first and `wait` executes before `signal`.
-#[cfg(windows)]
 pub(crate) fn flush_wgpu_wait_signal(
     queue: &wgpu::Queue,
     wait: Option<(&crate::sync::InteropSemaphore, u64)>,

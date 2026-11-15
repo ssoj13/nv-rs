@@ -25,7 +25,7 @@ Safe cuBLAS and cuBLASLt host API on top of `cublas-sys`, `cublaslt-sys`, and `c
 
 - **Handles & configuration (`handle`)**: `Handle`, `Operation`, `PointerMode`, `MathMode`, `DataType`, `ComputeType`, and `GemmAlgo`.
 - **GEMM operations (`gemm`)**: `sgemm`, `dgemm`, `sgemm_batched`, `dgemm_batched`, `sgemm_strided_batched`, `dgemm_strided_batched`, and `gemm_ex` / `gemm_strided_batched_ex`.
-- **cuBLASLt (`lt`)**: `LtHandle`, `MatmulDesc`, `MatrixLayout`, `Preference`, `HeuristicResult`, `Order`, and `Epilogue`.
+- **cuBLASLt (`lt`)**: `LtHandle`, `MatmulDesc`, `MatrixLayout`, `MatrixTransformDesc`, `EmulationDesc`, `Preference`, `MatmulAlgo`, `HeuristicResult`, `Order`, `Epilogue`, `BatchMode`, `ReductionScheme`, `SearchMode`, heuristics cache, and logger.
 - **Workspace & errors (`scratch`, `error`)**: `Scratch` caller-owned reusable device workspace with byte-budget checks, plus `Status` (`Copy` integer newtype) and `Error` (including `Error::Unavailable`, `Error::Cublas`, `Error::Budget`, and `Error::Invalid`).
 
 ---
@@ -55,7 +55,7 @@ Safe cuSOLVER host API on top of `cusolver-sys`, `cusolvermg-sys`, `cusparse-sys
 
 - **Dense solvers (`dn`)**: `DnHandle`, `DnFloat`, and `SvdJob` covering `GETRF`/`GETRS`, `POTRF`/`POTRS`, `GEQRF`/`ORGQR`, `GESVD`, and `SYEVD` for `f32` and `f64` with two-phase `bufferSize` -> byte budget -> `Scratch`.
 - **Sparse solvers (`sp`)**: `SpHandle` and `MatDescr` for sparse QR linear solving (`csrlsvqr`) and shift-invert eigensolving (`csreigvsi`), plus `SpFloat`.
-- **Multi-GPU solvers (`mg`)**: `MgHandle`, `MgGrid`, `MgGridMapping`, `MgDataType`, and `MgMatrixDesc` for multi-GPU dense `POTRF`/`POTRS` and `GETRF`/`GETRS`.
+- **Multi-GPU solvers (`mg`)**: `MgHandle`, `MgGrid`, `MgGridMapping`, `MgDataType`, `MgMatrixDesc`, `EigMode`, and `validate_mg_syevd_w_type` for multi-GPU dense `POTRF`/`POTRS`/`POTRI`, `GETRF`/`GETRS`, and `SYEVD`.
 
 ---
 

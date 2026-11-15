@@ -337,7 +337,7 @@ fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
         }
     }
 
-    let safe_src = read_tree(&root.join("crates").join(&lib.name).join("src"));
+    let safe_src = read_tree(&wrapper_src_dir(root, &lib.name));
     let all_src = read_tree(&root.join("crates"));
     let mut names: Vec<String> = symbols.clone();
     for n in overlay.keys() {
@@ -453,6 +453,17 @@ fn read(path: &Path) -> Result<String, Error> {
     })
 }
 
+/// Resolves the crate `src/` directory that holds safe wrappers for `lib_name`.
+fn wrapper_src_dir(root: &Path, lib_name: &str) -> PathBuf {
+    let crate_name = match lib_name {
+        "cublaslt" => "cublas",
+        "cusolvermg" => "cusolver",
+        "nvcuvid" => "nvdec",
+        other => other,
+    };
+    root.join("crates").join(crate_name).join("src")
+}
+
 /// Concatenated `.rs` sources under `dir` (empty when it does not exist).
 fn read_tree(dir: &Path) -> String {
     let mut out = String::new();
@@ -542,5 +553,26 @@ mod tests {
             ["demo: overlay names `demoZ`, which the inventory does not contain"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrapper_src_dir_maps_shared_crate_libraries() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            wrapper_src_dir(root, "cublaslt"),
+            root.join("crates").join("cublas").join("src")
+        );
+        assert_eq!(
+            wrapper_src_dir(root, "cusolvermg"),
+            root.join("crates").join("cusolver").join("src")
+        );
+        assert_eq!(
+            wrapper_src_dir(root, "nvcuvid"),
+            root.join("crates").join("nvdec").join("src")
+        );
+        assert_eq!(
+            wrapper_src_dir(root, "nvenc"),
+            root.join("crates").join("nvenc").join("src")
+        );
     }
 }

@@ -2,45 +2,76 @@ lib = "cusolvermg"
 
 [[fn]]
 name = "cusolverMgCreate"
+wrapper = "cusolver::mg::MgHandle::new"
 
 [[fn]]
 name = "cusolverMgCreateDeviceGrid"
+wrapper = "cusolver::mg::MgGrid::new"
 
 [[fn]]
 name = "cusolverMgCreateMatrixDesc"
+wrapper = "cusolver::mg::MgMatrixDesc::new"
 
 [[fn]]
 name = "cusolverMgDestroy"
+wrapper = "cusolver::mg::MgHandle::drop"
 
 [[fn]]
 name = "cusolverMgDestroyGrid"
+wrapper = "cusolver::mg::MgGrid::drop"
 
 [[fn]]
 name = "cusolverMgDestroyMatrixDesc"
+wrapper = "cusolver::mg::MgMatrixDesc::drop"
 
 [[fn]]
 name = "cusolverMgDeviceSelect"
+wrapper = "cusolver::mg::MgHandle::device_select"
 
 [[fn]]
 name = "cusolverMgGetrf"
+wrapper = "cusolver::mg::MgHandle::getrf"
 
 [[fn]]
 name = "cusolverMgGetrf_bufferSize"
+wrapper = "cusolver::mg::MgHandle::getrf_buffer_size"
 
 [[fn]]
 name = "cusolverMgGetrs"
+wrapper = "cusolver::mg::MgHandle::getrs"
 
 [[fn]]
 name = "cusolverMgGetrs_bufferSize"
+wrapper = "cusolver::mg::MgHandle::getrs_buffer_size"
 
 [[fn]]
 name = "cusolverMgPotrf"
+wrapper = "cusolver::mg::MgHandle::potrf"
 
 [[fn]]
 name = "cusolverMgPotrf_bufferSize"
+wrapper = "cusolver::mg::MgHandle::potrf_buffer_size"
+
+[[fn]]
+name = "cusolverMgPotri"
+wrapper = "cusolver::mg::MgHandle::potri"
+
+[[fn]]
+name = "cusolverMgPotri_bufferSize"
+wrapper = "cusolver::mg::MgHandle::potri_buffer_size"
 
 [[fn]]
 name = "cusolverMgPotrs"
+wrapper = "cusolver::mg::MgHandle::potrs"
 
 [[fn]]
 name = "cusolverMgPotrs_bufferSize"
+wrapper = "cusolver::mg::MgHandle::potrs_buffer_size"
+
+[[fn]]
+name = "cusolverMgSyevd"
+wrapper = "cusolver::mg::MgHandle::syevd"
+
+[[fn]]
+name = "cusolverMgSyevd_bufferSize"
+wrapper = "cusolver::mg::MgHandle::syevd_buffer_size"

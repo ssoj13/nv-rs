@@ -2,36 +2,45 @@ lib = "nvcuvid"
 
 [[fn]]
 name = "cuvidCreateDecoder"
+wrapper = "VideoDecoder::new"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidCreateVideoParser"
+wrapper = "VideoParser::new"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidDecodePicture"
+wrapper = "VideoDecoder::decode_picture"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidDestroyDecoder"
+wrapper = "VideoDecoder::drop"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidDestroyVideoParser"
+wrapper = "VideoParser::drop"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidGetDecoderCaps"
+wrapper = "decoder_caps"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidMapVideoFrame64"
+wrapper = "VideoDecoder::map_frame"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidParseVideoData"
+wrapper = "VideoParser::parse_packet"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"
 
 [[fn]]
 name = "cuvidUnmapVideoFrame64"
+wrapper = "MappedFrame::drop"
 test = "nvenc_to_nvdec_h264_roundtrip_psnr"

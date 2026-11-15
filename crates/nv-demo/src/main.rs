@@ -196,7 +196,8 @@ mod demo_app {
 
             // Double-buffered CUDA<->wgpu SharedBuffers so GUI 60 FPS never stalls on OptiX.
             let (shared_rgba, display_texture) =
-                allocate_render_targets(&interop, DEFAULT_W, DEFAULT_H);
+                allocate_render_targets(&interop, DEFAULT_W, DEFAULT_H)
+                    .expect("initial render targets");
             let buf_ptrs = [shared_rgba[0].cu_deviceptr(), shared_rgba[1].cu_deviceptr()];
             let view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let display_tex_id = egui_renderer.register_native_texture(
@@ -396,32 +397,37 @@ mod demo_app {
                 && self.last_resize_at.elapsed().as_millis() >= 120
             {
                 self.last_resize_at = Instant::now();
-                let (new_shared, new_tex) =
-                    allocate_render_targets(&self.interop, target_w, target_h);
-                let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
-                let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                self.egui_renderer.update_egui_texture_from_wgpu_texture(
-                    self.interop.device(),
-                    &new_view,
-                    wgpu::FilterMode::Linear,
-                    self.display_tex_id,
-                );
-                let old_shared = std::mem::replace(&mut self.shared_rgba, new_shared);
-                self.retired_buffers.push((self.buf_gen, old_shared));
-                self.display_texture = new_tex;
-                self.render_w = target_w;
-                self.render_h = target_h;
-                self.buf_gen = self.buf_gen.wrapping_add(1);
-                self.has_frame = false;
-                self.front_buf_idx = 0;
-                self.accum_count = 0;
-                self.total_samples = 0;
-                let _ = self.cmd_tx.send(RenderCmd::Resize {
-                    width: target_w,
-                    height: target_h,
-                    buf_ptrs: new_ptrs,
-                    gen_id: self.buf_gen,
-                });
+                match allocate_render_targets(&self.interop, target_w, target_h) {
+                    Ok((new_shared, new_tex)) => {
+                        let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
+                        let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            self.interop.device(),
+                            &new_view,
+                            wgpu::FilterMode::Linear,
+                            self.display_tex_id,
+                        );
+                        let old_shared = std::mem::replace(&mut self.shared_rgba, new_shared);
+                        self.retired_buffers.push((self.buf_gen, old_shared));
+                        self.display_texture = new_tex;
+                        self.render_w = target_w;
+                        self.render_h = target_h;
+                        self.buf_gen = self.buf_gen.wrapping_add(1);
+                        self.has_frame = false;
+                        self.front_buf_idx = 0;
+                        self.accum_count = 0;
+                        self.total_samples = 0;
+                        let _ = self.cmd_tx.send(RenderCmd::Resize {
+                            width: target_w,
+                            height: target_h,
+                            buf_ptrs: new_ptrs,
+                            gen_id: self.buf_gen,
+                        });
+                    }
+                    Err(e) => {
+                        self.last_saved_msg = Some(format!("Resize failed: {e}"));
+                    }
+                }
             }
 
             if save_png_requested && self.has_frame {
@@ -582,18 +588,16 @@ mod demo_app {
         interop: &InteropContext,
         width: u32,
         height: u32,
-    ) -> ([SharedBuffer; 2], wgpu::Texture) {
+    ) -> Result<([SharedBuffer; 2], wgpu::Texture), nv_wgpu::Error> {
         let byte_size = u64::from(width * height * 4);
         let make_shared = |label| {
-            interop
-                .create_buffer(&SharedBufferDescriptor {
-                    label: Some(label),
-                    size: byte_size,
-                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
-                })
-                .expect("SharedBuffer")
+            interop.create_buffer(&SharedBufferDescriptor {
+                label: Some(label),
+                size: byte_size,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+            })
         };
-        let shared = [make_shared("optix-rgba8-0"), make_shared("optix-rgba8-1")];
+        let shared = [make_shared("optix-rgba8-0")?, make_shared("optix-rgba8-1")?];
         let tex = interop.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("optix-viewport"),
             size: wgpu::Extent3d {
@@ -608,16 +612,15 @@ mod demo_app {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        (shared, tex)
+        Ok((shared, tex))
     }
 
     fn save_front_png(interop: &InteropContext, dev_ptr: u64, width: u32, height: u32) -> String {
         let byte_len = (width * height * 4) as usize;
         let mut host = vec![0u8; byte_len];
-        interop
-            .cuda_context()
-            .bind_to_thread()
-            .expect("cuda bind_to_thread for save_png");
+        if let Err(e) = interop.cuda_context().bind_to_thread() {
+            return format!("CUDA bind failed: {e}");
+        }
         // SAFETY: `dev_ptr` points to a `SharedBuffer` of `byte_len` bytes on the active context.
         let res =
             unsafe { cuda_bindings::cuMemcpyDtoH_v2(host.as_mut_ptr().cast(), dev_ptr, byte_len) };

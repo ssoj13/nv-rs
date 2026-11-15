@@ -1,5 +1,6 @@
 //! Multi-GPU cuSOLVER (`cusolverMg`) handle, device grid, distributed matrix descriptor,
-//! and multi-GPU `POTRF`/`POTRS`/`GETRF`/`GETRS` with two-phase workspace sizing.
+//! and multi-GPU `POTRF`/`POTRS`/`POTRI`, `GETRF`/`GETRS`, and `SYEVD` with two-phase workspace
+//! sizing.
 //!
 //! **What.**
 //! - [`MgHandle`] — owns `cusolverMgHandle_t` and selects participating GPU ordinals.
@@ -8,9 +9,9 @@
 //! - [`MgMatrixDesc`] — owns `cudaLibMgMatrixDesc_t` describing a 2D block-cyclic distributed
 //!   matrix over an [`MgGrid`].
 //! - Two-phase workspace sizing (`*_bufferSize` -> byte budget check -> caller-owned per-GPU
-//!   work pointers) for `potrf`, `potrs`, `getrf`, and `getrs`.
+//!   work pointers) for `potrf`, `potrs`, `potri`, `getrf`, `getrs`, and `syevd`.
 
-use crate::{Error, FillMode, Op, Result, check_mg, ensure_mg_loaded, mg_sys};
+use crate::{EigMode, Error, FillMode, Op, Result, check_mg, ensure_mg_loaded, mg_sys};
 use cuda_core::{Context, DriverError};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -56,6 +57,11 @@ impl MgDataType {
         }
     }
 
+    /// Returns `true` if the data type is real (`F32` or `F64`).
+    pub const fn is_real(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+
     pub(crate) fn to_sys(self) -> mg_sys::cudaDataType {
         match self {
             Self::F32 => mg_sys::cudaDataType_t_CUDA_R_32F,
@@ -99,6 +105,16 @@ pub fn validate_mg_matrix_desc(
     Ok(())
 }
 
+/// Validates that eigenvalue output type `data_type_w` for `syevd` is real (`F32` or `F64`).
+pub fn validate_mg_syevd_w_type(data_type_w: MgDataType) -> Result<()> {
+    if !data_type_w.is_real() {
+        return Err(Error::InvalidInput(
+            "syevd eigenvalue type data_type_w must be real (F32 or F64)",
+        ));
+    }
+    Ok(())
+}
+
 /// Checks `lwork` elements of `compute_type` against `budget_bytes` per GPU.
 pub fn check_mg_work_budget(
     lwork: i64,
@@ -124,6 +140,7 @@ pub fn check_mg_work_budget(
 }
 
 /// Owning multi-GPU cuSOLVER handle (`cusolverMgHandle_t`).
+#[must_use]
 pub struct MgHandle {
     raw: mg_sys::cusolverMgHandle_t,
     cuda: Arc<Context>,
@@ -516,6 +533,175 @@ impl MgHandle {
         })?;
         Ok(info)
     }
+
+    /// Queries workspace element count for `cusolverMgPotri` and checks it against `budget_bytes`.
+    ///
+    /// # Safety
+    ///
+    /// `array_d_a` must hold valid per-GPU device pointers matching `descr_a` on the selected devices.
+    #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
+    pub unsafe fn potri_buffer_size(
+        &self,
+        uplo: FillMode,
+        n: i32,
+        array_d_a: &mut [*mut c_void],
+        ia: i32,
+        ja: i32,
+        descr_a: &MgMatrixDesc,
+        compute_type: MgDataType,
+        budget_bytes: usize,
+    ) -> Result<(i64, usize)> {
+        self.cuda.bind_to_thread()?;
+        let mut lwork = 0i64;
+        // SAFETY: caller guarantees `array_d_a` holds valid per-device pointers for `descr_a`.
+        check_mg("cusolverMgPotri_bufferSize", unsafe {
+            mg_sys::cusolverMgPotri_bufferSize(
+                self.raw,
+                uplo.to_mg_sys(),
+                n,
+                array_d_a.as_mut_ptr(),
+                ia,
+                ja,
+                descr_a.raw(),
+                compute_type.to_sys(),
+                &mut lwork,
+            )
+        })?;
+        let bytes = check_mg_work_budget(lwork, compute_type, budget_bytes)?;
+        Ok((lwork, bytes))
+    }
+
+    /// Executes multi-GPU Cholesky inverse `cusolverMgPotri`, returning `h_info`.
+    ///
+    /// # Safety
+    ///
+    /// `array_d_a` and `array_d_work` must hold valid per-GPU device pointers sized for `descr_a`
+    /// and `lwork` elements of `compute_type`.
+    #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
+    pub unsafe fn potri(
+        &self,
+        uplo: FillMode,
+        n: i32,
+        array_d_a: &mut [*mut c_void],
+        ia: i32,
+        ja: i32,
+        descr_a: &MgMatrixDesc,
+        compute_type: MgDataType,
+        array_d_work: &mut [*mut c_void],
+        lwork: i64,
+    ) -> Result<i32> {
+        self.cuda.bind_to_thread()?;
+        let mut h_info = 0i32;
+        // SAFETY: caller guarantees per-GPU matrix and workspace pointers.
+        check_mg("cusolverMgPotri", unsafe {
+            mg_sys::cusolverMgPotri(
+                self.raw,
+                uplo.to_mg_sys(),
+                n,
+                array_d_a.as_mut_ptr(),
+                ia,
+                ja,
+                descr_a.raw(),
+                compute_type.to_sys(),
+                array_d_work.as_mut_ptr(),
+                lwork,
+                &mut h_info,
+            )
+        })?;
+        Ok(h_info)
+    }
+
+    /// Queries workspace element count for `cusolverMgSyevd` and checks it against `budget_bytes`.
+    ///
+    /// # Safety
+    ///
+    /// `array_d_a` must hold valid per-GPU device pointers matching `descr_a`, and `w` must be a
+    /// valid host eigenvalue buffer pointer for `n` elements of `data_type_w`.
+    #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
+    pub unsafe fn syevd_buffer_size(
+        &self,
+        jobz: EigMode,
+        uplo: FillMode,
+        n: i32,
+        array_d_a: &mut [*mut c_void],
+        ia: i32,
+        ja: i32,
+        descr_a: &MgMatrixDesc,
+        w: *mut c_void,
+        data_type_w: MgDataType,
+        compute_type: MgDataType,
+        budget_bytes: usize,
+    ) -> Result<(i64, usize)> {
+        validate_mg_syevd_w_type(data_type_w)?;
+        self.cuda.bind_to_thread()?;
+        let mut lwork = 0i64;
+        // SAFETY: caller guarantees `array_d_a` and `w` are valid pointers for `descr_a` and `n`.
+        check_mg("cusolverMgSyevd_bufferSize", unsafe {
+            mg_sys::cusolverMgSyevd_bufferSize(
+                self.raw,
+                jobz.to_mg_sys(),
+                uplo.to_mg_sys(),
+                n,
+                array_d_a.as_mut_ptr(),
+                ia,
+                ja,
+                descr_a.raw(),
+                w,
+                data_type_w.to_sys(),
+                compute_type.to_sys(),
+                &mut lwork,
+            )
+        })?;
+        let bytes = check_mg_work_budget(lwork, compute_type, budget_bytes)?;
+        Ok((lwork, bytes))
+    }
+
+    /// Executes multi-GPU symmetric/Hermitian eigensolver `cusolverMgSyevd`, returning `info`.
+    ///
+    /// # Safety
+    ///
+    /// `array_d_a`, `w`, and `array_d_work` must hold valid pointers sized for `descr_a`, `n`
+    /// eigenvalues of `data_type_w`, and `lwork` elements of `compute_type`.
+    #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
+    pub unsafe fn syevd(
+        &self,
+        jobz: EigMode,
+        uplo: FillMode,
+        n: i32,
+        array_d_a: &mut [*mut c_void],
+        ia: i32,
+        ja: i32,
+        descr_a: &MgMatrixDesc,
+        w: *mut c_void,
+        data_type_w: MgDataType,
+        compute_type: MgDataType,
+        array_d_work: &mut [*mut c_void],
+        lwork: i64,
+    ) -> Result<i32> {
+        validate_mg_syevd_w_type(data_type_w)?;
+        self.cuda.bind_to_thread()?;
+        let mut info = 0i32;
+        // SAFETY: caller guarantees per-GPU matrix, eigenvalue, and workspace pointers.
+        check_mg("cusolverMgSyevd", unsafe {
+            mg_sys::cusolverMgSyevd(
+                self.raw,
+                jobz.to_mg_sys(),
+                uplo.to_mg_sys(),
+                n,
+                array_d_a.as_mut_ptr(),
+                ia,
+                ja,
+                descr_a.raw(),
+                w,
+                data_type_w.to_sys(),
+                compute_type.to_sys(),
+                array_d_work.as_mut_ptr(),
+                lwork,
+                &mut info,
+            )
+        })?;
+        Ok(info)
+    }
 }
 
 impl Drop for MgHandle {
@@ -541,6 +727,7 @@ impl Drop for MgHandle {
 }
 
 /// Owning multi-GPU device grid (`cudaLibMgGrid_t`).
+#[must_use]
 pub struct MgGrid {
     raw: mg_sys::cudaLibMgGrid_t,
     cuda: Arc<Context>,
@@ -609,6 +796,7 @@ impl Drop for MgGrid {
 }
 
 /// Owning multi-GPU distributed matrix descriptor (`cudaLibMgMatrixDesc_t`).
+#[must_use]
 pub struct MgMatrixDesc {
     raw: mg_sys::cudaLibMgMatrixDesc_t,
     grid: Arc<MgGrid>,
@@ -709,5 +897,71 @@ mod tests {
             check_mg_work_budget(128, MgDataType::F64, 1024).unwrap(),
             1024
         );
+    }
+
+    #[test]
+    fn mg_data_type_mapping_and_byte_sizes() {
+        assert_eq!(MgDataType::F32.byte_size(), 4);
+        assert_eq!(MgDataType::F64.byte_size(), 8);
+        assert_eq!(MgDataType::C32.byte_size(), 8);
+        assert_eq!(MgDataType::C64.byte_size(), 16);
+
+        assert!(MgDataType::F32.is_real());
+        assert!(MgDataType::F64.is_real());
+        assert!(!MgDataType::C32.is_real());
+        assert!(!MgDataType::C64.is_real());
+
+        assert_eq!(MgDataType::F32.to_sys(), mg_sys::cudaDataType_t_CUDA_R_32F);
+        assert_eq!(MgDataType::C64.to_sys(), mg_sys::cudaDataType_t_CUDA_C_64F);
+        assert_eq!(
+            MgGridMapping::ColMajor.to_sys(),
+            mg_sys::cusolverMgGridMapping_t_CUDALIBMG_GRID_MAPPING_COL_MAJOR
+        );
+        assert_eq!(
+            MgGridMapping::RowMajor.to_sys(),
+            mg_sys::cusolverMgGridMapping_t_CUDALIBMG_GRID_MAPPING_ROW_MAJOR
+        );
+        assert_eq!(
+            EigMode::NoVector.to_mg_sys(),
+            mg_sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_NOVECTOR
+        );
+        assert_eq!(
+            EigMode::Vector.to_mg_sys(),
+            mg_sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_VECTOR
+        );
+    }
+
+    #[test]
+    fn mg_syevd_w_type_validation() {
+        assert!(validate_mg_syevd_w_type(MgDataType::F32).is_ok());
+        assert!(validate_mg_syevd_w_type(MgDataType::F64).is_ok());
+        assert!(matches!(
+            validate_mg_syevd_w_type(MgDataType::C32),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_mg_syevd_w_type(MgDataType::C64),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn mg_work_budget_overflow_is_rejected() {
+        assert!(matches!(
+            check_mg_work_budget(i64::MAX, MgDataType::C64, usize::MAX),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "GPU: requires CUDA device and cusolverMg library; run with --ignored"]
+    fn mg_handle_grid_and_desc_lifecycle() {
+        let cuda = Context::new(0).expect("CUDA context on device 0");
+        let mut handle = MgHandle::new(&cuda).expect("cusolverMgCreate");
+        handle.device_select(&[0]).expect("cusolverMgDeviceSelect");
+        let grid = MgGrid::new(&cuda, 1, 1, &[0], MgGridMapping::ColMajor)
+            .expect("cusolverMgCreateDeviceGrid");
+        let _desc = MgMatrixDesc::new(&grid, 4, 4, 2, 2, MgDataType::F32)
+            .expect("cusolverMgCreateMatrixDesc");
     }
 }

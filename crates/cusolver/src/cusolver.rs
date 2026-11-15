@@ -6,8 +6,8 @@
 //!   byte budget -> [`Scratch`].
 //! - [`sp`] — [`SpHandle`] and [`MatDescr`]: sparse QR linear solver (`csrlsvqr`) and
 //!   shift-invert eigensolver (`csreigvsi`).
-//! - [`mg`] — [`MgHandle`], [`MgGrid`], and [`MgMatrixDesc`]: multi-GPU dense `POTRF`/`POTRS`
-//!   and `GETRF`/`GETRS`.
+//! - [`mg`] — [`MgHandle`], [`MgGrid`], and [`MgMatrixDesc`]: multi-GPU dense `POTRF`/`POTRS`/
+//!   `POTRI`, `GETRF`/`GETRS`, and `SYEVD`.
 //!
 //! **Conventions.** Every handle owns its native cuSOLVER object, holds an
 //! `Arc<cuda_core::Context>`, and destroys it on `Drop`; teardown failures are recorded on the
@@ -273,6 +273,13 @@ impl EigMode {
         match self {
             Self::NoVector => sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_NOVECTOR,
             Self::Vector => sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_VECTOR,
+        }
+    }
+
+    pub(crate) fn to_mg_sys(self) -> mg_sys::cusolverEigMode_t {
+        match self {
+            Self::NoVector => mg_sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_NOVECTOR,
+            Self::Vector => mg_sys::cusolverEigMode_t_CUSOLVER_EIG_MODE_VECTOR,
         }
     }
 }

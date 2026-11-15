@@ -16,6 +16,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - **Starlight documentation & GitHub Pages** (`docs/`, `.github/workflows/pages.yml`): Full documentation site covering architecture, `nv-loader`, `nv-bindgen`, `cuda-core-ext`, `nv-wgpu`, all wrapped NVIDIA crates, `nv-demo`, and the `nv_rs` Python API, published at <https://ssoj13.github.io/nv-rs/>.
 - **`nv-demo` full-stack showcase** (`crates/nv-demo/`): Interactive OptiX 9 IAS ray tracer (fractal AABBs, dielectric glass, emissive neon, checkerboard floor) with `TemporalAov` AI denoising, A/B split view, live NVRTC `.cu` hot-reload, cuFFT diffraction bloom, zero-copy `nv-wgpu` presentation, `nvjpeg`/`nvenc` export, and `nvml`/`cupti`/`ngx` telemetry.
 - **Streamline NGX SDK discovery**: Enabled `ngx` by default in `nv-demo` and integrated NVIDIA Streamline `ngx-sdk` detection via `vcv-rs` and `bootstrap.py`.
+- **`cublaslt` safe wrapper coverage** (`crates/cublas/src/lt.rs`, `crates/cublas/src/error.rs`): Wrapped all 48 public `cublasLt*` entry points, adding `MatrixTransformDesc`, `EmulationDesc`, `MatmulAlgo` config/capabilities, `BatchMode`, `ReductionScheme`, `SearchMode`, heuristics cache, logger helpers, and `Status::lt_name` / `Status::lt_string`.
+- **`cusolvermg` safe wrapper coverage** (`crates/cusolver/src/mg.rs`, `crates/cusolver/src/cusolver.rs`): Completed all 19/19 `cusolverMg*` entry points with `potri_buffer_size`, `potri`, `syevd_buffer_size`, `syevd`, `EigMode::to_mg_sys`, and `validate_mg_syevd_w_type`.
+- **`xtask coverage` wrapper mapping & CI** (`xtask/src/xtask.rs`, `coverage/`, `.github/workflows/ci.yml`): Added `wrapper_src_dir` mapping (`cublaslt -> cublas`, `cusolvermg -> cusolver`, `nvcuvid -> nvdec`), populated wrapper coverage manifests, and included `-p xtask` in CI.
 
 ### Changed
 - **Generated shim safety**: `nv-bindgen` now emits explicit `// SAFETY:` comments on every `unsafe` block in generated `*_shims.rs` files, and `nv-loader` macros (`exports_sys!`, `split_exports_sys!`, `query_interface_sys!`) no longer suppress `clippy::undocumented_unsafe_blocks`.
@@ -24,6 +27,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ### Fixed
 - **`EncodeSession` `Sync` soundness** (`crates/nvenc/src/nvenc.rs`): Serialized all NVENC API calls and `Drop` paths touching the raw session handle behind an internal `Mutex<()>` (`lock_session()`), backing `unsafe impl Sync for EncodeSession`.
 - **Documentation & links**: Fixed GitHub Pages `/nv-rs` base-path links, added the documentation badge/link to `README.md`, and corrected the `nv_rs` submodule count (`25`).
+- **`nv-demo` runtime resize & PNG export error handling** (`crates/nv-demo/src/main.rs`): Replaced panic-on-OOM render-target reallocation and `save_front_png` CUDA context binding `unwrap()` calls with error propagation and status reporting.
 
 ## [0.1.0] - Initial Workspace
 

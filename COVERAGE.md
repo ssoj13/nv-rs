@@ -7,18 +7,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | Library | Symbols | Bound | Wrapped | Tested on GPU |
 |---|---:|---:|---:|---:|
 | cublas | 517 | 517 | 18 | 18 |
-| cublaslt | 54 | 54 | 0 | 0 |
+| cublaslt | 54 | 54 | 48 | 0 |
 | cudnn | 239 | 239 | 39 | 39 |
 | cufft | 35 | 35 | 20 | 20 |
 | cupti | 116 | 116 | 13 | 13 |
 | cusolver | 483 | 483 | 38 | 38 |
-| cusolvermg | 19 | 19 | 0 | 0 |
+| cusolvermg | 19 | 19 | 19 | 0 |
 | cusparse | 453 | 453 | 41 | 41 |
 | ngx | 68 | 68 | 23 | 23 |
 | npp | 8187 | 8187 | 19 | 19 |
 | nvapi | 298 | 298 | 40 | 40 |
 | nvcomp | 119 | 119 | 55 | 55 |
-| nvcuvid | 24 | 24 | 0 | 9 |
+| nvcuvid | 24 | 24 | 9 | 9 |
 | nvenc | 42 | 42 | 20 | 20 |
 | nvjpeg | 81 | 81 | 46 | 46 |
 | nvml | 390 | 390 | 56 | 56 |
@@ -556,60 +556,60 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `cublasLtCreate` | yes |  |  |  |
-| `cublasLtDestroy` | yes |  |  |  |
-| `cublasLtDisableCpuInstructionsSetMask` | yes |  |  |  |
-| `cublasLtEmulationDescCreate` | yes |  |  |  |
-| `cublasLtEmulationDescDestroy` | yes |  |  |  |
-| `cublasLtEmulationDescGetAttribute` | yes |  |  |  |
-| `cublasLtEmulationDescInit_internal` | yes |  |  |  |
-| `cublasLtEmulationDescSetAttribute` | yes |  |  |  |
-| `cublasLtGetCudartVersion` | yes |  |  |  |
-| `cublasLtGetProperty` | yes |  |  |  |
-| `cublasLtGetStatusName` | yes |  |  |  |
-| `cublasLtGetStatusString` | yes |  |  |  |
-| `cublasLtGetVersion` | yes |  |  |  |
-| `cublasLtGroupedMatrixLayoutCreate` | yes |  |  |  |
-| `cublasLtGroupedMatrixLayoutInit_internal` | yes |  |  |  |
-| `cublasLtHeuristicsCacheGetCapacity` | yes |  |  |  |
-| `cublasLtHeuristicsCacheSetCapacity` | yes |  |  |  |
-| `cublasLtLoggerForceDisable` | yes |  |  |  |
-| `cublasLtLoggerOpenFile` | yes |  |  |  |
-| `cublasLtLoggerSetCallback` | yes |  |  |  |
-| `cublasLtLoggerSetFile` | yes |  |  |  |
-| `cublasLtLoggerSetLevel` | yes |  |  |  |
-| `cublasLtLoggerSetMask` | yes |  |  |  |
-| `cublasLtMatmul` | yes |  |  |  |
-| `cublasLtMatmulAlgoCapGetAttribute` | yes |  |  |  |
-| `cublasLtMatmulAlgoCheck` | yes |  |  |  |
-| `cublasLtMatmulAlgoCheckForStream` | yes |  |  |  |
-| `cublasLtMatmulAlgoConfigGetAttribute` | yes |  |  |  |
-| `cublasLtMatmulAlgoConfigSetAttribute` | yes |  |  |  |
-| `cublasLtMatmulAlgoGetHeuristic` | yes |  |  |  |
-| `cublasLtMatmulAlgoGetHeuristicForStream` | yes |  |  |  |
-| `cublasLtMatmulAlgoGetIds` | yes |  |  |  |
-| `cublasLtMatmulAlgoInit` | yes |  |  |  |
-| `cublasLtMatmulDescCreate` | yes |  |  |  |
-| `cublasLtMatmulDescDestroy` | yes |  |  |  |
-| `cublasLtMatmulDescGetAttribute` | yes |  |  |  |
-| `cublasLtMatmulDescInit_internal` | yes |  |  |  |
-| `cublasLtMatmulDescSetAttribute` | yes |  |  |  |
-| `cublasLtMatmulPreferenceCreate` | yes |  |  |  |
-| `cublasLtMatmulPreferenceDestroy` | yes |  |  |  |
-| `cublasLtMatmulPreferenceGetAttribute` | yes |  |  |  |
-| `cublasLtMatmulPreferenceInit_internal` | yes |  |  |  |
-| `cublasLtMatmulPreferenceSetAttribute` | yes |  |  |  |
-| `cublasLtMatrixLayoutCreate` | yes |  |  |  |
-| `cublasLtMatrixLayoutDestroy` | yes |  |  |  |
-| `cublasLtMatrixLayoutGetAttribute` | yes |  |  |  |
-| `cublasLtMatrixLayoutInit_internal` | yes |  |  |  |
-| `cublasLtMatrixLayoutSetAttribute` | yes |  |  |  |
-| `cublasLtMatrixTransform` | yes |  |  |  |
-| `cublasLtMatrixTransformDescCreate` | yes |  |  |  |
-| `cublasLtMatrixTransformDescDestroy` | yes |  |  |  |
-| `cublasLtMatrixTransformDescGetAttribute` | yes |  |  |  |
-| `cublasLtMatrixTransformDescInit_internal` | yes |  |  |  |
-| `cublasLtMatrixTransformDescSetAttribute` | yes |  |  |  |
+| `cublasLtCreate` | yes | `cublas::lt::LtHandle::new` |  |  |
+| `cublasLtDestroy` | yes | `cublas::lt::LtHandle::drop` |  |  |
+| `cublasLtDisableCpuInstructionsSetMask` | yes | `cublas::lt::disable_cpu_instructions_set_mask` |  |  |
+| `cublasLtEmulationDescCreate` | yes | `cublas::lt::EmulationDesc::new` |  |  |
+| `cublasLtEmulationDescDestroy` | yes | `cublas::lt::EmulationDesc::drop` |  |  |
+| `cublasLtEmulationDescGetAttribute` | yes | `cublas::lt::EmulationDesc::get_attribute_bytes` |  |  |
+| `cublasLtEmulationDescInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtEmulationDescSetAttribute` | yes | `cublas::lt::EmulationDesc::set_attribute_bytes` |  |  |
+| `cublasLtGetCudartVersion` | yes | `cublas::lt::cudart_version` |  |  |
+| `cublasLtGetProperty` | yes | `cublas::lt::get_property` |  |  |
+| `cublasLtGetStatusName` | yes | `cublas::error::Status::lt_name` |  |  |
+| `cublasLtGetStatusString` | yes | `cublas::error::Status::lt_string` |  |  |
+| `cublasLtGetVersion` | yes | `cublas::lt::version` |  |  |
+| `cublasLtGroupedMatrixLayoutCreate` | yes | `cublas::lt::MatrixLayout::new_grouped` |  |  |
+| `cublasLtGroupedMatrixLayoutInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtHeuristicsCacheGetCapacity` | yes | `cublas::lt::heuristics_cache_capacity` |  |  |
+| `cublasLtHeuristicsCacheSetCapacity` | yes | `cublas::lt::set_heuristics_cache_capacity` |  |  |
+| `cublasLtLoggerForceDisable` | yes | `cublas::lt::logger_force_disable` |  |  |
+| `cublasLtLoggerOpenFile` | yes | `cublas::lt::logger_open_file` |  |  |
+| `cublasLtLoggerSetCallback` | yes | `cublas::lt::logger_set_callback` |  |  |
+| `cublasLtLoggerSetFile` | yes | `cublas::lt::logger_set_file` |  |  |
+| `cublasLtLoggerSetLevel` | yes | `cublas::lt::logger_set_level` |  |  |
+| `cublasLtLoggerSetMask` | yes | `cublas::lt::logger_set_mask` |  |  |
+| `cublasLtMatmul` | yes | `cublas::lt::LtHandle::matmul_with_scratch` |  |  |
+| `cublasLtMatmulAlgoCapGetAttribute` | yes | `cublas::lt::MatmulAlgo::cap_attribute_bytes` |  |  |
+| `cublasLtMatmulAlgoCheck` | yes | `cublas::lt::LtHandle::matmul_algo_check` |  |  |
+| `cublasLtMatmulAlgoCheckForStream` | yes | `cublas::lt::LtHandle::matmul_algo_check_for_stream` |  |  |
+| `cublasLtMatmulAlgoConfigGetAttribute` | yes | `cublas::lt::MatmulAlgo::config_bytes` |  |  |
+| `cublasLtMatmulAlgoConfigSetAttribute` | yes | `cublas::lt::MatmulAlgo::set_config_bytes` |  |  |
+| `cublasLtMatmulAlgoGetHeuristic` | yes | `cublas::lt::LtHandle::matmul_heuristic` |  |  |
+| `cublasLtMatmulAlgoGetHeuristicForStream` | yes | `cublas::lt::LtHandle::matmul_heuristic_for_stream` |  |  |
+| `cublasLtMatmulAlgoGetIds` | yes | `cublas::lt::LtHandle::matmul_algo_ids` |  |  |
+| `cublasLtMatmulAlgoInit` | yes | `cublas::lt::LtHandle::matmul_algo_init` |  |  |
+| `cublasLtMatmulDescCreate` | yes | `cublas::lt::MatmulDesc::new` |  |  |
+| `cublasLtMatmulDescDestroy` | yes | `cublas::lt::MatmulDesc::drop` |  |  |
+| `cublasLtMatmulDescGetAttribute` | yes | `cublas::lt::MatmulDesc::get_attribute_bytes` |  |  |
+| `cublasLtMatmulDescInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtMatmulDescSetAttribute` | yes | `cublas::lt::MatmulDesc::set_attribute_bytes` |  |  |
+| `cublasLtMatmulPreferenceCreate` | yes | `cublas::lt::Preference::new` |  |  |
+| `cublasLtMatmulPreferenceDestroy` | yes | `cublas::lt::Preference::drop` |  |  |
+| `cublasLtMatmulPreferenceGetAttribute` | yes | `cublas::lt::Preference::get_attribute_bytes` |  |  |
+| `cublasLtMatmulPreferenceInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtMatmulPreferenceSetAttribute` | yes | `cublas::lt::Preference::set_attribute_bytes` |  |  |
+| `cublasLtMatrixLayoutCreate` | yes | `cublas::lt::MatrixLayout::new` |  |  |
+| `cublasLtMatrixLayoutDestroy` | yes | `cublas::lt::MatrixLayout::drop` |  |  |
+| `cublasLtMatrixLayoutGetAttribute` | yes | `cublas::lt::MatrixLayout::get_attribute_bytes` |  |  |
+| `cublasLtMatrixLayoutInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtMatrixLayoutSetAttribute` | yes | `cublas::lt::MatrixLayout::set_attribute_bytes` |  |  |
+| `cublasLtMatrixTransform` | yes | `cublas::lt::LtHandle::matrix_transform` |  |  |
+| `cublasLtMatrixTransformDescCreate` | yes | `cublas::lt::MatrixTransformDesc::new` |  |  |
+| `cublasLtMatrixTransformDescDestroy` | yes | `cublas::lt::MatrixTransformDesc::drop` |  |  |
+| `cublasLtMatrixTransformDescGetAttribute` | yes | `cublas::lt::MatrixTransformDesc::get_attribute_bytes` |  |  |
+| `cublasLtMatrixTransformDescInit_internal` | yes |  |  | internal C stack-init helper |
+| `cublasLtMatrixTransformDescSetAttribute` | yes | `cublas::lt::MatrixTransformDesc::set_attribute_bytes` |  |  |
 
 ## cudnn
 
@@ -1520,25 +1520,25 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `cusolverMgCreate` | yes |  |  |  |
-| `cusolverMgCreateDeviceGrid` | yes |  |  |  |
-| `cusolverMgCreateMatrixDesc` | yes |  |  |  |
-| `cusolverMgDestroy` | yes |  |  |  |
-| `cusolverMgDestroyGrid` | yes |  |  |  |
-| `cusolverMgDestroyMatrixDesc` | yes |  |  |  |
-| `cusolverMgDeviceSelect` | yes |  |  |  |
-| `cusolverMgGetrf` | yes |  |  |  |
-| `cusolverMgGetrf_bufferSize` | yes |  |  |  |
-| `cusolverMgGetrs` | yes |  |  |  |
-| `cusolverMgGetrs_bufferSize` | yes |  |  |  |
-| `cusolverMgPotrf` | yes |  |  |  |
-| `cusolverMgPotrf_bufferSize` | yes |  |  |  |
-| `cusolverMgPotri` | yes |  |  |  |
-| `cusolverMgPotri_bufferSize` | yes |  |  |  |
-| `cusolverMgPotrs` | yes |  |  |  |
-| `cusolverMgPotrs_bufferSize` | yes |  |  |  |
-| `cusolverMgSyevd` | yes |  |  |  |
-| `cusolverMgSyevd_bufferSize` | yes |  |  |  |
+| `cusolverMgCreate` | yes | `cusolver::mg::MgHandle::new` |  |  |
+| `cusolverMgCreateDeviceGrid` | yes | `cusolver::mg::MgGrid::new` |  |  |
+| `cusolverMgCreateMatrixDesc` | yes | `cusolver::mg::MgMatrixDesc::new` |  |  |
+| `cusolverMgDestroy` | yes | `cusolver::mg::MgHandle::drop` |  |  |
+| `cusolverMgDestroyGrid` | yes | `cusolver::mg::MgGrid::drop` |  |  |
+| `cusolverMgDestroyMatrixDesc` | yes | `cusolver::mg::MgMatrixDesc::drop` |  |  |
+| `cusolverMgDeviceSelect` | yes | `cusolver::mg::MgHandle::device_select` |  |  |
+| `cusolverMgGetrf` | yes | `cusolver::mg::MgHandle::getrf` |  |  |
+| `cusolverMgGetrf_bufferSize` | yes | `cusolver::mg::MgHandle::getrf_buffer_size` |  |  |
+| `cusolverMgGetrs` | yes | `cusolver::mg::MgHandle::getrs` |  |  |
+| `cusolverMgGetrs_bufferSize` | yes | `cusolver::mg::MgHandle::getrs_buffer_size` |  |  |
+| `cusolverMgPotrf` | yes | `cusolver::mg::MgHandle::potrf` |  |  |
+| `cusolverMgPotrf_bufferSize` | yes | `cusolver::mg::MgHandle::potrf_buffer_size` |  |  |
+| `cusolverMgPotri` | yes | `cusolver::mg::MgHandle::potri` |  |  |
+| `cusolverMgPotri_bufferSize` | yes | `cusolver::mg::MgHandle::potri_buffer_size` |  |  |
+| `cusolverMgPotrs` | yes | `cusolver::mg::MgHandle::potrs` |  |  |
+| `cusolverMgPotrs_bufferSize` | yes | `cusolver::mg::MgHandle::potrs_buffer_size` |  |  |
+| `cusolverMgSyevd` | yes | `cusolver::mg::MgHandle::syevd` |  |  |
+| `cusolverMgSyevd_bufferSize` | yes | `cusolver::mg::MgHandle::syevd_buffer_size` |  |  |
 
 ## cusparse
 
@@ -10723,30 +10723,30 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `cuvidCreateDecoder` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
-| `cuvidCreateVideoParser` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidCreateDecoder` | yes | `VideoDecoder::new` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidCreateVideoParser` | yes | `VideoParser::new` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidCreateVideoSource` | yes |  |  |  |
 | `cuvidCreateVideoSourceW` | yes |  |  |  |
 | `cuvidCtxLock` | yes |  |  |  |
 | `cuvidCtxLockCreate` | yes |  |  |  |
 | `cuvidCtxLockDestroy` | yes |  |  |  |
 | `cuvidCtxUnlock` | yes |  |  |  |
-| `cuvidDecodePicture` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidDecodePicture` | yes | `VideoDecoder::decode_picture` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidDecodePictureAsync` | yes |  |  |  |
-| `cuvidDestroyDecoder` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
-| `cuvidDestroyVideoParser` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidDestroyDecoder` | yes | `VideoDecoder::drop` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidDestroyVideoParser` | yes | `VideoParser::drop` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidDestroyVideoSource` | yes |  |  |  |
 | `cuvidGetDecodeStatus` | yes |  |  |  |
-| `cuvidGetDecoderCaps` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidGetDecoderCaps` | yes | `decoder_caps` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidGetSourceAudioFormat` | yes |  |  |  |
 | `cuvidGetSourceVideoFormat` | yes |  |  |  |
 | `cuvidGetVideoSourceState` | yes |  |  |  |
-| `cuvidMapVideoFrame64` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
-| `cuvidParseVideoData` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidMapVideoFrame64` | yes | `VideoDecoder::map_frame` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidParseVideoData` | yes | `VideoParser::parse_packet` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidReconfigureDecoder` | yes |  |  |  |
 | `cuvidRegisterDecodeSurfaces` | yes |  |  |  |
 | `cuvidSetVideoSourceState` | yes |  |  |  |
-| `cuvidUnmapVideoFrame64` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidUnmapVideoFrame64` | yes | `MappedFrame::drop` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## nvenc
 

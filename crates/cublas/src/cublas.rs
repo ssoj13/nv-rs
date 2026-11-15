@@ -23,7 +23,12 @@ pub mod scratch;
 
 pub use error::{Error, Result, Status};
 pub use handle::{ComputeType, DataType, GemmAlgo, Handle, MathMode, Operation, PointerMode};
-pub use lt::{Epilogue, HeuristicResult, LtHandle, MatmulDesc, MatrixLayout, Order, Preference};
+pub use lt::{
+    AlgoCapAttr, AlgoConfigAttr, BatchMode, EmulationDesc, EmulationDescAttr, Epilogue,
+    HeuristicResult, LibraryProperty, LoggerCallback, LtHandle, MatmulAlgo, MatmulDesc,
+    MatmulDescAttr, MatrixLayout, MatrixLayoutAttr, MatrixTransformDesc, MatrixTransformDescAttr,
+    Order, Preference, PreferenceAttr, ReductionScheme, SearchMode,
+};
 pub use scratch::Scratch;
 
 pub use cublas_sys as sys;

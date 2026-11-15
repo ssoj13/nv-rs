@@ -2,39 +2,216 @@ lib = "cublaslt"
 
 [[fn]]
 name = "cublasLtCreate"
+wrapper = "cublas::lt::LtHandle::new"
 
 [[fn]]
 name = "cublasLtDestroy"
+wrapper = "cublas::lt::LtHandle::drop"
+
+[[fn]]
+name = "cublasLtDisableCpuInstructionsSetMask"
+wrapper = "cublas::lt::disable_cpu_instructions_set_mask"
+
+[[fn]]
+name = "cublasLtEmulationDescCreate"
+wrapper = "cublas::lt::EmulationDesc::new"
+
+[[fn]]
+name = "cublasLtEmulationDescDestroy"
+wrapper = "cublas::lt::EmulationDesc::drop"
+
+[[fn]]
+name = "cublasLtEmulationDescGetAttribute"
+wrapper = "cublas::lt::EmulationDesc::get_attribute_bytes"
+
+[[fn]]
+name = "cublasLtEmulationDescInit_internal"
+note = "internal C stack-init helper"
+
+[[fn]]
+name = "cublasLtEmulationDescSetAttribute"
+wrapper = "cublas::lt::EmulationDesc::set_attribute_bytes"
+
+[[fn]]
+name = "cublasLtGetCudartVersion"
+wrapper = "cublas::lt::cudart_version"
+
+[[fn]]
+name = "cublasLtGetProperty"
+wrapper = "cublas::lt::get_property"
+
+[[fn]]
+name = "cublasLtGetStatusName"
+wrapper = "cublas::error::Status::lt_name"
+
+[[fn]]
+name = "cublasLtGetStatusString"
+wrapper = "cublas::error::Status::lt_string"
+
+[[fn]]
+name = "cublasLtGetVersion"
+wrapper = "cublas::lt::version"
+
+[[fn]]
+name = "cublasLtGroupedMatrixLayoutCreate"
+wrapper = "cublas::lt::MatrixLayout::new_grouped"
+
+[[fn]]
+name = "cublasLtGroupedMatrixLayoutInit_internal"
+note = "internal C stack-init helper"
+
+[[fn]]
+name = "cublasLtHeuristicsCacheGetCapacity"
+wrapper = "cublas::lt::heuristics_cache_capacity"
+
+[[fn]]
+name = "cublasLtHeuristicsCacheSetCapacity"
+wrapper = "cublas::lt::set_heuristics_cache_capacity"
+
+[[fn]]
+name = "cublasLtLoggerForceDisable"
+wrapper = "cublas::lt::logger_force_disable"
+
+[[fn]]
+name = "cublasLtLoggerOpenFile"
+wrapper = "cublas::lt::logger_open_file"
+
+[[fn]]
+name = "cublasLtLoggerSetCallback"
+wrapper = "cublas::lt::logger_set_callback"
+
+[[fn]]
+name = "cublasLtLoggerSetFile"
+wrapper = "cublas::lt::logger_set_file"
+
+[[fn]]
+name = "cublasLtLoggerSetLevel"
+wrapper = "cublas::lt::logger_set_level"
+
+[[fn]]
+name = "cublasLtLoggerSetMask"
+wrapper = "cublas::lt::logger_set_mask"
 
 [[fn]]
 name = "cublasLtMatmul"
+wrapper = "cublas::lt::LtHandle::matmul_with_scratch"
+
+[[fn]]
+name = "cublasLtMatmulAlgoCapGetAttribute"
+wrapper = "cublas::lt::MatmulAlgo::cap_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatmulAlgoCheck"
+wrapper = "cublas::lt::LtHandle::matmul_algo_check"
+
+[[fn]]
+name = "cublasLtMatmulAlgoCheckForStream"
+wrapper = "cublas::lt::LtHandle::matmul_algo_check_for_stream"
+
+[[fn]]
+name = "cublasLtMatmulAlgoConfigGetAttribute"
+wrapper = "cublas::lt::MatmulAlgo::config_bytes"
+
+[[fn]]
+name = "cublasLtMatmulAlgoConfigSetAttribute"
+wrapper = "cublas::lt::MatmulAlgo::set_config_bytes"
 
 [[fn]]
 name = "cublasLtMatmulAlgoGetHeuristic"
+wrapper = "cublas::lt::LtHandle::matmul_heuristic"
+
+[[fn]]
+name = "cublasLtMatmulAlgoGetHeuristicForStream"
+wrapper = "cublas::lt::LtHandle::matmul_heuristic_for_stream"
+
+[[fn]]
+name = "cublasLtMatmulAlgoGetIds"
+wrapper = "cublas::lt::LtHandle::matmul_algo_ids"
+
+[[fn]]
+name = "cublasLtMatmulAlgoInit"
+wrapper = "cublas::lt::LtHandle::matmul_algo_init"
 
 [[fn]]
 name = "cublasLtMatmulDescCreate"
+wrapper = "cublas::lt::MatmulDesc::new"
 
 [[fn]]
 name = "cublasLtMatmulDescDestroy"
+wrapper = "cublas::lt::MatmulDesc::drop"
+
+[[fn]]
+name = "cublasLtMatmulDescGetAttribute"
+wrapper = "cublas::lt::MatmulDesc::get_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatmulDescInit_internal"
+note = "internal C stack-init helper"
 
 [[fn]]
 name = "cublasLtMatmulDescSetAttribute"
+wrapper = "cublas::lt::MatmulDesc::set_attribute_bytes"
 
 [[fn]]
 name = "cublasLtMatmulPreferenceCreate"
+wrapper = "cublas::lt::Preference::new"
 
 [[fn]]
 name = "cublasLtMatmulPreferenceDestroy"
+wrapper = "cublas::lt::Preference::drop"
+
+[[fn]]
+name = "cublasLtMatmulPreferenceGetAttribute"
+wrapper = "cublas::lt::Preference::get_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatmulPreferenceInit_internal"
+note = "internal C stack-init helper"
 
 [[fn]]
 name = "cublasLtMatmulPreferenceSetAttribute"
+wrapper = "cublas::lt::Preference::set_attribute_bytes"
 
 [[fn]]
 name = "cublasLtMatrixLayoutCreate"
+wrapper = "cublas::lt::MatrixLayout::new"
 
 [[fn]]
 name = "cublasLtMatrixLayoutDestroy"
+wrapper = "cublas::lt::MatrixLayout::drop"
+
+[[fn]]
+name = "cublasLtMatrixLayoutGetAttribute"
+wrapper = "cublas::lt::MatrixLayout::get_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatrixLayoutInit_internal"
+note = "internal C stack-init helper"
 
 [[fn]]
 name = "cublasLtMatrixLayoutSetAttribute"
+wrapper = "cublas::lt::MatrixLayout::set_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatrixTransform"
+wrapper = "cublas::lt::LtHandle::matrix_transform"
+
+[[fn]]
+name = "cublasLtMatrixTransformDescCreate"
+wrapper = "cublas::lt::MatrixTransformDesc::new"
+
+[[fn]]
+name = "cublasLtMatrixTransformDescDestroy"
+wrapper = "cublas::lt::MatrixTransformDesc::drop"
+
+[[fn]]
+name = "cublasLtMatrixTransformDescGetAttribute"
+wrapper = "cublas::lt::MatrixTransformDesc::get_attribute_bytes"
+
+[[fn]]
+name = "cublasLtMatrixTransformDescInit_internal"
+note = "internal C stack-init helper"
+
+[[fn]]
+name = "cublasLtMatrixTransformDescSetAttribute"
+wrapper = "cublas::lt::MatrixTransformDesc::set_attribute_bytes"

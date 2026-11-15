@@ -16,6 +16,7 @@ use std::fmt;
 ///
 /// Kept as a transparent integer newtype so status codes added in newer CUDA toolkits round-trip
 /// without breaking exhaustive matches.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Status(pub sys::cublasStatus_t);
@@ -77,6 +78,34 @@ impl Status {
             }
         }
         self.static_name()
+    }
+
+    /// Queries `cublasLtGetStatusName` if `cublasLt` is loaded, falling back to [`Self::static_name`].
+    pub fn lt_name(self) -> &'static str {
+        if lt_sys::load().is_ok() {
+            // SAFETY: `cublasLtGetStatusName` returns a static NUL-terminated string or null.
+            let ptr = unsafe { lt_sys::cublasLtGetStatusName(self.0 as lt_sys::cublasStatus_t) };
+            if !ptr.is_null() {
+                // SAFETY: `ptr` is non-null and points to a static C string inside cublasLt.
+                if let Ok(s) = unsafe { CStr::from_ptr(ptr) }.to_str() {
+                    return s;
+                }
+            }
+        }
+        self.static_name()
+    }
+
+    /// Queries `cublasLtGetStatusString` if `cublasLt` is loaded, returning `None` if unavailable.
+    pub fn lt_string(self) -> Option<&'static str> {
+        if lt_sys::load().is_ok() {
+            // SAFETY: `cublasLtGetStatusString` returns a static NUL-terminated string or null.
+            let ptr = unsafe { lt_sys::cublasLtGetStatusString(self.0 as lt_sys::cublasStatus_t) };
+            if !ptr.is_null() {
+                // SAFETY: `ptr` is non-null and points to a static C string inside cublasLt.
+                return unsafe { CStr::from_ptr(ptr) }.to_str().ok();
+            }
+        }
+        None
     }
 }
 

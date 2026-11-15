@@ -692,7 +692,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             flags: &[GeometryFlags::DISABLE_ANYHIT],
             ..TriangleMesh::new(&floor_verts)
         }],
-        tri_build_opts.clone(),
+        tri_build_opts,
     )
     .expect("floor GAS");
 
@@ -725,7 +725,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             flags: &[GeometryFlags::DISABLE_ANYHIT],
             ..TriangleMesh::new(&sphere_verts)
         }],
-        tri_build_opts.clone(),
+        tri_build_opts,
     )
     .expect("glass GAS");
 

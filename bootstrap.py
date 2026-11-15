@@ -64,7 +64,7 @@ COMMANDS (short or long):
           d dl,  deps dl [opts]      Download/extract public SDKs into .sdk (or --dir).
           d sys, deps sys [opts]     Install Linux system build/runtime packages (apt/dnf/pacman).
     i,  install [-d|--debug] [--] [cargo install opts...]
-        Install `nv-demo` into Cargo bin (`cargo install --path demo --force`).
+        Install `nv-demo` into Cargo bin (`cargo install --path crates/nv-demo --force`).
     py  <dev|build|test> [opts]
         Build and test the Python API (`python/nv-py`) via `maturin` and `pytest`:
           py dev   [--release]       Editable install into active Python env (`maturin develop`).
@@ -105,7 +105,7 @@ EXAMPLES:
     python bootstrap.py d s                      Inspect detected SDKs & NV_SDK_DIRS
     python bootstrap.py d dl --dry-run           Preview public SDK downloads
     python bootstrap.py d dl --only optix,nvcomp --allow-manual
-    python bootstrap.py i                        Install `nv-demo` (`cargo install --path demo --force`)
+    python bootstrap.py i                        Install `nv-demo` (`cargo install --path crates/nv-demo --force`)
     python bootstrap.py d                        Install Linux sys pkgs + public SDKs + manual guide
     python bootstrap.py d --dry-run              Preview full dependency provisioning
     python bootstrap.py d sys -y --nccl          Install Linux build/runtime deps + libnccl-dev
@@ -857,14 +857,14 @@ def cmd_deps_all(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace, passthrough: list[str]) -> int:
-    """Install `nv-demo` binary into Cargo bin via `cargo install --path demo --force`."""
+    """Install `nv-demo` binary into Cargo bin via `cargo install --path crates/nv-demo --force`."""
     if not check_cargo():
         return 1
     header("INSTALL (nv-demo)")
     profile = "debug" if args.debug else "release"
     step(f"Profile : {profile}")
     cmd = cargo_cmd(args.toolchain, "install")
-    cmd.extend(["--path", str(ROOT_DIR / "demo"), "--force"])
+    cmd.extend(["--path", str(ROOT_DIR / "crates" / "nv-demo"), "--force"])
     if args.debug:
         cmd.append("--debug")
     cmd.extend(passthrough)
@@ -982,20 +982,6 @@ def cmd_build(args: argparse.Namespace, passthrough: list[str]) -> int:
     if code != 0:
         err(f"build FAILED ({fmt_time(ms)})")
         return code
-
-    # Also build the standalone nv-demo showcase when building the whole workspace.
-    if not args.package:
-        step("Building nv-demo (demo/Cargo.toml)")
-        demo_cmd = cargo_cmd(args.toolchain, "build")
-        demo_cmd.extend(["--manifest-path", str(ROOT_DIR / "demo" / "Cargo.toml")])
-        if not args.debug:
-            demo_cmd.append("--release")
-        demo_cmd.extend(passthrough)
-        dcode, _, dms = run(demo_cmd, env=env)
-        if dcode != 0:
-            err(f"nv-demo build FAILED ({fmt_time(dms)})")
-            return dcode
-        ms += dms
 
     ok(f"build OK ({fmt_time(ms)})")
     return 0

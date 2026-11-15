@@ -1,7 +1,7 @@
 //! Interactive RTX OptiX 3D Fractal Path Tracer + AI Denoiser + Zero-Copy `nv-wgpu` + `egui_dock` Demo.
 //!
 //! Run with:
-//! `cargo run --manifest-path demo/Cargo.toml --release`
+//! `cargo run -p nv-demo --release`
 
 #[allow(unexpected_cfgs, dead_code, unused_imports, clippy::all)]
 mod camera_core;

@@ -6,14 +6,14 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-nv-wgpu = { path = "../crates/nv-wgpu" }
-nv-loader = { path = "../crates/nv-loader" }
-optix = { path = "../crates/optix" }
-nvrtc = { path = "../crates/nvrtc" }
-nvml = { path = "../crates/nvml" }
+nv-wgpu = { path = "../nv-wgpu" }
+nv-loader = { path = "../nv-loader" }
+optix = { path = "../optix" }
+nvrtc = { path = "../nvrtc" }
+nvml = { path = "../nvml" }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
-cuda-core-ext = { path = "../crates/cuda-core-ext" }
+cuda-core-ext = { path = "../cuda-core-ext" }
 
 wgpu = "30"
 egui = { version = "0.36", features = ["default_fonts"] }

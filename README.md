@@ -161,7 +161,7 @@ An excluded standalone showcase (`demo/`, binary `nv-demo`, also built by defaul
 
 ```powershell
 $env:NV_SDK_DIRS = "$PWD\.sdk"   # or set OPTIX_ROOT / CUDA_PATH
-cargo run --manifest-path demo/Cargo.toml --release
+cargo run -p nv-demo --release
 ```
 
 ---

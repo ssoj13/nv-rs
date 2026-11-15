@@ -62,6 +62,8 @@ export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH
 
 If you prefer individual overrides instead of `NV_SDK_DIRS`, set the per-SDK variables (`CUDA_PATH`, `OPTIX_ROOT`, `VULKAN_SDK`, `VIDEO_CODEC_SDK_ROOT`, `OPTICAL_FLOW_SDK_ROOT`, `NVCOMP_ROOT`, `NVAPI_ROOT`, `CUDNN_ROOT`, `NGX_SDK_ROOT`, `NCCL_ROOT`) to their respective SDK directories, then verify detection with `python bootstrap.py d s`.
 
+For **runtime** DLL/SO discovery (when shipping apps or plugins outside a standard `CUDA_PATH`), set `NV_DLL_DIRS` (`;` on Windows, `:` on Linux) or stage redistributable libraries next to your binary with `cargo xtask stage-dlls --out <dir>`. See [nv-loader](/nv-rs/core/nv-loader/) for the full search order.
+
 ## Verifying the Workspace
 
 `nv-rs` pins the host Rust toolchain to `1.99.1` and treats all warnings as errors:

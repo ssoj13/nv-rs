@@ -8,6 +8,7 @@ This reference documents every submodule, class, method, property, parameter, de
 Top-level module attributes and convenience functions:
 
 - `__version__: str`
+- `add_dll_directory(path: str | os.PathLike[str]) -> None`
 - `trace(level: str = "trace", print_on_exit: bool = True) -> diag.TraceGuard`
 - `format_doctor() -> str`
 
@@ -51,6 +52,7 @@ Context manager returned by `diag.trace(...)` and `nv_rs.trace(...)`.
 - `doctor() -> dict[str, Any]`
 - `trace(level: str = "trace", print_on_exit: bool = True) -> TraceGuard`
 - `format_doctor() -> str`
+- `add_dll_directory(path: str | os.PathLike[str]) -> None`
 
 ### `nv_rs.core`
 

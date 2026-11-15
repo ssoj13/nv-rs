@@ -981,7 +981,7 @@ mod test_support {
 
 #[cfg(test)]
 mod linux_tests {
-    use super::test_support::{Fake, read_extra_dirs_gate};
+    use super::test_support::{ExtraDirsGuard, Fake, read_extra_dirs_gate};
     use super::*;
 
     #[test]
@@ -1049,6 +1049,37 @@ mod linux_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn linux_add_search_dir_and_nv_dll_dirs_precede_runtime_root_and_sonames() {
+        let _guard = ExtraDirsGuard::new();
+        add_search_dir("/opt/extra_nv");
+        add_search_dir("/opt/extra_nv");
+        let spec = DllSpec {
+            lib: "cudnn",
+            group: Group::Sdk {
+                root_var: "CUDNN_ROOT",
+                hint: Some("/opt/hint/lib"),
+            },
+            windows: &[],
+            linux: &["libcudnn.so.9"],
+        };
+        let mut fake = Fake::default();
+        fake.env.insert("NV_DLL_DIRS", "/opt/env_nv");
+        fake.env.insert("CUDNN_ROOT", "/opt/cudnn");
+        let got = linux_candidates_with(&fake, &spec);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/opt/env_nv/libcudnn.so.9"),
+                PathBuf::from("/opt/extra_nv/libcudnn.so.9"),
+                PathBuf::from("/opt/cudnn/lib64/libcudnn.so.9"),
+                PathBuf::from("/opt/cudnn/lib/libcudnn.so.9"),
+                PathBuf::from("/opt/hint/lib/libcudnn.so.9"),
+                PathBuf::from("libcudnn.so.9"),
+            ]
+        );
     }
 
     #[test]

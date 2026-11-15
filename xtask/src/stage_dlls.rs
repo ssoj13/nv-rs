@@ -355,6 +355,12 @@ fn stage_with(
                     std::fs::copy(&src, &dst).map_err(|e| {
                         format!("copying {} -> {}: {e}", src.display(), dst.display())
                     })?;
+                    if let Ok(mtime) = std::fs::metadata(&src).and_then(|m| m.modified())
+                        && let Ok(f) = std::fs::File::options().write(true).open(&dst)
+                        && let Err(e) = f.set_modified(mtime)
+                    {
+                        return Err(format!("setting mtime on {}: {e}", dst.display()));
+                    }
                     let _ = writeln!(
                         log,
                         "copy  {:<12} {} -> {}",

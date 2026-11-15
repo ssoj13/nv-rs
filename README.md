@@ -9,6 +9,11 @@ CUDA <-> wgpu interop, and Rust device code via `cuda-oxide` — built on `cuda-
 
 Supported host targets: **Windows** (`x86_64`, `aarch64`) and **Linux** (`x86_64`, `aarch64`).
 
+> **Why `nv-rs` exists:** This project started while building `render-rs`, which needed direct
+> OptiX access from Rust to accelerate ray tracing. Instead of writing a quick one-off wrapper,
+> I decided to build clean, complete Rust bindings across the entire NVIDIA stack once and for
+> all — so no one ever has to fight this gap again.
+
 TANSTAAFL: NVIDIA headers and proprietary redistributables do not live in this git tree.
 Every `*-sys` crate reads headers from your installed SDKs at build time via
 [vcv-rs](https://github.com/ssoj13/vcv-rs) — or uses prebuilt bindings when headers or `libclang`

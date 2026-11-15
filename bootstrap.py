@@ -56,16 +56,15 @@ COMMANDS (short or long):
         Run `cargo clean` (-p/--package optional; --sdk removes .sdk cache).
     x,  xtask <args...>
         Forward arguments to `cargo xtask <args...>` (e.g. `coverage check`, `coverage optix`).
-    d,  deps <subcmd>
-        Manage native SDK dependencies:
+    d,  deps [all|s|dl|sys] [opts]
+        Manage native SDK & system dependencies:
+          d,     deps [all] [opts]   Install Linux system packages, download public SDKs,
+                                     and print step-by-step setup guides for manual SDKs.
           d s,   deps status         Inspect detected SDKs and NV_SDK_DIRS.
           d dl,  deps dl [opts]      Download/extract public SDKs into .sdk (or --dir).
           d sys, deps sys [opts]     Install Linux system build/runtime packages (apt/dnf/pacman).
-    i,  install [deps|sys] [opts]
-        Provision host dependencies end-to-end:
-          i deps [opts]              Install Linux system packages, download public SDKs,
-                                     and print step-by-step setup guides for manual SDKs.
-          i sys  [opts]              Alias for `deps sys`.
+    i,  install [-d|--debug] [--] [cargo install opts...]
+        Install `nv-demo` into Cargo bin (`cargo install --path demo --force`).
     py  <dev|build|test> [opts]
         Build and test the Python API (`python/nv-py`) via `maturin` and `pytest`:
           py dev   [--release]       Editable install into active Python env (`maturin develop`).
@@ -87,13 +86,13 @@ DEPS DL OPTIONS:
     --force                  Re-download/re-extract even if already present.
     --allow-manual           Skip auth-gated SDKs with notice instead of failing.
 
-INSTALL / DEPS SYS OPTIONS:
+DEPS ALL / SYS OPTIONS:
     -y, --yes                Non-interactive install (pass -y/--noconfirm to package manager).
     --nccl                   Also install system libnccl-dev (Linux apt).
     --dry-run                Preview package manager commands and SDK downloads.
-    --dir <path>             Target SDK root for `i deps` (default: <repo>/.sdk).
-    --only <sdk>             Filter SDKs for `i deps`, comma-separated or repeatable.
-    --force                  Re-download/re-extract public SDKs during `i deps`.
+    --dir <path>             Target SDK root for `deps` (default: <repo>/.sdk).
+    --only <sdk>             Filter SDKs for `deps`, comma-separated or repeatable.
+    --force                  Re-download/re-extract public SDKs during `deps`.
 
 EXAMPLES:
     python bootstrap.py                          Print this help screen
@@ -106,8 +105,9 @@ EXAMPLES:
     python bootstrap.py d s                      Inspect detected SDKs & NV_SDK_DIRS
     python bootstrap.py d dl --dry-run           Preview public SDK downloads
     python bootstrap.py d dl --only optix,nvcomp --allow-manual
-    python bootstrap.py i deps                   Install Linux sys pkgs + public SDKs + manual guide
-    python bootstrap.py i deps --dry-run         Preview full dependency provisioning
+    python bootstrap.py i                        Install `nv-demo` (`cargo install --path demo --force`)
+    python bootstrap.py d                        Install Linux sys pkgs + public SDKs + manual guide
+    python bootstrap.py d --dry-run              Preview full dependency provisioning
     python bootstrap.py d sys -y --nccl          Install Linux build/runtime deps + libnccl-dev
     python bootstrap.py py test                  Build Python bindings (`maturin`) & run pytest
 """
@@ -826,11 +826,8 @@ def cmd_deps_sys(dry_run: bool = False, yes: bool = False, with_nccl: bool = Fal
     return 0
 
 
-def cmd_install(sub: str, args: argparse.Namespace) -> int:
-    """Handle `i` / `install` commands (`deps`, `sys`)."""
-    if sub == "sys":
-        return cmd_deps_sys(dry_run=args.dry_run, yes=args.yes, with_nccl=args.nccl)
-
+def cmd_deps_all(args: argparse.Namespace) -> int:
+    """Handle `d` / `deps [all]` end-to-end dependency provisioning."""
     rc = cmd_deps_sys(dry_run=args.dry_run, yes=args.yes, with_nccl=args.nccl)
     if rc != 0:
         return rc
@@ -857,6 +854,23 @@ def cmd_install(sub: str, args: argparse.Namespace) -> int:
     cmd_deps_status(sdk_root)
     _print_manual_sdk_guide(sdk_root, only_set or None)
     return 0
+
+
+def cmd_install(args: argparse.Namespace, passthrough: list[str]) -> int:
+    """Install `nv-demo` binary into Cargo bin via `cargo install --path demo --force`."""
+    if not check_cargo():
+        return 1
+    header("INSTALL (nv-demo)")
+    profile = "debug" if args.debug else "release"
+    step(f"Profile : {profile}")
+    cmd = cargo_cmd(args.toolchain, "install")
+    cmd.extend(["--path", str(ROOT_DIR / "demo"), "--force"])
+    if args.debug:
+        cmd.append("--debug")
+    cmd.extend(passthrough)
+    code, _, ms = run(cmd, env=_cargo_env())
+    (ok if code == 0 else err)(f"install {'OK' if code == 0 else 'FAILED'} ({fmt_time(ms)})")
+    return code
 
 
 def _python_env(base_env: dict[str, str]) -> dict[str, str]:
@@ -1154,9 +1168,19 @@ def main() -> int:
         return cmd_clean(p.parse_args(rest))
 
     if cmd in ("d", "deps"):
-        if not rest or rest[0] in ("h", "help", "-h", "--help"):
+        if rest and rest[0] in ("h", "help", "-h", "--help"):
             print(HELP_TEXT)
             return 0
+        if not rest or rest[0].startswith("-") or rest[0] == "all":
+            sub_rest = rest[1:] if (rest and rest[0] == "all") else rest
+            p = argparse.ArgumentParser(prog="bootstrap.py deps")
+            p.add_argument("--dir", default=str(DEFAULT_SDK_DIR), help="Target SDK directory")
+            p.add_argument("--only", action="append", default=[], help="Filter SDK(s)")
+            p.add_argument("--dry-run", action="store_true", help="Preview without modifying system")
+            p.add_argument("--force", action="store_true", help="Re-download existing public SDKs")
+            p.add_argument("-y", "--yes", action="store_true", help="Non-interactive package install")
+            p.add_argument("--nccl", action="store_true", help="Also install libnccl-dev (Linux apt)")
+            return cmd_deps_all(p.parse_args(sub_rest))
         sub = rest[0]
         sub_rest = rest[1:]
         if sub in ("s", "status"):
@@ -1186,22 +1210,10 @@ def main() -> int:
         if rest and rest[0] in ("h", "help", "-h", "--help"):
             print(HELP_TEXT)
             return 0
-        if not rest or rest[0].startswith("-"):
-            sub, sub_rest = "deps", rest
-        elif rest[0] in ("deps", "sys"):
-            sub, sub_rest = rest[0], rest[1:]
-        else:
-            err(f"Unknown install subcommand: {rest[0]} (expected `deps` or `sys`)")
-            return 2
-
-        p = argparse.ArgumentParser(prog=f"bootstrap.py install {sub}")
-        p.add_argument("--dir", default=str(DEFAULT_SDK_DIR), help="Target SDK directory")
-        p.add_argument("--only", action="append", default=[], help="Filter SDK(s)")
-        p.add_argument("--dry-run", action="store_true", help="Preview without modifying system")
-        p.add_argument("--force", action="store_true", help="Re-download existing public SDKs")
-        p.add_argument("-y", "--yes", action="store_true", help="Non-interactive package install")
-        p.add_argument("--nccl", action="store_true", help="Also install libnccl-dev (Linux apt)")
-        return cmd_install(sub, p.parse_args(sub_rest))
+        p = argparse.ArgumentParser(prog="bootstrap.py install")
+        p.add_argument("-d", "--debug", action="store_true", help="Install debug profile")
+        p.add_argument("--toolchain", default=None, help="Cargo toolchain override")
+        return cmd_install(p.parse_args(rest), passthrough)
 
     if cmd == "py":
         if not rest or rest[0] in ("h", "help", "-h", "--help"):

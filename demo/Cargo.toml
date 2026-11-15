@@ -16,9 +16,11 @@ cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "mai
 cuda-core-ext = { path = "../crates/cuda-core-ext" }
 
 wgpu = "30"
-egui = { version = "0.37", features = ["default_fonts"] }
-egui-wgpu = "0.37"
-egui-winit = "0.37"
+egui = { version = "0.36", features = ["default_fonts"] }
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+egui_dock = "0.21"
+egui-phosphor = "0.14"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33.2"

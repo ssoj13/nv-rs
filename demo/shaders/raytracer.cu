@@ -23,6 +23,10 @@ struct Params {
     unsigned int enable_shadows;
     unsigned int fractal_kind; // 0=Mandelbulb, 1=Mandelbox, 2=KIFS Octahedron
     unsigned int bounces;
+    float floor_params[4];     // [roughness, scratch, scale, metallic]
+    float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, pad]
+    unsigned int accum_count;
+    unsigned int _pad0[3];
 };
 
 extern "C" {
@@ -235,14 +239,94 @@ static __forceinline__ __device__ float3 sample_cosine_hemisphere(float3 n, unsi
     ));
 }
 
-static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir) {
-    float t = fmaxf(0.0f, fminf(1.0f, 0.5f * (dir.y + 1.0f)));
-    float3 horizon = make_float3(0.55f, 0.72f, 0.92f);
-    float3 zenith  = make_float3(0.08f, 0.22f, 0.52f);
-    float3 col = f3_add(f3_mul(horizon, 1.0f - t), f3_mul(zenith, t));
+static __forceinline__ __device__ float hash21(float x, float y) {
+    float h = sinf(x * 127.1f + y * 311.7f) * 43758.5453123f;
+    return h - floorf(h);
+}
+
+static __forceinline__ __device__ float value_noise2(float x, float y) {
+    float ix = floorf(x);
+    float iy = floorf(y);
+    float fx = x - ix;
+    float fy = y - iy;
+    float ux = fx * fx * (3.0f - 2.0f * fx);
+    float uy = fy * fy * (3.0f - 2.0f * fy);
+    float a = hash21(ix, iy);
+    float b = hash21(ix + 1.0f, iy);
+    float c = hash21(ix, iy + 1.0f);
+    float d = hash21(ix + 1.0f, iy + 1.0f);
+    return (a + (b - a) * ux) + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+static __forceinline__ __device__ float fbm2(float x, float y) {
+    float v = 0.0f;
+    float amp = 0.5f;
+    for (int i = 0; i < 4; ++i) {
+        v += amp * value_noise2(x, y);
+        float nx = 1.6f * x - 1.2f * y;
+        float ny = 1.2f * x + 1.6f * y;
+        x = nx;
+        y = ny;
+        amp *= 0.5f;
+    }
+    return v;
+}
+
+static __forceinline__ __device__ float scratch_layer(float x, float y, float ca, float sa, float freq, float warp) {
+    float rx = x * ca - y * sa;
+    float ry = x * sa + y * ca;
+    float w = value_noise2(rx * 0.65f, ry * 0.65f) * warp;
+    float cell = floorf((ry + w) * freq);
+    float mask = hash21(cell, freq * 13.7f);
+    if (mask < 0.55f) return 0.0f;
+    float dist = fabsf(sinf((ry + w) * freq * 3.14159265f));
+    float streak = powf(fmaxf(0.0f, 1.0f - dist * 14.0f), 3.0f);
+    float seg = value_noise2(rx * 0.45f + cell * 1.7f, cell * 3.1f);
+    return streak * fmaxf(0.0f, (seg - 0.35f) * 1.54f);
+}
+
+static __forceinline__ __device__ float floor_height(float x, float z, float scale, float scratch_amt) {
+    float sx = x * scale;
+    float sz = z * scale;
+    float macro = fbm2(sx * 0.55f, sz * 0.55f) - 0.5f;
+    float micro = value_noise2(sx * 6.5f, sz * 6.5f) - 0.5f;
+    float s0 = scratch_layer(sx, sz, 0.9659f, 0.2588f, 3.8f, 0.45f);
+    float s1 = scratch_layer(sx, sz, 0.5000f, -0.8660f, 5.4f, 0.35f);
+    float s2 = scratch_layer(sx, sz, -0.7071f, 0.7071f, 7.2f, 0.28f);
+    float scratches = fminf(1.0f, s0 * 0.9f + s1 * 0.75f + s2 * 0.6f);
+    return macro * 0.55f + micro * 0.14f - scratches * 0.42f * scratch_amt;
+}
+
+static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+    float sky_i = fmaxf(0.05f, params.sky_params[0]);
+    float haze_k = fmaxf(0.5f, params.sky_params[2]);
+    float y = fmaxf(0.0f, dir.y);
+    float horizon_band = expf(-fabsf(dir.y) * (6.0f / haze_k));
+
+    // Balanced Rayleigh zenith-to-horizon gradient
+    float3 zenith  = make_float3(0.08f, 0.21f, 0.52f);
+    float3 horizon = make_float3(0.46f, 0.59f, 0.76f);
+    float3 col = f3_add(f3_mul(horizon, 1.0f - powf(y, 0.55f)), f3_mul(zenith, powf(y, 0.55f)));
+
+    // Warm horizon haze
+    float3 haze_col = make_float3(0.72f, 0.68f, 0.62f);
+    col = f3_add(col, f3_mul(haze_col, horizon_band * 0.22f));
+
+    // Below-horizon ground bounce
+    if (dir.y < 0.0f) {
+        float g = fminf(1.0f, -dir.y * 4.0f);
+        float3 ground_tint = make_float3(0.11f, 0.12f, 0.14f);
+        col = f3_add(f3_mul(col, 1.0f - g), f3_mul(ground_tint, g));
+    }
+
+    // Mie forward scattering + bounded sun disc (prevents fireflies & bounce blowup)
     float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
-    float sun_glow = powf(sun_dot, 32.0f) * 0.6f + powf(sun_dot, 512.0f) * 8.0f;
-    return f3_add(col, make_float3(sun_glow, sun_glow * 0.92f, sun_glow * 0.75f));
+    float mie = powf(sun_dot, 8.0f) * 0.16f + powf(sun_dot, 64.0f) * 0.45f;
+    float disc_t = fmaxf(0.0f, fminf(1.0f, (sun_dot - 0.9990f) / 0.0006f));
+    float sun_disc = disc_t * disc_t * (3.0f - 2.0f * disc_t) * (is_camera_ray ? 3.5f : 1.1f);
+    float3 sun_tint = make_float3(1.0f, 0.90f, 0.74f);
+    col = f3_add(col, f3_mul(sun_tint, mie + sun_disc));
+    return f3_mul(col, sky_i);
 }
 
 static __forceinline__ __device__ void trace_primary(
@@ -315,7 +399,7 @@ extern "C" __global__ void __raygen__render() {
             trace_primary(origin, dir, p0, p1, p2, p3, p4, p5, p6, p7);
 
             if (p0 == 0u) {
-                float3 sky = sky_color(dir, sun_dir);
+                float3 sky = sky_color(dir, sun_dir, bounce == 0);
                 sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
                 if (bounce == 0 && s == 0) {
                     first_albedo = sky;
@@ -337,16 +421,47 @@ extern "C" __global__ void __raygen__render() {
 
             float metallic = 0.0f;
             float rough = params.sun_dir[3];
+            float horizon_fade = 0.0f;
             if (inst_id == 0u) {
-                // Checkerboard floor
-                int cx = (int)floorf(hit_pos.x * 0.75f);
-                int cz = (int)floorf(hit_pos.z * 0.75f);
-                bool even = ((cx + cz) & 1) == 0;
-                base_col = even ? make_float3(0.82f, 0.84f, 0.88f) : make_float3(0.14f, 0.16f, 0.20f);
-                metallic = 0.35f;
+                // Procedural scratched uneven metal floor (OptiX raytraced)
+                float f_rough = params.floor_params[0];
+                float f_scratch = params.floor_params[1];
+                float f_scale = fmaxf(0.1f, params.floor_params[2]);
+                float f_metal = params.floor_params[3];
+
+                float h0 = floor_height(hit_pos.x, hit_pos.z, f_scale, f_scratch);
+                float bump_eps = 0.006f;
+                float hx = floor_height(hit_pos.x + bump_eps, hit_pos.z, f_scale, f_scratch);
+                float hz = floor_height(hit_pos.x, hit_pos.z + bump_eps, f_scale, f_scratch);
+                float bump_strength = (0.04f + 0.16f * f_scratch);
+                float dhd_x = (hx - h0) / bump_eps * bump_strength;
+                float dhd_z = (hz - h0) / bump_eps * bump_strength;
+                n = f3_norm(make_float3(n.x - dhd_x, n.y, n.z - dhd_z));
+
+                float sx = hit_pos.x * f_scale;
+                float sz = hit_pos.z * f_scale;
+                float patina = fbm2(sx * 0.45f + 11.3f, sz * 0.45f - 7.1f);
+                float groove = fmaxf(0.0f, -h0 * 1.4f);
+
+                // Brushed steel / titanium albedo (physically bounded, no overexposure)
+                float3 steel_dark = make_float3(0.14f, 0.15f, 0.17f);
+                float3 steel_bright = make_float3(0.36f, 0.38f, 0.42f);
+                float3 warm_tint = make_float3(0.28f, 0.25f, 0.22f);
+                base_col = f3_add(f3_mul(steel_dark, 1.0f - patina), f3_mul(steel_bright, patina));
+                base_col = f3_add(f3_mul(base_col, 1.0f - groove * 0.45f), f3_mul(warm_tint, groove * 0.45f));
+
+                rough = fmaxf(0.03f, fminf(0.88f, f_rough + 0.18f * (1.0f - patina) + 0.22f * groove));
+                metallic = fmaxf(0.0f, fminf(1.0f, f_metal * (1.0f - groove * 0.25f)));
+                horizon_fade = fmaxf(0.0f, fminf(1.0f, (hit_t - 28.0f) / 110.0f));
             } else {
                 // Fractal custom primitive uses orbit-trap base_col from p5
                 metallic = params.fractal_r1[0];
+            }
+
+            if (horizon_fade >= 0.995f) {
+                float3 sky = sky_color(dir, sun_dir, bounce == 0);
+                sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
+                break;
             }
 
             if (bounce == 0 && s == 0) {
@@ -359,20 +474,38 @@ extern "C" __global__ void __raygen__render() {
                 bool occluded = false;
                 if (params.enable_shadows != 0u) {
                     float3 jitter = make_float3(rand01(seed) - 0.5f, rand01(seed) - 0.5f, rand01(seed) - 0.5f);
-                    float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.06f)));
+                    float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.045f)));
                     occluded = trace_shadow(f3_add(hit_pos, f3_mul(n, 0.003f)), sdir, 1000.0f);
                 }
                 if (!occluded) {
                     float sun_i = params.fractal_r1[3];
-                    float3 sun_rad = make_float3(sun_i, sun_i * 0.93f, sun_i * 0.78f);
-                    sample_col = f3_add(sample_col, f3_mul3(throughput, f3_mul(f3_mul3(base_col, sun_rad), ndotl * (1.0f - metallic * 0.4f))));
+                    float3 sun_rad = make_float3(sun_i, sun_i * 0.93f, sun_i * 0.80f);
+                    // Energy-balanced diffuse (1 / PI) + specular lobe
+                    float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.75f));
+                    float3 half_v = f3_norm(f3_sub(sun_dir, dir));
+                    float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
+                    float spec_exp = fmaxf(4.0f, 2.0f / (rough * rough + 0.002f) - 2.0f);
+                    float spec_norm = (spec_exp + 2.0f) * 0.125f * 0.318309886f;
+                    float spec_val = powf(ndoth, fminf(spec_exp, 512.0f)) * fminf(spec_norm, 6.0f);
+                    float3 spec_tint = f3_add(make_float3(0.04f, 0.04f, 0.04f), f3_mul(base_col, metallic));
+                    float3 spec_term = f3_mul(f3_mul3(spec_tint, sun_rad), spec_val * ndotl);
+                    float3 direct = f3_add(diff_term, spec_term);
+                    if (horizon_fade > 0.0f) {
+                        float3 sky_h = sky_color(dir, sun_dir, bounce == 0);
+                        direct = f3_add(f3_mul(direct, 1.0f - horizon_fade), f3_mul(sky_h, horizon_fade));
+                    }
+                    sample_col = f3_add(sample_col, f3_mul3(throughput, direct));
                 }
+            }
+            if (horizon_fade > 0.0f) {
+                float3 sky_h = sky_color(dir, sun_dir, bounce == 0);
+                sample_col = f3_add(sample_col, f3_mul3(throughput, f3_mul(sky_h, horizon_fade * 0.5f)));
             }
 
             float3 diff_dir = sample_cosine_hemisphere(n, seed);
             float3 refl_dir = f3_reflect(dir, n);
             float3 spec_dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, rough)));
-            bool do_spec = (rand01(seed) < (0.20f + 0.65f * metallic));
+            bool do_spec = (rand01(seed) < (0.15f + 0.75f * metallic));
             dir = do_spec ? spec_dir : diff_dir;
             origin = f3_add(hit_pos, f3_mul(n, 0.003f));
             throughput = f3_mul3(throughput, base_col);
@@ -388,9 +521,34 @@ extern "C" __global__ void __raygen__render() {
     float4* color_buf  = (float4*)params.out_color_f32;
     float4* albedo_buf = (float4*)params.out_albedo_f32;
     float4* normal_buf = (float4*)params.out_normal_f32;
-    color_buf[out_idx]  = make_float4(final_col.x, final_col.y, final_col.z, 1.0f);
-    albedo_buf[out_idx] = make_float4(first_albedo.x, first_albedo.y, first_albedo.z, 1.0f);
-    normal_buf[out_idx] = make_float4(first_normal.x, first_normal.y, first_normal.z, 1.0f);
+    if (params.accum_count == 0u) {
+        color_buf[out_idx]  = make_float4(final_col.x, final_col.y, final_col.z, 1.0f);
+        albedo_buf[out_idx] = make_float4(first_albedo.x, first_albedo.y, first_albedo.z, 1.0f);
+        normal_buf[out_idx] = make_float4(first_normal.x, first_normal.y, first_normal.z, 1.0f);
+    } else {
+        float w = 1.0f / (float)(params.accum_count + 1u);
+        float4 pc = color_buf[out_idx];
+        float4 pa = albedo_buf[out_idx];
+        float4 pn = normal_buf[out_idx];
+        color_buf[out_idx] = make_float4(
+            pc.x + (final_col.x - pc.x) * w,
+            pc.y + (final_col.y - pc.y) * w,
+            pc.z + (final_col.z - pc.z) * w,
+            1.0f
+        );
+        albedo_buf[out_idx] = make_float4(
+            pa.x + (first_albedo.x - pa.x) * w,
+            pa.y + (first_albedo.y - pa.y) * w,
+            pa.z + (first_albedo.z - pa.z) * w,
+            1.0f
+        );
+        normal_buf[out_idx] = make_float4(
+            pn.x + (first_normal.x - pn.x) * w,
+            pn.y + (first_normal.y - pn.y) * w,
+            pn.z + (first_normal.z - pn.z) * w,
+            1.0f
+        );
+    }
 }
 
 extern "C" __global__ void __miss__miss() {

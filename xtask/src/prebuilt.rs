@@ -79,24 +79,57 @@ fn host_target() -> Result<String, String> {
 }
 
 fn stage_dir(root: &Path, out_root: &Path, target: &str) -> Result<String, String> {
+    let target_dir = resolve_target_dir(root);
+    let host = host_target().ok();
+    stage_dir_internal(root, &target_dir, out_root, target, host.as_deref())
+}
+
+fn resolve_target_dir(root: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(val) if !val.is_empty() => {
+            let p = PathBuf::from(val);
+            if p.is_relative() { root.join(p) } else { p }
+        }
+        _ => root.join("target"),
+    }
+}
+
+fn stage_dir_internal(
+    root: &Path,
+    target_dir: &Path,
+    out_root: &Path,
+    target: &str,
+    host: Option<&str>,
+) -> Result<String, String> {
     let sys_crates = discover_sys_crates(&root.join("crates"));
     if sys_crates.is_empty() {
         return Ok("staged prebuilt bindings: no *-sys crates found".into());
     }
 
+    let is_host = host.is_some_and(|h| h == target);
     let mut newest: BTreeMap<String, (SystemTime, PathBuf)> = BTreeMap::new();
-    let target_dir = root.join("target");
-    for entry in list_dirs(&target_dir) {
-        let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name == target {
-            for profile in list_dirs(&entry) {
-                scan_build_dir(&profile.join("build"), &sys_crates, &mut newest);
+
+    // 1. Target-qualified builds under <target_dir>/<target>/<profile>/build/
+    let explicit_target_dir = target_dir.join(target);
+    if explicit_target_dir.is_dir() {
+        for profile in list_dirs(&explicit_target_dir) {
+            scan_build_dir(&profile.join("build"), &sys_crates, &mut newest);
+        }
+    }
+
+    // 2. Unqualified host builds under <target_dir>/<profile>/build/
+    // Allowed ONLY when requested target equals the detected rustc host.
+    if is_host {
+        for entry in list_dirs(target_dir) {
+            let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == target {
+                continue;
             }
-        } else if matches!(name, "debug" | "release") || entry.join("build").is_dir() {
-            // Host build under target/<profile>/build/.
-            scan_build_dir(&entry.join("build"), &sys_crates, &mut newest);
+            if matches!(name, "debug" | "release") || entry.join("build").is_dir() {
+                scan_build_dir(&entry.join("build"), &sys_crates, &mut newest);
+            }
         }
     }
 
@@ -222,9 +255,16 @@ mod tests {
         assert!(parse_args(&["--out"]).is_err());
     }
 
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}_{}_{id}", std::process::id()))
+    }
+
     #[test]
     fn stage_dir_copies_binding_artifacts_and_skips_unrelated_files() {
-        let root = std::env::temp_dir().join("nv_rs_xtask_prebuilt_test");
+        let root = unique_test_dir("nv_rs_xtask_prebuilt_test");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
         let out_dir = root
@@ -245,13 +285,11 @@ mod tests {
         }
 
         let staged_root = root.join("staged");
-        let msg = stage_dir(&root, &staged_root, "x86_64-pc-windows-msvc").expect("stage");
+        let host = host_target().unwrap_or_else(|_| "x86_64-pc-windows-msvc".to_string());
+        let msg = stage_dir(&root, &staged_root, &host).expect("stage");
         assert!(msg.contains("nvml-sys (4 files)"), "{msg}");
 
-        let dst = staged_root
-            .join("nvml-sys")
-            .join("prebuilt")
-            .join("x86_64-pc-windows-msvc");
+        let dst = staged_root.join("nvml-sys").join("prebuilt").join(&host);
         for name in [
             "nvml_types.rs",
             "nvml_api.rs",
@@ -262,5 +300,158 @@ mod tests {
         }
         assert!(!dst.join("unrelated.txt").exists());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn foreign_target_ignores_newer_host_artifacts() {
+        let root = unique_test_dir("nv_rs_xtask_prebuilt_foreign_test");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
+
+        let host = "x86_64-pc-windows-msvc";
+        let foreign = "aarch64-unknown-linux-gnu";
+
+        // 1. Foreign target build under target/aarch64-unknown-linux-gnu/release/build/...
+        let foreign_out = root
+            .join("target")
+            .join(foreign)
+            .join("release")
+            .join("build")
+            .join("nvml-sys-aaaa1111bbbb2222")
+            .join("out");
+        std::fs::create_dir_all(&foreign_out).expect("foreign out dir");
+        std::fs::write(
+            foreign_out.join("nvml_types.rs"),
+            "// aarch64 foreign content",
+        )
+        .expect("write");
+        std::fs::write(foreign_out.join("nvml_api.rs"), "// aarch64 foreign api").expect("write");
+        std::fs::write(
+            foreign_out.join("nvml_shims.rs"),
+            "// aarch64 foreign shims",
+        )
+        .expect("write");
+        std::fs::write(foreign_out.join("nvml_inventory.json"), "{}").expect("write");
+
+        // Ensure host build files have newer timestamps
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // 2. Newer host build under unqualified target/debug/build/...
+        let host_out = root
+            .join("target")
+            .join("debug")
+            .join("build")
+            .join("nvml-sys-cccc3333dddd4444")
+            .join("out");
+        std::fs::create_dir_all(&host_out).expect("host out dir");
+        std::fs::write(host_out.join("nvml_types.rs"), "// host content newer").expect("write");
+        std::fs::write(host_out.join("nvml_api.rs"), "// host api newer").expect("write");
+        std::fs::write(host_out.join("nvml_shims.rs"), "// host shims newer").expect("write");
+        std::fs::write(host_out.join("nvml_inventory.json"), "{}").expect("write");
+
+        let staged_root = root.join("staged");
+        let msg = stage_dir_internal(
+            &root,
+            &root.join("target"),
+            &staged_root,
+            foreign,
+            Some(host),
+        )
+        .expect("stage foreign");
+        assert!(msg.contains("nvml-sys (4 files)"), "{msg}");
+
+        let dst = staged_root.join("nvml-sys").join("prebuilt").join(foreign);
+        let content = std::fs::read_to_string(dst.join("nvml_types.rs")).expect("read staged");
+        assert_eq!(
+            content, "// aarch64 foreign content",
+            "must use foreign target artifacts, not host!"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn foreign_target_rejects_when_only_host_build_exists() {
+        let root = unique_test_dir("nv_rs_xtask_prebuilt_missing_foreign_test");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
+
+        let host = "x86_64-pc-windows-msvc";
+        let foreign = "riscv64gc-unknown-linux-gnu";
+
+        let host_out = root
+            .join("target")
+            .join("debug")
+            .join("build")
+            .join("nvml-sys-1234567890abcdef")
+            .join("out");
+        std::fs::create_dir_all(&host_out).expect("host out dir");
+        std::fs::write(host_out.join("nvml_types.rs"), "// host content").expect("write");
+
+        let staged_root = root.join("staged");
+        let msg = stage_dir_internal(
+            &root,
+            &root.join("target"),
+            &staged_root,
+            foreign,
+            Some(host),
+        )
+        .expect("stage foreign");
+        assert!(
+            msg.contains("none (build the *-sys crates first)"),
+            "expected 'none' when foreign target has no build, got: {msg}"
+        );
+        assert!(
+            !staged_root
+                .join("nvml-sys")
+                .join("prebuilt")
+                .join(foreign)
+                .exists()
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn custom_target_dir_staged() {
+        let root = unique_test_dir("nv_rs_xtask_prebuilt_custom_target_dir_test");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
+
+        let custom_target = root.join("custom_target_dir");
+        let out_dir = custom_target
+            .join("debug")
+            .join("build")
+            .join("nvml-sys-0123456789abcdef")
+            .join("out");
+        std::fs::create_dir_all(&out_dir).expect("out dir");
+        std::fs::write(
+            out_dir.join("nvml_types.rs"),
+            "// custom target dir content",
+        )
+        .expect("write");
+        std::fs::write(out_dir.join("nvml_api.rs"), "// api").expect("write");
+        std::fs::write(out_dir.join("nvml_shims.rs"), "// shims").expect("write");
+        std::fs::write(out_dir.join("nvml_inventory.json"), "{}").expect("write");
+
+        let staged_root = root.join("staged");
+        let host = "x86_64-pc-windows-msvc";
+        let msg = stage_dir_internal(&root, &custom_target, &staged_root, host, Some(host))
+            .expect("stage custom target dir");
+        assert!(msg.contains("nvml-sys (4 files)"), "{msg}");
+
+        let dst = staged_root.join("nvml-sys").join("prebuilt").join(host);
+        let content = std::fs::read_to_string(dst.join("nvml_types.rs")).expect("read staged");
+        assert_eq!(content, "// custom target dir content");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_target_dir_defaults_to_target() {
+        let root = Path::new("/workspace");
+        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+            assert_eq!(resolve_target_dir(root), root.join("target"));
+        }
     }
 }

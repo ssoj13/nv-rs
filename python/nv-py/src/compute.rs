@@ -12,23 +12,15 @@ use pyo3::prelude::*;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
-/// Extracts `(raw_device_ptr, nbytes)` from a `PyDeviceBuffer`, supporting both
+/// Extracts `(raw_device_ptr, byte_len)` from a `PyDeviceBuffer`, supporting both
 /// `nv_rs`-owned buffers and borrowed DLPack tensors.
-fn buf_ptr_and_bytes(buf: &Bound<'_, PyDeviceBuffer>) -> PyResult<(u64, usize)> {
+pub(crate) fn buf_ptr_and_bytes(buf: &Bound<'_, PyDeviceBuffer>) -> (u64, usize) {
     let borrowed = buf.borrow();
-    let ptr = borrowed.raw_device_ptr();
-    let nbytes = match borrowed.owned_cuda_buf() {
-        Some(cuda_buf) => cuda_buf.len(),
-        None => {
-            drop(borrowed);
-            buf.getattr("nbytes")?.extract::<usize>()?
-        }
-    };
-    Ok((ptr, nbytes))
+    (borrowed.raw_device_ptr(), borrowed.byte_len())
 }
 
 /// Validates that `nbytes >= min_bytes` and `ptr != 0` when `min_bytes > 0`.
-fn validate_dev_buf(
+pub(crate) fn validate_dev_buf(
     category: &str,
     op: &str,
     name: &str,
@@ -206,9 +198,9 @@ impl PyCublasHandle {
                 )
             })?;
 
-        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a)?;
-        let (b_ptr, b_bytes) = buf_ptr_and_bytes(b)?;
-        let (c_ptr, c_bytes) = buf_ptr_and_bytes(c)?;
+        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a);
+        let (b_ptr, b_bytes) = buf_ptr_and_bytes(b);
+        let (c_ptr, c_bytes) = buf_ptr_and_bytes(c);
 
         validate_dev_buf("cublas", "gemm_f32", "a", a_ptr, a_bytes, req_a)?;
         validate_dev_buf("cublas", "gemm_f32", "b", b_ptr, b_bytes, req_b)?;
@@ -450,8 +442,8 @@ impl PyCufftPlan1d {
         direction: &str,
     ) -> PyResult<()> {
         let dir = parse_fft_direction(direction)?;
-        let (in_ptr, in_bytes) = buf_ptr_and_bytes(in_buf)?;
-        let (out_ptr, out_bytes) = buf_ptr_and_bytes(out_buf)?;
+        let (in_ptr, in_bytes) = buf_ptr_and_bytes(in_buf);
+        let (out_ptr, out_bytes) = buf_ptr_and_bytes(out_buf);
 
         let state_arc = self.state.clone();
         let (min_in, min_out, nx, batch, fft_type) = {
@@ -615,7 +607,7 @@ impl PyCurandGenerator {
 
     /// Fills `buf` with uniform `f32` values in `(0.0, 1.0]`, GIL-free.
     fn fill_uniform_f32(&self, py: Python<'_>, buf: &Bound<'_, PyDeviceBuffer>) -> PyResult<()> {
-        let (ptr, nbytes) = buf_ptr_and_bytes(buf)?;
+        let (ptr, nbytes) = buf_ptr_and_bytes(buf);
         if !nbytes.is_multiple_of(size_of::<f32>()) {
             return Err(record_and_err(
                 "curand",
@@ -683,7 +675,7 @@ impl PyCurandGenerator {
                 ErrorKind::InvalidArgument,
             ));
         }
-        let (ptr, nbytes) = buf_ptr_and_bytes(buf)?;
+        let (ptr, nbytes) = buf_ptr_and_bytes(buf);
         if !nbytes.is_multiple_of(size_of::<f32>()) {
             return Err(record_and_err(
                 "curand",

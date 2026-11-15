@@ -267,6 +267,8 @@ impl FftBloomPass {
         if needs_rebuild {
             // Drop old plans and buffers before allocating new ones so peak VRAM stays bounded.
             self.state = None;
+            // Rebind scratch to the execution stream so plan_many / exec_* share the same stream.
+            self.scratch = Scratch::new(stream);
 
             let half_w = fft_w / 2 + 1;
             let plane_real = (fft_w as usize) * (fft_h as usize);
@@ -483,7 +485,7 @@ impl FftBloomPass {
         // 5. Inverse batched 2D C2R FFT back to spatial RGB planes.
         state
             .c2r_plan
-            .exec_c2r(stream, &state.freq_buf, &mut state.real_buf)
+            .exec_c2r(stream, &mut state.freq_buf, &mut state.real_buf)
             .map_err(|e| format!("bloom exec_c2r failed: {e}"))?;
 
         // 6. Additively composite bloom back into `color_ptr`.

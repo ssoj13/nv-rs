@@ -549,7 +549,13 @@ def _safe_relpath(raw_name: str, strip_top: bool) -> Path | None:
     return Path(*parts)
 
 
-def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: bool = True) -> None:
+def _extract_archive(
+    archive: Path,
+    dst: Path,
+    archive_type: str,
+    strip_top: bool = True,
+    use_external_tar: bool = True,
+) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     dst_resolved = dst.resolve()
     if archive_type == "zip":
@@ -557,6 +563,9 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
             for info in zf.infolist():
                 if info.is_dir():
                     continue
+                norm_name = info.filename.replace("\\", "/")
+                if norm_name.startswith("/") or ":" in norm_name.split("/", 1)[0] or any(p == ".." for p in Path(norm_name).parts):
+                    raise ValueError(f"Unsafe archive entry path: {info.filename}")
                 rel = _safe_relpath(info.filename, strip_top)
                 if rel is None:
                     continue
@@ -567,7 +576,7 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
                 with zf.open(info, "r") as src, out_path.open("wb") as out:
                     shutil.copyfileobj(src, out)
     elif archive_type in ("tar.xz", "tar.gz"):
-        if not IS_WINDOWS and shutil.which("tar"):
+        if use_external_tar and not IS_WINDOWS and shutil.which("tar"):
             dst_resolved.mkdir(parents=True, exist_ok=True)
             cmd = ["tar", "--no-same-owner", "-xf", str(archive), "-C", str(dst_resolved)]
             if strip_top:
@@ -576,7 +585,22 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
             return
         mode = "r:xz" if archive_type == "tar.xz" else "r:gz"
         with tarfile.open(archive, mode) as tf:
+            link_members: list[tarfile.TarInfo] = []
             for member in tf.getmembers():
+                norm_name = member.name.replace("\\", "/")
+                if norm_name.startswith("/") or ":" in norm_name.split("/", 1)[0] or any(p == ".." for p in Path(norm_name).parts):
+                    raise ValueError(f"Unsafe archive entry path: {member.name}")
+                if member.isdir():
+                    rel = _safe_relpath(member.name, strip_top)
+                    if rel is not None:
+                        out_path = (dst_resolved / rel).resolve()
+                        if not out_path.is_relative_to(dst_resolved):
+                            raise ValueError(f"Unsafe archive entry path: {member.name}")
+                        out_path.mkdir(parents=True, exist_ok=True)
+                    continue
+                if member.islnk() or member.issym():
+                    link_members.append(member)
+                    continue
                 if not member.isfile():
                     continue
                 rel = _safe_relpath(member.name, strip_top)
@@ -590,6 +614,90 @@ def _extract_archive(archive: Path, dst: Path, archive_type: str, strip_top: boo
                 if src is not None:
                     with src, out_path.open("wb") as out:
                         shutil.copyfileobj(src, out)
+                if member.mode & 0o111:
+                    try:
+                        out_path.chmod(out_path.stat().st_mode | (member.mode & 0o777))
+                    except OSError:
+                        pass
+
+            # Second pass: process hardlinks and symlinks with traversal validation
+            pending_symlinks: list[tuple[tarfile.TarInfo, Path, Path]] = []
+            for member in link_members:
+                rel = _safe_relpath(member.name, strip_top)
+                if rel is None:
+                    continue
+                out_path = (dst_resolved / rel).resolve()
+                if not out_path.is_relative_to(dst_resolved):
+                    raise ValueError(f"Unsafe archive entry path: {member.name}")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if member.islnk():
+                    link_norm = member.linkname.replace("\\", "/")
+                    if link_norm.startswith("/") or ":" in link_norm.split("/", 1)[0] or any(p == ".." for p in Path(link_norm).parts):
+                        raise ValueError(f"Unsafe archive hardlink target: {member.linkname}")
+                    link_rel = _safe_relpath(member.linkname, strip_top)
+                    if link_rel is None and strip_top:
+                        link_rel = _safe_relpath(member.linkname, False)
+                    if link_rel is None:
+                        raise ValueError(f"Unsafe archive hardlink target: {member.linkname}")
+                    target_path = (dst_resolved / link_rel).resolve()
+                    if not target_path.is_relative_to(dst_resolved):
+                        raise ValueError(f"Unsafe archive hardlink target: {member.linkname}")
+                    if not target_path.exists() and strip_top:
+                        alt_rel = _safe_relpath(member.linkname, False)
+                        if alt_rel:
+                            alt_target = (dst_resolved / alt_rel).resolve()
+                            if alt_target.is_relative_to(dst_resolved) and alt_target.exists():
+                                target_path = alt_target
+                    if not target_path.exists():
+                        raise ValueError(f"Hardlink target does not exist: {member.linkname}")
+                    if out_path.exists() or out_path.is_symlink():
+                        out_path.unlink()
+                    try:
+                        os.link(target_path, out_path)
+                    except OSError:
+                        shutil.copy2(target_path, out_path)
+
+                elif member.issym():
+                    raw_link = member.linkname.replace("\\", "/")
+                    if raw_link.startswith("/") or ":" in raw_link.split("/", 1)[0]:
+                        raise ValueError(f"Unsafe absolute symlink target: {member.linkname}")
+                    target_resolved = Path(os.path.abspath(out_path.parent / raw_link))
+                    if not target_resolved.is_relative_to(dst_resolved):
+                        raise ValueError(f"Unsafe escaping symlink target: {member.linkname}")
+                    if out_path.exists() or out_path.is_symlink():
+                        out_path.unlink()
+                    created = False
+                    try:
+                        os.symlink(member.linkname, out_path)
+                        created = True
+                    except OSError:
+                        pass
+                    if not created:
+                        if target_resolved.is_file():
+                            shutil.copy2(target_resolved, out_path)
+                        elif target_resolved.is_dir():
+                            shutil.copytree(target_resolved, out_path)
+                        else:
+                            pending_symlinks.append((member, out_path, target_resolved))
+
+            max_rounds = 10
+            while pending_symlinks and max_rounds > 0:
+                max_rounds -= 1
+                next_pending = []
+                progress = False
+                for member, out_path, target_resolved in pending_symlinks:
+                    if target_resolved.is_file():
+                        shutil.copy2(target_resolved, out_path)
+                        progress = True
+                    elif target_resolved.is_dir():
+                        shutil.copytree(target_resolved, out_path)
+                        progress = True
+                    else:
+                        next_pending.append((member, out_path, target_resolved))
+                if not progress:
+                    break
+                pending_symlinks = next_pending
     else:
         raise ValueError(f"Unsupported archive type: {archive_type}")
 

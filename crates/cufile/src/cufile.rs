@@ -328,9 +328,43 @@ pub(crate) fn record_teardown_cufile(ctx: &Context, raw: cufile_sys::CUfileError
     }
 }
 
+mod sealed {
+    use super::*;
+
+    pub trait Sealed {}
+
+    impl<T> Sealed for DeviceBuffer<T> {}
+    impl<T> Sealed for DeviceBufferView<'_, T> {}
+    impl<T: DeviceSpan + ?Sized> Sealed for &mut T {}
+    impl<T: DeviceSpan + ?Sized> Sealed for Arc<T> {}
+    impl<B: DeviceSpan> Sealed for RegisteredBuffer<B> {}
+}
+
 /// Read-only device span accepted by cuFile write operations (`DeviceBuffer<T>`,
 /// `DeviceBufferView<'_, T>`, or [`RegisteredBuffer`]).
-pub trait DeviceSpan {
+///
+/// # Safety Invariant & Obligations
+/// This trait is sealed via the internal [`sealed::Sealed`] supertrait and cannot be implemented
+/// by external or downstream crates. This guarantees that:
+/// - **Allocation validity**: [`cu_deviceptr`](DeviceSpan::cu_deviceptr) points to a genuinely
+///   allocated CUDA device memory region in [`context`](DeviceSpan::context).
+/// - **Extent bounds**: The allocation contains at least [`num_bytes`](DeviceSpan::num_bytes)
+///   contiguous, allocated bytes accessible to cuFile driver operations.
+/// - **Lifetime**: The allocation remains alive and stationary for the duration of synchronous
+///   or stream-ordered async transfers referencing this span.
+/// - **Context association**: [`context`](DeviceSpan::context) is the exact CUDA [`Context`] that owns
+///   the allocation and matches the file handle and stream.
+///
+/// Downstream code cannot fabricate untrusted device spans with arbitrary addresses or lengths:
+/// ```compile_fail
+/// struct FabricatedSpan;
+/// impl cufile::DeviceSpan for FabricatedSpan {
+///     fn context(&self) -> &std::sync::Arc<cuda_core::Context> { unimplemented!() }
+///     fn cu_deviceptr(&self) -> cuda_bindings::CUdeviceptr { 0xdeadbeef }
+///     fn num_bytes(&self) -> usize { 1024 * 1024 }
+/// }
+/// ```
+pub trait DeviceSpan: sealed::Sealed {
     /// Owning CUDA context.
     fn context(&self) -> &Arc<Context>;
     /// Base CUDA device pointer.
@@ -341,6 +375,26 @@ pub trait DeviceSpan {
 
 /// Mutable device span accepted by cuFile read operations (`DeviceBuffer<T>`,
 /// `DeviceBufferView<'_, T>`, or [`RegisteredBuffer`]).
+///
+/// # Safety Invariant & Obligations
+/// This trait extends [`DeviceSpan`] and is sealed via the internal [`sealed::Sealed`] supertrait.
+/// External crates cannot implement this trait, preventing untrusted code from manufacturing
+/// destination buffers for cuFile read operations.
+///
+/// Implementors represent valid, writable device memory. When using [`Arc<T>`] where
+/// `T: DeviceSpanMut`, the caller guarantees that concurrent operations on the same or other
+/// streams do not cause data races on the underlying GPU memory.
+///
+/// Downstream code cannot fabricate untrusted mutable device spans:
+/// ```compile_fail
+/// struct FabricatedSpanMut;
+/// impl cufile::DeviceSpan for FabricatedSpanMut {
+///     fn context(&self) -> &std::sync::Arc<cuda_core::Context> { unimplemented!() }
+///     fn cu_deviceptr(&self) -> cuda_bindings::CUdeviceptr { 0xdeadbeef }
+///     fn num_bytes(&self) -> usize { 1024 * 1024 }
+/// }
+/// impl cufile::DeviceSpanMut for FabricatedSpanMut {}
+/// ```
 pub trait DeviceSpanMut: DeviceSpan {}
 
 impl<T> DeviceSpan for DeviceBuffer<T> {
@@ -466,6 +520,24 @@ mod tests {
             DriverSession::use_count(),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn t0_device_span_sealed_and_internal_impls() {
+        fn assert_device_span<T: DeviceSpan>() {}
+        fn assert_device_span_mut<T: DeviceSpanMut>() {}
+
+        assert_device_span::<DeviceBuffer<u8>>();
+        assert_device_span::<DeviceBufferView<'_, u8>>();
+        assert_device_span::<&mut DeviceBuffer<u8>>();
+        assert_device_span::<Arc<DeviceBuffer<u8>>>();
+        assert_device_span::<RegisteredBuffer<DeviceBuffer<u8>>>();
+
+        assert_device_span_mut::<DeviceBuffer<u8>>();
+        assert_device_span_mut::<DeviceBufferView<'_, u8>>();
+        assert_device_span_mut::<&mut DeviceBuffer<u8>>();
+        assert_device_span_mut::<Arc<DeviceBuffer<u8>>>();
+        assert_device_span_mut::<RegisteredBuffer<DeviceBuffer<u8>>>();
     }
 
     #[test]

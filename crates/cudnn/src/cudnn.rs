@@ -277,9 +277,40 @@ impl NanPropagation {
     }
 }
 
+mod sealed {
+    use super::*;
+
+    pub trait Sealed {}
+
+    impl<T> Sealed for DeviceBuffer<T> {}
+    impl<T> Sealed for DeviceBufferView<'_, T> {}
+}
+
 /// Read-only device memory view accepted by cuDNN forward operators, allowing typed
 /// [`DeviceBuffer<T>`] and [`DeviceBufferView<T>`] slices without extra wrappers.
-pub trait DeviceSpan {
+///
+/// # Safety Invariant & Obligations
+/// This trait is sealed via the internal [`sealed::Sealed`] supertrait and cannot be implemented
+/// by external or downstream crates. This guarantees that:
+/// - **Allocation validity**: [`cu_deviceptr`](DeviceSpan::cu_deviceptr) points to a genuinely
+///   allocated device memory region in [`context`](DeviceSpan::context).
+/// - **Extent bounds**: The allocation contains at least [`num_bytes`](DeviceSpan::num_bytes)
+///   contiguous, allocated bytes accessible to CUDA driver operations.
+/// - **Lifetime**: The allocation remains alive and stationary for the duration of any operation
+///   referencing this span.
+/// - **Context & stream synchronization**: [`context`](DeviceSpan::context) is the owning CUDA
+///   context matching the operation stream; callers ensure prior stream dependencies are synchronized.
+///
+/// Downstream code cannot fabricate untrusted device spans with arbitrary addresses or lengths:
+/// ```compile_fail
+/// struct FabricatedSpan;
+/// impl cudnn::DeviceSpan for FabricatedSpan {
+///     fn context(&self) -> &std::sync::Arc<cuda_core::Context> { unimplemented!() }
+///     fn cu_deviceptr(&self) -> cuda_bindings::CUdeviceptr { 0xdeadbeef }
+///     fn num_bytes(&self) -> usize { 1024 * 1024 }
+/// }
+/// ```
+pub trait DeviceSpan: sealed::Sealed {
     /// Owning CUDA context.
     fn context(&self) -> &Arc<Context>;
     /// Base device address.
@@ -471,5 +502,12 @@ mod tests {
         let out = z_dev.to_host_vec(&stream).unwrap();
         // Top-left window sum: -10 + 1 + 3 + 4 = -2 -> ReLU = 0; others: 12, 20, 24.
         assert_eq!(out, vec![0.0, 12.0, 20.0, 24.0]);
+    }
+
+    #[test]
+    fn t0_device_span_sealed_and_internal_impls() {
+        fn assert_device_span<T: DeviceSpan>() {}
+        assert_device_span::<DeviceBuffer<f32>>();
+        assert_device_span::<DeviceBufferView<'_, f32>>();
     }
 }

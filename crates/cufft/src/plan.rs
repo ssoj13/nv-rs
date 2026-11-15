@@ -5,13 +5,17 @@
 //! enforcement via [`Scratch`], stream binding (`cufftSetStream`), and typed execution for
 //! `C2C`, `R2C`, `C2R`, `Z2Z`, `D2Z`, and `Z2D`.
 //! **Why.** Prevents hidden driver/cuFFT workspace allocations by enforcing two-phase sizing and
-//! explicit byte budgets, and validates transform types and buffer extents before launching.
+//! explicit byte budgets, retains shared workspace ownership to prevent dangling native pointers,
+//! and validates transform types, stream compatibility, and buffer extents before launching.
 //! **Used by** `cufft` callers and T0/T3 tests.
 
 use crate::error::{check, teardown};
+use crate::scratch::ScratchInner;
 use crate::{Error, Result, Scratch, sys};
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Stream};
+use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Single-precision complex number matching `cufftComplex` (`float2`, 8-byte aligned).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -229,18 +233,22 @@ impl ManyDesc {
     /// Computes minimum `(input_elems, output_elems)` required by this `ManyDesc` using checked
     /// arithmetic.
     ///
-    /// Per `cufftMakePlanMany` semantics, `embed[0]` is ignored (dim 0 uses `req_dim[0]`), and
-    /// `embed[1..rank]` give the storage pitch of inner dimensions.
+    /// Per `cufftMakePlanMany` semantics:
+    /// - When `inembed` is `None`, cuFFT ignores `istride` and `idist` and assumes contiguous dense layout.
+    /// - When `onembed` is `None`, cuFFT ignores `ostride` and `odist` and assumes contiguous dense layout.
+    /// - When an embed array is provided (`Some`), `embed[0]` is ignored (dim 0 uses `req_dim[0]`), and
+    ///   `embed[1..rank]` give the storage pitch of inner dimensions.
     pub fn min_io_elems(&self) -> Result<(usize, usize)> {
         self.validate()?;
+        let (dense_in, dense_out) =
+            dense_io_elems(&self.n[..self.rank], self.batch, self.fft_type)?;
         let req_in = self.req_dims(false);
         let req_out = self.req_dims(true);
-        let max_idx_for = |req: [i32; 3], embed: Option<[i32; 3]>| -> Result<usize> {
-            let eff_embed = embed.unwrap_or(req);
+        let max_idx_for = |req: [i32; 3], embed: [i32; 3]| -> Result<usize> {
             let mut idx = (req[0] - 1) as usize;
             for i in 1..self.rank {
                 idx = idx
-                    .checked_mul(eff_embed[i] as usize)
+                    .checked_mul(embed[i] as usize)
                     .and_then(|v| v.checked_add((req[i] - 1) as usize))
                     .ok_or(Error::Invalid("ManyDesc embed index overflow"))?;
             }
@@ -262,12 +270,14 @@ impl ManyDesc {
                     .ok_or(Error::Invalid("ManyDesc total span overflow"))
             }
         };
-        let in_span = span(max_idx_for(req_in, self.inembed)?, self.istride, self.idist)?;
-        let out_span = span(
-            max_idx_for(req_out, self.onembed)?,
-            self.ostride,
-            self.odist,
-        )?;
+        let in_span = match self.inembed {
+            None => dense_in,
+            Some(embed) => span(max_idx_for(req_in, embed)?, self.istride, self.idist)?,
+        };
+        let out_span = match self.onembed {
+            None => dense_out,
+            Some(embed) => span(max_idx_for(req_out, embed)?, self.ostride, self.odist)?,
+        };
         Ok((in_span, out_span))
     }
 }
@@ -356,6 +366,21 @@ pub struct Plan {
     work_size: usize,
     min_input_elems: usize,
     min_output_elems: usize,
+    workspace: Option<Arc<ScratchInner>>,
+    last_generation: AtomicU64,
+    last_ws_ptr: AtomicUsize,
+}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Plan")
+            .field("handle", &self.handle)
+            .field("fft_type", &self.fft_type)
+            .field("work_size", &self.work_size)
+            .field("min_input_elems", &self.min_input_elems)
+            .field("min_output_elems", &self.min_output_elems)
+            .finish()
+    }
 }
 
 // SAFETY: `cufftHandle` has no thread-local state; moving ownership is safe, concurrent use is `!Sync`.
@@ -416,6 +441,7 @@ impl Plan {
         let ws_ptr = scratch.reserve(&stream, work_size, budget)?;
         let handle = guard.handle;
         if work_size > 0 {
+            guard.cuda.bind_to_thread()?;
             // SAFETY: `handle` is live with auto-allocation disabled; `ws_ptr` has `work_size` bytes.
             check("cufftSetWorkArea", unsafe {
                 sys::cufftSetWorkArea(handle, ws_ptr)
@@ -423,6 +449,12 @@ impl Plan {
         }
         let cuda = guard.cuda.clone();
         let handle = guard.into_handle();
+        let (workspace, ws_gen, ptr) = if work_size > 0 {
+            let ws_gen = scratch.generation();
+            (Some(scratch.inner.clone()), ws_gen, ws_ptr as usize)
+        } else {
+            (None, 0, 0)
+        };
         Ok(Self {
             handle,
             cuda,
@@ -430,6 +462,9 @@ impl Plan {
             work_size,
             min_input_elems,
             min_output_elems,
+            workspace,
+            last_generation: AtomicU64::new(ws_gen),
+            last_ws_ptr: AtomicUsize::new(ptr),
         })
     }
 
@@ -567,6 +602,13 @@ impl Plan {
         self.work_size
     }
 
+    /// Returns the CUDA [`Stream`] on which this plan's workspace was allocated, or `None` if
+    /// the plan requires no workspace (`work_size == 0`).
+    #[inline]
+    pub fn workspace_stream(&self) -> Option<&Arc<Stream>> {
+        self.workspace.as_ref().map(|ws| &ws.stream)
+    }
+
     /// Rebinds this plan's workspace to `scratch` (admitting `self.work_size()` against `budget`).
     pub fn set_work_area(&mut self, scratch: &mut Scratch, budget: usize) -> Result<()> {
         let stream = scratch.stream().clone();
@@ -582,15 +624,33 @@ impl Plan {
             check("cufftSetWorkArea", unsafe {
                 sys::cufftSetWorkArea(self.handle, ws_ptr)
             })?;
+            self.workspace = Some(scratch.inner.clone());
+            self.last_generation
+                .store(scratch.generation(), Ordering::Release);
+            self.last_ws_ptr.store(ws_ptr as usize, Ordering::Release);
+        } else {
+            self.workspace = None;
+            self.last_generation.store(0, Ordering::Release);
+            self.last_ws_ptr.store(0, Ordering::Release);
         }
         Ok(())
     }
 
     /// Binds `stream` to this plan.
+    ///
+    /// If the plan requires workspace (`work_size > 0`), `stream` must belong to the same CUDA
+    /// context and share the same native stream as the workspace allocation.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than the cuFFT plan",
+            ));
+        }
+        if let Some(ws) = &self.workspace
+            && stream.cu_stream() != ws.stream.cu_stream()
+        {
+            return Err(Error::Invalid(
+                "stream does not match cuFFT plan workspace stream",
             ));
         }
         self.cuda.bind_to_thread()?;
@@ -598,6 +658,45 @@ impl Plan {
         check("cufftSetStream", unsafe {
             sys::cufftSetStream(self.handle, stream.cu_stream())
         })
+    }
+
+    fn ensure_workspace(&self, stream: &Stream) -> Result<()> {
+        if self.work_size == 0 {
+            return Ok(());
+        }
+        let ws = self.workspace.as_ref().ok_or(Error::Invalid(
+            "cuFFT plan requires workspace but none is retained",
+        ))?;
+        if stream.cu_stream() != ws.stream.cu_stream() {
+            return Err(Error::Invalid(
+                "execution stream does not match cuFFT plan workspace stream",
+            ));
+        }
+        let state = ws.state.lock().unwrap_or_else(|p| p.into_inner());
+        let current_gen = state.generation;
+        let last_gen = self.last_generation.load(Ordering::Acquire);
+        let last_ptr = self.last_ws_ptr.load(Ordering::Acquire);
+        let buf = state
+            .buffer
+            .as_ref()
+            .ok_or(Error::Invalid("scratch buffer missing after allocation"))?;
+        if buf.len() < self.work_size {
+            return Err(Error::Invalid(
+                "scratch buffer capacity smaller than required cuFFT work area",
+            ));
+        }
+        let current_ptr = (buf.cu_deviceptr() as usize) as *mut c_void;
+        if current_gen != last_gen || current_ptr as usize != last_ptr {
+            self.cuda.bind_to_thread()?;
+            // SAFETY: `self.handle` is live and `current_ptr` has at least `self.work_size` device bytes.
+            check("cufftSetWorkArea", unsafe {
+                sys::cufftSetWorkArea(self.handle, current_ptr)
+            })?;
+            self.last_generation.store(current_gen, Ordering::Release);
+            self.last_ws_ptr
+                .store(current_ptr as usize, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn check_exec(&self, expected: FftType, in_len: usize, out_len: usize) -> Result<()> {
@@ -623,8 +722,9 @@ impl Plan {
         direction: Direction,
     ) -> Result<()> {
         self.check_exec(FftType::C2C, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: `cufftComplex` matches `Complex32` layout; cuFFT reads `input` without mutating it.
+        // SAFETY: `cufftComplex` matches `Complex32` layout; cuFFT reads `input` without mutating it; stream and workspace are bound.
         check("cufftExecC2C", unsafe {
             sys::cufftExecC2C(
                 self.handle,
@@ -643,8 +743,9 @@ impl Plan {
         output: &mut DeviceBuffer<Complex32>,
     ) -> Result<()> {
         self.check_exec(FftType::R2C, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: buffer extents and transform type are validated above; stream is bound.
+        // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound.
         check("cufftExecR2C", unsafe {
             sys::cufftExecR2C(
                 self.handle,
@@ -655,15 +756,22 @@ impl Plan {
     }
 
     /// Executes a single-precision complex-to-real inverse FFT (`cufftExecC2R`).
+    ///
+    /// # Note on Input Mutation
+    /// Per NVIDIA cuFFT documentation, out-of-place C2R transforms overwrite the input buffer
+    /// during execution. `input` is taken as `&mut DeviceBuffer<Complex32>` to enforce exclusive
+    /// access and document destructive execution in the type system.
     pub fn exec_c2r(
         &self,
         stream: &Stream,
-        input: &DeviceBuffer<Complex32>,
+        input: &mut DeviceBuffer<Complex32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         self.check_exec(FftType::C2R, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: buffer extents and transform type are validated above; stream is bound.
+        // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound;
+        // `input` is exclusively borrowed and mutated per cuFFT C2R specification.
         check("cufftExecC2R", unsafe {
             sys::cufftExecC2R(
                 self.handle,
@@ -682,8 +790,9 @@ impl Plan {
         direction: Direction,
     ) -> Result<()> {
         self.check_exec(FftType::Z2Z, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: `cufftDoubleComplex` matches `Complex64` layout; stream is bound.
+        // SAFETY: `cufftDoubleComplex` matches `Complex64` layout; stream and workspace are bound.
         check("cufftExecZ2Z", unsafe {
             sys::cufftExecZ2Z(
                 self.handle,
@@ -702,8 +811,9 @@ impl Plan {
         output: &mut DeviceBuffer<Complex64>,
     ) -> Result<()> {
         self.check_exec(FftType::D2Z, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: buffer extents and transform type are validated above; stream is bound.
+        // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound.
         check("cufftExecD2Z", unsafe {
             sys::cufftExecD2Z(
                 self.handle,
@@ -714,15 +824,22 @@ impl Plan {
     }
 
     /// Executes a double-precision complex-to-real inverse FFT (`cufftExecZ2D`).
+    ///
+    /// # Note on Input Mutation
+    /// Per NVIDIA cuFFT documentation, out-of-place Z2D transforms overwrite the input buffer
+    /// during execution. `input` is taken as `&mut DeviceBuffer<Complex64>` to enforce exclusive
+    /// access and document destructive execution in the type system.
     pub fn exec_z2d(
         &self,
         stream: &Stream,
-        input: &DeviceBuffer<Complex64>,
+        input: &mut DeviceBuffer<Complex64>,
         output: &mut DeviceBuffer<f64>,
     ) -> Result<()> {
         self.check_exec(FftType::Z2D, input.len(), output.len())?;
+        self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
-        // SAFETY: buffer extents and transform type are validated above; stream is bound.
+        // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound;
+        // `input` is exclusively borrowed and mutated per cuFFT Z2D specification.
         check("cufftExecZ2D", unsafe {
             sys::cufftExecZ2D(
                 self.handle,
@@ -745,5 +862,148 @@ impl Drop for Plan {
             }
             self.handle = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_desc_null_embed_batch_layout_normalization() {
+        // FFI-2 reproduction case: rank 1, n=[8, 1, 1], inembed=None, onembed=None, batch=2
+        // Default contiguous layout requires 16 elements (2 * 8), not 9 ((8-1)*1 + 1 + (2-1)*1).
+        let desc_c2c = ManyDesc {
+            rank: 1,
+            n: [8, 1, 1],
+            inembed: None,
+            istride: 1,
+            idist: 1,
+            onembed: None,
+            ostride: 1,
+            odist: 1,
+            fft_type: FftType::C2C,
+            batch: 2,
+        };
+        assert_eq!(desc_c2c.min_io_elems().unwrap(), (16, 16));
+
+        // When explicit embeds are provided, custom strides/distances are respected
+        let desc_c2c_explicit = ManyDesc {
+            inembed: Some([8, 1, 1]),
+            onembed: Some([8, 1, 1]),
+            ..desc_c2c
+        };
+        assert_eq!(desc_c2c_explicit.min_io_elems().unwrap(), (9, 9));
+
+        // Mixed embeds: input NULL (dense 16), output explicit (9)
+        let desc_mixed_in_null = ManyDesc {
+            inembed: None,
+            onembed: Some([8, 1, 1]),
+            ..desc_c2c
+        };
+        assert_eq!(desc_mixed_in_null.min_io_elems().unwrap(), (16, 9));
+
+        // Mixed embeds: input explicit (9), output NULL (dense 16)
+        let desc_mixed_out_null = ManyDesc {
+            inembed: Some([8, 1, 1]),
+            onembed: None,
+            ..desc_c2c
+        };
+        assert_eq!(desc_mixed_out_null.min_io_elems().unwrap(), (9, 16));
+    }
+
+    #[test]
+    fn many_desc_null_embed_all_transform_types() {
+        // R2C: 2D [16, 32], batch=3.
+        // Dense input: 3 * 16 * 32 = 1536 real elements.
+        // Dense output: 3 * 16 * (32/2 + 1) = 3 * 16 * 17 = 816 complex elements.
+        let desc_r2c = ManyDesc {
+            rank: 2,
+            n: [16, 32, 1],
+            inembed: None,
+            istride: 1,
+            idist: 100, // ignored by cuFFT when inembed is None
+            onembed: None,
+            ostride: 1,
+            odist: 50, // ignored by cuFFT when onembed is None
+            fft_type: FftType::R2C,
+            batch: 3,
+        };
+        assert_eq!(desc_r2c.min_io_elems().unwrap(), (1536, 816));
+
+        // C2R: 2D [16, 32], batch=3.
+        // Dense input: 816 complex elements.
+        // Dense output: 1536 real elements.
+        let desc_c2r = ManyDesc {
+            fft_type: FftType::C2R,
+            ..desc_r2c
+        };
+        assert_eq!(desc_c2r.min_io_elems().unwrap(), (816, 1536));
+
+        // D2Z: 2D [8, 16], batch=2.
+        // Dense input: 2 * 8 * 16 = 256 real elements.
+        // Dense output: 2 * 8 * (16/2 + 1) = 2 * 8 * 9 = 144 complex elements.
+        let desc_d2z = ManyDesc {
+            rank: 2,
+            n: [8, 16, 1],
+            inembed: None,
+            istride: 1,
+            idist: 10,
+            onembed: None,
+            ostride: 1,
+            odist: 10,
+            fft_type: FftType::D2Z,
+            batch: 2,
+        };
+        assert_eq!(desc_d2z.min_io_elems().unwrap(), (256, 144));
+
+        // Z2D: 2D [8, 16], batch=2.
+        let desc_z2d = ManyDesc {
+            fft_type: FftType::Z2D,
+            ..desc_d2z
+        };
+        assert_eq!(desc_z2d.min_io_elems().unwrap(), (144, 256));
+
+        // Z2Z: 3D [4, 4, 4], batch=2.
+        // Dense: 2 * 4 * 4 * 4 = 128 elements.
+        let desc_z2z = ManyDesc {
+            rank: 3,
+            n: [4, 4, 4],
+            inembed: None,
+            istride: 1,
+            idist: 1,
+            onembed: None,
+            ostride: 1,
+            odist: 1,
+            fft_type: FftType::Z2Z,
+            batch: 2,
+        };
+        assert_eq!(desc_z2z.min_io_elems().unwrap(), (128, 128));
+    }
+
+    #[test]
+    fn complex_types_layout_and_methods() {
+        let c32 = Complex32::new(1.5, -2.5);
+        assert_eq!(c32.re(), 1.5);
+        assert_eq!(c32.im(), -2.5);
+        assert_eq!(c32.0, [1.5, -2.5]);
+
+        let c64 = Complex64::new(3.0, -4.0);
+        assert_eq!(c64.re(), 3.0);
+        assert_eq!(c64.im(), -4.0);
+        assert_eq!(c64.0, [3.0, -4.0]);
+    }
+
+    #[test]
+    fn direction_and_fft_type_raw_codes() {
+        assert_eq!(Direction::Forward.raw(), sys::CUFFT_FORWARD);
+        assert_eq!(Direction::Inverse.raw(), sys::CUFFT_INVERSE as i32);
+
+        assert_eq!(FftType::R2C.raw(), sys::cufftType_t_CUFFT_R2C);
+        assert_eq!(FftType::C2R.raw(), sys::cufftType_t_CUFFT_C2R);
+        assert_eq!(FftType::C2C.raw(), sys::cufftType_t_CUFFT_C2C);
+        assert_eq!(FftType::D2Z.raw(), sys::cufftType_t_CUFFT_D2Z);
+        assert_eq!(FftType::Z2D.raw(), sys::cufftType_t_CUFFT_Z2D);
+        assert_eq!(FftType::Z2Z.raw(), sys::cufftType_t_CUFFT_Z2Z);
     }
 }

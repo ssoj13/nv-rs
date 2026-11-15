@@ -359,6 +359,29 @@ fn cuda_version_dirs(probe: &dyn Probe, cuda_base: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Extracts the numeric version components and original name for ordering wildcard DLL candidates.
+///
+/// Strips `prefix` and `.dll` (case-insensitively) from `name` and parses numeric segments
+/// (e.g. `cufft64_12.dll` -> `vec![12]`, `nvrtc64_130_0.dll` -> `vec![130, 0]`).
+pub(crate) fn dll_version_key<'a>(name: &'a str, prefix: &str) -> (Vec<u64>, &'a str) {
+    let lower_name = name.to_ascii_lowercase();
+    let lower_prefix = prefix.to_ascii_lowercase();
+    let min_len = lower_prefix.len() + 4; // prefix + ".dll"
+    let version_parts = if lower_name.len() >= min_len
+        && lower_name.starts_with(&lower_prefix)
+        && lower_name.ends_with(".dll")
+    {
+        let suffix = &lower_name[lower_prefix.len()..lower_name.len() - 4];
+        suffix
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (version_parts, name)
+}
+
 /// Candidate paths for `spec` as seen through `probe`, most preferred first.
 ///
 /// On Linux an SDK's discovered runtime directory precedes bare sonames. The dynamic linker's
@@ -380,9 +403,12 @@ pub fn candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
                         lower.starts_with(&prefix.to_ascii_lowercase()) && lower.ends_with(".dll")
                     })
                     .collect();
-                // Highest version suffix first: `cufft64_12.dll` before `cufft64_11.dll`.
-                matches.sort();
-                matches.reverse();
+                // Highest version suffix first: `cufft64_12.dll` before `cufft64_11.dll` before `cufft64_9.dll`.
+                matches.sort_by(|a, b| {
+                    let (ver_a, _) = dll_version_key(a, prefix);
+                    let (ver_b, _) = dll_version_key(b, prefix);
+                    ver_b.cmp(&ver_a).then_with(|| a.cmp(b))
+                });
                 out.extend(matches.into_iter().map(|f| dir.join(f)));
             } else {
                 out.push(dir.join(name));
@@ -1208,6 +1234,56 @@ mod tests {
                 PathBuf::from(r"C:\cuda\bin\x64\cufft64_12.dll"),
                 PathBuf::from(r"C:\cuda\bin\x64\cufft64_11.dll")
             ]
+        );
+    }
+
+    #[test]
+    fn toolkit_prefix_scan_orders_numeric_versions_correctly_over_lexical() {
+        let _gate = read_extra_dirs_gate();
+        // Lexical reverse sorting puts "cufft64_9.dll" ahead of "cufft64_11.dll"
+        // because '9' > '1'. Numeric version ordering must guarantee 12 > 11 > 9.
+        let mut fake = Fake::default();
+        fake.env.insert("CUDA_PATH", r"C:\cuda");
+        fake.dirs.insert(
+            PathBuf::from(r"C:\cuda\bin\x64"),
+            vec!["cufft64_9.dll", "cufft64_11.dll", "cufft64_12.dll"],
+        );
+        let got = candidates_with(&fake, &CUFFT);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_12.dll"),
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_11.dll"),
+                PathBuf::from(r"C:\cuda\bin\x64\cufft64_9.dll"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dll_version_key_extracts_numeric_parts_and_tie_breaks() {
+        assert_eq!(
+            dll_version_key("cufft64_12.dll", "cufft64_"),
+            (vec![12], "cufft64_12.dll")
+        );
+        assert_eq!(
+            dll_version_key("cufft64_11.dll", "cufft64_"),
+            (vec![11], "cufft64_11.dll")
+        );
+        assert_eq!(
+            dll_version_key("cufft64_9.dll", "cufft64_"),
+            (vec![9], "cufft64_9.dll")
+        );
+        assert_eq!(
+            dll_version_key("CUFFT64_12.DLL", "cufft64_"),
+            (vec![12], "CUFFT64_12.DLL")
+        );
+        assert_eq!(
+            dll_version_key("nvrtc64_130_0.dll", "nvrtc64_"),
+            (vec![130, 0], "nvrtc64_130_0.dll")
+        );
+        assert_eq!(
+            dll_version_key("random.dll", "cufft64_"),
+            (vec![], "random.dll")
         );
     }
 

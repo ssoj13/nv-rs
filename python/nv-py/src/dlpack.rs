@@ -1,6 +1,6 @@
 //! Minimal, dependency-free DLPack C ABI and `__cuda_array_interface__` support for zero-copy GPU interop.
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_void};
 use std::ptr;
 
 /// DLPack device type (`kDLCUDA = 2`, `kDLCPU = 1`).
@@ -154,153 +154,278 @@ pub unsafe extern "C" fn pycapsule_dlpack_destructor(capsule: *mut pyo3::ffi::Py
     }
 }
 
+/// Canonical dtype mapping descriptor tying short name, aliases, DLPack descriptor, and NumPy typestr together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DtypeEntry {
+    /// Canonical short name (e.g. `"f32"`, `"u8"`).
+    pub canonical: &'static str,
+    /// Known aliases accepted by `parse_dtype` (e.g. `&["float32", "<f4"]`).
+    pub aliases: &'static [&'static str],
+    /// Corresponding DLPack data type descriptor.
+    pub dl_type: DLDataType,
+    /// NumPy `__cuda_array_interface__` typestr (e.g. `"<f4"`).
+    pub numpy_typestr: &'static str,
+    /// Size of one element in bytes.
+    pub itemsize: usize,
+}
+
+/// Authoritative mapping table for supported DLPack / CUDA buffer element data types.
+///
+/// Serves as the Single Source of Truth (SSOT) for both [`parse_dtype`] and [`format_dl_dtype`],
+/// guaranteeing zero drift between parsing and formatting.
+pub const DTYPE_TABLE: &[DtypeEntry] = &[
+    DtypeEntry {
+        canonical: "u8",
+        aliases: &["uint8", "|u1"],
+        dl_type: DLDataType {
+            code: 1,
+            bits: 8,
+            lanes: 1,
+        },
+        numpy_typestr: "|u1",
+        itemsize: 1,
+    },
+    DtypeEntry {
+        canonical: "i8",
+        aliases: &["int8", "|i1"],
+        dl_type: DLDataType {
+            code: 0,
+            bits: 8,
+            lanes: 1,
+        },
+        numpy_typestr: "|i1",
+        itemsize: 1,
+    },
+    DtypeEntry {
+        canonical: "u16",
+        aliases: &["uint16", "<u2"],
+        dl_type: DLDataType {
+            code: 1,
+            bits: 16,
+            lanes: 1,
+        },
+        numpy_typestr: "<u2",
+        itemsize: 2,
+    },
+    DtypeEntry {
+        canonical: "i16",
+        aliases: &["int16", "<i2"],
+        dl_type: DLDataType {
+            code: 0,
+            bits: 16,
+            lanes: 1,
+        },
+        numpy_typestr: "<i2",
+        itemsize: 2,
+    },
+    DtypeEntry {
+        canonical: "u32",
+        aliases: &["uint32", "<u4"],
+        dl_type: DLDataType {
+            code: 1,
+            bits: 32,
+            lanes: 1,
+        },
+        numpy_typestr: "<u4",
+        itemsize: 4,
+    },
+    DtypeEntry {
+        canonical: "i32",
+        aliases: &["int32", "<i4"],
+        dl_type: DLDataType {
+            code: 0,
+            bits: 32,
+            lanes: 1,
+        },
+        numpy_typestr: "<i4",
+        itemsize: 4,
+    },
+    DtypeEntry {
+        canonical: "u64",
+        aliases: &["uint64", "<u8"],
+        dl_type: DLDataType {
+            code: 1,
+            bits: 64,
+            lanes: 1,
+        },
+        numpy_typestr: "<u8",
+        itemsize: 8,
+    },
+    DtypeEntry {
+        canonical: "i64",
+        aliases: &["int64", "<i8"],
+        dl_type: DLDataType {
+            code: 0,
+            bits: 64,
+            lanes: 1,
+        },
+        numpy_typestr: "<i8",
+        itemsize: 8,
+    },
+    DtypeEntry {
+        canonical: "f16",
+        aliases: &["float16", "<f2"],
+        dl_type: DLDataType {
+            code: 2,
+            bits: 16,
+            lanes: 1,
+        },
+        numpy_typestr: "<f2",
+        itemsize: 2,
+    },
+    DtypeEntry {
+        canonical: "bf16",
+        aliases: &["bfloat16"],
+        dl_type: DLDataType {
+            code: 4,
+            bits: 16,
+            lanes: 1,
+        },
+        numpy_typestr: "<V2",
+        itemsize: 2,
+    },
+    DtypeEntry {
+        canonical: "f32",
+        aliases: &["float32", "<f4"],
+        dl_type: DLDataType {
+            code: 2,
+            bits: 32,
+            lanes: 1,
+        },
+        numpy_typestr: "<f4",
+        itemsize: 4,
+    },
+    DtypeEntry {
+        canonical: "f64",
+        aliases: &["float64", "<f8"],
+        dl_type: DLDataType {
+            code: 2,
+            bits: 64,
+            lanes: 1,
+        },
+        numpy_typestr: "<f8",
+        itemsize: 8,
+    },
+    DtypeEntry {
+        canonical: "bool",
+        aliases: &["|b1"],
+        dl_type: DLDataType {
+            code: 6,
+            bits: 8,
+            lanes: 1,
+        },
+        numpy_typestr: "|b1",
+        itemsize: 1,
+    },
+];
+
+/// Finds a [`DtypeEntry`] matching `dtype` by canonical name or alias (case-insensitive, trimmed).
+pub fn find_dtype_entry(dtype: &str) -> Option<&'static DtypeEntry> {
+    let norm = dtype.trim().to_ascii_lowercase();
+    DTYPE_TABLE
+        .iter()
+        .find(|entry| entry.canonical == norm || entry.aliases.iter().any(|&a| a == norm))
+}
+
+/// Finds a [`DtypeEntry`] matching a given [`DLDataType`].
+pub fn find_dtype_by_dl(dt: DLDataType) -> Option<&'static DtypeEntry> {
+    DTYPE_TABLE.iter().find(|entry| entry.dl_type == dt)
+}
+
 /// Maps short dtype string (`"u8"`, `"i32"`, `"f16"`, `"f32"`, `"f64"`, ...) to `(DLDataType, numpy typestr, itemsize)`.
 pub fn parse_dtype(dtype: &str) -> Result<(DLDataType, &'static str, usize), String> {
-    match dtype.trim().to_ascii_lowercase().as_str() {
-        "u8" | "uint8" | "|u1" => Ok((
-            DLDataType {
-                code: 1,
-                bits: 8,
-                lanes: 1,
-            },
-            "|u1",
-            1,
-        )),
-        "i8" | "int8" | "|i1" => Ok((
-            DLDataType {
-                code: 0,
-                bits: 8,
-                lanes: 1,
-            },
-            "|i1",
-            1,
-        )),
-        "u16" | "uint16" | "<u2" => Ok((
-            DLDataType {
-                code: 1,
-                bits: 16,
-                lanes: 1,
-            },
-            "<u2",
-            2,
-        )),
-        "i16" | "int16" | "<i2" => Ok((
-            DLDataType {
-                code: 0,
-                bits: 16,
-                lanes: 1,
-            },
-            "<i2",
-            2,
-        )),
-        "u32" | "uint32" | "<u4" => Ok((
-            DLDataType {
-                code: 1,
-                bits: 32,
-                lanes: 1,
-            },
-            "<u4",
-            4,
-        )),
-        "i32" | "int32" | "<i4" => Ok((
-            DLDataType {
-                code: 0,
-                bits: 32,
-                lanes: 1,
-            },
-            "<i4",
-            4,
-        )),
-        "u64" | "uint64" | "<u8" => Ok((
-            DLDataType {
-                code: 1,
-                bits: 64,
-                lanes: 1,
-            },
-            "<u8",
-            8,
-        )),
-        "i64" | "int64" | "<i8" => Ok((
-            DLDataType {
-                code: 0,
-                bits: 64,
-                lanes: 1,
-            },
-            "<i8",
-            8,
-        )),
-        "f16" | "float16" | "<f2" => Ok((
-            DLDataType {
-                code: 2,
-                bits: 16,
-                lanes: 1,
-            },
-            "<f2",
-            2,
-        )),
-        "bf16" | "bfloat16" => Ok((
-            DLDataType {
-                code: 4,
-                bits: 16,
-                lanes: 1,
-            },
-            "<V2",
-            2,
-        )),
-        "f32" | "float32" | "<f4" => Ok((
-            DLDataType {
-                code: 2,
-                bits: 32,
-                lanes: 1,
-            },
-            "<f4",
-            4,
-        )),
-        "f64" | "float64" | "<f8" => Ok((
-            DLDataType {
-                code: 2,
-                bits: 64,
-                lanes: 1,
-            },
-            "<f8",
-            8,
-        )),
-        "bool" | "|b1" => Ok((
-            DLDataType {
-                code: 6,
-                bits: 8,
-                lanes: 1,
-            },
-            "|b1",
-            1,
-        )),
-        other => Err(format!("unsupported dtype `{other}`")),
-    }
+    find_dtype_entry(dtype)
+        .map(|entry| (entry.dl_type, entry.numpy_typestr, entry.itemsize))
+        .ok_or_else(|| format!("unsupported dtype `{dtype}`"))
 }
 
 /// Formats a [`DLDataType`] back to our canonical short dtype name.
 pub fn format_dl_dtype(dt: DLDataType) -> Result<&'static str, String> {
-    match (dt.code, dt.bits, dt.lanes) {
-        (1, 8, 1) => Ok("u8"),
-        (0, 8, 1) => Ok("i8"),
-        (1, 16, 1) => Ok("u16"),
-        (0, 16, 1) => Ok("i16"),
-        (1, 32, 1) => Ok("u32"),
-        (0, 32, 1) => Ok("i32"),
-        (1, 64, 1) => Ok("u64"),
-        (0, 64, 1) => Ok("i64"),
-        (2, 16, 1) => Ok("f16"),
-        (4, 16, 1) => Ok("bf16"),
-        (2, 32, 1) => Ok("f32"),
-        (2, 64, 1) => Ok("f64"),
-        (6, 8, 1) => Ok("bool"),
-        _ => Err(format!(
-            "unsupported DLDataType(code={}, bits={}, lanes={})",
-            dt.code, dt.bits, dt.lanes
-        )),
-    }
+    find_dtype_by_dl(dt)
+        .map(|entry| entry.canonical)
+        .ok_or_else(|| {
+            format!(
+                "unsupported DLDataType(code={}, bits={}, lanes={})",
+                dt.code, dt.bits, dt.lanes
+            )
+        })
 }
 
-/// Extracts `c_int` value for `PyCapsule_SetName` check (unused helper alias).
-#[allow(dead_code)]
-pub type CapsuleStatus = c_int;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dtype_table_roundtrip_all_canonical_types() {
+        for entry in DTYPE_TABLE {
+            // Canonical name parses correctly
+            let (dl, typestr, itemsize) = parse_dtype(entry.canonical).unwrap();
+            assert_eq!(dl, entry.dl_type);
+            assert_eq!(typestr, entry.numpy_typestr);
+            assert_eq!(itemsize, entry.itemsize);
+
+            // DLDataType formats back to the exact canonical name
+            let canonical = format_dl_dtype(entry.dl_type).unwrap();
+            assert_eq!(canonical, entry.canonical);
+        }
+    }
+
+    #[test]
+    fn dtype_table_parses_all_aliases() {
+        for entry in DTYPE_TABLE {
+            for &alias in entry.aliases {
+                let (dl, typestr, itemsize) = parse_dtype(alias).unwrap();
+                assert_eq!(dl, entry.dl_type);
+                assert_eq!(typestr, entry.numpy_typestr);
+                assert_eq!(itemsize, entry.itemsize);
+            }
+        }
+    }
+
+    #[test]
+    fn dtype_table_handles_whitespace_and_case() {
+        let (dl1, _, _) = parse_dtype("  F32  ").unwrap();
+        assert_eq!(
+            dl1,
+            DLDataType {
+                code: 2,
+                bits: 32,
+                lanes: 1
+            }
+        );
+
+        let (dl2, _, _) = parse_dtype("Float32").unwrap();
+        assert_eq!(
+            dl2,
+            DLDataType {
+                code: 2,
+                bits: 32,
+                lanes: 1
+            }
+        );
+
+        let (dl3, _, _) = parse_dtype("UINT8").unwrap();
+        assert_eq!(
+            dl3,
+            DLDataType {
+                code: 1,
+                bits: 8,
+                lanes: 1
+            }
+        );
+    }
+
+    #[test]
+    fn dtype_table_rejects_unsupported() {
+        assert!(parse_dtype("complex64").is_err());
+        assert!(parse_dtype("unknown").is_err());
+        assert!(
+            format_dl_dtype(DLDataType {
+                code: 99,
+                bits: 32,
+                lanes: 1
+            })
+            .is_err()
+        );
+    }
+}

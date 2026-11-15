@@ -21,46 +21,9 @@ use optix::{DebugLevel, DeviceContext, Module, ModuleOptions, OptLevel, Pipeline
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::compute::{buf_ptr_and_bytes, validate_dev_buf};
 use crate::core::{PyContext, PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
-
-// ---------------------------------------------------------------------------
-// Shared buffer validation helpers
-// ---------------------------------------------------------------------------
-
-fn buf_ptr_and_bytes(buf: &Bound<'_, PyDeviceBuffer>) -> PyResult<(u64, usize)> {
-    let borrowed = buf.borrow();
-    let ptr = borrowed.raw_device_ptr();
-    let nbytes = borrowed.byte_len();
-    Ok((ptr, nbytes))
-}
-
-fn validate_dev_buf(
-    category: &str,
-    op: &str,
-    name: &str,
-    ptr: u64,
-    nbytes: usize,
-    min_bytes: usize,
-) -> PyResult<()> {
-    if nbytes < min_bytes {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} buffer too small: got {nbytes} bytes, need at least {min_bytes} bytes"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    if min_bytes > 0 && ptr == 0 {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} device pointer is null"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // nv_rs.optix
@@ -352,7 +315,7 @@ fn validate_packed_view<T>(
     size: Size,
     channels: u32,
 ) -> PyResult<(u64, i32, npp::sys::NppiSize)> {
-    let (ptr, nbytes) = buf_ptr_and_bytes(buf)?;
+    let (ptr, nbytes) = buf_ptr_and_bytes(buf);
     let elems = nbytes / size_of::<T>();
     let step = packed_step::<T>(size.width, channels)?;
     let step_i32 = npp::image::validate_image_layout::<T>(elems, size, channels, step)
@@ -1021,7 +984,7 @@ fn set_32f(
     dst: &Bound<'_, PyDeviceBuffer>,
 ) -> PyResult<()> {
     let t0 = Instant::now();
-    let (dst_ptr, dst_bytes) = buf_ptr_and_bytes(dst)?;
+    let (dst_ptr, dst_bytes) = buf_ptr_and_bytes(dst);
     let len = dst_bytes / size_of::<f32>();
     if len == 0 || dst_bytes % size_of::<f32>() != 0 {
         return Err(record_and_err(
@@ -1065,9 +1028,9 @@ fn add_32f(
     dst: &Bound<'_, PyDeviceBuffer>,
 ) -> PyResult<()> {
     let t0 = Instant::now();
-    let (p1, b1) = buf_ptr_and_bytes(src1)?;
-    let (p2, b2) = buf_ptr_and_bytes(src2)?;
-    let (pd, bd) = buf_ptr_and_bytes(dst)?;
+    let (p1, b1) = buf_ptr_and_bytes(src1);
+    let (p2, b2) = buf_ptr_and_bytes(src2);
+    let (pd, bd) = buf_ptr_and_bytes(dst);
     if b1 == 0 || b1 != b2 || b1 != bd || b1 % size_of::<f32>() != 0 {
         return Err(record_and_err(
             "npp",
@@ -1119,9 +1082,9 @@ fn mul_32f(
     dst: &Bound<'_, PyDeviceBuffer>,
 ) -> PyResult<()> {
     let t0 = Instant::now();
-    let (p1, b1) = buf_ptr_and_bytes(src1)?;
-    let (p2, b2) = buf_ptr_and_bytes(src2)?;
-    let (pd, bd) = buf_ptr_and_bytes(dst)?;
+    let (p1, b1) = buf_ptr_and_bytes(src1);
+    let (p2, b2) = buf_ptr_and_bytes(src2);
+    let (pd, bd) = buf_ptr_and_bytes(dst);
     if b1 == 0 || b1 != b2 || b1 != bd || b1 % size_of::<f32>() != 0 {
         return Err(record_and_err(
             "npp",
@@ -1202,9 +1165,9 @@ fn sum_32f(
     scratch: &Bound<'_, PyDeviceBuffer>,
 ) -> PyResult<()> {
     let t0 = Instant::now();
-    let (ps, bs) = buf_ptr_and_bytes(src)?;
-    let (po, bo) = buf_ptr_and_bytes(sum_out)?;
-    let (pw, bw) = buf_ptr_and_bytes(scratch)?;
+    let (ps, bs) = buf_ptr_and_bytes(src);
+    let (po, bo) = buf_ptr_and_bytes(sum_out);
+    let (pw, bw) = buf_ptr_and_bytes(scratch);
     if bs == 0 || bs % size_of::<f32>() != 0 {
         return Err(record_and_err(
             "npp",

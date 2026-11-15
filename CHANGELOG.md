@@ -28,6 +28,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - **`EncodeSession` `Sync` soundness** (`crates/nvenc/src/nvenc.rs`): Serialized all NVENC API calls and `Drop` paths touching the raw session handle behind an internal `Mutex<()>` (`lock_session()`), backing `unsafe impl Sync for EncodeSession`.
 - **Documentation & links**: Fixed GitHub Pages `/nv-rs` base-path links, added the documentation badge/link to `README.md`, and corrected the `nv_rs` submodule count (`25`).
 - **`nv-demo` runtime resize & PNG export error handling** (`crates/nv-demo/src/main.rs`): Replaced panic-on-OOM render-target reallocation and `save_front_png` CUDA context binding `unwrap()` calls with error propagation and status reporting.
+- **`cufft` workspace ownership, `ManyDesc`, & destructive C2R/Z2D mutability** (`crates/cufft/src/{plan.rs,scratch.rs}`, `crates/nv-demo/src/fft_bloom.rs`): Retained `Arc<ScratchInner>` in `Plan` with generation tracking and stream validation, fixed `ManyDesc::min_io_elems` for `None`-embed batching, and changed `exec_c2r` / `exec_z2d` to require `&mut DeviceBuffer` input.
+- **Sealed `DeviceSpan` / `DeviceSpanMut` traits** (`crates/cudnn/src/cudnn.rs`, `crates/nccl/src/nccl.rs`, `crates/cufile/src/cufile.rs`): Sealed unsafe device-span traits via private `mod sealed` with `compile_fail` doctests.
+- **`nv-py` DLPack & `__cuda_array_interface__` soundness** (`python/nv-py/src/{core.rs,dlpack.rs,compute.rs,gfx_img.rs,sparse_ai.rs}`): Eliminated post-deleter UAF with `DlManagedGuard`, centralized checked `validate_shape_and_bytes`, exported byte `strides` and `"stream"` in `__cuda_array_interface__`, honored consumer `stream` (including `-1`) in `__dlpack__`, and unified `DTYPE_TABLE` / `buf_ptr_and_bytes` helpers.
+- **`nv-loader` numeric DLL version ordering** (`crates/nv-loader/src/nv_loader.rs`): Replaced lexical reverse sort on wildcard DLL matches with numeric version component ordering (`12 > 11 > 9`).
+- **Prebuilt target/host isolation & tar link extraction** (`xtask/src/prebuilt.rs`, `bootstrap.py`): Prevented host artifacts from contaminating foreign-target prebuilt staging (with `CARGO_TARGET_DIR` support), and added safe two-pass symlink/hardlink extraction with traversal guards in `bootstrap.py`.
 
 ## [0.1.0] - Initial Workspace
 

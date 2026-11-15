@@ -229,7 +229,9 @@ mod tests {
         plan_fwd
             .exec_r2c(&stream, &real_dev, &mut spec_dev)
             .unwrap();
-        plan_inv.exec_c2r(&stream, &spec_dev, &mut rec_dev).unwrap();
+        plan_inv
+            .exec_c2r(&stream, &mut spec_dev, &mut rec_dev)
+            .unwrap();
         let rec_host = rec_dev.to_host_vec(&stream).unwrap();
         let scale = (nx * ny) as f32;
         for (orig, rec) in real_host.iter().zip(rec_host.iter()) {

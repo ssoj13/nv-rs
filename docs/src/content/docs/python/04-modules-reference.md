@@ -77,13 +77,15 @@ Core CUDA context, stream, and device buffer primitives.
 - `@staticmethod alloc(stream: core.Stream, shape: list[int], dtype: str = "u8") -> core.DeviceBuffer`
 - `@staticmethod from_buffer(stream: core.Stream, data: Any, shape: list[int] | None = None, dtype: str | None = None) -> core.DeviceBuffer`
 - `@staticmethod from_dlpack(obj: Any, stream: core.Stream | None = None) -> core.DeviceBuffer`
-- `__dlpack__(self, stream: int | None = None) -> Any`
+- `__dlpack__(self, stream: int | core.Stream | None = None) -> Any`
 - `__dlpack_device__(self) -> tuple[int, int]`
 - `@property __cuda_array_interface__(self) -> dict[str, Any]`
 - `to_bytes(self, stream: core.Stream) -> bytes`
 - `@property ptr(self) -> int`
 - `@property nbytes(self) -> int`
 - `@property shape(self) -> list[int]`
+- `@property strides(self) -> list[int]`
+- `@property is_contiguous(self) -> bool`
 - `@property dtype(self) -> str`
 - `@property device_id(self) -> int`
 

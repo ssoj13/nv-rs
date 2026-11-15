@@ -18,10 +18,13 @@ use std::sync::Arc;
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use nvenc::{
-    BufferFormat, Codec, EncodeInput, EncodeSession, EncodeFlags, OutputBitstream, Preset,
+    BufferFormat, Codec, EncodeFlags, EncodeInput, EncodeSession, OutputBitstream, Preset,
     RegisteredResource, SessionConfig, Tuning,
 };
-use nvjpeg::{ChromaSubsampling, EncoderParams, EncoderState, Handle as NvjpegHandle, ImagePlanes, InputFormat};
+use nvjpeg::{
+    ChromaSubsampling, EncoderParams, EncoderState, Handle as NvjpegHandle, ImagePlanes,
+    InputFormat,
+};
 
 const RGBA8_TO_RGB8_CU: &str = r#"
 extern "C" __global__ void rgba8_to_rgb8(
@@ -101,7 +104,12 @@ struct CudaKernel {
 }
 
 impl CudaKernel {
-    fn compile(cuda: &Arc<CudaContext>, src: &str, unit_name: &str, fn_name: &str) -> Result<Self, String> {
+    fn compile(
+        cuda: &Arc<CudaContext>,
+        src: &str,
+        unit_name: &str,
+        fn_name: &str,
+    ) -> Result<Self, String> {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed: {e}"))?;
 
@@ -124,7 +132,9 @@ impl CudaKernel {
         // SAFETY: `ptx` is a NUL-terminated PTX image and `cuda` is bound to the current thread.
         let load_res = unsafe { cu::cuModuleLoadData(&mut module, ptx.as_ptr().cast()) };
         if load_res != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("cuModuleLoadData failed for {unit_name}: {load_res:?}"));
+            return Err(format!(
+                "cuModuleLoadData failed for {unit_name}: {load_res:?}"
+            ));
         }
 
         let c_fn_name = CString::new(fn_name)
@@ -225,7 +235,9 @@ pub fn save_jpeg_from_rgba8(
         )
     };
     if launch_res != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("rgba8_to_rgb8 cuLaunchKernel failed: {launch_res:?}"));
+        return Err(format!(
+            "rgba8_to_rgb8 cuLaunchKernel failed: {launch_res:?}"
+        ));
     }
 
     let handle = NvjpegHandle::new(cuda).map_err(|e| format!("nvJPEG init failed: {e}"))?;
@@ -305,7 +317,8 @@ impl VideoRecorder {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed: {e}"))?;
 
-        let kernel = CudaKernel::compile(cuda, RGBA8_TO_NV12_CU, "rgba8_to_nv12.cu", "rgba8_to_nv12")?;
+        let kernel =
+            CudaKernel::compile(cuda, RGBA8_TO_NV12_CU, "rgba8_to_nv12.cu", "rgba8_to_nv12")?;
 
         let mut session = EncodeSession::open(cuda)
             .map_err(|e| format!("NVENC unavailable or session open failed: {e}"))?;
@@ -423,7 +436,9 @@ impl VideoRecorder {
             )
         };
         if launch_res != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("rgba8_to_nv12 cuLaunchKernel failed: {launch_res:?}"));
+            return Err(format!(
+                "rgba8_to_nv12 cuLaunchKernel failed: {launch_res:?}"
+            ));
         }
 
         stream

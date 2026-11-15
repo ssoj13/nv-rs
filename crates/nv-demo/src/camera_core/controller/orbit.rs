@@ -45,7 +45,8 @@ impl HoudiniOrbit {
     /// turntable cannot roll).
     pub fn from_pose(pose: CameraPose) -> Self {
         let projection = super::projection_from_pose(pose, PerspectiveSettings::default());
-        let distance = projection.clamp_distance(crate::camera_core::convention::DEFAULT_ORBIT_DISTANCE);
+        let distance =
+            projection.clamp_distance(crate::camera_core::convention::DEFAULT_ORBIT_DISTANCE);
         let target = pose.eye + pose.forward() * distance;
         let mut rig = OrbitRig::from_pose(OrbitPose::from_view(target, pose.orientation, distance));
         rig.projection = projection;

@@ -527,7 +527,11 @@ mod tests {
             ..InertiaSettings::default()
         });
         let vp = crate::camera_core::viewport::ViewportSize::new(1, 1);
-        ctrl.apply_intent(crate::camera_core::intent::CameraIntent::SpeedScale(4.0), 0.0, vp);
+        ctrl.apply_intent(
+            crate::camera_core::intent::CameraIntent::SpeedScale(4.0),
+            0.0,
+            vp,
+        );
 
         ctrl.set_mode(NavMode::SpaceSim);
         assert_eq!(ctrl.speed_scale(), 4.0, "the held speed scale survived");

@@ -499,16 +499,14 @@ macro_rules! exports_sys {
             use super::types::*;
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_api.rs"));
         }
-        // Shim bodies share one safety argument, documented once in nv-bindgen (`shims`);
-        // prettyplease drops comments, so the per-block SAFETY lint cannot be met here.
+        // Generated shim unsafe blocks carry `// SAFETY:` comments emitted by `nv-bindgen`.
         #[allow(
             non_camel_case_types,
             non_upper_case_globals,
             non_snake_case,
             missing_docs,
             unnecessary_transmutes,
-            clippy::all,
-            clippy::undocumented_unsafe_blocks
+            clippy::all
         )]
         mod shims {
             use super::types::*;
@@ -626,14 +624,13 @@ macro_rules! query_interface_sys {
         mod types {
             include!(concat!(env!("OUT_DIR"), "/", $lib, "_types.rs"));
         }
-        // Shim bodies share one safety argument, documented once in nv-bindgen (`query_shims`).
+        // Generated shim unsafe blocks carry `// SAFETY:` comments emitted by `nv-bindgen`.
         #[allow(
             non_camel_case_types,
             non_upper_case_globals,
             non_snake_case,
             missing_docs,
-            clippy::all,
-            clippy::undocumented_unsafe_blocks
+            clippy::all
         )]
         mod shims {
             use super::types::*;
@@ -705,9 +702,9 @@ macro_rules! split_exports_sys {
                     use super::super::types::*;
                     include!(concat!(env!("OUT_DIR"), "/", $lib, "_", stringify!($part), "_api.rs"));
                 }
-                // Shim bodies share one safety argument, documented once in nv-bindgen (`shims`).
+                // Generated shim unsafe blocks carry `// SAFETY:` comments emitted by `nv-bindgen`.
                 #[doc(hidden)]
-                #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all, clippy::undocumented_unsafe_blocks)]
+                #[allow(non_camel_case_types, non_upper_case_globals, non_snake_case, missing_docs, clippy::all)]
                 pub mod shims {
                     use super::$loader;
                     use super::super::types::*;

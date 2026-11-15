@@ -189,7 +189,11 @@ pub fn smart_snap_yaw_pitch(yaw: f32, pitch: f32) -> (f32, f32) {
 /// of its largest component with the yaw in quarter turns (`Axis`, so a top / bottom view is
 /// square to the world), the direction with its smallest component projected out (`Plane`,
 /// continuous within the plane), or the unified 2-plane / 15°-axis cone rule (`Smart`).
-pub fn snapped_yaw_pitch(yaw: f32, pitch: f32, mode: crate::camera_core::OrbitSnapMode) -> (f32, f32) {
+pub fn snapped_yaw_pitch(
+    yaw: f32,
+    pitch: f32,
+    mode: crate::camera_core::OrbitSnapMode,
+) -> (f32, f32) {
     use crate::camera_core::OrbitSnapMode;
     use std::f32::consts::FRAC_PI_2;
     let dir = orientation_from_yaw_pitch(yaw, pitch) * DEFAULT_OFFSET_AXIS;

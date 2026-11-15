@@ -146,7 +146,10 @@ pub(crate) fn dolly_zoom(
     if fov == fov_y {
         return None;
     }
-    Some((distance * crate::camera_core::lens::dolly_zoom_factor(fov_y, fov), fov))
+    Some((
+        distance * crate::camera_core::lens::dolly_zoom_factor(fov_y, fov),
+        fov,
+    ))
 }
 
 /// The FOVs (radians) a dolly-zoom of an orbit at `distance` / `fov_y` can reach: the one
@@ -231,8 +234,13 @@ fn frame_sphere(
 ) -> (Vec3, f32) {
     let (center, radius) = crate::camera_core::fit::aabb_center_radius(min, max);
     let aspect = width as f32 / height.max(1) as f32;
-    let distance =
-        crate::camera_core::fit::distance_to_frame_sphere(radius, aspect, projection.fov_y, margin, projection);
+    let distance = crate::camera_core::fit::distance_to_frame_sphere(
+        radius,
+        aspect,
+        projection.fov_y,
+        margin,
+        projection,
+    );
     (center, distance)
 }
 
@@ -317,7 +325,10 @@ mod tests {
             // Wide: the FOV range limits first (the distance stays above its minimum).
             ctrl.apply_intent(CameraIntent::DollyZoom { dfov: 10.0 }, DT, vp());
             let (_, d1, f1, _) = orbit_state(&ctrl);
-            assert!((f1 - crate::camera_core::lens::FOV_MAX).abs() < 1e-5, "{kind}: fov {f1}");
+            assert!(
+                (f1 - crate::camera_core::lens::FOV_MAX).abs() < 1e-5,
+                "{kind}: fov {f1}"
+            );
             let k1 = subject_half_height(d1, f1);
             assert!((k1 - k0).abs() <= 1e-5 * k0, "{kind}: wide {k0} -> {k1}");
 
@@ -428,7 +439,10 @@ mod tests {
         let fly = CameraController::Fps(FpsFly::default());
         assert_eq!(
             fly.fov_range(),
-            (crate::camera_core::lens::FOV_MIN, crate::camera_core::lens::FOV_MAX)
+            (
+                crate::camera_core::lens::FOV_MIN,
+                crate::camera_core::lens::FOV_MAX
+            )
         );
     }
 }

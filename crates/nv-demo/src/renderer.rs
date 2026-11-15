@@ -12,10 +12,10 @@ use bytemuck::{Pod, Zeroable};
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use optix::{
-    Aabb, Accel, AovType, BuildOptions, CustomPrimitives, Denoiser, DenoiserModel,
-    DenoiserOptions, DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, Layer,
-    LinkOptions, Module, ModuleOptions, Params as DenoiserParams, Pipeline, PipelineOptions,
-    ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
+    Aabb, Accel, AovType, BuildOptions, CustomPrimitives, Denoiser, DenoiserModel, DenoiserOptions,
+    DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, Layer, LinkOptions, Module,
+    ModuleOptions, Params as DenoiserParams, Pipeline, PipelineOptions, ProgramGroup, SbtRecord,
+    Scratch, ShaderBindingTable, TriangleMesh,
 };
 
 use crate::fft_bloom::FftBloomPass;
@@ -423,12 +423,11 @@ fn build_optix_pipeline(
     let (module, _) = Module::new(optix_ctx, &ModuleOptions::default(), &opts, rt_ptx)
         .map_err(|e| format!("Module::new: {e}"))?;
 
-    let raygen = ProgramGroup::raygen(&module, "__raygen__render")
-        .map_err(|e| format!("raygen: {e}"))?;
-    let miss = ProgramGroup::miss(&module, "__miss__miss")
-        .map_err(|e| format!("miss: {e}"))?;
-    let miss_shadow = ProgramGroup::miss(&module, "__miss__shadow")
-        .map_err(|e| format!("miss_shadow: {e}"))?;
+    let raygen =
+        ProgramGroup::raygen(&module, "__raygen__render").map_err(|e| format!("raygen: {e}"))?;
+    let miss = ProgramGroup::miss(&module, "__miss__miss").map_err(|e| format!("miss: {e}"))?;
+    let miss_shadow =
+        ProgramGroup::miss(&module, "__miss__shadow").map_err(|e| format!("miss_shadow: {e}"))?;
     let hit_floor = ProgramGroup::hit_group(
         optix_ctx,
         HitGroup {
@@ -602,9 +601,18 @@ fn build_ias(
         i2.id = 2;
         i2.sbt_offset = 0;
         i2.transform = [
-            r, 0.0, 0.0, state.sat_pos[0],
-            0.0, r, 0.0, state.sat_pos[1],
-            0.0, 0.0, r, state.sat_pos[2],
+            r,
+            0.0,
+            0.0,
+            state.sat_pos[0],
+            0.0,
+            r,
+            0.0,
+            state.sat_pos[1],
+            0.0,
+            0.0,
+            r,
+            state.sat_pos[2],
         ];
         instances.push(i2);
     }
@@ -613,15 +621,18 @@ fn build_ias(
         let mut i3 = Instance::new(gas.neon);
         i3.id = 3;
         i3.sbt_offset = 0;
-        i3.transform = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, -1.24,
-            0.0, 0.0, 1.0, 0.0,
-        ];
+        i3.transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.24, 0.0, 0.0, 1.0, 0.0];
         instances.push(i3);
     }
 
-    Accel::instances(optix_ctx, stream, scratch, &instances, BuildOptions::default()).expect("IAS")
+    Accel::instances(
+        optix_ctx,
+        stream,
+        scratch,
+        &instances,
+        BuildOptions::default(),
+    )
+    .expect("IAS")
 }
 
 fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
@@ -634,7 +645,11 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     let mut cu_mod: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `tm_ptx` is NUL-terminated PTX compiled by NVRTC on the current context.
     let res = unsafe { cu::cuModuleLoadData(&mut cu_mod, tm_ptx.as_ptr().cast()) };
-    assert_eq!(res, cu::cudaError_enum_CUDA_SUCCESS, "cuModuleLoadData failed");
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleLoadData failed"
+    );
     let mut cu_func: cu::CUfunction = std::ptr::null_mut();
     let fn_name = CString::new("tonemap_f32_to_rgba8").unwrap();
     // SAFETY: `cu_mod` is valid and `fn_name` is NUL-terminated.
@@ -649,7 +664,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         func: cu_func,
     };
 
-    let (pipeline, sbt) = build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
+    let (pipeline, sbt) =
+        build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
     let floor_verts = DeviceBuffer::from_host(
@@ -724,7 +740,11 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     )
     .expect("neon GAS");
 
-    let sat_pos = [initial_settings.sat_orbit_radius, initial_settings.sat_height, 0.0];
+    let sat_pos = [
+        initial_settings.sat_orbit_radius,
+        initial_settings.sat_height,
+        0.0,
+    ];
     let ias = build_ias(
         &optix_ctx,
         &stream,
@@ -801,7 +821,8 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     rig.prev_denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("prev_denoised_f32 resize");
     rig.motion_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("motion_f32 resize");
     rig.depth_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("depth_f32 resize");
-    let (denoiser, is_temporal) = create_denoiser(&rig._optix_ctx, &rig.stream, width, height, temporal);
+    let (denoiser, is_temporal) =
+        create_denoiser(&rig._optix_ctx, &rig.stream, width, height, temporal);
     rig.denoiser = denoiser;
     rig.denoiser_is_temporal = is_temporal;
     rig.temporal_has_prev = false;
@@ -820,7 +841,8 @@ pub fn spawn_render_thread(
     let handle = thread::Builder::new()
         .name("optix-render".to_string())
         .spawn(move || {
-            cuda.bind_to_thread().expect("cuda bind_to_thread on render thread");
+            cuda.bind_to_thread()
+                .expect("cuda bind_to_thread on render thread");
             let mut rig = init_optix(&cuda, &initial_settings);
             let mut cur_w = DEFAULT_W;
             let mut cur_h = DEFAULT_H;
@@ -837,7 +859,12 @@ pub fn spawn_render_thread(
             let mut last_ias_state = (
                 settings.sat_on,
                 settings.neon_on,
-                [settings.sat_orbit_radius, settings.sat_height, 0.0, settings.sat_radius],
+                [
+                    settings.sat_orbit_radius,
+                    settings.sat_height,
+                    0.0,
+                    settings.sat_radius,
+                ],
             );
             let mut last_tick = Instant::now();
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
@@ -1100,7 +1127,12 @@ pub fn spawn_render_thread(
                         ],
                         [settings.box_fixed_r, 0.0, settings.box_iter as f32, 0.0],
                         [0.0; 4],
-                        [settings.box_fold_mult, settings.box_iter_rot.to_radians(), 0.0, 0.0],
+                        [
+                            settings.box_fold_mult,
+                            settings.box_iter_rot.to_radians(),
+                            0.0,
+                            0.0,
+                        ],
                     ),
                     2 => (
                         [settings.kifs_scale, settings.kifs_bailout, 0.0, 0.0],
@@ -1156,7 +1188,12 @@ pub fn spawn_render_thread(
                     height: cur_h,
                     frame_index,
                     spp: settings.spp,
-                    cam_pos: [camera.eye[0], camera.eye[1], camera.eye[2], settings.aperture],
+                    cam_pos: [
+                        camera.eye[0],
+                        camera.eye[1],
+                        camera.eye[2],
+                        settings.aperture,
+                    ],
                     cam_forward: [camera.fwd[0], camera.fwd[1], camera.fwd[2], 0.0],
                     cam_right: [
                         camera.right[0],
@@ -1164,7 +1201,12 @@ pub fn spawn_render_thread(
                         camera.right[2],
                         settings.focus_dist,
                     ],
-                    cam_up: [camera.up[0], camera.up[1], camera.up[2], camera.tan_half_fov],
+                    cam_up: [
+                        camera.up[0],
+                        camera.up[1],
+                        camera.up[2],
+                        camera.tan_half_fov,
+                    ],
                     sun_dir: [sun_x, sun_y, sun_z, settings.roughness],
                     fractal_p0,
                     fractal_p1,
@@ -1203,7 +1245,12 @@ pub fn spawn_render_thread(
                     _pad0: [0; 3],
                     out_motion_f32: rig.motion_f32.cu_deviceptr(),
                     out_depth_f32: rig.depth_f32.cu_deviceptr(),
-                    prev_cam_pos: [prev_camera.eye[0], prev_camera.eye[1], prev_camera.eye[2], 0.0],
+                    prev_cam_pos: [
+                        prev_camera.eye[0],
+                        prev_camera.eye[1],
+                        prev_camera.eye[2],
+                        0.0,
+                    ],
                     prev_cam_forward: [
                         prev_camera.fwd[0],
                         prev_camera.fwd[1],
@@ -1226,7 +1273,11 @@ pub fn spawn_render_thread(
                         sat_xyz[0],
                         sat_xyz[1],
                         sat_xyz[2],
-                        if settings.sat_on { settings.sat_radius } else { 0.0 },
+                        if settings.sat_on {
+                            settings.sat_radius
+                        } else {
+                            0.0
+                        },
                     ],
                     glass_params: [
                         settings.glass_ior,
@@ -1245,18 +1296,15 @@ pub fn spawn_render_thread(
                 let t_rt = Instant::now();
                 // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive `synchronize`.
                 unsafe {
-                    rig.pipeline.launch(
-                        &rig.stream,
-                        &rig.params_buf,
-                        &rig.sbt,
-                        [cur_w, cur_h, 1],
-                    )
+                    rig.pipeline
+                        .launch(&rig.stream, &rig.params_buf, &rig.sbt, [cur_w, cur_h, 1])
                 }
                 .expect("optix launch");
                 rig.stream.synchronize().expect("rt sync");
                 let rt_ms = t_rt.elapsed().as_secs_f32() * 1000.0;
 
-                let (final_f32_ptr, denoise_ms) = if settings.denoiser_on && settings.aov_mode == 0 {
+                let (final_f32_ptr, denoise_ms) = if settings.denoiser_on && settings.aov_mode == 0
+                {
                     let t_den = Instant::now();
                     let flow_img = if rig.denoiser_is_temporal {
                         Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
@@ -1287,8 +1335,12 @@ pub fn spawn_render_thread(
                     };
                     // SAFETY: all denoiser input/output/guide images outlive `synchronize`.
                     unsafe {
-                        rig.denoiser
-                            .invoke(&rig.stream, &guides, &[layer], DenoiserParams::default())
+                        rig.denoiser.invoke(
+                            &rig.stream,
+                            &guides,
+                            &[layer],
+                            DenoiserParams::default(),
+                        )
                     }
                     .expect("denoiser invoke");
                     if rig.denoiser_is_temporal {

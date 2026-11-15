@@ -1007,11 +1007,35 @@ pub fn query_shims(
         syn::parse2(quote!(#(#fns)*)).map_err(|e| gen_err(format!("shims: {e}")))?;
     bound.sort();
     unshimmed.sort();
+    let source = document_unsafe_blocks(
+        &prettyplease::unparse(&parsed),
+        "the header declares this exact id's signature and the query's library remains loaded for the process; the caller upholds the native call contract.",
+    );
     Ok(QueryShims {
-        source: prettyplease::unparse(&parsed),
+        source,
         bound,
         unshimmed,
     })
+}
+
+/// Re-attaches `// SAFETY:` comments above every `unsafe {` block after `prettyplease::unparse`,
+/// which strips comments from `quote!` tokens.
+fn document_unsafe_blocks(src: &str, safety_comment: &str) -> String {
+    let mut out = String::with_capacity(
+        src.len() + src.matches("unsafe {").count() * (safety_comment.len() + 16),
+    );
+    for line in src.lines() {
+        if line.contains("unsafe {") {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(indent);
+            out.push_str("// SAFETY: ");
+            out.push_str(safety_comment);
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Escapes regex metacharacters in a file name (`.` in `nppcore.h`).
@@ -1276,10 +1300,11 @@ pub fn shims(
     let tokens = quote!(#(#fns)*);
     let parsed: syn::File = syn::parse2(tokens).map_err(|e| gen_err(format!("shims: {e}")))?;
     unshimmed.sort();
-    Ok(Shims {
-        source: prettyplease::unparse(&parsed),
-        unshimmed,
-    })
+    let source = document_unsafe_blocks(
+        &prettyplease::unparse(&parsed),
+        "the caller upholds the native contract and the pointer's library remains loaded for the process.",
+    );
+    Ok(Shims { source, unshimmed })
 }
 
 /// Sorted entry-point names: the function-pointer fields of `struct_name` in `source` (bindgen's
@@ -2260,5 +2285,20 @@ pub type signedErr = ::std::os::raw::c_int;\n";
         assert!(copy_prebuilt_bindings(&FAKE, &prebuilt, &out).is_err());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn generated_shims_document_every_unsafe_block() {
+        let sample = "fn a() {\n    let x = unsafe { foo() };\n    Ok(unsafe { bar() })\n}\n";
+        let documented = document_unsafe_blocks(sample, "test invariant.");
+        let lines: Vec<&str> = documented.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("unsafe {") {
+                assert!(
+                    i > 0 && lines[i - 1].trim_start().starts_with("// SAFETY:"),
+                    "missing SAFETY comment before line {i}: {line}"
+                );
+            }
+        }
     }
 }

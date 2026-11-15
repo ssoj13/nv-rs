@@ -28,7 +28,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem::zeroed;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Raw `NVENCSTATUS` code wrapped as a `Copy` integer newtype so newer driver codes stay valid.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -514,13 +514,13 @@ pub struct EncodeSession {
     cuda: Arc<Context>,
     list: &'static sys::NV_ENCODE_API_FUNCTION_LIST,
     initialized: bool,
+    lock: Mutex<()>,
 }
 
-// SAFETY: NVENC session calls are synchronized by the caller / driver per session, and the CUDA
-// context handle is thread-safe.
+// SAFETY: Transferring ownership of `EncodeSession` between threads is safe because NVENC
+// session calls are serialized and the `Arc<Context>` / static function table are `Send + Sync`.
 unsafe impl Send for EncodeSession {}
-// SAFETY: see `Send` above — shared references are safe when callers serialize encode submissions
-// or rely on driver-level session locking.
+// SAFETY: Every NVENC API call using `self.raw` is serialized by `self.lock`.
 unsafe impl Sync for EncodeSession {}
 
 impl EncodeSession {
@@ -560,7 +560,12 @@ impl EncodeSession {
             cuda: cuda.clone(),
             list,
             initialized: false,
+            lock: Mutex::new(()),
         }))
+    }
+
+    fn lock_session(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Returns the owning CUDA context.
@@ -576,6 +581,7 @@ impl EncodeSession {
         param.version = VER_CAPS_PARAM;
         param.capsToQuery = cap;
         let mut val = 0i32;
+        let _guard = self.lock_session();
         // SAFETY: `self.raw` is a live encoder session; `param` and `val` are valid pointers.
         let status = unsafe { get_caps(self.raw, codec.guid(), &mut param, &mut val) };
         check("nvEncGetEncodeCaps", status, Some(self.raw), self.list)?;
@@ -594,6 +600,7 @@ impl EncodeSession {
         let mut out: sys::NV_ENC_PRESET_CONFIG = unsafe { zeroed() };
         out.version = VER_PRESET_CONFIG;
         out.presetCfg.version = VER_CONFIG;
+        let _guard = self.lock_session();
         // SAFETY: `self.raw` is a live session and `out` is properly versioned.
         let status = unsafe {
             get_preset(
@@ -651,9 +658,12 @@ impl EncodeSession {
             raw_cfg.version = VER_CONFIG;
             params.encodeConfig = (&raw mut *raw_cfg).cast();
         }
-        // SAFETY: `this.raw` is a live session and `params` (plus optional `custom_cfg`) outlives the call.
-        let status = unsafe { init_fn(this.raw, &mut params) };
-        check("nvEncInitializeEncoder", status, Some(this.raw), this.list)?;
+        {
+            let _guard = this.lock_session();
+            // SAFETY: `this.raw` is a live session and `params` (plus optional `custom_cfg`) outlives the call.
+            let status = unsafe { init_fn(this.raw, &mut params) };
+            check("nvEncInitializeEncoder", status, Some(this.raw), this.list)?;
+        }
         this.initialized = true;
         Ok(())
     }
@@ -663,6 +673,7 @@ impl EncodeSession {
         let set_streams = entry!(self.list, nvEncSetIOCudaStreams);
         let mut in_stream = input.cu_stream().cast::<c_void>();
         let mut out_stream = output.cu_stream().cast::<c_void>();
+        let _guard = self.lock_session();
         // SAFETY: `self.raw` is a live session and both `CUstream` handles are valid.
         let status = unsafe {
             set_streams(
@@ -733,6 +744,7 @@ impl EncodeSession {
         pic.bufferFmt = format.to_sys();
         pic.pictureStruct = sys::_NV_ENC_PIC_STRUCT_NV_ENC_PIC_STRUCT_FRAME;
         pic.pictureType = sys::_NV_ENC_PIC_TYPE_NV_ENC_PIC_TYPE_UNKNOWN;
+        let _guard = self.lock_session();
         // SAFETY: `self.raw` is initialized and `input_ptr`/`output` belong to this session.
         let status = unsafe { encode_fn(self.raw, &mut pic) };
         check("nvEncEncodePicture", status, Some(self.raw), self.list)
@@ -748,6 +760,7 @@ impl EncodeSession {
         let mut pic: sys::NV_ENC_PIC_PARAMS = unsafe { zeroed() };
         pic.version = VER_PIC_PARAMS;
         pic.encodePicFlags = pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_EOS);
+        let _guard = self.lock_session();
         // SAFETY: `self.raw` is initialized; EOS requires no input/output buffers.
         let status = unsafe { encode_fn(self.raw, &mut pic) };
         check("nvEncEncodePicture(EOS)", status, Some(self.raw), self.list)
@@ -764,6 +777,7 @@ impl Drop for EncodeSession {
             return;
         }
         if let Some(destroy_fn) = self.list.nvEncDestroyEncoder {
+            let _guard = self.lock_session();
             // SAFETY: `self.raw` is owned by this `EncodeSession` and no child handles remain (they hold `Arc<EncodeSession>`).
             let status = unsafe { destroy_fn(self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -802,6 +816,7 @@ impl InputBuffer {
         params.width = width;
         params.height = height;
         params.bufferFmt = format.to_sys();
+        let _guard = session.lock_session();
         // SAFETY: `session.raw` is a live encoder session.
         let status = unsafe { create_fn(session.raw, &mut params) };
         check(
@@ -826,14 +841,17 @@ impl InputBuffer {
         let mut params: sys::NV_ENC_LOCK_INPUT_BUFFER = unsafe { zeroed() };
         params.version = VER_LOCK_INPUT_BUFFER;
         params.inputBuffer = self.raw;
-        // SAFETY: `self.raw` is a live input buffer owned by `self.session`.
-        let status = unsafe { lock_fn(self.session.raw, &mut params) };
-        check(
-            "nvEncLockInputBuffer",
-            status,
-            Some(self.session.raw),
-            self.session.list,
-        )?;
+        {
+            let _guard = self.session.lock_session();
+            // SAFETY: `self.raw` is a live input buffer owned by `self.session`.
+            let status = unsafe { lock_fn(self.session.raw, &mut params) };
+            check(
+                "nvEncLockInputBuffer",
+                status,
+                Some(self.session.raw),
+                self.session.list,
+            )?;
+        }
         Ok(InputLock {
             buf: self,
             ptr: params.bufferDataPtr.cast::<u8>(),
@@ -865,6 +883,7 @@ impl InputBuffer {
 impl Drop for InputBuffer {
     fn drop(&mut self) {
         if let Some(destroy_fn) = self.session.list.nvEncDestroyInputBuffer {
+            let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was created by `nvEncCreateInputBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -917,6 +936,7 @@ impl InputLock<'_> {
 impl Drop for InputLock<'_> {
     fn drop(&mut self) {
         if let Some(unlock_fn) = self.buf.session.list.nvEncUnlockInputBuffer {
+            let _guard = self.buf.session.lock_session();
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -969,6 +989,7 @@ impl RegisteredResource {
         params.resourceToRegister = device_ptr as *mut c_void;
         params.bufferFormat = format.to_sys();
         params.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
+        let _guard = session.lock_session();
         // SAFETY: `session.raw` is live and `device_ptr` is valid per caller contract.
         let status = unsafe { reg_fn(session.raw, &mut params) };
         check(
@@ -1015,6 +1036,7 @@ impl RegisteredResource {
         params.resourceToRegister = array.cast::<c_void>();
         params.bufferFormat = format.to_sys();
         params.bufferUsage = sys::_NV_ENC_BUFFER_USAGE_NV_ENC_INPUT_IMAGE;
+        let _guard = session.lock_session();
         // SAFETY: `session.raw` is live and `array` is valid per caller contract.
         let status = unsafe { reg_fn(session.raw, &mut params) };
         check(
@@ -1040,14 +1062,17 @@ impl RegisteredResource {
         let mut params: sys::NV_ENC_MAP_INPUT_RESOURCE = unsafe { zeroed() };
         params.version = VER_MAP_INPUT_RESOURCE;
         params.registeredResource = self.raw;
-        // SAFETY: `self.raw` is a live registered resource on `self.session`.
-        let status = unsafe { map_fn(self.session.raw, &mut params) };
-        check(
-            "nvEncMapInputResource",
-            status,
-            Some(self.session.raw),
-            self.session.list,
-        )?;
+        {
+            let _guard = self.session.lock_session();
+            // SAFETY: `self.raw` is a live registered resource on `self.session`.
+            let status = unsafe { map_fn(self.session.raw, &mut params) };
+            check(
+                "nvEncMapInputResource",
+                status,
+                Some(self.session.raw),
+                self.session.list,
+            )?;
+        }
         Ok(MappedResource {
             res: self,
             mapped: params.mappedResource,
@@ -1078,6 +1103,7 @@ impl RegisteredResource {
 impl Drop for RegisteredResource {
     fn drop(&mut self) {
         if let Some(unreg_fn) = self.session.list.nvEncUnregisterResource {
+            let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was registered on `self.session` and all `MappedResource` guards have dropped.
             let status = unsafe { unreg_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -1105,6 +1131,7 @@ impl MappedResource<'_> {
 impl Drop for MappedResource<'_> {
     fn drop(&mut self) {
         if let Some(unmap_fn) = self.res.session.list.nvEncUnmapInputResource {
+            let _guard = self.res.session.lock_session();
             // SAFETY: `self.mapped` was returned by `nvEncMapInputResource`.
             let status = unsafe { unmap_fn(self.res.session.raw, self.mapped) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -1129,6 +1156,7 @@ impl OutputBitstream {
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_CREATE_BITSTREAM_BUFFER`.
         let mut params: sys::NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { zeroed() };
         params.version = VER_CREATE_BITSTREAM_BUFFER;
+        let _guard = session.lock_session();
         // SAFETY: `session.raw` is a live encoder session.
         let status = unsafe { create_fn(session.raw, &mut params) };
         check(
@@ -1150,26 +1178,30 @@ impl OutputBitstream {
         let mut params: sys::NV_ENC_LOCK_BITSTREAM = unsafe { zeroed() };
         params.version = VER_LOCK_BITSTREAM;
         params.outputBitstream = self.raw;
-        // SAFETY: `self.raw` is a live bitstream buffer owned by `self.session`.
-        let status = unsafe { lock_fn(self.session.raw, &mut params) };
-        check(
-            "nvEncLockBitstream",
-            status,
-            Some(self.session.raw),
-            self.session.list,
-        )?;
-        let size_bytes = params.bitstreamSizeInBytes as usize;
-        let ptr = params.bitstreamBufferPtr.cast::<u8>();
-        if size_bytes > 0 && ptr.is_null() {
-            // Unlock before returning error so the buffer doesn't stay locked.
-            if let Some(unlock_fn) = self.session.list.nvEncUnlockBitstream {
-                // SAFETY: `self.raw` was just locked.
-                let _ = unsafe { unlock_fn(self.session.raw, self.raw) };
+        let (size_bytes, ptr) = {
+            let _guard = self.session.lock_session();
+            // SAFETY: `self.raw` is a live bitstream buffer owned by `self.session`.
+            let status = unsafe { lock_fn(self.session.raw, &mut params) };
+            check(
+                "nvEncLockBitstream",
+                status,
+                Some(self.session.raw),
+                self.session.list,
+            )?;
+            let size_bytes = params.bitstreamSizeInBytes as usize;
+            let ptr = params.bitstreamBufferPtr.cast::<u8>();
+            if size_bytes > 0 && ptr.is_null() {
+                // Unlock before returning error so the buffer doesn't stay locked.
+                if let Some(unlock_fn) = self.session.list.nvEncUnlockBitstream {
+                    // SAFETY: `self.raw` was just locked.
+                    let _ = unsafe { unlock_fn(self.session.raw, self.raw) };
+                }
+                return Err(Error::Invalid(
+                    "locked bitstream pointer is null for non-empty payload",
+                ));
             }
-            return Err(Error::Invalid(
-                "locked bitstream pointer is null for non-empty payload",
-            ));
-        }
+            (size_bytes, ptr)
+        };
         let info = PacketInfo {
             frame_idx: params.frameIdx,
             timestamp: params.outputTimeStamp,
@@ -1191,6 +1223,7 @@ impl OutputBitstream {
 impl Drop for OutputBitstream {
     fn drop(&mut self) {
         if let Some(destroy_fn) = self.session.list.nvEncDestroyBitstreamBuffer {
+            let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was created by `nvEncCreateBitstreamBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
@@ -1231,6 +1264,7 @@ impl BitstreamLock<'_> {
 impl Drop for BitstreamLock<'_> {
     fn drop(&mut self) {
         if let Some(unlock_fn) = self.buf.session.list.nvEncUnlockBitstream {
+            let _guard = self.buf.session.lock_session();
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
             if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {

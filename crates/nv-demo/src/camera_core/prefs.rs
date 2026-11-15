@@ -249,7 +249,10 @@ impl NavPrefs {
         let default_fov = PerspectiveSettings::default().fov_y;
         let fov_y = finite_in(
             fov_y,
-            (crate::camera_core::lens::ANGLE_MIN_RAD, crate::camera_core::lens::ANGLE_MAX_RAD),
+            (
+                crate::camera_core::lens::ANGLE_MIN_RAD,
+                crate::camera_core::lens::ANGLE_MAX_RAD,
+            ),
             default_fov,
         );
         let height = if viewport_height.is_finite() {

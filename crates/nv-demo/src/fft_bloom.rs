@@ -304,12 +304,20 @@ impl FftBloomPass {
                 batch: 3,
             };
 
-            let r2c_plan =
-                Plan::plan_many(&self.cuda, &r2c_desc, FFT_SCRATCH_BUDGET_BYTES, &mut self.scratch)
-                    .map_err(|e| format!("cufft R2C plan_many failed: {e}"))?;
-            let c2r_plan =
-                Plan::plan_many(&self.cuda, &c2r_desc, FFT_SCRATCH_BUDGET_BYTES, &mut self.scratch)
-                    .map_err(|e| format!("cufft C2R plan_many failed: {e}"))?;
+            let r2c_plan = Plan::plan_many(
+                &self.cuda,
+                &r2c_desc,
+                FFT_SCRATCH_BUDGET_BYTES,
+                &mut self.scratch,
+            )
+            .map_err(|e| format!("cufft R2C plan_many failed: {e}"))?;
+            let c2r_plan = Plan::plan_many(
+                &self.cuda,
+                &c2r_desc,
+                FFT_SCRATCH_BUDGET_BYTES,
+                &mut self.scratch,
+            )
+            .map_err(|e| format!("cufft C2R plan_many failed: {e}"))?;
             let psf_plan = Plan::plan_2d(
                 &self.cuda,
                 ny,

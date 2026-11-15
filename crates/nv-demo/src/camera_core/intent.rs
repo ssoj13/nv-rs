@@ -193,7 +193,11 @@ impl CameraIntent {
     /// `Pan` / `PanInertia` `(x, y) -> (x cos + y sin, y cos - x sin)` and `ZoomAtCursor`'s
     /// cursor rotated the same way about the centre of `viewport`. Everything else, and a zero
     /// or non-finite roll, is returned unchanged (bit-identical).
-    pub fn unrolled(self, view_roll: f32, viewport: crate::camera_core::viewport::ViewportSize) -> Self {
+    pub fn unrolled(
+        self,
+        view_roll: f32,
+        viewport: crate::camera_core::viewport::ViewportSize,
+    ) -> Self {
         if view_roll == 0.0 || !view_roll.is_finite() {
             return self;
         }

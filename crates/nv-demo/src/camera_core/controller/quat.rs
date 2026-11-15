@@ -65,7 +65,8 @@ impl QuatOrbit {
     /// range.
     pub fn from_pose(pose: CameraPose) -> Self {
         let projection = super::projection_from_pose(pose, PerspectiveSettings::default());
-        let distance = projection.clamp_distance(crate::camera_core::convention::DEFAULT_ORBIT_DISTANCE);
+        let distance =
+            projection.clamp_distance(crate::camera_core::convention::DEFAULT_ORBIT_DISTANCE);
         let target = pose.eye + pose.forward() * distance;
         Self {
             target,

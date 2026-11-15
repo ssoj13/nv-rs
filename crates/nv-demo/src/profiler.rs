@@ -148,7 +148,14 @@ impl FrameTimings {
 
     /// Records one frame's pass timings and FPS without allocating.
     #[inline]
-    pub fn record(&mut self, rt_ms: f32, denoise_ms: f32, bloom_ms: f32, tonemap_ms: f32, fps: f32) {
+    pub fn record(
+        &mut self,
+        rt_ms: f32,
+        denoise_ms: f32,
+        bloom_ms: f32,
+        tonemap_ms: f32,
+        fps: f32,
+    ) {
         self.rt_ms.push(rt_ms);
         self.denoise_ms.push(denoise_ms);
         self.bloom_ms.push(bloom_ms);
@@ -249,7 +256,10 @@ pub fn probe_ngx_status() -> (bool, String) {
             "NGX SDK env present, not linked (enable --features ngx)".to_string(),
         )
     } else {
-        (false, "NGX SDK not linked (enable --features ngx)".to_string())
+        (
+            false,
+            "NGX SDK not linked (enable --features ngx)".to_string(),
+        )
     }
 }
 

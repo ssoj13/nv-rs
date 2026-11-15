@@ -32,8 +32,8 @@ mod demo_app {
     };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
-        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd,
-        align_render_size, spawn_render_thread,
+        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd, align_render_size,
+        spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, default_dock_state, dock_style, install_fonts};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
@@ -619,9 +619,8 @@ mod demo_app {
             .bind_to_thread()
             .expect("cuda bind_to_thread for save_png");
         // SAFETY: `dev_ptr` points to a `SharedBuffer` of `byte_len` bytes on the active context.
-        let res = unsafe {
-            cuda_bindings::cuMemcpyDtoH_v2(host.as_mut_ptr().cast(), dev_ptr, byte_len)
-        };
+        let res =
+            unsafe { cuda_bindings::cuMemcpyDtoH_v2(host.as_mut_ptr().cast(), dev_ptr, byte_len) };
         if res != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
             return format!("CUDA readback failed ({res:?})");
         }
@@ -667,7 +666,11 @@ mod demo_app {
         use crate::camera_core::input::{Button, DragBinding, DragRole, Mods};
         let drags = &mut driver.bindings_mut().drags;
         drags.retain(|b| !(b.button == Button::Secondary && b.mods == Mods::NONE));
-        drags.push(DragBinding::new(Button::Secondary, Mods::NONE, DragRole::Fly));
+        drags.push(DragBinding::new(
+            Button::Secondary,
+            Mods::NONE,
+            DragRole::Fly,
+        ));
     }
 
     fn pollster_block<F: std::future::Future>(fut: F) -> F::Output {

@@ -403,8 +403,12 @@ impl SpaceFlight {
             }
             step
         };
-        self.orientation =
-            crate::camera_core::dynamics::rotate_view(self.orientation, step.x, step.y, self.lock_up());
+        self.orientation = crate::camera_core::dynamics::rotate_view(
+            self.orientation,
+            step.x,
+            step.y,
+            self.lock_up(),
+        );
         self.look_stage1 != Vec2::ZERO || self.look_pending != Vec2::ZERO
     }
 
@@ -433,8 +437,12 @@ impl SpaceFlight {
         // After the alignment: it stops the look and roll motion before they are stepped.
         let turn = self.look.step(dt);
         if turn != Vec2::ZERO {
-            self.orientation =
-                crate::camera_core::dynamics::rotate_view(self.orientation, turn.x, turn.y, self.lock_up());
+            self.orientation = crate::camera_core::dynamics::rotate_view(
+                self.orientation,
+                turn.x,
+                turn.y,
+                self.lock_up(),
+            );
         }
         let spin = if self.align.is_none() {
             self.roll.step(

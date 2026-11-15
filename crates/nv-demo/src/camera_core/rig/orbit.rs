@@ -536,7 +536,8 @@ impl OrbitRig {
         };
         *yaw += yaw_delta;
         *pitch = crate::camera_core::num::clamp(*pitch + pitch_delta, -FRAC_PI_2, FRAC_PI_2);
-        let (target_yaw, target_pitch) = crate::camera_core::orientation::snapped_yaw_pitch(*yaw, *pitch, mode);
+        let (target_yaw, target_pitch) =
+            crate::camera_core::orientation::snapped_yaw_pitch(*yaw, *pitch, mode);
         let snapped = orientation_from_yaw_pitch(target_yaw, target_pitch);
         if mode == OrbitSnapMode::Smart && self.align_seconds > MIN_ALIGN_SECONDS {
             // `TransitionState::step` decays the remaining way as `exp(-speed * dt)`, so a time
@@ -1213,7 +1214,10 @@ mod tests {
         assert!(rig.is_animating());
         let mut rig = OrbitRig::from_yaw_pitch(0.4, 0.2, 10.0, Vec3::ZERO);
         rig.orbit_inertia(2.0, 0.5);
-        rig.animate_to_view(crate::camera_core::ViewTarget::face(crate::camera_core::Face::Top, crate::camera_core::UpAxis::Y));
+        rig.animate_to_view(crate::camera_core::ViewTarget::face(
+            crate::camera_core::Face::Top,
+            crate::camera_core::UpAxis::Y,
+        ));
         assert!(!rig.has_inertia() && rig.is_animating());
     }
 
@@ -1465,7 +1469,10 @@ mod tests {
         for pitch in [FRAC_PI_2, -FRAC_PI_2, 0.3] {
             for yaw in [0.0_f32, 0.7, -2.4] {
                 let orbit = OrbitPose::from_yaw_pitch(yaw, pitch, 5.0, target);
-                let cam = crate::camera_core::CameraPose::from_orbit(&orbit, PerspectiveSettings::default());
+                let cam = crate::camera_core::CameraPose::from_orbit(
+                    &orbit,
+                    PerspectiveSettings::default(),
+                );
                 let back = OrbitPose::from_view(target, cam.orientation, 5.0);
                 let (y, p) = yaw_pitch_from_orientation(back.orientation);
                 assert!(

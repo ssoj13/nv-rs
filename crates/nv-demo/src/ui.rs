@@ -129,16 +129,14 @@ impl UiContext<'_> {
     fn ui_viewport(&mut self, ui: &mut Ui) {
         let avail = ui.available_size();
         let ppp = ui.ctx().pixels_per_point();
-        *self.desired_vp_size = (
-            (avail.x * ppp).max(256.0),
-            (avail.y * ppp).max(144.0),
-        );
+        *self.desired_vp_size = ((avail.x * ppp).max(256.0), (avail.y * ppp).max(144.0));
         let aspect = self.render_w as f32 / self.render_h as f32;
         let w = avail.x.min(avail.y * aspect).max(64.0);
         let h = (w / aspect).max(64.0);
         let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
         let img_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(w, h));
-        ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(12, 13, 16));
         ui.painter().image(
             self.display_tex_id,
             img_rect,
@@ -168,8 +166,11 @@ impl UiContext<'_> {
                 egui::pos2(sx, img_rect.center().y),
                 egui::vec2(10.0, 26.0),
             );
-            ui.painter()
-                .rect_filled(knob, 4.0, Color32::from_rgba_unmultiplied(235, 240, 245, 220));
+            ui.painter().rect_filled(
+                knob,
+                4.0,
+                Color32::from_rgba_unmultiplied(235, 240, 245, 220),
+            );
         }
 
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
@@ -275,7 +276,10 @@ impl UiContext<'_> {
         section_header(ui, ic::SPARKLE, "Presets");
         equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
-                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb")).clicked() {
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb"))
+                    .clicked()
+                {
                     s.fractal_kind = 0;
                     s.bulb_power = 8.0;
                     s.bulb_julia = false;
@@ -287,7 +291,10 @@ impl UiContext<'_> {
                 }
             }
             1 => {
-                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box")).clicked() {
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box"))
+                    .clicked()
+                {
                     s.fractal_kind = 1;
                     s.box_scale = -2.0;
                     s.box_fold = 1.0;
@@ -299,7 +306,10 @@ impl UiContext<'_> {
                 }
             }
             2 => {
-                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS")).clicked() {
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS"))
+                    .clicked()
+                {
                     s.fractal_kind = 2;
                     s.kifs_scale = 2.0;
                     s.kifs_rot1 = 18.0;
@@ -312,7 +322,10 @@ impl UiContext<'_> {
                 }
             }
             _ => {
-                if ui.add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral")).clicked() {
+                if ui
+                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral"))
+                    .clicked()
+                {
                     s.fractal_kind = 0;
                     s.bulb_power = 7.0;
                     s.bulb_julia = true;
@@ -333,7 +346,10 @@ impl UiContext<'_> {
                 _ => (2u32, "KIFS Octa"),
             };
             if ui
-                .add_sized([w, ROW_H + 2.0], egui::Button::selectable(s.fractal_kind == kind, label))
+                .add_sized(
+                    [w, ROW_H + 2.0],
+                    egui::Button::selectable(s.fractal_kind == kind, label),
+                )
                 .clicked()
             {
                 s.fractal_kind = kind;
@@ -346,10 +362,31 @@ impl UiContext<'_> {
                 prop_slider_f32(ui, "Power", &mut s.bulb_power, 2.0..=16.0, 2, false);
                 prop_slider_f32(ui, "Bailout", &mut s.bulb_bailout, 2.0..=32.0, 1, false);
                 prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
-                prop_slider_f32(ui, "Theta Mult", &mut s.bulb_theta_mult, 0.25..=2.5, 2, false);
+                prop_slider_f32(
+                    ui,
+                    "Theta Mult",
+                    &mut s.bulb_theta_mult,
+                    0.25..=2.5,
+                    2,
+                    false,
+                );
                 prop_slider_f32(ui, "Phi Mult", &mut s.bulb_phi_mult, 0.25..=2.5, 2, false);
-                prop_slider_f32(ui, "Theta Ph", &mut s.bulb_theta_phase, -90.0..=90.0, 1, false);
-                prop_slider_f32(ui, "Phi Ph", &mut s.bulb_phi_phase, -180.0..=180.0, 1, false);
+                prop_slider_f32(
+                    ui,
+                    "Theta Ph",
+                    &mut s.bulb_theta_phase,
+                    -90.0..=90.0,
+                    1,
+                    false,
+                );
+                prop_slider_f32(
+                    ui,
+                    "Phi Ph",
+                    &mut s.bulb_phi_phase,
+                    -180.0..=180.0,
+                    1,
+                    false,
+                );
                 prop_toggle(ui, "Julia Mode", &mut s.bulb_julia, "Enable Julia C");
                 if s.bulb_julia {
                     prop_vec3(ui, "Julia C", &mut s.bulb_c, -1.5..=1.5, 0.01);
@@ -370,7 +407,14 @@ impl UiContext<'_> {
                 prop_slider_f32(ui, "Rot Y", &mut s.kifs_rot1, -180.0..=180.0, 1, false);
                 prop_slider_f32(ui, "Rot X", &mut s.kifs_rot2, -180.0..=180.0, 1, false);
                 prop_vec3(ui, "Offset", &mut s.kifs_offset, 0.1..=2.0, 0.01);
-                prop_slider_f32(ui, "Thickness", &mut s.kifs_thickness, 0.005..=0.25, 3, false);
+                prop_slider_f32(
+                    ui,
+                    "Thickness",
+                    &mut s.kifs_thickness,
+                    0.005..=0.25,
+                    3,
+                    false,
+                );
                 prop_slider_f32(ui, "Z Bias", &mut s.kifs_z_bias, 0.0..=1.5, 2, false);
                 prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
                 prop_slider_f32(ui, "Bailout", &mut s.kifs_bailout, 4.0..=32.0, 1, false);
@@ -386,7 +430,14 @@ impl UiContext<'_> {
 
         ui.add_space(6.0);
         section_header(ui, ic::SLIDERS_HORIZONTAL, "Detail & Shading");
-        prop_slider_f32(ui, "Detail Eps", &mut s.detail_eps, 0.00005..=0.005, 5, true);
+        prop_slider_f32(
+            ui,
+            "Detail Eps",
+            &mut s.detail_eps,
+            0.00005..=0.005,
+            5,
+            true,
+        );
         prop_slider_f32(ui, "Normal Eps", &mut s.norm_eps, 0.00005..=0.005, 5, true);
         prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=320, false);
         prop_slider_f32(ui, "Fudge", &mut s.fudge, 0.3..=1.1, 2, false);
@@ -402,7 +453,14 @@ impl UiContext<'_> {
 
         section_header(ui, ic::SUN, "Sky & Lighting");
         prop_slider_f32(ui, "Sun Power", &mut s.sun_intensity, 0.0..=4.0, 2, false);
-        prop_slider_f32(ui, "Sun Azimuth", &mut s.sun_azimuth, -180.0..=180.0, 1, false);
+        prop_slider_f32(
+            ui,
+            "Sun Azimuth",
+            &mut s.sun_azimuth,
+            -180.0..=180.0,
+            1,
+            false,
+        );
         prop_slider_f32(ui, "Sun Elev", &mut s.sun_elevation, 2.0..=88.0, 1, false);
         prop_slider_f32(ui, "Sky Power", &mut s.sky_intensity, 0.1..=2.0, 2, false);
         prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
@@ -415,7 +473,14 @@ impl UiContext<'_> {
 
         ui.add_space(6.0);
         section_header(ui, ic::SQUARES_FOUR, "Scratched Metal Floor");
-        prop_slider_f32(ui, "Roughness", &mut s.floor_roughness, 0.03..=0.80, 2, false);
+        prop_slider_f32(
+            ui,
+            "Roughness",
+            &mut s.floor_roughness,
+            0.03..=0.80,
+            2,
+            false,
+        );
         prop_slider_f32(ui, "Scratches", &mut s.floor_scratch, 0.0..=1.5, 2, false);
         prop_slider_f32(ui, "Tile Scale", &mut s.floor_scale, 0.3..=5.0, 2, false);
         prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
@@ -488,7 +553,10 @@ impl UiContext<'_> {
                 (4u32, "Motion"),
             ] {
                 if ui
-                    .add_sized([w, ROW_H], egui::Button::selectable(s.aov_mode == mode, lbl))
+                    .add_sized(
+                        [w, ROW_H],
+                        egui::Button::selectable(s.aov_mode == mode, lbl),
+                    )
                     .clicked()
                 {
                     s.aov_mode = mode;
@@ -502,10 +570,16 @@ impl UiContext<'_> {
         ui.add_space(4.0);
         equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
-                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.shadows_on, "Shadows"));
+                ui.add_sized(
+                    [w, ROW_H],
+                    egui::Checkbox::new(&mut s.shadows_on, "Shadows"),
+                );
             }
             1 => {
-                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"));
+                ui.add_sized(
+                    [w, ROW_H],
+                    egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
+                );
             }
             2 => {
                 ui.add_sized(
@@ -635,8 +709,12 @@ impl UiContext<'_> {
                 });
         });
 
-        if (*self.cam_mode, *self.cam_fly_mode, *self.cam_scheme, *self.cam_feel)
-            != (prev_m, prev_fly, prev_s, prev_f)
+        if (
+            *self.cam_mode,
+            *self.cam_fly_mode,
+            *self.cam_scheme,
+            *self.cam_feel,
+        ) != (prev_m, prev_fly, prev_s, prev_f)
         {
             self.cam_driver.controller_mut().set_mode(*self.cam_mode);
             let mut prefs = *self.cam_driver.prefs();
@@ -650,7 +728,10 @@ impl UiContext<'_> {
         equal_grid(ui, 2, 2, |ui, idx, w| match idx {
             0 => {
                 if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new(format!("{}  Home", ic::HOUSE)))
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(format!("{}  Home", ic::HOUSE)),
+                    )
                     .clicked()
                 {
                     self.cam_driver.controller_mut().set_pose(self.cam_home);
@@ -725,7 +806,10 @@ impl UiContext<'_> {
         stat_row(
             ui,
             "Temp / Load",
-            &format!("{} C / {} %", self.telemetry.temp_c, self.telemetry.util_gpu),
+            &format!(
+                "{} C / {} %",
+                self.telemetry.temp_c, self.telemetry.util_gpu
+            ),
         );
         stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
         stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
@@ -773,7 +857,12 @@ fn section_header(ui: &mut Ui, icon: &str, title: &str) {
     ui.add_space(2.0);
 }
 
-fn equal_grid(ui: &mut Ui, cols: usize, count: usize, mut item_ui: impl FnMut(&mut Ui, usize, f32)) {
+fn equal_grid(
+    ui: &mut Ui,
+    cols: usize,
+    count: usize,
+    mut item_ui: impl FnMut(&mut Ui, usize, f32),
+) {
     let gap = 4.0;
     let total_w = ui.available_width();
     let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(24.0);
@@ -846,13 +935,7 @@ fn prop_slider_f32(
     });
 }
 
-fn prop_slider_u32(
-    ui: &mut Ui,
-    label: &str,
-    val: &mut u32,
-    range: RangeInclusive<u32>,
-    log: bool,
-) {
+fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
     prop_row(ui, label, |ui| {
         let gap = 6.0;
         let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
@@ -870,13 +953,7 @@ fn prop_slider_u32(
     });
 }
 
-fn prop_vec3(
-    ui: &mut Ui,
-    label: &str,
-    v: &mut [f32; 3],
-    range: RangeInclusive<f32>,
-    speed: f32,
-) {
+fn prop_vec3(ui: &mut Ui, label: &str, v: &mut [f32; 3], range: RangeInclusive<f32>, speed: f32) {
     prop_row(ui, label, |ui| {
         let w = ((ui.available_width() - 8.0) / 3.0).max(32.0);
         for item in v.iter_mut() {
@@ -946,12 +1023,7 @@ fn sparkline_row(
             format!("{:.1} {unit}", ring.latest())
         };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(txt)
-                    .monospace()
-                    .size(11.0)
-                    .color(color),
-            );
+            ui.label(RichText::new(txt).monospace().size(11.0).color(color));
         });
     });
 }

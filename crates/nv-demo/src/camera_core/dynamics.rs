@@ -38,7 +38,8 @@ pub fn rotate_view(orientation: Quat, dyaw: f32, dpitch: f32, lock_up: Option<Ve
             // A STEP rule, not a clamp of the result: a view already past the limit is never
             // pulled back to it (no jump on the next tiny input); it may only move toward it.
             Some(up) => {
-                let elevation = crate::camera_core::num::clamp((o * -Vec3::Z).dot(up), -1.0, 1.0).asin();
+                let elevation =
+                    crate::camera_core::num::clamp((o * -Vec3::Z).dot(up), -1.0, 1.0).asin();
                 crate::camera_core::num::clamp(
                     elevation + dpitch,
                     elevation.min(-LOCK_POLE_LIMIT),

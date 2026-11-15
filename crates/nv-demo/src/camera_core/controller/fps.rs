@@ -231,7 +231,8 @@ impl FpsFly {
                 if Vec3::new(f.x, 0.0, f.z).length() > HEADING_MIN {
                     self.yaw = (-f.x).atan2(-f.z);
                 }
-                self.pitch = Self::clamp_pitch(crate::camera_core::num::clamp(f.y, -1.0, 1.0).asin());
+                self.pitch =
+                    Self::clamp_pitch(crate::camera_core::num::clamp(f.y, -1.0, 1.0).asin());
                 self.linear.stop();
                 self.look.stop();
             }

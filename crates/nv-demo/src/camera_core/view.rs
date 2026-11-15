@@ -512,8 +512,9 @@ mod tests {
     fn orbit_from_an_exact_pole_never_jumps() {
         let pivot = Vec3::ZERO;
         // Elevation of the camera side (a dot a hair past 1 would be a NaN asin).
-        let elev =
-            |p: &CameraPose| crate::camera_core::num::clamp((-p.forward()).dot(Vec3::Y), -1.0, 1.0).asin();
+        let elev = |p: &CameraPose| {
+            crate::camera_core::num::clamp((-p.forward()).dot(Vec3::Y), -1.0, 1.0).asin()
+        };
         let mut p = pose_looking(Vec3::NEG_Y, Vec3::NEG_Z);
         let lim = crate::camera_core::DEFAULT_PITCH_LIMIT;
         orbit_about(&mut p, pivot, UpAxis::Y, 0.0, -0.1, lim);

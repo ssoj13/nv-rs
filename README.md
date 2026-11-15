@@ -2,6 +2,8 @@
 
 *A driver panic is the mind-killer; check the `Result`, verify the SDK, and let the rays pass through.*
 
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://ssoj13.github.io/nv-rs/) — **<https://ssoj13.github.io/nv-rs/>**
+
 `nv-rs` is a multi-crate Rust workspace (and Python package `nv_rs`) providing unified, safe,
 and runtime-resilient access to the NVIDIA library stack — CUDA Toolkit libraries, OptiX,
 display/management APIs, video, compression, DLSS/NGX, CUDA ↔ `wgpu` zero-copy interop, Rust

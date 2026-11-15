@@ -64,7 +64,7 @@ Every library in `nv-rs` follows the same two-phase lifecycle:
 
 ### 2. Run Time: `nv-loader` (No Surprise Panics)
 
-- Instead of forcing the OS dynamic linker to resolve every vendor DLL/SO when your executable starts, `*-sys` crates load libraries on demand through [`nv-loader`](/core/nv-loader/).
+- Instead of forcing the OS dynamic linker to resolve every vendor DLL/SO when your executable starts, `*-sys` crates load libraries on demand through [`nv-loader`](/nv-rs/core/nv-loader/).
 - If a DLL or `.so` is missing on the user's machine (for example, `nvenc` on a headless node without video drivers, or `nvapi` on a non-NVIDIA GPU), you get a clean, typed `Err` you can handle gracefully — never an unhandled startup crash or panic.
 - **Intentional exception:** `ngx-sys` (DLSS / NGX) is statically linked against the NGX SDK library where required by the NGX integration model, while still exposing safe DLSS-SR / DLSS-RR wrappers.
 
@@ -76,10 +76,10 @@ You never have to swallow the whole workspace at once. Pick the layer that match
 
 | Layer | Purpose | Crates |
 |---|---|---|
-| **0. Core Engine** | Shared runtime loader & declarative `bindgen` pipeline | [`nv-loader`](/core/nv-loader/), [`nv-bindgen`](/core/nv-bindgen/), `nv-bindgen-fixture` |
+| **0. Core Engine** | Shared runtime loader & declarative `bindgen` pipeline | [`nv-loader`](/nv-rs/core/nv-loader/), [`nv-bindgen`](/nv-rs/core/nv-bindgen/), `nv-bindgen-fixture` |
 | **1. Raw FFI (`*-sys`)** | Generated C-ABI types, shims, and `nv-loader` dispatch tables | `cublas-sys`, `cudnn-sys`, `optix-sys`, `nvenc-sys`, `nvml-sys`, etc. |
-| **2. Safe Wrappers** | Idiomatic Rust types, RAII lifetimes, and typed errors | [Math](/crates/math/), [Graphics & Video](/crates/graphics-video/), [AI, Storage & Mgmt](/crates/ai-storage-mgmt/) |
-| **3. Interop & Device** | Zero-copy CUDA <-> `wgpu`, `cuda-core` extensions, Rust GPU kernels | [`cuda-core-ext`](/interop/cuda-core-ext/), [`nv-wgpu`](/interop/nv-wgpu/), [`device/*`](/interop/device-code/) |
+| **2. Safe Wrappers** | Idiomatic Rust types, RAII lifetimes, and typed errors | [Math](/nv-rs/crates/math/), [Graphics & Video](/nv-rs/crates/graphics-video/), [AI, Storage & Mgmt](/nv-rs/crates/ai-storage-mgmt/) |
+| **3. Interop & Device** | Zero-copy CUDA <-> `wgpu`, `cuda-core` extensions, Rust GPU kernels | [`cuda-core-ext`](/nv-rs/interop/cuda-core-ext/), [`nv-wgpu`](/nv-rs/interop/nv-wgpu/), [`device/*`](/nv-rs/interop/device-code/) |
 | **4. Tooling** | SDK provisioning, coverage tracking, and prebuilt staging | `bootstrap.py`, `xtask` (`coverage`, `prebuilt`) |
 
 ---
@@ -100,10 +100,10 @@ OS-specific libraries are scoped to their native platforms (for example, `nvapi`
 ## Choose Your Starting Path
 
 - **New to `nv-rs` and want to build locally?**
-  Start with [SDK Setup](/getting-started/sdk-setup/) to inspect what is already on your machine (`python bootstrap.py d s`) and pull public SDKs into `.sdk/`.
+  Start with [SDK Setup](/nv-rs/getting-started/sdk-setup/) to inspect what is already on your machine (`python bootstrap.py d s`) and pull public SDKs into `.sdk/`.
 - **Building in CI or without local SDK headers?**
-  Jump straight to [Prebuilt Bindings](/getting-started/prebuilt-bindings/) (`NV_RS_USE_PREBUILT=1`).
+  Jump straight to [Prebuilt Bindings](/nv-rs/getting-started/prebuilt-bindings/) (`NV_RS_USE_PREBUILT=1`).
 - **Looking for a specific NVIDIA library?**
-  Browse the domain guides under **Crates**: [Linear Algebra & Math](/crates/math/), [Imaging, Video & Graphics](/crates/graphics-video/), or [AI, Storage, Comms & Management](/crates/ai-storage-mgmt/).
+  Browse the domain guides under **Crates**: [Linear Algebra & Math](/nv-rs/crates/math/), [Imaging, Video & Graphics](/nv-rs/crates/graphics-video/), or [AI, Storage, Comms & Management](/nv-rs/crates/ai-storage-mgmt/).
 - **Contributing or adding a new `*-sys` + wrapper crate?**
-  Read [Core Infrastructure](/core/nv-loader/) and [Building & Testing](/contributing/building-testing/).
+  Read [Core Infrastructure](/nv-rs/core/nv-loader/) and [Building & Testing](/nv-rs/contributing/building-testing/).

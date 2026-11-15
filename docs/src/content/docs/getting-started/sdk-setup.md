@@ -73,4 +73,4 @@ python bootstrap.py b            # workspace build (--release by default; -d for
 python bootstrap.py b -p nv-demo # build the full-stack nv-demo showcase
 ```
 
-If a build host lacks SDK headers or `libclang`, see [Prebuilt Bindings](/getting-started/prebuilt-bindings/).
+If a build host lacks SDK headers or `libclang`, see [Prebuilt Bindings](/nv-rs/getting-started/prebuilt-bindings/).

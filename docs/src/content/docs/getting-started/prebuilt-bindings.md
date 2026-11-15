@@ -61,4 +61,4 @@ Optional flags:
 cargo xtask prebuilt --target x86_64-unknown-linux-gnu --out dist
 ```
 
-For SDK installation instructions on machines that do generate bindings from headers, see [SDK Setup](/getting-started/sdk-setup/).
+For SDK installation instructions on machines that do generate bindings from headers, see [SDK Setup](/nv-rs/getting-started/sdk-setup/).

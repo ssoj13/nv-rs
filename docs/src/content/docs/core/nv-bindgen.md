@@ -42,7 +42,7 @@ For `Exports`, `SplitExports`, and `QueryInterface`, `ReturnPolicy` defines the 
 1. If `NV_RS_USE_PREBUILT=1` (or `true`), `generate` copies pre-generated bindings directly into `$OUT_DIR`.
 2. Otherwise, if SDK discovery fails with `Error::SdkNotFound` or `Error::MissingLinkDirectory` (for non-`StaticLink` crates), or if header lookup/`bindgen`/`libclang` fails or panics, `generate` falls back to prebuilt bindings if matching files exist for `TARGET` under `NV_RS_PREBUILT_DIR` or `<CARGO_MANIFEST_DIR>/prebuilt/<TARGET>/`.
 
-See [Prebuilt Bindings](/getting-started/prebuilt-bindings/) for staging and artifact details.
+See [Prebuilt Bindings](/nv-rs/getting-started/prebuilt-bindings/) for staging and artifact details.
 
 ## `nv-bindgen-fixture`
 

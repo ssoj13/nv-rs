@@ -17,6 +17,8 @@ struct Params {
     float fractal_p0[4];  // [power/scale, bailout, fold_limit/julia_mode, min_radius]
     float fractal_p1[4];  // [fixed_radius/rot1, rot2, max_iter, 0]
     float fractal_p2[4];  // [c.x, c.y, c.z, 0] (julia_c or kifs offset)
+    float fractal_p3[4];  // formula-specific extra coefficients
+    float fractal_xform[4]; // [obj_scale, rot_x_rad, rot_y_rad, rot_z_rad]
     float fractal_r0[4];  // [detail_eps, fudge, normal_eps, march_steps]
     float fractal_r1[4];  // [metallic, trap_scale, palette_shift, sun_intensity]
     float time;
@@ -88,6 +90,11 @@ static __forceinline__ __device__ float3 rot_x(float3 p, float a) {
     float s = sinf(a);
     return make_float3(p.x, c * p.y - s * p.z, s * p.y + c * p.z);
 }
+static __forceinline__ __device__ float3 rot_z(float3 p, float a) {
+    float c = cosf(a);
+    float s = sinf(a);
+    return make_float3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
+}
 
 static __forceinline__ __device__ float2 sdf_mandelbulb(float3 q) {
     float power = params.fractal_p0[0];
@@ -95,6 +102,10 @@ static __forceinline__ __device__ float2 sdf_mandelbulb(float3 q) {
     bool julia = params.fractal_p0[2] > 0.5f;
     int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
     float3 c_add = julia ? make_f3(params.fractal_p2) : q;
+    float theta_mult = params.fractal_p3[0];
+    float phi_mult = params.fractal_p3[1];
+    float theta_phase = params.fractal_p3[2];
+    float phi_phase = params.fractal_p3[3];
 
     float3 z = q;
     float dr = 1.0f;
@@ -103,8 +114,8 @@ static __forceinline__ __device__ float2 sdf_mandelbulb(float3 q) {
     for (int i = 0; i < 28; ++i) {
         if (i >= max_iter || r > bailout) break;
         if (r < 1e-6f) return make_float2(0.0f, trap);
-        float theta = acosf(fmaxf(-1.0f, fminf(1.0f, z.z / r)));
-        float phi = atan2f(z.y, z.x);
+        float theta = acosf(fmaxf(-1.0f, fminf(1.0f, z.z / r))) * theta_mult + theta_phase;
+        float phi = atan2f(z.y, z.x) * phi_mult + phi_phase;
         dr = powf(r, power - 1.0f) * power * dr + 1.0f;
         float zr = powf(r, power);
         theta *= power;
@@ -124,6 +135,8 @@ static __forceinline__ __device__ float2 sdf_mandelbox(float3 q) {
     float min_r = fmaxf(0.05f, params.fractal_p0[3]);
     float fixed_r = fmaxf(min_r + 0.05f, params.fractal_p1[0]);
     int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
+    float fold_mult = params.fractal_p3[0];
+    float iter_rot = params.fractal_p3[1];
     float min_r2 = min_r * min_r;
     float fixed_r2 = fixed_r * fixed_r;
 
@@ -132,10 +145,13 @@ static __forceinline__ __device__ float2 sdf_mandelbox(float3 q) {
     float trap = 1e6f;
     for (int i = 0; i < 28; ++i) {
         if (i >= max_iter) break;
+        if (fabsf(iter_rot) > 1e-5f) {
+            z = rot_y(z, iter_rot);
+        }
         // Box fold
-        z.x = fmaxf(-fold, fminf(fold, z.x)) * 2.0f - z.x;
-        z.y = fmaxf(-fold, fminf(fold, z.y)) * 2.0f - z.y;
-        z.z = fmaxf(-fold, fminf(fold, z.z)) * 2.0f - z.z;
+        z.x = fmaxf(-fold, fminf(fold, z.x)) * fold_mult - z.x;
+        z.y = fmaxf(-fold, fminf(fold, z.y)) * fold_mult - z.y;
+        z.z = fmaxf(-fold, fminf(fold, z.z)) * fold_mult - z.z;
         // Sphere fold
         float r2 = f3_dot(z, z);
         if (r2 < min_r2) {
@@ -162,6 +178,8 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
     float a2 = params.fractal_p1[1];
     int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
     float3 off = make_f3(params.fractal_p2);
+    float thickness = fmaxf(0.005f, params.fractal_p3[0]);
+    float z_bias = params.fractal_p3[1];
 
     float3 z = q;
     float s = 1.0f;
@@ -179,7 +197,7 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
         z.x = z.x * sc - off.x * (sc - 1.0f);
         z.y = z.y * sc - off.y * (sc - 1.0f);
         z.z = z.z * sc;
-        if (z.z > 0.5f * off.z * (sc - 1.0f)) {
+        if (z.z > z_bias * off.z * (sc - 1.0f)) {
             z.z -= off.z * (sc - 1.0f);
         }
         s *= sc;
@@ -187,17 +205,23 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
         trap = fminf(trap, r2);
         if (r2 > bailout2) break;
     }
-    return make_float2((f3_len(z) - 0.1f) / s, sqrtf(fmaxf(trap, 0.0f)));
+    return make_float2((f3_len(z) - thickness) / s, sqrtf(fmaxf(trap, 0.0f)));
 }
 
 static __forceinline__ __device__ float2 eval_fractal(float3 p) {
+    float obj_scale = fmaxf(0.15f, params.fractal_xform[0]);
+    float3 q = rot_z(rot_y(rot_x(p, params.fractal_xform[1]), params.fractal_xform[2]), params.fractal_xform[3]);
+    q = f3_mul(q, 1.0f / obj_scale);
+    float2 res;
     if (params.fractal_kind == 1u) {
-        float2 r = sdf_mandelbox(f3_mul(p, 2.2f));
-        return make_float2(r.x * (1.0f / 2.2f), r.y);
+        float2 r = sdf_mandelbox(f3_mul(q, 2.2f));
+        res = make_float2(r.x * (1.0f / 2.2f), r.y);
     } else if (params.fractal_kind == 2u) {
-        return sdf_kifs_octahedron(p);
+        res = sdf_kifs_octahedron(q);
+    } else {
+        res = sdf_mandelbulb(q);
     }
-    return sdf_mandelbulb(p);
+    return make_float2(res.x * obj_scale, res.y);
 }
 
 static __forceinline__ __device__ float3 fractal_normal(float3 p, float eps) {
@@ -465,7 +489,6 @@ extern "C" __global__ void __raygen__render() {
 
                 rough = fmaxf(0.03f, fminf(0.88f, f_rough + 0.18f * (1.0f - patina) + 0.22f * groove));
                 metallic = fmaxf(0.0f, fminf(1.0f, f_metal * (1.0f - groove * 0.25f)));
-                horizon_fade = fmaxf(0.0f, fminf(1.0f, (hit_t - 28.0f) / 110.0f));
             } else {
                 // Fractal custom primitive uses orbit-trap base_col from p5
                 metallic = params.fractal_r1[0];

@@ -149,7 +149,52 @@ impl UiContext<'_> {
 
         *self.viewport_focused = resp.hovered() || resp.dragged();
         let df = crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0);
-        *self.cam_pose = df.pose;
+
+        let kb_free = !ui.ctx().egui_wants_keyboard_input();
+        let rmb_down = ui.input(|i| i.pointer.secondary_down());
+        let f_pressed = kb_free && *self.viewport_focused && ui.input(|i| i.key_pressed(egui::Key::F));
+        let a_pressed = kb_free
+            && *self.viewport_focused
+            && !rmb_down
+            && ui.input(|i| i.key_pressed(egui::Key::A));
+
+        if df.requests.frame_selected || f_pressed {
+            let cur = self.cam_driver.controller().pose();
+            let dist = cur.eye.length().max(0.25);
+            let fwd = if cur.eye.length_squared() > 1e-6 {
+                -cur.eye.normalize()
+            } else {
+                -glam::Vec3::Z
+            };
+            let aimed = CameraPose::from_eye_forward_up(
+                cur.eye,
+                fwd,
+                glam::Vec3::Y,
+                cur.fov_y,
+                cur.znear,
+                cur.zfar,
+            );
+            self.cam_driver.controller_mut().set_pose(aimed);
+            self.cam_driver.controller_mut().set_orbit_distance(dist);
+            *self.cam_pose = self.cam_driver.controller().pose();
+        } else if a_pressed {
+            let ext = 1.35 * self.settings.obj_scale.max(0.25);
+            self.cam_driver.controller_mut().apply_intent(
+                CameraIntent::FrameBounds {
+                    min: glam::Vec3::splat(-ext),
+                    max: glam::Vec3::splat(ext),
+                    margin: 1.2,
+                },
+                1.0 / 60.0,
+                ViewportSize::new(self.render_w, self.render_h),
+            );
+            *self.cam_pose = self.cam_driver.controller().pose();
+        } else if df.requests.home {
+            self.cam_driver.controller_mut().set_pose(self.cam_home);
+            *self.cam_pose = self.cam_home;
+        } else {
+            *self.cam_pose = df.pose;
+        }
 
         // Compact bottom-left status badge inside viewport
         let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
@@ -271,6 +316,10 @@ impl UiContext<'_> {
                 prop_slider_f32(ui, "Power", &mut s.bulb_power, 2.0..=16.0, 2, false);
                 prop_slider_f32(ui, "Bailout", &mut s.bulb_bailout, 2.0..=32.0, 1, false);
                 prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
+                prop_slider_f32(ui, "Theta Mult", &mut s.bulb_theta_mult, 0.25..=2.5, 2, false);
+                prop_slider_f32(ui, "Phi Mult", &mut s.bulb_phi_mult, 0.25..=2.5, 2, false);
+                prop_slider_f32(ui, "Theta Ph", &mut s.bulb_theta_phase, -90.0..=90.0, 1, false);
+                prop_slider_f32(ui, "Phi Ph", &mut s.bulb_phi_phase, -180.0..=180.0, 1, false);
                 prop_toggle(ui, "Julia Mode", &mut s.bulb_julia, "Enable Julia C");
                 if s.bulb_julia {
                     prop_vec3(ui, "Julia C", &mut s.bulb_c, -1.5..=1.5, 0.01);
@@ -279,8 +328,10 @@ impl UiContext<'_> {
             1 => {
                 prop_slider_f32(ui, "Scale", &mut s.box_scale, -3.5..=3.5, 2, false);
                 prop_slider_f32(ui, "Fold", &mut s.box_fold, 0.2..=2.2, 2, false);
+                prop_slider_f32(ui, "Fold Mult", &mut s.box_fold_mult, 1.2..=3.0, 2, false);
                 prop_slider_f32(ui, "Min R", &mut s.box_min_r, 0.05..=1.2, 2, false);
                 prop_slider_f32(ui, "Fixed R", &mut s.box_fixed_r, 0.4..=2.5, 2, false);
+                prop_slider_f32(ui, "Iter Rot", &mut s.box_iter_rot, -45.0..=45.0, 1, false);
                 prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=24, false);
                 prop_slider_f32(ui, "Bailout", &mut s.box_bailout, 4.0..=64.0, 1, false);
             }
@@ -289,10 +340,19 @@ impl UiContext<'_> {
                 prop_slider_f32(ui, "Rot Y", &mut s.kifs_rot1, -180.0..=180.0, 1, false);
                 prop_slider_f32(ui, "Rot X", &mut s.kifs_rot2, -180.0..=180.0, 1, false);
                 prop_vec3(ui, "Offset", &mut s.kifs_offset, 0.1..=2.0, 0.01);
+                prop_slider_f32(ui, "Thickness", &mut s.kifs_thickness, 0.005..=0.25, 3, false);
+                prop_slider_f32(ui, "Z Bias", &mut s.kifs_z_bias, 0.0..=1.5, 2, false);
                 prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
                 prop_slider_f32(ui, "Bailout", &mut s.kifs_bailout, 4.0..=32.0, 1, false);
             }
         }
+
+        ui.add_space(6.0);
+        section_header(ui, ic::ARROWS_OUT_CARDINAL, "Transform");
+        prop_slider_f32(ui, "Obj Scale", &mut s.obj_scale, 0.25..=2.5, 2, false);
+        prop_slider_f32(ui, "Rot X", &mut s.rot_x, -180.0..=180.0, 1, false);
+        prop_slider_f32(ui, "Rot Y", &mut s.rot_y, -180.0..=180.0, 1, false);
+        prop_slider_f32(ui, "Rot Z", &mut s.rot_z, -180.0..=180.0, 1, false);
 
         ui.add_space(6.0);
         section_header(ui, ic::SLIDERS_HORIZONTAL, "Detail & Shading");

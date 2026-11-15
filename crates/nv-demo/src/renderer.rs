@@ -51,6 +51,8 @@ struct LaunchParams {
     fractal_p0: [f32; 4],
     fractal_p1: [f32; 4],
     fractal_p2: [f32; 4],
+    fractal_p3: [f32; 4],
+    fractal_xform: [f32; 4],
     fractal_r0: [f32; 4],
     fractal_r1: [f32; 4],
     time: f32,
@@ -66,12 +68,21 @@ struct LaunchParams {
 #[derive(Clone, Copy, PartialEq)]
 pub struct DemoSettings {
     pub fractal_kind: u32,
+    // Fractal Transform
+    pub obj_scale: f32,
+    pub rot_x: f32,
+    pub rot_y: f32,
+    pub rot_z: f32,
     // Mandelbulb
     pub bulb_power: f32,
     pub bulb_bailout: f32,
     pub bulb_iter: u32,
     pub bulb_julia: bool,
     pub bulb_c: [f32; 3],
+    pub bulb_theta_mult: f32,
+    pub bulb_phi_mult: f32,
+    pub bulb_theta_phase: f32,
+    pub bulb_phi_phase: f32,
     // Mandelbox
     pub box_scale: f32,
     pub box_fold: f32,
@@ -79,6 +90,8 @@ pub struct DemoSettings {
     pub box_fixed_r: f32,
     pub box_iter: u32,
     pub box_bailout: f32,
+    pub box_fold_mult: f32,
+    pub box_iter_rot: f32,
     // KIFS Octahedron
     pub kifs_scale: f32,
     pub kifs_rot1: f32,
@@ -86,6 +99,8 @@ pub struct DemoSettings {
     pub kifs_offset: [f32; 3],
     pub kifs_iter: u32,
     pub kifs_bailout: f32,
+    pub kifs_thickness: f32,
+    pub kifs_z_bias: f32,
     // Detail & Shading
     pub detail_eps: f32,
     pub fudge: f32,
@@ -124,23 +139,35 @@ impl Default for DemoSettings {
     fn default() -> Self {
         Self {
             fractal_kind: 0,
+            obj_scale: 1.0,
+            rot_x: 0.0,
+            rot_y: 0.0,
+            rot_z: 0.0,
             bulb_power: 8.0,
             bulb_bailout: 8.0,
             bulb_iter: 12,
             bulb_julia: false,
             bulb_c: [-0.2, 0.6, 0.2],
+            bulb_theta_mult: 1.0,
+            bulb_phi_mult: 1.0,
+            bulb_theta_phase: 0.0,
+            bulb_phi_phase: 0.0,
             box_scale: -2.0,
             box_fold: 1.0,
             box_min_r: 0.5,
             box_fixed_r: 1.0,
             box_iter: 12,
             box_bailout: 16.0,
+            box_fold_mult: 2.0,
+            box_iter_rot: 0.0,
             kifs_scale: 2.0,
             kifs_rot1: 0.0,
             kifs_rot2: 0.0,
             kifs_offset: [1.0, 1.0, 1.0],
             kifs_iter: 12,
             kifs_bailout: 12.0,
+            kifs_thickness: 0.05,
+            kifs_z_bias: 0.5,
             detail_eps: 0.0005,
             fudge: 0.95,
             norm_eps: 0.0006,
@@ -387,16 +414,16 @@ fn init_optix(cuda: &Arc<CudaContext>) -> OptixRig {
     )
     .expect("sbt");
 
-    // Large raytraced horizon floor triangle mesh (y = -1.35)
+    // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
     let floor_verts = DeviceBuffer::from_host(
         &stream,
         &[
-            [-180.0f32, -1.35, -180.0],
-            [180.0, -1.35, -180.0],
-            [180.0, -1.35, 180.0],
-            [-180.0, -1.35, -180.0],
-            [180.0, -1.35, 180.0],
-            [-180.0, -1.35, 180.0],
+            [-15.0f32, -1.35, -15.0],
+            [15.0, -1.35, -15.0],
+            [15.0, -1.35, 15.0],
+            [-15.0, -1.35, -15.0],
+            [15.0, -1.35, 15.0],
+            [-15.0, -1.35, 15.0],
         ],
     )
     .expect("floor verts");
@@ -662,7 +689,7 @@ pub fn spawn_render_thread(
                     accum_count = 0;
                 }
 
-                let (fractal_p0, fractal_p1, fractal_p2) = match settings.fractal_kind {
+                let (fractal_p0, fractal_p1, fractal_p2, fractal_p3) = match settings.fractal_kind {
                     1 => (
                         [
                             settings.box_scale,
@@ -672,6 +699,7 @@ pub fn spawn_render_thread(
                         ],
                         [settings.box_fixed_r, 0.0, settings.box_iter as f32, 0.0],
                         [0.0; 4],
+                        [settings.box_fold_mult, settings.box_iter_rot.to_radians(), 0.0, 0.0],
                     ),
                     2 => (
                         [settings.kifs_scale, settings.kifs_bailout, 0.0, 0.0],
@@ -687,6 +715,7 @@ pub fn spawn_render_thread(
                             settings.kifs_offset[2],
                             0.0,
                         ],
+                        [settings.kifs_thickness, settings.kifs_z_bias, 0.0, 0.0],
                     ),
                     _ => (
                         [
@@ -701,6 +730,12 @@ pub fn spawn_render_thread(
                             settings.bulb_c[1],
                             settings.bulb_c[2],
                             0.0,
+                        ],
+                        [
+                            settings.bulb_theta_mult,
+                            settings.bulb_phi_mult,
+                            settings.bulb_theta_phase.to_radians(),
+                            settings.bulb_phi_phase.to_radians(),
                         ],
                     ),
                 };
@@ -733,6 +768,13 @@ pub fn spawn_render_thread(
                     fractal_p0,
                     fractal_p1,
                     fractal_p2,
+                    fractal_p3,
+                    fractal_xform: [
+                        settings.obj_scale,
+                        settings.rot_x.to_radians(),
+                        settings.rot_y.to_radians(),
+                        settings.rot_z.to_radians(),
+                    ],
                     fractal_r0: [
                         settings.detail_eps,
                         settings.fudge,

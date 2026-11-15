@@ -295,7 +295,7 @@ dependencies = [
  "ash",
  "cuda-bindings",
  "cuda-core",
- "gpu-info-rs",
+ "gpu-info-rs 0.1.0 (git+https://github.com/ssoj13/gpu-info-rs.git?branch=main)",
  "wgpu",
 ]
 
@@ -588,6 +588,29 @@ dependencies = [
  "log",
  "presser",
  "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "gpu-info-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34dabc781533d6dd3cfabf9c466a9622638c309aa6179ab6b6fab7835951618c"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "half",
+ "js-sys",
+ "libc",
+ "log",
+ "objc2",
+ "objc2-metal",
+ "pollster",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "wasm-bindgen",
+ "wgpu",
  "windows",
 ]
 
@@ -978,7 +1001,7 @@ dependencies = [
  "cuda-bindings",
  "cuda-core",
  "cuda-core-ext",
- "gpu-info-rs",
+ "gpu-info-rs 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "half",
  "libc",
  "thiserror",
@@ -1714,7 +1737,8 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 [[package]]
 name = "vcv-rs"
 version = "0.1.2"
-source = "git+https://github.com/ssoj13/vcv-rs.git?branch=main#4e93896b9450e8b348e1c336615acbb8f64aeaf9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70068e1c8c38caf0f0f97624f6f91296dfdce07ab1251be31f2bf6264524589"
 dependencies = [
  "object 0.40.0",
  "serde",

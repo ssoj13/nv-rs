@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 # Spikes are throwaway proofs with their own toolchains and lockfiles; `device` is the cuda-oxide
 # device-code workspace (its own toolchain).
-exclude = ["spikes", "device", "python"]
+exclude = ["spikes", "device", "python", "demo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,7 +18,7 @@ publish = false
 [workspace.dependencies]
 nv-loader = { path = "crates/nv-loader" }
 nv-bindgen = { path = "crates/nv-bindgen" }
-vcv-rs = { git = "https://github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix", "nvsdk"] }
+vcv-rs = { version = "0.1.2", default-features = false, features = ["cuda", "optix", "nvsdk"] }
 bindgen = "0.72"
 syn = { version = "2", features = ["full"] }
 quote = "1"
@@ -28,7 +28,7 @@ libloading = "0.8"
 cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-async = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
-gpu-info-rs = { git = "https://github.com/ssoj13/gpu-info-rs.git", branch = "main", default-features = false, features = ["wgpu"] }
+gpu-info-rs = { version = "0.1.0", default-features = false, features = ["wgpu"] }
 wgpu = "30"
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
 bytemuck = { version = "1", features = ["derive"] }

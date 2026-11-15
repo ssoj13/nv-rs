@@ -17,7 +17,7 @@ cuda-device = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "mai
 cuda-core = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
 cuda-host = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
 nv-bindgen = { path = "../crates/nv-bindgen" }
-vcv-rs = { git = "https://github.com/ssoj13/vcv-rs.git", branch = "main", default-features = false, features = ["cuda", "optix", "nvsdk"] }
+vcv-rs = { version = "0.1.2", default-features = false, features = ["cuda", "optix", "nvsdk"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

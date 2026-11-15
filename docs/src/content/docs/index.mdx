@@ -19,7 +19,7 @@ hero:
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-`nv-rs` is NVIDIA's multi-crate Rust workspace (Rust 2024 edition, Apache-2.0) built on `cuda-bindings` and `cuda-core`.
+`nv-rs` is an independent, multi-crate Rust workspace (Rust 2024 edition, Apache-2.0) built on `cuda-bindings` and `cuda-core` for the NVIDIA GPU stack.
 
 - **Supported host targets**: **Windows** (`x86_64`, `aarch64`) and **Linux** (`x86_64`, `aarch64`).
 - **No bundled SDKs**: Every `*-sys` crate reads headers from your installed SDKs at build time via `vcv-rs` — or falls back to prebuilt bindings when headers or `libclang` are unavailable (`NV_RS_USE_PREBUILT=1`).
@@ -43,10 +43,14 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
   <Card title="AI, Storage, Comms & Mgmt" icon="list-format">
     `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), and `nvapi` (`nvapi-sys`, Windows).
   </Card>
-  <Card title="Device & Tooling" icon="wrench">
-    `device/optix-device`, `device/cuda-tex-device` (`cuda-oxide` device workspaces), `xtask` (`coverage collect|generate|check`, `prebuilt`), and `bootstrap.py` for SDK provisioning and verification.
+  <Card title="Device, Python & Tooling" icon="wrench">
+    `device/optix-device`, `device/cuda-tex-device` (`cuda-oxide` device workspaces), `python/nv-py` (`nv_rs` with DLPack &amp; `__cuda_array_interface__`), `xtask` (`coverage collect|generate|check`, `prebuilt`, `stage-dlls`), and `bootstrap.py` for SDK provisioning and verification.
   </Card>
   <Card title="nv-demo Full-Stack Showcase" icon="star">
     Interactive **OptiX 9** multi-instance path tracer (`floor`, fractal AABB, glass sphere, neon accent) with `TemporalAov` denoising, 5 AOVs, A/B split, `nvrtc` shader hot-reload, `cufft` FFT bloom, `nvjpeg`/`nvenc` export, and `nvml`/`cupti`/`ngx` telemetry.
   </Card>
 </CardGrid>
+
+---
+
+**Author:** Alex Khalyavin &lt;joss13@gmail.com&gt; · **License:** Apache-2.0

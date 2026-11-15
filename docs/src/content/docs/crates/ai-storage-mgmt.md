@@ -28,6 +28,7 @@ Safe wrappers for cuDNN handles, tensor/layer descriptors, workspace budgeting, 
 
 - **Handle & descriptors (`handle`, `descriptor`)**: `Handle`, `TensorDescriptor`, `FilterDescriptor`, `ConvolutionDescriptor`, `ActivationDescriptor`, `PoolingDescriptor`, `ConvFwdAlgo`, `ConvMode`, `ActivationMode`, `PoolingMode`, and `MathType`.
 - **Forward operations (`ops`, `scratch`)**: `conv_forward` (`conv_forward_workspace_size`), `activation_forward`, `pooling_forward`, `softmax_forward` (`SoftmaxAlgo`, `SoftmaxMode`), and `batch_norm_forward_inference` (`BatchNormMode`, `derive_bn_tensor_desc`). Workspaces are sized up front against a caller-supplied byte budget before growing a reusable `Scratch` buffer.
+- **Device buffer traits**: `DeviceSpan` and `DeviceSpanMut` are sealed traits (`mod sealed`) preventing unsound external implementations.
 
 ---
 
@@ -47,6 +48,7 @@ Safe Rust wrappers for NVIDIA GPUDirect Storage (`cuFile`).
 
 - **Platform constraint**: `cufile-sys` exists only on Linux (`cfg(target_os = "linux")`). The `cufile` crate compiles on both Windows and Linux; GDS-only entry points return `Error::Unsupported` on non-Linux hosts while types, status decoding (`CufileStatus`), and explicit `IoMode::PosixFallback` remain usable everywhere.
 - **I/O policy & RAII (`handle`)**: `DriverSession` (`cuFileDriverOpen` / `cuFileDriverClose_v2`), `FileHandle`, `RegisteredBuffer`, `RegisteredStream`, and `AsyncIoSlot` for zero-steady-state-alloc stream-ordered async transfers. `IoMode::GdsOnly` never silently downgrades to host-staged POSIX I/O; `IoMode::PosixFallback` must be selected explicitly.
+- **Device buffer traits**: `DeviceSpan` and `DeviceSpanMut` are sealed traits (`mod sealed`) preventing unsound external implementations.
 
 ---
 
@@ -56,6 +58,7 @@ Safe Rust wrappers for NVIDIA NCCL collective and point-to-point GPU communicati
 
 - **Platform constraint**: `nccl-sys` exists only on Linux (`cfg(target_os = "linux")`). The `nccl` crate compiles on both Windows and Linux; on non-Linux targets, runtime entry points return `Error::Unsupported` while types, serialization, and validation remain available.
 - **Communicators & collectives (`comm`)**: `Comm` (`init_all`, `init_rank`), portable `UniqueId` tokens, `group` / `group_start` / `group_end` (`GroupGuard`) fusion, stream-ordered `all_reduce`, `broadcast`, `reduce`, `all_gather`, `reduce_scatter`, `send`, and `recv`, plus async-error-aware teardown (`async_error`, `finalize`, `abort`, and abort-on-fault in `Drop`).
+- **Device buffer traits**: `DeviceSpan` and `DeviceSpanMut` are sealed traits (`mod sealed`) preventing unsound external implementations.
 
 ---
 

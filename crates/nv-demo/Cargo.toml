@@ -1,9 +1,11 @@
 [package]
 name = "nv-demo"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [features]
 default = ["ngx"]
@@ -34,3 +36,6 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33.2"
 png = "0.18"
+
+[lints]
+workspace = true

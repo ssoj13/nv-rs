@@ -20,7 +20,7 @@ pub struct DllSpec {
 }
 ```
 
-- On **Windows**, `windows` entries are exact file names or `prefix*` patterns (for example `cublas64_13*` or `cufft64_12*`); matching `.dll` files in a searched directory are ordered highest name first.
+- On **Windows**, `windows` entries are exact file names or `prefix*` patterns (for example `cublas64_13*` or `cufft64_12*`); matching `.dll` files in a searched directory are ordered by descending numeric version components (for example `cufft64_12.dll` before `cufft64_11.dll` before `cufft64_9.dll`).
 - On **Linux**, `linux_candidates_with` emits paths from `extra_search_dirs` (`NV_DLL_DIRS` and `nv_loader::add_search_dir`), runtime `root_var` / `CUDA_PATH` (`CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT`, `CUDA_TOOLKIT_ROOT_DIR`) `lib64`/`lib` subdirectories, and any build-time `hint` (for `Group::Sdk`), followed by bare `linux` sonames resolved through the dynamic linker (`LD_LIBRARY_PATH`, `ld.so.cache`, `/usr/lib/wsl/lib` on WSL).
 
 `Group` controls where `candidates` / `candidates_with` searches:

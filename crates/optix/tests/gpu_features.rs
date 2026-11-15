@@ -377,7 +377,7 @@ fn run_tasks(
     while !wave.is_empty() {
         let results: Vec<(Vec<Task>, bool, std::thread::ThreadId)> = std::thread::scope(|s| {
             let handles: Vec<_> = wave
-                .into_iter()
+                .drain(..)
                 .map(|mut t| {
                     s.spawn(move || {
                         let key = t.key().expect("key");
@@ -403,7 +403,6 @@ fn run_tasks(
                 .map(|h| h.join().expect("task thread"))
                 .collect()
         });
-        wave = Vec::new();
         for (next, was_replay, id) in results {
             if was_replay {
                 replayed += 1;

@@ -122,6 +122,7 @@ cargo run -p nv-demo --release
 
 ## Conventions & Governance
 
+- **Author**: Alex Khalyavin <joss13@gmail.com>
 - **License**: Apache-2.0.
 - **NGX / DLSS Notice**: `ngx-sys` and `ngx` only bind the SDK. Applications that redistribute NVIDIA DLSS DLLs (`nvngx_dlss*.dll`) remain responsible for NVIDIA RTX SDK licence compliance and pre-release notification.
 - **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for DCO sign-off (`git commit -s`), CLA requirements, and Windows/WSL2 verification gates.

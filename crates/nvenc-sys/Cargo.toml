@@ -13,7 +13,6 @@ path = "src/nvenc_sys.rs"
 [dependencies]
 nv-loader.workspace = true
 libloading.workspace = true
-cuda-bindings.workspace = true
 
 [build-dependencies]
 nv-bindgen.workspace = true

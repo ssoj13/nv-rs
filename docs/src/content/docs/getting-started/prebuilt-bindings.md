@@ -51,7 +51,11 @@ On a machine that has the NVIDIA SDKs and `libclang` installed, build the `*-sys
 cargo xtask prebuilt
 ```
 
-`cargo xtask prebuilt` (alias `stage-prebuilt`) scans `target/*/build/*/out/` and `target/*/*/build/*/out/` for the newest `*_types.rs`, `*_api.rs`, `*_shims.rs`, and `*_inventory.json` files of each `crates/*-sys` crate and copies them into `crates/<crate>/prebuilt/<target_triple>/`.
+`cargo xtask prebuilt` (alias `stage-prebuilt`) resolves the Cargo target directory from `CARGO_TARGET_DIR` (resolving relative paths against the workspace root, defaulting to `target/`) and scans for the newest `*_types.rs`, `*_api.rs`, `*_shims.rs`, and `*_inventory.json` files of each `crates/*-sys` crate, copying them into `crates/<crate>/prebuilt/<target_triple>/`.
+
+Target isolation rules:
+- **Target-qualified builds** (`<target_dir>/<target>/<profile>/build/*/out/`): always scanned for the requested `--target`.
+- **Unqualified builds** (`<target_dir>/<profile>/build/*/out/`, e.g. `debug/` or `release/`): scanned **only** when `--target` matches the `host:` triple reported by `rustc -vV`, preventing host build artifacts from leaking into a foreign-target prebuilt directory.
 
 Optional flags:
 - `--target <triple>` — override the target triple (defaults to the `host:` reported by `rustc -vV`)
@@ -60,5 +64,12 @@ Optional flags:
 ```bash
 cargo xtask prebuilt --target x86_64-unknown-linux-gnu --out dist
 ```
+
+## Safe SDK Archive Extraction (`bootstrap.py`)
+
+When `bootstrap.py` unpacks `.tar.xz` / `.tar.gz` SDK archives using Python's `tarfile` (on Windows or when external `tar` is unavailable), it uses a two-pass extraction with path-traversal guards:
+
+1. **Pass 1 (files & directories)**: validates every member path against absolute paths, drive prefixes, `..` components, and escapes outside the destination root before creating directories and extracting regular files.
+2. **Pass 2 (hardlinks & symlinks)**: validates link targets against absolute, drive-prefixed, or escaping paths, then creates hardlinks/symlinks (falling back to file/directory copies with bounded multi-pass resolution for chained symlinks when OS symlink/hardlink privileges are unavailable).
 
 For SDK installation instructions on machines that do generate bindings from headers, see [SDK Setup](/nv-rs/getting-started/sdk-setup/).

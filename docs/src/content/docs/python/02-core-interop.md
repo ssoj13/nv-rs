@@ -50,7 +50,8 @@ print(buf.ptr, buf.nbytes, buf.shape, buf.dtype, buf.device_id)
 - `shape -> list[int]` — buffer dimensions.
 - `dtype -> str` — element type string (e.g. `"u8"`, `"f32"`).
 - `device_id -> int` — CUDA device ordinal.
-- `to_bytes(stream: core.Stream) -> bytes` — copies device memory back to host `bytes`.
+- `is_contiguous -> bool` — `True` if the buffer has row-major (C-contiguous) strides (`is_c_contiguous()`).
+- `to_bytes(stream: core.Stream) -> bytes` — copies device memory back to host `bytes`; checks `is_c_contiguous()` and raises an error on non-contiguous layouts.
 
 ## Buffer Protocol (`from_buffer` & `to_bytes`)
 
@@ -110,3 +111,15 @@ assert int(c_arr.data.ptr) == buf.ptr
 
 stream.synchronize()
 ```
+
+### Validation, Ownership & Stream Semantics
+
+- **Checked shape & byte-size validation (`validate_shape_and_bytes`)**: validates non-negative dimensions, non-zero dtype `itemsize`, and checked element-count and byte-size multiplication, rejecting negative dimensions or `usize` overflows before allocating or importing memory.
+- **Zero-UAF DLPack ownership (`DlManagedGuard`)**: `from_dlpack` wraps the imported `DLManagedTensor` in an RAII `DlManagedGuard`. If shape/dtype/device validation fails before ownership is transferred, dropping the guard invokes the producer's `deleter` exactly once without leaking or causing use-after-free.
+- **`__dlpack__(stream=...)` synchronization**:
+  - `stream=None` (default): synchronizes the buffer's producer stream before export.
+  - `stream=-1`: DLPack no-sync sentinel — skips synchronization.
+  - `stream=<int>` (CUDA stream handle `>= 0`) or `stream=<core.Stream>` (`PyStream`): skips synchronization when the consumer handle matches the producer stream; otherwise synchronizes the producer stream.
+- **`__cuda_array_interface__` v3 exports**:
+  - `"strides"`: exported in **bytes** (`element_stride * itemsize`, with checked multiplication) for non-empty shapes, or `None` for 0-D scalars.
+  - `"stream"`: exported as the integer CUDA stream handle (`u64`) when a stream is associated with the buffer, or `None` otherwise.

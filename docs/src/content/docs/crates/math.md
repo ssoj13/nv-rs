@@ -34,8 +34,8 @@ Safe cuBLAS and cuBLASLt host API on top of `cublas-sys`, `cublaslt-sys`, and `c
 
 Safe cuFFT host API on top of `cufft-sys` and `cuda-core`.
 
-- **Plans & transforms (`plan`)**: `Plan` (`plan_1d`, `plan_2d`, `plan_3d`, `plan_many`, `estimate_*`), `ManyDesc`, `FftType`, `Direction`, `Complex32`, `Complex64`, and typed execution (`exec_c2c`, `exec_r2c`, `exec_c2r`, `exec_z2z`, `exec_d2z`, `exec_z2d`).
-- **Workspace management**: Every `Plan` disables cuFFT auto-allocation (`cufftSetAutoAllocation(0)`) and sizes its `Scratch` workspace against a caller-supplied byte budget.
+- **Plans & transforms (`plan`)**: `Plan` (`plan_1d`, `plan_2d`, `plan_3d`, `plan_many`, `estimate_*`), `ManyDesc` (where `ManyDesc::min_io_elems` normalizes `None`-embed dense layouts), `FftType`, `Direction`, `Complex32`, `Complex64`, and typed execution (`exec_c2c`, `exec_r2c`, `exec_c2r`, `exec_z2z`, `exec_d2z`, `exec_z2d`; `exec_c2r` and `exec_z2d` take `&mut DeviceBuffer` for destructive cuFFT inputs).
+- **Workspace management**: Every `Plan` disables cuFFT auto-allocation (`cufftSetAutoAllocation(0)`), sizes its `Scratch` workspace against a caller-supplied byte budget, and retains `Arc<ScratchInner>` with generation tracking and stream validation.
 - **Diagnostics (`version`, `error`)**: `version()` queries `cufftGetVersion`; `FftResult` (`Copy` integer newtype) and `Error` report failures cleanly.
 
 ---

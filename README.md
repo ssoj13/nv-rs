@@ -2,35 +2,60 @@
 
 An armed engineer checks his tooling before he draws.
 
-`nv-rs` is NVIDIA's multi-crate Rust workspace giving direct, honest access to the NVIDIA library
-stack — CUDA Toolkit libraries, OptiX, display/management APIs, video, compression, DLSS/NGX,
-CUDA <-> wgpu interop, and Rust device code via `cuda-oxide` — built on `cuda-bindings` and
-`cuda-core`.
+`nv-rs` is a multi-crate Rust workspace (and Python package `nv_rs`) providing unified, safe,
+and runtime-resilient access to the NVIDIA library stack — CUDA Toolkit libraries, OptiX,
+display/management APIs, video, compression, DLSS/NGX, CUDA ↔ `wgpu` zero-copy interop, Rust
+device code for OptiX via `cuda-oxide`, and zero-copy Python bindings — built directly on
+[`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust) (`cuda-bindings`, `cuda-core`,
+`cuda-async`).
 
 Supported host targets: **Windows** (`x86_64`, `aarch64`) and **Linux** (`x86_64`, `aarch64`).
 
-> **Why `nv-rs` exists:** This project started while building `render-rs`, which needed direct
-> OptiX access from Rust to accelerate ray tracing. Instead of writing a quick one-off wrapper,
-> I decided to build clean, complete Rust bindings across the entire NVIDIA stack once and for
-> all — so no one ever has to fight this gap again.
+---
 
-TANSTAAFL: NVIDIA headers and proprietary redistributables do not live in this git tree.
-Every `*-sys` crate reads headers from your installed SDKs at build time via
-[vcv-rs](https://github.com/ssoj13/vcv-rs) — or uses prebuilt bindings when headers or `libclang`
-are unavailable — and loads runtime libraries through one shared loader (`nv-loader`) with
-explicit typed errors. If a DLL or shared object is missing, you get a clean `Err`, never a
-surprise panic.
+## Why `nv-rs` Exists
 
-For architecture decisions, current state, and coverage numbers, read the ship's log:
+This project started while building `render-rs`, which needed direct **OptiX** access from Rust
+to accelerate ray tracing. Instead of writing a narrow one-off wrapper, the goal became to solve
+the NVIDIA-on-Rust gap once and for all across the entire stack.
+
+### The Gap in the Ecosystem
+
+- **`NVIDIA/cuda-rust` covers the core, not the stack:** `cuda-bindings`, `cuda-core`, and
+  `cuda-async` provide a solid foundation for CUDA Driver/Runtime and `cutile`, but leave out
+  OptiX, cuDNN, cuBLAS/cuBLASLt, cuSPARSE, cuSOLVER, cuFFT, cuRAND, NPP, nvJPEG, Video Codec
+  (`nvenc`/`nvdec`), Optical Flow (`nvofa`), DLSS/NGX, `nvCOMP`, `cuFile` (GPUDirect Storage),
+  `NCCL`, `NVRTC`, `CUPTI`, `NVML`, `NVAPI`, and CUDA ↔ `wgpu` interop.
+- **Fragmented third-party crates don't compose:** standalone wrappers define incompatible
+  `CUstream` / `CUcontext` types, hardcode SDK paths, or panic when a driver/DLL is absent.
+- **OptiX device code in Rust needed compiler fixes:** compiling Rust kernels to OptiX PTX
+  with `cuda-oxide` hit real gaps (`ptx_asm!` input arity for cooperative vectors,
+  `#[export_name]` on device globals, SBT callable rooting, and 64-bit pointers across all
+  address spaces).
+
+### What `nv-rs` Solves
+
+1. **One `CUstream` / `CUcontext` spine:** every crate builds directly on `NVIDIA/cuda-rust`,
+   so buffers, streams, events, and contexts pass seamlessly between `cublas`, `optix`, `cudnn`,
+   `nvenc`, `nv-wgpu`, and `cuda-core-ext`.
+2. **Zero-copy graphics & Python interop:** `nv-wgpu` shares Vulkan (`OPAQUE_WIN32` /
+   `OPAQUE_FD`) and DX12 resources with CUDA; `nv_rs` (PyO3 + `maturin`) exposes all modules to
+   Python with DLPack, `__cuda_array_interface__`, and Buffer Protocol support.
+3. **No committed proprietary headers (`nv-loader` + `nv-bindgen`):** every `*-sys` crate
+   generates bindings at build time from your installed SDKs via
+   [`vcv-rs`](https://github.com/ssoj13/vcv-rs) (or falls back to prebuilt bindings via
+   `NV_RS_USE_PREBUILT=1`), and loads DLLs/SOs dynamically with typed `Result` errors — never a
+   surprise panic.
+4. **Upstream-first:** host crates and `nv_rs` already build directly against upstream
+   [`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust). The `device/` workspace
+   temporarily tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs
+   [#1818](https://github.com/NVIDIA/cuda-rust/pull/1818),
+   [#1819](https://github.com/NVIDIA/cuda-rust/pull/1819),
+   [#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and
+   [#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
+
+For architecture decisions, current state, and symbol/GPU-test coverage numbers, see
 [PLAN.md](PLAN.md) and [COVERAGE.md](COVERAGE.md).
-
-Host crates and Python bindings (`nv_rs`) build directly against upstream
-[`NVIDIA/cuda-rust`](https://github.com/NVIDIA/cuda-rust). The `device/` workspace temporarily
-tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs
-[#1818](https://github.com/NVIDIA/cuda-rust/pull/1818),
-[#1819](https://github.com/NVIDIA/cuda-rust/pull/1819),
-[#1820](https://github.com/NVIDIA/cuda-rust/pull/1820), and
-[#1821](https://github.com/NVIDIA/cuda-rust/pull/1821) are under review.
 
 ---
 
@@ -39,11 +64,12 @@ tracks [`cuda-rust_b`](https://github.com/ssoj13/cuda-rust_b) while upstream PRs
 | Layer | Crates |
 |---|---|
 | **Infrastructure** | `nv-loader` (shared runtime loader, `exports_sys!` / `split_exports_sys!` / `query_interface_sys!`), `nv-bindgen` (declarative `LibSpec` generator + prebuilt fallback), `nv-bindgen-fixture` |
-| **Interop & Extensions** | `cuda-core-ext` (external memory/semaphores, arrays, textures/surfaces, green contexts), `nv-wgpu` (zero-copy CUDA <-> `wgpu` buffer/texture/semaphore interop) |
+| **Interop & Extensions** | `cuda-core-ext` (external memory/semaphores, arrays, textures/surfaces, green contexts), `nv-wgpu` (zero-copy CUDA ↔ `wgpu` buffer/texture/semaphore interop) |
 | **Linear Algebra & Math** | `cublas` (`cublas-sys`, `cublaslt-sys`), `cufft` (`cufft-sys`), `curand`, `cusolver` (`cusolver-sys`, `cusolvermg-sys`), `cusparse` (`cusparse-sys`) |
 | **Imaging, Video & Graphics** | `npp` (`npp-sys`), `nvjpeg` (`nvjpeg-sys`), `nvdec` (`nvcuvid-sys`), `nvenc` (`nvenc-sys`), `nvofa` (`nvofa-sys`), `optix` (`optix-sys`), `ngx` (`ngx-sys` — statically linked per PLAN D15; DLSS-SR/RR safe wrapper supporting both `Init_with_ProjectID` and `ApplicationId` per D13) |
 | **AI, Storage, Comms & Mgmt** | `cudnn` (`cudnn-sys`), `nvcomp` (`nvcomp-sys`), `cufile` (`cufile-sys`, Linux GPUDirect Storage), `nccl` (`nccl-sys`, Linux), `nvrtc` (`nvrtc-sys`), `cupti` (`cupti-sys`), `nvml` (`nvml-sys`), `nvapi` (`nvapi-sys`, Windows) |
 | **Device & Tooling** | `device/optix-device`, `device/cuda-tex-device`, `xtask` (`coverage collect\|generate\|check`, `prebuilt`) |
+| **Python & Docs** | `python/nv-py` (`nv_rs` via PyO3/`maturin`: 24 submodules, DLPack/`__cuda_array_interface__`/Buffer Protocol, `nv_rs.diag`), `docs/` (Astro + Starlight) |
 
 ---
 

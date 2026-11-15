@@ -52,7 +52,8 @@ The scene builds separate Geometry Acceleration Structures (GAS) combined into a
 ## Post-Processing, Hot-Reload & Export
 
 - **`nvrtc` Live Shader Hot-Reload**: clicking **Hot-Reload Shader (NVRTC)** reads `crates/nv-demo/shaders/raytracer.cu` from disk, compiles it to PTX via `nvrtc`, rebuilds the OptiX `Pipeline` and `ShaderBindingTable`, and resets accumulation without restarting the app.
-- **`cufft` FFT Optical Bloom**: `FftBloomPass` extracts bright pixels above a soft-knee luminance threshold into a power-of-two padded 3-channel planar buffer, runs a batched 2D `R2C` plan (`cufft`), multiplies by a cached procedural N-blade (`3..=12`) aperture diffraction PSF spectrum, runs `C2R`, and additively composites halation and starbursts back onto the `float4` color buffer.
+- **`cufft` FFT Optical Bloom**: `FftBloomPass` binds its `Scratch` workspace to the active render stream, extracts bright pixels above a soft-knee luminance threshold into a power-of-two padded 3-channel planar buffer, runs a batched 2D `R2C` plan (`cufft`), multiplies by a cached procedural N-blade (`3..=12`) aperture diffraction PSF spectrum, runs `C2R` (`&mut` destructive input), and additively composites halation and starbursts back onto the `float4` color buffer.
+- **Triangle GAS & Resize Resilience**: triangle GAS builders enable `random_vertex_access: true` for `optixGetTriangleVertexData`, and runtime viewport resize / PNG export paths propagate `nv_wgpu` and CUDA context errors cleanly without panicking on OOM.
 - **`nvjpeg` & `nvenc` Zero-Copy Export**:
   - **JPEG Snapshot**: converts the device `RGBA8` frame to `RGB8` via an NVRTC kernel and encodes on the GPU with `nvjpeg`.
   - **H.264 Recording**: converts each `RGBA8` frame to `NV12` (BT.709 limited range) via an NVRTC kernel and encodes zero-copy with `nvenc` (`RegisteredResource`) into an Annex-B `.h264` stream.

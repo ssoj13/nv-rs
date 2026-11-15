@@ -1,6 +1,6 @@
 ---
 title: Architecture Notes & Ship's Log
-description: Map of internal engineering logs (PLAN.md, HANDOFF.md, TODO.md, COVERAGE.md) and archived documentation in docs/old/.
+description: Map of internal engineering logs (PLAN.md, COVERAGE.md, AGENTS.md, DIAGRAMS.md) and archived documentation in docs/old/.
 sidebar:
   order: 2
 ---
@@ -11,15 +11,14 @@ sidebar:
 
 | Document | Role |
 |---|---|
-| `PLAN.md` | Architecture decisions, milestone checkpoints, and workspace updates (including toolchain unification to `1.99.1`, `bootstrap.py` provisioning, `ngx` D13 wrapper design, `cuda-core-ext` rename, and historical transfer checkpoints). |
-| `HANDOFF.md` | Current project state, verified Windows/WSL2/GPU test checkpoints (such as RTX 3080 Ti integration runs and Wave 2 release readiness), and continuation notes across sessions. |
-| `TODO.md` | Active work queue tracking completed items and remaining tasks across workspace waves. |
+| `PLAN.md` | Consolidated master plan, completed milestone ledger (`M1`–`M4`), and prioritized backlog (`P2`/`P3` future work). |
+| `AGENTS.md` / `DIAGRAMS.md` | Repository engineering guide, workspace boundaries, and architecture dataflow diagrams. |
 | `COVERAGE.md` | Generated symbol inventory and coverage matrix produced by `cargo xtask coverage generate` from `coverage/`, recording **bound**, **wrapped**, and **tested-on-gpu** status per library. Do not edit manually. |
 
 ## Workspace Boundaries (`Cargo.toml`)
 
 - Active workspace members are `crates/*` and `xtask`.
-- `spikes` (throwaway proofs with their own toolchains and lockfiles) and `device` (`cuda-oxide` device-code workspace with its own toolchain) are excluded from the root host workspace.
+- `spikes` (throwaway proofs with their own toolchains and lockfiles), `device` (`cuda-oxide` device-code workspace requiring nightly), and `python` (`nv-py` maturin/PyO3 extension workspace) are excluded from the root host workspace.
 
 ## Archived Documentation (`docs/old/`)
 

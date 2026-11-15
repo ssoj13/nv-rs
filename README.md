@@ -155,6 +155,17 @@ with an NVIDIA GPU.
 
 ---
 
+## Interactive RTX Demo (`demo/`)
+
+An excluded standalone showcase (`demo/`, binary `nv-demo`, also built by default via `python bootstrap.py b`) combining **OptiX 9** ray tracing (RT Cores via custom AABB fractal primitives — Mandelbulb, Mandelbox, KIFS Octahedron — plus a triangle checkerboard floor), **OptiX AI Denoiser**, **NVRTC** runtime `.cu` -> PTX compilation, zero-copy **`nv-wgpu`** (`SharedBuffer` -> `wgpu::Texture`), an **`egui-wgpu`** interactive orbit/SpaceSim viewport, and live **NVML** GPU telemetry:
+
+```powershell
+$env:NV_SDK_DIRS = "$PWD\.sdk"   # or set OPTIX_ROOT / CUDA_PATH
+cargo run --manifest-path demo/Cargo.toml --release
+```
+
+---
+
 ## Conventions & Governance
 
 - **License**: Apache-2.0.

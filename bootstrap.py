@@ -963,9 +963,28 @@ def cmd_build(args: argparse.Namespace, passthrough: list[str]) -> int:
         cmd.append("--workspace")
     cmd.extend(passthrough)
 
-    code, _, ms = run(cmd, env=_cargo_env())
-    (ok if code == 0 else err)(f"build {'OK' if code == 0 else 'FAILED'} ({fmt_time(ms)})")
-    return code
+    env = _cargo_env()
+    code, _, ms = run(cmd, env=env)
+    if code != 0:
+        err(f"build FAILED ({fmt_time(ms)})")
+        return code
+
+    # Also build the standalone nv-demo showcase when building the whole workspace.
+    if not args.package:
+        step("Building nv-demo (demo/Cargo.toml)")
+        demo_cmd = cargo_cmd(args.toolchain, "build")
+        demo_cmd.extend(["--manifest-path", str(ROOT_DIR / "demo" / "Cargo.toml")])
+        if not args.debug:
+            demo_cmd.append("--release")
+        demo_cmd.extend(passthrough)
+        dcode, _, dms = run(demo_cmd, env=env)
+        if dcode != 0:
+            err(f"nv-demo build FAILED ({fmt_time(dms)})")
+            return dcode
+        ms += dms
+
+    ok(f"build OK ({fmt_time(ms)})")
+    return 0
 
 
 def cmd_test(args: argparse.Namespace, passthrough: list[str]) -> int:

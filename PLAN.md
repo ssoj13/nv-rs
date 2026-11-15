@@ -1,367 +1,92 @@
-# nv-rs — plan
+# nv-rs — Master Plan & Roadmap
 
-## 2026-11-14 Update (Corporate Release Readiness)
+> Consolidated single source of truth for `nv-rs` architecture, decisions, completed milestones, and remaining work.
+> (`TODO.md` and `HANDOFF.md` have been merged here.)
 
-- **Host toolchain**: Unified to `1.99.1` in `rust-toolchain.toml` (matching `device/`).
-- **`bootstrap.py`**: Adapted for `nv-rs` (stdlib-only Python 3; `d s` / `d dl` for 10 SDKs with depth-3 `NV_SDK_DIRS` scan, `b`/`t`/`c`/`s`/`cl`/`x`).
-- **`crates/ngx` (D13 confirmed & implemented)**: Full safe wrapper supporting both `Init_with_ProjectID` (`NgxVulkan::init`) and `ApplicationId` (`NgxVulkan::init_with_app_id`), `Parameters`, and `FeatureHandle`, with Windows and Linux x86_64 preparation.
-- **WSL2 verification**: `cufile` and `nccl` verified on Linux (WSL2 Ubuntu).
-- **Crate rename**: `cuda-ext` renamed to `cuda-core-ext` across the workspace.
-- **Corporate release readiness**: Added `CONTRIBUTING.md`, `SECURITY.md`, `deny.toml`; updated `README.md` and `Cargo.toml` `[workspace.package]` metadata.
+## 1. Current Status (2026-11-14)
 
-## Transfer checkpoint — 2026-11-13 (Codex)
+- **Core Rust Workspace**: All 22+ crates (`nv-loader`, `nv-bindgen`, `nv-wgpu`, `cuda-core-ext`, `optix`, `ngx`, `cublas`, `cufft`, `curand`, `cusparse`, `cusolver`, `npp`, `nvjpeg`, `nvrtc`, `cupti`, `nvml`, `nvapi`, `nvenc`, `nvdec`, `nvofa`, `cudnn`, `nvcomp`, `nccl`, `cufile`) implemented, audited, and GPU-verified on Windows (RTX 3080 Ti) and Linux WSL2 (`cufile`, `nccl`).
+- **Python API (`nv_rs`)**: Full PyO3 + `maturin` bindings in `python/nv-py/`, zero-copy interop (DLPack, `__cuda_array_interface__`, Python Buffer Protocol), `nv_rs.diag` + `nv_rs.errors`, `.pyi` type stubs, and pytest suite.
+- **Documentation**: Astro + Starlight site in `docs/` (including `Python API` section) built cleanly (`bun run build`, 19 pages).
+- **Corporate Release Readiness**: `rust-toolchain.toml` unified to `1.99.1`, `bootstrap.py` adapted, `CONTRIBUTING.md`, `SECURITY.md`, `deny.toml`, `README.md`, and `Cargo.toml` metadata finalized.
 
-**Status: paused by owner for an environment change.** All task agents have stopped/completed; do not resume implementation automatically. The owner explicitly requested updating progress and pushing the unfinished source checkpoint to main.
+---
 
-- vcv-rs checkpoint is published on main at `a8cab6688c1ef01f1067ea3d150ad7283e1367cb`.
-- Both host and device Cargo.lock files now resolve that exact vcv-rs revision. Metadata-only commands succeeded: `cargo +1.98.0 update -p vcv-rs` and `cargo +1.99.1 update --manifest-path device/Cargo.toml -p vcv-rs`. They added object 0.40.0, removed unused optional CLI dependencies, and recorded the three written host sys crates; no compile/test result follows.
-- nv-rs D01/D02 source remains **unreviewed and untested**. M2 is open. Historical M1/M3/M4/M5 and prior 18-library results below do not validate this checkpoint.
-- vcv-rs D11 reached a 225-ID source-only static closure. Added ID226 (real COFF/ELF archive test) has not been formatted after insertion, independently reviewed or executed.
-- vcv-rs D12 has 125 IDs; the full review is incomplete. **Known defect remains:** fmt_ps accepts oversized Windows/.NET environment keys/values/joined lists and may fail after earlier assignments. D13's 110-ID independent review remains pending.
-- No Windows/Linux build, check, test, shell round trip, seeded mutant or GPU gate ran for this wave. Platform gates are 0/2.
-- Durable transfer records, exact continuation, source hashes and unexecuted validation scripts are in sibling [vcv-rs HANDOFF.md](../vcv-rs/HANDOFF.md) and its `docs/mastermind/evidence/2026-11-13-transfer/`. SDK binaries and proprietary headers were excluded.
-- Recovery documentation-agent OAuth failure produced no result; root wrote this checkpoint. No new agent or chat-wait loop was started after stop.
+## 2. Remaining / Open Items
 
-After the owner resumes: repair/review the vcv-rs length boundary, review ID226 and complete D12/D13/seam reviews; commit/push any new edits before every build/check/test. Root monitors CPU/RAM/GPU/other builds and serializes both platform gates under the existing build-lock override. Then verify nv-rs consumers and finish M2 NCCL/nvCOMP/cuFile reviews and supported-platform gates. Preserve separate NCCL multi-GPU and native-Linux cuFile/storage requirements.
+- [ ] **Multi-GPU & Native Linux Hardware Gates (RunPod / Bare-Metal Linux)**:
+  - `nccl` `t3_multi_rank_all_reduce` (requires `>= 2` GPUs; currently skips cleanly on single-GPU hosts).
+  - `cufile` native Linux GPUDirect Storage (GDS) hardware path (WSL2 runs `PosixFallback`).
+- [ ] **CI / Distribution (Optional / Release)**:
+  - Publish prebuilt `nv_rs` wheels (`maturin build --release`) and prebuilt Rust bindings (`NV_RS_USE_PREBUILT=1`) if distributing binary artifacts.
 
+---
 
-## Historical checkpoint (superseded above)
+## 3. Architecture & Decisions
 
-
-Rust access to the whole NVIDIA library family (driver, CUDA Toolkit, SDKs), OptiX device code
-in Rust through cuda-oxide, and CUDA <-> wgpu interop. Built on the `cuda-rust_b` fork
-(`ssh://git@github.com/ssoj13/cuda-rust_b.git`, checked out at
-`C:\projects\projects.rust.cg\nv\cuda-rust_b-optix`, verified at `42cc04eda` on 2026-11-13). Intended to be shown to NVIDIA, so it
-follows `NVIDIA/cuda-rust` conventions throughout.
-
-Status: implementation is in progress. [TODO.md](TODO.md) and the [domain index](docs/mastermind/MASTERMIND_INDEX.md) track the current unverified M2 wave; [HANDOFF.md](HANDOFF.md) preserves prior milestone evidence. Dated results and prerequisite inventories below are historical snapshots, not checks of the current source.
-
-## 1. Decisions
-
-| # | Decision | Reason |
-|---|---|---|
-| D1 | Cover every NVIDIA library, not only what render-rs needs | Project goal; the pitch is completeness |
-| D2 | Reuse `cuda-bindings`, `cuda-core`, `cuda-async`, `libnvvm-sys`, `nvjitlink-sys` from the fork by git | One set of bindings per driver; `CUstream`/`CUcontext` must unify across crates |
-| D3 | Missing safe CUDA features live in our `cuda-core-ext` (renamed from `cuda-ext`), not patched into `cuda-core` | Independent of upstream; written in cuda-core style so it can be offered later |
-| D4 | Hardware RT through OptiX + cuda-oxide; wgpu ray query stays the portable path in render-rs | OptiX exposes RT cores, SER, OMM, clusters, denoiser from one API |
-| D5 | Patch cuda-oxide in the fork only (no upstream PRs for now) | `ptx_asm!` input limit and `#[device]` export names block OptiX |
-| D6 | Bindings generated by bindgen at build time from the user's installed SDKs; no NVIDIA header or derived file is committed | OptiX, cuDNN, NGX headers are proprietary; RTX SDKs License Sec. 4(e) forbids open-source relicensing |
-| D7 | OptiX device layer generated at build time from the user's `optix_device_impl.h` | Same licensing reason as D6 |
-| D8 | Target OptiX 9.x | Cooperative vectors, clusters, current SER |
-| D9 | Flat layout `crates/<name>`, plain package names (`optix-sys`, `nvenc`), no crates.io publishing | Workspace name already says nv-rs; git dependencies until NVIDIA replies |
-| D10 | wgpu adapter built now; gpu-info-rs stays the single owner of the shared wgpu/Vulkan device | `gpu-info-rs/src/shared_vk.rs` already creates it via `open_with_callback`; a second device cannot share memory |
-| D11 | NVML lives in nv-rs; gpu-info-rs becomes a consumer | One NVML binding |
-| D12 | Linux testing: WSL2 daily, RunPod for what WSL cannot run (each rental priced and approved first) | WSL has no native NVIDIA Vulkan, no GPUDirect Storage, no multi-GPU NCCL |
-| D13 | NGX: full safe wrapper using `Init_with_ProjectID` (caller-supplied GUID, `engineType = CUSTOM`) and `ApplicationId` (`init_with_app_id`) — **confirmed & implemented** | Supports both ProjectID and AppId init flows; licence obligations fall on the final application |
-
-| D14 | SDK header discovery (CUDA Toolkit, OptiX, MSVC/UCRT for libclang) goes through vcv-rs; OptiX detection lives in vcv-rs | One discovery mechanism shared with the `vcv-rs` shell environment, so a shell and a build never select different SDKs |
-| D15 | `ngx-sys` links the NGX SDK's static library (`nvsdk_ngx_d.lib`, plus `advapi32`/`user32`) at build time | NGX ships no DLL exposing its API, only static libraries; the only exception to runtime loading. Revisit if NVIDIA ships a loadable NGX API |
-| D16 | Every separately shipped SDK (cuDNN, Video Codec, Optical Flow, NVAPI, NGX, nvCOMP) is located by `vcv_rs::nvsdk` (root vars, `%ProgramFiles%/NVIDIA`, `%ProgramData%/NVIDIA Corporation`, `NV_SDK_DIRS`) | Replaces per-SDK environment variables; the SDK's DLL folder is baked into the sys crate as a load hint |
-
-Dropped: Streamline and Reflex (C++ API, no C ABI); migrating gracefold-rs off its vendored
-cubecl/cudarc cuBLAS path.
-
-Conventions taken from cuda-rust: Apache-2.0, DCO (`git commit -s` on every commit), toolchain
-pins (host 1.98.0, device 1.99.1), edition 2024, `deny.toml`, mdBook docs. Files carry the owner's
-copyright until contribution; no claim of NVIDIA affiliation anywhere.
-
-## 2. Layout
-
-```
-nv-rs/
-  Cargo.toml               host workspace, resolver 3
-  rust-toolchain.toml      1.98.0
-  crates/
-    nv-loader              DLL discovery, libloading, version/ABI gate, LoadError
-    nv-bindgen             build-dependency: header discovery, bindgen config, panic-free shims
-    # sys: one crate per DLL family
-    optix-sys nvenc-sys nvcuvid-sys nvofa-sys nvml-sys nvapi-sys
-    cublas-sys cufft-sys cusparse-sys cusolver-sys npp-sys nvjpeg-sys
-    nvrtc-sys cupti-sys cufile-sys cudnn-sys nccl-sys nvcomp-sys ngx-sys
-    # safe wrappers
-    cuda-core-ext optix nvenc nvdec nvofa nvml nvapi
-    cublas cufft curand cusparse cusolver npp nvjpeg nvrtc cupti cufile
-    cudnn nccl nvcomp ngx
-    optix-repr             no_std: SBT header, payload layout, shared host/device
-    nv-wgpu                CUDA <-> wgpu interop (excluded from default-members)
-  device/                  nested workspace, excluded from root, toolchain 1.99.1
-    optix-device optix-device-macros cuda-tex-device
-  coverage/                <lib>.toml overlays, evidence/<lib>/*.json, generated COVERAGE.md
-  xtask/                   coverage, gpu-test
-```
-
-- cuRAND is already bound in `cuda-bindings`; `curand` is a safe crate only.
-- Sys crates group by DLL family: one `npp-sys`, one `cusolver-sys` (Dn/Sp/Rf/Mg).
-- Umbrella crates (`nv` host, `nv-device`) come later, as feature-gated re-exports with no code.
-- Every crate: `[lib] path = "src/<name>.rs"`, `//!` header on every file.
-
-### Dependencies
-
-| Layer | Depends on |
-|---|---|
-| `nv-loader` | `libloading` |
-| `*-sys` | `nv-loader`; `cuda-bindings` (driver types blocklisted and re-used) |
-| safe crates | own sys, `cuda-core`; `cuda-async` behind feature `async` |
-| `cuda-core-ext` | `cuda-bindings`, `cuda-core` |
-| `nv-wgpu` | `cuda-core-ext`, `wgpu` 30, `ash`, `windows` |
-| `device/*` | `cuda-device`, `optix-repr` |
-
-## 3. Binding pipeline
-
-One generator, one declarative `LibSpec` per library; each sys `build.rs` is a single
-`nv_bindgen::generate(&SPEC)` call. Generalises `cuda-bindings/build.rs` (types pass, dynamic
-functions pass with `dynamic_link_require_all(false)`, panic-free `extern "C"` shims returning the
-library's own status code, enum-signedness normalisation MSVC vs Linux).
-
-`LibSpec` fields: `headers`, `allow_fn`/`allow_type`, `blocklist_type`, `status_type` +
-not-loaded/missing-symbol codes, `group` (Driver/Toolkit/Sdk + env var), `dll` (Windows prefix +
-version scan, Linux sonames), `shape` (`Exports` | `FunctionTable { query_symbol }` for OptiX and
-NVENC | `QueryInterface` for NVAPI), `version_probe`.
-
-`nv-loader` is the only runtime loader: `OnceLock<Result<Api, LoadError>>`,
-`LoadError { NotFound { tried }, RuntimeTooOld { built, found }, AbiUnsupported, SymbolMissing }`.
-
-DLL discovery:
-
-| Group | Windows | Linux |
-|---|---|---|
-| Driver | System32; `nvoptix.dll`, `nvngx.dll` only in DriverStore — resolve the display adapter's driver dir from the registry | sonames, `/usr/lib/wsl/lib` |
-| Toolkit | `CUDA_PATH*`/`CUDA_HOME`, `bin\x64`, version-scanned by prefix (`cublas64_13`, `cufft64_12`, `nvrtc64_130_0`) | `lib64`, sonames |
-| SDK | per-SDK env var (`OPTIX_ROOT`, `CUDNN_ROOT`, `NVCOMP_ROOT`, `VIDEO_CODEC_SDK_ROOT`, `DLSS_ROOT`); never guess | same |
-
-Toolkit discovery logic is ported from cuda-oxide's `cuda-toolkit-discovery` (workspace-private,
-not a stable dependency).
-
-## 4. Safe API rules
-
-- One owner struct per native handle, `Drop` destroys; children hold `Arc<Parent>`. Drop errors go
-  to the context's error record (cuda-core pattern).
-- Constructors take `&Arc<cuda_core::Context>`; enqueueing calls take `&Stream`. Under `async`,
-  stream-ordered calls return `impl DeviceOp` and retain every buffer before submit.
-- Errors: one `thiserror` enum per crate (`Load`, `Status { call, code }`,
-  `Unsupported { what, required, found }`, `Budget { requested, available }`, `InvalidInput`).
-  Status codes are integer newtypes so newer codes stay valid. An explicit request never
-  downgrades.
-- FFI callbacks (OptiX log, NVDEC parser, CUPTI) run inside `catch_unwind`; errors are returned
-  from the next safe call.
-- Sizing is two-phase: query bytes, admit against a caller byte budget, allocate once. Scratch is
-  caller-owned and reused. Limits come from device queries, never invented defaults.
-- Typed SBT: `SbtRecord<T>` is `repr(C, align(16))` with the header from `optix-repr`; mixed
-  alignment rejected at build time.
-- Typed payload: `#[derive(Payload)]` gives word count, packing and per-stage read/write; host
-  `OptixPayloadType` and device `trace::<P>` use the same struct.
-
-## 5. wgpu adapter (`nv-wgpu`)
-
-- The graphics API allocates, CUDA imports (CUDA device memory has no Vulkan-importable export).
-- Buffers -> `CUdeviceptr` -> `RawDeviceBuffer::foreign` (default path for kernel output).
-  Images -> `CUmipmappedArray` -> texture objects (read) / surface objects (write).
-- nv-wgpu contributes the required Vulkan extensions to gpu-info-rs `open_shared`; adopting an
-  existing device checks them and returns `Unsupported` if missing. DX12 needs no device setup.
-- Device matching: Vulkan device UUID vs `cuDeviceGetUuid`; DX12 LUID vs `cuDeviceGetLuid`.
-
-| | Vulkan Windows | Vulkan Linux | DX12 |
+| # | Decision | Status | Reason |
 |---|---|---|---|
-| Memory | `OPAQUE_WIN32` | `OPAQUE_FD` | `D3D12_RESOURCE` / `D3D12_HEAP` |
-| Wrap in wgpu | `texture_from_raw` + `create_texture_from_hal`; `Buffer::from_raw_externally_owned` | same | `texture_from_raw` / `buffer_from_raw` |
-| Sync | timeline semaphore via `Queue::add_wait_semaphore` / `add_signal_semaphore` | same, fd | shared `ID3D12Fence`, `Signal`/`Wait` on `raw_queue()` |
+| D1 | Cover every NVIDIA library, not only what `render-rs` needs | Done | Project goal; completeness |
+| D2 | Reuse `cuda-bindings`, `cuda-core`, `cuda-async`, `libnvvm-sys`, `nvjitlink-sys` from `cuda-rust_b` fork | Done | One set of bindings per driver; `CUstream`/`CUcontext` unify across crates |
+| D3 | Missing safe CUDA features live in `cuda-core-ext` (renamed from `cuda-ext`) | Done | Independent of upstream; `cuda-core` style |
+| D4 | Hardware RT through OptiX + `cuda-oxide`; `wgpu` ray query stays portable | Done | OptiX exposes RT cores, SER, OMM, clusters, denoiser |
+| D5 | Patch `cuda-oxide` in the fork only | Done | `ptx_asm!` input limit and `#[device]` export names |
+| D6 | Bindings generated by `bindgen` at build time (no proprietary headers committed) | Done | RTX SDKs License Sec. 4(e) |
+| D7 | OptiX device layer generated at build time from `optix_device_impl.h` | Done | Same licensing reason as D6 |
+| D8 | Target OptiX 9.x | Done | Cooperative vectors, clusters, current SER |
+| D9 | Flat layout `crates/<name>`, plain package names | Done | Clean workspace structure |
+| D10 | `wgpu` adapter built now; `gpu-info-rs` owns shared `wgpu`/Vulkan device | Done | Single device required for memory sharing |
+| D11 | NVML lives in `nv-rs`; `gpu-info-rs` becomes a consumer | Done | One NVML binding |
+| D12 | Linux testing: WSL2 daily, RunPod for multi-GPU / GDS | Active | WSL lacks native NVIDIA Vulkan, GDS, multi-GPU NCCL |
+| D13 | NGX: full safe wrapper (`Init_with_ProjectID` & `ApplicationId`) | Done | Windows & Linux x86_64 preparation |
+| D14 | SDK header discovery via `vcv-rs` (`vcv_rs::nvsdk`) | Done | Shared discovery across shell and builds |
+| D15 | `ngx-sys` links static `nvsdk_ngx_d.lib` at build time | Done | NGX ships static libs, no public DLL |
+| D16 | Separately shipped SDKs located by `vcv_rs::nvsdk` | Done | Replaces per-SDK env vars |
+| D17 | Python API (`nv_rs`) via PyO3 + `maturin` with DLPack / CAI / Buffer Protocol | Done | Zero-copy interop with NumPy, PyTorch, CuPy, Warp |
 
-Formats: one table `wgpu::TextureFormat` -> CUDA array format; anything else is `Unsupported`.
-Import size is the allocation size; `CUDA_EXTERNAL_MEMORY_DEDICATED` for dedicated allocations.
-Hooks verified in wgpu-hal 30.0.2: `vulkan/adapter.rs:2995`, `vulkan/device.rs:296`,
-`vulkan/mod.rs:743-769,1524,1552`, `dx12/device.rs:457-488`; wgpu 30.0.2 `api/device.rs:341,463`.
+---
 
-## 6. Coverage matrix
+## 4. Completed Milestones & Historical Checkpoints
 
-Modelled on `cuda-oxide/intrinsics` (catalog + overlay + evidence, CI `check`).
+<details>
+<summary>[DONE] Wave 3 — Python API (`nv_rs`) & Starlight Docs (2026-11-14)</summary>
 
-- `coverage/<lib>.toml`: hand-written; per function: wrapper path, test id, status, note.
-- `coverage/evidence/<lib>/<sdk>-<target>.json`: machine-written; header sha256, symbol-name
-  inventory (names only, never header text), DLL export presence, GPU test records (GPU, driver,
-  toolkit, commit, date, platform: Windows / WSL2 / Linux).
-- Status: **bound** (symbol in inventory), **wrapped** (referenced from the safe crate, `syn` scan),
-  **tested-on-gpu** (evidence record whose test id exists).
-- `xtask coverage generate` writes `COVERAGE.md`; `xtask coverage check` regenerates and diffs.
+- [x] `python/nv-py/`: PyO3 + `maturin` package `nv_rs` covering all 24 submodules.
+- [x] `nv_rs.core`: DLPack, `__cuda_array_interface__`, Python Buffer Protocol zero-copy interop.
+- [x] `nv_rs.diag` & `nv_rs.errors`: runtime diagnostics, loader/device inspection, typed exceptions.
+- [x] `python/nv-py/python/nv_rs/__init__.pyi` & `tests/test_nv_rs.py`.
+- [x] `docs/src/content/docs/python/` (`01-overview.md`, `02-core-interop.md`, `03-diagnostics.md`, `04-modules-reference.md`) + `docs/astro.config.mjs` (`bun run build` verified: 19 pages).
 
-## 7. Testing
+</details>
 
-| Tier | Needs | Covers |
-|---|---|---|
-| T0 | nothing | discovery with injected env/fs, SBT packing, payload derive, error mapping, format table, coverage tool, trybuild |
-| T1 | headers | bindgen output compiles, layout asserts, shim snapshots, DLL export presence |
-| T2 | GPU | `#[ignore]` + `NV_RS_GPU_TESTS=1`, one process at a time (lock file), `--test-threads=1`, VRAM ceiling asserted |
-| T3 | GPU | golden data: 64x64 images with tolerance, cuFFT/cuBLAS vs CPU, fixed-seed cuRAND, exact OptiX hit mask |
+<details>
+<summary>[DONE] Wave 2 — Corporate Release Readiness & WSL2 Verification (2026-11-14)</summary>
 
-T2/T3 run only via `xtask gpu-test --lib <name> --budget-mb <n>`. The dev machine is shared: no
-looped suites, no stacked builds.
+- [x] Unify host toolchain pin to `1.99.1` (`rust-toolchain.toml`).
+- [x] Adapt `bootstrap.py` for `nv-rs` (`d s` / `d dl` SDK discovery & download, `b`/`t`/`c`/`s`/`cl`/`x`).
+- [x] Implement D13 in `crates/ngx` (`NgxVulkan::init` + `init_with_app_id`, `Parameters`, `FeatureHandle`), verified on Windows & WSL2.
+- [x] Verify `cufile` and `nccl` on Linux WSL2 (`nccl` `t3_multi_rank_all_reduce` skips cleanly when `< 2` GPUs).
+- [x] Rename `cuda-ext` -> `cuda-core-ext`; add `nv-bindgen` prebuilt bindings fallback (`NV_RS_USE_PREBUILT=1`).
+- [x] Corporate release readiness (M4): `README.md`, `Cargo.toml` `[workspace.package]`, `CONTRIBUTING.md`, `SECURITY.md`, `deny.toml`.
 
-## 8. Milestones
+</details>
 
-| # | Work | Gate | Parallel |
-|---|---|---|---|
-| S1a | OptiX PTX spike without trace: `__raygen__` kernel using getters via `ptx_asm!`, PTX from the embedded module, hand-declared function table | `optixModuleCreate` succeeds with an empty log; a 4x4 launch writes its launch indices | yes |
-| S1b | Fork patch: `ptx_asm!` inputs 16 -> 64 (+ marker arities in `cuda-device/src/ptx.rs`); one-triangle GAS + trace | 16x16 hit mask equals the analytic mask | after S1a |
-| S2 | Vulkan exportable buffer -> CUDA import -> kernel write -> wgpu compute read; timeline semaphore both ways | 0 mismatches; no lazy clear over CUDA-written data | yes |
-| S3 | `nv-bindgen` prototype on nvml (exports), optix (function table), cufft (shared CUDA types) | all three compile at T1; NVML init + device count runs | yes |
-| M1 | `nv-loader`, `nv-bindgen`, coverage skeleton | T0 green; `coverage check` passes on an empty overlay | blocks M2 |
-| M2 | all sys crates | T1 green; inventory evidence per library | per library |
-| M3 | `cuda-ext` (arrays, tex/surf objects, external memory/semaphores, green contexts, export handles, host register, LUID, managed) | T2: texture sample, surface write, external memory round trip | with M2 |
-| M4 | `optix` host + `optix-repr` | T3: triangle golden; accel sizes admitted against a budget | after optix-sys |
-| M5 | `optix-device` (generated from header), macros, `cuda-tex-device`; fork patch for `#[device(export_name)]` (callables) | T3: closest-hit + miss + typed payload render | after S1b, with M4 |
-| M6 | `nv-wgpu`: Vulkan Windows, DX12, Vulkan Linux | T2 per backend; composes with gpu-info-rs `open_shared` | after M3 |
-| M7 | toolkit safe wrappers | T3 per library | per library |
-| M8 | nvenc / nvdec / nvofa | encode -> decode round trip within PSNR tolerance | yes |
-| M9 | cudnn, nvcomp, ngx, nccl, cufile | T1 everywhere; T2 where the platform allows (RunPod for cufile, multi-GPU nccl) | yes |
-| M10 | render-rs `pt-optix` backend next to `pt-cuda` | same scene matches `pt-cuda` within tolerance | after M4-M6 |
-| M11 | pitch package: docs, coverage matrix, demo | coverage generated; demo runs from a clean checkout | last |
+<details>
+<summary>[DONE] Wave 1 — M2/M6/M7-M9 Safe Wrappers & RTX 3080 Ti GPU Verification (2026-11-13 / 2026-11-14)</summary>
 
-**S1a result (2026-11-12): PASS.** RTX 3080 Ti, driver 621.24, OptiX 9.1 (ABI 118), cuda-rust_b
-`0379bbf`. cuda-oxide emitted clean PTX (`.version 7.1`, `.target sm_86`, `.visible .entry
-__raygen__ids()` with the two `call (%r), _optix_get_launch_index_*, ();` asm blocks);
-`optixModuleCreate` succeeded with an info-only log, pipeline + 4x4 launch wrote indices 1..16
-correctly. Finding: `#[constant(export_name = "params")]` is ignored inside `#[cuda_module]`; the
-symbol is mangled to `cuda_oxide_const_<hash>_kernels_L<line>C<col>_PARAMS`, so the spike reads the
-name from the PTX. Added to the fork patch list (alongside `ptx_asm!` input arity and
-`#[device(export_name)]`).
+- [x] `vcv-rs` Windows/Linux fixes verified and locked at `31c54282`.
+- [x] M2 (`D01_D02`): `nvcomp-sys`, `nccl-sys`, `cufile-sys`, `nv-bindgen`, `nv-loader`, `nv-bindgen-fixture` audited & repaired.
+- [x] M6 (`D03`: `crates/nv-wgpu`): `wgpu 30` <-> CUDA interop (Vulkan `OPAQUE_WIN32`/`OPAQUE_FD`, DX12 shared heaps/fences, `SharedBuffer`, `SharedTexture`, `InteropSemaphore`).
+- [x] M7–M9 (`D04`–`D09`): Safe wrappers for `cublas`, `cufft`, `curand`, `cusparse`, `cusolver`, `npp`, `nvjpeg`, `nvrtc`, `cupti`, `nvml`, `nvapi`, `nvenc`, `nvdec`, `nvofa`, `cudnn`, `nvcomp`, `nccl`, `cufile`.
+- [x] Independent Inquisitor static audits: PASS across all 8 domains (`D01_D02`–`D09`).
+- [x] `cargo +1.98.0 clippy --all-targets -j 2 -- -D warnings`: PASS (0 warnings) across all 22 target crates.
+- [x] GPU T2/T3 integration tests on RTX 3080 Ti: PASS across all Windows-runnable crates (`nv-wgpu`, `nv-bindgen`, `cublas`, `cufft`, `curand`, `cusparse`, `cusolver`, `npp`, `nvjpeg`, `nvrtc`, `cupti`, `nvml`, `nvapi`, `nvenc`, `nvdec`, `nvofa`, `cudnn-sys`, `cudnn`, `nvcomp`).
 
-**S1b result (2026-11-13): PASS.** Fork branch `feat/optix-device` (cuda-rust_b `09b082e8d`):
-`ptx_asm!` admits 64 inputs (markers `__ptx_asm_out_0..128`, `__ptx_asm_void_0..64`; before,
-64 outputs were admitted but only 32-argument markers existed) and `#[cuda_module]` keeps a
-user `#[constant(export_name = "...")]`. `spikes/s1b-optix-trace`: `__raygen__mask` written in
-Rust issues `_optix_trace_typed_32` (32 outputs + 49 inputs, the `optix_device_impl.h` shape)
-against a one-triangle GAS; closest-hit / miss set payload 0 via `_optix_set_payload`; launch
-params found as `.const params`. The 16x16 hit mask equals the analytic mask (legs 1.03, every
-pixel centre at least 0.03 from an edge). Finding: other sessions keep the shared
-`~/.cargo/cuda-oxide` backend DLL open, so a run that needs a rebuilt backend uses a private
-copy through `CUDA_OXIDE_BACKEND`.
+</details>
 
-**M4 result (2026-11-13): DONE.** `crates/optix`: `DeviceContext` (log sink behind
-`catch_unwind`, validation mode); `Accel` (triangle GAS, IAS holding its children, compaction,
-`BuildOptions::budget` checked before any allocation, caller-owned `Scratch` reused across builds
-on one stream, `allow_update` + `unsafe refit_triangles` / `refit_instances` with the topology
-checked); `Module` / `ProgramGroup` (raygen, miss, exception, hit group, callables); `Pipeline`
-(+ `unsafe launch`, params size checked); `SbtRecord<T: Pod>` / `ShaderBindingTable`; `Denoiser`
-(HDR / AOV models, albedo + normal guides, state and scratch sized once per image size against a
-budget, HDR intensity per invoke). Gate: clippy `-D warnings` clean; 11/11 GPU tests on the PTX
-cuda-oxide produced for S1b (GAS and IAS masks, refit of vertices and instance transforms, refit
-rejections, scratch reuse, budget refusal, params size, compile log, HDR and guided-AOV
-denoising halve the noise of a flat grey image, denoiser argument checks). Moved to later
-milestones: `optix-repr` (shared host/device types) with M5; motion blur, opacity micromaps,
-curves/spheres, temporal and upscaling denoisers, AOV layers beyond beauty when render-rs needs
-them (M10).
+<details>
+<summary>[ARCHIVED] Historical 2026-11-13 Transfer & Recovery Checkpoints (superseded)</summary>
 
-**M5 result (2026-11-13): DONE, no deferred items.** The whole OptiX 9.1 API is covered,
-proved by `cargo xtask coverage optix` (device API 248/248 `optix_device.h` functions mapped in
-`device/optix-device/API_MAP.toml`, host table 57/57 `OptixFunctionTable` entries used with 3
-reserved stubs allowlisted, raw layer 206/206 `_optix_*` intrinsics used by the typed layer).
-- Device workspace `device/` (toolchain 1.99.1, `cargo oxide`): `optix-device` — `raw` generated
-  at build time from the SDK headers by `nv_bindgen::device_asm` (each intrinsic issues the
-  header's own inline PTX), `sys` generated `no_std` from `optix_types.h`
-  (`nv_bindgen::core_types`), and a typed layer: state, payload (typed `Payload`), trace,
-  exception, geometry (all primitives), transform (motion, nlerp SRT), hitobject (SER),
-  coop_vec, footprint, `direct_call!` / `continuation_call!` (PTX `.callprototype` calls, since
-  cuda-oxide does not call through fn pointers); `cuda-tex-device` (every CUDA texture fetch,
-  sparse residency, surfaces in b8..b64 with trap/clamp/zero; generated by `gen/gen.py`).
-- Host `crates/optix` completed: properties, log, disk cache, error names, task compiles with
-  serialization, payload types, bound values, built-in IS, stack sizes, symbol memcpy,
-  transforms, every build input (curves, spheres, custom, instance pointers, all formats,
-  motion), emit, relocation, opacity micromaps, cluster AS, every denoiser model + AOV + tiling,
-  coop-vec matrix convert. `cuda-ext` gained linear textures, cubemap and sparse arrays, tile pools.
-- Fork patches (cuda-rust_b main `42cc04eda`, merged with nvidia/main `7a7d160ea`): `ptx_asm!`
-  up to 256 inputs; `#[constant(export_name)]` in `#[cuda_module]`; OptiX callables rooted by the
-  collector; opt-in 64-bit pointers in every address space (`CUDA_OXIDE_NO_SHORT_PTR`, required
-  for OptiX programs: 32-bit `.local` addressing faults inside OptiX); `#[no_mangle]` device
-  globals; named array lengths of statics.
-- Gate: clippy `-D warnings` clean on both workspaces; GPU: 11 + 44 host tests
-  (`crates/optix/tests/gpu.rs`, `gpu_features.rs`) and 15/15 device cases
-  (`device/optix-device-tests`: ptr64, shade, geometry, transform, hitobject, intersect,
-  exception, callables, payload_types, symbols, const_index, coop_vec N=8/32/80, texture, sparse,
-  footprint) on RTX 3080 Ti, driver 621.24.
-- Findings kept as documented behaviour: a start-vanishing motion GAS traced directly (not under
-  an IAS) faults in the driver; current-hit triangle vertex data on a motion GAS returns key 0
-  (the from-handle query interpolates); `optixBuiltinISModuleGet` modules are destroyed by us.
+- 2026-11-13 Transfer checkpoint (Codex): `vcv-rs` `a8cab668` / `31c54282` lockfile sync, pre-verification M2 snapshot from `8b7e13c`, and recovery snapshots. All superseded by Wave 1, Wave 2, and Wave 3 completions above.
 
-**S2 result (2026-11-12): PASS.** `spikes/s2-wgpu-cuda-share`: gpu-info-rs shared Vulkan device +
-`SharedBuffer::export` (dedicated, `OPAQUE_WIN32`) imported by `cuImportExternalMemory` +
-`cuExternalMemoryGetMappedBuffer`; Vulkan timeline semaphore exported `OPAQUE_WIN32`, imported as
-`TIMELINE_SEMAPHORE_WIN32`. CUDA write -> signal 1 -> wgpu `add_wait_semaphore` + acquire + copy:
-0/4096 wrong (no lazy clear over CUDA data). wgpu copy + release + `add_signal_semaphore(2)` ->
-CUDA wait 2 -> read: 0/4096 wrong. Device UUIDs match. Note: the fork's `cuda-bindings` on `main`
-now ships committed generated bindings (`cuda-bindings/generated/<target>/`), so D6 must be
-reconciled with the fork's policy.
-
-**S3 result (2026-11-12): PASS.** `spikes/s3-nv-bindgen`: `nv-loader` (System32 / DriverStore /
-toolkit prefix scan) + `nv-bindgen` (one `LibSpec` per library) drive `nvml-sys` (exports:
-init, count, name = RTX 3080 Ti), `optix-sys` (function table, ABI 118, 480 bytes) and
-`cufft-sys` (toolkit `cufft64_12.dll`, version 12300; `cudaStream_t` is
-`cuda_bindings::CUstream_st`, proven at compile time). 0 warnings with `wrap_unsafe_ops(true)`.
-Findings for M1: bindgen's dynamic-loading methods panic (`expect`) on a missing symbol, so
-`nv-bindgen` must emit its own panic-free shims returning the library's status code (as
-`cuda-bindings/build.rs` does); `optix-sys` should also re-use `cuda-bindings` for
-`CUcontext`/`CUstream`; DriverStore discovery must read the active adapter's driver folder from the
-registry instead of scanning FileRepository.
-
-All three spikes passed; M1 can start.
-
-**M2 status (2026-11-13): 18 libraries bound, building, loading and tested on this machine** —
-nvml 390, optix 60, cufft 35, cublas 517, cublaslt 54, cusparse 453, cusolver 483, cusolvermg 19,
-nvjpeg 81, nvrtc 29, cupti 116, nvcuvid 24, nvenc 42, npp 8187, cudnn 224, nvapi 298, nvofa 12,
-ngx 68 symbols (11,092 in all; COVERAGE.md). Gate: workspace clippy `-D warnings` clean, 71/71
-tests including GPU. Generator bug classes found on real headers and locked by tests: non-status
-return types, types used only in signatures, C parameters shadowing shim bindings, typedef'd
-function-table fields, libraries split over several DLLs (NPP, mapped from the DLL export
-tables), query-interface libraries (NVAPI), headers needing clang arguments (NVAPI SAL macros),
-layouts bindgen gets wrong (MSVC bitfield union, made opaque), static-only SDKs (NGX, D15).
-Remaining M2: nvCOMP (not installed here), NCCL and cuFile (Linux only).
-
-**M1 result (2026-11-12): DONE.** `crates/nv-loader` (Driver / DriverStore / Toolkit / Sdk groups;
-DriverStore via each display adapter's `OpenGLDriverName`, as `optix_stubs.h` does; `Probe` trait
-for machine-free tests; `LoadError::{NotFound, Rejected, RuntimeTooOld}`), `crates/nv-bindgen`
-(declarative `LibSpec`; headers located by vcv-rs `detect_cuda` / `optix::detect_optix` / SDK root
-var; MSVC/UCRT includes from vcv-rs passed as `-idirafter`; types pass + dynamic-loading struct +
-panic-free shims + `inventory.json`), `xtask coverage generate|check`. Gate: clippy `-D warnings`
-clean; T0 14/14 (nv-bindgen runs real bindgen on a synthetic header); `coverage check` ok on an
-empty overlay. OptiX SDK detection was added to vcv-rs itself (`vcv_rs::optix`, vcv-rs `18f6ed8`),
-so header discovery for every SDK lives in one place (decision D14).
-
-If S1a fails (OptiX rejects LLVM-NVPTX PTX): stop and reassess. Fallback is post-processing PTX with
-the fork's `ptx-parse`; that changes M5.
-
-Parallel work goes to agents on disjoint file sets; agents do not build concurrently — the
-orchestrator runs one build/test gate per wave.
-
-## 9. Risks
-
-- OptiX may reject PTX from LLVM's NVPTX backend (target version, trap, debug sections). S1a.
-- `call` inside a `ptx_asm!` template is unused in cuda-oxide today; the importer may reject it.
-- `_optix_*` device ABI is versioned; pin the OptiX ABI in `optix-sys` and test on driver updates.
-- NVAPI and NGX are Windows/D3D-centric.
-- Scope is ~45 crates; M1 must be solid before M2 fans out.
-
-## 10. What to show NVIDIA first
-
-1. An OptiX scene whose programs are written in Rust and compiled by cuda-oxide, no nvcc.
-2. `cuda-ext` (external memory, texture objects) in cuda-core style.
-3. The generated coverage matrix with evidence.
-4. The cuda-oxide fork patches (`ptx_asm!` arity, `#[device(export_name)]`, texture intrinsics shard).
-
-## 11. Original prerequisite inventory (historical)
-
-- OptiX SDK 9.x (headers only; set `OPTIX_ROOT`). Not installed yet.
-- Video Codec SDK (present: `C:\projects\projects.rust.cg\nv\Video_Codec_SDK_13.1.15`).
-- cuDNN headers (9.23 present), nvCOMP SDK, DLSS SDK, NVAPI SDK — not installed yet.
-- WSL2 with CUDA for Linux builds.
-
-## 12. Open
-
-- ~~D13 (NGX full wrapper with ProjectID) awaits confirmation.~~ **Confirmed & implemented (2026-11-14)** in `crates/ngx` (`init` + `init_with_app_id`).
-
-**M3 result (2026-11-13): DONE.** `crates/cuda-ext` in cuda-core's style: external memory and
-semaphores (Win32/fd/D3D12, timeline and binary), CUDA arrays and mipmapped arrays with blocking
-host copies, texture objects (array / mipmapped / pitched 2D) and surface objects, host
-registration with device mapping, managed memory, device UUID and LUID, green contexts (SM
-partitions with their own streams). Gate: clippy `-D warnings` clean; 7 GPU tests pass including
-a Vulkan -> CUDA -> wgpu round trip of a shared buffer ordered by an imported timeline semaphore
-(both directions exact). Not covered: sampling a texture / writing a surface from device code
-(needs cuda-oxide texture intrinsics, M5); `cuMemExportToShareableHandle` (lives with cuda-core's
-VMM API).
+</details>

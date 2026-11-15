@@ -3,7 +3,7 @@
   "headers": [
     {
       "name": "cudnn.h",
-      "sha256": "f113f07032ea02b54ca17d6e0469e1adb362ca6bfe26a8627f77f94de7a6ef04"
+      "sha256": "1c926a330ff35736b3b5af7f4ac32ad8c35c72e0dbcfc952f78bed59a4e7b05c"
     }
   ],
   "symbols": [
@@ -11,6 +11,8 @@
     "cudnnActivationForward",
     "cudnnAddTensor",
     "cudnnAdvVersionCheck",
+    "cudnnB2BCausalConv1dBackward",
+    "cudnnB2BCausalConv1dForward",
     "cudnnBackendCreateDescriptor",
     "cudnnBackendDestroyDescriptor",
     "cudnnBackendExecute",
@@ -30,6 +32,8 @@
     "cudnnCTCLoss_v8",
     "cudnnCausalConv1dBackward",
     "cudnnCausalConv1dForward",
+    "cudnnCausalConv1dNwhBackward",
+    "cudnnCausalConv1dNwhForward",
     "cudnnCnnVersionCheck",
     "cudnnConvolutionBackwardBias",
     "cudnnConvolutionBackwardData",
@@ -84,6 +88,8 @@
     "cudnnDropoutForward",
     "cudnnDropoutGetReserveSpaceSize",
     "cudnnDropoutGetStatesSize",
+    "cudnnFFTCausalConv1dBackward",
+    "cudnnFFTCausalConv1dForward",
     "cudnnFindConvolutionBackwardDataAlgorithm",
     "cudnnFindConvolutionBackwardDataAlgorithmEx",
     "cudnnFindConvolutionBackwardFilterAlgorithm",
@@ -159,11 +165,20 @@
     "cudnnGetTensorSizeInBytes",
     "cudnnGetTensorTransformDescriptor",
     "cudnnGetVersion",
+    "cudnnGnnAggSimpleBackward",
+    "cudnnGnnAggSimpleForward",
+    "cudnnGnnMhaGatBackward",
+    "cudnnGnnMhaGatForward",
+    "cudnnGnnMhaGatV2Backward",
+    "cudnnGnnMhaGatV2Forward",
     "cudnnGraphVersionCheck",
     "cudnnIm2Col",
     "cudnnInitTransformDest",
     "cudnnLRNCrossChannelBackward",
     "cudnnLRNCrossChannelForward",
+    "cudnnLongFFTCausalConv1dBackward",
+    "cudnnLongFFTCausalConv1dForward",
+    "cudnnLongFFTCausalConv1dGetBufferSizes",
     "cudnnMakeFusedOpsPlan",
     "cudnnMultiHeadAttnBackwardData",
     "cudnnMultiHeadAttnBackwardWeights",
@@ -234,6 +249,7 @@
   ],
   "unshimmed": [
     "cudnnGetCudartVersion",
+    "cudnnGetLastErrorString",
     "cudnnGetMaxDeviceVersion",
     "cudnnGetVersion"
   ]

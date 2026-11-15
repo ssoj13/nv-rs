@@ -1,0 +1,91 @@
+lib = "cublas"
+
+[[fn]]
+name = "cublasCreate_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasDestroy_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasDgemmBatched"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasDgemmStridedBatched"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasDgemm_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGemmEx"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGemmStridedBatchedEx"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGetMathMode"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGetPointerMode_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGetStatusName"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasGetVersion_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSetMathMode"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSetPointerMode_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSetStream_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSetWorkspace_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSgemmBatched"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSgemmStridedBatched"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"
+
+[[fn]]
+name = "cublasSgemm_v2"
+wrapper = "cublas"
+test = "status_newtype_is_copy_and_preserves_unknown_codes"

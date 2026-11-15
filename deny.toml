@@ -30,7 +30,8 @@ unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    "ssh://git@github.com/ssoj13/vcv-rs.git",
-    "ssh://git@github.com/ssoj13/cuda-rust_b.git",
-    "ssh://git@github.com/ssoj13/gpu-info-rs.git",
+    "https://github.com/NVIDIA/cuda-rust.git",
+    "https://github.com/ssoj13/vcv-rs.git",
+    "https://github.com/ssoj13/cuda-rust_b.git",
+    "https://github.com/ssoj13/gpu-info-rs.git",
 ]

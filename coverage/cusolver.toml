@@ -1,0 +1,191 @@
+lib = "cusolver"
+
+[[fn]]
+name = "cusolverDnCreate"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDestroy"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgeqrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgeqrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgesvd"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgesvd_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgetrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgetrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDgetrs"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDorgqr"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDorgqr_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDpotrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDpotrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDpotrs"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDsyevd"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnDsyevd_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSetStream"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgeqrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgeqrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgesvd"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgesvd_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgetrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgetrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSgetrs"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSorgqr"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSorgqr_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSpotrf"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSpotrf_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSpotrs"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSsyevd"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverDnSsyevd_bufferSize"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpCreate"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpDcsreigvsi"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpDcsrlsvqr"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpDestroy"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpScsreigvsi"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpScsrlsvqr"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"
+
+[[fn]]
+name = "cusolverSpSetStream"
+wrapper = "cusolver"
+test = "dn_lu_getrf_getrs_solves_and_checks_residual"

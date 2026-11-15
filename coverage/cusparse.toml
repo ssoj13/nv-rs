@@ -1,0 +1,206 @@
+lib = "cusparse"
+
+[[fn]]
+name = "cusparseCreate"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateBlockedEll"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateCoo"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateCsc"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateCsr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateDnMat"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCreateDnVec"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseCsrSetPointers"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseDestroy"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseDestroyDnMat"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseDestroyDnVec"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseDestroySpMat"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseGetErrorName"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseGetPointerMode"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseGetStream"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseGetVersion"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSetPointerMode"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSetStream"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpGEMM_compute"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpGEMM_copy"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpGEMM_createDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpGEMM_destroyDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpGEMM_workEstimation"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMM"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMM_bufferSize"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMM_preprocess"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMV"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMV_bufferSize"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMV_preprocess"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMatGetSize"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpMatSetAttribute"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSM_analysis"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSM_bufferSize"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSM_createDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSM_destroyDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSM_solve"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSV_analysis"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSV_bufferSize"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSV_createDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSV_destroyDescr"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"
+
+[[fn]]
+name = "cusparseSpSV_solve"
+wrapper = "cusparse"
+test = "spmv_csr_f32_matches_reference"

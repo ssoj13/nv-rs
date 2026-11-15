@@ -1,0 +1,281 @@
+lib = "nvml"
+
+[[fn]]
+name = "nvmlDeviceGetArchitecture"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetBAR1MemoryInfo"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetClockInfo"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetComputeRunningProcesses_v3"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCount_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCudaComputeCapability"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCurrPcieLinkGeneration"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCurrPcieLinkWidth"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCurrentClocksEventReasons"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetCurrentClocksThrottleReasons"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetDecoderUtilization"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetEccMode"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetEncoderUtilization"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetEnforcedPowerLimit"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetFanSpeed"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetFanSpeed_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetGraphicsRunningProcesses_v3"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetHandleByIndex_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetHandleByPciBusId_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetHandleByUUID"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetIndex"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetMaxClockInfo"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetMaxPcieLinkGeneration"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetMaxPcieLinkWidth"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetMemoryInfo"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetMemoryInfo_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetName"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetNumFans"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetNvLinkCapability"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetNvLinkErrorCounter"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetNvLinkState"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetNvLinkVersion"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPciInfo_v3"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPcieReplayCounter"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPcieThroughput"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPerformanceState"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPowerManagementDefaultLimit"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPowerManagementLimit"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPowerManagementLimitConstraints"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetPowerUsage"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetSerial"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetTemperature"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetTemperatureThreshold"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetTotalEccErrors"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetTotalEnergyConsumption"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetUUID"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetUtilizationRates"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlDeviceGetVbiosVersion"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlErrorString"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlInitWithFlags"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlInit_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlShutdown"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlSystemGetCudaDriverVersion_v2"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlSystemGetDriverBranch"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlSystemGetDriverVersion"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "nvmlSystemGetNVMLVersion"
+wrapper = "nvml"
+test = "status_copy_classification_and_formatting"

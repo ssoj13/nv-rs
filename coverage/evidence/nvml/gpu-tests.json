@@ -1,0 +1,11 @@
+[
+  {
+    "test": "status_copy_classification_and_formatting",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  }
+]

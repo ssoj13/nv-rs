@@ -16,8 +16,8 @@ pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py311", "gene
 thiserror = "2"
 
 nv-loader = { path = "../../crates/nv-loader" }
-cuda-core = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
-cuda-bindings = { git = "ssh://git@github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
+cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 nvml = { path = "../../crates/nvml" }
 nvrtc = { path = "../../crates/nvrtc" }
 nvcomp = { path = "../../crates/nvcomp" }

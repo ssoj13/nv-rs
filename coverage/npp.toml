@@ -1,0 +1,96 @@
+lib = "npp"
+
+[[fn]]
+name = "nppGetLibVersion"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiFilterBox_8u_C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiFilterBox_8u_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiFilterGauss_8u_C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiFilterGauss_8u_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiRGBToGray_8u_C3C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiRGBToYCbCr_8u_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiResize_32f_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiResize_8u_C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiResize_8u_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiResize_8u_C4R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiThreshold_Val_32f_C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiThreshold_Val_8u_C1R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppiYCbCrToRGB_8u_C3R_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppsAdd_32f_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppsMul_32f_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppsSet_32f_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppsSumGetBufferSize_32f_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"
+
+[[fn]]
+name = "nppsSum_32f_Ctx"
+wrapper = "npp"
+test = "color_convert_and_resize_roundtrip"

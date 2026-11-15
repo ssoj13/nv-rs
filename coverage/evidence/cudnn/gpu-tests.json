@@ -1,0 +1,29 @@
+[
+  {
+    "test": "t0_rank_and_enum_validation",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  },
+  {
+    "test": "t0_scale_pair_abi_selection",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  },
+  {
+    "test": "t0_status_and_datatype_mapping",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  }
+]

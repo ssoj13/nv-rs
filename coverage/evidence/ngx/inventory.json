@@ -7,11 +7,11 @@
     },
     {
       "name": "nvsdk_ngx.h",
-      "sha256": "96f21266a05ef06bb49f58c89de1a7845f2d9b1e0e0e069fe03740b8eaf0344d"
+      "sha256": "dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
     },
     {
       "name": "nvsdk_ngx_vk.h",
-      "sha256": "3be54d0103cce02174fd34912c60c9f40c73b5eec919e42613a2268c589c53ad"
+      "sha256": "2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d"
     }
   ],
   "symbols": [

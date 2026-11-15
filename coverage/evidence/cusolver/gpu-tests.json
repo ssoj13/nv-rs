@@ -1,0 +1,11 @@
+[
+  {
+    "test": "dn_lu_getrf_getrs_solves_and_checks_residual",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  }
+]

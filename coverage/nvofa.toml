@@ -1,0 +1,61 @@
+lib = "nvofa"
+
+[[fn]]
+name = "nvCreateOpticalFlowCuda"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFCreateGPUBufferCuda"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFDestroy"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFDestroyGPUBufferCuda"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFExecute"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFGPUBufferGetCUarray"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFGPUBufferGetCUdeviceptr"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFGPUBufferGetStrideInfo"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFGetCaps"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFGetLastError"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFInit"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"
+
+[[fn]]
+name = "nvOFSetIOCudaStreams"
+wrapper = "nvofa"
+test = "optical_flow_detects_synthetic_shift"

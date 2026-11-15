@@ -1,0 +1,286 @@
+lib = "optix"
+
+[[fn]]
+name = "optixAccelBuild"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixAccelCompact"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixAccelComputeMemoryUsage"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixAccelEmitProperty"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixAccelGetRelocationInfo"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixAccelRelocate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixBuiltinISModuleGet"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixCheckRelocationCompatibility"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixClusterAccelBuild"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixClusterAccelComputeMemoryUsage"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixConvertPointerToTraversableHandle"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixCoopVecMatrixComputeSize"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixCoopVecMatrixConvert"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserComputeAverageColor"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserComputeIntensity"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserComputeMemoryResources"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserCreate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserCreateWithUserModel"
+wrapper = "optix"
+test = "context_reports_every_property"
+
+[[fn]]
+name = "optixDenoiserDestroy"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserInvoke"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDenoiserSetup"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextCancelCreations"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextCreate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextDestroy"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextGetCacheDatabaseSizes"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextGetCacheEnabled"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextGetCacheLocation"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextGetProperty"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextSetCacheDatabaseSizes"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextSetCacheEnabled"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextSetCacheLocation"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixDeviceContextSetLogCallback"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixGetErrorName"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixGetErrorString"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixLaunch"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixModuleCancelCreation"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixModuleCreate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixModuleCreateWithTasks"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixModuleDestroy"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixModuleGetCompilationState"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixOpacityMicromapArrayBuild"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixOpacityMicromapArrayComputeMemoryUsage"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixOpacityMicromapArrayGetRelocationInfo"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixOpacityMicromapArrayRelocate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixPipelineCreate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixPipelineDestroy"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixPipelineSetStackSize"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixPipelineSetStackSizeFromCallDepths"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixPipelineSymbolMemcpyAsync"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixProgramGroupCreate"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixProgramGroupDestroy"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixProgramGroupGetStackSize"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixSbtRecordPackHeader"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixTaskDeserializeOutput"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixTaskExecute"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixTaskGetSerializationKey"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"
+
+[[fn]]
+name = "optixTaskSerializeOutput"
+wrapper = "optix"
+test = "traces_a_compacted_triangle_gas"

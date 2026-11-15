@@ -1,0 +1,37 @@
+lib = "nvcuvid"
+
+[[fn]]
+name = "cuvidCreateDecoder"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidCreateVideoParser"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidDecodePicture"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidDestroyDecoder"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidDestroyVideoParser"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidGetDecoderCaps"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidMapVideoFrame64"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidParseVideoData"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"
+
+[[fn]]
+name = "cuvidUnmapVideoFrame64"
+test = "nvenc_to_nvdec_h264_roundtrip_psnr"

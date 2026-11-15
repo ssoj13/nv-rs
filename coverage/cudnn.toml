@@ -1,0 +1,196 @@
+lib = "cudnn"
+
+[[fn]]
+name = "cudnnActivationForward"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnBatchNormalizationForwardInference"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnConvolutionForward"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnCreate"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnCreateActivationDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnCreateConvolutionDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnCreateFilterDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnCreatePoolingDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnCreateTensorDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnDeriveBNTensorDescriptor"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnDestroy"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnDestroyActivationDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnDestroyConvolutionDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnDestroyFilterDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnDestroyPoolingDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnDestroyTensorDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnGetConvolution2dForwardOutputDim"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnGetConvolutionForwardWorkspaceSize"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnGetCudartVersion"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnGetErrorString"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnGetFilterSizeInBytes"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnGetMaxDeviceVersion"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnGetPooling2dForwardOutputDim"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnGetTensorSizeInBytes"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnGetVersion"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnPoolingForward"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"
+
+[[fn]]
+name = "cudnnSetActivationDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetConvolution2dDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetConvolutionGroupCount"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetConvolutionMathType"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetConvolutionNdDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetFilter4dDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetFilterNdDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetPooling2dDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetPoolingNdDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetStream"
+wrapper = "cudnn"
+test = "t0_status_and_datatype_mapping"
+
+[[fn]]
+name = "cudnnSetTensor4dDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSetTensorNdDescriptor"
+wrapper = "cudnn"
+test = "t0_rank_and_enum_validation"
+
+[[fn]]
+name = "cudnnSoftmaxForward"
+wrapper = "cudnn"
+test = "t0_scale_pair_abi_selection"

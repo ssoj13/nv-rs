@@ -1,0 +1,116 @@
+lib = "ngx"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetD"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetF"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetI"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetUI"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetULL"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_GetVoidPointer"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetD"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetF"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetI"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetUI"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetULL"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_Parameter_SetVoidPointer"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_AllocateParameters"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_CreateFeature"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_DestroyParameters"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_EvaluateFeature_C"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_GetCapabilityParameters"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_GetScratchBufferSize"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_Init"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_Init_with_ProjectID"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_ReleaseFeature"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_RequiredExtensions"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"
+
+[[fn]]
+name = "NVSDK_NGX_VULKAN_Shutdown1"
+wrapper = "ngx"
+test = "ngx_vulkan_required_extensions_smoke"

@@ -8195,5 +8195,8 @@
     "nppsZero_64sc_Ctx",
     "nppsZero_8u_Ctx"
   ],
-  "unshimmed": []
+  "unshimmed": [
+    "nppiFree",
+    "nppsFree"
+  ]
 }

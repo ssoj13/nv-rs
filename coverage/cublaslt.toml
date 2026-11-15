@@ -1,0 +1,40 @@
+lib = "cublaslt"
+
+[[fn]]
+name = "cublasLtCreate"
+
+[[fn]]
+name = "cublasLtDestroy"
+
+[[fn]]
+name = "cublasLtMatmul"
+
+[[fn]]
+name = "cublasLtMatmulAlgoGetHeuristic"
+
+[[fn]]
+name = "cublasLtMatmulDescCreate"
+
+[[fn]]
+name = "cublasLtMatmulDescDestroy"
+
+[[fn]]
+name = "cublasLtMatmulDescSetAttribute"
+
+[[fn]]
+name = "cublasLtMatmulPreferenceCreate"
+
+[[fn]]
+name = "cublasLtMatmulPreferenceDestroy"
+
+[[fn]]
+name = "cublasLtMatmulPreferenceSetAttribute"
+
+[[fn]]
+name = "cublasLtMatrixLayoutCreate"
+
+[[fn]]
+name = "cublasLtMatrixLayoutDestroy"
+
+[[fn]]
+name = "cublasLtMatrixLayoutSetAttribute"

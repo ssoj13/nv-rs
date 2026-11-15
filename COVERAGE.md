@@ -6,24 +6,25 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Library | Symbols | Bound | Wrapped | Tested on GPU |
 |---|---:|---:|---:|---:|
-| cublas | 517 | 517 | 0 | 0 |
+| cublas | 517 | 517 | 18 | 18 |
 | cublaslt | 54 | 54 | 0 | 0 |
-| cudnn | 224 | 224 | 0 | 0 |
-| cufft | 35 | 35 | 0 | 0 |
-| cupti | 116 | 116 | 0 | 0 |
-| cusolver | 483 | 483 | 0 | 0 |
+| cudnn | 239 | 239 | 39 | 39 |
+| cufft | 35 | 35 | 20 | 20 |
+| cupti | 116 | 116 | 13 | 13 |
+| cusolver | 483 | 483 | 38 | 38 |
 | cusolvermg | 19 | 19 | 0 | 0 |
-| cusparse | 453 | 453 | 0 | 0 |
-| ngx | 68 | 68 | 0 | 0 |
-| npp | 8187 | 8187 | 0 | 0 |
-| nvapi | 298 | 298 | 0 | 0 |
-| nvcuvid | 24 | 24 | 0 | 0 |
-| nvenc | 42 | 42 | 0 | 0 |
-| nvjpeg | 81 | 81 | 0 | 0 |
-| nvml | 390 | 390 | 0 | 0 |
-| nvofa | 12 | 12 | 0 | 0 |
-| nvrtc | 29 | 29 | 0 | 0 |
-| optix | 60 | 60 | 0 | 0 |
+| cusparse | 453 | 453 | 41 | 41 |
+| ngx | 68 | 68 | 23 | 23 |
+| npp | 8187 | 8187 | 19 | 19 |
+| nvapi | 298 | 298 | 40 | 40 |
+| nvcomp | 119 | 119 | 55 | 55 |
+| nvcuvid | 24 | 24 | 0 | 9 |
+| nvenc | 42 | 42 | 20 | 20 |
+| nvjpeg | 81 | 81 | 46 | 46 |
+| nvml | 390 | 390 | 56 | 56 |
+| nvofa | 12 | 12 | 12 | 12 |
+| nvrtc | 29 | 29 | 19 | 19 |
+| optix | 60 | 60 | 57 | 57 |
 
 ## cublas
 
@@ -109,7 +110,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasCmatinvBatched` | yes |  |  |  |
 | `cublasCopyEx` | yes |  |  |  |
 | `cublasCopyEx_64` | yes |  |  |  |
-| `cublasCreate_v2` | yes |  |  |  |
+| `cublasCreate_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasCrot_v2` | yes |  |  |  |
 | `cublasCrot_v2_64` | yes |  |  |  |
 | `cublasCrotg_v2` | yes |  |  |  |
@@ -169,19 +170,19 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasDdgmm_64` | yes |  |  |  |
 | `cublasDdot_v2` | yes |  |  |  |
 | `cublasDdot_v2_64` | yes |  |  |  |
-| `cublasDestroy_v2` | yes |  |  |  |
+| `cublasDestroy_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasDgbmv_v2` | yes |  |  |  |
 | `cublasDgbmv_v2_64` | yes |  |  |  |
 | `cublasDgeam` | yes |  |  |  |
 | `cublasDgeam_64` | yes |  |  |  |
 | `cublasDgelsBatched` | yes |  |  |  |
-| `cublasDgemmBatched` | yes |  |  |  |
+| `cublasDgemmBatched` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasDgemmBatched_64` | yes |  |  |  |
 | `cublasDgemmGroupedBatched` | yes |  |  |  |
 | `cublasDgemmGroupedBatched_64` | yes |  |  |  |
-| `cublasDgemmStridedBatched` | yes |  |  |  |
+| `cublasDgemmStridedBatched` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasDgemmStridedBatched_64` | yes |  |  |  |
-| `cublasDgemm_v2` | yes |  |  |  |
+| `cublasDgemm_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasDgemm_v2_64` | yes |  |  |  |
 | `cublasDgemvBatched` | yes |  |  |  |
 | `cublasDgemvBatched_64` | yes |  |  |  |
@@ -260,11 +261,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasDznrm2_v2_64` | yes |  |  |  |
 | `cublasGemmBatchedEx` | yes |  |  |  |
 | `cublasGemmBatchedEx_64` | yes |  |  |  |
-| `cublasGemmEx` | yes |  |  |  |
+| `cublasGemmEx` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasGemmEx_64` | yes |  |  |  |
 | `cublasGemmGroupedBatchedEx` | yes |  |  |  |
 | `cublasGemmGroupedBatchedEx_64` | yes |  |  |  |
-| `cublasGemmStridedBatchedEx` | yes |  |  |  |
+| `cublasGemmStridedBatchedEx` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasGemmStridedBatchedEx_64` | yes |  |  |  |
 | `cublasGetAtomicsMode` | yes |  |  |  |
 | `cublasGetCudartVersion` | yes |  |  |  |
@@ -275,22 +276,22 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasGetFixedPointEmulationMantissaControl` | yes |  |  |  |
 | `cublasGetFixedPointEmulationMaxMantissaBitCount` | yes |  |  |  |
 | `cublasGetLoggerCallback` | yes |  |  |  |
-| `cublasGetMathMode` | yes |  |  |  |
+| `cublasGetMathMode` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasGetMatrix` | yes |  |  |  |
 | `cublasGetMatrixAsync` | yes |  |  |  |
 | `cublasGetMatrixAsync_64` | yes |  |  |  |
 | `cublasGetMatrix_64` | yes |  |  |  |
-| `cublasGetPointerMode_v2` | yes |  |  |  |
+| `cublasGetPointerMode_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasGetProperty` | yes |  |  |  |
 | `cublasGetSmCountTarget` | yes |  |  |  |
-| `cublasGetStatusName` | yes |  |  |  |
+| `cublasGetStatusName` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasGetStatusString` | yes |  |  |  |
 | `cublasGetStream_v2` | yes |  |  |  |
 | `cublasGetVector` | yes |  |  |  |
 | `cublasGetVectorAsync` | yes |  |  |  |
 | `cublasGetVectorAsync_64` | yes |  |  |  |
 | `cublasGetVector_64` | yes |  |  |  |
-| `cublasGetVersion_v2` | yes |  |  |  |
+| `cublasGetVersion_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasIamaxEx` | yes |  |  |  |
 | `cublasIamaxEx_64` | yes |  |  |  |
 | `cublasIaminEx` | yes |  |  |  |
@@ -344,33 +345,33 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cublasSetFixedPointEmulationMantissaControl` | yes |  |  |  |
 | `cublasSetFixedPointEmulationMaxMantissaBitCount` | yes |  |  |  |
 | `cublasSetLoggerCallback` | yes |  |  |  |
-| `cublasSetMathMode` | yes |  |  |  |
+| `cublasSetMathMode` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSetMatrix` | yes |  |  |  |
 | `cublasSetMatrixAsync` | yes |  |  |  |
 | `cublasSetMatrixAsync_64` | yes |  |  |  |
 | `cublasSetMatrix_64` | yes |  |  |  |
-| `cublasSetPointerMode_v2` | yes |  |  |  |
+| `cublasSetPointerMode_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSetSmCountTarget` | yes |  |  |  |
-| `cublasSetStream_v2` | yes |  |  |  |
+| `cublasSetStream_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSetVector` | yes |  |  |  |
 | `cublasSetVectorAsync` | yes |  |  |  |
 | `cublasSetVectorAsync_64` | yes |  |  |  |
 | `cublasSetVector_64` | yes |  |  |  |
-| `cublasSetWorkspace_v2` | yes |  |  |  |
+| `cublasSetWorkspace_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSgbmv_v2` | yes |  |  |  |
 | `cublasSgbmv_v2_64` | yes |  |  |  |
 | `cublasSgeam` | yes |  |  |  |
 | `cublasSgeam_64` | yes |  |  |  |
 | `cublasSgelsBatched` | yes |  |  |  |
-| `cublasSgemmBatched` | yes |  |  |  |
+| `cublasSgemmBatched` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSgemmBatched_64` | yes |  |  |  |
 | `cublasSgemmEx` | yes |  |  |  |
 | `cublasSgemmEx_64` | yes |  |  |  |
 | `cublasSgemmGroupedBatched` | yes |  |  |  |
 | `cublasSgemmGroupedBatched_64` | yes |  |  |  |
-| `cublasSgemmStridedBatched` | yes |  |  |  |
+| `cublasSgemmStridedBatched` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSgemmStridedBatched_64` | yes |  |  |  |
-| `cublasSgemm_v2` | yes |  |  |  |
+| `cublasSgemm_v2` | yes | `cublas` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cublasSgemm_v2_64` | yes |  |  |  |
 | `cublasSgemvBatched` | yes |  |  |  |
 | `cublasSgemvBatched_64` | yes |  |  |  |
@@ -612,14 +613,16 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 ## cudnn
 
-- `cudnn.h` sha256 `f113f07032ea02b54ca17d6e0469e1adb362ca6bfe26a8627f77f94de7a6ef04`
+- `cudnn.h` sha256 `1c926a330ff35736b3b5af7f4ac32ad8c35c72e0dbcfc952f78bed59a4e7b05c`
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
 | `cudnnActivationBackward` | yes |  |  |  |
-| `cudnnActivationForward` | yes |  |  |  |
+| `cudnnActivationForward` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnAddTensor` | yes |  |  |  |
 | `cudnnAdvVersionCheck` | yes |  |  |  |
+| `cudnnB2BCausalConv1dBackward` | yes |  |  |  |
+| `cudnnB2BCausalConv1dForward` | yes |  |  |  |
 | `cudnnBackendCreateDescriptor` | yes |  |  |  |
 | `cudnnBackendDestroyDescriptor` | yes |  |  |  |
 | `cudnnBackendExecute` | yes |  |  |  |
@@ -631,7 +634,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnBackendUpdateCudaGraph` | yes |  |  |  |
 | `cudnnBatchNormalizationBackward` | yes |  |  |  |
 | `cudnnBatchNormalizationBackwardEx` | yes |  |  |  |
-| `cudnnBatchNormalizationForwardInference` | yes |  |  |  |
+| `cudnnBatchNormalizationForwardInference` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnBatchNormalizationForwardTraining` | yes |  |  |  |
 | `cudnnBatchNormalizationForwardTrainingEx` | yes |  |  |  |
 | `cudnnBuildRNNDynamic` | yes |  |  |  |
@@ -639,53 +642,55 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnCTCLoss_v8` | yes |  |  |  |
 | `cudnnCausalConv1dBackward` | yes |  |  |  |
 | `cudnnCausalConv1dForward` | yes |  |  |  |
+| `cudnnCausalConv1dNwhBackward` | yes |  |  |  |
+| `cudnnCausalConv1dNwhForward` | yes |  |  |  |
 | `cudnnCnnVersionCheck` | yes |  |  |  |
 | `cudnnConvolutionBackwardBias` | yes |  |  |  |
 | `cudnnConvolutionBackwardData` | yes |  |  |  |
 | `cudnnConvolutionBackwardFilter` | yes |  |  |  |
 | `cudnnConvolutionBiasActivationForward` | yes |  |  |  |
-| `cudnnConvolutionForward` | yes |  |  |  |
-| `cudnnCreate` | yes |  |  |  |
-| `cudnnCreateActivationDescriptor` | yes |  |  |  |
+| `cudnnConvolutionForward` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnCreate` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnCreateActivationDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnCreateAttnDescriptor` | yes |  |  |  |
 | `cudnnCreateCTCLossDescriptor` | yes |  |  |  |
-| `cudnnCreateConvolutionDescriptor` | yes |  |  |  |
+| `cudnnCreateConvolutionDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnCreateDropoutDescriptor` | yes |  |  |  |
-| `cudnnCreateFilterDescriptor` | yes |  |  |  |
+| `cudnnCreateFilterDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnCreateFusedOpsConstParamPack` | yes |  |  |  |
 | `cudnnCreateFusedOpsPlan` | yes |  |  |  |
 | `cudnnCreateFusedOpsVariantParamPack` | yes |  |  |  |
 | `cudnnCreateLRNDescriptor` | yes |  |  |  |
 | `cudnnCreateOpTensorDescriptor` | yes |  |  |  |
-| `cudnnCreatePoolingDescriptor` | yes |  |  |  |
+| `cudnnCreatePoolingDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnCreateRNNDataDescriptor` | yes |  |  |  |
 | `cudnnCreateRNNDescriptor` | yes |  |  |  |
 | `cudnnCreateReduceTensorDescriptor` | yes |  |  |  |
 | `cudnnCreateSeqDataDescriptor` | yes |  |  |  |
 | `cudnnCreateSpatialTransformerDescriptor` | yes |  |  |  |
-| `cudnnCreateTensorDescriptor` | yes |  |  |  |
+| `cudnnCreateTensorDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnCreateTensorTransformDescriptor` | yes |  |  |  |
-| `cudnnDeriveBNTensorDescriptor` | yes |  |  |  |
+| `cudnnDeriveBNTensorDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDeriveNormTensorDescriptor` | yes |  |  |  |
-| `cudnnDestroy` | yes |  |  |  |
-| `cudnnDestroyActivationDescriptor` | yes |  |  |  |
+| `cudnnDestroy` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnDestroyActivationDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDestroyAttnDescriptor` | yes |  |  |  |
 | `cudnnDestroyCTCLossDescriptor` | yes |  |  |  |
-| `cudnnDestroyConvolutionDescriptor` | yes |  |  |  |
+| `cudnnDestroyConvolutionDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDestroyDropoutDescriptor` | yes |  |  |  |
-| `cudnnDestroyFilterDescriptor` | yes |  |  |  |
+| `cudnnDestroyFilterDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDestroyFusedOpsConstParamPack` | yes |  |  |  |
 | `cudnnDestroyFusedOpsPlan` | yes |  |  |  |
 | `cudnnDestroyFusedOpsVariantParamPack` | yes |  |  |  |
 | `cudnnDestroyLRNDescriptor` | yes |  |  |  |
 | `cudnnDestroyOpTensorDescriptor` | yes |  |  |  |
-| `cudnnDestroyPoolingDescriptor` | yes |  |  |  |
+| `cudnnDestroyPoolingDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDestroyRNNDataDescriptor` | yes |  |  |  |
 | `cudnnDestroyRNNDescriptor` | yes |  |  |  |
 | `cudnnDestroyReduceTensorDescriptor` | yes |  |  |  |
 | `cudnnDestroySeqDataDescriptor` | yes |  |  |  |
 | `cudnnDestroySpatialTransformerDescriptor` | yes |  |  |  |
-| `cudnnDestroyTensorDescriptor` | yes |  |  |  |
+| `cudnnDestroyTensorDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnDestroyTensorTransformDescriptor` | yes |  |  |  |
 | `cudnnDivisiveNormalizationBackward` | yes |  |  |  |
 | `cudnnDivisiveNormalizationForward` | yes |  |  |  |
@@ -693,6 +698,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnDropoutForward` | yes |  |  |  |
 | `cudnnDropoutGetReserveSpaceSize` | yes |  |  |  |
 | `cudnnDropoutGetStatesSize` | yes |  |  |  |
+| `cudnnFFTCausalConv1dBackward` | yes |  |  |  |
+| `cudnnFFTCausalConv1dForward` | yes |  |  |  |
 | `cudnnFindConvolutionBackwardDataAlgorithm` | yes |  |  |  |
 | `cudnnFindConvolutionBackwardDataAlgorithmEx` | yes |  |  |  |
 | `cudnnFindConvolutionBackwardFilterAlgorithm` | yes |  |  |  |
@@ -714,7 +721,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnGetCTCLossWorkspaceSize_v8` | yes |  |  |  |
 | `cudnnGetCallback` | yes |  |  |  |
 | `cudnnGetConvolution2dDescriptor` | yes |  |  |  |
-| `cudnnGetConvolution2dForwardOutputDim` | yes |  |  |  |
+| `cudnnGetConvolution2dForwardOutputDim` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetConvolutionBackwardDataAlgorithmMaxCount` | yes |  |  |  |
 | `cudnnGetConvolutionBackwardDataAlgorithm_v7` | yes |  |  |  |
 | `cudnnGetConvolutionBackwardDataWorkspaceSize` | yes |  |  |  |
@@ -723,25 +730,25 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnGetConvolutionBackwardFilterWorkspaceSize` | yes |  |  |  |
 | `cudnnGetConvolutionForwardAlgorithmMaxCount` | yes |  |  |  |
 | `cudnnGetConvolutionForwardAlgorithm_v7` | yes |  |  |  |
-| `cudnnGetConvolutionForwardWorkspaceSize` | yes |  |  |  |
+| `cudnnGetConvolutionForwardWorkspaceSize` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetConvolutionGroupCount` | yes |  |  |  |
 | `cudnnGetConvolutionMathType` | yes |  |  |  |
 | `cudnnGetConvolutionNdDescriptor` | yes |  |  |  |
 | `cudnnGetConvolutionNdForwardOutputDim` | yes |  |  |  |
 | `cudnnGetConvolutionReorderType` | yes |  |  |  |
-| `cudnnGetCudartVersion` | yes |  |  |  |
+| `cudnnGetCudartVersion` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetDropoutDescriptor` | yes |  |  |  |
-| `cudnnGetErrorString` | yes |  |  |  |
+| `cudnnGetErrorString` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetExecutionPlanWorkspaceSize` | yes |  |  |  |
 | `cudnnGetFilter4dDescriptor` | yes |  |  |  |
 | `cudnnGetFilterNdDescriptor` | yes |  |  |  |
-| `cudnnGetFilterSizeInBytes` | yes |  |  |  |
+| `cudnnGetFilterSizeInBytes` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetFoldedConvBackwardDataDescriptors` | yes |  |  |  |
 | `cudnnGetFusedOpsConstParamPackAttribute` | yes |  |  |  |
 | `cudnnGetFusedOpsVariantParamPackAttribute` | yes |  |  |  |
 | `cudnnGetLRNDescriptor` | yes |  |  |  |
 | `cudnnGetLastErrorString` | yes |  |  |  |
-| `cudnnGetMaxDeviceVersion` | yes |  |  |  |
+| `cudnnGetMaxDeviceVersion` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetMultiHeadAttnBuffers` | yes |  |  |  |
 | `cudnnGetMultiHeadAttnWeights` | yes |  |  |  |
 | `cudnnGetNormalizationBackwardWorkspaceSize` | yes |  |  |  |
@@ -749,7 +756,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnGetNormalizationTrainingReserveSpaceSize` | yes |  |  |  |
 | `cudnnGetOpTensorDescriptor` | yes |  |  |  |
 | `cudnnGetPooling2dDescriptor` | yes |  |  |  |
-| `cudnnGetPooling2dForwardOutputDim` | yes |  |  |  |
+| `cudnnGetPooling2dForwardOutputDim` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetPoolingNdDescriptor` | yes |  |  |  |
 | `cudnnGetPoolingNdForwardOutputDim` | yes |  |  |  |
 | `cudnnGetProperty` | yes |  |  |  |
@@ -765,14 +772,23 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnGetStream` | yes |  |  |  |
 | `cudnnGetTensor4dDescriptor` | yes |  |  |  |
 | `cudnnGetTensorNdDescriptor` | yes |  |  |  |
-| `cudnnGetTensorSizeInBytes` | yes |  |  |  |
+| `cudnnGetTensorSizeInBytes` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnGetTensorTransformDescriptor` | yes |  |  |  |
-| `cudnnGetVersion` | yes |  |  |  |
+| `cudnnGetVersion` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnGnnAggSimpleBackward` | yes |  |  |  |
+| `cudnnGnnAggSimpleForward` | yes |  |  |  |
+| `cudnnGnnMhaGatBackward` | yes |  |  |  |
+| `cudnnGnnMhaGatForward` | yes |  |  |  |
+| `cudnnGnnMhaGatV2Backward` | yes |  |  |  |
+| `cudnnGnnMhaGatV2Forward` | yes |  |  |  |
 | `cudnnGraphVersionCheck` | yes |  |  |  |
 | `cudnnIm2Col` | yes |  |  |  |
 | `cudnnInitTransformDest` | yes |  |  |  |
 | `cudnnLRNCrossChannelBackward` | yes |  |  |  |
 | `cudnnLRNCrossChannelForward` | yes |  |  |  |
+| `cudnnLongFFTCausalConv1dBackward` | yes |  |  |  |
+| `cudnnLongFFTCausalConv1dForward` | yes |  |  |  |
+| `cudnnLongFFTCausalConv1dGetBufferSizes` | yes |  |  |  |
 | `cudnnMakeFusedOpsPlan` | yes |  |  |  |
 | `cudnnMultiHeadAttnBackwardData` | yes |  |  |  |
 | `cudnnMultiHeadAttnBackwardWeights` | yes |  |  |  |
@@ -783,7 +799,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnOpTensor` | yes |  |  |  |
 | `cudnnOpsVersionCheck` | yes |  |  |  |
 | `cudnnPoolingBackward` | yes |  |  |  |
-| `cudnnPoolingForward` | yes |  |  |  |
+| `cudnnPoolingForward` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnQueryRuntimeError` | yes |  |  |  |
 | `cudnnRNNBackwardData_v8` | yes |  |  |  |
 | `cudnnRNNBackwardWeights_v8` | yes |  |  |  |
@@ -796,7 +812,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnReorderFilterAndBias` | yes |  |  |  |
 | `cudnnRestoreDropoutDescriptor` | yes |  |  |  |
 | `cudnnScaleTensor` | yes |  |  |  |
-| `cudnnSetActivationDescriptor` | yes |  |  |  |
+| `cudnnSetActivationDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetActivationDescriptorSwishBeta` | yes |  |  |  |
 | `cudnnSetAttnDescriptor` | yes |  |  |  |
 | `cudnnSetCTCLossDescriptor` | yes |  |  |  |
@@ -804,34 +820,34 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cudnnSetCTCLossDescriptor_v8` | yes |  |  |  |
 | `cudnnSetCTCLossDescriptor_v9` | yes |  |  |  |
 | `cudnnSetCallback` | yes |  |  |  |
-| `cudnnSetConvolution2dDescriptor` | yes |  |  |  |
-| `cudnnSetConvolutionGroupCount` | yes |  |  |  |
-| `cudnnSetConvolutionMathType` | yes |  |  |  |
-| `cudnnSetConvolutionNdDescriptor` | yes |  |  |  |
+| `cudnnSetConvolution2dDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnSetConvolutionGroupCount` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnSetConvolutionMathType` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnSetConvolutionNdDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetConvolutionReorderType` | yes |  |  |  |
 | `cudnnSetDropoutDescriptor` | yes |  |  |  |
-| `cudnnSetFilter4dDescriptor` | yes |  |  |  |
-| `cudnnSetFilterNdDescriptor` | yes |  |  |  |
+| `cudnnSetFilter4dDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnSetFilterNdDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetFusedOpsConstParamPackAttribute` | yes |  |  |  |
 | `cudnnSetFusedOpsVariantParamPackAttribute` | yes |  |  |  |
 | `cudnnSetLRNDescriptor` | yes |  |  |  |
 | `cudnnSetOpTensorDescriptor` | yes |  |  |  |
-| `cudnnSetPooling2dDescriptor` | yes |  |  |  |
-| `cudnnSetPoolingNdDescriptor` | yes |  |  |  |
+| `cudnnSetPooling2dDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cudnnSetPoolingNdDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetRNNDataDescriptor` | yes |  |  |  |
 | `cudnnSetRNNDescriptor_v8` | yes |  |  |  |
 | `cudnnSetReduceTensorDescriptor` | yes |  |  |  |
 | `cudnnSetSeqDataDescriptor` | yes |  |  |  |
 | `cudnnSetSpatialTransformerNdDescriptor` | yes |  |  |  |
-| `cudnnSetStream` | yes |  |  |  |
+| `cudnnSetStream` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetTensor` | yes |  |  |  |
-| `cudnnSetTensor4dDescriptor` | yes |  |  |  |
+| `cudnnSetTensor4dDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetTensor4dDescriptorEx` | yes |  |  |  |
-| `cudnnSetTensorNdDescriptor` | yes |  |  |  |
+| `cudnnSetTensorNdDescriptor` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSetTensorNdDescriptorEx` | yes |  |  |  |
 | `cudnnSetTensorTransformDescriptor` | yes |  |  |  |
 | `cudnnSoftmaxBackward` | yes |  |  |  |
-| `cudnnSoftmaxForward` | yes |  |  |  |
+| `cudnnSoftmaxForward` | yes | `cudnn` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cudnnSpatialTfGridGeneratorBackward` | yes |  |  |  |
 | `cudnnSpatialTfGridGeneratorForward` | yes |  |  |  |
 | `cudnnSpatialTfSamplerBackward` | yes |  |  |  |
@@ -847,41 +863,41 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `cufftCreate` | yes |  |  |  |
-| `cufftDestroy` | yes |  |  |  |
-| `cufftEstimate1d` | yes |  |  |  |
-| `cufftEstimate2d` | yes |  |  |  |
-| `cufftEstimate3d` | yes |  |  |  |
+| `cufftCreate` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftDestroy` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftEstimate1d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftEstimate2d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftEstimate3d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftEstimateMany` | yes |  |  |  |
-| `cufftExecC2C` | yes |  |  |  |
-| `cufftExecC2R` | yes |  |  |  |
-| `cufftExecD2Z` | yes |  |  |  |
-| `cufftExecR2C` | yes |  |  |  |
-| `cufftExecZ2D` | yes |  |  |  |
-| `cufftExecZ2Z` | yes |  |  |  |
+| `cufftExecC2C` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftExecC2R` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftExecD2Z` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftExecR2C` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftExecZ2D` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftExecZ2Z` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftGetPlanPropertyInt64` | yes |  |  |  |
 | `cufftGetProperty` | yes |  |  |  |
-| `cufftGetSize` | yes |  |  |  |
+| `cufftGetSize` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftGetSize1d` | yes |  |  |  |
 | `cufftGetSize2d` | yes |  |  |  |
 | `cufftGetSize3d` | yes |  |  |  |
 | `cufftGetSizeMany` | yes |  |  |  |
 | `cufftGetSizeMany64` | yes |  |  |  |
-| `cufftGetVersion` | yes |  |  |  |
-| `cufftMakePlan1d` | yes |  |  |  |
-| `cufftMakePlan2d` | yes |  |  |  |
-| `cufftMakePlan3d` | yes |  |  |  |
-| `cufftMakePlanMany` | yes |  |  |  |
+| `cufftGetVersion` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftMakePlan1d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftMakePlan2d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftMakePlan3d` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftMakePlanMany` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftMakePlanMany64` | yes |  |  |  |
 | `cufftPlan1d` | yes |  |  |  |
 | `cufftPlan2d` | yes |  |  |  |
 | `cufftPlan3d` | yes |  |  |  |
 | `cufftPlanMany` | yes |  |  |  |
 | `cufftResetPlanProperty` | yes |  |  |  |
-| `cufftSetAutoAllocation` | yes |  |  |  |
+| `cufftSetAutoAllocation` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftSetPlanPropertyInt64` | yes |  |  |  |
-| `cufftSetStream` | yes |  |  |  |
-| `cufftSetWorkArea` | yes |  |  |  |
+| `cufftSetStream` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftSetWorkArea` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## cupti
 
@@ -891,10 +907,10 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 |---|---|---|---|---|
 | `cuptiActivityConfigurePCSampling` | yes |  |  |  |
 | `cuptiActivityConfigureUnifiedMemoryCounter` | yes |  |  |  |
-| `cuptiActivityDisable` | yes |  |  |  |
+| `cuptiActivityDisable` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityDisableContext` | yes |  |  |  |
 | `cuptiActivityDisable_v2` | yes |  |  |  |
-| `cuptiActivityEnable` | yes |  |  |  |
+| `cuptiActivityEnable` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityEnableAllSyncRecords` | yes |  |  |  |
 | `cuptiActivityEnableAndDump` | yes |  |  |  |
 | `cuptiActivityEnableAndDump_v2` | yes |  |  |  |
@@ -910,21 +926,21 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cuptiActivityEnableRuntimeApi_v2` | yes |  |  |  |
 | `cuptiActivityEnable_v2` | yes |  |  |  |
 | `cuptiActivityFlush` | yes |  |  |  |
-| `cuptiActivityFlushAll` | yes |  |  |  |
+| `cuptiActivityFlushAll` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityFlushPeriod` | yes |  |  |  |
 | `cuptiActivityGetAttribute` | yes |  |  |  |
 | `cuptiActivityGetAttribute_v2` | yes |  |  |  |
 | `cuptiActivityGetEnabledKinds` | yes |  |  |  |
-| `cuptiActivityGetNextRecord` | yes |  |  |  |
+| `cuptiActivityGetNextRecord` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityGetNextRecord_v2` | yes |  |  |  |
-| `cuptiActivityGetNumDroppedRecords` | yes |  |  |  |
+| `cuptiActivityGetNumDroppedRecords` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityGetNumDroppedRecords_v2` | yes |  |  |  |
 | `cuptiActivityGetStructSize` | yes |  |  |  |
 | `cuptiActivityPopExternalCorrelationId` | yes |  |  |  |
 | `cuptiActivityPopExternalCorrelationId_v2` | yes |  |  |  |
 | `cuptiActivityPushExternalCorrelationId` | yes |  |  |  |
 | `cuptiActivityPushExternalCorrelationId_v2` | yes |  |  |  |
-| `cuptiActivityRegisterCallbacks` | yes |  |  |  |
+| `cuptiActivityRegisterCallbacks` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiActivityRegisterCallbacks_v2` | yes |  |  |  |
 | `cuptiActivityRegisterTimestampCallback` | yes |  |  |  |
 | `cuptiActivitySetAttribute` | yes |  |  |  |
@@ -940,8 +956,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cuptiDeviceVirtualizationMode` | yes |  |  |  |
 | `cuptiDisableKernelReplayMode` | yes |  |  |  |
 | `cuptiEnableAllDomains` | yes |  |  |  |
-| `cuptiEnableCallback` | yes |  |  |  |
-| `cuptiEnableDomain` | yes |  |  |  |
+| `cuptiEnableCallback` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuptiEnableDomain` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiEnableKernelReplayMode` | yes |  |  |  |
 | `cuptiEnumEventDomains` | yes |  |  |  |
 | `cuptiEnumMetrics` | yes |  |  |  |
@@ -968,7 +984,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cuptiEventGroupSetsDestroy` | yes |  |  |  |
 | `cuptiFinalize` | yes |  |  |  |
 | `cuptiGetAutoBoostState` | yes |  |  |  |
-| `cuptiGetCallbackName` | yes |  |  |  |
+| `cuptiGetCallbackName` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiGetCallbackState` | yes |  |  |  |
 | `cuptiGetContextId` | yes |  |  |  |
 | `cuptiGetDeviceId` | yes |  |  |  |
@@ -980,13 +996,13 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cuptiGetLastError` | yes |  |  |  |
 | `cuptiGetNumEventDomains` | yes |  |  |  |
 | `cuptiGetNumMetrics` | yes |  |  |  |
-| `cuptiGetResultString` | yes |  |  |  |
+| `cuptiGetResultString` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiGetStreamId` | yes |  |  |  |
 | `cuptiGetStreamIdEx` | yes |  |  |  |
 | `cuptiGetThreadIdType` | yes |  |  |  |
 | `cuptiGetTimestamp` | yes |  |  |  |
 | `cuptiGetTimestamp_v2` | yes |  |  |  |
-| `cuptiGetVersion` | yes |  |  |  |
+| `cuptiGetVersion` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiIsTracingSessionRunning` | yes |  |  |  |
 | `cuptiKernelReplaySubscribeUpdate` | yes |  |  |  |
 | `cuptiMetricCreateEventGroupSets` | yes |  |  |  |
@@ -1001,10 +1017,10 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cuptiMetricGetValue2` | yes |  |  |  |
 | `cuptiSetEventCollectionMode` | yes |  |  |  |
 | `cuptiSetThreadIdType` | yes |  |  |  |
-| `cuptiSubscribe` | yes |  |  |  |
+| `cuptiSubscribe` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuptiSubscribe_v2` | yes |  |  |  |
 | `cuptiSupportedDomains` | yes |  |  |  |
-| `cuptiUnsubscribe` | yes |  |  |  |
+| `cuptiUnsubscribe` | yes | `cupti` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## cusolver
 
@@ -1071,7 +1087,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusolverDnCpotri_bufferSize` | yes |  |  |  |
 | `cusolverDnCpotrs` | yes |  |  |  |
 | `cusolverDnCpotrsBatched` | yes |  |  |  |
-| `cusolverDnCreate` | yes |  |  |  |
+| `cusolverDnCreate` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnCreateGesvdjInfo` | yes |  |  |  |
 | `cusolverDnCreateParams` | yes |  |  |  |
 | `cusolverDnCreateSyevjInfo` | yes |  |  |  |
@@ -1109,47 +1125,47 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusolverDnDXgels_bufferSize` | yes |  |  |  |
 | `cusolverDnDXgesv` | yes |  |  |  |
 | `cusolverDnDXgesv_bufferSize` | yes |  |  |  |
-| `cusolverDnDestroy` | yes |  |  |  |
+| `cusolverDnDestroy` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDestroyGesvdjInfo` | yes |  |  |  |
 | `cusolverDnDestroyParams` | yes |  |  |  |
 | `cusolverDnDestroySyevjInfo` | yes |  |  |  |
 | `cusolverDnDgebrd` | yes |  |  |  |
 | `cusolverDnDgebrd_bufferSize` | yes |  |  |  |
-| `cusolverDnDgeqrf` | yes |  |  |  |
-| `cusolverDnDgeqrf_bufferSize` | yes |  |  |  |
-| `cusolverDnDgesvd` | yes |  |  |  |
-| `cusolverDnDgesvd_bufferSize` | yes |  |  |  |
+| `cusolverDnDgeqrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDgeqrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDgesvd` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDgesvd_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDgesvdaStridedBatched` | yes |  |  |  |
 | `cusolverDnDgesvdaStridedBatched_bufferSize` | yes |  |  |  |
 | `cusolverDnDgesvdj` | yes |  |  |  |
 | `cusolverDnDgesvdjBatched` | yes |  |  |  |
 | `cusolverDnDgesvdjBatched_bufferSize` | yes |  |  |  |
 | `cusolverDnDgesvdj_bufferSize` | yes |  |  |  |
-| `cusolverDnDgetrf` | yes |  |  |  |
-| `cusolverDnDgetrf_bufferSize` | yes |  |  |  |
-| `cusolverDnDgetrs` | yes |  |  |  |
+| `cusolverDnDgetrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDgetrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDgetrs` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDlaswp` | yes |  |  |  |
 | `cusolverDnDlauum` | yes |  |  |  |
 | `cusolverDnDlauum_bufferSize` | yes |  |  |  |
 | `cusolverDnDorgbr` | yes |  |  |  |
 | `cusolverDnDorgbr_bufferSize` | yes |  |  |  |
-| `cusolverDnDorgqr` | yes |  |  |  |
-| `cusolverDnDorgqr_bufferSize` | yes |  |  |  |
+| `cusolverDnDorgqr` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDorgqr_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDorgtr` | yes |  |  |  |
 | `cusolverDnDorgtr_bufferSize` | yes |  |  |  |
 | `cusolverDnDormqr` | yes |  |  |  |
 | `cusolverDnDormqr_bufferSize` | yes |  |  |  |
 | `cusolverDnDormtr` | yes |  |  |  |
 | `cusolverDnDormtr_bufferSize` | yes |  |  |  |
-| `cusolverDnDpotrf` | yes |  |  |  |
+| `cusolverDnDpotrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDpotrfBatched` | yes |  |  |  |
-| `cusolverDnDpotrf_bufferSize` | yes |  |  |  |
+| `cusolverDnDpotrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDpotri` | yes |  |  |  |
 | `cusolverDnDpotri_bufferSize` | yes |  |  |  |
-| `cusolverDnDpotrs` | yes |  |  |  |
+| `cusolverDnDpotrs` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDpotrsBatched` | yes |  |  |  |
-| `cusolverDnDsyevd` | yes |  |  |  |
-| `cusolverDnDsyevd_bufferSize` | yes |  |  |  |
+| `cusolverDnDsyevd` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnDsyevd_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnDsyevdx` | yes |  |  |  |
 | `cusolverDnDsyevdx_bufferSize` | yes |  |  |  |
 | `cusolverDnDsyevj` | yes |  |  |  |
@@ -1230,44 +1246,44 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusolverDnSetFixedPointEmulationMantissaControl` | yes |  |  |  |
 | `cusolverDnSetFixedPointEmulationMaxMantissaBitCount` | yes |  |  |  |
 | `cusolverDnSetMathMode` | yes |  |  |  |
-| `cusolverDnSetStream` | yes |  |  |  |
+| `cusolverDnSetStream` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSgebrd` | yes |  |  |  |
 | `cusolverDnSgebrd_bufferSize` | yes |  |  |  |
-| `cusolverDnSgeqrf` | yes |  |  |  |
-| `cusolverDnSgeqrf_bufferSize` | yes |  |  |  |
-| `cusolverDnSgesvd` | yes |  |  |  |
-| `cusolverDnSgesvd_bufferSize` | yes |  |  |  |
+| `cusolverDnSgeqrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSgeqrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSgesvd` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSgesvd_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSgesvdaStridedBatched` | yes |  |  |  |
 | `cusolverDnSgesvdaStridedBatched_bufferSize` | yes |  |  |  |
 | `cusolverDnSgesvdj` | yes |  |  |  |
 | `cusolverDnSgesvdjBatched` | yes |  |  |  |
 | `cusolverDnSgesvdjBatched_bufferSize` | yes |  |  |  |
 | `cusolverDnSgesvdj_bufferSize` | yes |  |  |  |
-| `cusolverDnSgetrf` | yes |  |  |  |
-| `cusolverDnSgetrf_bufferSize` | yes |  |  |  |
-| `cusolverDnSgetrs` | yes |  |  |  |
+| `cusolverDnSgetrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSgetrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSgetrs` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSlaswp` | yes |  |  |  |
 | `cusolverDnSlauum` | yes |  |  |  |
 | `cusolverDnSlauum_bufferSize` | yes |  |  |  |
 | `cusolverDnSorgbr` | yes |  |  |  |
 | `cusolverDnSorgbr_bufferSize` | yes |  |  |  |
-| `cusolverDnSorgqr` | yes |  |  |  |
-| `cusolverDnSorgqr_bufferSize` | yes |  |  |  |
+| `cusolverDnSorgqr` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSorgqr_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSorgtr` | yes |  |  |  |
 | `cusolverDnSorgtr_bufferSize` | yes |  |  |  |
 | `cusolverDnSormqr` | yes |  |  |  |
 | `cusolverDnSormqr_bufferSize` | yes |  |  |  |
 | `cusolverDnSormtr` | yes |  |  |  |
 | `cusolverDnSormtr_bufferSize` | yes |  |  |  |
-| `cusolverDnSpotrf` | yes |  |  |  |
+| `cusolverDnSpotrf` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSpotrfBatched` | yes |  |  |  |
-| `cusolverDnSpotrf_bufferSize` | yes |  |  |  |
+| `cusolverDnSpotrf_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSpotri` | yes |  |  |  |
 | `cusolverDnSpotri_bufferSize` | yes |  |  |  |
-| `cusolverDnSpotrs` | yes |  |  |  |
+| `cusolverDnSpotrs` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSpotrsBatched` | yes |  |  |  |
-| `cusolverDnSsyevd` | yes |  |  |  |
-| `cusolverDnSsyevd_bufferSize` | yes |  |  |  |
+| `cusolverDnSsyevd` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusolverDnSsyevd_bufferSize` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverDnSsyevdx` | yes |  |  |  |
 | `cusolverDnSsyevdx_bufferSize` | yes |  |  |  |
 | `cusolverDnSsyevj` | yes |  |  |  |
@@ -1447,36 +1463,36 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusolverSpCcsrqrBufferInfoBatched` | yes |  |  |  |
 | `cusolverSpCcsrqrsvBatched` | yes |  |  |  |
 | `cusolverSpCcsrzfdHost` | yes |  |  |  |
-| `cusolverSpCreate` | yes |  |  |  |
+| `cusolverSpCreate` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpCreateCsrqrInfo` | yes |  |  |  |
 | `cusolverSpDcsreigsHost` | yes |  |  |  |
-| `cusolverSpDcsreigvsi` | yes |  |  |  |
+| `cusolverSpDcsreigvsi` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpDcsreigvsiHost` | yes |  |  |  |
 | `cusolverSpDcsrlsqvqrHost` | yes |  |  |  |
 | `cusolverSpDcsrlsvchol` | yes |  |  |  |
 | `cusolverSpDcsrlsvcholHost` | yes |  |  |  |
 | `cusolverSpDcsrlsvluHost` | yes |  |  |  |
-| `cusolverSpDcsrlsvqr` | yes |  |  |  |
+| `cusolverSpDcsrlsvqr` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpDcsrlsvqrHost` | yes |  |  |  |
 | `cusolverSpDcsrqrBufferInfoBatched` | yes |  |  |  |
 | `cusolverSpDcsrqrsvBatched` | yes |  |  |  |
 | `cusolverSpDcsrzfdHost` | yes |  |  |  |
-| `cusolverSpDestroy` | yes |  |  |  |
+| `cusolverSpDestroy` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpDestroyCsrqrInfo` | yes |  |  |  |
 | `cusolverSpGetStream` | yes |  |  |  |
 | `cusolverSpScsreigsHost` | yes |  |  |  |
-| `cusolverSpScsreigvsi` | yes |  |  |  |
+| `cusolverSpScsreigvsi` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpScsreigvsiHost` | yes |  |  |  |
 | `cusolverSpScsrlsqvqrHost` | yes |  |  |  |
 | `cusolverSpScsrlsvchol` | yes |  |  |  |
 | `cusolverSpScsrlsvcholHost` | yes |  |  |  |
 | `cusolverSpScsrlsvluHost` | yes |  |  |  |
-| `cusolverSpScsrlsvqr` | yes |  |  |  |
+| `cusolverSpScsrlsvqr` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpScsrlsvqrHost` | yes |  |  |  |
 | `cusolverSpScsrqrBufferInfoBatched` | yes |  |  |  |
 | `cusolverSpScsrqrsvBatched` | yes |  |  |  |
 | `cusolverSpScsrzfdHost` | yes |  |  |  |
-| `cusolverSpSetStream` | yes |  |  |  |
+| `cusolverSpSetStream` | yes | `cusolver` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusolverSpXcsrissymHost` | yes |  |  |  |
 | `cusolverSpXcsrmetisndHost` | yes |  |  |  |
 | `cusolverSpXcsrpermHost` | yes |  |  |  |
@@ -1609,8 +1625,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseCooGet` | yes |  |  |  |
 | `cusparseCooSetPointers` | yes |  |  |  |
 | `cusparseCooSetStridedBatch` | yes |  |  |  |
-| `cusparseCreate` | yes |  |  |  |
-| `cusparseCreateBlockedEll` | yes |  |  |  |
+| `cusparseCreate` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseCreateBlockedEll` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseCreateBsr` | yes |  |  |  |
 | `cusparseCreateBsric02Info` | yes |  |  |  |
 | `cusparseCreateBsrilu02Info` | yes |  |  |  |
@@ -1626,14 +1642,14 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseCreateConstDnVec` | yes |  |  |  |
 | `cusparseCreateConstSlicedEll` | yes |  |  |  |
 | `cusparseCreateConstSpVec` | yes |  |  |  |
-| `cusparseCreateCoo` | yes |  |  |  |
-| `cusparseCreateCsc` | yes |  |  |  |
-| `cusparseCreateCsr` | yes |  |  |  |
+| `cusparseCreateCoo` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseCreateCsc` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseCreateCsr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseCreateCsric02Info` | yes |  |  |  |
 | `cusparseCreateCsrilu02Info` | yes |  |  |  |
 | `cusparseCreateCsru2csrInfo` | yes |  |  |  |
-| `cusparseCreateDnMat` | yes |  |  |  |
-| `cusparseCreateDnVec` | yes |  |  |  |
+| `cusparseCreateDnMat` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseCreateDnVec` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseCreateIdentityPermutation` | yes |  |  |  |
 | `cusparseCreateMatDescr` | yes |  |  |  |
 | `cusparseCreatePruneInfo` | yes |  |  |  |
@@ -1644,7 +1660,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseCsr2cscEx2` | yes |  |  |  |
 | `cusparseCsr2cscEx2_bufferSize` | yes |  |  |  |
 | `cusparseCsrGet` | yes |  |  |  |
-| `cusparseCsrSetPointers` | yes |  |  |  |
+| `cusparseCsrSetPointers` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseCsrSetStridedBatch` | yes |  |  |  |
 | `cusparseDbsr2csr` | yes |  |  |  |
 | `cusparseDbsric02` | yes |  |  |  |
@@ -1690,7 +1706,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseDenseToSparse_analysis` | yes |  |  |  |
 | `cusparseDenseToSparse_bufferSize` | yes |  |  |  |
 | `cusparseDenseToSparse_convert` | yes |  |  |  |
-| `cusparseDestroy` | yes |  |  |  |
+| `cusparseDestroy` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseDestroyBsric02Info` | yes |  |  |  |
 | `cusparseDestroyBsrilu02Info` | yes |  |  |  |
 | `cusparseDestroyBsrsm2Info` | yes |  |  |  |
@@ -1699,11 +1715,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseDestroyCsric02Info` | yes |  |  |  |
 | `cusparseDestroyCsrilu02Info` | yes |  |  |  |
 | `cusparseDestroyCsru2csrInfo` | yes |  |  |  |
-| `cusparseDestroyDnMat` | yes |  |  |  |
-| `cusparseDestroyDnVec` | yes |  |  |  |
+| `cusparseDestroyDnMat` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseDestroyDnVec` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseDestroyMatDescr` | yes |  |  |  |
 | `cusparseDestroyPruneInfo` | yes |  |  |  |
-| `cusparseDestroySpMat` | yes |  |  |  |
+| `cusparseDestroySpMat` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseDestroySpVec` | yes |  |  |  |
 | `cusparseDgebsr2csr` | yes |  |  |  |
 | `cusparseDgebsr2gebsc` | yes |  |  |  |
@@ -1747,16 +1763,16 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseDpruneDense2csrNnzByPercentage` | yes |  |  |  |
 | `cusparseDpruneDense2csr_bufferSizeExt` | yes |  |  |  |
 | `cusparseGather` | yes |  |  |  |
-| `cusparseGetErrorName` | yes |  |  |  |
+| `cusparseGetErrorName` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseGetErrorString` | yes |  |  |  |
 | `cusparseGetMatDiagType` | yes |  |  |  |
 | `cusparseGetMatFillMode` | yes |  |  |  |
 | `cusparseGetMatIndexBase` | yes |  |  |  |
 | `cusparseGetMatType` | yes |  |  |  |
-| `cusparseGetPointerMode` | yes |  |  |  |
+| `cusparseGetPointerMode` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseGetProperty` | yes |  |  |  |
-| `cusparseGetStream` | yes |  |  |  |
-| `cusparseGetVersion` | yes |  |  |  |
+| `cusparseGetStream` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseGetVersion` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseLoggerForceDisable` | yes |  |  |  |
 | `cusparseLoggerOpenFile` | yes |  |  |  |
 | `cusparseLoggerSetCallback` | yes |  |  |  |
@@ -1813,8 +1829,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseSetMatFillMode` | yes |  |  |  |
 | `cusparseSetMatIndexBase` | yes |  |  |  |
 | `cusparseSetMatType` | yes |  |  |  |
-| `cusparseSetPointerMode` | yes |  |  |  |
-| `cusparseSetStream` | yes |  |  |  |
+| `cusparseSetPointerMode` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSetStream` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSgebsr2csr` | yes |  |  |  |
 | `cusparseSgebsr2gebsc` | yes |  |  |  |
 | `cusparseSgebsr2gebsc_bufferSize` | yes |  |  |  |
@@ -1841,45 +1857,45 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cusparseSpGEAM_createDescr` | yes |  |  |  |
 | `cusparseSpGEAM_destroyDescr` | yes |  |  |  |
 | `cusparseSpGEAM_nnz` | yes |  |  |  |
-| `cusparseSpGEMM_compute` | yes |  |  |  |
-| `cusparseSpGEMM_copy` | yes |  |  |  |
-| `cusparseSpGEMM_createDescr` | yes |  |  |  |
-| `cusparseSpGEMM_destroyDescr` | yes |  |  |  |
+| `cusparseSpGEMM_compute` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpGEMM_copy` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpGEMM_createDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpGEMM_destroyDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpGEMM_estimateMemory` | yes |  |  |  |
 | `cusparseSpGEMM_getNumProducts` | yes |  |  |  |
-| `cusparseSpGEMM_workEstimation` | yes |  |  |  |
+| `cusparseSpGEMM_workEstimation` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpGEMMreuse_compute` | yes |  |  |  |
 | `cusparseSpGEMMreuse_copy` | yes |  |  |  |
 | `cusparseSpGEMMreuse_nnz` | yes |  |  |  |
 | `cusparseSpGEMMreuse_workEstimation` | yes |  |  |  |
-| `cusparseSpMM` | yes |  |  |  |
+| `cusparseSpMM` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpMMOp` | yes |  |  |  |
 | `cusparseSpMMOp_createPlan` | yes |  |  |  |
 | `cusparseSpMMOp_destroyPlan` | yes |  |  |  |
-| `cusparseSpMM_bufferSize` | yes |  |  |  |
-| `cusparseSpMM_preprocess` | yes |  |  |  |
-| `cusparseSpMV` | yes |  |  |  |
-| `cusparseSpMV_bufferSize` | yes |  |  |  |
-| `cusparseSpMV_preprocess` | yes |  |  |  |
+| `cusparseSpMM_bufferSize` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpMM_preprocess` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpMV` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpMV_bufferSize` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpMV_preprocess` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpMatGetAttribute` | yes |  |  |  |
 | `cusparseSpMatGetFormat` | yes |  |  |  |
 | `cusparseSpMatGetIndexBase` | yes |  |  |  |
-| `cusparseSpMatGetSize` | yes |  |  |  |
+| `cusparseSpMatGetSize` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpMatGetStridedBatch` | yes |  |  |  |
 | `cusparseSpMatGetValues` | yes |  |  |  |
-| `cusparseSpMatSetAttribute` | yes |  |  |  |
+| `cusparseSpMatSetAttribute` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpMatSetValues` | yes |  |  |  |
-| `cusparseSpSM_analysis` | yes |  |  |  |
-| `cusparseSpSM_bufferSize` | yes |  |  |  |
-| `cusparseSpSM_createDescr` | yes |  |  |  |
-| `cusparseSpSM_destroyDescr` | yes |  |  |  |
-| `cusparseSpSM_solve` | yes |  |  |  |
+| `cusparseSpSM_analysis` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSM_bufferSize` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSM_createDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSM_destroyDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSM_solve` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpSM_updateMatrix` | yes |  |  |  |
-| `cusparseSpSV_analysis` | yes |  |  |  |
-| `cusparseSpSV_bufferSize` | yes |  |  |  |
-| `cusparseSpSV_createDescr` | yes |  |  |  |
-| `cusparseSpSV_destroyDescr` | yes |  |  |  |
-| `cusparseSpSV_solve` | yes |  |  |  |
+| `cusparseSpSV_analysis` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSV_bufferSize` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSV_createDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSV_destroyDescr` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cusparseSpSV_solve` | yes | `cusparse` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cusparseSpSV_updateMatrix` | yes |  |  |  |
 | `cusparseSpVV` | yes |  |  |  |
 | `cusparseSpVV_bufferSize` | yes |  |  |  |
@@ -1987,8 +2003,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 ## ngx
 
 - `vulkan/vulkan.h` sha256 `dfb52fde20c963f4d74829a7a07aef1e822e6fa0df4ea45a26c7effb7c286802`
-- `nvsdk_ngx.h` sha256 `96f21266a05ef06bb49f58c89de1a7845f2d9b1e0e0e069fe03740b8eaf0344d`
-- `nvsdk_ngx_vk.h` sha256 `3be54d0103cce02174fd34912c60c9f40c73b5eec919e42613a2268c589c53ad`
+- `nvsdk_ngx.h` sha256 `dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848`
+- `nvsdk_ngx_vk.h` sha256 `2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d`
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
@@ -2028,38 +2044,38 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NVSDK_NGX_D3D12_Init_with_ProjectID` | yes |  |  |  |
 | `NVSDK_NGX_D3D12_ReleaseFeature` | yes |  |  |  |
 | `NVSDK_NGX_D3D12_Shutdown1` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetD` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetD` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NVSDK_NGX_Parameter_GetD3d11Resource` | yes |  |  |  |
 | `NVSDK_NGX_Parameter_GetD3d12Resource` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetF` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetI` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetUI` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetULL` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_GetVoidPointer` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetD` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_GetF` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_GetI` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_GetUI` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_GetULL` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_GetVoidPointer` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_SetD` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NVSDK_NGX_Parameter_SetD3d11Resource` | yes |  |  |  |
 | `NVSDK_NGX_Parameter_SetD3d12Resource` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetF` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetI` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetUI` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetULL` | yes |  |  |  |
-| `NVSDK_NGX_Parameter_SetVoidPointer` | yes |  |  |  |
+| `NVSDK_NGX_Parameter_SetF` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_SetI` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_SetUI` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_SetULL` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_Parameter_SetVoidPointer` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NVSDK_NGX_UpdateFeature` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_AllocateParameters` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_CreateFeature` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_AllocateParameters` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_CreateFeature` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NVSDK_NGX_VULKAN_CreateFeature1` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_DestroyParameters` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_EvaluateFeature_C` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_GetCapabilityParameters` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_DestroyParameters` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_EvaluateFeature_C` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_GetCapabilityParameters` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements` | yes |  |  |  |
 | `NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements` | yes |  |  |  |
 | `NVSDK_NGX_VULKAN_GetFeatureRequirements` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_GetScratchBufferSize` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_Init` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_Init_with_ProjectID` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_ReleaseFeature` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_RequiredExtensions` | yes |  |  |  |
-| `NVSDK_NGX_VULKAN_Shutdown1` | yes |  |  |  |
+| `NVSDK_NGX_VULKAN_GetScratchBufferSize` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_Init` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_Init_with_ProjectID` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_ReleaseFeature` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_RequiredExtensions` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NVSDK_NGX_VULKAN_Shutdown1` | yes | `ngx` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## npp
 
@@ -2067,7 +2083,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `nppGetLibVersion` | yes |  |  |  |
+| `nppGetLibVersion` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiAbsDiffC_16u_C1R` | yes |  |  |  |
 | `nppiAbsDiffC_16u_C1R_Ctx` | yes |  |  |  |
 | `nppiAbsDiffC_32f_C1R` | yes |  |  |  |
@@ -4629,8 +4645,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiFilterBox_32f_C4R_Ctx` | yes |  |  |  |
 | `nppiFilterBox_64f_C1R_Ctx` | yes |  |  |  |
 | `nppiFilterBox_8u_AC4R_Ctx` | yes |  |  |  |
-| `nppiFilterBox_8u_C1R_Ctx` | yes |  |  |  |
-| `nppiFilterBox_8u_C3R_Ctx` | yes |  |  |  |
+| `nppiFilterBox_8u_C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nppiFilterBox_8u_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiFilterBox_8u_C4R_Ctx` | yes |  |  |  |
 | `nppiFilterCannyBorderGetBufferSize` | yes |  |  |  |
 | `nppiFilterCannyBorder_8u_C1R_Ctx` | yes |  |  |  |
@@ -4765,8 +4781,8 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiFilterGauss_32f_C3R_Ctx` | yes |  |  |  |
 | `nppiFilterGauss_32f_C4R_Ctx` | yes |  |  |  |
 | `nppiFilterGauss_8u_AC4R_Ctx` | yes |  |  |  |
-| `nppiFilterGauss_8u_C1R_Ctx` | yes |  |  |  |
-| `nppiFilterGauss_8u_C3R_Ctx` | yes |  |  |  |
+| `nppiFilterGauss_8u_C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nppiFilterGauss_8u_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiFilterGauss_8u_C4R_Ctx` | yes |  |  |  |
 | `nppiFilterHarrisCornersBorderGetBufferSize` | yes |  |  |  |
 | `nppiFilterHarrisCornersBorder_8u32f_C1R_Ctx` | yes |  |  |  |
@@ -7334,7 +7350,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiRGBToGray_32f_AC4C1R_Ctx` | yes |  |  |  |
 | `nppiRGBToGray_32f_C3C1R_Ctx` | yes |  |  |  |
 | `nppiRGBToGray_8u_AC4C1R_Ctx` | yes |  |  |  |
-| `nppiRGBToGray_8u_C3C1R_Ctx` | yes |  |  |  |
+| `nppiRGBToGray_8u_C3C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiRGBToHLS_8u_AC4R_Ctx` | yes |  |  |  |
 | `nppiRGBToHLS_8u_C3R_Ctx` | yes |  |  |  |
 | `nppiRGBToHSV_8u_AC4R_Ctx` | yes |  |  |  |
@@ -7366,7 +7382,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiRGBToYCbCr_8u_AC4P3R_Ctx` | yes |  |  |  |
 | `nppiRGBToYCbCr_8u_AC4R_Ctx` | yes |  |  |  |
 | `nppiRGBToYCbCr_8u_C3P3R_Ctx` | yes |  |  |  |
-| `nppiRGBToYCbCr_8u_C3R_Ctx` | yes |  |  |  |
+| `nppiRGBToYCbCr_8u_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiRGBToYCbCr_8u_P3R_Ctx` | yes |  |  |  |
 | `nppiRGBToYCrCb420_8u_AC4P3R_Ctx` | yes |  |  |  |
 | `nppiRGBToYCrCb422_8u_C3C2R_Ctx` | yes |  |  |  |
@@ -7577,14 +7593,14 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiResize_16u_P4R_Ctx` | yes |  |  |  |
 | `nppiResize_32f_AC4R_Ctx` | yes |  |  |  |
 | `nppiResize_32f_C1R_Ctx` | yes |  |  |  |
-| `nppiResize_32f_C3R_Ctx` | yes |  |  |  |
+| `nppiResize_32f_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiResize_32f_C4R_Ctx` | yes |  |  |  |
 | `nppiResize_32f_P3R_Ctx` | yes |  |  |  |
 | `nppiResize_32f_P4R_Ctx` | yes |  |  |  |
 | `nppiResize_8u_AC4R_Ctx` | yes |  |  |  |
-| `nppiResize_8u_C1R_Ctx` | yes |  |  |  |
-| `nppiResize_8u_C3R_Ctx` | yes |  |  |  |
-| `nppiResize_8u_C4R_Ctx` | yes |  |  |  |
+| `nppiResize_8u_C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nppiResize_8u_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nppiResize_8u_C4R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiResize_8u_P3R_Ctx` | yes |  |  |  |
 | `nppiResize_8u_P4R_Ctx` | yes |  |  |  |
 | `nppiRotate_16u_AC4R_Ctx` | yes |  |  |  |
@@ -8837,7 +8853,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiThreshold_Val_32f_C1IR` | yes |  |  |  |
 | `nppiThreshold_Val_32f_C1IR_Ctx` | yes |  |  |  |
 | `nppiThreshold_Val_32f_C1R` | yes |  |  |  |
-| `nppiThreshold_Val_32f_C1R_Ctx` | yes |  |  |  |
+| `nppiThreshold_Val_32f_C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiThreshold_Val_32f_C3IR` | yes |  |  |  |
 | `nppiThreshold_Val_32f_C3IR_Ctx` | yes |  |  |  |
 | `nppiThreshold_Val_32f_C3R` | yes |  |  |  |
@@ -8849,7 +8865,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiThreshold_Val_8u_C1IR` | yes |  |  |  |
 | `nppiThreshold_Val_8u_C1IR_Ctx` | yes |  |  |  |
 | `nppiThreshold_Val_8u_C1R` | yes |  |  |  |
-| `nppiThreshold_Val_8u_C1R_Ctx` | yes |  |  |  |
+| `nppiThreshold_Val_8u_C1R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiThreshold_Val_8u_C3IR` | yes |  |  |  |
 | `nppiThreshold_Val_8u_C3IR_Ctx` | yes |  |  |  |
 | `nppiThreshold_Val_8u_C3R` | yes |  |  |  |
@@ -9297,7 +9313,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppiYCbCrToRGBBatch_8u_P3C3R_Advanced_Ctx` | yes |  |  |  |
 | `nppiYCbCrToRGBBatch_8u_P3C3R_Ctx` | yes |  |  |  |
 | `nppiYCbCrToRGB_8u_AC4R_Ctx` | yes |  |  |  |
-| `nppiYCbCrToRGB_8u_C3R_Ctx` | yes |  |  |  |
+| `nppiYCbCrToRGB_8u_C3R_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppiYCbCrToRGB_8u_P3C3R_Ctx` | yes |  |  |  |
 | `nppiYCbCrToRGB_8u_P3C4R_Ctx` | yes |  |  |  |
 | `nppiYCbCrToRGB_8u_P3R_Ctx` | yes |  |  |  |
@@ -9411,7 +9427,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsAdd_16u_Ctx` | yes |  |  |  |
 | `nppsAdd_16u_ISfs_Ctx` | yes |  |  |  |
 | `nppsAdd_16u_Sfs_Ctx` | yes |  |  |  |
-| `nppsAdd_32f_Ctx` | yes |  |  |  |
+| `nppsAdd_32f_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppsAdd_32f_I_Ctx` | yes |  |  |  |
 | `nppsAdd_32fc_Ctx` | yes |  |  |  |
 | `nppsAdd_32fc_I_Ctx` | yes |  |  |  |
@@ -9888,7 +9904,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsMul_16u_Sfs_Ctx` | yes |  |  |  |
 | `nppsMul_32f32fc_Ctx` | yes |  |  |  |
 | `nppsMul_32f32fc_I_Ctx` | yes |  |  |  |
-| `nppsMul_32f_Ctx` | yes |  |  |  |
+| `nppsMul_32f_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppsMul_32f_I_Ctx` | yes |  |  |  |
 | `nppsMul_32fc_Ctx` | yes |  |  |  |
 | `nppsMul_32fc_I_Ctx` | yes |  |  |  |
@@ -10023,7 +10039,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsSet_16s_Ctx` | yes |  |  |  |
 | `nppsSet_16sc_Ctx` | yes |  |  |  |
 | `nppsSet_16u_Ctx` | yes |  |  |  |
-| `nppsSet_32f_Ctx` | yes |  |  |  |
+| `nppsSet_32f_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppsSet_32fc_Ctx` | yes |  |  |  |
 | `nppsSet_32s_Ctx` | yes |  |  |  |
 | `nppsSet_32sc_Ctx` | yes |  |  |  |
@@ -10145,7 +10161,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsSumGetBufferSize_16s_Sfs_Ctx` | yes |  |  |  |
 | `nppsSumGetBufferSize_16sc32sc_Sfs_Ctx` | yes |  |  |  |
 | `nppsSumGetBufferSize_16sc_Sfs_Ctx` | yes |  |  |  |
-| `nppsSumGetBufferSize_32f_Ctx` | yes |  |  |  |
+| `nppsSumGetBufferSize_32f_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppsSumGetBufferSize_32fc_Ctx` | yes |  |  |  |
 | `nppsSumGetBufferSize_32s_Sfs_Ctx` | yes |  |  |  |
 | `nppsSumGetBufferSize_64f_Ctx` | yes |  |  |  |
@@ -10162,7 +10178,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nppsSum_16s_Sfs_Ctx` | yes |  |  |  |
 | `nppsSum_16sc32sc_Sfs_Ctx` | yes |  |  |  |
 | `nppsSum_16sc_Sfs_Ctx` | yes |  |  |  |
-| `nppsSum_32f_Ctx` | yes |  |  |  |
+| `nppsSum_32f_Ctx` | yes | `npp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nppsSum_32fc_Ctx` | yes |  |  |  |
 | `nppsSum_32s_Sfs_Ctx` | yes |  |  |  |
 | `nppsSum_64f_Ctx` | yes |  |  |  |
@@ -10257,7 +10273,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 ## nvapi
 
-- `nvapi.h` sha256 `6969bf2e9657f9c113b592333e26213abe8d50390137b6b49e6f5599c99dfd9b`
+- `nvapi.h` sha256 `9f301d0b362a017143d833ccb64d55b2d9cbd6a5c9705c11032c1d74335a6858`
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
@@ -10267,7 +10283,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_DISP_GetAdaptiveSyncData` | yes |  |  |  |
 | `NvAPI_DISP_GetAssociatedUnAttachedNvidiaDisplayHandle` | yes |  |  |  |
 | `NvAPI_DISP_GetDisplayConfig` | yes |  |  |  |
-| `NvAPI_DISP_GetDisplayIdByDisplayName` | yes |  |  |  |
+| `NvAPI_DISP_GetDisplayIdByDisplayName` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DISP_GetEdidData` | yes |  |  |  |
 | `NvAPI_DISP_GetGDIPrimaryDisplayId` | yes |  |  |  |
 | `NvAPI_DISP_GetMonitorCapabilities` | yes |  |  |  |
@@ -10284,28 +10300,28 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_DISP_TryCustomDisplay` | yes |  |  |  |
 | `NvAPI_DRS_CreateApplication` | yes |  |  |  |
 | `NvAPI_DRS_CreateProfile` | yes |  |  |  |
-| `NvAPI_DRS_CreateSession` | yes |  |  |  |
+| `NvAPI_DRS_CreateSession` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_DeleteApplication` | yes |  |  |  |
 | `NvAPI_DRS_DeleteApplicationEx` | yes |  |  |  |
 | `NvAPI_DRS_DeleteProfile` | yes |  |  |  |
 | `NvAPI_DRS_DeleteProfileSetting` | yes |  |  |  |
-| `NvAPI_DRS_DestroySession` | yes |  |  |  |
+| `NvAPI_DRS_DestroySession` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_EnumApplications` | yes |  |  |  |
 | `NvAPI_DRS_EnumAvailableSettingIds` | yes |  |  |  |
 | `NvAPI_DRS_EnumAvailableSettingValues` | yes |  |  |  |
-| `NvAPI_DRS_EnumProfiles` | yes |  |  |  |
+| `NvAPI_DRS_EnumProfiles` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_EnumSettings` | yes |  |  |  |
 | `NvAPI_DRS_FindApplicationByName` | yes |  |  |  |
-| `NvAPI_DRS_FindProfileByName` | yes |  |  |  |
+| `NvAPI_DRS_FindProfileByName` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_GetApplicationInfo` | yes |  |  |  |
 | `NvAPI_DRS_GetBaseProfile` | yes |  |  |  |
-| `NvAPI_DRS_GetCurrentGlobalProfile` | yes |  |  |  |
-| `NvAPI_DRS_GetNumProfiles` | yes |  |  |  |
-| `NvAPI_DRS_GetProfileInfo` | yes |  |  |  |
+| `NvAPI_DRS_GetCurrentGlobalProfile` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_DRS_GetNumProfiles` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_DRS_GetProfileInfo` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_GetSetting` | yes |  |  |  |
 | `NvAPI_DRS_GetSettingIdFromName` | yes |  |  |  |
 | `NvAPI_DRS_GetSettingNameFromId` | yes |  |  |  |
-| `NvAPI_DRS_LoadSettings` | yes |  |  |  |
+| `NvAPI_DRS_LoadSettings` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_DRS_LoadSettingsFromFile` | yes |  |  |  |
 | `NvAPI_DRS_RestoreAllDefaults` | yes |  |  |  |
 | `NvAPI_DRS_RestoreProfileDefault` | yes |  |  |  |
@@ -10318,12 +10334,12 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_DisableHWCursor` | yes |  |  |  |
 | `NvAPI_Disp_ColorControl` | yes |  |  |  |
 | `NvAPI_Disp_GetColorimetry` | yes |  |  |  |
-| `NvAPI_Disp_GetHdrCapabilities` | yes |  |  |  |
+| `NvAPI_Disp_GetHdrCapabilities` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_Disp_GetHdrToneMapping` | yes |  |  |  |
 | `NvAPI_Disp_GetOutputMode` | yes |  |  |  |
 | `NvAPI_Disp_GetSourceColorSpace` | yes |  |  |  |
 | `NvAPI_Disp_GetSourceHdrMetadata` | yes |  |  |  |
-| `NvAPI_Disp_GetVRRInfo` | yes |  |  |  |
+| `NvAPI_Disp_GetVRRInfo` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_Disp_HdrColorControl` | yes |  |  |  |
 | `NvAPI_Disp_InfoFrameControl` | yes |  |  |  |
 | `NvAPI_Disp_SetHdrToneMapping` | yes |  |  |  |
@@ -10332,11 +10348,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_Disp_SetSourceHdrMetadata` | yes |  |  |  |
 | `NvAPI_EnableCurrentMosaicTopology` | yes |  |  |  |
 | `NvAPI_EnableHWCursor` | yes |  |  |  |
-| `NvAPI_EnumLogicalGPUs` | yes |  |  |  |
-| `NvAPI_EnumNvidiaDisplayHandle` | yes |  |  |  |
+| `NvAPI_EnumLogicalGPUs` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_EnumNvidiaDisplayHandle` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_EnumNvidiaUnAttachedDisplayHandle` | yes |  |  |  |
-| `NvAPI_EnumPhysicalGPUs` | yes |  |  |  |
-| `NvAPI_EnumTCCPhysicalGPUs` | yes |  |  |  |
+| `NvAPI_EnumPhysicalGPUs` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_EnumTCCPhysicalGPUs` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_Event_RegisterCallback` | yes |  |  |  |
 | `NvAPI_Event_UnregisterCallback` | yes |  |  |  |
 | `NvAPI_GPU_ClientIllumDevicesGetControl` | yes |  |  |  |
@@ -10350,13 +10366,13 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GPU_GetAGPAperture` | yes |  |  |  |
 | `NvAPI_GPU_GetActiveOutputs` | yes |  |  |  |
 | `NvAPI_GPU_GetAdapterIdFromPhysicalGpu` | yes |  |  |  |
-| `NvAPI_GPU_GetAllClockFrequencies` | yes |  |  |  |
+| `NvAPI_GPU_GetAllClockFrequencies` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetAllDisplayIds` | yes |  |  |  |
 | `NvAPI_GPU_GetAllOutputs` | yes |  |  |  |
-| `NvAPI_GPU_GetArchInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetArchInfo` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetBoardInfo` | yes |  |  |  |
-| `NvAPI_GPU_GetBusId` | yes |  |  |  |
-| `NvAPI_GPU_GetBusSlotId` | yes |  |  |  |
+| `NvAPI_GPU_GetBusId` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_GPU_GetBusSlotId` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetBusType` | yes |  |  |  |
 | `NvAPI_GPU_GetConnectedDisplayIds` | yes |  |  |  |
 | `NvAPI_GPU_GetConnectedOutputs` | yes |  |  |  |
@@ -10365,18 +10381,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GPU_GetConnectedSLIOutputsWithLidState` | yes |  |  |  |
 | `NvAPI_GPU_GetCurrentAGPRate` | yes |  |  |  |
 | `NvAPI_GPU_GetCurrentPCIEDownstreamWidth` | yes |  |  |  |
-| `NvAPI_GPU_GetCurrentPstate` | yes |  |  |  |
-| `NvAPI_GPU_GetDynamicPstatesInfoEx` | yes |  |  |  |
+| `NvAPI_GPU_GetCurrentPstate` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_GPU_GetDynamicPstatesInfoEx` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetECCConfigurationInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetECCErrorInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetECCStatusInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetEDID` | yes |  |  |  |
 | `NvAPI_GPU_GetEncoderSessionsInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetEncoderStatistics` | yes |  |  |  |
-| `NvAPI_GPU_GetFullName` | yes |  |  |  |
+| `NvAPI_GPU_GetFullName` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetGPUInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetGPUType` | yes |  |  |  |
-| `NvAPI_GPU_GetGpuCoreCount` | yes |  |  |  |
+| `NvAPI_GPU_GetGpuCoreCount` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetGspFeatures` | yes |  |  |  |
 | `NvAPI_GPU_GetHDCPSupportStatus` | yes |  |  |  |
 | `NvAPI_GPU_GetIRQ` | yes |  |  |  |
@@ -10384,11 +10400,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GPU_GetLicensableFeatures` | yes |  |  |  |
 | `NvAPI_GPU_GetLogicalGpuInfo` | yes |  |  |  |
 | `NvAPI_GPU_GetMemoryInfo` | yes |  |  |  |
-| `NvAPI_GPU_GetMemoryInfoEx` | yes |  |  |  |
+| `NvAPI_GPU_GetMemoryInfoEx` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetOutputType` | yes |  |  |  |
 | `NvAPI_GPU_GetOverclockStatus` | yes |  |  |  |
-| `NvAPI_GPU_GetPCIIdentifiers` | yes |  |  |  |
-| `NvAPI_GPU_GetPerfDecreaseInfo` | yes |  |  |  |
+| `NvAPI_GPU_GetPCIIdentifiers` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_GPU_GetPerfDecreaseInfo` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetPhysicalFrameBufferSize` | yes |  |  |  |
 | `NvAPI_GPU_GetPstates20` | yes |  |  |  |
 | `NvAPI_GPU_GetPstatesInfoEx` | yes |  |  |  |
@@ -10401,13 +10417,13 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GPU_GetScanoutWarpingState` | yes |  |  |  |
 | `NvAPI_GPU_GetShaderSubPipeCount` | yes |  |  |  |
 | `NvAPI_GPU_GetSystemType` | yes |  |  |  |
-| `NvAPI_GPU_GetTachReading` | yes |  |  |  |
-| `NvAPI_GPU_GetThermalSettings` | yes |  |  |  |
-| `NvAPI_GPU_GetUUID` | yes |  |  |  |
+| `NvAPI_GPU_GetTachReading` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_GPU_GetThermalSettings` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `NvAPI_GPU_GetUUID` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetVRReadyData` | yes |  |  |  |
 | `NvAPI_GPU_GetVbiosOEMRevision` | yes |  |  |  |
 | `NvAPI_GPU_GetVbiosRevision` | yes |  |  |  |
-| `NvAPI_GPU_GetVbiosVersionString` | yes |  |  |  |
+| `NvAPI_GPU_GetVbiosVersionString` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GPU_GetVirtualFrameBufferSize` | yes |  |  |  |
 | `NvAPI_GPU_GetVirtualizationInfo` | yes |  |  |  |
 | `NvAPI_GPU_NVLINK_GetCaps` | yes |  |  |  |
@@ -10427,30 +10443,30 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GPU_WorkstationFeatureQuery` | yes |  |  |  |
 | `NvAPI_GPU_WorkstationFeatureSetup` | yes |  |  |  |
 | `NvAPI_GSync_AdjustSyncDelay` | yes |  |  |  |
-| `NvAPI_GSync_EnumSyncDevices` | yes |  |  |  |
+| `NvAPI_GSync_EnumSyncDevices` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GSync_GetControlParameters` | yes |  |  |  |
 | `NvAPI_GSync_GetStatusParameters` | yes |  |  |  |
-| `NvAPI_GSync_GetSyncStatus` | yes |  |  |  |
+| `NvAPI_GSync_GetSyncStatus` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GSync_GetTopology` | yes |  |  |  |
-| `NvAPI_GSync_QueryCapabilities` | yes |  |  |  |
+| `NvAPI_GSync_QueryCapabilities` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GSync_SetControlParameters` | yes |  |  |  |
 | `NvAPI_GSync_SetSyncStateSettings` | yes |  |  |  |
 | `NvAPI_GetAssociatedDisplayOutputId` | yes |  |  |  |
 | `NvAPI_GetAssociatedNvidiaDisplayHandle` | yes |  |  |  |
-| `NvAPI_GetAssociatedNvidiaDisplayName` | yes |  |  |  |
+| `NvAPI_GetAssociatedNvidiaDisplayName` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GetCurrentMosaicTopology` | yes |  |  |  |
 | `NvAPI_GetDisplayDriverVersion` | yes |  |  |  |
 | `NvAPI_GetDisplayPortInfo` | yes |  |  |  |
-| `NvAPI_GetErrorMessage` | yes |  |  |  |
+| `NvAPI_GetErrorMessage` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GetGPUIDfromPhysicalGPU` | yes |  |  |  |
 | `NvAPI_GetHDMISupportInfo` | yes |  |  |  |
-| `NvAPI_GetInterfaceVersionString` | yes |  |  |  |
+| `NvAPI_GetInterfaceVersionString` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GetLogicalGPUFromDisplay` | yes |  |  |  |
 | `NvAPI_GetLogicalGPUFromPhysicalGPU` | yes |  |  |  |
 | `NvAPI_GetPhysicalGPUFromGPUID` | yes |  |  |  |
 | `NvAPI_GetPhysicalGPUFromUnAttachedDisplay` | yes |  |  |  |
 | `NvAPI_GetPhysicalGPUsFromDisplay` | yes |  |  |  |
-| `NvAPI_GetPhysicalGPUsFromLogicalGPU` | yes |  |  |  |
+| `NvAPI_GetPhysicalGPUsFromLogicalGPU` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_GetSupportedMosaicTopologies` | yes |  |  |  |
 | `NvAPI_GetSupportedViews` | yes |  |  |  |
 | `NvAPI_GetUnAttachedAssociatedDisplayName` | yes |  |  |  |
@@ -10459,7 +10475,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_GetViewEx` | yes |  |  |  |
 | `NvAPI_I2CRead` | yes |  |  |  |
 | `NvAPI_I2CWrite` | yes |  |  |  |
-| `NvAPI_Initialize` | yes |  |  |  |
+| `NvAPI_Initialize` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_Mosaic_EnableCurrentTopo` | yes |  |  |  |
 | `NvAPI_Mosaic_EnumDisplayGrids` | yes |  |  |  |
 | `NvAPI_Mosaic_EnumDisplayModes` | yes |  |  |  |
@@ -10487,7 +10503,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_SYS_GetChipSetInfo` | yes |  |  |  |
 | `NvAPI_SYS_GetDisplayDriverInfo` | yes |  |  |  |
 | `NvAPI_SYS_GetDisplayIdFromGpuAndOutputId` | yes |  |  |  |
-| `NvAPI_SYS_GetDriverAndBranchVersion` | yes |  |  |  |
+| `NvAPI_SYS_GetDriverAndBranchVersion` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_SYS_GetGpuAndOutputIdFromDisplayId` | yes |  |  |  |
 | `NvAPI_SYS_GetLidAndDockInfo` | yes |  |  |  |
 | `NvAPI_SYS_GetLogicalGPUs` | yes |  |  |  |
@@ -10536,7 +10552,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_Stereo_SetSurfaceCreationMode` | yes |  |  |  |
 | `NvAPI_Stereo_Trigger_Activation` | yes |  |  |  |
 | `NvAPI_UninstallRise` | yes |  |  |  |
-| `NvAPI_Unload` | yes |  |  |  |
+| `NvAPI_Unload` | yes | `nvapi` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `NvAPI_VIO_Close` | yes |  |  |  |
 | `NvAPI_VIO_EnumDataFormats` | yes |  |  |  |
 | `NvAPI_VIO_EnumDevices` | yes |  |  |  |
@@ -10560,36 +10576,177 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `NvAPI_VIO_Stop` | yes |  |  |  |
 | `NvAPI_VIO_SyncFormatDetect` | yes |  |  |  |
 
+## nvcomp
+
+- `nvcomp.h` sha256 `0737ae854cacff07c5003fbf9a40003260393518ef6abe3e592a6fe64e219972`
+- `nvcomp_export.h` sha256 `634f474f4123928231943b32e624311ebf49d1673fa33c709052e55666a9bac8`
+- `nvcomp/shared_types.h` sha256 `d7d9d12955e9e70f7d73ce2679e9eb130e4f54821a3a255017a2a40d34f0abdd`
+- `nvcomp/version.h` sha256 `eac322d1c8db7c77807f981b25f9b5d836e56712efdeef664247a6e67231c98b`
+- `nvcomp/ans.h` sha256 `f2b8661a76eb9093ca2f4304023ffe99c59ad25a89dc5389bd5df89205b718ca`
+- `nvcomp/bitcomp.h` sha256 `f09db7ed492bf443bdaf88be4137bdfd032b2cee148a169292f5b25b2435cb55`
+- `nvcomp/cascaded.h` sha256 `aae8ffadc03d74d02acd732706e679aabca4458695895ad6872e3fc95a3ad51f`
+- `nvcomp/crc32.h` sha256 `2d53f4b05c36cfc564e88b0b01f32d24fb4259cbc7df2c54fdf9c2cef8d4a309`
+- `nvcomp/deflate.h` sha256 `6c49a24f8e7a1b0648021dd33ccdd6f69ee40ca68b5b1d4693ce7547cf0cd8bc`
+- `nvcomp/gdeflate.h` sha256 `b39c4b058a7eb8a3dc3d32c7dd5f819ab4c981dbf62414244643e5bb05dc6f94`
+- `nvcomp/gzip.h` sha256 `b905e26c740f375c161b79bd1129c61ce19da1b55c5a62bcde56ecdb9860d42f`
+- `nvcomp/lz4.h` sha256 `79a533a9cd04b32ff0879b7e35c7a91107360e6feb6c46cadd6b6432b4269080`
+- `nvcomp/snappy.h` sha256 `879e25b7b78708ef3d3c14588451955bbf2066811d495e1852afcf23d1248d38`
+- `nvcomp/zstd.h` sha256 `2d18f269b46df65b9721b262713512ff9ef8f399b791d10e3fc6377e38f1bfa7`
+- `nvcomp/native/bitcomp.h` sha256 `ace0ba5b0da4cbb097762cadf3036570d139c76e6d95fe1661430c621652b7c7`
+- `nvcomp/native/bitcomp_mode.h` sha256 `3996fc944a2e30db4c55f6fd14e3abef14952e0511b6af654faa4402573026c1`
+
+| Symbol | Bound | Wrapper | Tested on GPU | Note |
+|---|---|---|---|---|
+| `bitcompAccelerateRemoteCompression` | yes |  |  |  |
+| `bitcompCompressLossless` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `bitcompCompressLossy_fp16` | yes |  |  |  |
+| `bitcompCompressLossy_fp32` | yes |  |  |  |
+| `bitcompCompressLossy_fp64` | yes |  |  |  |
+| `bitcompCreatePlan` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `bitcompCreatePlanFromCompressedData` | yes |  |  |  |
+| `bitcompDestroyPlan` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `bitcompGetCompressedInfo` | yes |  |  |  |
+| `bitcompGetCompressedSize` | yes |  |  |  |
+| `bitcompGetCompressedSizeAsync` | yes |  |  |  |
+| `bitcompGetDataTypeFromHandle` | yes |  |  |  |
+| `bitcompGetUncompressedSize` | yes |  |  |  |
+| `bitcompGetUncompressedSizeFromHandle` | yes |  |  |  |
+| `bitcompHostCompressLossless` | yes |  |  |  |
+| `bitcompHostCompressLossy_fp16` | yes |  |  |  |
+| `bitcompHostCompressLossy_fp32` | yes |  |  |  |
+| `bitcompHostCompressLossy_fp64` | yes |  |  |  |
+| `bitcompHostPartialUncompress` | yes |  |  |  |
+| `bitcompHostUncompress` | yes |  |  |  |
+| `bitcompMaxBuflen` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `bitcompPartialUncompress` | yes |  |  |  |
+| `bitcompSetStream` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `bitcompUncompress` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedANSCompressAsync` | yes |  |  |  |
+| `nvcompBatchedANSCompressGetMaxOutputChunkSize` | yes |  |  |  |
+| `nvcompBatchedANSCompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedANSCompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedANSCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedANSDecompressAsync` | yes |  |  |  |
+| `nvcompBatchedANSDecompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedANSDecompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedANSDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedANSGetDecompressSizeAsync` | yes |  |  |  |
+| `nvcompBatchedBitcompCompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompCompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompCompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompCompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedBitcompDecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompDecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompDecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedBitcompDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedBitcompGetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCRC32Async` | yes |  |  |  |
+| `nvcompBatchedCRC32GetHeuristicConf` | yes |  |  |  |
+| `nvcompBatchedCRC32SearchConf` | yes |  |  |  |
+| `nvcompBatchedCascadedCompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedCompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedCompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedCompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedCascadedDecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedDecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedDecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedCascadedDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedCascadedGetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedDeflateCompressAsync` | yes |  |  |  |
+| `nvcompBatchedDeflateCompressGetMaxOutputChunkSize` | yes |  |  |  |
+| `nvcompBatchedDeflateCompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedDeflateCompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedDeflateCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedDeflateDecompressAsync` | yes |  |  |  |
+| `nvcompBatchedDeflateDecompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedDeflateDecompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedDeflateDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedDeflateGetDecompressSizeAsync` | yes |  |  |  |
+| `nvcompBatchedGdeflateCompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateCompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateCompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateCompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedGdeflateDecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateDecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateDecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGdeflateDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedGdeflateGetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedGzipCompressAsync` | yes |  |  |  |
+| `nvcompBatchedGzipCompressGetMaxOutputChunkSize` | yes |  |  |  |
+| `nvcompBatchedGzipCompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedGzipCompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedGzipCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedGzipDecompressAsync` | yes |  |  |  |
+| `nvcompBatchedGzipDecompressGetRequiredAlignments` | yes |  |  |  |
+| `nvcompBatchedGzipDecompressGetTempSize` | yes |  |  |  |
+| `nvcompBatchedGzipDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedGzipGetDecompressSizeAsync` | yes |  |  |  |
+| `nvcompBatchedLZ4CompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4CompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4CompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4CompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4CompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedLZ4DecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4DecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4DecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedLZ4DecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedLZ4GetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyCompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyCompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyCompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyCompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedSnappyDecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyDecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyDecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedSnappyDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedSnappyGetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdCompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdCompressGetMaxOutputChunkSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdCompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdCompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdCompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedZstdDecompressAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdDecompressGetRequiredAlignments` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdDecompressGetTempSize` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompBatchedZstdDecompressGetTempSizeSync` | yes |  |  |  |
+| `nvcompBatchedZstdGetDecompressSizeAsync` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvcompGetProperties` | yes |  |  |  |
+| `nvcompGetStatusString` | yes | `nvcomp` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+
 ## nvcuvid
 
 - `nvcuvid.h` sha256 `8980e3d9c1e41b116240a451b6249b3ab9e8e9582f4792ccc6eade42a6024e0d`
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `cuvidCreateDecoder` | yes |  |  |  |
-| `cuvidCreateVideoParser` | yes |  |  |  |
+| `cuvidCreateDecoder` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidCreateVideoParser` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidCreateVideoSource` | yes |  |  |  |
 | `cuvidCreateVideoSourceW` | yes |  |  |  |
 | `cuvidCtxLock` | yes |  |  |  |
 | `cuvidCtxLockCreate` | yes |  |  |  |
 | `cuvidCtxLockDestroy` | yes |  |  |  |
 | `cuvidCtxUnlock` | yes |  |  |  |
-| `cuvidDecodePicture` | yes |  |  |  |
+| `cuvidDecodePicture` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidDecodePictureAsync` | yes |  |  |  |
-| `cuvidDestroyDecoder` | yes |  |  |  |
-| `cuvidDestroyVideoParser` | yes |  |  |  |
+| `cuvidDestroyDecoder` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidDestroyVideoParser` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidDestroyVideoSource` | yes |  |  |  |
 | `cuvidGetDecodeStatus` | yes |  |  |  |
-| `cuvidGetDecoderCaps` | yes |  |  |  |
+| `cuvidGetDecoderCaps` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidGetSourceAudioFormat` | yes |  |  |  |
 | `cuvidGetSourceVideoFormat` | yes |  |  |  |
 | `cuvidGetVideoSourceState` | yes |  |  |  |
-| `cuvidMapVideoFrame64` | yes |  |  |  |
-| `cuvidParseVideoData` | yes |  |  |  |
+| `cuvidMapVideoFrame64` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cuvidParseVideoData` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cuvidReconfigureDecoder` | yes |  |  |  |
 | `cuvidRegisterDecodeSurfaces` | yes |  |  |  |
 | `cuvidSetVideoSourceState` | yes |  |  |  |
-| `cuvidUnmapVideoFrame64` | yes |  |  |  |
+| `cuvidUnmapVideoFrame64` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## nvenc
 
@@ -10597,19 +10754,19 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `nvEncCreateBitstreamBuffer` | yes |  |  |  |
-| `nvEncCreateInputBuffer` | yes |  |  |  |
+| `nvEncCreateBitstreamBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncCreateInputBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncCreateMVBuffer` | yes |  |  |  |
-| `nvEncDestroyBitstreamBuffer` | yes |  |  |  |
-| `nvEncDestroyEncoder` | yes |  |  |  |
-| `nvEncDestroyInputBuffer` | yes |  |  |  |
+| `nvEncDestroyBitstreamBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncDestroyEncoder` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncDestroyInputBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncDestroyMVBuffer` | yes |  |  |  |
-| `nvEncEncodePicture` | yes |  |  |  |
-| `nvEncGetEncodeCaps` | yes |  |  |  |
+| `nvEncEncodePicture` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncGetEncodeCaps` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncGetEncodeGUIDCount` | yes |  |  |  |
 | `nvEncGetEncodeGUIDs` | yes |  |  |  |
 | `nvEncGetEncodePresetConfig` | yes |  |  |  |
-| `nvEncGetEncodePresetConfigEx` | yes |  |  |  |
+| `nvEncGetEncodePresetConfigEx` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncGetEncodePresetCount` | yes |  |  |  |
 | `nvEncGetEncodePresetGUIDs` | yes |  |  |  |
 | `nvEncGetEncodeProfileGUIDCount` | yes |  |  |  |
@@ -10617,28 +10774,28 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvEncGetEncodeStats` | yes |  |  |  |
 | `nvEncGetInputFormatCount` | yes |  |  |  |
 | `nvEncGetInputFormats` | yes |  |  |  |
-| `nvEncGetLastErrorString` | yes |  |  |  |
+| `nvEncGetLastErrorString` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncGetSequenceParamEx` | yes |  |  |  |
 | `nvEncGetSequenceParams` | yes |  |  |  |
-| `nvEncInitializeEncoder` | yes |  |  |  |
+| `nvEncInitializeEncoder` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncInvalidateRefFrames` | yes |  |  |  |
-| `nvEncLockBitstream` | yes |  |  |  |
-| `nvEncLockInputBuffer` | yes |  |  |  |
+| `nvEncLockBitstream` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncLockInputBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncLookaheadPicture` | yes |  |  |  |
-| `nvEncMapInputResource` | yes |  |  |  |
+| `nvEncMapInputResource` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncOpenEncodeSession` | yes |  |  |  |
-| `nvEncOpenEncodeSessionEx` | yes |  |  |  |
+| `nvEncOpenEncodeSessionEx` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncReconfigureEncoder` | yes |  |  |  |
 | `nvEncRegisterAsyncEvent` | yes |  |  |  |
-| `nvEncRegisterResource` | yes |  |  |  |
+| `nvEncRegisterResource` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncRestoreEncoderState` | yes |  |  |  |
 | `nvEncRunMotionEstimationOnly` | yes |  |  |  |
-| `nvEncSetIOCudaStreams` | yes |  |  |  |
-| `nvEncUnlockBitstream` | yes |  |  |  |
-| `nvEncUnlockInputBuffer` | yes |  |  |  |
-| `nvEncUnmapInputResource` | yes |  |  |  |
+| `nvEncSetIOCudaStreams` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncUnlockBitstream` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncUnlockInputBuffer` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvEncUnmapInputResource` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvEncUnregisterAsyncEvent` | yes |  |  |  |
-| `nvEncUnregisterResource` | yes |  |  |  |
+| `nvEncUnregisterResource` | yes | `nvenc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## nvjpeg
 
@@ -10646,21 +10803,21 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `nvjpegBufferDeviceCreate` | yes |  |  |  |
+| `nvjpegBufferDeviceCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferDeviceCreateV2` | yes |  |  |  |
-| `nvjpegBufferDeviceDestroy` | yes |  |  |  |
-| `nvjpegBufferDeviceResize` | yes |  |  |  |
+| `nvjpegBufferDeviceDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegBufferDeviceResize` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferDeviceRetrieve` | yes |  |  |  |
-| `nvjpegBufferPinnedCreate` | yes |  |  |  |
+| `nvjpegBufferPinnedCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferPinnedCreateV2` | yes |  |  |  |
-| `nvjpegBufferPinnedDestroy` | yes |  |  |  |
-| `nvjpegBufferPinnedResize` | yes |  |  |  |
+| `nvjpegBufferPinnedDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegBufferPinnedResize` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferPinnedRetrieve` | yes |  |  |  |
-| `nvjpegCreate` | yes |  |  |  |
-| `nvjpegCreateEx` | yes |  |  |  |
+| `nvjpegCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegCreateEx` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegCreateExV2` | yes |  |  |  |
-| `nvjpegCreateSimple` | yes |  |  |  |
-| `nvjpegDecode` | yes |  |  |  |
+| `nvjpegCreateSimple` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegDecode` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegDecodeBatched` | yes |  |  |  |
 | `nvjpegDecodeBatchedEx` | yes |  |  |  |
 | `nvjpegDecodeBatchedInitialize` | yes |  |  |  |
@@ -10668,65 +10825,65 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvjpegDecodeBatchedPreAllocate` | yes |  |  |  |
 | `nvjpegDecodeBatchedSupported` | yes |  |  |  |
 | `nvjpegDecodeBatchedSupportedEx` | yes |  |  |  |
-| `nvjpegDecodeJpeg` | yes |  |  |  |
+| `nvjpegDecodeJpeg` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegDecodeJpegDevice` | yes |  |  |  |
 | `nvjpegDecodeJpegHost` | yes |  |  |  |
 | `nvjpegDecodeJpegTransferToDevice` | yes |  |  |  |
-| `nvjpegDecodeParamsCreate` | yes |  |  |  |
-| `nvjpegDecodeParamsDestroy` | yes |  |  |  |
+| `nvjpegDecodeParamsCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegDecodeParamsDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegDecodeParamsSetAllowCMYK` | yes |  |  |  |
 | `nvjpegDecodeParamsSetExifOrientation` | yes |  |  |  |
-| `nvjpegDecodeParamsSetOutputFormat` | yes |  |  |  |
+| `nvjpegDecodeParamsSetOutputFormat` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegDecodeParamsSetROI` | yes |  |  |  |
 | `nvjpegDecodeParamsSetScaleFactor` | yes |  |  |  |
-| `nvjpegDecoderCreate` | yes |  |  |  |
-| `nvjpegDecoderDestroy` | yes |  |  |  |
+| `nvjpegDecoderCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegDecoderDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegDecoderJpegSupported` | yes |  |  |  |
-| `nvjpegDecoderStateCreate` | yes |  |  |  |
-| `nvjpegDestroy` | yes |  |  |  |
+| `nvjpegDecoderStateCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegEncode` | yes |  |  |  |
-| `nvjpegEncodeGetBufferSize` | yes |  |  |  |
-| `nvjpegEncodeImage` | yes |  |  |  |
-| `nvjpegEncodeRetrieveBitstream` | yes |  |  |  |
+| `nvjpegEncodeGetBufferSize` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncodeImage` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncodeRetrieveBitstream` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegEncodeRetrieveBitstreamDevice` | yes |  |  |  |
-| `nvjpegEncodeYUV` | yes |  |  |  |
+| `nvjpegEncodeYUV` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegEncoderParamsCopyMetadata` | yes |  |  |  |
 | `nvjpegEncoderParamsCopyQuantizationTables` | yes |  |  |  |
-| `nvjpegEncoderParamsCreate` | yes |  |  |  |
-| `nvjpegEncoderParamsDestroy` | yes |  |  |  |
-| `nvjpegEncoderParamsSetEncoding` | yes |  |  |  |
-| `nvjpegEncoderParamsSetOptimizedHuffman` | yes |  |  |  |
-| `nvjpegEncoderParamsSetQuality` | yes |  |  |  |
-| `nvjpegEncoderParamsSetRestartInterval` | yes |  |  |  |
-| `nvjpegEncoderParamsSetSamplingFactors` | yes |  |  |  |
-| `nvjpegEncoderStateCreate` | yes |  |  |  |
+| `nvjpegEncoderParamsCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsSetEncoding` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsSetOptimizedHuffman` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsSetQuality` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsSetRestartInterval` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderParamsSetSamplingFactors` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegEncoderStateCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegEncoderStateCreateWithBackend` | yes |  |  |  |
-| `nvjpegEncoderStateDestroy` | yes |  |  |  |
+| `nvjpegEncoderStateDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegGetCudartProperty` | yes |  |  |  |
 | `nvjpegGetDeviceMemoryPadding` | yes |  |  |  |
 | `nvjpegGetHardwareDecoderInfo` | yes |  |  |  |
 | `nvjpegGetHardwareEncoderInfo` | yes |  |  |  |
-| `nvjpegGetImageInfo` | yes |  |  |  |
+| `nvjpegGetImageInfo` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegGetPinnedMemoryPadding` | yes |  |  |  |
 | `nvjpegGetProperty` | yes |  |  |  |
-| `nvjpegJpegStateCreate` | yes |  |  |  |
-| `nvjpegJpegStateDestroy` | yes |  |  |  |
-| `nvjpegJpegStreamCreate` | yes |  |  |  |
-| `nvjpegJpegStreamDestroy` | yes |  |  |  |
-| `nvjpegJpegStreamGetChromaSubsampling` | yes |  |  |  |
+| `nvjpegJpegStateCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStateDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamGetChromaSubsampling` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegJpegStreamGetComponentDimensions` | yes |  |  |  |
-| `nvjpegJpegStreamGetComponentsNum` | yes |  |  |  |
-| `nvjpegJpegStreamGetExifOrientation` | yes |  |  |  |
-| `nvjpegJpegStreamGetFrameDimensions` | yes |  |  |  |
-| `nvjpegJpegStreamGetJpegEncoding` | yes |  |  |  |
-| `nvjpegJpegStreamGetSamplePrecision` | yes |  |  |  |
-| `nvjpegJpegStreamParse` | yes |  |  |  |
-| `nvjpegJpegStreamParseHeader` | yes |  |  |  |
+| `nvjpegJpegStreamGetComponentsNum` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamGetExifOrientation` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamGetFrameDimensions` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamGetJpegEncoding` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamGetSamplePrecision` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamParse` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegJpegStreamParseHeader` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegJpegStreamParseTables` | yes |  |  |  |
 | `nvjpegSetDeviceMemoryPadding` | yes |  |  |  |
 | `nvjpegSetPinnedMemoryPadding` | yes |  |  |  |
-| `nvjpegStateAttachDeviceBuffer` | yes |  |  |  |
-| `nvjpegStateAttachPinnedBuffer` | yes |  |  |  |
+| `nvjpegStateAttachDeviceBuffer` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegStateAttachPinnedBuffer` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## nvml
 
@@ -10754,10 +10911,10 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetAdaptiveClockInfoStatus` | yes |  |  |  |
 | `nvmlDeviceGetAddressingMode` | yes |  |  |  |
 | `nvmlDeviceGetApplicationsClock` | yes |  |  |  |
-| `nvmlDeviceGetArchitecture` | yes |  |  |  |
+| `nvmlDeviceGetArchitecture` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetAttributes_v2` | yes |  |  |  |
 | `nvmlDeviceGetAutoBoostedClocksEnabled` | yes |  |  |  |
-| `nvmlDeviceGetBAR1MemoryInfo` | yes |  |  |  |
+| `nvmlDeviceGetBAR1MemoryInfo` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetBBXTimeData_v1` | yes |  |  |  |
 | `nvmlDeviceGetBoardId` | yes |  |  |  |
 | `nvmlDeviceGetBoardPartNumber` | yes |  |  |  |
@@ -10768,27 +10925,27 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetCapabilities` | yes |  |  |  |
 | `nvmlDeviceGetClkMonStatus` | yes |  |  |  |
 | `nvmlDeviceGetClock` | yes |  |  |  |
-| `nvmlDeviceGetClockInfo` | yes |  |  |  |
+| `nvmlDeviceGetClockInfo` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetClockOffsets` | yes |  |  |  |
 | `nvmlDeviceGetComputeInstanceId` | yes |  |  |  |
 | `nvmlDeviceGetComputeMode` | yes |  |  |  |
-| `nvmlDeviceGetComputeRunningProcesses_v3` | yes |  |  |  |
+| `nvmlDeviceGetComputeRunningProcesses_v3` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetConfComputeGpuAttestationReport` | yes |  |  |  |
 | `nvmlDeviceGetConfComputeGpuCertificate` | yes |  |  |  |
 | `nvmlDeviceGetConfComputeMemSizeInfo` | yes |  |  |  |
 | `nvmlDeviceGetConfComputeProtectedMemoryUsage` | yes |  |  |  |
 | `nvmlDeviceGetCoolerInfo` | yes |  |  |  |
-| `nvmlDeviceGetCount_v2` | yes |  |  |  |
+| `nvmlDeviceGetCount_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetCpuAffinity` | yes |  |  |  |
 | `nvmlDeviceGetCpuAffinityWithinScope` | yes |  |  |  |
 | `nvmlDeviceGetCreatableVgpus` | yes |  |  |  |
-| `nvmlDeviceGetCudaComputeCapability` | yes |  |  |  |
-| `nvmlDeviceGetCurrPcieLinkGeneration` | yes |  |  |  |
-| `nvmlDeviceGetCurrPcieLinkWidth` | yes |  |  |  |
+| `nvmlDeviceGetCudaComputeCapability` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetCurrPcieLinkGeneration` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetCurrPcieLinkWidth` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetCurrentClockFreqs` | yes |  |  |  |
-| `nvmlDeviceGetCurrentClocksEventReasons` | yes |  |  |  |
-| `nvmlDeviceGetCurrentClocksThrottleReasons` | yes |  |  |  |
-| `nvmlDeviceGetDecoderUtilization` | yes |  |  |  |
+| `nvmlDeviceGetCurrentClocksEventReasons` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetCurrentClocksThrottleReasons` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetDecoderUtilization` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetDefaultApplicationsClock` | yes |  |  |  |
 | `nvmlDeviceGetDefaultEccMode` | yes |  |  |  |
 | `nvmlDeviceGetDetailedEccErrors` | yes |  |  |  |
@@ -10798,18 +10955,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetDramEncryptionMode` | yes |  |  |  |
 | `nvmlDeviceGetDriverModel_v2` | yes |  |  |  |
 | `nvmlDeviceGetDynamicPstatesInfo` | yes |  |  |  |
-| `nvmlDeviceGetEccMode` | yes |  |  |  |
+| `nvmlDeviceGetEccMode` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetEncoderCapacity` | yes |  |  |  |
 | `nvmlDeviceGetEncoderSessions` | yes |  |  |  |
 | `nvmlDeviceGetEncoderStats` | yes |  |  |  |
-| `nvmlDeviceGetEncoderUtilization` | yes |  |  |  |
-| `nvmlDeviceGetEnforcedPowerLimit` | yes |  |  |  |
+| `nvmlDeviceGetEncoderUtilization` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetEnforcedPowerLimit` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetFBCSessions` | yes |  |  |  |
 | `nvmlDeviceGetFBCStats` | yes |  |  |  |
 | `nvmlDeviceGetFanControlPolicy_v2` | yes |  |  |  |
-| `nvmlDeviceGetFanSpeed` | yes |  |  |  |
+| `nvmlDeviceGetFanSpeed` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetFanSpeedRPM` | yes |  |  |  |
-| `nvmlDeviceGetFanSpeed_v2` | yes |  |  |  |
+| `nvmlDeviceGetFanSpeed_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetFieldValues` | yes |  |  |  |
 | `nvmlDeviceGetGpcClkMinMaxVfOffset` | yes |  |  |  |
 | `nvmlDeviceGetGpcClkVfOffset` | yes |  |  |  |
@@ -10825,18 +10982,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetGpuInstances` | yes |  |  |  |
 | `nvmlDeviceGetGpuMaxPcieLinkGeneration` | yes |  |  |  |
 | `nvmlDeviceGetGpuOperationMode` | yes |  |  |  |
-| `nvmlDeviceGetGraphicsRunningProcesses_v3` | yes |  |  |  |
+| `nvmlDeviceGetGraphicsRunningProcesses_v3` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetGridLicensableFeatures_v4` | yes |  |  |  |
 | `nvmlDeviceGetGspFirmwareMode` | yes |  |  |  |
 | `nvmlDeviceGetGspFirmwareVersion` | yes |  |  |  |
-| `nvmlDeviceGetHandleByIndex_v2` | yes |  |  |  |
-| `nvmlDeviceGetHandleByPciBusId_v2` | yes |  |  |  |
+| `nvmlDeviceGetHandleByIndex_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetHandleByPciBusId_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetHandleBySerial` | yes |  |  |  |
-| `nvmlDeviceGetHandleByUUID` | yes |  |  |  |
+| `nvmlDeviceGetHandleByUUID` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetHandleByUUIDV` | yes |  |  |  |
 | `nvmlDeviceGetHostVgpuMode` | yes |  |  |  |
 | `nvmlDeviceGetHostname_v1` | yes |  |  |  |
-| `nvmlDeviceGetIndex` | yes |  |  |  |
+| `nvmlDeviceGetIndex` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetInforomConfigurationChecksum` | yes |  |  |  |
 | `nvmlDeviceGetInforomImageVersion` | yes |  |  |  |
 | `nvmlDeviceGetInforomVersion` | yes |  |  |  |
@@ -10845,18 +11002,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetLastBBXFlushTime` | yes |  |  |  |
 | `nvmlDeviceGetMPSComputeRunningProcesses_v3` | yes |  |  |  |
 | `nvmlDeviceGetMarginTemperature` | yes |  |  |  |
-| `nvmlDeviceGetMaxClockInfo` | yes |  |  |  |
+| `nvmlDeviceGetMaxClockInfo` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetMaxCustomerBoostClock` | yes |  |  |  |
 | `nvmlDeviceGetMaxMigDeviceCount` | yes |  |  |  |
-| `nvmlDeviceGetMaxPcieLinkGeneration` | yes |  |  |  |
-| `nvmlDeviceGetMaxPcieLinkWidth` | yes |  |  |  |
+| `nvmlDeviceGetMaxPcieLinkGeneration` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetMaxPcieLinkWidth` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetMemClkMinMaxVfOffset` | yes |  |  |  |
 | `nvmlDeviceGetMemClkVfOffset` | yes |  |  |  |
 | `nvmlDeviceGetMemoryAffinity` | yes |  |  |  |
 | `nvmlDeviceGetMemoryBusWidth` | yes |  |  |  |
 | `nvmlDeviceGetMemoryErrorCounter` | yes |  |  |  |
-| `nvmlDeviceGetMemoryInfo` | yes |  |  |  |
-| `nvmlDeviceGetMemoryInfo_v2` | yes |  |  |  |
+| `nvmlDeviceGetMemoryInfo` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetMemoryInfo_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetMigDeviceHandleByIndex` | yes |  |  |  |
 | `nvmlDeviceGetMigMode` | yes |  |  |  |
 | `nvmlDeviceGetMinMaxClockOfPState` | yes |  |  |  |
@@ -10864,43 +11021,43 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetMinorNumber` | yes |  |  |  |
 | `nvmlDeviceGetModuleId` | yes |  |  |  |
 | `nvmlDeviceGetMultiGpuBoard` | yes |  |  |  |
-| `nvmlDeviceGetName` | yes |  |  |  |
-| `nvmlDeviceGetNumFans` | yes |  |  |  |
+| `nvmlDeviceGetName` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetNumFans` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetNumGpuCores` | yes |  |  |  |
 | `nvmlDeviceGetNumaNodeId` | yes |  |  |  |
-| `nvmlDeviceGetNvLinkCapability` | yes |  |  |  |
-| `nvmlDeviceGetNvLinkErrorCounter` | yes |  |  |  |
+| `nvmlDeviceGetNvLinkCapability` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetNvLinkErrorCounter` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetNvLinkInfo` | yes |  |  |  |
 | `nvmlDeviceGetNvLinkRemoteDeviceType` | yes |  |  |  |
 | `nvmlDeviceGetNvLinkRemotePciInfo_v2` | yes |  |  |  |
-| `nvmlDeviceGetNvLinkState` | yes |  |  |  |
+| `nvmlDeviceGetNvLinkState` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetNvLinkUtilizationControl` | yes |  |  |  |
 | `nvmlDeviceGetNvLinkUtilizationCounter` | yes |  |  |  |
-| `nvmlDeviceGetNvLinkVersion` | yes |  |  |  |
+| `nvmlDeviceGetNvLinkVersion` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetNvlinkBwMode` | yes |  |  |  |
 | `nvmlDeviceGetNvlinkSupportedBwModes` | yes |  |  |  |
 | `nvmlDeviceGetOfaUtilization` | yes |  |  |  |
 | `nvmlDeviceGetP2PStatus` | yes |  |  |  |
 | `nvmlDeviceGetPciInfoExt` | yes |  |  |  |
-| `nvmlDeviceGetPciInfo_v3` | yes |  |  |  |
+| `nvmlDeviceGetPciInfo_v3` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetPcieLinkMaxSpeed` | yes |  |  |  |
-| `nvmlDeviceGetPcieReplayCounter` | yes |  |  |  |
+| `nvmlDeviceGetPcieReplayCounter` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetPcieSpeed` | yes |  |  |  |
-| `nvmlDeviceGetPcieThroughput` | yes |  |  |  |
+| `nvmlDeviceGetPcieThroughput` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetPdi` | yes |  |  |  |
 | `nvmlDeviceGetPerformanceModes` | yes |  |  |  |
-| `nvmlDeviceGetPerformanceState` | yes |  |  |  |
+| `nvmlDeviceGetPerformanceState` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetPersistenceMode` | yes |  |  |  |
 | `nvmlDeviceGetPgpuMetadataString` | yes |  |  |  |
 | `nvmlDeviceGetPlatformInfo` | yes |  |  |  |
-| `nvmlDeviceGetPowerManagementDefaultLimit` | yes |  |  |  |
-| `nvmlDeviceGetPowerManagementLimit` | yes |  |  |  |
-| `nvmlDeviceGetPowerManagementLimitConstraints` | yes |  |  |  |
+| `nvmlDeviceGetPowerManagementDefaultLimit` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetPowerManagementLimit` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetPowerManagementLimitConstraints` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetPowerManagementMode` | yes |  |  |  |
 | `nvmlDeviceGetPowerMizerMode_v1` | yes |  |  |  |
 | `nvmlDeviceGetPowerSource` | yes |  |  |  |
 | `nvmlDeviceGetPowerState` | yes |  |  |  |
-| `nvmlDeviceGetPowerUsage` | yes |  |  |  |
+| `nvmlDeviceGetPowerUsage` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetProcessUtilization` | yes |  |  |  |
 | `nvmlDeviceGetProcessesUtilizationInfo` | yes |  |  |  |
 | `nvmlDeviceGetRemappedRows` | yes |  |  |  |
@@ -10912,7 +11069,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetRowRemapperHistogram` | yes |  |  |  |
 | `nvmlDeviceGetRunningProcessDetailList` | yes |  |  |  |
 | `nvmlDeviceGetSamples` | yes |  |  |  |
-| `nvmlDeviceGetSerial` | yes |  |  |  |
+| `nvmlDeviceGetSerial` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetSramEccErrorStatus` | yes |  |  |  |
 | `nvmlDeviceGetSramUniqueUncorrectedEccErrorCounts` | yes |  |  |  |
 | `nvmlDeviceGetSupportedClocksEventReasons` | yes |  |  |  |
@@ -10923,18 +11080,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceGetSupportedPerformanceStates` | yes |  |  |  |
 | `nvmlDeviceGetSupportedVgpus` | yes |  |  |  |
 | `nvmlDeviceGetTargetFanSpeed` | yes |  |  |  |
-| `nvmlDeviceGetTemperature` | yes |  |  |  |
-| `nvmlDeviceGetTemperatureThreshold` | yes |  |  |  |
+| `nvmlDeviceGetTemperature` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetTemperatureThreshold` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetTemperatureV` | yes |  |  |  |
 | `nvmlDeviceGetThermalSettings` | yes |  |  |  |
 | `nvmlDeviceGetTopologyCommonAncestor` | yes |  |  |  |
 | `nvmlDeviceGetTopologyNearestGpus` | yes |  |  |  |
-| `nvmlDeviceGetTotalEccErrors` | yes |  |  |  |
-| `nvmlDeviceGetTotalEnergyConsumption` | yes |  |  |  |
-| `nvmlDeviceGetUUID` | yes |  |  |  |
+| `nvmlDeviceGetTotalEccErrors` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetTotalEnergyConsumption` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetUUID` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetUnrepairableMemoryFlag_v1` | yes |  |  |  |
-| `nvmlDeviceGetUtilizationRates` | yes |  |  |  |
-| `nvmlDeviceGetVbiosVersion` | yes |  |  |  |
+| `nvmlDeviceGetUtilizationRates` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlDeviceGetVbiosVersion` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlDeviceGetVgpuCapabilities` | yes |  |  |  |
 | `nvmlDeviceGetVgpuHeterogeneousMode` | yes |  |  |  |
 | `nvmlDeviceGetVgpuInstancesUtilizationInfo` | yes |  |  |  |
@@ -11010,7 +11167,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlDeviceWorkloadPowerProfileGetProfilesInfo` | yes |  |  |  |
 | `nvmlDeviceWorkloadPowerProfileSetRequestedProfiles` | yes |  |  |  |
 | `nvmlDeviceWorkloadPowerProfileUpdateProfiles_v1` | yes |  |  |  |
-| `nvmlErrorString` | yes |  |  |  |
+| `nvmlErrorString` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlEventSetCreate` | yes |  |  |  |
 | `nvmlEventSetFree` | yes |  |  |  |
 | `nvmlEventSetWait_v2` | yes |  |  |  |
@@ -11048,10 +11205,10 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlGpuInstanceSetVgpuHeterogeneousMode` | yes |  |  |  |
 | `nvmlGpuInstanceSetVgpuSchedulerState` | yes |  |  |  |
 | `nvmlGpuInstanceSetVgpuSchedulerState_v2` | yes |  |  |  |
-| `nvmlInitWithFlags` | yes |  |  |  |
-| `nvmlInit_v2` | yes |  |  |  |
+| `nvmlInitWithFlags` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlInit_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlSetVgpuVersion` | yes |  |  |  |
-| `nvmlShutdown` | yes |  |  |  |
+| `nvmlShutdown` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlSystemEventSetCreate` | yes |  |  |  |
 | `nvmlSystemEventSetFree` | yes |  |  |  |
 | `nvmlSystemEventSetWait` | yes |  |  |  |
@@ -11062,11 +11219,11 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvmlSystemGetConfComputeSettings` | yes |  |  |  |
 | `nvmlSystemGetConfComputeState` | yes |  |  |  |
 | `nvmlSystemGetCudaDriverVersion` | yes |  |  |  |
-| `nvmlSystemGetCudaDriverVersion_v2` | yes |  |  |  |
-| `nvmlSystemGetDriverBranch` | yes |  |  |  |
-| `nvmlSystemGetDriverVersion` | yes |  |  |  |
+| `nvmlSystemGetCudaDriverVersion_v2` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlSystemGetDriverBranch` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvmlSystemGetDriverVersion` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlSystemGetHicVersion` | yes |  |  |  |
-| `nvmlSystemGetNVMLVersion` | yes |  |  |  |
+| `nvmlSystemGetNVMLVersion` | yes | `nvml` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvmlSystemGetNvlinkBwMode` | yes |  |  |  |
 | `nvmlSystemGetProcessName` | yes |  |  |  |
 | `nvmlSystemGetTopologyGpuSet` | yes |  |  |  |
@@ -11131,18 +11288,18 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `nvCreateOpticalFlowCuda` | yes |  |  |  |
-| `nvOFCreateGPUBufferCuda` | yes |  |  |  |
-| `nvOFDestroy` | yes |  |  |  |
-| `nvOFDestroyGPUBufferCuda` | yes |  |  |  |
-| `nvOFExecute` | yes |  |  |  |
-| `nvOFGPUBufferGetCUarray` | yes |  |  |  |
-| `nvOFGPUBufferGetCUdeviceptr` | yes |  |  |  |
-| `nvOFGPUBufferGetStrideInfo` | yes |  |  |  |
-| `nvOFGetCaps` | yes |  |  |  |
-| `nvOFGetLastError` | yes |  |  |  |
-| `nvOFInit` | yes |  |  |  |
-| `nvOFSetIOCudaStreams` | yes |  |  |  |
+| `nvCreateOpticalFlowCuda` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFCreateGPUBufferCuda` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFDestroy` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFDestroyGPUBufferCuda` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFExecute` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFGPUBufferGetCUarray` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFGPUBufferGetCUdeviceptr` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFGPUBufferGetStrideInfo` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFGetCaps` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFGetLastError` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFInit` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvOFSetIOCudaStreams` | yes | `nvofa` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## nvrtc
 
@@ -11150,35 +11307,35 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `nvrtcAddNameExpression` | yes |  |  |  |
-| `nvrtcCompileProgram` | yes |  |  |  |
-| `nvrtcCreateProgram` | yes |  |  |  |
-| `nvrtcDestroyProgram` | yes |  |  |  |
+| `nvrtcAddNameExpression` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcCompileProgram` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcCreateProgram` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcDestroyProgram` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvrtcGetBundledHeadersInfo` | yes |  |  |  |
-| `nvrtcGetCUBIN` | yes |  |  |  |
-| `nvrtcGetCUBINSize` | yes |  |  |  |
-| `nvrtcGetErrorString` | yes |  |  |  |
-| `nvrtcGetLTOIR` | yes |  |  |  |
-| `nvrtcGetLTOIRSize` | yes |  |  |  |
-| `nvrtcGetLoweredName` | yes |  |  |  |
-| `nvrtcGetNumSupportedArchs` | yes |  |  |  |
-| `nvrtcGetOptiXIR` | yes |  |  |  |
-| `nvrtcGetOptiXIRSize` | yes |  |  |  |
+| `nvrtcGetCUBIN` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetCUBINSize` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetErrorString` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetLTOIR` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetLTOIRSize` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetLoweredName` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetNumSupportedArchs` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetOptiXIR` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetOptiXIRSize` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvrtcGetPCHCreateStatus` | yes |  |  |  |
 | `nvrtcGetPCHHeapSize` | yes |  |  |  |
 | `nvrtcGetPCHHeapSizeRequired` | yes |  |  |  |
-| `nvrtcGetPTX` | yes |  |  |  |
-| `nvrtcGetPTXSize` | yes |  |  |  |
-| `nvrtcGetProgramLog` | yes |  |  |  |
-| `nvrtcGetProgramLogSize` | yes |  |  |  |
-| `nvrtcGetSupportedArchs` | yes |  |  |  |
+| `nvrtcGetPTX` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetPTXSize` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetProgramLog` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetProgramLogSize` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvrtcGetSupportedArchs` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvrtcGetTileIR` | yes |  |  |  |
 | `nvrtcGetTileIRSize` | yes |  |  |  |
 | `nvrtcInstallBundledHeaders` | yes |  |  |  |
 | `nvrtcRemoveBundledHeaders` | yes |  |  |  |
 | `nvrtcSetFlowCallback` | yes |  |  |  |
 | `nvrtcSetPCHHeapSize` | yes |  |  |  |
-| `nvrtcVersion` | yes |  |  |  |
+| `nvrtcVersion` | yes | `nvrtc` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 
 ## optix
 
@@ -11186,63 +11343,63 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 
 | Symbol | Bound | Wrapper | Tested on GPU | Note |
 |---|---|---|---|---|
-| `optixAccelBuild` | yes |  |  |  |
-| `optixAccelCompact` | yes |  |  |  |
-| `optixAccelComputeMemoryUsage` | yes |  |  |  |
-| `optixAccelEmitProperty` | yes |  |  |  |
-| `optixAccelGetRelocationInfo` | yes |  |  |  |
-| `optixAccelRelocate` | yes |  |  |  |
-| `optixBuiltinISModuleGet` | yes |  |  |  |
-| `optixCheckRelocationCompatibility` | yes |  |  |  |
-| `optixClusterAccelBuild` | yes |  |  |  |
-| `optixClusterAccelComputeMemoryUsage` | yes |  |  |  |
-| `optixConvertPointerToTraversableHandle` | yes |  |  |  |
-| `optixCoopVecMatrixComputeSize` | yes |  |  |  |
-| `optixCoopVecMatrixConvert` | yes |  |  |  |
-| `optixDenoiserComputeAverageColor` | yes |  |  |  |
-| `optixDenoiserComputeIntensity` | yes |  |  |  |
-| `optixDenoiserComputeMemoryResources` | yes |  |  |  |
-| `optixDenoiserCreate` | yes |  |  |  |
-| `optixDenoiserCreateWithUserModel` | yes |  |  |  |
-| `optixDenoiserDestroy` | yes |  |  |  |
-| `optixDenoiserInvoke` | yes |  |  |  |
-| `optixDenoiserSetup` | yes |  |  |  |
-| `optixDeviceContextCancelCreations` | yes |  |  |  |
-| `optixDeviceContextCreate` | yes |  |  |  |
-| `optixDeviceContextDestroy` | yes |  |  |  |
-| `optixDeviceContextGetCacheDatabaseSizes` | yes |  |  |  |
-| `optixDeviceContextGetCacheEnabled` | yes |  |  |  |
-| `optixDeviceContextGetCacheLocation` | yes |  |  |  |
-| `optixDeviceContextGetProperty` | yes |  |  |  |
-| `optixDeviceContextSetCacheDatabaseSizes` | yes |  |  |  |
-| `optixDeviceContextSetCacheEnabled` | yes |  |  |  |
-| `optixDeviceContextSetCacheLocation` | yes |  |  |  |
-| `optixDeviceContextSetLogCallback` | yes |  |  |  |
-| `optixGetErrorName` | yes |  |  |  |
-| `optixGetErrorString` | yes |  |  |  |
-| `optixLaunch` | yes |  |  |  |
-| `optixModuleCancelCreation` | yes |  |  |  |
-| `optixModuleCreate` | yes |  |  |  |
-| `optixModuleCreateWithTasks` | yes |  |  |  |
-| `optixModuleDestroy` | yes |  |  |  |
-| `optixModuleGetCompilationState` | yes |  |  |  |
-| `optixOpacityMicromapArrayBuild` | yes |  |  |  |
-| `optixOpacityMicromapArrayComputeMemoryUsage` | yes |  |  |  |
-| `optixOpacityMicromapArrayGetRelocationInfo` | yes |  |  |  |
-| `optixOpacityMicromapArrayRelocate` | yes |  |  |  |
-| `optixPipelineCreate` | yes |  |  |  |
-| `optixPipelineDestroy` | yes |  |  |  |
-| `optixPipelineSetStackSize` | yes |  |  |  |
-| `optixPipelineSetStackSizeFromCallDepths` | yes |  |  |  |
-| `optixPipelineSymbolMemcpyAsync` | yes |  |  |  |
-| `optixProgramGroupCreate` | yes |  |  |  |
-| `optixProgramGroupDestroy` | yes |  |  |  |
-| `optixProgramGroupGetStackSize` | yes |  |  |  |
-| `optixSbtRecordPackHeader` | yes |  |  |  |
+| `optixAccelBuild` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixAccelCompact` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixAccelComputeMemoryUsage` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixAccelEmitProperty` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixAccelGetRelocationInfo` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixAccelRelocate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixBuiltinISModuleGet` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixCheckRelocationCompatibility` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixClusterAccelBuild` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixClusterAccelComputeMemoryUsage` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixConvertPointerToTraversableHandle` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixCoopVecMatrixComputeSize` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixCoopVecMatrixConvert` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserComputeAverageColor` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserComputeIntensity` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserComputeMemoryResources` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserCreate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserCreateWithUserModel` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserDestroy` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserInvoke` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDenoiserSetup` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextCancelCreations` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextCreate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextDestroy` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextGetCacheDatabaseSizes` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextGetCacheEnabled` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextGetCacheLocation` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextGetProperty` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextSetCacheDatabaseSizes` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextSetCacheEnabled` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextSetCacheLocation` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixDeviceContextSetLogCallback` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixGetErrorName` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixGetErrorString` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixLaunch` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixModuleCancelCreation` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixModuleCreate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixModuleCreateWithTasks` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixModuleDestroy` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixModuleGetCompilationState` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixOpacityMicromapArrayBuild` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixOpacityMicromapArrayComputeMemoryUsage` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixOpacityMicromapArrayGetRelocationInfo` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixOpacityMicromapArrayRelocate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixPipelineCreate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixPipelineDestroy` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixPipelineSetStackSize` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixPipelineSetStackSizeFromCallDepths` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixPipelineSymbolMemcpyAsync` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixProgramGroupCreate` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixProgramGroupDestroy` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixProgramGroupGetStackSize` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixSbtRecordPackHeader` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `optixStub` | yes |  |  |  |
-| `optixTaskDeserializeOutput` | yes |  |  |  |
-| `optixTaskExecute` | yes |  |  |  |
-| `optixTaskGetSerializationKey` | yes |  |  |  |
-| `optixTaskSerializeOutput` | yes |  |  |  |
+| `optixTaskDeserializeOutput` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixTaskExecute` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixTaskGetSerializationKey` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `optixTaskSerializeOutput` | yes | `optix` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `stub1` | yes |  |  |  |
 | `stub2` | yes |  |  |  |

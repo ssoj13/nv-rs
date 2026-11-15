@@ -1,0 +1,276 @@
+lib = "nvcomp"
+
+[[fn]]
+name = "bitcompCompressLossless"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "bitcompCreatePlan"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "bitcompDestroyPlan"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "bitcompMaxBuflen"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "bitcompSetStream"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "bitcompUncompress"
+wrapper = "nvcomp"
+test = "t0_bitcomp_dtype_mapping"
+
+[[fn]]
+name = "nvcompBatchedBitcompCompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompCompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompCompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompCompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompDecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompDecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompDecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedBitcompGetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedCompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedCompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedCompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedCompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedDecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedDecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedDecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedCascadedGetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateCompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateCompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateCompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateCompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateDecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateDecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateDecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedGdeflateGetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4CompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4CompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4CompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4CompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4DecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4DecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4DecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedLZ4GetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyCompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyCompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyCompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyCompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyDecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyDecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyDecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedSnappyGetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdCompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdCompressGetMaxOutputChunkSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdCompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdCompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdDecompressAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdDecompressGetRequiredAlignments"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdDecompressGetTempSize"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompBatchedZstdGetDecompressSizeAsync"
+wrapper = "nvcomp"
+test = "t0_format_defaults_and_validation"
+
+[[fn]]
+name = "nvcompGetStatusString"
+wrapper = "nvcomp"
+test = "t0_status_and_budget_checks"

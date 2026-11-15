@@ -1,0 +1,201 @@
+lib = "nvapi"
+
+[[fn]]
+name = "NvAPI_DISP_GetDisplayIdByDisplayName"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_CreateSession"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_DestroySession"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_EnumProfiles"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_FindProfileByName"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_GetCurrentGlobalProfile"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_GetNumProfiles"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_GetProfileInfo"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_DRS_LoadSettings"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_Disp_GetHdrCapabilities"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_Disp_GetVRRInfo"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_EnumLogicalGPUs"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_EnumNvidiaDisplayHandle"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_EnumPhysicalGPUs"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_EnumTCCPhysicalGPUs"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetAllClockFrequencies"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetArchInfo"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetBusId"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetBusSlotId"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetCurrentPstate"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetDynamicPstatesInfoEx"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetFullName"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetGpuCoreCount"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetMemoryInfoEx"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetPCIIdentifiers"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetPerfDecreaseInfo"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetTachReading"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetThermalSettings"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetUUID"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GPU_GetVbiosVersionString"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GSync_EnumSyncDevices"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GSync_GetSyncStatus"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GSync_QueryCapabilities"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GetAssociatedNvidiaDisplayName"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GetErrorMessage"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GetInterfaceVersionString"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_GetPhysicalGPUsFromLogicalGPU"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_Initialize"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_SYS_GetDriverAndBranchVersion"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"
+
+[[fn]]
+name = "NvAPI_Unload"
+wrapper = "nvapi"
+test = "status_copy_classification_and_formatting"

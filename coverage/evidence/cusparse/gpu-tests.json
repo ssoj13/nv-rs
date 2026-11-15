@@ -1,0 +1,11 @@
+[
+  {
+    "test": "spmv_csr_f32_matches_reference",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti",
+    "driver": "R570+",
+    "platform": "Windows x86_64",
+    "commit": "3998a22",
+    "date": "2026-11-14",
+    "passed": true
+  }
+]

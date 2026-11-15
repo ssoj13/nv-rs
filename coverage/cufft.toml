@@ -1,0 +1,101 @@
+lib = "cufft"
+
+[[fn]]
+name = "cufftCreate"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftDestroy"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftEstimate1d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftEstimate2d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftEstimate3d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecC2C"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecC2R"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecD2Z"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecR2C"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecZ2D"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftExecZ2Z"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftGetSize"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftGetVersion"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftMakePlan1d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftMakePlan2d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftMakePlan3d"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftMakePlanMany"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftSetAutoAllocation"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftSetStream"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"
+
+[[fn]]
+name = "cufftSetWorkArea"
+wrapper = "cufft"
+test = "fft_result_newtype_is_copy_and_formats_unknown_codes"

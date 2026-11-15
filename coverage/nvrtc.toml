@@ -1,0 +1,96 @@
+lib = "nvrtc"
+
+[[fn]]
+name = "nvrtcAddNameExpression"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcCompileProgram"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcCreateProgram"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcDestroyProgram"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetCUBIN"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetCUBINSize"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetErrorString"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetLTOIR"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetLTOIRSize"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetLoweredName"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetNumSupportedArchs"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetOptiXIR"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetOptiXIRSize"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetPTX"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetPTXSize"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetProgramLog"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetProgramLogSize"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcGetSupportedArchs"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"
+
+[[fn]]
+name = "nvrtcVersion"
+wrapper = "nvrtc"
+test = "version_and_supported_archs"

@@ -254,16 +254,20 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
 dependencies = [
+ "bindgen",
  "libloading",
- "serde_json",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "cuda-core"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -277,7 +281,7 @@ dependencies = [
 [[package]]
 name = "cuda-core-derive"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -298,7 +302,7 @@ dependencies = [
 [[package]]
 name = "cuda-repr"
 version = "0.5.0"
-source = "git+ssh://git@github.com/ssoj13/cuda-rust_b.git?branch=main#0379bbf1182b9e81b0964c44d18d899f6d494b0f"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
 
 [[package]]
 name = "cudnn"
@@ -590,7 +594,7 @@ dependencies = [
 [[package]]
 name = "gpu-info-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/gpu-info-rs.git?branch=main#657c35702211f0ee610ddbc4e409501638d68c93"
+source = "git+https://github.com/ssoj13/gpu-info-rs.git?branch=main#657c35702211f0ee610ddbc4e409501638d68c93"
 dependencies = [
  "ash",
  "bytemuck",
@@ -1709,8 +1713,8 @@ checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "vcv-rs"
-version = "0.1.1"
-source = "git+ssh://git@github.com/ssoj13/vcv-rs.git?branch=main#31c54282807fe2b0705ffde543fc8dfef4c2b543"
+version = "0.1.2"
+source = "git+https://github.com/ssoj13/vcv-rs.git?branch=main#4e93896b9450e8b348e1c336615acbb8f64aeaf9"
 dependencies = [
  "object 0.40.0",
  "serde",

@@ -1,0 +1,231 @@
+lib = "nvjpeg"
+
+[[fn]]
+name = "nvjpegBufferDeviceCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegBufferDeviceDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegBufferDeviceResize"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegBufferPinnedCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegBufferPinnedDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegBufferPinnedResize"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegCreateEx"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegCreateSimple"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecode"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecodeJpeg"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecodeParamsCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecodeParamsDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecodeParamsSetOutputFormat"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecoderCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecoderDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDecoderStateCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncodeGetBufferSize"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncodeImage"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncodeRetrieveBitstream"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncodeYUV"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsSetEncoding"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsSetOptimizedHuffman"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsSetQuality"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsSetRestartInterval"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderParamsSetSamplingFactors"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderStateCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegEncoderStateDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegGetImageInfo"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStateCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStateDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamCreate"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamDestroy"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetChromaSubsampling"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetComponentsNum"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetExifOrientation"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetFrameDimensions"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetJpegEncoding"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamGetSamplePrecision"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamParse"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegJpegStreamParseHeader"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegStateAttachDeviceBuffer"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"
+
+[[fn]]
+name = "nvjpegStateAttachPinnedBuffer"
+wrapper = "nvjpeg"
+test = "encode_decode_psnr_interleaved_and_planar"

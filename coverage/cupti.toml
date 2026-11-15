@@ -1,0 +1,66 @@
+lib = "cupti"
+
+[[fn]]
+name = "cuptiActivityDisable"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiActivityEnable"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiActivityFlushAll"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiActivityGetNextRecord"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiActivityGetNumDroppedRecords"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiActivityRegisterCallbacks"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiEnableCallback"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiEnableDomain"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiGetCallbackName"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiGetResultString"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiGetVersion"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiSubscribe"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"
+
+[[fn]]
+name = "cuptiUnsubscribe"
+wrapper = "cupti"
+test = "activity_captures_memcpy_records"

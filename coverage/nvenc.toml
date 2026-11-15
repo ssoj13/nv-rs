@@ -1,0 +1,101 @@
+lib = "nvenc"
+
+[[fn]]
+name = "nvEncCreateBitstreamBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncCreateInputBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncDestroyBitstreamBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncDestroyEncoder"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncDestroyInputBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncEncodePicture"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncGetEncodeCaps"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncGetEncodePresetConfigEx"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncGetLastErrorString"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncInitializeEncoder"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncLockBitstream"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncLockInputBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncMapInputResource"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncOpenEncodeSessionEx"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncRegisterResource"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncSetIOCudaStreams"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncUnlockBitstream"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncUnlockInputBuffer"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncUnmapInputResource"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"
+
+[[fn]]
+name = "nvEncUnregisterResource"
+wrapper = "nvenc"
+test = "encode_synthetic_nv12_h264_hevc_av1"

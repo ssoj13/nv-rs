@@ -1,0 +1,46 @@
+lib = "cusolvermg"
+
+[[fn]]
+name = "cusolverMgCreate"
+
+[[fn]]
+name = "cusolverMgCreateDeviceGrid"
+
+[[fn]]
+name = "cusolverMgCreateMatrixDesc"
+
+[[fn]]
+name = "cusolverMgDestroy"
+
+[[fn]]
+name = "cusolverMgDestroyGrid"
+
+[[fn]]
+name = "cusolverMgDestroyMatrixDesc"
+
+[[fn]]
+name = "cusolverMgDeviceSelect"
+
+[[fn]]
+name = "cusolverMgGetrf"
+
+[[fn]]
+name = "cusolverMgGetrf_bufferSize"
+
+[[fn]]
+name = "cusolverMgGetrs"
+
+[[fn]]
+name = "cusolverMgGetrs_bufferSize"
+
+[[fn]]
+name = "cusolverMgPotrf"
+
+[[fn]]
+name = "cusolverMgPotrf_bufferSize"
+
+[[fn]]
+name = "cusolverMgPotrs"
+
+[[fn]]
+name = "cusolverMgPotrs_bufferSize"

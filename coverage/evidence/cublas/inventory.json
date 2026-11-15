@@ -526,6 +526,7 @@
     "cublasZtrttp"
   ],
   "unshimmed": [
-    "cublasGetCudartVersion"
+    "cublasGetCudartVersion",
+    "cublasXerbla"
   ]
 }

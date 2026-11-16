@@ -9,6 +9,7 @@ mod camera_core;
 mod camera_egui;
 mod fft_bloom;
 mod gpu_export;
+mod persist;
 mod profiler;
 mod renderer;
 mod ui;
@@ -91,10 +92,14 @@ mod demo_app {
         dock_state: DockState<DockTab>,
         dock_style: DockStyle,
         viewport_focused: bool,
+        win_state: crate::persist::WindowState,
+        last_saved_state: crate::persist::PersistedState,
+        last_persist_at: Instant,
     }
 
     impl Drop for DemoApp {
         fn drop(&mut self) {
+            self.save_persisted();
             let _ = self.cmd_tx.send(RenderCmd::Shutdown);
             if let Some(handle) = self.render_thread.take() {
                 let _ = handle.join();
@@ -103,7 +108,7 @@ mod demo_app {
     }
 
     impl DemoApp {
-        pub fn new(window: Arc<Window>) -> Self {
+        pub fn new(window: Arc<Window>, persisted: crate::persist::PersistedState) -> Self {
             let size = window.inner_size();
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::VULKAN,
@@ -163,12 +168,16 @@ mod demo_app {
                 }
             });
 
+            let cam_mode = persisted.camera.nav_mode();
+            let cam_fly_mode = persisted.camera.nav_fly_mode();
+            let scheme = persisted.camera.nav_scheme();
+            let cam_feel = persisted.camera.nav_feel();
             let prefs = NavPrefs {
-                hold_fly_mode: NavMode::FpsFly,
-                feel: NavFeel::Sharp,
+                mode: cam_mode,
+                hold_fly_mode: cam_fly_mode,
+                feel: cam_feel,
                 ..NavPrefs::default()
             };
-            let scheme = NavScheme::default();
             let mut cam_driver = CameraDriver::new(prefs, scheme);
             enable_rmb_fly(&mut cam_driver);
             cam_driver.controller_mut().apply_intent(
@@ -181,7 +190,12 @@ mod demo_app {
                 ViewportSize::new(DEFAULT_W, DEFAULT_H),
             );
             let cam_home = cam_driver.controller().pose();
-            let cam_pose = cam_home;
+            let cam_pose = persisted
+                .camera
+                .pose
+                .and_then(|p| p.to_pose())
+                .unwrap_or(cam_home);
+            cam_driver.controller_mut().set_pose(cam_pose);
             let egui_winit = egui_winit::State::new(
                 egui_ctx.clone(),
                 egui::ViewportId::ROOT,
@@ -208,7 +222,7 @@ mod demo_app {
                 wgpu::FilterMode::Linear,
             );
 
-            let settings = DemoSettings::default();
+            let settings = persisted.settings;
             let initial_camera = pose_to_frame(cam_pose);
             let (cmd_tx, frame_rx, render_thread) = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
@@ -271,13 +285,55 @@ mod demo_app {
                 cam_home,
                 cam_pose,
                 last_sent_camera: initial_camera,
-                cam_mode: prefs.mode,
-                cam_fly_mode: prefs.hold_fly_mode,
+                cam_mode,
+                cam_fly_mode,
                 cam_scheme: scheme,
-                cam_feel: prefs.feel,
+                cam_feel,
                 dock_state,
                 dock_style,
                 viewport_focused: false,
+                win_state: persisted.window.sanitized(),
+                last_saved_state: persisted,
+                last_persist_at: Instant::now(),
+            }
+        }
+
+        fn current_persisted_state(&self) -> crate::persist::PersistedState {
+            crate::persist::PersistedState {
+                window: self.win_state,
+                settings: self.settings,
+                camera: crate::persist::CameraState::from_runtime(
+                    self.cam_mode,
+                    self.cam_fly_mode,
+                    self.cam_scheme,
+                    self.cam_feel,
+                    self.cam_pose,
+                ),
+            }
+        }
+
+        pub fn save_persisted(&mut self) {
+            let cur = self.current_persisted_state();
+            if cur != self.last_saved_state {
+                let _ = crate::persist::save(&cur);
+                self.last_saved_state = cur;
+            }
+            self.last_persist_at = Instant::now();
+        }
+
+        pub fn update_window_geometry(&mut self) {
+            let max = self.window.is_maximized();
+            self.win_state.maximized = max;
+            if !max {
+                let sz = self.window.inner_size();
+                if sz.width >= 320 && sz.height >= 240 {
+                    self.win_state.width = sz.width;
+                    self.win_state.height = sz.height;
+                }
+                if let Ok(pos) = self.window.outer_position() {
+                    self.win_state.x = Some(pos.x);
+                    self.win_state.y = Some(pos.y);
+                }
             }
         }
 
@@ -585,6 +641,10 @@ mod demo_app {
 
             self.interop.queue().submit(Some(encoder.finish()));
             self.interop.queue().present(frame);
+            if self.last_persist_at.elapsed().as_secs_f32() >= 1.5 {
+                self.update_window_geometry();
+                self.save_persisted();
+            }
             self.window.request_redraw();
         }
     }
@@ -713,11 +773,17 @@ struct Runner {
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_none() {
-            let attrs = Window::default_attributes()
+            let persisted = crate::persist::load();
+            let win_cfg = persisted.window.sanitized();
+            let mut attrs = Window::default_attributes()
                 .with_title("nv-rs RTX Fractal Path Tracer (OptiX 9 + AI Denoiser + nv-wgpu)")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+                .with_inner_size(winit::dpi::PhysicalSize::new(win_cfg.width, win_cfg.height))
+                .with_maximized(win_cfg.maximized);
+            if let (Some(x), Some(y)) = (win_cfg.x, win_cfg.y) {
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
             let win = Arc::new(event_loop.create_window(attrs).expect("window"));
-            self.app = Some(DemoApp::new(win));
+            self.app = Some(DemoApp::new(win, persisted));
         }
     }
 
@@ -726,11 +792,16 @@ impl ApplicationHandler for Runner {
             return;
         };
         if matches!(event, WindowEvent::CloseRequested) {
+            app.update_window_geometry();
+            app.save_persisted();
             event_loop.exit();
             return;
         }
         if let WindowEvent::Resized(s) = event {
             app.resize(s.width, s.height);
+            app.update_window_geometry();
+        } else if matches!(event, WindowEvent::Moved(_)) {
+            app.update_window_geometry();
         } else if matches!(event, WindowEvent::RedrawRequested) {
             app.render();
         }

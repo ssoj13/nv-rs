@@ -1964,6 +1964,8 @@ dependencies = [
  "nvrtc",
  "optix",
  "png",
+ "serde",
+ "serde_json",
  "wgpu",
  "winit",
 ]

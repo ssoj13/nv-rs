@@ -81,7 +81,8 @@ struct LaunchParams {
 
 const _: () = assert!(std::mem::size_of::<LaunchParams>() == 432);
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DemoSettings {
     pub fractal_kind: u32,
     // Fractal Transform

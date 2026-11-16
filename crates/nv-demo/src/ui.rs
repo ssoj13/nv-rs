@@ -391,513 +391,554 @@ impl UiContext<'_> {
 
     fn ui_fractal(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
-        section_header(ui, ic::SPARKLE, "Presets");
-        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
-            0 => {
-                if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb"))
-                    .clicked()
-                {
-                    s.fractal_kind = 0;
-                    s.bulb_power = 8.0;
-                    s.bulb_julia = false;
-                    s.metallic = 0.78;
-                    s.roughness = 0.14;
-                    s.palette_shift = 0.08;
-                    s.sun_azimuth = 36.0;
-                    s.sun_elevation = 42.0;
+        collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", true, |ui| {
+            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
+                0 => {
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb"))
+                        .clicked()
+                    {
+                        s.fractal_kind = 0;
+                        s.bulb_power = 8.0;
+                        s.bulb_julia = false;
+                        s.metallic = 0.78;
+                        s.roughness = 0.14;
+                        s.palette_shift = 0.08;
+                        s.sun_azimuth = 36.0;
+                        s.sun_elevation = 42.0;
+                    }
                 }
-            }
-            1 => {
-                if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box"))
-                    .clicked()
-                {
-                    s.fractal_kind = 1;
-                    s.box_scale = -2.0;
-                    s.box_fold = 1.0;
-                    s.metallic = 0.92;
-                    s.roughness = 0.10;
-                    s.palette_shift = 0.45;
-                    s.sun_azimuth = -45.0;
-                    s.sun_elevation = 35.0;
+                1 => {
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box"))
+                        .clicked()
+                    {
+                        s.fractal_kind = 1;
+                        s.box_scale = -2.0;
+                        s.box_fold = 1.0;
+                        s.metallic = 0.92;
+                        s.roughness = 0.10;
+                        s.palette_shift = 0.45;
+                        s.sun_azimuth = -45.0;
+                        s.sun_elevation = 35.0;
+                    }
                 }
-            }
-            2 => {
-                if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS"))
-                    .clicked()
-                {
-                    s.fractal_kind = 2;
-                    s.kifs_scale = 2.0;
-                    s.kifs_rot1 = 18.0;
-                    s.kifs_rot2 = -12.0;
-                    s.metallic = 0.65;
-                    s.roughness = 0.22;
-                    s.palette_shift = 0.72;
-                    s.sun_azimuth = 55.0;
-                    s.sun_elevation = 28.0;
+                2 => {
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS"))
+                        .clicked()
+                    {
+                        s.fractal_kind = 2;
+                        s.kifs_scale = 2.0;
+                        s.kifs_rot1 = 18.0;
+                        s.kifs_rot2 = -12.0;
+                        s.metallic = 0.65;
+                        s.roughness = 0.22;
+                        s.palette_shift = 0.72;
+                        s.sun_azimuth = 55.0;
+                        s.sun_elevation = 28.0;
+                    }
                 }
-            }
-            _ => {
+                _ => {
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral"))
+                        .clicked()
+                    {
+                        s.fractal_kind = 0;
+                        s.bulb_power = 7.0;
+                        s.bulb_julia = true;
+                        s.bulb_c = [-0.22, 0.62, 0.18];
+                        s.metallic = 0.30;
+                        s.roughness = 0.26;
+                        s.palette_shift = 0.22;
+                    }
+                }
+            });
+        });
+
+        collapsing_section(ui, "sec_formula", ic::CUBE, "Formula", true, |ui| {
+            equal_grid(ui, 3, 3, |ui, idx, w| {
+                let (kind, label) = match idx {
+                    0 => (0u32, "Mandelbulb"),
+                    1 => (1u32, "Mandelbox"),
+                    _ => (2u32, "KIFS Octa"),
+                };
                 if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral"))
+                    .add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::selectable(s.fractal_kind == kind, label),
+                    )
                     .clicked()
                 {
-                    s.fractal_kind = 0;
-                    s.bulb_power = 7.0;
-                    s.bulb_julia = true;
-                    s.bulb_c = [-0.22, 0.62, 0.18];
-                    s.metallic = 0.30;
-                    s.roughness = 0.26;
-                    s.palette_shift = 0.22;
+                    s.fractal_kind = kind;
+                }
+            });
+            ui.add_space(1.0);
+
+            match s.fractal_kind {
+                0 => {
+                    prop_slider_f32(ui, "Power", &mut s.bulb_power, 2.0..=16.0, 2, false);
+                    prop_slider_f32(ui, "Bailout", &mut s.bulb_bailout, 2.0..=32.0, 1, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
+                    prop_slider_f32(
+                        ui,
+                        "Theta Mult",
+                        &mut s.bulb_theta_mult,
+                        0.25..=2.5,
+                        2,
+                        false,
+                    );
+                    prop_slider_f32(ui, "Phi Mult", &mut s.bulb_phi_mult, 0.25..=2.5, 2, false);
+                    prop_slider_f32(
+                        ui,
+                        "Theta Ph",
+                        &mut s.bulb_theta_phase,
+                        -90.0..=90.0,
+                        1,
+                        false,
+                    );
+                    prop_slider_f32(
+                        ui,
+                        "Phi Ph",
+                        &mut s.bulb_phi_phase,
+                        -180.0..=180.0,
+                        1,
+                        false,
+                    );
+                    prop_toggle(ui, "Julia Mode", &mut s.bulb_julia, "Enable Julia C");
+                    if s.bulb_julia {
+                        prop_vec3(ui, "Julia C", &mut s.bulb_c, -1.5..=1.5, 0.01);
+                    }
+                }
+                1 => {
+                    prop_slider_f32(ui, "Scale", &mut s.box_scale, -3.5..=3.5, 2, false);
+                    prop_slider_f32(ui, "Fold", &mut s.box_fold, 0.2..=2.2, 2, false);
+                    prop_slider_f32(ui, "Fold Mult", &mut s.box_fold_mult, 1.2..=3.0, 2, false);
+                    prop_slider_f32(ui, "Min R", &mut s.box_min_r, 0.05..=1.2, 2, false);
+                    prop_slider_f32(ui, "Fixed R", &mut s.box_fixed_r, 0.4..=2.5, 2, false);
+                    prop_slider_f32(ui, "Iter Rot", &mut s.box_iter_rot, -45.0..=45.0, 1, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=24, false);
+                    prop_slider_f32(ui, "Bailout", &mut s.box_bailout, 4.0..=64.0, 1, false);
+                }
+                _ => {
+                    prop_slider_f32(ui, "Scale", &mut s.kifs_scale, 1.3..=2.8, 2, false);
+                    prop_slider_f32(ui, "Rot Y", &mut s.kifs_rot1, -180.0..=180.0, 1, false);
+                    prop_slider_f32(ui, "Rot X", &mut s.kifs_rot2, -180.0..=180.0, 1, false);
+                    prop_vec3(ui, "Offset", &mut s.kifs_offset, 0.1..=2.0, 0.01);
+                    prop_slider_f32(
+                        ui,
+                        "Thickness",
+                        &mut s.kifs_thickness,
+                        0.005..=0.25,
+                        3,
+                        false,
+                    );
+                    prop_slider_f32(ui, "Z Bias", &mut s.kifs_z_bias, 0.0..=1.5, 2, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
+                    prop_slider_f32(ui, "Bailout", &mut s.kifs_bailout, 4.0..=32.0, 1, false);
                 }
             }
         });
-        ui.add_space(2.0);
 
-        section_header(ui, ic::CUBE, "Formula");
-        equal_grid(ui, 3, 3, |ui, idx, w| {
-            let (kind, label) = match idx {
-                0 => (0u32, "Mandelbulb"),
-                1 => (1u32, "Mandelbox"),
-                _ => (2u32, "KIFS Octa"),
-            };
-            if ui
-                .add_sized(
-                    [w, ROW_H + 2.0],
-                    egui::Button::selectable(s.fractal_kind == kind, label),
-                )
-                .clicked()
-            {
-                s.fractal_kind = kind;
-            }
-        });
-        ui.add_space(1.0);
-
-        match s.fractal_kind {
-            0 => {
-                prop_slider_f32(ui, "Power", &mut s.bulb_power, 2.0..=16.0, 2, false);
-                prop_slider_f32(ui, "Bailout", &mut s.bulb_bailout, 2.0..=32.0, 1, false);
-                prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
-                prop_slider_f32(
-                    ui,
-                    "Theta Mult",
-                    &mut s.bulb_theta_mult,
-                    0.25..=2.5,
-                    2,
-                    false,
-                );
-                prop_slider_f32(ui, "Phi Mult", &mut s.bulb_phi_mult, 0.25..=2.5, 2, false);
-                prop_slider_f32(
-                    ui,
-                    "Theta Ph",
-                    &mut s.bulb_theta_phase,
-                    -90.0..=90.0,
-                    1,
-                    false,
-                );
-                prop_slider_f32(
-                    ui,
-                    "Phi Ph",
-                    &mut s.bulb_phi_phase,
-                    -180.0..=180.0,
-                    1,
-                    false,
-                );
-                prop_toggle(ui, "Julia Mode", &mut s.bulb_julia, "Enable Julia C");
-                if s.bulb_julia {
-                    prop_vec3(ui, "Julia C", &mut s.bulb_c, -1.5..=1.5, 0.01);
-                }
-            }
-            1 => {
-                prop_slider_f32(ui, "Scale", &mut s.box_scale, -3.5..=3.5, 2, false);
-                prop_slider_f32(ui, "Fold", &mut s.box_fold, 0.2..=2.2, 2, false);
-                prop_slider_f32(ui, "Fold Mult", &mut s.box_fold_mult, 1.2..=3.0, 2, false);
-                prop_slider_f32(ui, "Min R", &mut s.box_min_r, 0.05..=1.2, 2, false);
-                prop_slider_f32(ui, "Fixed R", &mut s.box_fixed_r, 0.4..=2.5, 2, false);
-                prop_slider_f32(ui, "Iter Rot", &mut s.box_iter_rot, -45.0..=45.0, 1, false);
-                prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=24, false);
-                prop_slider_f32(ui, "Bailout", &mut s.box_bailout, 4.0..=64.0, 1, false);
-            }
-            _ => {
-                prop_slider_f32(ui, "Scale", &mut s.kifs_scale, 1.3..=2.8, 2, false);
-                prop_slider_f32(ui, "Rot Y", &mut s.kifs_rot1, -180.0..=180.0, 1, false);
-                prop_slider_f32(ui, "Rot X", &mut s.kifs_rot2, -180.0..=180.0, 1, false);
-                prop_vec3(ui, "Offset", &mut s.kifs_offset, 0.1..=2.0, 0.01);
-                prop_slider_f32(
-                    ui,
-                    "Thickness",
-                    &mut s.kifs_thickness,
-                    0.005..=0.25,
-                    3,
-                    false,
-                );
-                prop_slider_f32(ui, "Z Bias", &mut s.kifs_z_bias, 0.0..=1.5, 2, false);
-                prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
-                prop_slider_f32(ui, "Bailout", &mut s.kifs_bailout, 4.0..=32.0, 1, false);
-            }
-        }
-
-        ui.add_space(2.0);
-        section_header(ui, ic::ARROWS_OUT_CARDINAL, "Transform");
-        prop_slider_f32(ui, "Obj Scale", &mut s.obj_scale, 0.25..=2.5, 2, false);
-        prop_slider_f32(ui, "Rot X", &mut s.rot_x, -180.0..=180.0, 1, false);
-        prop_slider_f32(ui, "Rot Y", &mut s.rot_y, -180.0..=180.0, 1, false);
-        prop_slider_f32(ui, "Rot Z", &mut s.rot_z, -180.0..=180.0, 1, false);
-
-        ui.add_space(2.0);
-        section_header(ui, ic::SLIDERS_HORIZONTAL, "Detail & Shading");
-        prop_slider_f32(
+        collapsing_section(
             ui,
-            "Detail Eps",
-            &mut s.detail_eps,
-            0.00005..=0.005,
-            5,
+            "sec_transform",
+            ic::ARROWS_OUT_CARDINAL,
+            "Transform",
             true,
+            |ui| {
+                prop_slider_f32(ui, "Obj Scale", &mut s.obj_scale, 0.25..=2.5, 2, false);
+                prop_slider_f32(ui, "Rot X", &mut s.rot_x, -180.0..=180.0, 1, false);
+                prop_slider_f32(ui, "Rot Y", &mut s.rot_y, -180.0..=180.0, 1, false);
+                prop_slider_f32(ui, "Rot Z", &mut s.rot_z, -180.0..=180.0, 1, false);
+            },
         );
-        prop_slider_f32(ui, "Normal Eps", &mut s.norm_eps, 0.00005..=0.005, 5, true);
-        prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=320, false);
-        prop_slider_f32(ui, "Fudge", &mut s.fudge, 0.3..=1.1, 2, false);
-        prop_slider_u32(ui, "Bounces", &mut s.bounces, 1..=6, false);
-        prop_slider_f32(ui, "Metallic", &mut s.metallic, 0.0..=1.0, 2, false);
-        prop_slider_f32(ui, "Roughness", &mut s.roughness, 0.02..=0.85, 2, false);
-        prop_slider_f32(ui, "Trap Scale", &mut s.trap_scale, 0.1..=3.0, 2, false);
-        prop_slider_f32(ui, "Hue Shift", &mut s.palette_shift, 0.0..=1.0, 2, false);
+
+        collapsing_section(
+            ui,
+            "sec_detail",
+            ic::SLIDERS_HORIZONTAL,
+            "Detail & Shading",
+            true,
+            |ui| {
+                prop_slider_f32(
+                    ui,
+                    "Detail Eps",
+                    &mut s.detail_eps,
+                    0.00005..=0.005,
+                    5,
+                    true,
+                );
+                prop_slider_f32(ui, "Normal Eps", &mut s.norm_eps, 0.00005..=0.005, 5, true);
+                prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=320, false);
+                prop_slider_f32(ui, "Fudge", &mut s.fudge, 0.3..=1.1, 2, false);
+                prop_slider_u32(ui, "Bounces", &mut s.bounces, 1..=6, false);
+                prop_slider_f32(ui, "Metallic", &mut s.metallic, 0.0..=1.0, 2, false);
+                prop_slider_f32(ui, "Roughness", &mut s.roughness, 0.02..=0.85, 2, false);
+                prop_slider_f32(ui, "Trap Scale", &mut s.trap_scale, 0.1..=3.0, 2, false);
+                prop_slider_f32(ui, "Hue Shift", &mut s.palette_shift, 0.0..=1.0, 2, false);
+            },
+        );
     }
 
     fn ui_render_floor(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
 
-        section_header(ui, ic::SUN, "Sky & Lighting");
-        prop_slider_f32(ui, "Sun Power", &mut s.sun_intensity, 0.0..=4.0, 2, false);
-        prop_slider_f32(
-            ui,
-            "Sun Azimuth",
-            &mut s.sun_azimuth,
-            -180.0..=180.0,
-            1,
-            false,
-        );
-        prop_slider_f32(ui, "Sun Elev", &mut s.sun_elevation, 2.0..=88.0, 1, false);
-        prop_slider_f32(ui, "Sky Power", &mut s.sky_intensity, 0.1..=2.0, 2, false);
-        prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
-        prop_slider_f32(ui, "Exposure", &mut s.exposure, 0.25..=2.0, 2, false);
-
-        ui.add_space(2.0);
-        section_header(ui, ic::APERTURE, "Lens DoF");
-        prop_slider_f32(ui, "Aperture", &mut s.aperture, 0.0..=0.12, 3, false);
-        prop_slider_f32(ui, "Focus Dist", &mut s.focus_dist, 0.5..=12.0, 2, false);
-
-        ui.add_space(2.0);
-        section_header(ui, ic::SQUARES_FOUR, "Scratched Metal Floor");
-        prop_slider_f32(
-            ui,
-            "Roughness",
-            &mut s.floor_roughness,
-            0.03..=0.80,
-            2,
-            false,
-        );
-        prop_slider_f32(ui, "Scratches", &mut s.floor_scratch, 0.0..=1.5, 2, false);
-        prop_slider_f32(ui, "Tile Scale", &mut s.floor_scale, 0.3..=5.0, 2, false);
-        prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
-
-        ui.add_space(2.0);
-        section_header(ui, ic::GLOBE, "Scene");
-        prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
-        if s.sat_on {
-            prop_toggle(ui, "Analytic", &mut s.glass_analytic, "Smooth Analytic Sphere");
-            prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
-            prop_slider_u32(ui, "Spheres Num", &mut s.sat_count, 0..=24, false);
-            if !s.glass_analytic {
-                prop_slider_u32(ui, "U Segs", &mut s.sat_u_segs, 4..=96, false);
-                prop_slider_u32(ui, "V Segs", &mut s.sat_v_segs, 4..=96, false);
-            }
-            prop_slider_u32(ui, "Orbit Seed", &mut s.sat_seed, 0..=9999, false);
-            prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.001..=0.80, 3, false);
-            prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.001..=0.80, 3, false);
-            prop_slider_f32(ui, "Min Orbit", &mut s.sat_orbit_min, 0.6..=4.5, 2, false);
-            prop_slider_f32(ui, "Max Orbit", &mut s.sat_orbit_max, 0.6..=4.5, 2, false);
-            prop_slider_f32(ui, "Min Height", &mut s.sat_height_min, -1.0..=2.0, 2, false);
-            prop_slider_f32(ui, "Max Height", &mut s.sat_height_max, -1.0..=2.0, 2, false);
-            prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, -3.0..=3.0, 2, false);
-            prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, -3.0..=3.0, 2, false);
-            prop_slider_f32(ui, "Bob Amp Min", &mut s.sat_bob_amp_min, 0.0..=0.80, 2, false);
-            prop_slider_f32(ui, "Bob Amp Max", &mut s.sat_bob_amp_max, 0.0..=0.80, 2, false);
-            prop_slider_f32(ui, "Bob Frq Min", &mut s.sat_bob_freq_min, 0.0..=5.0, 2, false);
-            prop_slider_f32(ui, "Bob Frq Max", &mut s.sat_bob_freq_max, 0.0..=5.0, 2, false);
-            prop_slider_f32(ui, "Hue Spread", &mut s.sat_hue_spread, 0.0..=1.0, 2, false);
-            prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
+        collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
+            prop_slider_f32(ui, "Sun Power", &mut s.sun_intensity, 0.0..=4.0, 2, false);
             prop_slider_f32(
                 ui,
-                "Glass Rough",
-                &mut s.glass_roughness,
-                0.0..=0.35,
-                3,
+                "Sun Azimuth",
+                &mut s.sun_azimuth,
+                -180.0..=180.0,
+                1,
                 false,
             );
-            prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=12.0, 2, false);
-        }
-        prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
+            prop_slider_f32(ui, "Sun Elev", &mut s.sun_elevation, 2.0..=88.0, 1, false);
+            prop_slider_f32(ui, "Sky Power", &mut s.sky_intensity, 0.1..=2.0, 2, false);
+            prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
+            prop_slider_f32(ui, "Exposure", &mut s.exposure, 0.25..=2.0, 2, false);
+        });
 
-        ui.add_space(2.0);
-        section_header(ui, ic::SUN_DIM, "FFT Bloom (cuFFT)");
-        prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
-        if s.bloom_on {
-            prop_slider_f32(ui, "Threshold", &mut s.bloom_threshold, 0.2..=5.0, 2, false);
-            prop_slider_f32(ui, "Intensity", &mut s.bloom_intensity, 0.0..=2.0, 2, false);
-            prop_slider_u32(ui, "Blades", &mut s.bloom_blades, 3..=12, false);
-        }
+        collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", true, |ui| {
+            prop_slider_f32(ui, "Aperture", &mut s.aperture, 0.0..=0.12, 3, false);
+            prop_slider_f32(ui, "Focus Dist", &mut s.focus_dist, 0.5..=12.0, 2, false);
+        });
 
-        ui.add_space(2.0);
-        section_header(ui, ic::COLUMNS, "A/B Split");
-        prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
-        if s.split_on {
-            prop_slider_f32(ui, "Split X", &mut s.split_x, 0.02..=0.98, 2, false);
-            prop_row(ui, "Right AOV", |ui| {
-                let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
+        collapsing_section(
+            ui,
+            "sec_floor",
+            ic::SQUARES_FOUR,
+            "Scratched Metal Floor",
+            true,
+            |ui| {
+                prop_slider_f32(
+                    ui,
+                    "Roughness",
+                    &mut s.floor_roughness,
+                    0.03..=0.80,
+                    2,
+                    false,
+                );
+                prop_slider_f32(ui, "Scratches", &mut s.floor_scratch, 0.0..=1.5, 2, false);
+                prop_slider_f32(ui, "Tile Scale", &mut s.floor_scale, 0.3..=5.0, 2, false);
+                prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
+            },
+        );
+
+        collapsing_section(ui, "sec_scene", ic::GLOBE, "Scene", true, |ui| {
+            prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
+            if s.sat_on {
+                prop_toggle(ui, "Analytic", &mut s.glass_analytic, "Smooth Analytic Sphere");
+                prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
+                prop_slider_u32(ui, "Spheres Num", &mut s.sat_count, 0..=24, false);
+                if !s.glass_analytic {
+                    prop_slider_u32(ui, "U Segs", &mut s.sat_u_segs, 4..=96, false);
+                    prop_slider_u32(ui, "V Segs", &mut s.sat_v_segs, 4..=96, false);
+                }
+                prop_slider_u32(ui, "Orbit Seed", &mut s.sat_seed, 0..=9999, false);
+                prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.001..=0.80, 3, false);
+                prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.001..=0.80, 3, false);
+                prop_slider_f32(ui, "Min Orbit", &mut s.sat_orbit_min, 0.6..=4.5, 2, false);
+                prop_slider_f32(ui, "Max Orbit", &mut s.sat_orbit_max, 0.6..=4.5, 2, false);
+                prop_slider_f32(ui, "Min Height", &mut s.sat_height_min, -1.0..=2.0, 2, false);
+                prop_slider_f32(ui, "Max Height", &mut s.sat_height_max, -1.0..=2.0, 2, false);
+                prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, -3.0..=3.0, 2, false);
+                prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, -3.0..=3.0, 2, false);
+                prop_slider_f32(ui, "Bob Amp Min", &mut s.sat_bob_amp_min, 0.0..=0.80, 2, false);
+                prop_slider_f32(ui, "Bob Amp Max", &mut s.sat_bob_amp_max, 0.0..=0.80, 2, false);
+                prop_slider_f32(ui, "Bob Frq Min", &mut s.sat_bob_freq_min, 0.0..=5.0, 2, false);
+                prop_slider_f32(ui, "Bob Frq Max", &mut s.sat_bob_freq_max, 0.0..=5.0, 2, false);
+                prop_slider_f32(ui, "Hue Spread", &mut s.sat_hue_spread, 0.0..=1.0, 2, false);
+                prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
+                prop_slider_f32(
+                    ui,
+                    "Glass Rough",
+                    &mut s.glass_roughness,
+                    0.0..=0.35,
+                    3,
+                    false,
+                );
+                prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=12.0, 2, false);
+            }
+            prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
+        });
+
+        collapsing_section(
+            ui,
+            "sec_bloom",
+            ic::SUN_DIM,
+            "FFT Bloom (cuFFT)",
+            true,
+            |ui| {
+                prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
+                if s.bloom_on {
+                    prop_slider_f32(ui, "Threshold", &mut s.bloom_threshold, 0.2..=5.0, 2, false);
+                    prop_slider_f32(ui, "Intensity", &mut s.bloom_intensity, 0.0..=2.0, 2, false);
+                    prop_slider_u32(ui, "Blades", &mut s.bloom_blades, 3..=12, false);
+                }
+            },
+        );
+
+        collapsing_section(ui, "sec_split", ic::COLUMNS, "A/B Split", true, |ui| {
+            prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
+            if s.split_on {
+                prop_slider_f32(ui, "Split X", &mut s.split_x, 0.02..=0.98, 2, false);
+                prop_row(ui, "Right AOV", |ui| {
+                    let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (mode, lbl) in [(0u32, "Raw"), (1u32, "Albedo"), (2u32, "Normal")] {
+                        if ui
+                            .add_sized(
+                                [w, ROW_H],
+                                egui::Button::selectable(s.right_is_aov == mode, lbl),
+                            )
+                            .clicked()
+                        {
+                            s.right_is_aov = mode;
+                        }
+                    }
+                });
+            }
+        });
+
+        collapsing_section(ui, "sec_pt", ic::SPARKLE, "Path Tracer", true, |ui| {
+            prop_row(ui, "Scale", |ui| {
+                let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
                 ui.spacing_mut().item_spacing.x = 4.0;
-                for (mode, lbl) in [(0u32, "Raw"), (1u32, "Albedo"), (2u32, "Normal")] {
+                for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
+                    let selected = (s.render_scale - val).abs() < 0.05;
                     if ui
-                        .add_sized(
-                            [w, ROW_H],
-                            egui::Button::selectable(s.right_is_aov == mode, lbl),
-                        )
+                        .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
                         .clicked()
                     {
-                        s.right_is_aov = mode;
+                        s.render_scale = val;
                     }
                 }
             });
-        }
-
-        ui.add_space(2.0);
-        section_header(ui, ic::SPARKLE, "Path Tracer");
-        prop_row(ui, "Scale", |ui| {
-            let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
-                let selected = (s.render_scale - val).abs() < 0.05;
-                if ui
-                    .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
-                    .clicked()
-                {
-                    s.render_scale = val;
+            prop_row(ui, "AOV", |ui| {
+                let w = ((ui.available_width() - 16.0) / 5.0).max(28.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (mode, lbl) in [
+                    (0u32, "Beauty"),
+                    (1u32, "Albedo"),
+                    (2u32, "Normal"),
+                    (3u32, "Depth"),
+                    (4u32, "Motion"),
+                ] {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H],
+                            egui::Button::selectable(s.aov_mode == mode, lbl),
+                        )
+                        .clicked()
+                    {
+                        s.aov_mode = mode;
+                    }
                 }
-            }
-        });
-        prop_row(ui, "AOV", |ui| {
-            let w = ((ui.available_width() - 16.0) / 5.0).max(28.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (mode, lbl) in [
-                (0u32, "Beauty"),
-                (1u32, "Albedo"),
-                (2u32, "Normal"),
-                (3u32, "Depth"),
-                (4u32, "Motion"),
-            ] {
-                if ui
-                    .add_sized(
+            });
+            prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
+            prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
+            prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=2.0, 2, false);
+
+            ui.add_space(1.0);
+            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
+                0 => {
+                    ui.add_sized(
                         [w, ROW_H],
-                        egui::Button::selectable(s.aov_mode == mode, lbl),
-                    )
-                    .clicked()
-                {
-                    s.aov_mode = mode;
+                        egui::Checkbox::new(&mut s.shadows_on, "Shadows"),
+                    );
                 }
+                1 => {
+                    ui.add_sized(
+                        [w, ROW_H],
+                        egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
+                    );
+                }
+                2 => {
+                    ui.add_sized(
+                        [w, ROW_H],
+                        egui::Checkbox::new(&mut s.temporal_denoise, "Temporal AI"),
+                    );
+                }
+                _ => {
+                    ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
+                }
+            });
+            ui.add_space(1.0);
+            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
+                0 => {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE)),
+                        )
+                        .clicked()
+                    {
+                        *self.reset_accum_requested = true;
+                    }
+                }
+                1 => {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
+                        )
+                        .clicked()
+                    {
+                        *self.save_png_requested = true;
+                    }
+                }
+                2 => {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
+                        )
+                        .clicked()
+                    {
+                        *self.save_jpeg_requested = true;
+                    }
+                }
+                _ => {
+                    let rec_lbl = if self.is_recording {
+                        format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
+                    } else {
+                        format!("{}  Record H.264", ic::VIDEO_CAMERA)
+                    };
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
+                        .clicked()
+                    {
+                        *self.toggle_record_requested = true;
+                    }
+                }
+            });
+            ui.add_space(2.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), ROW_H + 2.0],
+                    egui::Button::new(format!("{}  Hot-Reload Shader (NVRTC)", ic::LIGHTNING)),
+                )
+                .clicked()
+            {
+                *self.reload_shader_requested = true;
             }
-        });
-        prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
-        prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
-        prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=2.0, 2, false);
-
-        ui.add_space(1.0);
-        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
-            0 => {
-                ui.add_sized(
-                    [w, ROW_H],
-                    egui::Checkbox::new(&mut s.shadows_on, "Shadows"),
+            if let Some(msg) = self.last_saved_msg {
+                ui.label(
+                    RichText::new(msg)
+                        .size(11.0)
+                        .color(Color32::from_rgb(166, 209, 137)),
                 );
             }
-            1 => {
-                ui.add_sized(
-                    [w, ROW_H],
-                    egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
-                );
-            }
-            2 => {
-                ui.add_sized(
-                    [w, ROW_H],
-                    egui::Checkbox::new(&mut s.temporal_denoise, "Temporal AI"),
-                );
-            }
-            _ => {
-                ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
-            }
         });
-        ui.add_space(1.0);
-        equal_grid(ui, 2, 4, |ui, idx, w| match idx {
-            0 => {
-                if ui
-                    .add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE)),
-                    )
-                    .clicked()
-                {
-                    *self.reset_accum_requested = true;
-                }
-            }
-            1 => {
-                if ui
-                    .add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
-                    )
-                    .clicked()
-                {
-                    *self.save_png_requested = true;
-                }
-            }
-            2 => {
-                if ui
-                    .add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
-                    )
-                    .clicked()
-                {
-                    *self.save_jpeg_requested = true;
-                }
-            }
-            _ => {
-                let rec_lbl = if self.is_recording {
-                    format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
-                } else {
-                    format!("{}  Record H.264", ic::VIDEO_CAMERA)
-                };
-                if ui
-                    .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
-                    .clicked()
-                {
-                    *self.toggle_record_requested = true;
-                }
-            }
-        });
-        ui.add_space(2.0);
-        if ui
-            .add_sized(
-                [ui.available_width(), ROW_H + 2.0],
-                egui::Button::new(format!("{}  Hot-Reload Shader (NVRTC)", ic::LIGHTNING)),
-            )
-            .clicked()
-        {
-            *self.reload_shader_requested = true;
-        }
-        if let Some(msg) = self.last_saved_msg {
-            ui.label(
-                RichText::new(msg)
-                    .size(11.0)
-                    .color(Color32::from_rgb(166, 209, 137)),
-            );
-        }
     }
 
     fn ui_camera_stats(&mut self, ui: &mut Ui) {
-        section_header(ui, ic::GAUGE, "Telemetry");
-        stat_row(ui, "GPU", &self.telemetry.gpu_name);
-        stat_row(
-            ui,
-            "Resolution",
-            &format!("{} x {}", self.render_w, self.render_h),
-        );
-        stat_row(
-            ui,
-            "GUI / RT",
-            &format!("{:.0} FPS / {:.1} ms", self.fps, self.rt_ms),
-        );
-        stat_row(
-            ui,
-            "Bloom / TM",
-            &format!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms),
-        );
-        stat_row(
-            ui,
-            "Accum",
-            &format!(
-                "{} / {} ({} spp)",
-                self.accum_count, self.settings.max_accum, self.total_samples
-            ),
-        );
-        stat_row(ui, "Denoiser", &format!("{:.1} ms", self.denoise_ms));
-        stat_row(
-            ui,
-            "VRAM",
-            &format!(
-                "{} / {} MiB",
-                self.telemetry.vram_used_mib, self.telemetry.vram_total_mib
-            ),
-        );
-        stat_row(
-            ui,
-            "Clocks",
-            &format!(
-                "{} / {} MHz",
-                self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
-            ),
-        );
-        stat_row(
-            ui,
-            "Temp / Load",
-            &format!(
-                "{} C / {} %",
-                self.telemetry.temp_c, self.telemetry.util_gpu
-            ),
-        );
-        stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
-        stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
-        stat_row(ui, "NGX", &self.telemetry.ngx_status);
+        collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", true, |ui| {
+            stat_row(ui, "GPU", &self.telemetry.gpu_name);
+            stat_row(
+                ui,
+                "Resolution",
+                &format!("{} x {}", self.render_w, self.render_h),
+            );
+            stat_row(
+                ui,
+                "GUI / RT",
+                &format!("{:.0} FPS / {:.1} ms", self.fps, self.rt_ms),
+            );
+            stat_row(
+                ui,
+                "Bloom / TM",
+                &format!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms),
+            );
+            stat_row(
+                ui,
+                "Accum",
+                &format!(
+                    "{} / {} ({} spp)",
+                    self.accum_count, self.settings.max_accum, self.total_samples
+                ),
+            );
+            stat_row(ui, "Denoiser", &format!("{:.1} ms", self.denoise_ms));
+            stat_row(
+                ui,
+                "VRAM",
+                &format!(
+                    "{} / {} MiB",
+                    self.telemetry.vram_used_mib, self.telemetry.vram_total_mib
+                ),
+            );
+            stat_row(
+                ui,
+                "Clocks",
+                &format!(
+                    "{} / {} MHz",
+                    self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
+                ),
+            );
+            stat_row(
+                ui,
+                "Temp / Load",
+                &format!(
+                    "{} C / {} %",
+                    self.telemetry.temp_c, self.telemetry.util_gpu
+                ),
+            );
+            stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
+            stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
+            stat_row(ui, "NGX", &self.telemetry.ngx_status);
+        });
 
-        ui.add_space(2.0);
-        section_header(ui, ic::CHART_LINE, "Performance");
-        sparkline_row(
-            ui,
-            "RT ms",
-            &self.timings.rt_ms,
-            Color32::from_rgb(138, 173, 244),
-            "ms",
-        );
-        sparkline_row(
-            ui,
-            "Denoise ms",
-            &self.timings.denoise_ms,
-            Color32::from_rgb(166, 209, 137),
-            "ms",
-        );
-        sparkline_row(
-            ui,
-            "Bloom ms",
-            &self.timings.bloom_ms,
-            Color32::from_rgb(238, 212, 159),
-            "ms",
-        );
-        sparkline_row(
-            ui,
-            "FPS",
-            &self.timings.fps,
-            Color32::from_rgb(198, 160, 246),
-            "",
-        );
+        collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {
+            sparkline_row(
+                ui,
+                "RT ms",
+                &self.timings.rt_ms,
+                Color32::from_rgb(138, 173, 244),
+                "ms",
+            );
+            sparkline_row(
+                ui,
+                "Denoise ms",
+                &self.timings.denoise_ms,
+                Color32::from_rgb(166, 209, 137),
+                "ms",
+            );
+            sparkline_row(
+                ui,
+                "Bloom ms",
+                &self.timings.bloom_ms,
+                Color32::from_rgb(238, 212, 159),
+                "ms",
+            );
+            sparkline_row(
+                ui,
+                "FPS",
+                &self.timings.fps,
+                Color32::from_rgb(198, 160, 246),
+                "",
+            );
+        });
     }
 }
 
-fn section_header(ui: &mut Ui, icon: &str, title: &str) {
-    ui.label(
+fn collapsing_section(
+    ui: &mut Ui,
+    id_salt: &str,
+    icon: &str,
+    title: &str,
+    default_open: bool,
+    add_body: impl FnOnce(&mut Ui),
+) {
+    egui::CollapsingHeader::new(
         RichText::new(format!("{icon}  {title}"))
             .strong()
             .color(Color32::from_rgb(166, 209, 137)),
-    );
+    )
+    .id_salt(id_salt)
+    .default_open(default_open)
+    .show(ui, add_body);
 }
 
 fn equal_grid(

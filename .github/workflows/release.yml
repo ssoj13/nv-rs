@@ -23,13 +23,13 @@ jobs:
           - os: windows-latest
             target: windows-x86_64
             archive: nv-demo-windows-x86_64.zip
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: linux-x86_64
             archive: nv-demo-linux-x86_64.tgz
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -38,7 +38,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Linux GUI, Clang & Vulkan dev dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-26.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -73,6 +73,8 @@ jobs:
             "-s",
             "nvcc_13.3",
             "cudart_13.3",
+            "curand_13.3",
+            "curand_dev_13.3",
             "nvrtc_13.3",
             "nvrtc_dev_13.3",
             "cufft_13.3",
@@ -96,16 +98,18 @@ jobs:
           "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Setup CUDA Toolkit 13.3 (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-26.04'
         shell: bash
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cuda-nvcc-13-3 \
             cuda-cudart-dev-13-3 \
             cuda-driver-dev-13-3 \
+            libcurand-13-3 \
+            libcurand-dev-13-3 \
             cuda-nvrtc-13-3 \
             cuda-nvrtc-dev-13-3 \
             libcufft-13-3 \
@@ -167,7 +171,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}" -Force
 
       - name: Stage portable Linux bundle
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-26.04'
         shell: bash
         run: |
           mkdir -p dist/crates/nv-demo/shaders
@@ -194,7 +198,7 @@ jobs:
           tar -C dist -czf "${{ matrix.archive }}" .
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.archive }}
@@ -203,15 +207,15 @@ jobs:
     name: Publish GitHub Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             nv-demo-windows-x86_64.zip

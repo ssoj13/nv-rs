@@ -20,7 +20,7 @@ use cusparse::{
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
-use crate::compute::{buf_ptr_and_bytes, validate_dev_buf};
+use crate::buf_util::{buf_ptr_and_bytes, validate_dev_buf};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -28,16 +28,11 @@ use crate::errors::{ErrorKind, record_and_err};
 // nv_rs.cusparse
 // ---------------------------------------------------------------------------
 
-fn map_cusparse_err(op: &str, err: cusparse::Error) -> PyErr {
-    let kind = match &err {
-        cusparse::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        cusparse::Error::InvalidInput(_) | cusparse::Error::Budget { .. } => {
-            ErrorKind::InvalidArgument
-        }
-        cusparse::Error::Status { .. } | cusparse::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("cusparse", op, err, kind)
-}
+py_err_mapper!(map_cusparse_err, "cusparse", cusparse::Error, {
+    cusparse::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    cusparse::Error::InvalidInput(_) | cusparse::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    cusparse::Error::Status { .. } | cusparse::Error::Driver(_) => ErrorKind::Cuda,
+});
 
 fn check_cusparse_status(
     call: &'static str,
@@ -429,18 +424,13 @@ impl PyCusparseHandle {
 // nv_rs.cusolver
 // ---------------------------------------------------------------------------
 
-fn map_cusolver_err(op: &str, err: cusolver::Error) -> PyErr {
-    let kind = match &err {
-        cusolver::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        cusolver::Error::InvalidInput(_) | cusolver::Error::Budget { .. } => {
-            ErrorKind::InvalidArgument
-        }
-        cusolver::Error::Status { .. }
-        | cusolver::Error::Cusparse { .. }
-        | cusolver::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("cusolver", op, err, kind)
-}
+py_err_mapper!(map_cusolver_err, "cusolver", cusolver::Error, {
+    cusolver::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    cusolver::Error::InvalidInput(_) | cusolver::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    cusolver::Error::Status { .. }
+    | cusolver::Error::Cusparse { .. }
+    | cusolver::Error::Driver(_) => ErrorKind::Cuda,
+});
 
 struct CusolverDnState {
     handle: CusolverDnInnerHandle,
@@ -927,63 +917,34 @@ impl PyCusolverDnHandle {
 // nv_rs.cudnn
 // ---------------------------------------------------------------------------
 
-fn map_cudnn_err(op: &str, err: cudnn::Error) -> PyErr {
-    let kind = match &err {
-        cudnn::Error::Load(_) | cudnn::Error::Call(_) => ErrorKind::LibraryNotFound,
-        cudnn::Error::Invalid(_) | cudnn::Error::Budget { .. } | cudnn::Error::Unsupported(_) => {
-            ErrorKind::InvalidArgument
-        }
-        cudnn::Error::Status { .. } | cudnn::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("cudnn", op, err, kind)
-}
+py_err_mapper!(map_cudnn_err, "cudnn", cudnn::Error, {
+    cudnn::Error::Load(_) | cudnn::Error::Call(_) => ErrorKind::LibraryNotFound,
+    cudnn::Error::Invalid(_) | cudnn::Error::Budget { .. } | cudnn::Error::Unsupported(_) => {
+        ErrorKind::InvalidArgument
+    },
+    cudnn::Error::Status { .. } | cudnn::Error::Driver(_) => ErrorKind::Cuda,
+});
 
-fn parse_activation_mode(mode: &str) -> PyResult<ActivationMode> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "sigmoid" => Ok(ActivationMode::Sigmoid),
-        "relu" => Ok(ActivationMode::Relu),
-        "tanh" => Ok(ActivationMode::Tanh),
-        "clipped_relu" => Ok(ActivationMode::ClippedRelu),
-        "elu" => Ok(ActivationMode::Elu),
-        "identity" => Ok(ActivationMode::Identity),
-        "swish" => Ok(ActivationMode::Swish),
-        other => Err(record_and_err(
-            "cudnn",
-            "activation_forward_f32",
-            format!(
-                "unsupported activation mode '{other}'; expected sigmoid|relu|tanh|clipped_relu|elu|identity|swish"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_activation_mode, "cudnn", "activation_forward_f32", ActivationMode, "activation mode (expected sigmoid|relu|tanh|clipped_relu|elu|identity|swish)", {
+    "sigmoid" => ActivationMode::Sigmoid,
+    "relu" => ActivationMode::Relu,
+    "tanh" => ActivationMode::Tanh,
+    "clipped_relu" => ActivationMode::ClippedRelu,
+    "elu" => ActivationMode::Elu,
+    "identity" => ActivationMode::Identity,
+    "swish" => ActivationMode::Swish,
+});
 
-fn parse_softmax_algo(algo: &str) -> PyResult<SoftmaxAlgo> {
-    match algo.trim().to_ascii_lowercase().as_str() {
-        "fast" => Ok(SoftmaxAlgo::Fast),
-        "accurate" => Ok(SoftmaxAlgo::Accurate),
-        "log" => Ok(SoftmaxAlgo::Log),
-        other => Err(record_and_err(
-            "cudnn",
-            "softmax_forward_f32",
-            format!("unsupported softmax algo '{other}'; expected fast|accurate|log"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_softmax_algo, "cudnn", "softmax_forward_f32", SoftmaxAlgo, "softmax algo (expected fast|accurate|log)", {
+    "fast" => SoftmaxAlgo::Fast,
+    "accurate" => SoftmaxAlgo::Accurate,
+    "log" => SoftmaxAlgo::Log,
+});
 
-fn parse_softmax_mode(mode: &str) -> PyResult<SoftmaxMode> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "instance" => Ok(SoftmaxMode::Instance),
-        "channel" => Ok(SoftmaxMode::Channel),
-        other => Err(record_and_err(
-            "cudnn",
-            "softmax_forward_f32",
-            format!("unsupported softmax mode '{other}'; expected instance|channel"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_softmax_mode, "cudnn", "softmax_forward_f32", SoftmaxMode, "softmax mode (expected instance|channel)", {
+    "instance" => SoftmaxMode::Instance,
+    "channel" => SoftmaxMode::Channel,
+});
 
 fn validate_4d_f32_bytes(op: &str, shape: [usize; 4]) -> PyResult<usize> {
     if shape.contains(&0) {
@@ -1297,24 +1258,19 @@ impl PyCudnnHandle {
 
 /// Registers `nv_rs.cusparse`, `nv_rs.cusolver`, and `nv_rs.cudnn` submodules.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let sys_modules = py.import("sys")?.getattr("modules")?;
+    py_register_submodule!(py, parent, "cusparse", |m| {
+        m.add_function(wrap_pyfunction!(cusparse_version, &m)?)?;
+        m.add_class::<PyCusparseHandle>()?;
+    })?;
 
-    let m_cusparse = PyModule::new(py, "cusparse")?;
-    m_cusparse.add_function(wrap_pyfunction!(cusparse_version, &m_cusparse)?)?;
-    m_cusparse.add_class::<PyCusparseHandle>()?;
-    parent.add_submodule(&m_cusparse)?;
-    sys_modules.set_item("nv_rs.cusparse", m_cusparse)?;
+    py_register_submodule!(py, parent, "cusolver", |m| {
+        m.add_class::<PyCusolverDnHandle>()?;
+    })?;
 
-    let m_cusolver = PyModule::new(py, "cusolver")?;
-    m_cusolver.add_class::<PyCusolverDnHandle>()?;
-    parent.add_submodule(&m_cusolver)?;
-    sys_modules.set_item("nv_rs.cusolver", m_cusolver)?;
-
-    let m_cudnn = PyModule::new(py, "cudnn")?;
-    m_cudnn.add_function(wrap_pyfunction!(cudnn_version, &m_cudnn)?)?;
-    m_cudnn.add_class::<PyCudnnHandle>()?;
-    parent.add_submodule(&m_cudnn)?;
-    sys_modules.set_item("nv_rs.cudnn", m_cudnn)?;
+    py_register_submodule!(py, parent, "cudnn", |m| {
+        m.add_function(wrap_pyfunction!(cudnn_version, &m)?)?;
+        m.add_class::<PyCudnnHandle>()?;
+    })?;
 
     Ok(())
 }

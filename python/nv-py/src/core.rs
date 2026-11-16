@@ -750,6 +750,7 @@ impl PyDeviceBuffer {
     }
 
     /// `__cuda_array_interface__` v3 dictionary for zero-copy CuPy / Numba / PyTorch interop.
+    /// @py-return: dict[str, Any]
     #[getter]
     fn __cuda_array_interface__(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let (_, typestr, itemsize) = parse_dtype(&self.dtype).map_err(|e| {
@@ -896,15 +897,11 @@ impl PyDeviceBuffer {
 
 /// Registers the `nv_rs.core` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "core")?;
-    m.add_class::<PyContext>()?;
-    m.add_class::<PyStream>()?;
-    m.add_class::<PyDeviceBuffer>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.core", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "core", |m| {
+        m.add_class::<PyContext>()?;
+        m.add_class::<PyStream>()?;
+        m.add_class::<PyDeviceBuffer>()?;
+    })
 }
 
 #[cfg(test)]

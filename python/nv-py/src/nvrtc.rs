@@ -10,15 +10,12 @@ use pyo3::types::PyBytes;
 
 use crate::errors::{ErrorKind, record_and_err};
 
-fn map_nvrtc_err(op: &str, err: nvrtc::Error) -> PyErr {
-    let kind = match &err {
-        nvrtc::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvrtc::Error::Compilation { .. } => ErrorKind::Compile,
-        nvrtc::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-        _ => ErrorKind::Cuda,
-    };
-    record_and_err("nvrtc", op, err, kind)
-}
+py_err_mapper!(map_nvrtc_err, "nvrtc", nvrtc::Error, {
+    nvrtc::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvrtc::Error::Compilation { .. } => ErrorKind::Compile,
+    nvrtc::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+    _ => ErrorKind::Cuda,
+});
 
 /// Returns `(major, minor)` NVRTC version.
 #[pyfunction]
@@ -115,7 +112,10 @@ impl PyCompileResult {
     dlto=false,
     extra_args=None
 ))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Python keyword-argument API for NVRTC compilation options"
+)]
 fn compile(
     py: Python<'_>,
     source: String,
@@ -222,14 +222,10 @@ fn compile(
 
 /// Registers the `nv_rs.nvrtc` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "nvrtc")?;
-    m.add_function(wrap_pyfunction!(version, &m)?)?;
-    m.add_function(wrap_pyfunction!(supported_archs, &m)?)?;
-    m.add_function(wrap_pyfunction!(compile, &m)?)?;
-    m.add_class::<PyCompileResult>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.nvrtc", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "nvrtc", |m| {
+        m.add_function(wrap_pyfunction!(version, &m)?)?;
+        m.add_function(wrap_pyfunction!(supported_archs, &m)?)?;
+        m.add_function(wrap_pyfunction!(compile, &m)?)?;
+        m.add_class::<PyCompileResult>()?;
+    })
 }

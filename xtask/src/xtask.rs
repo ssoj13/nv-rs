@@ -1,4 +1,4 @@
-//! nv-rs repository tasks. Today: the coverage matrix.
+//! nv-rs repository tasks: coverage matrices, prebuilt staging, DLL deployment, and Python stubs.
 //!
 //! **What.** `cargo xtask coverage generate` writes `COVERAGE.md` from
 //! - `coverage/<lib>.toml` — hand-written overlay: per entry point, its safe wrapper and test id;
@@ -21,9 +21,14 @@
 //! to an existing Rust item, every `OptixFunctionTable` field is used by `crates/optix`, and every
 //! `_optix_*` intrinsic is used by the typed device layer. It prints counts and exits non-zero,
 //! listing the missing names, on any gap.
+//!
+//! `cargo xtask py-stubs <generate|check>` (module `py_stubs`) parses `python/nv-py/src/*.rs` and
+//! `python/nv-py/python/nv_rs/__init__.py` to deterministically generate or verify
+//! `python/nv-py/python/nv_rs/__init__.pyi` and `docs/src/content/docs/python/04-modules-reference.md`.
 
 mod optix_cov;
 mod prebuilt;
+mod py_stubs;
 mod stage_dlls;
 
 use serde::Deserialize;
@@ -47,11 +52,22 @@ enum Error {
     #[error("{0}")]
     Prebuilt(String),
     #[error("{0}")]
+    PyStubs(String),
+    #[error("{0}")]
     StageDlls(String),
-    #[error(
-        "usage: cargo xtask <coverage <collect|generate|check|optix> | prebuilt [--out <dir>] [--target <triple>] | stage-prebuilt [--out <dir>] [--target <triple>] | stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]>"
-    )]
+    #[error("{}", help())]
     Usage,
+}
+
+fn help() -> &'static str {
+    "usage: cargo xtask <command>\n\
+     \n\
+     commands:\n\
+     \x20 coverage <collect|generate|check|optix>   Generate or verify API coverage matrices\n\
+     \x20 py-stubs <generate|check>                 Generate or verify Python .pyi stubs and docs\n\
+     \x20 prebuilt [--out <dir>] [--target <triple>] Package prebuilt sys bindings\n\
+     \x20 stage-prebuilt [--out <dir>] [--target <triple>] Alias for prebuilt\n\
+     \x20 stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run] Stage runtime DLLs"
 }
 
 /// `coverage/<lib>.toml`.
@@ -119,10 +135,14 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["help" | "--help" | "-h"] => Ok(help().to_string()),
         ["coverage", "generate"] => generate(&root),
         ["coverage", "check"] => check(&root),
         ["coverage", "collect"] => collect(&root),
         ["coverage", "optix"] => optix_cov::run(&root).map_err(Error::Optix),
+        ["py-stubs", "generate"] => py_stubs::generate(&root).map_err(Error::PyStubs),
+        ["py-stubs", "check"] => py_stubs::check(&root).map_err(Error::PyStubs),
+        ["py-stubs", "--help" | "-h" | "help"] => Ok(help().to_string()),
         ["prebuilt" | "stage-prebuilt", rest @ ..] => {
             let refs: Vec<&str> = rest.to_vec();
             prebuilt::run(&root, &refs).map_err(Error::Prebuilt)

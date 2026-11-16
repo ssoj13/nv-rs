@@ -32,6 +32,12 @@ Maintainer: Alex Khalyavin `<joss13@gmail.com>`.
 - [x] Verified `device/optix-device` and `device/cuda-tex-device` (`cargo +nightly check`), `cargo +nightly clippy --workspace --all-targets -- -D warnings`, `cargo +nightly test --workspace --quiet`, `cargo clippy` (stable), `cargo test --workspace`, `pytest`, WSL2 `Ubuntu` tests, and `bun run build` in `docs/`.
 - [x] Updated `README.md`, `CHANGELOG.md`, and `docs/src/content/docs/**` with all changes and author attribution (`Alex Khalyavin <joss13@gmail.com>`).
 
+### M5 — Python (`nv_rs`) SSOT Stub & Docs Automation (`py-stubs`)
+- [x] Fixed 6 stub/doc/annotation drift bugs across `python/nv-py/src/*.rs` (`__exit__` `(exc_type, exc_val, exc_tb)` kwargs, `/// @py-return:` structured return schemas for `Py<PyDict>`/`Py<PyAny>`, `#[expect(clippy::too_many_arguments)]` in `nvrtc.rs`, `pyproject.toml` description).
+- [x] Consolidated PyO3 boilerplate into `python/nv-py/src/macros.rs` (`py_register_submodule!`, `py_parse_enum!`, `py_err_mapper!`) and `python/nv-py/src/buf_util.rs` (`buf_ptr_and_bytes`, `validate_dev_buf`), keeping all `#[pyclass]`/`#[pymethods]`/`#[pyfunction]` headers explicit.
+- [x] Implemented `cargo xtask py-stubs <generate|check>` in `xtask/src/py_stubs.rs` (`syn`-based SSOT parser) to deterministically generate and drift-check `python/nv-py/python/nv_rs/__init__.pyi` and `docs/src/content/docs/python/04-modules-reference.md`.
+- [x] Deepened `python/nv-py/tests/test_stub_sync.py` (full `ast` verification of all 25 submodules, classes, methods, functions, return annotations, and optional runtime `inspect` parity) and wired `cargo run -p xtask -- py-stubs check` into `.github/workflows/ci.yml` and `bootstrap.py`.
+
 ---
 
 ## Backlog (Optional / Future Work, Sorted by Priority)

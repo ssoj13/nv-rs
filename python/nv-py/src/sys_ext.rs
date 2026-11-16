@@ -45,65 +45,33 @@ fn resolve_cuda_ctx(
     }
 }
 
-fn register_submodule(
-    py: Python<'_>,
-    parent: &Bound<'_, PyModule>,
-    full_name: &str,
-    m: &Bound<'_, PyModule>,
-) -> PyResult<()> {
-    parent.add_submodule(m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item(full_name, m)?;
-    Ok(())
-}
-
 // ============================================================================
 // 1. nv_rs.cupti
 // ============================================================================
 
-fn map_cupti_err(op: &str, err: cupti::Error) -> PyErr {
-    let kind = match &err {
-        cupti::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        cupti::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-        _ => ErrorKind::Cuda,
-    };
-    record_and_err("cupti", op, err, kind)
-}
+py_err_mapper!(map_cupti_err, "cupti", cupti::Error, {
+    cupti::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    cupti::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+    _ => ErrorKind::Cuda,
+});
 
-fn parse_activity_kind(kind: &str) -> PyResult<ActivityKind> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "memcpy" => Ok(ActivityKind::Memcpy),
-        "memset" => Ok(ActivityKind::Memset),
-        "kernel" => Ok(ActivityKind::Kernel),
-        "concurrent_kernel" | "concurrentkernel" => Ok(ActivityKind::ConcurrentKernel),
-        "driver" => Ok(ActivityKind::Driver),
-        "runtime" => Ok(ActivityKind::Runtime),
-        _ => Err(record_and_err(
-            "cupti",
-            "parse_activity_kind",
-            format!("unknown CUPTI activity kind `{kind}`"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_activity_kind, "cupti", "parse_activity_kind", ActivityKind, "CUPTI activity kind", {
+    "memcpy" => ActivityKind::Memcpy,
+    "memset" => ActivityKind::Memset,
+    "kernel" => ActivityKind::Kernel,
+    "concurrent_kernel" | "concurrentkernel" => ActivityKind::ConcurrentKernel,
+    "driver" => ActivityKind::Driver,
+    "runtime" => ActivityKind::Runtime,
+});
 
-fn parse_callback_domain(domain: &str) -> PyResult<CallbackDomain> {
-    match domain.trim().to_ascii_lowercase().as_str() {
-        "driver_api" | "driverapi" | "driver" => Ok(CallbackDomain::DriverApi),
-        "runtime_api" | "runtimeapi" | "runtime" => Ok(CallbackDomain::RuntimeApi),
-        "resource" => Ok(CallbackDomain::Resource),
-        "synchronize" | "sync" => Ok(CallbackDomain::Synchronize),
-        "nvtx" => Ok(CallbackDomain::Nvtx),
-        "state" => Ok(CallbackDomain::State),
-        _ => Err(record_and_err(
-            "cupti",
-            "parse_callback_domain",
-            format!("unknown CUPTI callback domain `{domain}`"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_callback_domain, "cupti", "parse_callback_domain", CallbackDomain, "CUPTI callback domain", {
+    "driver_api" | "driverapi" | "driver" => CallbackDomain::DriverApi,
+    "runtime_api" | "runtimeapi" | "runtime" => CallbackDomain::RuntimeApi,
+    "resource" => CallbackDomain::Resource,
+    "synchronize" | "sync" => CallbackDomain::Synchronize,
+    "nvtx" => CallbackDomain::Nvtx,
+    "state" => CallbackDomain::State,
+});
 
 fn callback_domain_str(domain: CallbackDomain) -> &'static str {
     match domain {
@@ -271,6 +239,7 @@ impl PyCuptiActivity {
     }
 
     /// Drains all collected activity records, returning `(records, dropped_count)`.
+    /// @py-return: tuple[list[dict[str, Any]], int]
     fn drain_records(&self, py: Python<'_>) -> PyResult<(Vec<Py<PyDict>>, usize)> {
         let (records, dropped) = py
             .detach(|| {
@@ -429,12 +398,12 @@ impl PyCuptiSubscriber {
 }
 
 fn register_cupti(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "cupti")?;
-    m.add_function(wrap_pyfunction!(cupti_version_py, &m)?)?;
-    m.add_function(wrap_pyfunction!(callback_name, &m)?)?;
-    m.add_class::<PyCuptiActivity>()?;
-    m.add_class::<PyCuptiSubscriber>()?;
-    register_submodule(py, parent, "nv_rs.cupti", &m)
+    py_register_submodule!(py, parent, "cupti", |m| {
+        m.add_function(wrap_pyfunction!(cupti_version_py, &m)?)?;
+        m.add_function(wrap_pyfunction!(callback_name, &m)?)?;
+        m.add_class::<PyCuptiActivity>()?;
+        m.add_class::<PyCuptiSubscriber>()?;
+    })
 }
 
 // ============================================================================
@@ -824,16 +793,16 @@ impl PyExternalMemoryDesc {
 }
 
 fn register_cuda_ext(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "cuda_ext")?;
-    m.add_function(wrap_pyfunction!(device_luid, &m)?)?;
-    m.add_function(wrap_pyfunction!(device_uuid, &m)?)?;
-    m.add_function(wrap_pyfunction!(sparse_arrays_supported, &m)?)?;
-    m.add_function(wrap_pyfunction!(split_sms, &m)?)?;
-    m.add_class::<PyManagedBuffer>()?;
-    m.add_class::<PyHostRegistration>()?;
-    m.add_class::<PyGreenContext>()?;
-    m.add_class::<PyExternalMemoryDesc>()?;
-    register_submodule(py, parent, "nv_rs.cuda_ext", &m)
+    py_register_submodule!(py, parent, "cuda_ext", |m| {
+        m.add_function(wrap_pyfunction!(device_luid, &m)?)?;
+        m.add_function(wrap_pyfunction!(device_uuid, &m)?)?;
+        m.add_function(wrap_pyfunction!(sparse_arrays_supported, &m)?)?;
+        m.add_function(wrap_pyfunction!(split_sms, &m)?)?;
+        m.add_class::<PyManagedBuffer>()?;
+        m.add_class::<PyHostRegistration>()?;
+        m.add_class::<PyGreenContext>()?;
+        m.add_class::<PyExternalMemoryDesc>()?;
+    })
 }
 
 // ============================================================================
@@ -864,55 +833,44 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn map_wgpu_err(op: &str, err: nv_wgpu::Error) -> PyErr {
-    let kind = match &err {
-        nv_wgpu::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-        nv_wgpu::Error::Unsupported { .. }
-        | nv_wgpu::Error::BackendMismatch { .. }
-        | nv_wgpu::Error::DeviceMismatch { .. }
-        | nv_wgpu::Error::NoMatchingCudaDevice { .. } => ErrorKind::InvalidArgument,
-        _ => ErrorKind::Cuda,
-    };
-    record_and_err("wgpu", op, err, kind)
-}
+py_err_mapper!(map_wgpu_err, "wgpu", nv_wgpu::Error, {
+    nv_wgpu::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+    nv_wgpu::Error::Unsupported { .. }
+    | nv_wgpu::Error::BackendMismatch { .. }
+    | nv_wgpu::Error::DeviceMismatch { .. }
+    | nv_wgpu::Error::NoMatchingCudaDevice { .. } => ErrorKind::InvalidArgument,
+    _ => ErrorKind::Cuda,
+});
 
-fn parse_texture_format(fmt: &str) -> PyResult<wgpu::TextureFormat> {
-    match fmt.trim().to_ascii_lowercase().as_str() {
-        "r8unorm" | "r8_unorm" => Ok(wgpu::TextureFormat::R8Unorm),
-        "r8uint" | "r8_uint" => Ok(wgpu::TextureFormat::R8Uint),
-        "rg8unorm" | "rg8_unorm" => Ok(wgpu::TextureFormat::Rg8Unorm),
-        "rg8uint" | "rg8_uint" => Ok(wgpu::TextureFormat::Rg8Uint),
-        "rgba8unorm" | "rgba8_unorm" => Ok(wgpu::TextureFormat::Rgba8Unorm),
-        "rgba8unormsrgb" | "rgba8_unorm_srgb" => Ok(wgpu::TextureFormat::Rgba8UnormSrgb),
-        "rgba8uint" | "rgba8_uint" => Ok(wgpu::TextureFormat::Rgba8Uint),
-        "bgra8unorm" | "bgra8_unorm" => Ok(wgpu::TextureFormat::Bgra8Unorm),
-        "bgra8unormsrgb" | "bgra8_unorm_srgb" => Ok(wgpu::TextureFormat::Bgra8UnormSrgb),
-        "r16unorm" | "r16_unorm" => Ok(wgpu::TextureFormat::R16Unorm),
-        "r16uint" | "r16_uint" => Ok(wgpu::TextureFormat::R16Uint),
-        "r16float" | "r16_float" => Ok(wgpu::TextureFormat::R16Float),
-        "rg16unorm" | "rg16_unorm" => Ok(wgpu::TextureFormat::Rg16Unorm),
-        "rg16uint" | "rg16_uint" => Ok(wgpu::TextureFormat::Rg16Uint),
-        "rg16float" | "rg16_float" => Ok(wgpu::TextureFormat::Rg16Float),
-        "rgba16unorm" | "rgba16_unorm" => Ok(wgpu::TextureFormat::Rgba16Unorm),
-        "rgba16uint" | "rgba16_uint" => Ok(wgpu::TextureFormat::Rgba16Uint),
-        "rgba16float" | "rgba16_float" => Ok(wgpu::TextureFormat::Rgba16Float),
-        "r32uint" | "r32_uint" => Ok(wgpu::TextureFormat::R32Uint),
-        "r32sint" | "r32_sint" => Ok(wgpu::TextureFormat::R32Sint),
-        "r32float" | "r32_float" => Ok(wgpu::TextureFormat::R32Float),
-        "rg32uint" | "rg32_uint" => Ok(wgpu::TextureFormat::Rg32Uint),
-        "rg32sint" | "rg32_sint" => Ok(wgpu::TextureFormat::Rg32Sint),
-        "rg32float" | "rg32_float" => Ok(wgpu::TextureFormat::Rg32Float),
-        "rgba32uint" | "rgba32_uint" => Ok(wgpu::TextureFormat::Rgba32Uint),
-        "rgba32sint" | "rgba32_sint" => Ok(wgpu::TextureFormat::Rgba32Sint),
-        "rgba32float" | "rgba32_float" => Ok(wgpu::TextureFormat::Rgba32Float),
-        _ => Err(record_and_err(
-            "wgpu",
-            "parse_texture_format",
-            format!("unsupported wgpu texture format `{fmt}`"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_texture_format, "wgpu", "parse_texture_format", wgpu::TextureFormat, "wgpu texture format", {
+    "r8unorm" | "r8_unorm" => wgpu::TextureFormat::R8Unorm,
+    "r8uint" | "r8_uint" => wgpu::TextureFormat::R8Uint,
+    "rg8unorm" | "rg8_unorm" => wgpu::TextureFormat::Rg8Unorm,
+    "rg8uint" | "rg8_uint" => wgpu::TextureFormat::Rg8Uint,
+    "rgba8unorm" | "rgba8_unorm" => wgpu::TextureFormat::Rgba8Unorm,
+    "rgba8unormsrgb" | "rgba8_unorm_srgb" => wgpu::TextureFormat::Rgba8UnormSrgb,
+    "rgba8uint" | "rgba8_uint" => wgpu::TextureFormat::Rgba8Uint,
+    "bgra8unorm" | "bgra8_unorm" => wgpu::TextureFormat::Bgra8Unorm,
+    "bgra8unormsrgb" | "bgra8_unorm_srgb" => wgpu::TextureFormat::Bgra8UnormSrgb,
+    "r16unorm" | "r16_unorm" => wgpu::TextureFormat::R16Unorm,
+    "r16uint" | "r16_uint" => wgpu::TextureFormat::R16Uint,
+    "r16float" | "r16_float" => wgpu::TextureFormat::R16Float,
+    "rg16unorm" | "rg16_unorm" => wgpu::TextureFormat::Rg16Unorm,
+    "rg16uint" | "rg16_uint" => wgpu::TextureFormat::Rg16Uint,
+    "rg16float" | "rg16_float" => wgpu::TextureFormat::Rg16Float,
+    "rgba16unorm" | "rgba16_unorm" => wgpu::TextureFormat::Rgba16Unorm,
+    "rgba16uint" | "rgba16_uint" => wgpu::TextureFormat::Rgba16Uint,
+    "rgba16float" | "rgba16_float" => wgpu::TextureFormat::Rgba16Float,
+    "r32uint" | "r32_uint" => wgpu::TextureFormat::R32Uint,
+    "r32sint" | "r32_sint" => wgpu::TextureFormat::R32Sint,
+    "r32float" | "r32_float" => wgpu::TextureFormat::R32Float,
+    "rg32uint" | "rg32_uint" => wgpu::TextureFormat::Rg32Uint,
+    "rg32sint" | "rg32_sint" => wgpu::TextureFormat::Rg32Sint,
+    "rg32float" | "rg32_float" => wgpu::TextureFormat::Rg32Float,
+    "rgba32uint" | "rgba32_uint" => wgpu::TextureFormat::Rgba32Uint,
+    "rgba32sint" | "rgba32_sint" => wgpu::TextureFormat::Rgba32Sint,
+    "rgba32float" | "rgba32_float" => wgpu::TextureFormat::Rgba32Float,
+});
 
 fn parse_buffer_usage(usage: &str) -> PyResult<wgpu::BufferUsages> {
     let mut flags = wgpu::BufferUsages::empty();
@@ -1030,6 +988,7 @@ fn is_supported(py: Python<'_>) -> bool {
 }
 
 /// Probes all visible Vulkan/DX12 `wgpu` adapters and their CUDA interop capability.
+/// @py-return: list[dict[str, Any]]
 #[pyfunction]
 fn probe_adapters(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let probes = py.detach(probe_wgpu_adapters);
@@ -1292,15 +1251,15 @@ impl PyInteropSemaphore {
 }
 
 fn register_wgpu(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "wgpu")?;
-    m.add_function(wrap_pyfunction!(is_supported, &m)?)?;
-    m.add_function(wrap_pyfunction!(probe_adapters, &m)?)?;
-    m.add_function(wrap_pyfunction!(wgpu_aligned_row_pitch, &m)?)?;
-    m.add_function(wrap_pyfunction!(wgpu_aligned_staging_bytes, &m)?)?;
-    m.add_class::<PyInteropContext>()?;
-    m.add_class::<PySharedBuffer>()?;
-    m.add_class::<PyInteropSemaphore>()?;
-    register_submodule(py, parent, "nv_rs.wgpu", &m)
+    py_register_submodule!(py, parent, "wgpu", |m| {
+        m.add_function(wrap_pyfunction!(is_supported, &m)?)?;
+        m.add_function(wrap_pyfunction!(probe_adapters, &m)?)?;
+        m.add_function(wrap_pyfunction!(wgpu_aligned_row_pitch, &m)?)?;
+        m.add_function(wrap_pyfunction!(wgpu_aligned_staging_bytes, &m)?)?;
+        m.add_class::<PyInteropContext>()?;
+        m.add_class::<PySharedBuffer>()?;
+        m.add_class::<PyInteropSemaphore>()?;
+    })
 }
 
 // ============================================================================

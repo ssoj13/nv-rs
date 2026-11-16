@@ -22,6 +22,7 @@ use nvofa::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
+use crate::buf_util::validate_dev_buf;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -29,166 +30,144 @@ use crate::errors::{ErrorKind, record_and_err};
 // Error mapping & parsing helpers
 // ---------------------------------------------------------------------------
 
-fn map_nvenc_err(op: &str, err: nvenc::Error) -> PyErr {
-    let kind = match &err {
-        nvenc::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvenc::Error::Invalid(_)
-        | nvenc::Error::Unsupported { .. }
-        | nvenc::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        nvenc::Error::Driver(_) | nvenc::Error::Status { .. } => ErrorKind::Cuda,
-    };
-    record_and_err("nvenc", op, err, kind)
-}
+py_err_mapper!(map_nvenc_err, "nvenc", nvenc::Error, {
+    nvenc::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvenc::Error::Invalid(_)
+    | nvenc::Error::Unsupported { .. }
+    | nvenc::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvenc::Error::Driver(_) | nvenc::Error::Status { .. } => ErrorKind::Cuda,
+});
 
-fn map_nvdec_err(op: &str, err: nvdec::Error) -> PyErr {
-    let kind = match &err {
-        nvdec::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvdec::Error::Invalid(_)
-        | nvdec::Error::Unsupported { .. }
-        | nvdec::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        nvdec::Error::Driver(_) | nvdec::Error::Status { .. } | nvdec::Error::CallbackPanic(_) => {
-            ErrorKind::Cuda
-        }
-    };
-    record_and_err("nvdec", op, err, kind)
-}
-
-fn map_nvofa_err(op: &str, err: nvofa::Error) -> PyErr {
-    let kind = match &err {
-        nvofa::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvofa::Error::Invalid(_)
-        | nvofa::Error::Unsupported { .. }
-        | nvofa::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        nvofa::Error::Driver(_) | nvofa::Error::Status { .. } => ErrorKind::Cuda,
-    };
-    record_and_err("nvofa", op, err, kind)
-}
-
-fn parse_enc_codec(name: &str) -> PyResult<(EncCodec, &'static str)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "h264" | "avc" => Ok((EncCodec::H264, "h264")),
-        "hevc" | "h265" => Ok((EncCodec::Hevc, "hevc")),
-        "av1" => Ok((EncCodec::Av1, "av1")),
-        other => Err(record_and_err(
-            "nvenc",
-            "parse_codec",
-            format!("unsupported NVENC codec `{other}`; expected h264, hevc, or av1"),
-            ErrorKind::InvalidArgument,
-        )),
+py_err_mapper!(map_nvdec_err, "nvdec", nvdec::Error, {
+    nvdec::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvdec::Error::Invalid(_)
+    | nvdec::Error::Unsupported { .. }
+    | nvdec::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvdec::Error::Driver(_) | nvdec::Error::Status { .. } | nvdec::Error::CallbackPanic(_) => {
+        ErrorKind::Cuda
     }
-}
+});
 
-fn parse_preset(name: &str) -> PyResult<Preset> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "p1" => Ok(Preset::P1),
-        "p2" => Ok(Preset::P2),
-        "p3" => Ok(Preset::P3),
-        "p4" => Ok(Preset::P4),
-        "p5" => Ok(Preset::P5),
-        "p6" => Ok(Preset::P6),
-        "p7" => Ok(Preset::P7),
-        other => Err(record_and_err(
-            "nvenc",
-            "parse_preset",
-            format!("unsupported NVENC preset `{other}`; expected p1..p7"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_err_mapper!(map_nvofa_err, "nvofa", nvofa::Error, {
+    nvofa::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvofa::Error::Invalid(_)
+    | nvofa::Error::Unsupported { .. }
+    | nvofa::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvofa::Error::Driver(_) | nvofa::Error::Status { .. } => ErrorKind::Cuda,
+});
 
-fn parse_tuning(name: &str) -> PyResult<Tuning> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "hq" | "high_quality" => Ok(Tuning::HighQuality),
-        "ll" | "low_latency" => Ok(Tuning::LowLatency),
-        "ull" | "ultra_low_latency" => Ok(Tuning::UltraLowLatency),
-        "lossless" => Ok(Tuning::Lossless),
-        "uhq" | "ultra_high_quality" => Ok(Tuning::UltraHighQuality),
-        other => Err(record_and_err(
-            "nvenc",
-            "parse_tuning",
-            format!(
-                "unsupported NVENC tuning `{other}`; expected high_quality, low_latency, ultra_low_latency, lossless, or ultra_high_quality"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_enc_codec,
+    "nvenc",
+    "parse_codec",
+    (EncCodec, &'static str),
+    "NVENC codec (expected h264, hevc, or av1)",
+    {
+        "h264" | "avc" => (EncCodec::H264, "h264"),
+        "hevc" | "h265" => (EncCodec::Hevc, "hevc"),
+        "av1" => (EncCodec::Av1, "av1"),
     }
-}
+);
 
-fn parse_enc_format(name: &str) -> PyResult<(EncBufferFormat, &'static str)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "nv12" => Ok((EncBufferFormat::Nv12, "nv12")),
-        "yv12" => Ok((EncBufferFormat::Yv12, "yv12")),
-        "iyuv" | "i420" => Ok((EncBufferFormat::Iyuv, "iyuv")),
-        "yuv444" => Ok((EncBufferFormat::Yuv444, "yuv444")),
-        "yuv420_10bit" | "p010" => Ok((EncBufferFormat::Yuv420_10Bit, "yuv420_10bit")),
-        "yuv444_10bit" => Ok((EncBufferFormat::Yuv444_10Bit, "yuv444_10bit")),
-        "argb" => Ok((EncBufferFormat::Argb, "argb")),
-        "abgr" => Ok((EncBufferFormat::Abgr, "abgr")),
-        "argb10" => Ok((EncBufferFormat::Argb10, "argb10")),
-        "abgr10" => Ok((EncBufferFormat::Abgr10, "abgr10")),
-        other => Err(record_and_err(
-            "nvenc",
-            "parse_format",
-            format!("unsupported NVENC buffer format `{other}`"),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_preset,
+    "nvenc",
+    "parse_preset",
+    Preset,
+    "NVENC preset (expected p1..p7)",
+    {
+        "p1" => Preset::P1,
+        "p2" => Preset::P2,
+        "p3" => Preset::P3,
+        "p4" => Preset::P4,
+        "p5" => Preset::P5,
+        "p6" => Preset::P6,
+        "p7" => Preset::P7,
     }
-}
+);
 
-fn parse_dec_codec(name: &str) -> PyResult<(DecCodec, &'static str)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "mpeg1" => Ok((DecCodec::Mpeg1, "mpeg1")),
-        "mpeg2" => Ok((DecCodec::Mpeg2, "mpeg2")),
-        "mpeg4" => Ok((DecCodec::Mpeg4, "mpeg4")),
-        "vc1" => Ok((DecCodec::Vc1, "vc1")),
-        "h264" | "avc" => Ok((DecCodec::H264, "h264")),
-        "jpeg" | "mjpeg" => Ok((DecCodec::Jpeg, "jpeg")),
-        "hevc" | "h265" => Ok((DecCodec::Hevc, "hevc")),
-        "vp8" => Ok((DecCodec::Vp8, "vp8")),
-        "vp9" => Ok((DecCodec::Vp9, "vp9")),
-        "av1" => Ok((DecCodec::Av1, "av1")),
-        other => Err(record_and_err(
-            "nvdec",
-            "parse_codec",
-            format!("unsupported NVDEC codec `{other}`"),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_tuning,
+    "nvenc",
+    "parse_tuning",
+    Tuning,
+    "NVENC tuning (expected high_quality, low_latency, ultra_low_latency, lossless, or ultra_high_quality)",
+    {
+        "hq" | "high_quality" => Tuning::HighQuality,
+        "ll" | "low_latency" => Tuning::LowLatency,
+        "ull" | "ultra_low_latency" => Tuning::UltraLowLatency,
+        "lossless" => Tuning::Lossless,
+        "uhq" | "ultra_high_quality" => Tuning::UltraHighQuality,
     }
-}
+);
 
-fn parse_dec_chroma(name: &str) -> PyResult<DecChromaFormat> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "monochrome" | "400" => Ok(DecChromaFormat::Monochrome),
-        "420" | "yuv420" => Ok(DecChromaFormat::Yuv420),
-        "422" | "yuv422" => Ok(DecChromaFormat::Yuv422),
-        "444" | "yuv444" => Ok(DecChromaFormat::Yuv444),
-        other => Err(record_and_err(
-            "nvdec",
-            "parse_chroma",
-            format!(
-                "unsupported NVDEC chroma format `{other}`; expected 420, 422, 444, or monochrome"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_enc_format,
+    "nvenc",
+    "parse_format",
+    (EncBufferFormat, &'static str),
+    "NVENC buffer format",
+    {
+        "nv12" => (EncBufferFormat::Nv12, "nv12"),
+        "yv12" => (EncBufferFormat::Yv12, "yv12"),
+        "iyuv" | "i420" => (EncBufferFormat::Iyuv, "iyuv"),
+        "yuv444" => (EncBufferFormat::Yuv444, "yuv444"),
+        "yuv420_10bit" | "p010" => (EncBufferFormat::Yuv420_10Bit, "yuv420_10bit"),
+        "yuv444_10bit" => (EncBufferFormat::Yuv444_10Bit, "yuv444_10bit"),
+        "argb" => (EncBufferFormat::Argb, "argb"),
+        "abgr" => (EncBufferFormat::Abgr, "abgr"),
+        "argb10" => (EncBufferFormat::Argb10, "argb10"),
+        "abgr10" => (EncBufferFormat::Abgr10, "abgr10"),
     }
-}
+);
 
-fn parse_dec_surface_format(name: &str) -> PyResult<SurfaceFormat> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "nv12" => Ok(SurfaceFormat::Nv12),
-        "p016" | "p010" => Ok(SurfaceFormat::P016),
-        "yuv444" => Ok(SurfaceFormat::Yuv444),
-        "yuv444_16bit" => Ok(SurfaceFormat::Yuv444_16Bit),
-        other => Err(record_and_err(
-            "nvdec",
-            "parse_surface_format",
-            format!(
-                "unsupported NVDEC output format `{other}`; expected nv12, p016, yuv444, or yuv444_16bit"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_dec_codec,
+    "nvdec",
+    "parse_codec",
+    (DecCodec, &'static str),
+    "NVDEC codec",
+    {
+        "mpeg1" => (DecCodec::Mpeg1, "mpeg1"),
+        "mpeg2" => (DecCodec::Mpeg2, "mpeg2"),
+        "mpeg4" => (DecCodec::Mpeg4, "mpeg4"),
+        "vc1" => (DecCodec::Vc1, "vc1"),
+        "h264" | "avc" => (DecCodec::H264, "h264"),
+        "jpeg" | "mjpeg" => (DecCodec::Jpeg, "jpeg"),
+        "hevc" | "h265" => (DecCodec::Hevc, "hevc"),
+        "vp8" => (DecCodec::Vp8, "vp8"),
+        "vp9" => (DecCodec::Vp9, "vp9"),
+        "av1" => (DecCodec::Av1, "av1"),
     }
-}
+);
+
+py_parse_enum!(
+    parse_dec_chroma,
+    "nvdec",
+    "parse_chroma",
+    DecChromaFormat,
+    "NVDEC chroma format (expected 420, 422, 444, or monochrome)",
+    {
+        "monochrome" | "400" => DecChromaFormat::Monochrome,
+        "420" | "yuv420" => DecChromaFormat::Yuv420,
+        "422" | "yuv422" => DecChromaFormat::Yuv422,
+        "444" | "yuv444" => DecChromaFormat::Yuv444,
+    }
+);
+
+py_parse_enum!(
+    parse_dec_surface_format,
+    "nvdec",
+    "parse_surface_format",
+    SurfaceFormat,
+    "NVDEC output format (expected nv12, p016, yuv444, or yuv444_16bit)",
+    {
+        "nv12" => SurfaceFormat::Nv12,
+        "p016" | "p010" => SurfaceFormat::P016,
+        "yuv444" => SurfaceFormat::Yuv444,
+        "yuv444_16bit" => SurfaceFormat::Yuv444_16Bit,
+    }
+);
 
 fn parse_grid_size(grid: u32) -> PyResult<GridSize> {
     match grid {
@@ -204,35 +183,31 @@ fn parse_grid_size(grid: u32) -> PyResult<GridSize> {
     }
 }
 
-fn parse_of_format(name: &str) -> PyResult<(OfBufferFormat, &'static str)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "grayscale8" | "gray8" | "u8" => Ok((OfBufferFormat::Grayscale8, "grayscale8")),
-        "nv12" => Ok((OfBufferFormat::Nv12, "nv12")),
-        "abgr8" | "rgba8" => Ok((OfBufferFormat::Abgr8, "abgr8")),
-        other => Err(record_and_err(
-            "nvofa",
-            "parse_format",
-            format!(
-                "unsupported NVOFA input format `{other}`; expected grayscale8, nv12, or abgr8"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_of_format,
+    "nvofa",
+    "parse_format",
+    (OfBufferFormat, &'static str),
+    "NVOFA input format (expected grayscale8, nv12, or abgr8)",
+    {
+        "grayscale8" | "gray8" | "u8" => (OfBufferFormat::Grayscale8, "grayscale8"),
+        "nv12" => (OfBufferFormat::Nv12, "nv12"),
+        "abgr8" | "rgba8" => (OfBufferFormat::Abgr8, "abgr8"),
     }
-}
+);
 
-fn parse_perf_level(name: &str) -> PyResult<PerfLevel> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "slow" => Ok(PerfLevel::Slow),
-        "medium" => Ok(PerfLevel::Medium),
-        "fast" => Ok(PerfLevel::Fast),
-        other => Err(record_and_err(
-            "nvofa",
-            "parse_perf_level",
-            format!("unsupported NVOFA perf_level `{other}`; expected slow, medium, or fast"),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_perf_level,
+    "nvofa",
+    "parse_perf_level",
+    PerfLevel,
+    "NVOFA perf_level (expected slow, medium, or fast)",
+    {
+        "slow" => PerfLevel::Slow,
+        "medium" => PerfLevel::Medium,
+        "fast" => PerfLevel::Fast,
     }
-}
+);
 
 /// Executes a 2D device-to-device copy on `stream` and synchronizes.
 #[expect(
@@ -291,6 +266,7 @@ fn is_codec_supported(py: Python<'_>, stream: &PyStream, codec: &str) -> PyResul
 }
 
 /// Queries hardware encoder capabilities for `codec` (`"h264"`, `"hevc"`, `"av1"`).
+/// @py-return: dict[str, Any]
 #[pyfunction]
 fn codec_caps(py: Python<'_>, stream: &PyStream, codec: &str) -> PyResult<Py<PyDict>> {
     let (enc_codec, codec_name) = parse_enc_codec(codec)?;
@@ -492,14 +468,6 @@ impl PyNvencEncoder {
         output_sps_pps: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let dev_ptr = frame.raw_device_ptr();
-        if dev_ptr == 0 {
-            return Err(record_and_err(
-                "nvenc",
-                "encode",
-                "input DeviceBuffer has null device pointer",
-                ErrorKind::InvalidArgument,
-            ));
-        }
         let pitch = self.format.tight_pitch(self.width).ok_or_else(|| {
             record_and_err(
                 "nvenc",
@@ -529,18 +497,14 @@ impl PyNvencEncoder {
                     ErrorKind::InvalidArgument,
                 )
             })?;
-        let frame_bytes = frame.byte_len();
-        if frame_bytes < expected_bytes {
-            return Err(record_and_err(
-                "nvenc",
-                "encode",
-                format!(
-                    "input DeviceBuffer too small: {} B < expected {} B for {}x{} {}",
-                    frame_bytes, expected_bytes, self.width, self.height, self.format_name
-                ),
-                ErrorKind::InvalidArgument,
-            ));
-        }
+        validate_dev_buf(
+            "nvenc",
+            "encode",
+            "input",
+            dev_ptr,
+            frame.byte_len(),
+            expected_bytes,
+        )?;
 
         let state_arc = self.state.clone();
         let width = self.width;
@@ -664,13 +628,14 @@ impl PyNvencEncoder {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &self,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        let _ = (exc_type, exc_val, exc_tb);
         self.close();
         false
     }
@@ -692,6 +657,7 @@ impl PyNvencEncoder {
 // ---------------------------------------------------------------------------
 
 /// Queries NVDEC hardware capabilities for `codec`, `chroma`, and `bit_depth`.
+/// @py-return: dict[str, Any]
 #[pyfunction]
 #[pyo3(signature = (stream, codec="h264", chroma="420", bit_depth=8))]
 fn decoder_caps(
@@ -1064,13 +1030,14 @@ impl PyNvdecDecoder {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &self,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        let _ = (exc_type, exc_val, exc_tb);
         self.close();
         false
     }
@@ -1273,15 +1240,6 @@ impl PyNvofa {
     ) -> PyResult<PyDeviceBuffer> {
         let prev_ptr = prev_buf.raw_device_ptr();
         let curr_ptr = curr_buf.raw_device_ptr();
-        if prev_ptr == 0 || curr_ptr == 0 {
-            return Err(record_and_err(
-                "nvofa",
-                "execute",
-                "input DeviceBuffer has null device pointer",
-                ErrorKind::InvalidArgument,
-            ));
-        }
-
         let expected_in_bytes = match self.input_format {
             OfBufferFormat::Grayscale8 | OfBufferFormat::Abgr8 => (self.width as usize)
                 .checked_mul(self.height as usize)
@@ -1298,19 +1256,22 @@ impl PyNvofa {
             )
         })?;
 
-        for (label, buf) in [("prev_buf", prev_buf), ("curr_buf", curr_buf)] {
-            let buf_bytes = buf.byte_len();
-            if buf_bytes < expected_in_bytes {
-                return Err(record_and_err(
-                    "nvofa",
-                    "execute",
-                    format!(
-                        "{label} DeviceBuffer too small: {buf_bytes} B < expected {expected_in_bytes} B"
-                    ),
-                    ErrorKind::InvalidArgument,
-                ));
-            }
-        }
+        validate_dev_buf(
+            "nvofa",
+            "execute",
+            "prev_buf",
+            prev_ptr,
+            prev_buf.byte_len(),
+            expected_in_bytes,
+        )?;
+        validate_dev_buf(
+            "nvofa",
+            "execute",
+            "curr_buf",
+            curr_ptr,
+            curr_buf.byte_len(),
+            expected_in_bytes,
+        )?;
 
         let state_arc = self.state.clone();
         let width = self.width;
@@ -1446,13 +1407,14 @@ impl PyNvofa {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &self,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        let _ = (exc_type, exc_val, exc_tb);
         self.close();
         false
     }
@@ -1477,26 +1439,21 @@ impl PyNvofa {
 
 /// Registers `nv_rs.nvenc`, `nv_rs.nvdec`, and `nv_rs.nvofa` submodules.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let sys_modules = py.import("sys")?.getattr("modules")?;
+    py_register_submodule!(py, parent, "nvenc", |m| {
+        m.add_function(wrap_pyfunction!(is_codec_supported, &m)?)?;
+        m.add_function(wrap_pyfunction!(codec_caps, &m)?)?;
+        m.add_class::<PyNvencEncoder>()?;
+    })?;
 
-    let m_enc = PyModule::new(py, "nvenc")?;
-    m_enc.add_function(wrap_pyfunction!(is_codec_supported, &m_enc)?)?;
-    m_enc.add_function(wrap_pyfunction!(codec_caps, &m_enc)?)?;
-    m_enc.add_class::<PyNvencEncoder>()?;
-    parent.add_submodule(&m_enc)?;
-    sys_modules.set_item("nv_rs.nvenc", m_enc)?;
+    py_register_submodule!(py, parent, "nvdec", |m| {
+        m.add_function(wrap_pyfunction!(decoder_caps, &m)?)?;
+        m.add_class::<PyDecodedFrame>()?;
+        m.add_class::<PyNvdecDecoder>()?;
+    })?;
 
-    let m_dec = PyModule::new(py, "nvdec")?;
-    m_dec.add_function(wrap_pyfunction!(decoder_caps, &m_dec)?)?;
-    m_dec.add_class::<PyDecodedFrame>()?;
-    m_dec.add_class::<PyNvdecDecoder>()?;
-    parent.add_submodule(&m_dec)?;
-    sys_modules.set_item("nv_rs.nvdec", m_dec)?;
-
-    let m_of = PyModule::new(py, "nvofa")?;
-    m_of.add_class::<PyNvofa>()?;
-    parent.add_submodule(&m_of)?;
-    sys_modules.set_item("nv_rs.nvofa", m_of)?;
+    py_register_submodule!(py, parent, "nvofa", |m| {
+        m.add_class::<PyNvofa>()?;
+    })?;
 
     Ok(())
 }

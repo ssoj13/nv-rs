@@ -9,56 +9,19 @@ use curand::{Generator as CurandInnerGenerator, RngType};
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
+use crate::buf_util::{buf_ptr_and_bytes, validate_dev_buf};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
-
-/// Extracts `(raw_device_ptr, byte_len)` from a `PyDeviceBuffer`, supporting both
-/// `nv_rs`-owned buffers and borrowed DLPack tensors.
-pub(crate) fn buf_ptr_and_bytes(buf: &Bound<'_, PyDeviceBuffer>) -> (u64, usize) {
-    let borrowed = buf.borrow();
-    (borrowed.raw_device_ptr(), borrowed.byte_len())
-}
-
-/// Validates that `nbytes >= min_bytes` and `ptr != 0` when `min_bytes > 0`.
-pub(crate) fn validate_dev_buf(
-    category: &str,
-    op: &str,
-    name: &str,
-    ptr: u64,
-    nbytes: usize,
-    min_bytes: usize,
-) -> PyResult<()> {
-    if nbytes < min_bytes {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} buffer too small: got {nbytes} bytes, need at least {min_bytes} bytes"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    if min_bytes > 0 && ptr == 0 {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} device pointer is null"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // nv_rs.cublas
 // ---------------------------------------------------------------------------
 
-fn map_cublas_err(op: &str, err: cublas::Error) -> PyErr {
-    let kind = match &err {
-        cublas::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        cublas::Error::Invalid(_) | cublas::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        cublas::Error::Cublas { .. } | cublas::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("cublas", op, err, kind)
-}
+py_err_mapper!(map_cublas_err, "cublas", cublas::Error, {
+    cublas::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    cublas::Error::Invalid(_) | cublas::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    cublas::Error::Cublas { .. } | cublas::Error::Driver(_) => ErrorKind::Cuda,
+});
 
 struct CublasState {
     handle: CublasInnerHandle,
@@ -274,41 +237,22 @@ impl PyCublasHandle {
 // nv_rs.cufft
 // ---------------------------------------------------------------------------
 
-fn map_cufft_err(op: &str, err: cufft::Error) -> PyErr {
-    let kind = match &err {
-        cufft::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        cufft::Error::Invalid(_) | cufft::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        cufft::Error::Cufft { .. } | cufft::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("cufft", op, err, kind)
-}
+py_err_mapper!(map_cufft_err, "cufft", cufft::Error, {
+    cufft::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    cufft::Error::Invalid(_) | cufft::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    cufft::Error::Cufft { .. } | cufft::Error::Driver(_) => ErrorKind::Cuda,
+});
 
-fn parse_fft_kind(kind: &str) -> PyResult<FftType> {
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "c2c" => Ok(FftType::C2C),
-        "r2c" => Ok(FftType::R2C),
-        "c2r" => Ok(FftType::C2R),
-        other => Err(record_and_err(
-            "cufft",
-            "parse_fft_kind",
-            format!("unsupported 1D FFT kind `{other}`; expected 'c2c', 'r2c', or 'c2r'"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_fft_kind, "cufft", "parse_fft_kind", FftType, "1D FFT kind (expected 'c2c', 'r2c', or 'c2r')", {
+    "c2c" => FftType::C2C,
+    "r2c" => FftType::R2C,
+    "c2r" => FftType::C2R,
+});
 
-fn parse_fft_direction(direction: &str) -> PyResult<Direction> {
-    match direction.trim().to_ascii_lowercase().as_str() {
-        "forward" | "fwd" => Ok(Direction::Forward),
-        "inverse" | "inv" | "backward" => Ok(Direction::Inverse),
-        other => Err(record_and_err(
-            "cufft",
-            "parse_fft_direction",
-            format!("unsupported FFT direction `{other}`; expected 'forward' or 'inverse'"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_fft_direction, "cufft", "parse_fft_direction", Direction, "FFT direction (expected 'forward' or 'inverse')", {
+    "forward" | "fwd" => Direction::Forward,
+    "inverse" | "inv" | "backward" => Direction::Inverse,
+});
 
 struct CufftState {
     plan: CufftPlan,
@@ -548,14 +492,11 @@ impl PyCufftPlan1d {
 // nv_rs.curand
 // ---------------------------------------------------------------------------
 
-fn map_curand_err(op: &str, err: curand::Error) -> PyErr {
-    let kind = match &err {
-        curand::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        curand::Error::Invalid(_) => ErrorKind::InvalidArgument,
-        curand::Error::Curand { .. } | curand::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("curand", op, err, kind)
-}
+py_err_mapper!(map_curand_err, "curand", curand::Error, {
+    curand::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    curand::Error::Invalid(_) => ErrorKind::InvalidArgument,
+    curand::Error::Curand { .. } | curand::Error::Driver(_) => ErrorKind::Cuda,
+});
 
 struct CurandState {
     generator: CurandInnerGenerator,
@@ -750,22 +691,14 @@ impl PyCurandGenerator {
 
 /// Registers `nv_rs.cublas`, `nv_rs.cufft`, and `nv_rs.curand` submodules.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let sys_modules = py.import("sys")?.getattr("modules")?;
-
-    let m_cublas = PyModule::new(py, "cublas")?;
-    m_cublas.add_class::<PyCublasHandle>()?;
-    parent.add_submodule(&m_cublas)?;
-    sys_modules.set_item("nv_rs.cublas", m_cublas)?;
-
-    let m_cufft = PyModule::new(py, "cufft")?;
-    m_cufft.add_class::<PyCufftPlan1d>()?;
-    parent.add_submodule(&m_cufft)?;
-    sys_modules.set_item("nv_rs.cufft", m_cufft)?;
-
-    let m_curand = PyModule::new(py, "curand")?;
-    m_curand.add_class::<PyCurandGenerator>()?;
-    parent.add_submodule(&m_curand)?;
-    sys_modules.set_item("nv_rs.curand", m_curand)?;
-
+    py_register_submodule!(py, parent, "cublas", |m| {
+        m.add_class::<PyCublasHandle>()?;
+    })?;
+    py_register_submodule!(py, parent, "cufft", |m| {
+        m.add_class::<PyCufftPlan1d>()?;
+    })?;
+    py_register_submodule!(py, parent, "curand", |m| {
+        m.add_class::<PyCurandGenerator>()?;
+    })?;
     Ok(())
 }

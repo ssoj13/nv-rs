@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "nv-rs repository tasks: coverage matrix generation and checking"
+description = "nv-rs repository tasks: coverage matrices, prebuilt staging, and Python stub generation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,7 @@ path = "src/xtask.rs"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+syn.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 # Optix coverage gate: SDK location (vcv-rs) and the `_optix_*` intrinsic scanner (nv-bindgen).

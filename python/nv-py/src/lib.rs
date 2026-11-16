@@ -4,6 +4,10 @@
 #![deny(clippy::all)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[macro_use]
+mod macros;
+
+mod buf_util;
 mod compute;
 mod core;
 mod diag;

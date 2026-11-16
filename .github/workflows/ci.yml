@@ -47,5 +47,8 @@ jobs:
       - name: Test Rust crates
         run: cargo test -p nv-loader -p nv-bindgen -p nv-bindgen-fixture -p xtask
 
+      - name: Check Python stubs
+        run: cargo run -p xtask -- py-stubs check
+
       - name: Python stub sync test
         run: python -m unittest python/nv-py/tests/test_stub_sync.py -v

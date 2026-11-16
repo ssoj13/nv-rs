@@ -45,59 +45,38 @@ fn unsupported_windows(op: &str) -> PyErr {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn map_nccl_err(op: &str, err: nccl::Error) -> PyErr {
-    let kind = match &err {
-        nccl::Error::Load(_) => ErrorKind::LibraryNotFound,
-        nccl::Error::Invalid(_) | nccl::Error::Unsupported(_) => ErrorKind::InvalidArgument,
-        nccl::Error::Driver(_) | nccl::Error::Status { .. } | nccl::Error::Call(_) => {
-            ErrorKind::Cuda
-        }
-    };
-    record_and_err("nccl", op, err, kind)
-}
+py_err_mapper!(map_nccl_err, "nccl", nccl::Error, {
+    nccl::Error::Load(_) => ErrorKind::LibraryNotFound,
+    nccl::Error::Invalid(_) | nccl::Error::Unsupported(_) => ErrorKind::InvalidArgument,
+    nccl::Error::Driver(_) | nccl::Error::Status { .. } | nccl::Error::Call(_) => {
+        ErrorKind::Cuda
+    }
+});
 
 #[cfg(target_os = "linux")]
-fn parse_nccl_dtype(name: &str) -> PyResult<nccl::DataType> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "i8" | "int8" => Ok(nccl::DataType::I8),
-        "u8" | "uint8" => Ok(nccl::DataType::U8),
-        "i32" | "int32" => Ok(nccl::DataType::I32),
-        "u32" | "uint32" => Ok(nccl::DataType::U32),
-        "i64" | "int64" => Ok(nccl::DataType::I64),
-        "u64" | "uint64" => Ok(nccl::DataType::U64),
-        "f16" | "float16" => Ok(nccl::DataType::F16),
-        "f32" | "float32" => Ok(nccl::DataType::F32),
-        "f64" | "float64" => Ok(nccl::DataType::F64),
-        "bf16" | "bfloat16" => Ok(nccl::DataType::Bf16),
-        "f8e4m3" | "fp8_e4m3" => Ok(nccl::DataType::F8E4M3),
-        "f8e5m2" | "fp8_e5m2" => Ok(nccl::DataType::F8E5M2),
-        other => Err(record_and_err(
-            "nccl",
-            "parse_dtype",
-            format!("unsupported NCCL dtype `{other}`"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_nccl_dtype, "nccl", "parse_dtype", nccl::DataType, "NCCL dtype", {
+    "i8" | "int8" => nccl::DataType::I8,
+    "u8" | "uint8" => nccl::DataType::U8,
+    "i32" | "int32" => nccl::DataType::I32,
+    "u32" | "uint32" => nccl::DataType::U32,
+    "i64" | "int64" => nccl::DataType::I64,
+    "u64" | "uint64" => nccl::DataType::U64,
+    "f16" | "float16" => nccl::DataType::F16,
+    "f32" | "float32" => nccl::DataType::F32,
+    "f64" | "float64" => nccl::DataType::F64,
+    "bf16" | "bfloat16" => nccl::DataType::Bf16,
+    "f8e4m3" | "fp8_e4m3" => nccl::DataType::F8E4M3,
+    "f8e5m2" | "fp8_e5m2" => nccl::DataType::F8E5M2,
+});
 
 #[cfg(target_os = "linux")]
-fn parse_nccl_redop(name: &str) -> PyResult<nccl::RedOp> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "sum" => Ok(nccl::RedOp::Sum),
-        "prod" => Ok(nccl::RedOp::Prod),
-        "max" => Ok(nccl::RedOp::Max),
-        "min" => Ok(nccl::RedOp::Min),
-        "avg" => Ok(nccl::RedOp::Avg),
-        other => Err(record_and_err(
-            "nccl",
-            "parse_redop",
-            format!(
-                "unsupported NCCL reduction op `{other}`; expected sum, prod, max, min, or avg"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_nccl_redop, "nccl", "parse_redop", nccl::RedOp, "NCCL reduction op (expected sum, prod, max, min, or avg)", {
+    "sum" => nccl::RedOp::Sum,
+    "prod" => nccl::RedOp::Prod,
+    "max" => nccl::RedOp::Max,
+    "min" => nccl::RedOp::Min,
+    "avg" => nccl::RedOp::Avg,
+});
 
 #[cfg(target_os = "linux")]
 fn owned_cuda_buf(buf: &PyDeviceBuffer, op: &str) -> PyResult<Arc<CudaDeviceBuffer<u8>>> {
@@ -972,31 +951,20 @@ impl PyNcclComm {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn map_cufile_err(op: &str, err: cufile::Error) -> PyErr {
-    let kind = match &err {
-        cufile::Error::Load(_) => ErrorKind::LibraryNotFound,
-        cufile::Error::Invalid(_) | cufile::Error::Unsupported(_) => ErrorKind::InvalidArgument,
-        cufile::Error::Io(_) => ErrorKind::General,
-        cufile::Error::Driver(_) | cufile::Error::Status { .. } | cufile::Error::Call(_) => {
-            ErrorKind::Cuda
-        }
-    };
-    record_and_err("cufile", op, err, kind)
-}
+py_err_mapper!(map_cufile_err, "cufile", cufile::Error, {
+    cufile::Error::Load(_) => ErrorKind::LibraryNotFound,
+    cufile::Error::Invalid(_) | cufile::Error::Unsupported(_) => ErrorKind::InvalidArgument,
+    cufile::Error::Io(_) => ErrorKind::General,
+    cufile::Error::Driver(_) | cufile::Error::Status { .. } | cufile::Error::Call(_) => {
+        ErrorKind::Cuda
+    }
+});
 
 #[cfg(target_os = "linux")]
-fn parse_io_mode(mode: &str) -> PyResult<cufile::IoMode> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "gds" | "gds_only" => Ok(cufile::IoMode::GdsOnly),
-        "posix" | "posix_fallback" => Ok(cufile::IoMode::PosixFallback),
-        other => Err(record_and_err(
-            "cufile",
-            "parse_mode",
-            format!("unsupported cuFile mode `{other}`; expected 'gds' or 'posix'"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_io_mode, "cufile", "parse_mode", cufile::IoMode, "cuFile mode (expected 'gds' or 'posix')", {
+    "gds" | "gds_only" => cufile::IoMode::GdsOnly,
+    "posix" | "posix_fallback" => cufile::IoMode::PosixFallback,
+});
 
 /// Returns the loaded `libcufile` library version integer.
 #[pyfunction]
@@ -1079,6 +1047,7 @@ impl PyCufileDriver {
     }
 
     /// Queries active cuFile driver and NVFS kernel properties.
+    /// @py-return: dict[str, Any]
     fn properties(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         #[cfg(target_os = "linux")]
         {
@@ -1152,14 +1121,15 @@ impl PyCufileDriver {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
         self.close(py)?;
         Ok(false)
     }
@@ -1390,14 +1360,15 @@ impl PyCufileHandle {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
         self.close(py)?;
         Ok(false)
     }
@@ -1408,16 +1379,13 @@ impl PyCufileHandle {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
-fn map_nvapi_err(op: &str, err: nvapi::Error) -> PyErr {
-    let kind = match &err {
-        nvapi::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvapi::Error::UnsupportedPlatform | nvapi::Error::InvalidInput(_) => {
-            ErrorKind::InvalidArgument
-        }
-        nvapi::Error::Status { .. } => ErrorKind::Cuda,
-    };
-    record_and_err("nvapi", op, err, kind)
-}
+py_err_mapper!(map_nvapi_err, "nvapi", nvapi::Error, {
+    nvapi::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvapi::Error::UnsupportedPlatform | nvapi::Error::InvalidInput(_) => {
+        ErrorKind::InvalidArgument
+    },
+    nvapi::Error::Status { .. } => ErrorKind::Cuda,
+});
 
 #[cfg(target_os = "windows")]
 fn select_physical_gpu(
@@ -1487,6 +1455,7 @@ impl PyNvapiSession {
     }
 
     /// Queries the NVIDIA display driver version and branch (`version`, `major`, `minor`, `branch`).
+    /// @py-return: dict[str, Any]
     fn driver_version(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         #[cfg(target_os = "windows")]
         {
@@ -1554,6 +1523,7 @@ impl PyNvapiSession {
     }
 
     /// Queries thermal sensor readings for physical GPU `index`.
+    /// @py-return: list[dict[str, Any]]
     #[pyo3(signature = (index=0))]
     fn thermal_info(&self, py: Python<'_>, index: usize) -> PyResult<Vec<Py<PyDict>>> {
         #[cfg(target_os = "windows")]
@@ -1584,6 +1554,7 @@ impl PyNvapiSession {
     }
 
     /// Queries detailed hardware, memory, clock, and P-state telemetry for physical GPU `index`.
+    /// @py-return: dict[str, Any]
     #[pyo3(signature = (index=0))]
     fn gpu_info(&self, py: Python<'_>, index: usize) -> PyResult<Py<PyDict>> {
         #[cfg(target_os = "windows")]
@@ -1635,6 +1606,7 @@ impl PyNvapiSession {
     }
 
     /// Enumerates attached NVIDIA displays along with HDR and VRR capabilities.
+    /// @py-return: list[dict[str, Any]]
     fn display_info(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         #[cfg(target_os = "windows")]
         {
@@ -1722,41 +1694,28 @@ impl PyNvapiSession {
 // Module registration
 // ---------------------------------------------------------------------------
 
-fn register_submodule(
-    py: Python<'_>,
-    parent: &Bound<'_, PyModule>,
-    sub: &Bound<'_, PyModule>,
-    full_name: &str,
-) -> PyResult<()> {
-    parent.add_submodule(sub)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item(full_name, sub)?;
-    Ok(())
-}
-
 /// Registers `nv_rs.nccl`, `nv_rs.cufile`, and `nv_rs.nvapi` cross-platform.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let nccl_mod = PyModule::new(py, "nccl")?;
-    nccl_mod.add("SUPPORTED", cfg!(target_os = "linux"))?;
-    nccl_mod.add_function(wrap_pyfunction!(nccl_version, &nccl_mod)?)?;
-    nccl_mod.add_function(wrap_pyfunction!(nccl_unique_id, &nccl_mod)?)?;
-    nccl_mod.add_function(wrap_pyfunction!(nccl_group_start, &nccl_mod)?)?;
-    nccl_mod.add_function(wrap_pyfunction!(nccl_group_end, &nccl_mod)?)?;
-    nccl_mod.add_class::<PyNcclComm>()?;
-    register_submodule(py, parent, &nccl_mod, "nv_rs.nccl")?;
+    py_register_submodule!(py, parent, "nccl", |m| {
+        m.add("SUPPORTED", cfg!(target_os = "linux"))?;
+        m.add_function(wrap_pyfunction!(nccl_version, &m)?)?;
+        m.add_function(wrap_pyfunction!(nccl_unique_id, &m)?)?;
+        m.add_function(wrap_pyfunction!(nccl_group_start, &m)?)?;
+        m.add_function(wrap_pyfunction!(nccl_group_end, &m)?)?;
+        m.add_class::<PyNcclComm>()?;
+    })?;
 
-    let cufile_mod = PyModule::new(py, "cufile")?;
-    cufile_mod.add("SUPPORTED", cfg!(target_os = "linux"))?;
-    cufile_mod.add_function(wrap_pyfunction!(cufile_version, &cufile_mod)?)?;
-    cufile_mod.add_class::<PyCufileDriver>()?;
-    cufile_mod.add_class::<PyCufileHandle>()?;
-    register_submodule(py, parent, &cufile_mod, "nv_rs.cufile")?;
+    py_register_submodule!(py, parent, "cufile", |m| {
+        m.add("SUPPORTED", cfg!(target_os = "linux"))?;
+        m.add_function(wrap_pyfunction!(cufile_version, &m)?)?;
+        m.add_class::<PyCufileDriver>()?;
+        m.add_class::<PyCufileHandle>()?;
+    })?;
 
-    let nvapi_mod = PyModule::new(py, "nvapi")?;
-    nvapi_mod.add("SUPPORTED", cfg!(target_os = "windows"))?;
-    nvapi_mod.add_class::<PyNvapiSession>()?;
-    register_submodule(py, parent, &nvapi_mod, "nv_rs.nvapi")?;
+    py_register_submodule!(py, parent, "nvapi", |m| {
+        m.add("SUPPORTED", cfg!(target_os = "windows"))?;
+        m.add_class::<PyNvapiSession>()?;
+    })?;
 
     Ok(())
 }

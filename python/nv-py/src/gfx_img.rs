@@ -21,7 +21,7 @@ use optix::{DebugLevel, DeviceContext, Module, ModuleOptions, OptLevel, Pipeline
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::compute::{buf_ptr_and_bytes, validate_dev_buf};
+use crate::buf_util::{buf_ptr_and_bytes, validate_dev_buf};
 use crate::core::{PyContext, PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -29,37 +29,26 @@ use crate::errors::{ErrorKind, record_and_err};
 // nv_rs.optix
 // ---------------------------------------------------------------------------
 
-fn map_optix_err(op: &str, err: optix::Error) -> PyErr {
-    let kind = match &err {
-        optix::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        optix::Error::Invalid(_) | optix::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        optix::Error::Optix { log, .. } => {
-            if log.is_empty() {
-                ErrorKind::Cuda
-            } else {
-                ErrorKind::Compile
-            }
+py_err_mapper!(map_optix_err, "optix", optix::Error, {
+    optix::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    optix::Error::Invalid(_) | optix::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    optix::Error::Optix { log, .. } => {
+        if log.is_empty() {
+            ErrorKind::Cuda
+        } else {
+            ErrorKind::Compile
         }
-        optix::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("optix", op, err, kind)
-}
+    },
+    optix::Error::Driver(_) => ErrorKind::Cuda,
+});
 
-fn parse_opt_level(name: &str) -> PyResult<OptLevel> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "default" => Ok(OptLevel::Default),
-        "0" | "l0" => Ok(OptLevel::L0),
-        "1" | "l1" => Ok(OptLevel::L1),
-        "2" | "l2" => Ok(OptLevel::L2),
-        "3" | "l3" => Ok(OptLevel::L3),
-        other => Err(record_and_err(
-            "optix",
-            "parse_opt_level",
-            format!("unsupported OptiX opt_level `{other}`; expected default, l0, l1, l2, or l3"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_opt_level, "optix", "parse_opt_level", OptLevel, "OptiX opt_level (expected default, l0, l1, l2, or l3)", {
+    "default" => OptLevel::Default,
+    "0" | "l0" => OptLevel::L0,
+    "1" | "l1" => OptLevel::L1,
+    "2" | "l2" => OptLevel::L2,
+    "3" | "l3" => OptLevel::L3,
+});
 
 /// Returns the OptiX ABI version compiled into `optix-sys`.
 #[pyfunction]
@@ -240,14 +229,11 @@ impl PyOptixContext {
 // nv_rs.npp
 // ---------------------------------------------------------------------------
 
-fn map_npp_err(op: &str, err: npp::Error) -> PyErr {
-    let kind = match &err {
-        npp::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        npp::Error::InvalidInput(_) | npp::Error::Budget { .. } => ErrorKind::InvalidArgument,
-        npp::Error::Status { .. } | npp::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("npp", op, err, kind)
-}
+py_err_mapper!(map_npp_err, "npp", npp::Error, {
+    npp::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    npp::Error::InvalidInput(_) | npp::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    npp::Error::Status { .. } | npp::Error::Driver(_) => ErrorKind::Cuda,
+});
 
 fn check_npp_status(call: &'static str, code: npp::sys::NppStatus) -> npp::Result<()> {
     let status = NppStatus(code);
@@ -258,23 +244,13 @@ fn check_npp_status(call: &'static str, code: npp::sys::NppStatus) -> npp::Resul
     }
 }
 
-fn parse_interp(name: &str) -> PyResult<i32> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "nn" | "nearest" => Ok(Interpolation::Nearest as i32),
-        "linear" | "bilinear" => Ok(Interpolation::Linear as i32),
-        "cubic" | "bicubic" => Ok(Interpolation::Cubic as i32),
-        "super" => Ok(Interpolation::Super as i32),
-        "lanczos" => Ok(Interpolation::Lanczos as i32),
-        other => Err(record_and_err(
-            "npp",
-            "parse_interp",
-            format!(
-                "unsupported NPP interpolation `{other}`; expected nearest, linear, cubic, super, or lanczos"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_interp, "npp", "parse_interp", i32, "NPP interpolation (expected nearest, linear, cubic, super, or lanczos)", {
+    "nn" | "nearest" => Interpolation::Nearest as i32,
+    "linear" | "bilinear" => Interpolation::Linear as i32,
+    "cubic" | "bicubic" => Interpolation::Cubic as i32,
+    "super" => Interpolation::Super as i32,
+    "lanczos" => Interpolation::Lanczos as i32,
+});
 
 fn interp_to_sys(interp_idx: i32) -> npp::Result<i32> {
     let raw = match interp_idx {
@@ -1226,37 +1202,24 @@ fn sum_32f(
 // nv_rs.ngx
 // ---------------------------------------------------------------------------
 
-fn map_ngx_err(op: &str, err: ngx::Error) -> PyErr {
-    let kind = match &err {
-        ngx::Error::Unsupported(_) => ErrorKind::LibraryNotFound,
-        ngx::Error::InvalidArgument(_) => ErrorKind::InvalidArgument,
-        ngx::Error::Ngx { .. } => ErrorKind::Cuda,
-    };
-    record_and_err("ngx", op, err, kind)
-}
+py_err_mapper!(map_ngx_err, "ngx", ngx::Error, {
+    ngx::Error::Unsupported(_) => ErrorKind::LibraryNotFound,
+    ngx::Error::InvalidArgument(_) => ErrorKind::InvalidArgument,
+    ngx::Error::Ngx { .. } => ErrorKind::Cuda,
+});
 
-fn parse_ngx_feature(name: &str) -> PyResult<(&'static str, Feature)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "super_sampling" | "dlss" | "dlss_sr" => Ok(("super_sampling", Feature::SuperSampling)),
-        "in_painting" => Ok(("in_painting", Feature::InPainting)),
-        "image_super_resolution" => Ok(("image_super_resolution", Feature::ImageSuperResolution)),
-        "slow_motion" => Ok(("slow_motion", Feature::SlowMotion)),
-        "video_super_resolution" => Ok(("video_super_resolution", Feature::VideoSuperResolution)),
-        "image_signal_processing" => {
-            Ok(("image_signal_processing", Feature::ImageSignalProcessing))
-        }
-        "deep_resolve" => Ok(("deep_resolve", Feature::DeepResolve)),
-        "frame_generation" | "dlss_fg" => Ok(("frame_generation", Feature::FrameGeneration)),
-        "deep_dvc" => Ok(("deep_dvc", Feature::DeepDvc)),
-        "ray_reconstruction" | "dlss_rr" => Ok(("ray_reconstruction", Feature::RayReconstruction)),
-        other => Err(record_and_err(
-            "ngx",
-            "parse_ngx_feature",
-            format!("unsupported NGX feature `{other}`"),
-            ErrorKind::InvalidArgument,
-        )),
-    }
-}
+py_parse_enum!(parse_ngx_feature, "ngx", "parse_ngx_feature", (&'static str, Feature), "NGX feature", {
+    "super_sampling" | "dlss" | "dlss_sr" => ("super_sampling", Feature::SuperSampling),
+    "in_painting" => ("in_painting", Feature::InPainting),
+    "image_super_resolution" => ("image_super_resolution", Feature::ImageSuperResolution),
+    "slow_motion" => ("slow_motion", Feature::SlowMotion),
+    "video_super_resolution" => ("video_super_resolution", Feature::VideoSuperResolution),
+    "image_signal_processing" => ("image_signal_processing", Feature::ImageSignalProcessing),
+    "deep_resolve" => ("deep_resolve", Feature::DeepResolve),
+    "frame_generation" | "dlss_fg" => ("frame_generation", Feature::FrameGeneration),
+    "deep_dvc" => ("deep_dvc", Feature::DeepDvc),
+    "ray_reconstruction" | "dlss_rr" => ("ray_reconstruction", Feature::RayReconstruction),
+});
 
 /// NGX / DLSS runtime capabilities and Vulkan extension requirements.
 #[pyclass(name = "NgxCapabilities", module = "nv_rs.ngx")]
@@ -1477,44 +1440,39 @@ fn validate_project_id(
 
 /// Registers `nv_rs.optix`, `nv_rs.npp`, and `nv_rs.ngx` submodules.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let sys_modules = py.import("sys")?.getattr("modules")?;
+    py_register_submodule!(py, parent, "optix", |m| {
+        m.add_class::<PyOptixContext>()?;
+        m.add_class::<PyOptixModule>()?;
+        m.add_function(wrap_pyfunction!(abi_version, &m)?)?;
+    })?;
 
-    let optix_mod = PyModule::new(py, "optix")?;
-    optix_mod.add_class::<PyOptixContext>()?;
-    optix_mod.add_class::<PyOptixModule>()?;
-    optix_mod.add_function(wrap_pyfunction!(abi_version, &optix_mod)?)?;
-    parent.add_submodule(&optix_mod)?;
-    sys_modules.set_item("nv_rs.optix", optix_mod)?;
+    py_register_submodule!(py, parent, "npp", |m| {
+        m.add_class::<PyNppStreamContext>()?;
+        m.add_function(wrap_pyfunction!(version, &m)?)?;
+        m.add_function(wrap_pyfunction!(rgb_to_gray_8u, &m)?)?;
+        m.add_function(wrap_pyfunction!(rgb_to_ycbcr_8u, &m)?)?;
+        m.add_function(wrap_pyfunction!(ycbcr_to_rgb_8u, &m)?)?;
+        m.add_function(wrap_pyfunction!(resize_8u_c1, &m)?)?;
+        m.add_function(wrap_pyfunction!(resize_8u_c3, &m)?)?;
+        m.add_function(wrap_pyfunction!(resize_8u_c4, &m)?)?;
+        m.add_function(wrap_pyfunction!(resize_32f_c3, &m)?)?;
+        m.add_function(wrap_pyfunction!(filter_gauss_8u, &m)?)?;
+        m.add_function(wrap_pyfunction!(threshold_val_8u_c1, &m)?)?;
+        m.add_function(wrap_pyfunction!(threshold_val_32f_c1, &m)?)?;
+        m.add_function(wrap_pyfunction!(set_32f, &m)?)?;
+        m.add_function(wrap_pyfunction!(add_32f, &m)?)?;
+        m.add_function(wrap_pyfunction!(mul_32f, &m)?)?;
+        m.add_function(wrap_pyfunction!(sum_32f_scratch_bytes, &m)?)?;
+        m.add_function(wrap_pyfunction!(sum_32f, &m)?)?;
+    })?;
 
-    let npp_mod = PyModule::new(py, "npp")?;
-    npp_mod.add_class::<PyNppStreamContext>()?;
-    npp_mod.add_function(wrap_pyfunction!(version, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(rgb_to_gray_8u, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(rgb_to_ycbcr_8u, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(ycbcr_to_rgb_8u, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(resize_8u_c1, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(resize_8u_c3, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(resize_8u_c4, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(resize_32f_c3, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(filter_gauss_8u, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(threshold_val_8u_c1, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(threshold_val_32f_c1, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(set_32f, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(add_32f, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(mul_32f, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(sum_32f_scratch_bytes, &npp_mod)?)?;
-    npp_mod.add_function(wrap_pyfunction!(sum_32f, &npp_mod)?)?;
-    parent.add_submodule(&npp_mod)?;
-    sys_modules.set_item("nv_rs.npp", npp_mod)?;
-
-    let ngx_mod = PyModule::new(py, "ngx")?;
-    ngx_mod.add_class::<PyNgxCapabilities>()?;
-    ngx_mod.add_function(wrap_pyfunction!(is_dlss_supported, &ngx_mod)?)?;
-    ngx_mod.add_function(wrap_pyfunction!(required_extensions, &ngx_mod)?)?;
-    ngx_mod.add_function(wrap_pyfunction!(feature_requirements, &ngx_mod)?)?;
-    ngx_mod.add_function(wrap_pyfunction!(validate_project_id, &ngx_mod)?)?;
-    parent.add_submodule(&ngx_mod)?;
-    sys_modules.set_item("nv_rs.ngx", ngx_mod)?;
+    py_register_submodule!(py, parent, "ngx", |m| {
+        m.add_class::<PyNgxCapabilities>()?;
+        m.add_function(wrap_pyfunction!(is_dlss_supported, &m)?)?;
+        m.add_function(wrap_pyfunction!(required_extensions, &m)?)?;
+        m.add_function(wrap_pyfunction!(feature_requirements, &m)?)?;
+        m.add_function(wrap_pyfunction!(validate_project_id, &m)?)?;
+    })?;
 
     Ok(())
 }

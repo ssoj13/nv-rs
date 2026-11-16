@@ -28,6 +28,7 @@ fn set_level(level: &str) -> PyResult<&'static str> {
 }
 
 /// Returns cumulative diagnostic counters (library loads, GPU alloc/free bytes, errors).
+/// @py-return: dict[str, Any]
 #[pyfunction]
 fn stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let st = diag::stats();
@@ -76,6 +77,7 @@ fn add_dll_directory(path: std::path::PathBuf) {
 }
 
 /// Probes all known NVIDIA libraries without loading them into the process.
+/// @py-return: dict[str, dict[str, Any]]
 #[pyfunction]
 fn probe_libraries(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
@@ -100,6 +102,7 @@ fn probe_libraries(py: Python<'_>) -> PyResult<Py<PyDict>> {
 }
 
 /// Collects a full environment diagnostic report (`os`, `arch`, `env`, `libraries`, `stats`, `python_interop`).
+/// @py-return: dict[str, Any]
 #[pyfunction]
 fn doctor(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let report = PyDict::new(py);
@@ -183,14 +186,15 @@ impl TraceGuard {
         slf
     }
 
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
     fn __exit__(
         &mut self,
         py: Python<'_>,
-        _exc_type: Option<Py<PyAny>>,
-        _exc_val: Option<Py<PyAny>>,
-        _exc_tb: Option<Py<PyAny>>,
+        exc_type: Option<Py<PyAny>>,
+        exc_val: Option<Py<PyAny>>,
+        exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
         let st = diag::stats();
         self.live_bytes_delta = st.gpu_live_bytes as i64 - self.start_live_bytes as i64;
         self.error_delta = st.errors.saturating_sub(self.start_errors);
@@ -239,19 +243,15 @@ impl TraceGuard {
 
 /// Registers the `nv_rs.diag` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "diag")?;
-    m.add_function(wrap_pyfunction!(get_level, &m)?)?;
-    m.add_function(wrap_pyfunction!(set_level, &m)?)?;
-    m.add_function(wrap_pyfunction!(stats, &m)?)?;
-    m.add_function(wrap_pyfunction!(events, &m)?)?;
-    m.add_function(wrap_pyfunction!(clear_events, &m)?)?;
-    m.add_function(wrap_pyfunction!(add_dll_directory, &m)?)?;
-    m.add_function(wrap_pyfunction!(probe_libraries, &m)?)?;
-    m.add_function(wrap_pyfunction!(doctor, &m)?)?;
-    m.add_class::<TraceGuard>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.diag", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "diag", |m| {
+        m.add_function(wrap_pyfunction!(get_level, &m)?)?;
+        m.add_function(wrap_pyfunction!(set_level, &m)?)?;
+        m.add_function(wrap_pyfunction!(stats, &m)?)?;
+        m.add_function(wrap_pyfunction!(events, &m)?)?;
+        m.add_function(wrap_pyfunction!(clear_events, &m)?)?;
+        m.add_function(wrap_pyfunction!(add_dll_directory, &m)?)?;
+        m.add_function(wrap_pyfunction!(probe_libraries, &m)?)?;
+        m.add_function(wrap_pyfunction!(doctor, &m)?)?;
+        m.add_class::<TraceGuard>()?;
+    })
 }

@@ -52,21 +52,17 @@ pub enum ErrorKind {
 
 /// Registers the `nv_rs.errors` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "errors")?;
-    m.add("NvError", py.get_type::<NvError>())?;
-    m.add(
-        "NvLibraryNotFoundError",
-        py.get_type::<NvLibraryNotFoundError>(),
-    )?;
-    m.add("NvCudaError", py.get_type::<NvCudaError>())?;
-    m.add(
-        "NvInvalidArgumentError",
-        py.get_type::<NvInvalidArgumentError>(),
-    )?;
-    m.add("NvCompileError", py.get_type::<NvCompileError>())?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.errors", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "errors", |m| {
+        m.add("NvError", py.get_type::<NvError>())?;
+        m.add(
+            "NvLibraryNotFoundError",
+            py.get_type::<NvLibraryNotFoundError>(),
+        )?;
+        m.add("NvCudaError", py.get_type::<NvCudaError>())?;
+        m.add(
+            "NvInvalidArgumentError",
+            py.get_type::<NvInvalidArgumentError>(),
+        )?;
+        m.add("NvCompileError", py.get_type::<NvCompileError>())?;
+    })
 }

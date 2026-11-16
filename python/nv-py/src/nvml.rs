@@ -6,16 +6,13 @@ use nvml::{ClockDomain, Device, Nvml};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::errors::{ErrorKind, record_and_err};
+use crate::errors::ErrorKind;
 
-fn map_nvml_err(op: &str, err: nvml::Error) -> PyErr {
-    let kind = match &err {
-        nvml::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvml::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-        _ => ErrorKind::Cuda,
-    };
-    record_and_err("nvml", op, err, kind)
-}
+py_err_mapper!(map_nvml_err, "nvml", nvml::Error, {
+    nvml::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvml::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+    _ => ErrorKind::Cuda,
+});
 
 /// NVML session handle.
 #[pyclass(name = "Nvml", module = "nv_rs.nvml")]
@@ -112,6 +109,7 @@ impl PyNvmlDevice {
             .map_err(|e| map_nvml_err("power_limit_mw", e))
     }
 
+    /// @py-return: dict[str, int]
     fn memory_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let mem = self
             .inner
@@ -124,6 +122,7 @@ impl PyNvmlDevice {
         Ok(d.unbind())
     }
 
+    /// @py-return: dict[str, int]
     fn utilization(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let u = self
             .inner
@@ -135,6 +134,7 @@ impl PyNvmlDevice {
         Ok(d.unbind())
     }
 
+    /// @py-return: dict[str, int | None]
     fn clocks_mhz(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let d = PyDict::new(py);
         d.set_item("graphics", self.inner.clock_mhz(ClockDomain::Graphics).ok())?;
@@ -143,6 +143,7 @@ impl PyNvmlDevice {
         Ok(d.unbind())
     }
 
+    /// @py-return: dict[str, Any]
     fn summary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let d = PyDict::new(py);
         d.set_item("index", self.index()?)?;
@@ -159,12 +160,8 @@ impl PyNvmlDevice {
 
 /// Registers the `nv_rs.nvml` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "nvml")?;
-    m.add_class::<PyNvml>()?;
-    m.add_class::<PyNvmlDevice>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.nvml", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "nvml", |m| {
+        m.add_class::<PyNvml>()?;
+        m.add_class::<PyNvmlDevice>()?;
+    })
 }

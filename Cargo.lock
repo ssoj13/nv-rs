@@ -4366,6 +4366,7 @@ dependencies = [
  "nv-loader",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "thiserror 2.0.21",
  "toml",
  "vcv-rs",

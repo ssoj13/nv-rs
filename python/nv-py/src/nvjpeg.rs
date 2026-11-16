@@ -23,79 +23,68 @@ use pyo3::types::PyBytes;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
-fn map_nvjpeg_err(op: &str, err: nvjpeg::Error) -> PyErr {
-    let kind = match &err {
-        nvjpeg::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-        nvjpeg::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-        nvjpeg::Error::Status { .. } | nvjpeg::Error::Driver(_) => ErrorKind::Cuda,
-    };
-    record_and_err("nvjpeg", op, err, kind)
-}
+py_err_mapper!(map_nvjpeg_err, "nvjpeg", nvjpeg::Error, {
+    nvjpeg::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
+    nvjpeg::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
+    nvjpeg::Error::Status { .. } | nvjpeg::Error::Driver(_) => ErrorKind::Cuda,
+});
 
-fn parse_backend(name: &str) -> PyResult<Backend> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "default" => Ok(Backend::Default),
-        "hybrid" => Ok(Backend::Hybrid),
-        "gpu_hybrid" | "gpuhybrid" => Ok(Backend::GpuHybrid),
-        "hardware" => Ok(Backend::Hardware),
-        other => Err(record_and_err(
-            "nvjpeg",
-            "parse_backend",
-            format!(
-                "unsupported nvJPEG backend `{other}`; expected default, hybrid, gpu_hybrid, or hardware"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_backend,
+    "nvjpeg",
+    "parse_backend",
+    Backend,
+    "nvJPEG backend (expected default, hybrid, gpu_hybrid, or hardware)",
+    {
+        "default" => Backend::Default,
+        "hybrid" => Backend::Hybrid,
+        "gpu_hybrid" | "gpuhybrid" => Backend::GpuHybrid,
+        "hardware" => Backend::Hardware,
     }
-}
+);
 
-fn parse_output_format(name: &str) -> PyResult<(OutputFormat, usize)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "rgbi" => Ok((OutputFormat::Rgbi, 3)),
-        "bgri" => Ok((OutputFormat::Bgri, 3)),
-        "y" | "gray" => Ok((OutputFormat::Y, 1)),
-        other => Err(record_and_err(
-            "nvjpeg",
-            "parse_output_format",
-            format!("unsupported output format `{other}`; expected rgbi, bgri, or y"),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_output_format,
+    "nvjpeg",
+    "parse_output_format",
+    (OutputFormat, usize),
+    "output format (expected rgbi, bgri, or y)",
+    {
+        "rgbi" => (OutputFormat::Rgbi, 3),
+        "bgri" => (OutputFormat::Bgri, 3),
+        "y" | "gray" => (OutputFormat::Y, 1),
     }
-}
+);
 
-fn parse_input_format(name: &str) -> PyResult<(InputFormat, usize)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "rgbi" => Ok((InputFormat::Rgbi, 3)),
-        "bgri" => Ok((InputFormat::Bgri, 3)),
-        other => Err(record_and_err(
-            "nvjpeg",
-            "parse_input_format",
-            format!("unsupported input format `{other}`; expected rgbi or bgri"),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_input_format,
+    "nvjpeg",
+    "parse_input_format",
+    (InputFormat, usize),
+    "input format (expected rgbi or bgri)",
+    {
+        "rgbi" => (InputFormat::Rgbi, 3),
+        "bgri" => (InputFormat::Bgri, 3),
     }
-}
+);
 
-fn parse_subsampling(name: &str) -> PyResult<ChromaSubsampling> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "444" | "yuv444" => Ok(ChromaSubsampling::Yuv444),
-        "422" | "yuv422" => Ok(ChromaSubsampling::Yuv422),
-        "420" | "yuv420" => Ok(ChromaSubsampling::Yuv420),
-        "440" | "yuv440" => Ok(ChromaSubsampling::Yuv440),
-        "411" | "yuv411" => Ok(ChromaSubsampling::Yuv411),
-        "410" | "yuv410" => Ok(ChromaSubsampling::Yuv410),
-        "gray" => Ok(ChromaSubsampling::Gray),
-        "410v" | "yuv410v" => Ok(ChromaSubsampling::Yuv410v),
-        other => Err(record_and_err(
-            "nvjpeg",
-            "parse_subsampling",
-            format!(
-                "unsupported chroma subsampling `{other}`; expected 444, 422, 420, 440, 411, 410, gray, or 410v"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_subsampling,
+    "nvjpeg",
+    "parse_subsampling",
+    ChromaSubsampling,
+    "chroma subsampling (expected 444, 422, 420, 440, 411, 410, gray, or 410v)",
+    {
+        "444" | "yuv444" => ChromaSubsampling::Yuv444,
+        "422" | "yuv422" => ChromaSubsampling::Yuv422,
+        "420" | "yuv420" => ChromaSubsampling::Yuv420,
+        "440" | "yuv440" => ChromaSubsampling::Yuv440,
+        "411" | "yuv411" => ChromaSubsampling::Yuv411,
+        "410" | "yuv410" => ChromaSubsampling::Yuv410,
+        "gray" => ChromaSubsampling::Gray,
+        "410v" | "yuv410v" => ChromaSubsampling::Yuv410v,
     }
-}
+);
 
 fn subsampling_to_str(css: ChromaSubsampling) -> &'static str {
     match css {
@@ -461,12 +450,8 @@ impl PyNvjpegEncoder {
 
 /// Registers the `nv_rs.nvjpeg` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "nvjpeg")?;
-    m.add_class::<PyNvjpegDecoder>()?;
-    m.add_class::<PyNvjpegEncoder>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.nvjpeg", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "nvjpeg", |m| {
+        m.add_class::<PyNvjpegDecoder>()?;
+        m.add_class::<PyNvjpegEncoder>()?;
+    })
 }

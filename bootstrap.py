@@ -49,7 +49,8 @@ COMMANDS (short or long):
         Run workspace tests (--release by default; -d/--debug; -n/--nocapture;
         -p/--package repeatable; --gpu for #[ignore] GPU tests).
     c,  check [opts]
-        Run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings`.
+        Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+        and `cargo run -p xtask -- py-stubs check`.
     s,  status
         Show Rust toolchain, git status, and detected NVIDIA SDK summary.
     cl, clean [opts]
@@ -65,11 +66,12 @@ COMMANDS (short or long):
           d sys, deps sys [opts]     Install Linux system build/runtime packages (apt/dnf/pacman).
     i,  install [-d|--debug] [--] [cargo install opts...]
         Install `nv-demo` into Cargo bin (`cargo install --path crates/nv-demo --force`).
-    py  <dev|build|test> [opts]
+    py  <dev|build|test|stubs> [opts]
         Build and test the Python API (`python/nv-py`) via `maturin` and `pytest`:
           py dev   [--release]       Editable install into active Python env (`maturin develop`).
           py build [--release]       Build abi3 wheel (`maturin build`).
           py test  [--release]       Run `py dev` + `pytest` on `python/nv-py/tests`.
+          py stubs [--toolchain tc]  Verify Python stubs via `cargo run -p xtask -- py-stubs check`.
     h,  help
         Print this help screen and exit 0.
 
@@ -100,7 +102,7 @@ EXAMPLES:
     python bootstrap.py b -d -p nvenc -p nvdec   Build specific crates in debug mode
     python bootstrap.py t -p optix -- --lib      Run optix unit tests
     python bootstrap.py t --gpu -p nvrtc         Run GPU #[ignore] tests for nvrtc
-    python bootstrap.py c                        Run fmt --check + clippy -D warnings
+    python bootstrap.py c                        Run fmt --check + clippy -D warnings + py-stubs check
     python bootstrap.py x coverage check         Run cargo xtask coverage check
     python bootstrap.py d s                      Inspect detected SDKs & NV_SDK_DIRS
     python bootstrap.py d dl --dry-run           Preview public SDK downloads
@@ -110,6 +112,7 @@ EXAMPLES:
     python bootstrap.py d --dry-run              Preview full dependency provisioning
     python bootstrap.py d sys -y --nccl          Install Linux build/runtime deps + libnccl-dev
     python bootstrap.py py test                  Build Python bindings (`maturin`) & run pytest
+    python bootstrap.py py stubs                 Verify Python stubs (`xtask py-stubs check`)
 """
 
 
@@ -1130,10 +1133,19 @@ def cmd_test(args: argparse.Namespace, passthrough: list[str]) -> int:
     return code
 
 
+def cmd_py_stubs(toolchain: str | None = None) -> int:
+    if not check_cargo():
+        return 1
+    cmd = cargo_cmd(toolchain, "run", "-p", "xtask", "--", "py-stubs", "check")
+    code, _, ms = run(cmd)
+    (ok if code == 0 else err)(f"xtask py-stubs check ({fmt_time(ms)})")
+    return code
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     if not check_cargo():
         return 1
-    header("CHECK (fmt + clippy -D warnings)")
+    header("CHECK (fmt + clippy -D warnings + py-stubs)")
 
     fmt_cmd = cargo_cmd(args.toolchain, "fmt", "--all", "--check")
     code, _, ms = run(fmt_cmd)
@@ -1152,7 +1164,10 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     code, _, ms = run(clippy_cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"cargo clippy ({fmt_time(ms)})")
-    return code
+    if code != 0:
+        return code
+
+    return cmd_py_stubs(args.toolchain)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1315,9 +1330,15 @@ def main() -> int:
             print(HELP_TEXT)
             return 0
         sub = rest[0]
-        if sub not in ("dev", "build", "test"):
-            err(f"Unknown py subcommand: {sub} (expected `dev`, `build`, or `test`)")
+        if sub not in ("dev", "build", "test", "stubs"):
+            err(f"Unknown py subcommand: {sub} (expected `dev`, `build`, `test`, or `stubs`)")
             return 2
+        if sub == "stubs":
+            p = argparse.ArgumentParser(prog="bootstrap.py py stubs")
+            p.add_argument("--toolchain", default=None, help="Cargo toolchain override")
+            ns = p.parse_args(rest[1:])
+            header("Python API: xtask py-stubs check")
+            return cmd_py_stubs(toolchain=ns.toolchain)
         p = argparse.ArgumentParser(prog=f"bootstrap.py py {sub}")
         p.add_argument("--release", action="store_true", help="Build Python extension in release mode")
         ns = p.parse_args(rest[1:])

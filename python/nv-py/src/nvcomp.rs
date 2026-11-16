@@ -10,33 +10,27 @@ use pyo3::prelude::*;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
-fn parse_format_kind(name: &str) -> PyResult<FormatKind> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "lz4" => Ok(FormatKind::Lz4),
-        "snappy" => Ok(FormatKind::Snappy),
-        "zstd" => Ok(FormatKind::Zstd),
-        "cascaded" => Ok(FormatKind::Cascaded),
-        "gdeflate" => Ok(FormatKind::Gdeflate),
-        "bitcomp" => Ok(FormatKind::Bitcomp),
-        other => Err(record_and_err(
-            "nvcomp",
-            "parse_format",
-            format!(
-                "unsupported nvCOMP format `{other}`; expected lz4, snappy, zstd, cascaded, gdeflate, or bitcomp"
-            ),
-            ErrorKind::InvalidArgument,
-        )),
+py_parse_enum!(
+    parse_format_kind,
+    "nvcomp",
+    "parse_format",
+    FormatKind,
+    "nvCOMP format (expected lz4, snappy, zstd, cascaded, gdeflate, or bitcomp)",
+    {
+        "lz4" => FormatKind::Lz4,
+        "snappy" => FormatKind::Snappy,
+        "zstd" => FormatKind::Zstd,
+        "cascaded" => FormatKind::Cascaded,
+        "gdeflate" => FormatKind::Gdeflate,
+        "bitcomp" => FormatKind::Bitcomp,
     }
-}
+);
 
-fn map_nvcomp_err(op: &str, err: nvcomp::Error) -> PyErr {
-    let kind = match &err {
-        nvcomp::Error::Load(_) => ErrorKind::LibraryNotFound,
-        nvcomp::Error::Invalid(_) | nvcomp::Error::Unsupported(_) => ErrorKind::InvalidArgument,
-        _ => ErrorKind::Cuda,
-    };
-    record_and_err("nvcomp", op, err, kind)
-}
+py_err_mapper!(map_nvcomp_err, "nvcomp", nvcomp::Error, {
+    nvcomp::Error::Load(_) => ErrorKind::LibraryNotFound,
+    nvcomp::Error::Invalid(_) | nvcomp::Error::Unsupported(_) => ErrorKind::InvalidArgument,
+    _ => ErrorKind::Cuda,
+});
 
 /// Self-describing GPU compressed payload produced by [`PyCompressionManager::compress`].
 #[pyclass(name = "CompressedBuffer", module = "nv_rs.nvcomp")]
@@ -228,12 +222,8 @@ impl PyCompressionManager {
 
 /// Registers the `nv_rs.nvcomp` submodule.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(py, "nvcomp")?;
-    m.add_class::<PyCompressedBuffer>()?;
-    m.add_class::<PyCompressionManager>()?;
-    parent.add_submodule(&m)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item("nv_rs.nvcomp", m)?;
-    Ok(())
+    py_register_submodule!(py, parent, "nvcomp", |m| {
+        m.add_class::<PyCompressedBuffer>()?;
+        m.add_class::<PyCompressionManager>()?;
+    })
 }

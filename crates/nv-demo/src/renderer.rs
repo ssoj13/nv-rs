@@ -153,12 +153,22 @@ pub struct DemoSettings {
     // Multi-instance Scene (Glass Satellite + Neon Accent)
     pub sat_on: bool,
     pub sat_orbit: bool,
-    pub sat_radius: f32,
-    pub sat_orbit_radius: f32,
-    pub sat_height: f32,
+    pub sat_count: u32,
+    pub sat_seed: u32,
+    pub sat_size_min: f32,
+    pub sat_size_max: f32,
+    pub sat_orbit_min: f32,
+    pub sat_orbit_max: f32,
+    pub sat_height_min: f32,
+    pub sat_height_max: f32,
+    pub sat_speed_min: f32,
+    pub sat_speed_max: f32,
     pub glass_ior: f32,
     pub glass_absorb: f32,
     pub glass_roughness: f32,
+    pub glass_analytic: bool,
+    pub sat_u_segs: u32,
+    pub sat_v_segs: u32,
     pub neon_on: bool,
     // FFT Bloom (cuFFT)
     pub bloom_on: bool,
@@ -236,12 +246,22 @@ impl Default for DemoSettings {
             spin_speed: 0.45,
             sat_on: true,
             sat_orbit: false,
-            sat_radius: 0.36,
-            sat_orbit_radius: 1.65,
-            sat_height: 0.25,
+            sat_count: 1,
+            sat_seed: 42,
+            sat_size_min: 0.14,
+            sat_size_max: 0.42,
+            sat_orbit_min: 1.35,
+            sat_orbit_max: 2.85,
+            sat_height_min: -0.45,
+            sat_height_max: 0.85,
+            sat_speed_min: 0.40,
+            sat_speed_max: 1.60,
             glass_ior: 1.52,
             glass_absorb: 0.45,
             glass_roughness: 0.02,
+            glass_analytic: true,
+            sat_u_segs: 24,
+            sat_v_segs: 36,
             neon_on: true,
             bloom_on: false,
             bloom_threshold: 1.25,
@@ -325,7 +345,9 @@ struct OptixRig {
     _scratch: Scratch,
     floor_gas: Arc<Accel>,
     fractal_gas: Arc<Accel>,
-    glass_gas: Arc<Accel>,
+    glass_analytic_gas: Arc<Accel>,
+    glass_mesh_gas: Arc<Accel>,
+    glass_mesh_segs: (u32, u32),
     neon_gas: Arc<Accel>,
     ias: Arc<Accel>,
     pipeline: Pipeline,
@@ -445,6 +467,15 @@ fn build_optix_pipeline(
         },
     )
     .map_err(|e| format!("hit_fractal: {e}"))?;
+    let hit_sphere = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__fractal")),
+            intersection: Some((&module, "__intersection__sphere")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_sphere: {e}"))?;
 
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
@@ -456,6 +487,7 @@ fn build_optix_pipeline(
             miss_shadow.clone(),
             hit_floor.clone(),
             hit_fractal.clone(),
+            hit_sphere.clone(),
         ],
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
@@ -470,6 +502,7 @@ fn build_optix_pipeline(
         &[
             SbtRecord::new(&hit_floor, 0u32).map_err(|e| format!("sbt hit0: {e}"))?,
             SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
+            SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
         ],
     )
     .map_err(|e| format!("SBT::new: {e}"))?;
@@ -542,6 +575,32 @@ fn build_uv_sphere(stacks: u32, slices: u32) -> Vec<[f32; 3]> {
     tris
 }
 
+fn build_sphere_mesh_gas(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    u_segs: u32,
+    v_segs: u32,
+) -> Arc<Accel> {
+    let sphere_tris = build_uv_sphere(v_segs.max(4), u_segs.max(4));
+    let sphere_verts = DeviceBuffer::from_host(stream, &sphere_tris).expect("sphere verts");
+    let tri_build_opts = BuildOptions {
+        prefer_fast_trace: true,
+        ..Default::default()
+    };
+    Accel::triangles(
+        optix_ctx,
+        stream,
+        scratch,
+        &[TriangleMesh {
+            flags: &[GeometryFlags::DISABLE_ANYHIT],
+            ..TriangleMesh::new(&sphere_verts)
+        }],
+        tri_build_opts,
+    )
+    .expect("glass mesh GAS")
+}
+
 fn build_torus_ring(major_r: f32, minor_r: f32, segs: u32, tube_segs: u32) -> Vec<[f32; 3]> {
     use std::f32::consts::TAU;
     let mut tris = Vec::with_capacity((segs * tube_segs * 6) as usize);
@@ -566,15 +625,30 @@ fn build_torus_ring(major_r: f32, minor_r: f32, segs: u32, tube_segs: u32) -> Ve
 struct SceneGas<'a> {
     floor: &'a Arc<Accel>,
     fractal: &'a Arc<Accel>,
-    glass: &'a Arc<Accel>,
+    glass_analytic: &'a Arc<Accel>,
+    glass_mesh: &'a Arc<Accel>,
     neon: &'a Arc<Accel>,
 }
 
 struct SceneState {
-    sat_pos: [f32; 3],
-    sat_radius: f32,
+    sat_angle: f32,
+    sat_count: u32,
+    sat_seed: u32,
+    sat_size_range: [f32; 2],
+    sat_orbit_range: [f32; 2],
+    sat_height_range: [f32; 2],
+    sat_speed_range: [f32; 2],
     sat_on: bool,
+    glass_analytic: bool,
     neon_on: bool,
+}
+
+fn splitmix32(mut x: u32) -> f32 {
+    x = x.wrapping_add(0x9E37_79B9);
+    x = (x ^ (x >> 16)).wrapping_mul(0x85EB_CA6B);
+    x = (x ^ (x >> 13)).wrapping_mul(0xC2B2_AE35);
+    x ^= x >> 16;
+    (x >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
 fn build_ias(
@@ -584,7 +658,8 @@ fn build_ias(
     gas: SceneGas<'_>,
     state: SceneState,
 ) -> Arc<Accel> {
-    let mut instances = Vec::with_capacity(4);
+    let count = state.sat_count.min(24) as usize;
+    let mut instances = Vec::with_capacity(3 + count);
     let mut i0 = Instance::new(gas.floor);
     i0.id = 0;
     i0.sbt_offset = 0;
@@ -595,26 +670,50 @@ fn build_ias(
     i1.sbt_offset = 1;
     instances.push(i1);
 
-    if state.sat_on {
-        let r = state.sat_radius.max(0.05);
-        let mut i2 = Instance::new(gas.glass);
-        i2.id = 2;
-        i2.sbt_offset = 0;
-        i2.transform = [
-            r,
-            0.0,
-            0.0,
-            state.sat_pos[0],
-            0.0,
-            r,
-            0.0,
-            state.sat_pos[1],
-            0.0,
-            0.0,
-            r,
-            state.sat_pos[2],
-        ];
-        instances.push(i2);
+    if state.sat_on && count > 0 {
+        let (glass_gas, sbt_off) = if state.glass_analytic {
+            (gas.glass_analytic, 2)
+        } else {
+            (gas.glass_mesh, 0)
+        };
+        let s_min = state.sat_size_range[0].min(state.sat_size_range[1]).max(0.05);
+        let s_max = state.sat_size_range[0].max(state.sat_size_range[1]).max(0.05);
+        let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
+        let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
+        let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
+        let h_max = state.sat_height_range[0].max(state.sat_height_range[1]);
+        let v_min = state.sat_speed_range[0].min(state.sat_speed_range[1]);
+        let v_max = state.sat_speed_range[0].max(state.sat_speed_range[1]);
+
+        for idx in 0..count {
+            let base = state
+                .sat_seed
+                .wrapping_mul(747_796_405)
+                .wrapping_add((idx as u32).wrapping_mul(2_891_336_453));
+            let u0 = splitmix32(base ^ 0x1111_1111);
+            let u1 = splitmix32(base ^ 0x2222_2222);
+            let u2 = splitmix32(base ^ 0x3333_3333);
+            let u3 = splitmix32(base ^ 0x4444_4444);
+            let u4 = splitmix32(base ^ 0x5555_5555);
+
+            let r = s_min + (s_max - s_min) * u0;
+            // Stratify orbital radii across the band with seeded jitter so spheres stay spaced.
+            let t_orbit = (idx as f32 + 0.15 + 0.70 * u1) / (count as f32);
+            let orbit_r = o_min + (o_max - o_min) * t_orbit;
+            let height = h_min + (h_max - h_min) * u2;
+            let phase0 = u3 * std::f32::consts::TAU;
+            let speed = v_min + (v_max - v_min) * u4;
+            let angle = phase0 + state.sat_angle * speed;
+            let px = orbit_r * angle.cos();
+            let py = height + 0.08 * (angle * 1.7 + phase0).sin();
+            let pz = orbit_r * angle.sin();
+
+            let mut inst = Instance::new(glass_gas);
+            inst.id = 2;
+            inst.sbt_offset = sbt_off;
+            inst.transform = [r, 0.0, 0.0, px, 0.0, r, 0.0, py, 0.0, 0.0, r, pz];
+            instances.push(inst);
+        }
     }
 
     if state.neon_on {
@@ -714,20 +813,31 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     )
     .expect("fractal GAS");
 
-    // Glass satellite sphere (unit sphere, transformed via IAS)
-    let sphere_tris = build_uv_sphere(24, 36);
-    let sphere_verts = DeviceBuffer::from_host(&stream, &sphere_tris).expect("sphere verts");
-    let glass_gas = Accel::triangles(
+    // Analytic glass satellite sphere (unit sphere AABB, transformed via IAS)
+    let sphere_aabb_buf = DeviceBuffer::from_host(
+        &stream,
+        &[Aabb {
+            min: [-1.0, -1.0, -1.0],
+            max: [1.0, 1.0, 1.0],
+        }],
+    )
+    .expect("sphere aabb");
+    let glass_analytic_gas = Accel::custom(
         &optix_ctx,
         &stream,
         &mut scratch,
-        &[TriangleMesh {
-            flags: &[GeometryFlags::DISABLE_ANYHIT],
-            ..TriangleMesh::new(&sphere_verts)
-        }],
-        tri_build_opts,
+        &[CustomPrimitives::new(&sphere_aabb_buf)],
+        BuildOptions::default(),
     )
-    .expect("glass GAS");
+    .expect("glass analytic GAS");
+    let glass_mesh_segs = (initial_settings.sat_u_segs, initial_settings.sat_v_segs);
+    let glass_mesh_gas = build_sphere_mesh_gas(
+        &optix_ctx,
+        &stream,
+        &mut scratch,
+        glass_mesh_segs.0,
+        glass_mesh_segs.1,
+    );
 
     // Emissive neon accent ring around the stage
     let ring_tris = build_torus_ring(1.95, 0.045, 72, 14);
@@ -744,11 +854,6 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     )
     .expect("neon GAS");
 
-    let sat_pos = [
-        initial_settings.sat_orbit_radius,
-        initial_settings.sat_height,
-        0.0,
-    ];
     let ias = build_ias(
         &optix_ctx,
         &stream,
@@ -756,13 +861,29 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         SceneGas {
             floor: &floor_gas,
             fractal: &fractal_gas,
-            glass: &glass_gas,
+            glass_analytic: &glass_analytic_gas,
+            glass_mesh: &glass_mesh_gas,
             neon: &neon_gas,
         },
         SceneState {
-            sat_pos,
-            sat_radius: initial_settings.sat_radius,
+            sat_angle: 0.0,
+            sat_count: initial_settings.sat_count,
+            sat_seed: initial_settings.sat_seed,
+            sat_size_range: [initial_settings.sat_size_min, initial_settings.sat_size_max],
+            sat_orbit_range: [
+                initial_settings.sat_orbit_min,
+                initial_settings.sat_orbit_max,
+            ],
+            sat_height_range: [
+                initial_settings.sat_height_min,
+                initial_settings.sat_height_max,
+            ],
+            sat_speed_range: [
+                initial_settings.sat_speed_min,
+                initial_settings.sat_speed_max,
+            ],
             sat_on: initial_settings.sat_on,
+            glass_analytic: initial_settings.glass_analytic,
             neon_on: initial_settings.neon_on,
         },
     );
@@ -794,7 +915,9 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         _scratch: scratch,
         floor_gas,
         fractal_gas,
-        glass_gas,
+        glass_analytic_gas,
+        glass_mesh_gas,
+        glass_mesh_segs,
         neon_gas,
         ias,
         pipeline,
@@ -862,12 +985,22 @@ pub fn spawn_render_thread(
             let mut sat_angle: f32 = 0.0;
             let mut last_ias_state = (
                 settings.sat_on,
+                settings.glass_analytic,
+                settings.sat_u_segs,
+                settings.sat_v_segs,
+                settings.sat_count,
+                settings.sat_seed,
                 settings.neon_on,
                 [
-                    settings.sat_orbit_radius,
-                    settings.sat_height,
+                    settings.sat_size_min,
+                    settings.sat_size_max,
+                    settings.sat_orbit_min,
+                    settings.sat_orbit_max,
+                    settings.sat_height_min,
+                    settings.sat_height_max,
+                    settings.sat_speed_min,
+                    settings.sat_speed_max,
                     0.0,
-                    settings.sat_radius,
                 ],
             );
             let mut last_tick = Instant::now();
@@ -1031,7 +1164,7 @@ pub fn spawn_render_thread(
                 }
 
                 let converged = !settings.auto_rotate
-                    && !(settings.sat_on && settings.sat_orbit)
+                    && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
                     && recorder.is_none()
                     && pending_jpeg.is_none()
                     && pending_status.is_none()
@@ -1076,20 +1209,42 @@ pub fn spawn_render_thread(
                     spin_angle += dt * settings.spin_speed;
                     accum_count = 0;
                 }
-                if settings.sat_on && settings.sat_orbit {
+                if settings.sat_on && settings.sat_orbit && settings.sat_count > 0 {
                     sat_angle += dt * settings.spin_speed;
                     accum_count = 0;
                 }
 
-                let sat_xyz = [
-                    settings.sat_orbit_radius * sat_angle.cos(),
-                    settings.sat_height + 0.12 * (sat_angle * 2.0).sin(),
-                    settings.sat_orbit_radius * sat_angle.sin(),
-                ];
+                if !settings.glass_analytic
+                    && (settings.sat_u_segs, settings.sat_v_segs) != rig.glass_mesh_segs
+                {
+                    rig.glass_mesh_gas = build_sphere_mesh_gas(
+                        &rig._optix_ctx,
+                        &rig.stream,
+                        &mut rig._scratch,
+                        settings.sat_u_segs,
+                        settings.sat_v_segs,
+                    );
+                    rig.glass_mesh_segs = (settings.sat_u_segs, settings.sat_v_segs);
+                }
                 let ias_state = (
                     settings.sat_on,
+                    settings.glass_analytic,
+                    settings.sat_u_segs,
+                    settings.sat_v_segs,
+                    settings.sat_count,
+                    settings.sat_seed,
                     settings.neon_on,
-                    [sat_xyz[0], sat_xyz[1], sat_xyz[2], settings.sat_radius],
+                    [
+                        settings.sat_size_min,
+                        settings.sat_size_max,
+                        settings.sat_orbit_min,
+                        settings.sat_orbit_max,
+                        settings.sat_height_min,
+                        settings.sat_height_max,
+                        settings.sat_speed_min,
+                        settings.sat_speed_max,
+                        sat_angle,
+                    ],
                 );
                 if ias_state != last_ias_state {
                     rig.ias = build_ias(
@@ -1099,13 +1254,20 @@ pub fn spawn_render_thread(
                         SceneGas {
                             floor: &rig.floor_gas,
                             fractal: &rig.fractal_gas,
-                            glass: &rig.glass_gas,
+                            glass_analytic: &rig.glass_analytic_gas,
+                            glass_mesh: &rig.glass_mesh_gas,
                             neon: &rig.neon_gas,
                         },
                         SceneState {
-                            sat_pos: sat_xyz,
-                            sat_radius: settings.sat_radius,
+                            sat_angle,
+                            sat_count: settings.sat_count,
+                            sat_seed: settings.sat_seed,
+                            sat_size_range: [settings.sat_size_min, settings.sat_size_max],
+                            sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
+                            sat_height_range: [settings.sat_height_min, settings.sat_height_max],
+                            sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
                             sat_on: settings.sat_on,
+                            glass_analytic: settings.glass_analytic,
                             neon_on: settings.neon_on,
                         },
                     );
@@ -1277,16 +1439,7 @@ pub fn spawn_render_thread(
                         prev_camera.up[2],
                         prev_camera.tan_half_fov,
                     ],
-                    sat_pos: [
-                        sat_xyz[0],
-                        sat_xyz[1],
-                        sat_xyz[2],
-                        if settings.sat_on {
-                            settings.sat_radius
-                        } else {
-                            0.0
-                        },
-                    ],
+                    sat_pos: [0.0; 4],
                     glass_params: [
                         settings.glass_ior,
                         settings.glass_absorb,

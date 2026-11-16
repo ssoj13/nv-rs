@@ -823,3 +823,35 @@ extern "C" __global__ void __closesthit__fractal() {
     optixSetPayload_7(0u);
 }
 
+extern "C" __global__ void __intersection__sphere() {
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    float a = f3_dot(dir, dir);
+    if (a <= 1e-12f) return;
+    float b = f3_dot(orig, dir);
+    float c = f3_dot(orig, orig) - 1.0f;
+    float disc = b * b - a * c;
+    if (disc < 0.0f) return;
+
+    float sq = sqrtf(disc);
+    float inv_a = 1.0f / a;
+    float t = (-b - sq) * inv_a;
+    if (t < tmin || t > tmax) {
+        t = (-b + sq) * inv_a;
+        if (t < tmin || t > tmax) return;
+    }
+
+    float3 hit_obj = f3_add(orig, f3_mul(dir, t));
+    float3 obj_n = f3_norm(hit_obj);
+    optixReportIntersection(
+        t, 0,
+        __float_as_uint(obj_n.x),
+        __float_as_uint(obj_n.y),
+        __float_as_uint(obj_n.z),
+        0xFFE0E0E0u
+    );
+}
+

@@ -343,7 +343,8 @@ impl UiContext<'_> {
             4 => "MOTION",
             _ => "BEAUTY",
         };
-        let sat_orbiting = self.settings.sat_on && self.settings.sat_orbit;
+        let sat_orbiting =
+            self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let status = if self.settings.auto_rotate || sat_orbiting {
             let anim_tag = match (self.settings.auto_rotate, sat_orbiting) {
                 (true, true) => "SPIN+ORBIT",
@@ -606,17 +607,22 @@ impl UiContext<'_> {
         section_header(ui, ic::GLOBE, "Scene");
         prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
         if s.sat_on {
+            prop_toggle(ui, "Analytic", &mut s.glass_analytic, "Smooth Analytic Sphere");
             prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
-            prop_slider_f32(ui, "Sat Radius", &mut s.sat_radius, 0.12..=0.80, 2, false);
-            prop_slider_f32(
-                ui,
-                "Orbit Radius",
-                &mut s.sat_orbit_radius,
-                0.6..=3.5,
-                2,
-                false,
-            );
-            prop_slider_f32(ui, "Sat Height", &mut s.sat_height, -0.8..=1.5, 2, false);
+            prop_slider_u32(ui, "Spheres Num", &mut s.sat_count, 0..=24, false);
+            if !s.glass_analytic {
+                prop_slider_u32(ui, "U Segs", &mut s.sat_u_segs, 4..=96, false);
+                prop_slider_u32(ui, "V Segs", &mut s.sat_v_segs, 4..=96, false);
+            }
+            prop_slider_u32(ui, "Orbit Seed", &mut s.sat_seed, 0..=9999, false);
+            prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.05..=0.80, 2, false);
+            prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.05..=0.80, 2, false);
+            prop_slider_f32(ui, "Min Orbit", &mut s.sat_orbit_min, 0.6..=4.5, 2, false);
+            prop_slider_f32(ui, "Max Orbit", &mut s.sat_orbit_max, 0.6..=4.5, 2, false);
+            prop_slider_f32(ui, "Min Height", &mut s.sat_height_min, -1.0..=2.0, 2, false);
+            prop_slider_f32(ui, "Max Height", &mut s.sat_height_max, -1.0..=2.0, 2, false);
+            prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, 0.1..=3.0, 2, false);
+            prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, 0.1..=3.0, 2, false);
             prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
             prop_slider_f32(
                 ui,

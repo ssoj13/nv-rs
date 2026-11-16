@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraPose, NavFeel, NavMode};
 use crate::renderer::DemoSettings;
+use crate::ui::UiTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -155,6 +156,7 @@ impl CameraState {
 #[serde(default)]
 pub struct PersistedState {
     pub window: WindowState,
+    pub theme: UiTheme,
     pub settings: DemoSettings,
     pub camera: CameraState,
 }

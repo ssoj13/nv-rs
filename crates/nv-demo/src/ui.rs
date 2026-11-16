@@ -52,13 +52,138 @@ pub fn default_dock_state() -> DockState<DockTab> {
     state
 }
 
-pub fn dock_style(ctx: &egui::Context) -> Style {
-    let mut style = Style::from_egui(ctx.style_of(egui::Theme::Dark).as_ref());
-    style.tab_bar.height = 26.0;
-    style.tab_bar.bg_fill = Color32::from_rgb(20, 22, 26);
-    style.tab.tab_body.bg_fill = Color32::from_rgb(24, 26, 31);
-    style.separator.width = 3.0;
-    style
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum UiTheme {
+    #[default]
+    Obsidian,
+    Midnight,
+    Slate,
+    Catppuccin,
+    Light,
+}
+
+impl UiTheme {
+    pub const ALL: [Self; 5] = [
+        Self::Obsidian,
+        Self::Midnight,
+        Self::Slate,
+        Self::Catppuccin,
+        Self::Light,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Obsidian => "Obsidian",
+            Self::Midnight => "Midnight",
+            Self::Slate => "Slate",
+            Self::Catppuccin => "Catppuccin",
+            Self::Light => "Light",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Obsidian => Self::Midnight,
+            Self::Midnight => Self::Slate,
+            Self::Slate => Self::Catppuccin,
+            Self::Catppuccin => Self::Light,
+            Self::Light => Self::Obsidian,
+        }
+    }
+
+    pub fn section_color(self) -> Color32 {
+        match self {
+            Self::Light => Color32::from_rgb(38, 125, 65),
+            _ => Color32::from_rgb(166, 209, 137),
+        }
+    }
+
+    /// Applies unified panel/widget visuals to `ctx` and returns a matching `egui_dock::Style`.
+    pub fn apply(self, ctx: &egui::Context) -> Style {
+        let (is_light, panel_bg, bar_bg, widget_bg, accent, text_col) = match self {
+            Self::Obsidian => (
+                false,
+                Color32::from_rgb(22, 24, 29),
+                Color32::from_rgb(17, 19, 23),
+                Color32::from_rgb(32, 35, 42),
+                Color32::from_rgb(82, 139, 255),
+                Color32::from_rgb(218, 224, 235),
+            ),
+            Self::Midnight => (
+                false,
+                Color32::from_rgb(14, 16, 21),
+                Color32::from_rgb(10, 12, 16),
+                Color32::from_rgb(24, 27, 35),
+                Color32::from_rgb(100, 160, 255),
+                Color32::from_rgb(220, 226, 238),
+            ),
+            Self::Slate => (
+                false,
+                Color32::from_rgb(32, 35, 41),
+                Color32::from_rgb(26, 29, 34),
+                Color32::from_rgb(44, 48, 56),
+                Color32::from_rgb(97, 175, 239),
+                Color32::from_rgb(224, 228, 236),
+            ),
+            Self::Catppuccin => (
+                false,
+                Color32::from_rgb(30, 30, 46),
+                Color32::from_rgb(24, 24, 37),
+                Color32::from_rgb(49, 50, 68),
+                Color32::from_rgb(137, 180, 250),
+                Color32::from_rgb(205, 214, 244),
+            ),
+            Self::Light => (
+                true,
+                Color32::from_rgb(240, 242, 246),
+                Color32::from_rgb(228, 231, 237),
+                Color32::from_rgb(252, 253, 255),
+                Color32::from_rgb(37, 99, 235),
+                Color32::from_rgb(30, 34, 42),
+            ),
+        };
+
+        let mut visuals = if is_light {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        };
+        visuals.panel_fill = panel_bg;
+        visuals.window_fill = panel_bg;
+        visuals.extreme_bg_color = bar_bg;
+        visuals.faint_bg_color = widget_bg;
+        visuals.override_text_color = Some(text_col);
+        visuals.selection.bg_fill = accent.linear_multiply(0.35);
+        visuals.widgets.noninteractive.bg_fill = panel_bg;
+        visuals.widgets.inactive.bg_fill = widget_bg;
+        visuals.widgets.hovered.bg_fill = if is_light {
+            Color32::from_rgb(218, 223, 232)
+        } else {
+            Color32::from_rgb(50, 55, 66)
+        };
+        visuals.widgets.active.bg_fill = accent.linear_multiply(0.55);
+        let egui_theme = if is_light {
+            egui::Theme::Light
+        } else {
+            egui::Theme::Dark
+        };
+        ctx.set_theme(egui_theme);
+        ctx.set_visuals_of(egui_theme, visuals);
+
+        let mut style = Style::from_egui(ctx.style_of(egui_theme).as_ref());
+        style.tab_bar.height = 24.0;
+        style.tab_bar.bg_fill = bar_bg;
+        style.tab.tab_body.bg_fill = panel_bg;
+        style.tab.active.bg_fill = panel_bg;
+        style.tab.focused.bg_fill = panel_bg;
+        style.tab.inactive.bg_fill = bar_bg;
+        style.tab.hovered.bg_fill = widget_bg;
+        style.tab.active.text_color = text_col;
+        style.tab.focused.text_color = text_col;
+        style.separator.width = 3.0;
+        style.separator.color_idle = bar_bg;
+        style
+    }
 }
 
 pub struct UiContext<'a> {
@@ -74,6 +199,7 @@ pub struct UiContext<'a> {
     pub cam_fly_mode: &'a mut NavMode,
     pub cam_scheme: &'a mut NavScheme,
     pub cam_feel: &'a mut NavFeel,
+    pub theme: &'a mut UiTheme,
     pub telemetry: &'a GpuTelemetry,
     pub timings: &'a FrameTimings,
     pub accum_count: u32,
@@ -232,6 +358,23 @@ impl UiContext<'_> {
             {
                 *self.reset_accum_requested = true;
             }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let theme_btn = ui
+                    .button(format!("{} {}", ic::PALETTE, self.theme.label()))
+                    .on_hover_text("Left-click: cycle theme\nRight-click: choose theme");
+                if theme_btn.clicked() {
+                    *self.theme = self.theme.next();
+                }
+                theme_btn.context_menu(|ui| {
+                    for t in UiTheme::ALL {
+                        if ui.selectable_label(*self.theme == t, t.label()).clicked() {
+                            *self.theme = t;
+                            ui.close();
+                        }
+                    }
+                });
+            });
         });
     }
 
@@ -934,7 +1077,11 @@ fn collapsing_section(
     egui::CollapsingHeader::new(
         RichText::new(format!("{icon}  {title}"))
             .strong()
-            .color(Color32::from_rgb(166, 209, 137)),
+            .color(if ui.visuals().dark_mode {
+                UiTheme::Obsidian.section_color()
+            } else {
+                UiTheme::Light.section_color()
+            }),
     )
     .id_salt(id_salt)
     .default_open(default_open)
@@ -978,8 +1125,8 @@ fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
                 egui::pos2(label_rect.left(), label_rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 label,
-                egui::FontId::proportional(12.0),
-                Color32::from_rgb(188, 194, 206),
+                egui::FontId::proportional(11.5),
+                ui.visuals().weak_text_color(),
             );
             let rem_w = (total_w - LABEL_W - gap).max(60.0);
             ui.allocate_ui_with_layout(
@@ -1065,7 +1212,7 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
                 RichText::new(value)
                     .monospace()
                     .size(11.5)
-                    .color(Color32::from_rgb(220, 226, 236)),
+                    .color(ui.visuals().text_color()),
             );
         });
     });
@@ -1084,7 +1231,7 @@ fn sparkline_row(
         let plot_w = (ui.available_width() - val_w - gap).max(40.0);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, ROW_H - 2.0), Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, Color32::from_rgb(16, 18, 22));
+        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
 
         let n = ring.len();
         if n >= 2 {

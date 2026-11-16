@@ -21,7 +21,16 @@ use optix::{
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::{VideoRecorder, save_jpeg_from_rgba8};
 
+#[cfg(has_embedded_ptx)]
+const EMBEDDED_RAYTRACER_PTX: &str =
+    concat!(include_str!(concat!(env!("OUT_DIR"), "/raytracer.ptx")), "\0");
+#[cfg(has_embedded_ptx)]
+const EMBEDDED_TONEMAP_PTX: &str =
+    concat!(include_str!(concat!(env!("OUT_DIR"), "/tonemap.ptx")), "\0");
+
+#[cfg(not(has_embedded_ptx))]
 const RAYTRACER_CU: &str = include_str!("../shaders/raytracer.cu");
+#[cfg(not(has_embedded_ptx))]
 const TONEMAP_CU: &str = include_str!("../shaders/tonemap.cu");
 
 pub const DEFAULT_W: u32 = 896;
@@ -764,13 +773,28 @@ fn build_ias(
     .expect("IAS")
 }
 
+#[cfg(has_embedded_ptx)]
+fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
+    (
+        EMBEDDED_RAYTRACER_PTX.as_bytes().to_vec(),
+        EMBEDDED_TONEMAP_PTX.as_bytes().to_vec(),
+    )
+}
+
+#[cfg(not(has_embedded_ptx))]
+fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
+    (
+        try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true).expect("raytracer.cu PTX"),
+        try_compile_ptx(TONEMAP_CU, "tonemap.cu", false).expect("tonemap.cu PTX"),
+    )
+}
+
 fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
     let stream = cuda.default_stream();
     let optix_ctx = DeviceContext::new(cuda, None, 0, false).expect("OptiX DeviceContext");
     let mut scratch = Scratch::new(&stream);
 
-    let rt_ptx = try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true).expect("raytracer.cu PTX");
-    let tm_ptx = try_compile_ptx(TONEMAP_CU, "tonemap.cu", false).expect("tonemap.cu PTX");
+    let (rt_ptx, tm_ptx) = initial_ptx();
     let mut cu_mod: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `tm_ptx` is NUL-terminated PTX compiled by NVRTC on the current context.
     let res = unsafe { cu::cuModuleLoadData(&mut cu_mod, tm_ptx.as_ptr().cast()) };

@@ -39,5 +39,8 @@ png = "0.18"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[build-dependencies]
+cc = "1"
+
 [lints]
 workspace = true

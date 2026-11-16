@@ -36,7 +36,7 @@ mod demo_app {
         CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd, align_render_size,
         spawn_render_thread,
     };
-    use crate::ui::{DockTab, UiContext, default_dock_state, dock_style, install_fonts};
+    use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
     use nv_wgpu::{InteropContext, SharedBuffer, SharedBufferDescriptor};
@@ -91,6 +91,7 @@ mod demo_app {
         cam_feel: NavFeel,
         dock_state: DockState<DockTab>,
         dock_style: DockStyle,
+        theme: UiTheme,
         viewport_focused: bool,
         win_state: crate::persist::WindowState,
         last_saved_state: crate::persist::PersistedState,
@@ -239,7 +240,8 @@ mod demo_app {
             let telemetry = profiler.read_telemetry(nvml_dev.as_ref());
 
             let dock_state = default_dock_state();
-            let dock_style = dock_style(&egui_ctx);
+            let theme = persisted.theme;
+            let dock_style = theme.apply(&egui_ctx);
 
             Self {
                 window,
@@ -291,6 +293,7 @@ mod demo_app {
                 cam_feel,
                 dock_state,
                 dock_style,
+                theme,
                 viewport_focused: false,
                 win_state: persisted.window.sanitized(),
                 last_saved_state: persisted,
@@ -301,6 +304,7 @@ mod demo_app {
         fn current_persisted_state(&self) -> crate::persist::PersistedState {
             crate::persist::PersistedState {
                 window: self.win_state,
+                theme: self.theme,
                 settings: self.settings,
                 camera: crate::persist::CameraState::from_runtime(
                     self.cam_mode,
@@ -404,6 +408,7 @@ mod demo_app {
             let mut save_jpeg_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
+            let prev_theme = self.theme;
             let mut ui_ctx = UiContext {
                 settings: &mut self.settings,
                 display_tex_id: self.display_tex_id,
@@ -417,6 +422,7 @@ mod demo_app {
                 cam_fly_mode: &mut self.cam_fly_mode,
                 cam_scheme: &mut self.cam_scheme,
                 cam_feel: &mut self.cam_feel,
+                theme: &mut self.theme,
                 telemetry: &self.telemetry,
                 timings: &self.profiler.timings,
                 accum_count: self.accum_count,
@@ -447,6 +453,9 @@ mod demo_app {
                     .show_leaf_collapse_buttons(false)
                     .show_inside(ui, &mut ui_ctx);
             });
+            if self.theme != prev_theme {
+                self.dock_style = self.theme.apply(&self.egui_ctx);
+            }
 
             // 3. Dynamic viewport resolution resize (debounced 120ms to avoid thrashing on drag).
             let (target_w, target_h) = align_render_size(

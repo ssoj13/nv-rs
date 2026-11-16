@@ -12,8 +12,8 @@
 //!   `Shutdown1`, `CreateFeature` / `EvaluateFeature_C` / `ReleaseFeature`).
 //!
 //! **Conventions.** Every native handle owns its NGX object, holds an `Arc` of the parent
-//! [`NgxVulkan`] session, and releases it on `Drop`. Non-Windows targets compile clean stubs
-//! returning [`Error::Unsupported`].
+//! [`NgxVulkan`] session, and releases it on `Drop`. Targets without the NGX SDK compile clean
+//! stubs returning [`Error::Unsupported`].
 //! **Used by** renderers, upscalers, and NGX GPU smoke tests.
 
 pub mod error;
@@ -27,10 +27,20 @@ pub use types::{
     BufferFormat, DlssFeatureFlags, DlssPerfQuality, DlssQuality, Feature, Guid, ProjectId,
     RequiredExtensions,
 };
-pub use vulkan::{FeatureHandle, NgxVulkan, VulkanDeviceHandles};
+pub use vulkan::{
+    DlssOptimalSettings, FeatureHandle, NgxVulkan, VkImageResourceInfo, VulkanDeviceHandles,
+};
 
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 pub use ngx_sys as sys;
+
+/// Converts an FFI `NVSDK_NGX_Result` (`i32` on MSVC, `u32` on Linux GCC/Clang) to `i32`
+/// without triggering `clippy::unnecessary_cast` on either target.
+#[cfg(has_ngx_sdk)]
+#[inline(always)]
+pub(crate) fn check_sys(call: &'static str, rc: sys::NVSDK_NGX_Result) -> Result<()> {
+    error::check(call, i32::from_ne_bytes(rc.to_ne_bytes()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -169,33 +179,43 @@ mod tests {
         assert!(unknown.to_string().contains("-42"));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(has_ngx_sdk)]
     #[test]
     fn sys_constants_match_wrapper_values() {
         assert_eq!(
             NGX_RESULT_SUCCESS,
-            sys::NVSDK_NGX_Result_NVSDK_NGX_Result_Success
+            i32::from_ne_bytes(sys::NVSDK_NGX_Result_NVSDK_NGX_Result_Success.to_ne_bytes())
         );
         assert_eq!(
             DlssPerfQuality::MaxPerf.to_raw(),
-            sys::NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxPerf
+            i32::from_ne_bytes(
+                sys::NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxPerf.to_ne_bytes()
+            )
         );
         assert_eq!(
             DlssPerfQuality::Dlaa.to_raw(),
-            sys::NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_DLAA
+            i32::from_ne_bytes(
+                sys::NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_DLAA.to_ne_bytes()
+            )
         );
         assert_eq!(
             Feature::SuperSampling.to_raw(),
-            sys::NVSDK_NGX_Feature_NVSDK_NGX_Feature_SuperSampling
+            i32::from_ne_bytes(
+                sys::NVSDK_NGX_Feature_NVSDK_NGX_Feature_SuperSampling.to_ne_bytes()
+            )
         );
         assert_eq!(
             Feature::RayReconstruction.to_raw(),
-            sys::NVSDK_NGX_Feature_NVSDK_NGX_Feature_RayReconstruction
+            i32::from_ne_bytes(
+                sys::NVSDK_NGX_Feature_NVSDK_NGX_Feature_RayReconstruction.to_ne_bytes()
+            )
         );
         let pid = ProjectId::from_guid_str("00000000-0000-0000-0000-000000000001").unwrap();
         assert_eq!(
             pid.engine_type(),
-            sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM
+            i32::from_ne_bytes(
+                sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM.to_ne_bytes()
+            )
         );
     }
 
@@ -215,15 +235,42 @@ mod tests {
         let res_pid = unsafe { NgxVulkan::init(&pid, data_path, null_handles) };
         // SAFETY: Same as above.
         let res_app = unsafe { NgxVulkan::init_with_app_id(12345, data_path, null_handles) };
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             assert!(matches!(res_pid, Err(Error::InvalidArgument(_))));
             assert!(matches!(res_app, Err(Error::InvalidArgument(_))));
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             assert!(matches!(res_pid, Err(Error::Unsupported(_))));
             assert!(matches!(res_app, Err(Error::Unsupported(_))));
         }
+    }
+
+    #[test]
+    fn dlss_helper_structs_construct_and_default() {
+        let info = VkImageResourceInfo {
+            image_view: std::ptr::null_mut(),
+            image: std::ptr::null_mut(),
+            format: 97, // VK_FORMAT_R16G16B16A16_SFLOAT
+            width: 1920,
+            height: 1080,
+            read_write: true,
+        };
+        assert_eq!(info.width, 1920);
+        assert_eq!(info.height, 1080);
+        assert!(info.read_write);
+
+        let settings = DlssOptimalSettings::default();
+        assert_eq!(settings.render_width, 0);
+        assert_eq!(settings.sharpness, 0.0);
+    }
+
+    #[cfg(has_ngx_sdk)]
+    #[test]
+    fn wchar_nul_encodes_ascii_path_with_terminator() {
+        let wide = crate::vulkan::to_wchar_nul(std::path::Path::new("ngx/logs"));
+        assert_eq!(wide.last().copied(), Some(0));
+        assert_eq!(wide.len(), "ngx/logs".len() + 1);
     }
 }

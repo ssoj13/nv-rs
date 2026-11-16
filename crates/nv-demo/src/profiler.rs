@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 use cuda_core::Context as CudaContext;
 use cupti::{ActivityKind, ActivityProfiler, ActivityRecord, CallbackDomain, Subscriber};
-#[cfg(feature = "ngx")]
 use ngx::NgxVulkan;
 use nvml::{ClockDomain, Device as NvmlDevice};
 
@@ -212,7 +211,6 @@ impl Default for GpuTelemetry {
 /// Probes whether the NVIDIA NGX / DLSS runtime is available on this host.
 ///
 /// Never panics; returns `(available, status_description)`.
-#[cfg(feature = "ngx")]
 pub fn probe_ngx_status() -> (bool, String) {
     match NgxVulkan::required_extensions() {
         Ok(exts) => (
@@ -225,65 +223,6 @@ pub fn probe_ngx_status() -> (bool, String) {
         ),
         Err(err) => (false, format!("Unavailable: {err}")),
     }
-}
-
-/// Probes whether the NVIDIA NGX / DLSS runtime is available without linking `ngx`.
-///
-/// Checks `NGX_SDK_ROOT` / `DLSS_ROOT` and searches `System32` and `PATH` for `nvngx_dlss.dll`.
-/// Never panics; returns `(available, status_description)`.
-#[cfg(not(feature = "ngx"))]
-pub fn probe_ngx_status() -> (bool, String) {
-    use std::path::Path;
-
-    if let Some(dll_path) = find_nvngx_dlss_dll() {
-        return (
-            true,
-            format!(
-                "DLL present ({}; enable --features ngx)",
-                dll_path.display()
-            ),
-        );
-    }
-
-    let has_sdk_env = ["NGX_SDK_ROOT", "DLSS_ROOT"].into_iter().any(|var| {
-        std::env::var_os(var)
-            .map(|v| !v.is_empty() && Path::new(&v).exists())
-            .unwrap_or(false)
-    });
-    if has_sdk_env {
-        (
-            false,
-            "NGX SDK env present, not linked (enable --features ngx)".to_string(),
-        )
-    } else {
-        (
-            false,
-            "NGX SDK not linked (enable --features ngx)".to_string(),
-        )
-    }
-}
-
-#[cfg(not(feature = "ngx"))]
-fn find_nvngx_dlss_dll() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-
-    let sys_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let sys32_dll = sys_root.join("System32").join("nvngx_dlss.dll");
-    if sys32_dll.is_file() {
-        return Some(sys32_dll);
-    }
-
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("nvngx_dlss.dll");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 /// Manages frame timing history, optional CUPTI activity/subscriber handles, and NVML polling.

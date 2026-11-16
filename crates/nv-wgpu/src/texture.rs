@@ -680,6 +680,47 @@ impl SharedTexture {
         &self.ext_mem
     }
 
+    /// Returns the raw `VkImage` handle (`*mut c_void`) when backed by Vulkan,
+    /// or `None` on DX12.
+    #[inline]
+    pub fn vk_image_raw(&self) -> Option<*mut core::ffi::c_void> {
+        use ash::vk::Handle as _;
+        match &self.backing {
+            TextureNativeBacking::Vulkan { vk, .. } => {
+                Some(vk.image.as_raw() as usize as *mut core::ffi::c_void)
+            }
+            #[cfg(windows)]
+            TextureNativeBacking::Dx12 { .. } => None,
+        }
+    }
+
+    /// Returns the raw `VkFormat` integer (`u32`) when backed by Vulkan,
+    /// or `None` on DX12.
+    #[inline]
+    pub fn vk_format_raw(&self) -> Option<u32> {
+        match &self.backing {
+            TextureNativeBacking::Vulkan { .. } => {
+                Some(self.format_mapping().vk_format.as_raw() as u32)
+            }
+            #[cfg(windows)]
+            TextureNativeBacking::Dx12 { .. } => None,
+        }
+    }
+}
+
+/// Returns the raw `VkImageView` handle (`*mut c_void`) for a [`wgpu::TextureView`]
+/// when backed by Vulkan, or `None` on other backends.
+#[inline]
+pub fn vk_image_view_raw(view: &wgpu::TextureView) -> Option<*mut std::ffi::c_void> {
+    use ash::vk::Handle as _;
+    // SAFETY: Read-only HAL inspection of the Vulkan image view handle; `view` outlives the call.
+    unsafe {
+        view.as_hal::<Vulkan>()
+            .map(|v| v.raw_handle().as_raw() as usize as *mut std::ffi::c_void)
+    }
+}
+
+impl SharedTexture {
     /// Submits a Vulkan layout + queue-family ownership release barrier from `wgpu` (`from_uses`)
     /// to `VK_QUEUE_FAMILY_EXTERNAL` + `VK_IMAGE_LAYOUT_GENERAL` for CUDA consumption.
     ///

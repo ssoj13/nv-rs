@@ -8,11 +8,13 @@ use egui_phosphor::regular as ic;
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
+use crate::demo_anim::DemoAnimator;
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::DemoSettings;
 
-const LABEL_W: f32 = 86.0;
-const VAL_W: f32 = 64.0;
+const LABEL_W: f32 = 84.0;
+const VAL_W: f32 = 56.0;
+const ANIM_BTN_W: f32 = 16.0;
 const ROW_H: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -52,7 +54,9 @@ pub fn default_dock_state() -> DockState<DockTab> {
     state
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum UiTheme {
     #[default]
     Obsidian,
@@ -188,6 +192,7 @@ impl UiTheme {
 
 pub struct UiContext<'a> {
     pub settings: &'a mut DemoSettings,
+    pub demo_anim: &'a mut DemoAnimator,
     pub display_tex_id: egui::TextureId,
     pub render_w: u32,
     pub render_h: u32,
@@ -359,6 +364,24 @@ impl UiContext<'_> {
                 *self.reset_accum_requested = true;
             }
 
+            ui.separator();
+            ui.checkbox(&mut self.demo_anim.enabled, "Demo");
+            ui.label(RichText::new("Period").small().weak());
+            ui.add(
+                egui::DragValue::new(&mut self.demo_anim.period_s)
+                    .range(0.5..=60.0)
+                    .speed(0.1)
+                    .fixed_decimals(1)
+                    .suffix("s"),
+            );
+            ui.label(RichText::new("Amp").small().weak());
+            ui.add(
+                egui::DragValue::new(&mut self.demo_anim.amp)
+                    .range(0.05..=5.0)
+                    .speed(0.02)
+                    .fixed_decimals(2),
+            );
+
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let theme_btn = ui
                     .button(format!("{} {}", ic::PALETTE, self.theme.label()))
@@ -488,13 +511,19 @@ impl UiContext<'_> {
         };
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
-        let status = if self.settings.auto_rotate || sat_orbiting {
-            let anim_tag = match (self.settings.auto_rotate, sat_orbiting) {
-                (true, true) => "SPIN+ORBIT",
-                (true, false) => "SPIN",
-                (false, true) => "ORBIT",
-                (false, false) => unreachable!(),
-            };
+        let demo_running = self.demo_anim.is_running();
+        let status = if self.settings.auto_rotate || sat_orbiting || demo_running {
+            let mut tags = Vec::with_capacity(3);
+            if demo_running {
+                tags.push("DEMO");
+            }
+            if self.settings.auto_rotate {
+                tags.push("SPIN");
+            }
+            if sat_orbiting {
+                tags.push("ORBIT");
+            }
+            let anim_tag = tags.join("+");
             format!(
                 "{} {}  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
                 ic::ARROWS_CLOCKWISE,
@@ -534,6 +563,7 @@ impl UiContext<'_> {
 
     fn ui_fractal(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
+        let anim = &mut *self.demo_anim;
         collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", true, |ui| {
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
@@ -620,28 +650,61 @@ impl UiContext<'_> {
 
             match s.fractal_kind {
                 0 => {
-                    prop_slider_f32(ui, "Power", &mut s.bulb_power, 2.0..=16.0, 2, false);
-                    prop_slider_f32(ui, "Bailout", &mut s.bulb_bailout, 2.0..=32.0, 1, false);
-                    prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
-                    prop_slider_f32(
+                    anim_slider_f32(
                         ui,
+                        anim,
+                        "bulb_power",
+                        "Power",
+                        &mut s.bulb_power,
+                        2.0..=16.0,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "bulb_bailout",
+                        "Bailout",
+                        &mut s.bulb_bailout,
+                        2.0..=32.0,
+                        1,
+                        false,
+                    );
+                    prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "bulb_theta_mult",
                         "Theta Mult",
                         &mut s.bulb_theta_mult,
                         0.25..=2.5,
                         2,
                         false,
                     );
-                    prop_slider_f32(ui, "Phi Mult", &mut s.bulb_phi_mult, 0.25..=2.5, 2, false);
-                    prop_slider_f32(
+                    anim_slider_f32(
                         ui,
+                        anim,
+                        "bulb_phi_mult",
+                        "Phi Mult",
+                        &mut s.bulb_phi_mult,
+                        0.25..=2.5,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "bulb_theta_phase",
                         "Theta Ph",
                         &mut s.bulb_theta_phase,
                         -90.0..=90.0,
                         1,
                         false,
                     );
-                    prop_slider_f32(
+                    anim_slider_f32(
                         ui,
+                        anim,
+                        "bulb_phi_phase",
                         "Phi Ph",
                         &mut s.bulb_phi_phase,
                         -180.0..=180.0,
@@ -650,35 +713,161 @@ impl UiContext<'_> {
                     );
                     prop_toggle(ui, "Julia Mode", &mut s.bulb_julia, "Enable Julia C");
                     if s.bulb_julia {
-                        prop_vec3(ui, "Julia C", &mut s.bulb_c, -1.5..=1.5, 0.01);
+                        anim_vec3(
+                            ui,
+                            anim,
+                            "bulb_c",
+                            "Julia C",
+                            &mut s.bulb_c,
+                            -1.5..=1.5,
+                            0.01,
+                        );
                     }
                 }
                 1 => {
-                    prop_slider_f32(ui, "Scale", &mut s.box_scale, -3.5..=3.5, 2, false);
-                    prop_slider_f32(ui, "Fold", &mut s.box_fold, 0.2..=2.2, 2, false);
-                    prop_slider_f32(ui, "Fold Mult", &mut s.box_fold_mult, 1.2..=3.0, 2, false);
-                    prop_slider_f32(ui, "Min R", &mut s.box_min_r, 0.05..=1.2, 2, false);
-                    prop_slider_f32(ui, "Fixed R", &mut s.box_fixed_r, 0.4..=2.5, 2, false);
-                    prop_slider_f32(ui, "Iter Rot", &mut s.box_iter_rot, -45.0..=45.0, 1, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_scale",
+                        "Scale",
+                        &mut s.box_scale,
+                        -3.5..=3.5,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_fold",
+                        "Fold",
+                        &mut s.box_fold,
+                        0.2..=2.2,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_fold_mult",
+                        "Fold Mult",
+                        &mut s.box_fold_mult,
+                        1.2..=3.0,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_min_r",
+                        "Min R",
+                        &mut s.box_min_r,
+                        0.05..=1.2,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_fixed_r",
+                        "Fixed R",
+                        &mut s.box_fixed_r,
+                        0.4..=2.5,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_iter_rot",
+                        "Iter Rot",
+                        &mut s.box_iter_rot,
+                        -45.0..=45.0,
+                        1,
+                        false,
+                    );
                     prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=24, false);
-                    prop_slider_f32(ui, "Bailout", &mut s.box_bailout, 4.0..=64.0, 1, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "box_bailout",
+                        "Bailout",
+                        &mut s.box_bailout,
+                        4.0..=64.0,
+                        1,
+                        false,
+                    );
                 }
                 _ => {
-                    prop_slider_f32(ui, "Scale", &mut s.kifs_scale, 1.3..=2.8, 2, false);
-                    prop_slider_f32(ui, "Rot Y", &mut s.kifs_rot1, -180.0..=180.0, 1, false);
-                    prop_slider_f32(ui, "Rot X", &mut s.kifs_rot2, -180.0..=180.0, 1, false);
-                    prop_vec3(ui, "Offset", &mut s.kifs_offset, 0.1..=2.0, 0.01);
-                    prop_slider_f32(
+                    anim_slider_f32(
                         ui,
+                        anim,
+                        "kifs_scale",
+                        "Scale",
+                        &mut s.kifs_scale,
+                        1.3..=2.8,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "kifs_rot1",
+                        "Rot Y",
+                        &mut s.kifs_rot1,
+                        -180.0..=180.0,
+                        1,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "kifs_rot2",
+                        "Rot X",
+                        &mut s.kifs_rot2,
+                        -180.0..=180.0,
+                        1,
+                        false,
+                    );
+                    anim_vec3(
+                        ui,
+                        anim,
+                        "kifs_offset",
+                        "Offset",
+                        &mut s.kifs_offset,
+                        0.1..=2.0,
+                        0.01,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "kifs_thickness",
                         "Thickness",
                         &mut s.kifs_thickness,
                         0.005..=0.25,
                         3,
                         false,
                     );
-                    prop_slider_f32(ui, "Z Bias", &mut s.kifs_z_bias, 0.0..=1.5, 2, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "kifs_z_bias",
+                        "Z Bias",
+                        &mut s.kifs_z_bias,
+                        0.0..=1.5,
+                        2,
+                        false,
+                    );
                     prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
-                    prop_slider_f32(ui, "Bailout", &mut s.kifs_bailout, 4.0..=32.0, 1, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "kifs_bailout",
+                        "Bailout",
+                        &mut s.kifs_bailout,
+                        4.0..=32.0,
+                        1,
+                        false,
+                    );
                 }
             }
         });
@@ -690,10 +879,46 @@ impl UiContext<'_> {
             "Transform",
             true,
             |ui| {
-                prop_slider_f32(ui, "Obj Scale", &mut s.obj_scale, 0.25..=2.5, 2, false);
-                prop_slider_f32(ui, "Rot X", &mut s.rot_x, -180.0..=180.0, 1, false);
-                prop_slider_f32(ui, "Rot Y", &mut s.rot_y, -180.0..=180.0, 1, false);
-                prop_slider_f32(ui, "Rot Z", &mut s.rot_z, -180.0..=180.0, 1, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "obj_scale",
+                    "Obj Scale",
+                    &mut s.obj_scale,
+                    0.25..=2.5,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "rot_x",
+                    "Rot X",
+                    &mut s.rot_x,
+                    -180.0..=180.0,
+                    1,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "rot_y",
+                    "Rot Y",
+                    &mut s.rot_y,
+                    -180.0..=180.0,
+                    1,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "rot_z",
+                    "Rot Z",
+                    &mut s.rot_z,
+                    -180.0..=180.0,
+                    1,
+                    false,
+                );
             },
         );
 
@@ -704,48 +929,170 @@ impl UiContext<'_> {
             "Detail & Shading",
             true,
             |ui| {
-                prop_slider_f32(
+                anim_slider_f32(
                     ui,
+                    anim,
+                    "detail_eps",
                     "Detail Eps",
                     &mut s.detail_eps,
                     0.00005..=0.005,
                     5,
                     true,
                 );
-                prop_slider_f32(ui, "Normal Eps", &mut s.norm_eps, 0.00005..=0.005, 5, true);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "norm_eps",
+                    "Normal Eps",
+                    &mut s.norm_eps,
+                    0.00005..=0.005,
+                    5,
+                    true,
+                );
                 prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=320, false);
-                prop_slider_f32(ui, "Fudge", &mut s.fudge, 0.3..=1.1, 2, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "fudge",
+                    "Fudge",
+                    &mut s.fudge,
+                    0.3..=1.1,
+                    2,
+                    false,
+                );
                 prop_slider_u32(ui, "Bounces", &mut s.bounces, 1..=6, false);
-                prop_slider_f32(ui, "Metallic", &mut s.metallic, 0.0..=1.0, 2, false);
-                prop_slider_f32(ui, "Roughness", &mut s.roughness, 0.02..=0.85, 2, false);
-                prop_slider_f32(ui, "Trap Scale", &mut s.trap_scale, 0.1..=3.0, 2, false);
-                prop_slider_f32(ui, "Hue Shift", &mut s.palette_shift, 0.0..=1.0, 2, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "metallic",
+                    "Metallic",
+                    &mut s.metallic,
+                    0.0..=1.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "roughness",
+                    "Roughness",
+                    &mut s.roughness,
+                    0.02..=0.85,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "trap_scale",
+                    "Trap Scale",
+                    &mut s.trap_scale,
+                    0.1..=3.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "palette_shift",
+                    "Hue Shift",
+                    &mut s.palette_shift,
+                    0.0..=1.0,
+                    2,
+                    false,
+                );
             },
         );
     }
 
     fn ui_render_floor(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
+        let anim = &mut *self.demo_anim;
 
         collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
-            prop_slider_f32(ui, "Sun Power", &mut s.sun_intensity, 0.0..=4.0, 2, false);
-            prop_slider_f32(
+            anim_slider_f32(
                 ui,
+                anim,
+                "sun_intensity",
+                "Sun Power",
+                &mut s.sun_intensity,
+                0.0..=4.0,
+                2,
+                false,
+            );
+            anim_slider_f32(
+                ui,
+                anim,
+                "sun_azimuth",
                 "Sun Azimuth",
                 &mut s.sun_azimuth,
                 -180.0..=180.0,
                 1,
                 false,
             );
-            prop_slider_f32(ui, "Sun Elev", &mut s.sun_elevation, 2.0..=88.0, 1, false);
-            prop_slider_f32(ui, "Sky Power", &mut s.sky_intensity, 0.1..=2.0, 2, false);
-            prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
-            prop_slider_f32(ui, "Exposure", &mut s.exposure, 0.25..=2.0, 2, false);
+            anim_slider_f32(
+                ui,
+                anim,
+                "sun_elevation",
+                "Sun Elev",
+                &mut s.sun_elevation,
+                2.0..=88.0,
+                1,
+                false,
+            );
+            anim_slider_f32(
+                ui,
+                anim,
+                "sky_intensity",
+                "Sky Power",
+                &mut s.sky_intensity,
+                0.1..=2.0,
+                2,
+                false,
+            );
+            anim_slider_f32(
+                ui,
+                anim,
+                "horizon_haze",
+                "Haze",
+                &mut s.horizon_haze,
+                0.4..=2.5,
+                2,
+                false,
+            );
+            anim_slider_f32(
+                ui,
+                anim,
+                "exposure",
+                "Exposure",
+                &mut s.exposure,
+                0.25..=2.0,
+                2,
+                false,
+            );
         });
 
         collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", true, |ui| {
-            prop_slider_f32(ui, "Aperture", &mut s.aperture, 0.0..=0.12, 3, false);
-            prop_slider_f32(ui, "Focus Dist", &mut s.focus_dist, 0.5..=12.0, 2, false);
+            anim_slider_f32(
+                ui,
+                anim,
+                "aperture",
+                "Aperture",
+                &mut s.aperture,
+                0.0..=0.12,
+                3,
+                false,
+            );
+            anim_slider_f32(
+                ui,
+                anim,
+                "focus_dist",
+                "Focus Dist",
+                &mut s.focus_dist,
+                0.5..=12.0,
+                2,
+                false,
+            );
         });
 
         collapsing_section(
@@ -755,24 +1102,58 @@ impl UiContext<'_> {
             "Scratched Metal Floor",
             true,
             |ui| {
-                prop_slider_f32(
+                anim_slider_f32(
                     ui,
+                    anim,
+                    "floor_roughness",
                     "Roughness",
                     &mut s.floor_roughness,
                     0.03..=0.80,
                     2,
                     false,
                 );
-                prop_slider_f32(ui, "Scratches", &mut s.floor_scratch, 0.0..=1.5, 2, false);
-                prop_slider_f32(ui, "Tile Scale", &mut s.floor_scale, 0.3..=5.0, 2, false);
-                prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "floor_scratch",
+                    "Scratches",
+                    &mut s.floor_scratch,
+                    0.0..=1.5,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "floor_scale",
+                    "Tile Scale",
+                    &mut s.floor_scale,
+                    0.3..=5.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "floor_metallic",
+                    "Metallic",
+                    &mut s.floor_metallic,
+                    0.0..=1.0,
+                    2,
+                    false,
+                );
             },
         );
 
         collapsing_section(ui, "sec_scene", ic::GLOBE, "Scene", true, |ui| {
             prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
             if s.sat_on {
-                prop_toggle(ui, "Analytic", &mut s.glass_analytic, "Smooth Analytic Sphere");
+                prop_toggle(
+                    ui,
+                    "Analytic",
+                    &mut s.glass_analytic,
+                    "Smooth Analytic Sphere",
+                );
                 prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
                 prop_slider_u32(ui, "Spheres Num", &mut s.sat_count, 0..=24, false);
                 if !s.glass_analytic {
@@ -780,29 +1161,166 @@ impl UiContext<'_> {
                     prop_slider_u32(ui, "V Segs", &mut s.sat_v_segs, 4..=96, false);
                 }
                 prop_slider_u32(ui, "Orbit Seed", &mut s.sat_seed, 0..=9999, false);
-                prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.001..=0.80, 3, false);
-                prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.001..=0.80, 3, false);
-                prop_slider_f32(ui, "Min Orbit", &mut s.sat_orbit_min, 0.6..=4.5, 2, false);
-                prop_slider_f32(ui, "Max Orbit", &mut s.sat_orbit_max, 0.6..=4.5, 2, false);
-                prop_slider_f32(ui, "Min Height", &mut s.sat_height_min, -1.0..=2.0, 2, false);
-                prop_slider_f32(ui, "Max Height", &mut s.sat_height_max, -1.0..=2.0, 2, false);
-                prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, -3.0..=3.0, 2, false);
-                prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, -3.0..=3.0, 2, false);
-                prop_slider_f32(ui, "Bob Amp Min", &mut s.sat_bob_amp_min, 0.0..=0.80, 2, false);
-                prop_slider_f32(ui, "Bob Amp Max", &mut s.sat_bob_amp_max, 0.0..=0.80, 2, false);
-                prop_slider_f32(ui, "Bob Frq Min", &mut s.sat_bob_freq_min, 0.0..=5.0, 2, false);
-                prop_slider_f32(ui, "Bob Frq Max", &mut s.sat_bob_freq_max, 0.0..=5.0, 2, false);
-                prop_slider_f32(ui, "Hue Spread", &mut s.sat_hue_spread, 0.0..=1.0, 2, false);
-                prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
-                prop_slider_f32(
+                anim_slider_f32(
                     ui,
+                    anim,
+                    "sat_size_min",
+                    "Min Size",
+                    &mut s.sat_size_min,
+                    0.001..=0.80,
+                    3,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_size_max",
+                    "Max Size",
+                    &mut s.sat_size_max,
+                    0.001..=0.80,
+                    3,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_orbit_min",
+                    "Min Orbit",
+                    &mut s.sat_orbit_min,
+                    0.6..=4.5,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_orbit_max",
+                    "Max Orbit",
+                    &mut s.sat_orbit_max,
+                    0.6..=4.5,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_height_min",
+                    "Min Height",
+                    &mut s.sat_height_min,
+                    -1.0..=2.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_height_max",
+                    "Max Height",
+                    &mut s.sat_height_max,
+                    -1.0..=2.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_speed_min",
+                    "Min Speed",
+                    &mut s.sat_speed_min,
+                    -3.0..=3.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_speed_max",
+                    "Max Speed",
+                    &mut s.sat_speed_max,
+                    -3.0..=3.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_bob_amp_min",
+                    "Bob Amp Min",
+                    &mut s.sat_bob_amp_min,
+                    0.0..=0.80,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_bob_amp_max",
+                    "Bob Amp Max",
+                    &mut s.sat_bob_amp_max,
+                    0.0..=0.80,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_bob_freq_min",
+                    "Bob Frq Min",
+                    &mut s.sat_bob_freq_min,
+                    0.0..=5.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_bob_freq_max",
+                    "Bob Frq Max",
+                    &mut s.sat_bob_freq_max,
+                    0.0..=5.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "sat_hue_spread",
+                    "Hue Spread",
+                    &mut s.sat_hue_spread,
+                    0.0..=1.0,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "glass_ior",
+                    "Glass IOR",
+                    &mut s.glass_ior,
+                    1.05..=2.40,
+                    2,
+                    false,
+                );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "glass_roughness",
                     "Glass Rough",
                     &mut s.glass_roughness,
                     0.0..=0.35,
                     3,
                     false,
                 );
-                prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=12.0, 2, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "glass_absorb",
+                    "Absorb",
+                    &mut s.glass_absorb,
+                    0.0..=12.0,
+                    2,
+                    false,
+                );
             }
             prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
         });
@@ -816,8 +1334,26 @@ impl UiContext<'_> {
             |ui| {
                 prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
                 if s.bloom_on {
-                    prop_slider_f32(ui, "Threshold", &mut s.bloom_threshold, 0.2..=5.0, 2, false);
-                    prop_slider_f32(ui, "Intensity", &mut s.bloom_intensity, 0.0..=2.0, 2, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "bloom_threshold",
+                        "Threshold",
+                        &mut s.bloom_threshold,
+                        0.2..=5.0,
+                        2,
+                        false,
+                    );
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "bloom_intensity",
+                        "Intensity",
+                        &mut s.bloom_intensity,
+                        0.0..=2.0,
+                        2,
+                        false,
+                    );
                     prop_slider_u32(ui, "Blades", &mut s.bloom_blades, 3..=12, false);
                 }
             },
@@ -826,7 +1362,16 @@ impl UiContext<'_> {
         collapsing_section(ui, "sec_split", ic::COLUMNS, "A/B Split", true, |ui| {
             prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
             if s.split_on {
-                prop_slider_f32(ui, "Split X", &mut s.split_x, 0.02..=0.98, 2, false);
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "split_x",
+                    "Split X",
+                    &mut s.split_x,
+                    0.02..=0.98,
+                    2,
+                    false,
+                );
                 prop_row(ui, "Right AOV", |ui| {
                     let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -882,7 +1427,16 @@ impl UiContext<'_> {
             });
             prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
             prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
-            prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=2.0, 2, false);
+            anim_slider_f32(
+                ui,
+                anim,
+                "spin_speed",
+                "Spin Speed",
+                &mut s.spin_speed,
+                0.0..=2.0,
+                2,
+                false,
+            );
 
             ui.add_space(1.0);
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
@@ -893,10 +1447,16 @@ impl UiContext<'_> {
                     );
                 }
                 1 => {
-                    ui.add_sized(
-                        [w, ROW_H],
-                        egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
-                    );
+                    if ui
+                        .add_sized(
+                            [w, ROW_H],
+                            egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
+                        )
+                        .changed()
+                        && s.denoiser_on
+                    {
+                        s.dlss_on = false;
+                    }
                 }
                 2 => {
                     ui.add_sized(
@@ -908,6 +1468,48 @@ impl UiContext<'_> {
                     ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
                 }
             });
+            ui.add_space(1.0);
+            prop_row(ui, "DLSS", |ui| {
+                if ui
+                    .checkbox(&mut s.dlss_on, "DLSS Super Resolution")
+                    .changed()
+                    && s.dlss_on
+                {
+                    s.denoiser_on = false;
+                }
+            });
+            prop_row(ui, "DLSS Qual", |ui| {
+                let w = ((ui.available_width() - 20.0) / 6.0).max(24.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (q, lbl) in [
+                    (0u32, "UltraP"),
+                    (1u32, "Perf"),
+                    (2u32, "Bal"),
+                    (3u32, "Qual"),
+                    (4u32, "UltraQ"),
+                    (5u32, "DLAA"),
+                ] {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H],
+                            egui::Button::selectable(s.dlss_quality == q, lbl),
+                        )
+                        .clicked()
+                    {
+                        s.dlss_quality = q;
+                    }
+                }
+            });
+            anim_slider_f32(
+                ui,
+                anim,
+                "dlss_sharpness",
+                "DLSS Sharp",
+                &mut s.dlss_sharpness,
+                0.0..=1.0,
+                2,
+                false,
+            );
             ui.add_space(1.0);
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
@@ -1074,15 +1676,13 @@ fn collapsing_section(
     default_open: bool,
     add_body: impl FnOnce(&mut Ui),
 ) {
-    egui::CollapsingHeader::new(
-        RichText::new(format!("{icon}  {title}"))
-            .strong()
-            .color(if ui.visuals().dark_mode {
-                UiTheme::Obsidian.section_color()
-            } else {
-                UiTheme::Light.section_color()
-            }),
-    )
+    egui::CollapsingHeader::new(RichText::new(format!("{icon}  {title}")).strong().color(
+        if ui.visuals().dark_mode {
+            UiTheme::Obsidian.section_color()
+        } else {
+            UiTheme::Light.section_color()
+        },
+    ))
     .id_salt(id_salt)
     .default_open(default_open)
     .show(ui, add_body);
@@ -1138,8 +1738,34 @@ fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
     );
 }
 
-fn prop_slider_f32(
+fn anim_toggle_btn(ui: &mut Ui, anim: &mut DemoAnimator, key: &str) {
+    let active = anim.is_active(key);
+    let col = if active {
+        if ui.visuals().dark_mode {
+            UiTheme::Obsidian.section_color()
+        } else {
+            UiTheme::Light.section_color()
+        }
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let btn = egui::Button::new(RichText::new(ic::WAVE_SINE).size(11.0).color(col))
+        .selected(active)
+        .frame(active);
+    if ui
+        .add_sized([ANIM_BTN_W, ROW_H], btn)
+        .on_hover_text("Animate ±Amp*sin(2πt/Period)")
+        .clicked()
+    {
+        anim.toggle(key);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anim_slider_f32(
     ui: &mut Ui,
+    anim: &mut DemoAnimator,
+    key: &str,
     label: &str,
     val: &mut f32,
     range: RangeInclusive<f32>,
@@ -1147,8 +1773,8 @@ fn prop_slider_f32(
     log: bool,
 ) {
     prop_row(ui, label, |ui| {
-        let gap = 6.0;
-        let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
+        let gap = 4.0;
+        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
@@ -1163,12 +1789,13 @@ fn prop_slider_f32(
                 .fixed_decimals(decimals)
                 .speed(0.005),
         );
+        anim_toggle_btn(ui, anim, key);
     });
 }
 
 fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
     prop_row(ui, label, |ui| {
-        let gap = 6.0;
+        let gap = 4.0;
         let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
@@ -1184,9 +1811,19 @@ fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusiv
     });
 }
 
-fn prop_vec3(ui: &mut Ui, label: &str, v: &mut [f32; 3], range: RangeInclusive<f32>, speed: f32) {
+fn anim_vec3(
+    ui: &mut Ui,
+    anim: &mut DemoAnimator,
+    key: &str,
+    label: &str,
+    v: &mut [f32; 3],
+    range: RangeInclusive<f32>,
+    speed: f32,
+) {
     prop_row(ui, label, |ui| {
-        let w = ((ui.available_width() - 8.0) / 3.0).max(32.0);
+        let gap = 4.0;
+        let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(28.0);
+        ui.spacing_mut().item_spacing.x = gap;
         for item in v.iter_mut() {
             ui.add_sized(
                 [w, ROW_H],
@@ -1196,6 +1833,7 @@ fn prop_vec3(ui: &mut Ui, label: &str, v: &mut [f32; 3], range: RangeInclusive<f
                     .fixed_decimals(2),
             );
         }
+        anim_toggle_btn(ui, anim, key);
     });
 }
 

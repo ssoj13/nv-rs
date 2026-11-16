@@ -1,6 +1,7 @@
 [package]
 name = "ngx-sys"
 description = "Raw NGX (DLSS) bindings: SDK types and the statically linked NGX API (Vulkan, D3D12, CUDA)"
+links = "ngx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

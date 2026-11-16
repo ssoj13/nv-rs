@@ -59,7 +59,10 @@ fn main() {
                 SDKS_WINDOWS,
             );
             match nv_bindgen::generate(&spec) {
-                Ok(_) => println!("cargo::rustc-cfg=has_ngx_sdk"),
+                Ok(_) => {
+                    println!("cargo::rustc-cfg=has_ngx_sdk");
+                    println!("cargo::metadata=has_ngx_sdk=1");
+                }
                 Err(e) => {
                     println!("cargo::error={e}");
                     std::process::exit(1);
@@ -75,7 +78,10 @@ fn main() {
                 SDKS_UNIX,
             );
             match nv_bindgen::generate(&spec) {
-                Ok(_) => println!("cargo::rustc-cfg=has_ngx_sdk"),
+                Ok(_) => {
+                    println!("cargo::rustc-cfg=has_ngx_sdk");
+                    println!("cargo::metadata=has_ngx_sdk=1");
+                }
                 Err(e) => {
                     println!("cargo::rerun-if-env-changed=NGX_SDK_ROOT");
                     println!("cargo::rerun-if-env-changed=NV_SDK_DIRS");

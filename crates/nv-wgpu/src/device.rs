@@ -10,8 +10,8 @@
 //! Used by callers setting up [`InteropContext`](crate::InteropContext) and by
 //! tests validating multi-GPU / multi-backend device selection.
 
-use std::ffi::CStr;
-use std::sync::Arc;
+use std::ffi::{CStr, CString};
+use std::sync::{Arc, Mutex};
 
 use ash::{khr, vk};
 use cuda_core::Context;
@@ -285,6 +285,68 @@ pub fn find_matching_cuda_device(
     })
 }
 
+/// Interns a Vulkan extension name as a `'static CStr`, validating against
+/// interior NUL bytes and leaking each unique string at most once.
+fn intern_cstr(name: &str) -> Result<&'static CStr> {
+    static INTERNED: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
+    let cstr = CString::new(name)
+        .map_err(|_| Error::InvalidInput("vulkan extension name contains interior NUL"))?;
+    let mut guard = INTERNED.lock().map_err(|_| Error::InvalidHandle {
+        source_api: "INTERNED vulkan extension mutex poisoned",
+    })?;
+    if let Some(&existing) = guard.iter().find(|&&s| s.to_bytes() == cstr.as_bytes()) {
+        return Ok(existing);
+    }
+    let leaked: &'static CStr = Box::leak(cstr.into_boxed_c_str());
+    guard.push(leaked);
+    Ok(leaked)
+}
+
+/// Creates a Vulkan-backed [`wgpu::Instance`] with `instance_exts` enabled on top
+/// of `wgpu`'s default instance extensions via `wgpu::hal::vulkan::Instance::init_with_callback`.
+pub fn create_vulkan_instance_with_extensions(instance_exts: &[&str]) -> Result<wgpu::Instance> {
+    let mut extra_cstrs = Vec::with_capacity(instance_exts.len());
+    for &ext in instance_exts {
+        extra_cstrs.push(intern_cstr(ext)?);
+    }
+
+    let hal_desc = wgpu::hal::InstanceDescriptor {
+        name: "nv-wgpu",
+        flags: wgpu::InstanceFlags::from_build_config(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        telemetry: None,
+        display: None,
+    };
+
+    let callback: Option<Box<wgpu::hal::vulkan::CreateInstanceCallback>> = if extra_cstrs.is_empty()
+    {
+        None
+    } else {
+        Some(Box::new(move |args| {
+            for &ext in &extra_cstrs {
+                if !args.extensions.contains(&ext) {
+                    args.extensions.push(ext);
+                }
+            }
+        }))
+    };
+
+    // SAFETY: `hal_desc` is valid for the duration of `init_with_callback`, and
+    // the callback only appends validated extension names without removing features.
+    let hal_instance =
+        unsafe { wgpu::hal::vulkan::Instance::init_with_callback(&hal_desc, callback) }.map_err(
+            |e| {
+                Error::WgpuRequest(format!(
+                    "wgpu_hal::vulkan::Instance::init_with_callback: {e}"
+                ))
+            },
+        )?;
+
+    // SAFETY: `hal_instance` was just initialized by `wgpu::hal::vulkan::Instance::init_with_callback`.
+    Ok(unsafe { wgpu::Instance::from_hal::<Vulkan>(hal_instance) })
+}
+
 /// Opens a Vulkan `wgpu::Device` + `wgpu::Queue` from `adapter` with all required
 /// external memory and external timeline semaphore extensions enabled via
 /// `wgpu_hal::vulkan::Adapter::open_with_callback`.
@@ -297,6 +359,28 @@ pub fn open_vulkan_device_with_interop(
     limits: &wgpu::Limits,
     label: Option<&str>,
 ) -> Result<(wgpu::Device, wgpu::Queue)> {
+    open_vulkan_device_with_interop_extensions(adapter, features, limits, label, &[])
+}
+
+/// Opens a Vulkan `wgpu::Device` + `wgpu::Queue` from `adapter` with all required
+/// external interop extensions plus `extra_device_exts` enabled via
+/// `wgpu_hal::vulkan::Adapter::open_with_callback`.
+///
+/// Fails with [`Error::BackendMismatch`] if `adapter` is not Vulkan,
+/// [`Error::InvalidInput`] if any extension name contains an interior NUL byte,
+/// or [`Error::Unsupported`] if the adapter lacks any required or extra extension.
+pub fn open_vulkan_device_with_interop_extensions(
+    adapter: &wgpu::Adapter,
+    features: wgpu::Features,
+    limits: &wgpu::Limits,
+    label: Option<&str>,
+    extra_device_exts: &[&str],
+) -> Result<(wgpu::Device, wgpu::Queue)> {
+    let mut extra_cstrs = Vec::with_capacity(extra_device_exts.len());
+    for &ext in extra_device_exts {
+        extra_cstrs.push(intern_cstr(ext)?);
+    }
+
     // SAFETY: Reads Vulkan HAL adapter capabilities without destroying the adapter.
     let hal_adapter = unsafe { adapter.as_hal::<Vulkan>() }.ok_or(Error::BackendMismatch {
         expected: "Vulkan",
@@ -308,7 +392,12 @@ pub fn open_vulkan_device_with_interop(
     let phys = hal_adapter.raw_physical_device();
     // SAFETY: `phys` is a valid physical device of `raw_inst`.
     let api_version = unsafe { raw_inst.get_physical_device_properties(phys) }.api_version;
-    let required = required_vulkan_extensions(api_version);
+    let mut required = required_vulkan_extensions(api_version);
+    for ext in extra_cstrs {
+        if !required.contains(&ext) {
+            required.push(ext);
+        }
+    }
     for &ext in &required {
         if !caps.supports_extension(ext) {
             return Err(Error::Unsupported {
@@ -399,5 +488,16 @@ mod tests {
     fn luid_packing_matches_little_endian_order() {
         let bytes = luid_to_bytes(0x0403_0201, 0x0807_0605);
         assert_eq!(bytes, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn intern_cstr_deduplicates_and_rejects_interior_nul() {
+        let a = intern_cstr("VK_KHR_test_ext").unwrap();
+        let b = intern_cstr("VK_KHR_test_ext").unwrap();
+        assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()));
+        assert!(matches!(
+            create_vulkan_instance_with_extensions(&["VK_KHR_bad\0ext"]),
+            Err(Error::InvalidInput(_))
+        ));
     }
 }

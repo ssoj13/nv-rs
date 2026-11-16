@@ -553,6 +553,12 @@ impl VkBarrierRunner {
         self.queue_family
     }
 
+    /// Returns the underlying `ash::Device`.
+    #[inline]
+    pub(crate) fn vk_device(&self) -> &ash::Device {
+        &self.device
+    }
+
     /// Submits a single `vk::ImageMemoryBarrier` with zero steady-state allocations.
     pub(crate) fn submit_image_barrier(
         &self,
@@ -605,6 +611,15 @@ impl VkBarrierRunner {
         })
     }
 
+    /// Records a primary command buffer via `f`, submits it to `queue`, and waits
+    /// for fence completion before returning.
+    pub(crate) fn record_and_submit_wait<F, R>(&self, queue: vk::Queue, f: F) -> Result<R>
+    where
+        F: FnOnce(vk::CommandBuffer) -> Result<R>,
+    {
+        self.record_and_submit_inner(queue, None, None, true, |_, cmd| f(cmd))
+    }
+
     fn record_and_submit<F>(
         &self,
         queue: vk::Queue,
@@ -614,6 +629,23 @@ impl VkBarrierRunner {
     ) -> Result<()>
     where
         F: FnOnce(&ash::Device, vk::CommandBuffer),
+    {
+        self.record_and_submit_inner(queue, wait, signal, false, |dev, cmd| {
+            record(dev, cmd);
+            Ok(())
+        })
+    }
+
+    fn record_and_submit_inner<F, R>(
+        &self,
+        queue: vk::Queue,
+        wait: Option<(vk::Semaphore, u64)>,
+        signal: Option<(vk::Semaphore, u64)>,
+        wait_for_completion: bool,
+        record: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<R>,
     {
         let mut guard = self.slots.lock().map_err(|_| Error::InvalidHandle {
             source_api: "VkBarrierRunner mutex poisoned",
@@ -648,8 +680,9 @@ impl VkBarrierRunner {
                 .begin_command_buffer(slot_cmd, &begin_info)
                 .map_err(|e| Error::vulkan("vkBeginCommandBuffer", e))?;
         }
-        record(&self.device, slot_cmd);
-        // SAFETY: `slot_cmd` is in recording state and only references stack barriers.
+        // If `record` fails before `reset_fences`, `slot_fence` stays signaled for future reuse.
+        let result = record(&self.device, slot_cmd)?;
+        // SAFETY: `slot_cmd` is in recording state.
         unsafe {
             self.device
                 .end_command_buffer(slot_cmd)
@@ -672,7 +705,15 @@ impl VkBarrierRunner {
             }
             return Err(err);
         }
-        Ok(())
+        if wait_for_completion {
+            // SAFETY: `slot_fence` was just submitted on `queue` and is owned by `self.device`.
+            unsafe {
+                self.device
+                    .wait_for_fences(core::slice::from_ref(&slot_fence), true, u64::MAX)
+            }
+            .map_err(|e| Error::vulkan("vkWaitForFences", e))?;
+        }
+        Ok(result)
     }
 }
 

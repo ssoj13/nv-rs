@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraPose, NavFeel, NavMode};
+use crate::demo_anim::DemoAnimator;
 use crate::renderer::DemoSettings;
 use crate::ui::UiTheme;
 
@@ -158,6 +159,7 @@ pub struct PersistedState {
     pub window: WindowState,
     pub theme: UiTheme,
     pub settings: DemoSettings,
+    pub demo_anim: DemoAnimator,
     pub camera: CameraState,
 }
 
@@ -322,8 +324,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nv_demo_partial_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = dir.join("nv-demo.json");
-        std::fs::write(&path, r#"{"window":{"width":1440},"settings":{"sat_count":9}}"#)
-            .expect("write");
+        std::fs::write(
+            &path,
+            r#"{"window":{"width":1440},"settings":{"sat_count":9}}"#,
+        )
+        .expect("write");
 
         let loaded = load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);

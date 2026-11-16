@@ -7,6 +7,7 @@
 mod camera_core;
 #[allow(unexpected_cfgs, dead_code, unused_imports, deprecated, clippy::all)]
 mod camera_egui;
+mod demo_anim;
 mod fft_bloom;
 mod gpu_export;
 mod persist;
@@ -39,17 +40,290 @@ mod demo_app {
     use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
-    use nv_wgpu::{InteropContext, SharedBuffer, SharedBufferDescriptor};
+    use nv_wgpu::{
+        InteropContext, SharedBuffer, SharedBufferDescriptor, SharedTexture,
+        SharedTextureDescriptor, VkImageTransition, vk_image_view_raw,
+    };
+
+    fn dlss_quality_from_ui(q: u32) -> ngx::DlssPerfQuality {
+        match q {
+            0 => ngx::DlssPerfQuality::UltraPerformance,
+            1 => ngx::DlssPerfQuality::MaxPerf,
+            2 => ngx::DlssPerfQuality::Balanced,
+            3 => ngx::DlssPerfQuality::MaxQuality,
+            4 => ngx::DlssPerfQuality::UltraQuality,
+            5 => ngx::DlssPerfQuality::Dlaa,
+            _ => ngx::DlssPerfQuality::MaxQuality,
+        }
+    }
+
+    struct DlssPass {
+        feature: ngx::FeatureHandle,
+        eval_params: ngx::Parameters,
+        color_in: SharedTexture,
+        color_view: wgpu::TextureView,
+        depth_in: SharedTexture,
+        depth_view: wgpu::TextureView,
+        motion_in: SharedTexture,
+        motion_view: wgpu::TextureView,
+        output_out: SharedTexture,
+        output_view: wgpu::TextureView,
+        render_w: u32,
+        render_h: u32,
+        out_w: u32,
+        out_h: u32,
+        quality: u32,
+        reset_next: bool,
+    }
+
+    impl DlssPass {
+        fn new(
+            interop: &InteropContext,
+            ngx: &ngx::NgxVulkan,
+            render_w: u32,
+            render_h: u32,
+            out_w: u32,
+            out_h: u32,
+            quality: u32,
+        ) -> Result<Self, String> {
+            let make_tex = |w, h, fmt, usage, label| {
+                let mut desc = SharedTextureDescriptor::d2(w, h, fmt, usage, false);
+                desc.label = Some(label);
+                interop
+                    .create_texture(&desc)
+                    .map_err(|e| format!("{label}: {e}"))
+            };
+            let color_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                "dlss-color-in",
+            )?;
+            let depth_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::R32Float,
+                wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                "dlss-depth-in",
+            )?;
+            let motion_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rg32Float,
+                wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                "dlss-motion-in",
+            )?;
+            let output_out = make_tex(
+                out_w,
+                out_h,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                "dlss-output",
+            )?;
+
+            let color_view = color_in
+                .wgpu_texture()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let depth_view = depth_in
+                .wgpu_texture()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let motion_view = motion_in
+                .wgpu_texture()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            let output_view = output_out
+                .wgpu_texture()
+                .create_view(&wgpu::TextureViewDescriptor::default());
+
+            let ngx_q = dlss_quality_from_ui(quality);
+            let flags = ngx::DlssFeatureFlags::MV_LOW_RES | ngx::DlssFeatureFlags::DO_SHARPENING;
+            let mut create_res: Option<Result<ngx::FeatureHandle, ngx::Error>> = None;
+            interop
+                .submit_vulkan_commands(|cmd| {
+                    // SAFETY: `cmd` is a valid recording `VkCommandBuffer` from `interop`.
+                    create_res = Some(unsafe {
+                        ngx.create_dlss_sr(cmd, render_w, render_h, out_w, out_h, ngx_q, flags)
+                    });
+                    Ok(())
+                })
+                .map_err(|e| format!("submit_vulkan_commands: {e}"))?;
+            let feature = create_res
+                .ok_or_else(|| "DLSS feature creation did not run".to_string())?
+                .map_err(|e| format!("create_dlss_sr: {e}"))?;
+            let eval_params = ngx
+                .allocate_parameters()
+                .map_err(|e| format!("allocate_parameters: {e}"))?;
+
+            Ok(Self {
+                feature,
+                eval_params,
+                color_in,
+                color_view,
+                depth_in,
+                depth_view,
+                motion_in,
+                motion_view,
+                output_out,
+                output_view,
+                render_w,
+                render_h,
+                out_w,
+                out_h,
+                quality,
+                reset_next: true,
+            })
+        }
+
+        fn vk_info(
+            tex: &SharedTexture,
+            view: &wgpu::TextureView,
+            w: u32,
+            h: u32,
+            read_write: bool,
+        ) -> Result<ngx::VkImageResourceInfo, String> {
+            let image = tex
+                .vk_image_raw()
+                .ok_or_else(|| "missing VkImage".to_string())?;
+            let image_view =
+                vk_image_view_raw(view).ok_or_else(|| "missing VkImageView".to_string())?;
+            let format = tex
+                .vk_format_raw()
+                .ok_or_else(|| "missing VkFormat".to_string())?;
+            Ok(ngx::VkImageResourceInfo {
+                image_view,
+                image,
+                format,
+                width: w,
+                height: h,
+                read_write,
+            })
+        }
+
+        fn evaluate(
+            &mut self,
+            interop: &InteropContext,
+            jitter: [f32; 2],
+            sharpness: f32,
+        ) -> Result<(), String> {
+            let color = Self::vk_info(
+                &self.color_in,
+                &self.color_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let depth = Self::vk_info(
+                &self.depth_in,
+                &self.depth_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let motion = Self::vk_info(
+                &self.motion_in,
+                &self.motion_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let output = Self::vk_info(
+                &self.output_out,
+                &self.output_view,
+                self.out_w,
+                self.out_h,
+                true,
+            )?;
+
+            let reset = self.reset_next;
+            self.reset_next = false;
+            let mut eval_res: Option<Result<(), ngx::Error>> = None;
+            interop
+                .submit_vulkan_commands(|cmd| {
+                    // SAFETY: `cmd` is a valid recording `VkCommandBuffer` and all 4
+                    // `SharedTexture`s stay alive through `submit_vulkan_commands` completion.
+                    unsafe {
+                        interop.vk_image_barrier(
+                            cmd,
+                            color.image,
+                            VkImageTransition::TransferDstToShaderRead,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            depth.image,
+                            VkImageTransition::TransferDstToShaderRead,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            motion.image,
+                            VkImageTransition::TransferDstToShaderRead,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            output.image,
+                            VkImageTransition::UndefinedToGeneral,
+                        )?;
+                        let res = self.feature.evaluate_dlss_sr_with_params(
+                            cmd,
+                            &mut self.eval_params,
+                            color,
+                            depth,
+                            motion,
+                            output,
+                            self.render_w,
+                            self.render_h,
+                            jitter[0],
+                            jitter[1],
+                            1.0,
+                            1.0,
+                            sharpness,
+                            reset,
+                        );
+                        interop.vk_image_barrier(
+                            cmd,
+                            color.image,
+                            VkImageTransition::ShaderReadToTransferDst,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            depth.image,
+                            VkImageTransition::ShaderReadToTransferDst,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            motion.image,
+                            VkImageTransition::ShaderReadToTransferDst,
+                        )?;
+                        interop.vk_image_barrier(
+                            cmd,
+                            output.image,
+                            VkImageTransition::GeneralToShaderRead,
+                        )?;
+                        eval_res = Some(res);
+                    }
+                    Ok(())
+                })
+                .map_err(|e| format!("submit_vulkan_commands: {e}"))?;
+            eval_res
+                .ok_or_else(|| "DLSS evaluate did not run".to_string())?
+                .map_err(|e| format!("evaluate_dlss_sr: {e}"))
+        }
+    }
 
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
         surface_config: wgpu::SurfaceConfiguration,
+        dlss_pass: Option<DlssPass>,
+        cached_dlss_opt: Option<((u32, u32, u32), ngx::DlssOptimalSettings)>,
+        ngx_vulkan: Option<ngx::NgxVulkan>,
+        ngx_init_error: Option<String>,
         interop: InteropContext,
         egui_ctx: egui::Context,
         egui_winit: egui_winit::State,
         egui_renderer: egui_wgpu::Renderer,
         shared_rgba: [SharedBuffer; 2],
+        shared_depth: [SharedBuffer; 2],
+        shared_motion: [SharedBuffer; 2],
         retired_buffers: Vec<(u64, [SharedBuffer; 2])>,
         buf_gen: u64,
         render_w: u32,
@@ -59,7 +333,10 @@ mod demo_app {
         front_buf_idx: usize,
         has_frame: bool,
         display_texture: wgpu::Texture,
+        display_view: wgpu::TextureView,
         display_tex_id: egui::TextureId,
+        using_dlss_tex: bool,
+        last_jitter: [f32; 2],
         last_saved_msg: Option<String>,
         cmd_tx: Sender<RenderCmd>,
         frame_rx: Receiver<FrameReady>,
@@ -81,6 +358,7 @@ mod demo_app {
         record_frames: u64,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
+        demo_anim: crate::demo_anim::DemoAnimator,
         cam_driver: CameraDriver,
         cam_home: CameraPose,
         cam_pose: CameraPose,
@@ -111,19 +389,50 @@ mod demo_app {
     impl DemoApp {
         pub fn new(window: Arc<Window>, persisted: crate::persist::PersistedState) -> Self {
             let size = window.inner_size();
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+            let ngx_exts = ngx::NgxVulkan::required_extensions().ok();
+            let instance = if let Some(ref exts) = ngx_exts {
+                let inst_strs: Vec<&str> = exts
+                    .instance_extensions
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                nv_wgpu::create_vulkan_instance_with_extensions(&inst_strs).unwrap_or_else(|_| {
+                    wgpu::Instance::new(wgpu::InstanceDescriptor {
+                        backends: wgpu::Backends::VULKAN,
+                        ..wgpu::InstanceDescriptor::new_without_display_handle()
+                    })
+                })
+            } else {
+                wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::VULKAN,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                })
+            };
             let surface = instance
                 .create_surface(window.clone())
                 .expect("wgpu surface");
 
             let adapters = pollster_block(instance.enumerate_adapters(wgpu::Backends::VULKAN));
             let mut chosen = None;
+            let mut used_ngx_exts = false;
             for adapter in adapters {
                 if !adapter.is_surface_supported(&surface) {
                     continue;
+                }
+                if let Some(ref exts) = ngx_exts {
+                    let dev_strs: Vec<&str> =
+                        exts.device_extensions.iter().map(String::as_str).collect();
+                    if let Ok(ctx) = InteropContext::open_vulkan_with_extensions(
+                        &adapter,
+                        wgpu::Features::empty(),
+                        &wgpu::Limits::default(),
+                        Some("nv-rtx-demo"),
+                        &dev_strs,
+                    ) {
+                        chosen = Some((adapter, ctx));
+                        used_ngx_exts = true;
+                        break;
+                    }
                 }
                 if let Ok(ctx) = InteropContext::open_vulkan(
                     &adapter,
@@ -136,6 +445,39 @@ mod demo_app {
                 }
             }
             let (adapter, interop) = chosen.expect("Vulkan+CUDA interop adapter");
+
+            let (ngx_vulkan, ngx_init_error) = if used_ngx_exts {
+                match (
+                    ngx::ProjectId::from_guid_str("a7b3c1d2-4e5f-4a6b-8c9d-0e1f2a3b4c5d"),
+                    interop.raw_vulkan_handles(),
+                ) {
+                    (Ok(pid), Some(raw)) => {
+                        let data_path = std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let handles = ngx::VulkanDeviceHandles {
+                            instance: raw.instance,
+                            physical_device: raw.physical_device,
+                            device: raw.device,
+                            get_instance_proc_addr: raw.get_instance_proc_addr,
+                            get_device_proc_addr: raw.get_device_proc_addr,
+                        };
+                        // SAFETY: `interop` keeps the Vulkan instance/device alive until after `ngx_vulkan` drops.
+                        match unsafe { ngx::NgxVulkan::init(&pid, &data_path, handles) } {
+                            Ok(v) => (Some(v), None),
+                            Err(e) => (None, Some(format!("NGX init failed: {e}"))),
+                        }
+                    }
+                    (Err(e), _) => (None, Some(format!("NGX ProjectId error: {e}"))),
+                    (_, None) => (None, Some("NGX requires Vulkan backend".to_string())),
+                }
+            } else {
+                (
+                    None,
+                    Some("NGX Vulkan extensions unavailable on this host/adapter".to_string()),
+                )
+            };
 
             let mut surface_config = surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -212,14 +554,26 @@ mod demo_app {
             );
 
             // Double-buffered CUDA<->wgpu SharedBuffers so GUI 60 FPS never stalls on OptiX.
-            let (shared_rgba, display_texture) =
-                allocate_render_targets(&interop, DEFAULT_W, DEFAULT_H)
-                    .expect("initial render targets");
+            let RenderTargets {
+                rgba: shared_rgba,
+                depth: shared_depth,
+                motion: shared_motion,
+                display_texture,
+            } = allocate_render_targets(&interop, DEFAULT_W, DEFAULT_H)
+                .expect("initial render targets");
             let buf_ptrs = [shared_rgba[0].cu_deviceptr(), shared_rgba[1].cu_deviceptr()];
-            let view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let depth_ptrs = [
+                shared_depth[0].cu_deviceptr(),
+                shared_depth[1].cu_deviceptr(),
+            ];
+            let motion_ptrs = [
+                shared_motion[0].cu_deviceptr(),
+                shared_motion[1].cu_deviceptr(),
+            ];
+            let display_view = display_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let display_tex_id = egui_renderer.register_native_texture(
                 interop.device(),
-                &view,
+                &display_view,
                 wgpu::FilterMode::Linear,
             );
 
@@ -228,6 +582,8 @@ mod demo_app {
             let (cmd_tx, frame_rx, render_thread) = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
                 buf_ptrs,
+                depth_ptrs,
+                motion_ptrs,
                 settings,
                 initial_camera,
             );
@@ -247,11 +603,17 @@ mod demo_app {
                 window,
                 surface,
                 surface_config,
+                dlss_pass: None,
+                cached_dlss_opt: None,
+                ngx_vulkan,
+                ngx_init_error,
                 interop,
                 egui_ctx,
                 egui_winit,
                 egui_renderer,
                 shared_rgba,
+                shared_depth,
+                shared_motion,
                 retired_buffers: Vec::new(),
                 buf_gen: 0,
                 render_w: DEFAULT_W,
@@ -261,7 +623,10 @@ mod demo_app {
                 front_buf_idx: 0,
                 has_frame: false,
                 display_texture,
+                display_view,
                 display_tex_id,
+                using_dlss_tex: false,
+                last_jitter: [0.0, 0.0],
                 last_saved_msg: None,
                 cmd_tx,
                 frame_rx,
@@ -283,6 +648,7 @@ mod demo_app {
                 record_frames: 0,
                 settings,
                 last_sent_settings: settings,
+                demo_anim: persisted.demo_anim.clone(),
                 cam_driver,
                 cam_home,
                 cam_pose,
@@ -306,6 +672,7 @@ mod demo_app {
                 window: self.win_state,
                 theme: self.theme,
                 settings: self.settings,
+                demo_anim: self.demo_anim.clone(),
                 camera: crate::persist::CameraState::from_runtime(
                     self.cam_mode,
                     self.cam_fly_mode,
@@ -382,6 +749,7 @@ mod demo_app {
                 self.has_frame = true;
                 self.accum_count = msg.accum_count;
                 self.total_samples = msg.total_samples;
+                self.last_jitter = msg.jitter;
                 self.rt_ms = msg.rt_ms;
                 self.denoise_ms = msg.denoise_ms;
                 self.bloom_ms = msg.bloom_ms;
@@ -411,6 +779,7 @@ mod demo_app {
             let prev_theme = self.theme;
             let mut ui_ctx = UiContext {
                 settings: &mut self.settings,
+                demo_anim: &mut self.demo_anim,
                 display_tex_id: self.display_tex_id,
                 render_w: self.render_w,
                 render_h: self.render_h,
@@ -457,29 +826,104 @@ mod demo_app {
                 self.dock_style = self.theme.apply(&self.egui_ctx);
             }
 
-            // 3. Dynamic viewport resolution resize (debounced 120ms to avoid thrashing on drag).
-            let (target_w, target_h) = align_render_size(
-                self.desired_vp_size.0,
-                self.desired_vp_size.1,
-                self.settings.render_scale,
-            );
+            // 3. Dynamic viewport resolution resize & DLSS lifecycle.
+            if self.settings.dlss_on && self.ngx_vulkan.is_none() {
+                self.settings.dlss_on = false;
+                self.last_saved_msg = Some(
+                    self.ngx_init_error
+                        .clone()
+                        .unwrap_or_else(|| "DLSS unavailable: NGX not initialized".to_string()),
+                );
+            }
+
+            let (out_w, out_h) =
+                align_render_size(self.desired_vp_size.0, self.desired_vp_size.1, 1.0);
+            let (target_w, target_h) = if self.settings.dlss_on {
+                if let Some(ref ngx) = self.ngx_vulkan {
+                    let key = (out_w, out_h, self.settings.dlss_quality);
+                    let opt_res = match self.cached_dlss_opt {
+                        Some((k, opt)) if k == key => Ok(opt),
+                        _ => {
+                            let res = ngx.query_dlss_optimal_settings(
+                                out_w,
+                                out_h,
+                                dlss_quality_from_ui(self.settings.dlss_quality),
+                            );
+                            if let Ok(opt) = res {
+                                self.cached_dlss_opt = Some((key, opt));
+                            }
+                            res
+                        }
+                    };
+                    match opt_res {
+                        Ok(opt) => {
+                            let min_w = 256.min(out_w);
+                            let min_h = 144.min(out_h);
+                            (
+                                ((opt.render_width + 31) & !63).clamp(min_w, out_w),
+                                (opt.render_height & !1).clamp(min_h, out_h),
+                            )
+                        }
+                        Err(e) => {
+                            self.settings.dlss_on = false;
+                            self.last_saved_msg = Some(format!("DLSS query failed: {e}"));
+                            align_render_size(
+                                self.desired_vp_size.0,
+                                self.desired_vp_size.1,
+                                self.settings.render_scale,
+                            )
+                        }
+                    }
+                } else {
+                    align_render_size(
+                        self.desired_vp_size.0,
+                        self.desired_vp_size.1,
+                        self.settings.render_scale,
+                    )
+                }
+            } else {
+                align_render_size(
+                    self.desired_vp_size.0,
+                    self.desired_vp_size.1,
+                    self.settings.render_scale,
+                )
+            };
+
+            let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
+                || self.settings.dlss_quality != self.last_sent_settings.dlss_quality;
             if (target_w != self.render_w || target_h != self.render_h)
-                && self.last_resize_at.elapsed().as_millis() >= 120
+                && (self.last_resize_at.elapsed().as_millis() >= 120 || dlss_toggled)
             {
                 self.last_resize_at = Instant::now();
                 match allocate_render_targets(&self.interop, target_w, target_h) {
-                    Ok((new_shared, new_tex)) => {
+                    Ok(RenderTargets {
+                        rgba: new_shared,
+                        depth: new_depth,
+                        motion: new_motion,
+                        display_texture: new_tex,
+                    }) => {
                         let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
+                        let new_depth_ptrs =
+                            [new_depth[0].cu_deviceptr(), new_depth[1].cu_deviceptr()];
+                        let new_motion_ptrs =
+                            [new_motion[0].cu_deviceptr(), new_motion[1].cu_deviceptr()];
                         let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
-                            self.interop.device(),
-                            &new_view,
-                            wgpu::FilterMode::Linear,
-                            self.display_tex_id,
-                        );
+                        if !self.using_dlss_tex {
+                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                self.interop.device(),
+                                &new_view,
+                                wgpu::FilterMode::Linear,
+                                self.display_tex_id,
+                            );
+                        }
                         let old_shared = std::mem::replace(&mut self.shared_rgba, new_shared);
+                        let old_depth = std::mem::replace(&mut self.shared_depth, new_depth);
+                        let old_motion = std::mem::replace(&mut self.shared_motion, new_motion);
                         self.retired_buffers.push((self.buf_gen, old_shared));
+                        self.retired_buffers.push((self.buf_gen, old_depth));
+                        self.retired_buffers.push((self.buf_gen, old_motion));
                         self.display_texture = new_tex;
+                        self.display_view = new_view;
                         self.render_w = target_w;
                         self.render_h = target_h;
                         self.buf_gen = self.buf_gen.wrapping_add(1);
@@ -491,6 +935,8 @@ mod demo_app {
                             width: target_w,
                             height: target_h,
                             buf_ptrs: new_ptrs,
+                            depth_ptrs: new_depth_ptrs,
+                            motion_ptrs: new_motion_ptrs,
                             gen_id: self.buf_gen,
                         });
                     }
@@ -498,6 +944,65 @@ mod demo_app {
                         self.last_saved_msg = Some(format!("Resize failed: {e}"));
                     }
                 }
+            }
+
+            if self.settings.dlss_on {
+                let needs_rebuild = self.dlss_pass.as_ref().is_none_or(|p| {
+                    p.render_w != self.render_w
+                        || p.render_h != self.render_h
+                        || p.out_w != out_w
+                        || p.out_h != out_h
+                        || p.quality != self.settings.dlss_quality
+                });
+                if needs_rebuild {
+                    if self.using_dlss_tex {
+                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            self.interop.device(),
+                            &self.display_view,
+                            wgpu::FilterMode::Linear,
+                            self.display_tex_id,
+                        );
+                        self.using_dlss_tex = false;
+                    }
+                    self.dlss_pass = None;
+                    if let Some(ref ngx) = self.ngx_vulkan {
+                        match DlssPass::new(
+                            &self.interop,
+                            ngx,
+                            self.render_w,
+                            self.render_h,
+                            out_w,
+                            out_h,
+                            self.settings.dlss_quality,
+                        ) {
+                            Ok(pass) => {
+                                self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    self.interop.device(),
+                                    &pass.output_view,
+                                    wgpu::FilterMode::Linear,
+                                    self.display_tex_id,
+                                );
+                                self.using_dlss_tex = true;
+                                self.dlss_pass = Some(pass);
+                            }
+                            Err(e) => {
+                                self.settings.dlss_on = false;
+                                self.last_saved_msg = Some(format!("DLSS init failed: {e}"));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if self.using_dlss_tex {
+                    self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        self.interop.device(),
+                        &self.display_view,
+                        wgpu::FilterMode::Linear,
+                        self.display_tex_id,
+                    );
+                    self.using_dlss_tex = false;
+                }
+                self.dlss_pass = None;
             }
 
             if save_png_requested && self.has_frame {
@@ -532,16 +1037,18 @@ mod demo_app {
                 let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
             }
 
-            // 4. Push camera/settings updates to render thread only when changed.
+            // 4. Advance demo animator & push camera/settings updates when changed.
+            self.demo_anim.tick(dt);
+            let effective_settings = self.demo_anim.apply(&self.settings);
             let cam_frame = pose_to_frame(self.cam_pose);
             if reset_accum_requested
-                || self.settings != self.last_sent_settings
+                || effective_settings != self.last_sent_settings
                 || cam_frame != self.last_sent_camera
             {
-                self.last_sent_settings = self.settings;
+                self.last_sent_settings = effective_settings;
                 self.last_sent_camera = cam_frame;
                 let _ = self.cmd_tx.send(RenderCmd::Update {
-                    settings: Box::new(self.settings),
+                    settings: Box::new(effective_settings),
                     camera: cam_frame,
                     reset_accum: reset_accum_requested,
                 });
@@ -584,27 +1091,101 @@ mod demo_app {
                     });
 
             if self.has_frame {
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(self.render_w * 4),
-                            rows_per_image: Some(self.render_h),
+                if self.settings.dlss_on
+                    && let Some(ref mut dlss) = self.dlss_pass
+                {
+                    let mut copy_enc = self.interop.device().create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("dlss-copy-inputs"),
                         },
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.display_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
+                    );
+                    let extent = wgpu::Extent3d {
                         width: self.render_w,
                         height: self.render_h,
                         depth_or_array_layers: 1,
-                    },
-                );
+                    };
+                    let copy_buf = |enc: &mut wgpu::CommandEncoder,
+                                    buf: &wgpu::Buffer,
+                                    tex: &wgpu::Texture,
+                                    bpp: u32| {
+                        enc.copy_buffer_to_texture(
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: buf,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(self.render_w * bpp),
+                                    rows_per_image: Some(self.render_h),
+                                },
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            extent,
+                        );
+                    };
+                    copy_buf(
+                        &mut copy_enc,
+                        self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
+                        dlss.color_in.wgpu_texture(),
+                        4,
+                    );
+                    copy_buf(
+                        &mut copy_enc,
+                        self.shared_depth[self.front_buf_idx].wgpu_buffer(),
+                        dlss.depth_in.wgpu_texture(),
+                        4,
+                    );
+                    copy_buf(
+                        &mut copy_enc,
+                        self.shared_motion[self.front_buf_idx].wgpu_buffer(),
+                        dlss.motion_in.wgpu_texture(),
+                        8,
+                    );
+                    self.interop.queue().submit(Some(copy_enc.finish()));
+                    if let Err(e) = dlss.evaluate(
+                        &self.interop,
+                        self.last_jitter,
+                        self.settings.dlss_sharpness,
+                    ) {
+                        self.settings.dlss_on = false;
+                        if self.using_dlss_tex {
+                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                self.interop.device(),
+                                &self.display_view,
+                                wgpu::FilterMode::Linear,
+                                self.display_tex_id,
+                            );
+                            self.using_dlss_tex = false;
+                        }
+                        self.dlss_pass = None;
+                        self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
+                    }
+                } else {
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(self.render_w * 4),
+                                rows_per_image: Some(self.render_h),
+                            },
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.display_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: self.render_w,
+                            height: self.render_h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
 
             for (id, deltas) in &full_output.textures_delta.set {
@@ -658,21 +1239,39 @@ mod demo_app {
         }
     }
 
+    struct RenderTargets {
+        rgba: [SharedBuffer; 2],
+        depth: [SharedBuffer; 2],
+        motion: [SharedBuffer; 2],
+        display_texture: wgpu::Texture,
+    }
+
     fn allocate_render_targets(
         interop: &InteropContext,
         width: u32,
         height: u32,
-    ) -> Result<([SharedBuffer; 2], wgpu::Texture), nv_wgpu::Error> {
-        let byte_size = u64::from(width * height * 4);
-        let make_shared = |label| {
+    ) -> Result<RenderTargets, nv_wgpu::Error> {
+        let pixels = u64::from(width) * u64::from(height);
+        let make_shared = |label, bytes| {
             interop.create_buffer(&SharedBufferDescriptor {
                 label: Some(label),
-                size: byte_size,
+                size: bytes,
                 usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
             })
         };
-        let shared = [make_shared("optix-rgba8-0")?, make_shared("optix-rgba8-1")?];
-        let tex = interop.device().create_texture(&wgpu::TextureDescriptor {
+        let rgba = [
+            make_shared("optix-rgba8-0", pixels * 4)?,
+            make_shared("optix-rgba8-1", pixels * 4)?,
+        ];
+        let depth = [
+            make_shared("optix-depth-0", pixels * 4)?,
+            make_shared("optix-depth-1", pixels * 4)?,
+        ];
+        let motion = [
+            make_shared("optix-motion-0", pixels * 8)?,
+            make_shared("optix-motion-1", pixels * 8)?,
+        ];
+        let display_texture = interop.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("optix-viewport"),
             size: wgpu::Extent3d {
                 width,
@@ -686,7 +1285,12 @@ mod demo_app {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        Ok((shared, tex))
+        Ok(RenderTargets {
+            rgba,
+            depth,
+            motion,
+            display_texture,
+        })
     }
 
     fn save_front_png(interop: &InteropContext, dev_ptr: u64, width: u32, height: u32) -> String {

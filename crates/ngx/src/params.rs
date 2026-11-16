@@ -13,13 +13,13 @@ use crate::error::{Error, Result};
 use crate::types::{DlssFeatureFlags, DlssPerfQuality};
 use std::ffi::c_void;
 
-#[cfg(target_os = "windows")]
-use crate::error::check;
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
+use crate::check_sys;
+#[cfg(has_ngx_sdk)]
 use crate::vulkan::VulkanSession;
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 use std::ffi::{CString, c_char};
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 use std::sync::Arc;
 
 /// Common NGX parameter key names (from `nvsdk_ngx_defs.h`).
@@ -40,19 +40,65 @@ pub mod keys {
     pub const SUPER_SAMPLING_AVAILABLE: &str = "SuperSampling.Available";
     /// Ray-reconstruction availability flag (`"RayReconstruction.Available"`).
     pub const RAY_RECONSTRUCTION_AVAILABLE: &str = "RayReconstruction.Available";
+    /// Sharpness (`"Sharpness"`).
+    pub const SHARPNESS: &str = "Sharpness";
+    /// Legacy RTX value flag (`"RTXValue"`).
+    pub const RTX_VALUE: &str = "RTXValue";
+    /// DLSS optimal-settings callback pointer (`"DLSSOptimalSettingsCallback"`).
+    pub const DLSS_OPTIMAL_SETTINGS_CALLBACK: &str = "DLSSOptimalSettingsCallback";
+    /// Dynamic DLSS max render width (`"DLSS.Get.Dynamic.Max.Render.Width"`).
+    pub const DLSS_DYNAMIC_MAX_RENDER_WIDTH: &str = "DLSS.Get.Dynamic.Max.Render.Width";
+    /// Dynamic DLSS max render height (`"DLSS.Get.Dynamic.Max.Render.Height"`).
+    pub const DLSS_DYNAMIC_MAX_RENDER_HEIGHT: &str = "DLSS.Get.Dynamic.Max.Render.Height";
+    /// Dynamic DLSS min render width (`"DLSS.Get.Dynamic.Min.Render.Width"`).
+    pub const DLSS_DYNAMIC_MIN_RENDER_WIDTH: &str = "DLSS.Get.Dynamic.Min.Render.Width";
+    /// Dynamic DLSS min render height (`"DLSS.Get.Dynamic.Min.Render.Height"`).
+    pub const DLSS_DYNAMIC_MIN_RENDER_HEIGHT: &str = "DLSS.Get.Dynamic.Min.Render.Height";
+    /// Creation GPU node mask (`"CreationNodeMask"`).
+    pub const CREATION_NODE_MASK: &str = "CreationNodeMask";
+    /// Visibility GPU node mask (`"VisibilityNodeMask"`).
+    pub const VISIBILITY_NODE_MASK: &str = "VisibilityNodeMask";
+    /// Enable output subrects (`"DLSS.Enable.Output.Subrects"`).
+    pub const DLSS_ENABLE_OUTPUT_SUBRECTS: &str = "DLSS.Enable.Output.Subrects";
+    /// Color input resource (`"Color"`).
+    pub const COLOR: &str = "Color";
+    /// Output resource (`"Output"`).
+    pub const OUTPUT: &str = "Output";
+    /// Depth input resource (`"Depth"`).
+    pub const DEPTH: &str = "Depth";
+    /// Motion vectors input resource (`"MotionVectors"`).
+    pub const MOTION_VECTORS: &str = "MotionVectors";
+    /// Jitter offset X (`"Jitter.Offset.X"`).
+    pub const JITTER_OFFSET_X: &str = "Jitter.Offset.X";
+    /// Jitter offset Y (`"Jitter.Offset.Y"`).
+    pub const JITTER_OFFSET_Y: &str = "Jitter.Offset.Y";
+    /// Temporal history reset flag (`"Reset"`).
+    pub const RESET: &str = "Reset";
+    /// Motion vector X scale (`"MV.Scale.X"`).
+    pub const MV_SCALE_X: &str = "MV.Scale.X";
+    /// Motion vector Y scale (`"MV.Scale.Y"`).
+    pub const MV_SCALE_Y: &str = "MV.Scale.Y";
+    /// Render subrect width (`"DLSS.Render.Subrect.Dimensions.Width"`).
+    pub const DLSS_RENDER_SUBRECT_WIDTH: &str = "DLSS.Render.Subrect.Dimensions.Width";
+    /// Render subrect height (`"DLSS.Render.Subrect.Dimensions.Height"`).
+    pub const DLSS_RENDER_SUBRECT_HEIGHT: &str = "DLSS.Render.Subrect.Dimensions.Height";
+    /// Pre-exposure scalar (`"DLSS.Pre.Exposure"`).
+    pub const DLSS_PRE_EXPOSURE: &str = "DLSS.Pre.Exposure";
+    /// Exposure scale (`"DLSS.Exposure.Scale"`).
+    pub const DLSS_EXPOSURE_SCALE: &str = "DLSS.Exposure.Scale";
 }
 
 /// RAII wrapper around an `NVSDK_NGX_Parameter` bag.
 ///
 /// Destroyed automatically on [`Drop`] via `NVSDK_NGX_VULKAN_DestroyParameters`.
 pub struct Parameters {
-    #[cfg(target_os = "windows")]
+    #[cfg(has_ngx_sdk)]
     pub(crate) ptr: *mut ngx_sys::NVSDK_NGX_Parameter,
-    #[cfg(target_os = "windows")]
+    #[cfg(has_ngx_sdk)]
     pub(crate) _session: Arc<VulkanSession>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 impl Drop for Parameters {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -64,7 +110,7 @@ impl Drop for Parameters {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 impl Parameters {
     pub(crate) fn from_raw(
         ptr: *mut ngx_sys::NVSDK_NGX_Parameter,
@@ -93,90 +139,90 @@ impl Parameters {
 impl Parameters {
     /// Sets an unsigned 64-bit integer parameter (`NVSDK_NGX_Parameter_SetULL`).
     pub fn set_u64(&mut self, name: &str, value: u64) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is a valid `NVSDK_NGX_Parameter` and `cname` is NUL-terminated.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetULL(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Sets an unsigned 32-bit integer parameter (`NVSDK_NGX_Parameter_SetUI`).
     pub fn set_u32(&mut self, name: &str, value: u32) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is a valid `NVSDK_NGX_Parameter` and `cname` is NUL-terminated.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetUI(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Sets a signed 32-bit integer parameter (`NVSDK_NGX_Parameter_SetI`).
     pub fn set_i32(&mut self, name: &str, value: i32) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is a valid `NVSDK_NGX_Parameter` and `cname` is NUL-terminated.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetI(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Sets a 32-bit float parameter (`NVSDK_NGX_Parameter_SetF`).
     pub fn set_f32(&mut self, name: &str, value: f32) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is a valid `NVSDK_NGX_Parameter` and `cname` is NUL-terminated.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetF(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Sets a 64-bit float parameter (`NVSDK_NGX_Parameter_SetD`).
     pub fn set_f64(&mut self, name: &str, value: f64) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is a valid `NVSDK_NGX_Parameter` and `cname` is NUL-terminated.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetD(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
@@ -188,144 +234,144 @@ impl Parameters {
     /// `value` must point to a valid object of the type expected by NGX for `name` (for example,
     /// `*mut NVSDK_NGX_Resource_VK`) and remain valid for as long as NGX reads it.
     pub unsafe fn set_void_ptr(&mut self, name: &str, value: *mut c_void) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and caller guarantees `value`.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_SetVoidPointer(self.ptr, cname, value) };
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = (name, value);
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads an unsigned 64-bit integer parameter (`NVSDK_NGX_Parameter_GetULL`).
     pub fn get_u64(&self, name: &str) -> Result<u64> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out = 0u64;
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetULL(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetULL", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetULL", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads an unsigned 32-bit integer parameter (`NVSDK_NGX_Parameter_GetUI`).
     pub fn get_u32(&self, name: &str) -> Result<u32> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out = 0u32;
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetUI(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetUI", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetUI", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads a signed 32-bit integer parameter (`NVSDK_NGX_Parameter_GetI`).
     pub fn get_i32(&self, name: &str) -> Result<i32> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out = 0i32;
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetI(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetI", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetI", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads a 32-bit float parameter (`NVSDK_NGX_Parameter_GetF`).
     pub fn get_f32(&self, name: &str) -> Result<f32> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out = 0.0f32;
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetF(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetF", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetF", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads a 64-bit float parameter (`NVSDK_NGX_Parameter_GetD`).
     pub fn get_f64(&self, name: &str) -> Result<f64> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out = 0.0f64;
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetD(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetD", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetD", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
 
     /// Reads a raw pointer parameter (`NVSDK_NGX_Parameter_GetVoidPointer`).
     pub fn get_void_ptr(&self, name: &str) -> Result<*mut c_void> {
-        #[cfg(target_os = "windows")]
+        #[cfg(has_ngx_sdk)]
         {
             let mut out: *mut c_void = std::ptr::null_mut();
             let rc = with_cstr(name, |cname| {
                 // SAFETY: `self.ptr` is valid, `cname` is NUL-terminated, and `out` is writable.
                 unsafe { ngx_sys::NVSDK_NGX_Parameter_GetVoidPointer(self.ptr, cname, &mut out) }
             })?;
-            check("NVSDK_NGX_Parameter_GetVoidPointer", rc)?;
+            check_sys("NVSDK_NGX_Parameter_GetVoidPointer", rc)?;
             Ok(out)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(has_ngx_sdk))]
         {
             let _ = name;
             Err(Error::Unsupported(
-                "NGX is only supported on Windows".into(),
+                "NGX SDK is not available for this target".into(),
             ))
         }
     }
@@ -361,7 +407,7 @@ impl Parameters {
 }
 
 /// Invokes `f` with a NUL-terminated C string for `name` without heap allocation for short keys.
-#[cfg(target_os = "windows")]
+#[cfg(has_ngx_sdk)]
 pub(crate) fn with_cstr<R>(name: &str, f: impl FnOnce(*const c_char) -> R) -> Result<R> {
     let bytes = name.as_bytes();
     if bytes.contains(&0) {

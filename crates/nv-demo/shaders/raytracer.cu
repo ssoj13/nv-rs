@@ -38,7 +38,9 @@ struct Params {
     float sat_pos[4];      // [x, y, z, radius/enable]
     float glass_params[4]; // [ior, absorption, roughness, enable]
     unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion
-    unsigned int _pad1[3];
+    float jitter_x;
+    float jitter_y;
+    unsigned int _pad1;
 };
 
 extern "C" {
@@ -421,8 +423,9 @@ extern "C" __global__ void __raygen__render() {
     bool has_prev_cam = (prev_tan_fov > 1e-5f);
 
     for (unsigned int s = 0; s < spp; ++s) {
-        float jx = rand01(seed) - 0.5f;
-        float jy = rand01(seed) - 0.5f;
+        bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
+        float jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
+        float jy = use_dlss_jitter ? params.jitter_y : (rand01(seed) - 0.5f + params.jitter_y);
         float u = ((float)idx.x + 0.5f + jx) / (float)params.width * 2.0f - 1.0f;
         float v = 1.0f - ((float)idx.y + 0.5f + jy) / (float)params.height * 2.0f;
 

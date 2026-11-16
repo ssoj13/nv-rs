@@ -23,6 +23,9 @@ const NGX_RESULT_FAIL_BASE: i32 = -1_160_773_632;
 pub struct ResultCode(pub i32);
 
 impl ResultCode {
+    /// Driver or NGX binary is out of date (`NVSDK_NGX_Result_FAIL_OutOfDate`).
+    pub const OUT_OF_DATE: Self = Self(NGX_RESULT_FAIL_BASE + 12);
+
     /// Returns the underlying integer `NVSDK_NGX_Result` value.
     pub const fn raw(self) -> i32 {
         self.0

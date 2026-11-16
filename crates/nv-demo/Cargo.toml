@@ -7,10 +7,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-default = ["ngx"]
-ngx = ["dep:ngx"]
-
 [dependencies]
 nv-wgpu = { path = "../nv-wgpu" }
 nv-loader = { path = "../nv-loader" }
@@ -21,7 +17,7 @@ cufft = { path = "../cufft" }
 nvjpeg = { path = "../nvjpeg" }
 nvenc = { path = "../nvenc" }
 cupti = { path = "../cupti" }
-ngx = { path = "../ngx", optional = true }
+ngx = { path = "../ngx" }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-core-ext = { path = "../cuda-core-ext" }

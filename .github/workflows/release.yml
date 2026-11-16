@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x86_64
+            archive: nv-demo-windows-x86_64.zip
+          - os: ubuntu-latest
+            target: linux-x86_64
+            archive: nv-demo-linux-x86_64.tgz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI & Vulkan dev dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libvulkan-dev
+          echo "VULKAN_SDK=/usr" >> "$GITHUB_ENV"
+
+      - name: Setup CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.26
+        with:
+          cuda: "12.8.0"
+
+      - name: Fetch OptiX SDK headers (NVIDIA/optix-dev)
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/NVIDIA/optix-dev.git "${GITHUB_WORKSPACE}/optix-dev"
+          echo "OPTIX_ROOT=${GITHUB_WORKSPACE}/optix-dev" >> "$GITHUB_ENV"
+
+      - name: Fetch NVIDIA DLSS SDK (NVIDIA/DLSS)
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git "${GITHUB_WORKSPACE}/dlss-sdk"
+          echo "NGX_SDK_ROOT=${GITHUB_WORKSPACE}/dlss-sdk" >> "$GITHUB_ENV"
+
+      - name: Fetch Video Codec SDK headers (FFmpeg/nv-codec-headers)
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git "${GITHUB_WORKSPACE}/nv-codec-headers"
+          mkdir -p "${GITHUB_WORKSPACE}/video-codec-sdk/Interface"
+          cp "${GITHUB_WORKSPACE}/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h" "${GITHUB_WORKSPACE}/video-codec-sdk/Interface/nvEncodeAPI.h"
+          echo "VIDEO_CODEC_SDK_ROOT=${GITHUB_WORKSPACE}/video-codec-sdk" >> "$GITHUB_ENV"
+
+      - name: Build nv-demo (release)
+        run: cargo build -p nv-demo --release
+
+      - name: Stage portable Windows bundle
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/crates/nv-demo/shaders | Out-Null
+          Copy-Item target/release/nv-demo.exe dist/
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti
+          foreach ($dir in @("$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin")) {
+            if (Test-Path $dir) {
+              Get-ChildItem -Path $dir -Filter "nvrtc-builtins64_*.dll" -ErrorAction SilentlyContinue |
+                Copy-Item -Destination dist/ -Force
+            }
+          }
+          $dlssDll = Join-Path $env:NGX_SDK_ROOT "lib/Windows_x86_64/rel/nvngx_dlss.dll"
+          if (Test-Path $dlssDll) {
+            Copy-Item $dlssDll -Destination dist/ -Force
+          }
+          Copy-Item crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
+          Copy-Item README.md dist/
+          Get-ChildItem -Path . -Filter "LICENSE*" | Copy-Item -Destination dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}" -Force
+
+      - name: Stage portable Linux bundle
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          mkdir -p dist/crates/nv-demo/shaders
+          cp target/release/nv-demo dist/
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti
+          for dir in "${CUDA_PATH}/lib64" "${CUDA_PATH}/targets/x86_64-linux/lib"; do
+            if [ -d "$dir" ]; then
+              cp -L "$dir"/libnvrtc-builtins.so* dist/ 2>/dev/null || true
+            fi
+          done
+          if [ -d "${NGX_SDK_ROOT}/lib/Linux_x86_64/rel" ]; then
+            cp -L "${NGX_SDK_ROOT}/lib/Linux_x86_64/rel"/libnvidia-ngx-dlss.so* dist/ 2>/dev/null || true
+          fi
+          cp crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
+          cp README.md LICENSE* dist/ 2>/dev/null || true
+          cat << 'EOF' > dist/run-nv-demo.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="${DIR}:${LD_LIBRARY_PATH:-}"
+          exec "${DIR}/nv-demo" "$@"
+          EOF
+          chmod +x dist/nv-demo dist/run-nv-demo.sh
+          tar -C dist -czf "${{ matrix.archive }}" .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nv-demo-windows-x86_64.zip
+            nv-demo-linux-x86_64.tgz
+          generate_release_notes: true

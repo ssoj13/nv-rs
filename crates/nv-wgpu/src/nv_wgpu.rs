@@ -22,9 +22,12 @@
 //! Uses `cuda-core`, `cuda-core-ext`, `gpu-info-rs`, `wgpu`, `ash`, and OS handle APIs
 //! (`Win32` NT handles on Windows, `OPAQUE_FD` on Unix).
 
+use std::ffi::c_void;
 use std::sync::Arc;
 
+use ash::vk::Handle as _;
 use cuda_core::Context;
+use wgpu::hal::api::Vulkan;
 
 pub mod buffer;
 pub mod device;
@@ -38,8 +41,9 @@ pub use buffer::{SharedBuffer, SharedBufferDescriptor, validate_buffer_descripto
 #[cfg(windows)]
 pub use device::wgpu_dx12_luid;
 pub use device::{
-    GpuIdentity, InteropBackend, detect_backend, find_matching_cuda_device,
-    open_vulkan_device_with_interop, pair_shared_gpu, required_vulkan_extensions,
+    GpuIdentity, InteropBackend, create_vulkan_instance_with_extensions, detect_backend,
+    find_matching_cuda_device, open_vulkan_device_with_interop,
+    open_vulkan_device_with_interop_extensions, pair_shared_gpu, required_vulkan_extensions,
     verify_device_interop_support, verify_matching_cuda_device, wgpu_gpu_identity,
     wgpu_vulkan_uuid,
 };
@@ -52,7 +56,41 @@ pub use format::{
 pub use sync::InteropSemaphore;
 pub use texture::{
     SharedSurfaceObject, SharedTexture, SharedTextureDescriptor, validate_texture_descriptor,
+    vk_image_view_raw,
 };
+
+/// Vulkan image layout transitions recorded via [`InteropContext::vk_image_barrier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VkImageTransition {
+    /// `TRANSFER_DST_OPTIMAL` -> `SHADER_READ_ONLY_OPTIMAL` (compute shader read).
+    TransferDstToShaderRead,
+    /// `SHADER_READ_ONLY_OPTIMAL` -> `TRANSFER_DST_OPTIMAL` (restore for `wgpu` copy).
+    ShaderReadToTransferDst,
+    /// `UNDEFINED` -> `GENERAL` (compute storage read/write).
+    UndefinedToGeneral,
+    /// `GENERAL` -> `SHADER_READ_ONLY_OPTIMAL` (fragment shader sample).
+    GeneralToShaderRead,
+}
+
+/// Raw Vulkan handles extracted from an [`InteropContext`] for external native
+/// SDKs (such as NVIDIA NGX).
+#[derive(Debug, Clone, Copy)]
+pub struct RawVulkanHandles {
+    /// Raw `VkInstance` handle.
+    pub instance: *mut c_void,
+    /// Raw `VkPhysicalDevice` handle.
+    pub physical_device: *mut c_void,
+    /// Raw `VkDevice` handle.
+    pub device: *mut c_void,
+    /// Raw `PFN_vkGetInstanceProcAddr` function pointer.
+    pub get_instance_proc_addr: *const c_void,
+    /// Raw `PFN_vkGetDeviceProcAddr` function pointer.
+    pub get_device_proc_addr: *const c_void,
+    /// Raw `VkQueue` handle (`wgpu` queue, or dedicated barrier queue if configured).
+    pub queue: *mut c_void,
+    /// Vulkan queue family index of `queue`.
+    pub queue_family_index: u32,
+}
 
 /// Paired `wgpu::Device` + `wgpu::Queue` + matching `cuda_core::Context` verified
 /// for zero-copy external memory and timeline semaphore interop.
@@ -63,6 +101,7 @@ pub struct InteropContext {
     queue: wgpu::Queue,
     cuda_ctx: Arc<Context>,
     vulkan_barrier_queue: Option<ash::vk::Queue>,
+    vulkan_cmd_runner: Option<Arc<platform::VkBarrierRunner>>,
 }
 
 impl std::fmt::Debug for InteropContext {
@@ -72,6 +111,23 @@ impl std::fmt::Debug for InteropContext {
             .field("cuda_ordinal", &self.cuda_ctx.ordinal())
             .finish_non_exhaustive()
     }
+}
+
+fn build_vulkan_cmd_runner(
+    backend: InteropBackend,
+    device: &wgpu::Device,
+) -> Result<Option<Arc<platform::VkBarrierRunner>>> {
+    if backend != InteropBackend::Vulkan {
+        return Ok(None);
+    }
+    // SAFETY: Read-only inspection of Vulkan HAL device and queue family index.
+    let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
+        expected: "Vulkan",
+        found: device.adapter_info().backend,
+    })?;
+    let runner =
+        platform::VkBarrierRunner::new(hal_dev.raw_device().clone(), hal_dev.queue_family_index())?;
+    Ok(Some(Arc::new(runner)))
 }
 
 impl InteropContext {
@@ -84,12 +140,14 @@ impl InteropContext {
     ) -> Result<Self> {
         let backend = verify_device_interop_support(&device)?;
         let cuda_ctx = find_matching_cuda_device(adapter, &device)?;
+        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &device)?;
         Ok(Self {
             backend,
             device,
             queue,
             cuda_ctx,
             vulkan_barrier_queue: None,
+            vulkan_cmd_runner,
         })
     }
 
@@ -103,12 +161,14 @@ impl InteropContext {
     ) -> Result<Self> {
         let backend = verify_device_interop_support(&device)?;
         verify_matching_cuda_device(adapter, &device, &cuda_ctx)?;
+        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &device)?;
         Ok(Self {
             backend,
             device,
             queue,
             cuda_ctx,
             vulkan_barrier_queue: None,
+            vulkan_cmd_runner,
         })
     }
 
@@ -120,7 +180,26 @@ impl InteropContext {
         limits: &wgpu::Limits,
         label: Option<&str>,
     ) -> Result<Self> {
-        let (device, queue) = open_vulkan_device_with_interop(adapter, features, limits, label)?;
+        Self::open_vulkan_with_extensions(adapter, features, limits, label, &[])
+    }
+
+    /// Opens a Vulkan `wgpu::Device` from `adapter` with all required external
+    /// interop extensions plus `extra_device_exts` enabled, then pairs it with
+    /// the matching CUDA device.
+    pub fn open_vulkan_with_extensions(
+        adapter: &wgpu::Adapter,
+        features: wgpu::Features,
+        limits: &wgpu::Limits,
+        label: Option<&str>,
+        extra_device_exts: &[&str],
+    ) -> Result<Self> {
+        let (device, queue) = open_vulkan_device_with_interop_extensions(
+            adapter,
+            features,
+            limits,
+            label,
+            extra_device_exts,
+        )?;
         Self::from_wgpu(adapter, device, queue)
     }
 
@@ -133,12 +212,14 @@ impl InteropContext {
     /// open an interop-ready device from `&shared.adapter` via [`Self::open_vulkan`].
     pub fn from_shared_gpu(shared: &gpu_info::SharedGpu) -> Result<Self> {
         let (backend, cuda_ctx) = pair_shared_gpu(shared)?;
+        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &shared.device)?;
         Ok(Self {
             backend,
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             cuda_ctx,
             vulkan_barrier_queue: None,
+            vulkan_cmd_runner,
         })
     }
 
@@ -216,5 +297,153 @@ impl InteropContext {
         signal: Option<(&InteropSemaphore, u64)>,
     ) -> Result<()> {
         platform::flush_wgpu_wait_signal(&self.queue, wait, signal)
+    }
+
+    /// Extracts raw Vulkan handles (`VkInstance`, `VkPhysicalDevice`, `VkDevice`,
+    /// `VkQueue`, queue family index, and `vkGet*ProcAddr`) when backed by Vulkan,
+    /// or returns `None` on DX12.
+    pub fn raw_vulkan_handles(&self) -> Option<RawVulkanHandles> {
+        if self.backend != InteropBackend::Vulkan {
+            return None;
+        }
+        // SAFETY: Read-only HAL inspection of Vulkan device and queue handles.
+        let hal_dev = unsafe { self.device.as_hal::<Vulkan>() }?;
+        let shared_inst = hal_dev.shared_instance();
+        let raw_inst = shared_inst.raw_instance();
+        let raw_queue = if let Some(q) = self.vulkan_barrier_queue {
+            q
+        } else {
+            // SAFETY: Read-only HAL inspection of `wgpu`'s Vulkan queue handle.
+            let hal_q = unsafe { self.queue.as_hal::<Vulkan>() }?;
+            hal_q.as_raw()
+        };
+        Some(RawVulkanHandles {
+            instance: raw_inst.handle().as_raw() as usize as *mut c_void,
+            physical_device: hal_dev.raw_physical_device().as_raw() as usize as *mut c_void,
+            device: hal_dev.raw_device().handle().as_raw() as usize as *mut c_void,
+            get_instance_proc_addr: shared_inst.entry().static_fn().get_instance_proc_addr
+                as *const c_void,
+            get_device_proc_addr: raw_inst.fp_v1_0().get_device_proc_addr as *const c_void,
+            queue: raw_queue.as_raw() as usize as *mut c_void,
+            queue_family_index: hal_dev.queue_family_index(),
+        })
+    }
+
+    /// Allocates/reuses a primary `VkCommandBuffer`, lets `f` record commands into
+    /// it (`*mut c_void` = `VkCommandBuffer`), submits it to the device's Vulkan
+    /// queue, and waits for completion via fence.
+    pub fn submit_vulkan_commands<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(*mut c_void) -> Result<R>,
+    {
+        if self.backend != InteropBackend::Vulkan {
+            return Err(Error::BackendMismatch {
+                expected: "Vulkan",
+                found: self.device.adapter_info().backend,
+            });
+        }
+        let runner = self
+            .vulkan_cmd_runner
+            .as_deref()
+            .ok_or_else(|| Error::BackendMismatch {
+                expected: "Vulkan",
+                found: self.device.adapter_info().backend,
+            })?;
+        platform::with_barrier_vk_queue(&self.queue, self.vulkan_barrier_queue, |raw_q| {
+            runner.record_and_submit_wait(raw_q, |cmd| f(cmd.as_raw() as usize as *mut c_void))
+        })
+    }
+
+    /// Records a `vkCmdPipelineBarrier` image layout transition into `cmd_buffer`
+    /// (`*mut c_void` = `VkCommandBuffer`) for `image` (`*mut c_void` = `VkImage`).
+    ///
+    /// # Safety
+    ///
+    /// `cmd_buffer` must be a valid recording `VkCommandBuffer` from
+    /// [`Self::submit_vulkan_commands`], and `image` must be a live `VkImage` on `self.device`.
+    pub unsafe fn vk_image_barrier(
+        &self,
+        cmd_buffer: *mut c_void,
+        image: *mut c_void,
+        transition: VkImageTransition,
+    ) -> Result<()> {
+        if self.backend != InteropBackend::Vulkan {
+            return Err(Error::BackendMismatch {
+                expected: "Vulkan",
+                found: self.device.adapter_info().backend,
+            });
+        }
+        let runner = self
+            .vulkan_cmd_runner
+            .as_deref()
+            .ok_or_else(|| Error::BackendMismatch {
+                expected: "Vulkan",
+                found: self.device.adapter_info().backend,
+            })?;
+        let cmd = ash::vk::CommandBuffer::from_raw(cmd_buffer as usize as u64);
+        let img = ash::vk::Image::from_raw(image as usize as u64);
+        let (src_stage, dst_stage, src_access, dst_access, old_layout, new_layout) =
+            match transition {
+                VkImageTransition::TransferDstToShaderRead => (
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ash::vk::AccessFlags::TRANSFER_WRITE,
+                    ash::vk::AccessFlags::SHADER_READ,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ),
+                VkImageTransition::ShaderReadToTransferDst => (
+                    ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::AccessFlags::SHADER_READ,
+                    ash::vk::AccessFlags::TRANSFER_WRITE,
+                    ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                ),
+                VkImageTransition::UndefinedToGeneral => (
+                    ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+                    ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ash::vk::AccessFlags::empty(),
+                    ash::vk::AccessFlags::SHADER_WRITE | ash::vk::AccessFlags::SHADER_READ,
+                    ash::vk::ImageLayout::UNDEFINED,
+                    ash::vk::ImageLayout::GENERAL,
+                ),
+                VkImageTransition::GeneralToShaderRead => (
+                    ash::vk::PipelineStageFlags::COMPUTE_SHADER,
+                    ash::vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    ash::vk::AccessFlags::SHADER_WRITE,
+                    ash::vk::AccessFlags::SHADER_READ,
+                    ash::vk::ImageLayout::GENERAL,
+                    ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ),
+            };
+        let barrier = ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
+            .image(img)
+            .subresource_range(ash::vk::ImageSubresourceRange {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        // SAFETY: Caller guarantees `cmd` is a valid recording `VkCommandBuffer` and `img` is live.
+        unsafe {
+            runner.vk_device().cmd_pipeline_barrier(
+                cmd,
+                src_stage,
+                dst_stage,
+                ash::vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                core::slice::from_ref(&barrier),
+            );
+        }
+        Ok(())
     }
 }

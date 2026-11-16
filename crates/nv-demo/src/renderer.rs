@@ -22,8 +22,10 @@ use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::{VideoRecorder, save_jpeg_from_rgba8};
 
 #[cfg(has_embedded_ptx)]
-const EMBEDDED_RAYTRACER_PTX: &str =
-    concat!(include_str!(concat!(env!("OUT_DIR"), "/raytracer.ptx")), "\0");
+const EMBEDDED_RAYTRACER_PTX: &str = concat!(
+    include_str!(concat!(env!("OUT_DIR"), "/raytracer.ptx")),
+    "\0"
+);
 #[cfg(has_embedded_ptx)]
 const EMBEDDED_TONEMAP_PTX: &str =
     concat!(include_str!(concat!(env!("OUT_DIR"), "/tonemap.ptx")), "\0");
@@ -85,7 +87,9 @@ struct LaunchParams {
     sat_pos: [f32; 4],
     glass_params: [f32; 4],
     aov_mode: u32,
-    _pad1: [u32; 3],
+    jitter_x: f32,
+    jitter_y: f32,
+    _pad1: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<LaunchParams>() == 432);
@@ -194,6 +198,10 @@ pub struct DemoSettings {
     pub split_on: bool,
     pub split_x: f32,
     pub right_is_aov: u32,
+    // DLSS Super Resolution (NGX)
+    pub dlss_on: bool,
+    pub dlss_quality: u32,
+    pub dlss_sharpness: f32,
 }
 
 impl Default for DemoSettings {
@@ -290,6 +298,9 @@ impl Default for DemoSettings {
             split_on: false,
             split_x: 0.5,
             right_is_aov: 0,
+            dlss_on: false,
+            dlss_quality: 3,
+            dlss_sharpness: 0.35,
         }
     }
 }
@@ -313,6 +324,8 @@ pub enum RenderCmd {
         width: u32,
         height: u32,
         buf_ptrs: [u64; 2],
+        depth_ptrs: [u64; 2],
+        motion_ptrs: [u64; 2],
         gen_id: u64,
     },
     ReturnBuffer {
@@ -336,6 +349,7 @@ pub struct FrameReady {
     pub gen_id: u64,
     pub accum_count: u32,
     pub total_samples: u32,
+    pub jitter: [f32; 2],
     pub rt_ms: f32,
     pub denoise_ms: f32,
     pub bloom_ms: f32,
@@ -699,8 +713,12 @@ fn build_ias(
         } else {
             (gas.glass_mesh, 0)
         };
-        let s_min = state.sat_size_range[0].min(state.sat_size_range[1]).max(0.001);
-        let s_max = state.sat_size_range[0].max(state.sat_size_range[1]).max(0.001);
+        let s_min = state.sat_size_range[0]
+            .min(state.sat_size_range[1])
+            .max(0.001);
+        let s_max = state.sat_size_range[0]
+            .max(state.sat_size_range[1])
+            .max(0.001);
         let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
         let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
         let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
@@ -1019,9 +1037,23 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     rig.stream.synchronize().expect("resize sync");
 }
 
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut f = 1.0f32;
+    let mut r = 0.0f32;
+    let base_f = base as f32;
+    while index > 0 {
+        f /= base_f;
+        r += f * (index % base) as f32;
+        index /= base;
+    }
+    r
+}
+
 pub fn spawn_render_thread(
     cuda: Arc<CudaContext>,
     initial_buf_ptrs: [u64; 2],
+    initial_depth_ptrs: [u64; 2],
+    initial_motion_ptrs: [u64; 2],
     initial_settings: DemoSettings,
     initial_camera: CameraFrame,
 ) -> (Sender<RenderCmd>, Receiver<FrameReady>, JoinHandle<()>) {
@@ -1038,6 +1070,8 @@ pub fn spawn_render_thread(
             let mut cur_h = DEFAULT_H;
             let mut cur_gen: u64 = 0;
             let mut buf_ptrs = initial_buf_ptrs;
+            let mut depth_ptrs = initial_depth_ptrs;
+            let mut motion_ptrs = initial_motion_ptrs;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut settings = initial_settings;
             let mut camera = initial_camera;
@@ -1085,6 +1119,8 @@ pub fn spawn_render_thread(
                                  cur_h: &mut u32,
                                  cur_gen: &mut u64,
                                  buf_ptrs: &mut [u64; 2],
+                                 depth_ptrs: &mut [u64; 2],
+                                 motion_ptrs: &mut [u64; 2],
                                  free_bufs: &mut VecDeque<usize>,
                                  settings: &mut DemoSettings,
                                  camera: &mut CameraFrame,
@@ -1108,6 +1144,7 @@ pub fn spawn_render_thread(
                             tmp.bloom_threshold = settings.bloom_threshold;
                             tmp.bloom_intensity = settings.bloom_intensity;
                             tmp.bloom_blades = settings.bloom_blades;
+                            tmp.dlss_sharpness = settings.dlss_sharpness;
                             if s.aov_mode < 3 && settings.aov_mode < 3 {
                                 tmp.aov_mode = settings.aov_mode;
                             }
@@ -1124,6 +1161,8 @@ pub fn spawn_render_thread(
                             width,
                             height,
                             buf_ptrs: new_ptrs,
+                            depth_ptrs: new_depth_ptrs,
+                            motion_ptrs: new_motion_ptrs,
                             gen_id,
                         } => {
                             if let Some(rec) = recorder.take() {
@@ -1136,6 +1175,8 @@ pub fn spawn_render_thread(
                                 *cur_h = height;
                             }
                             *buf_ptrs = new_ptrs;
+                            *depth_ptrs = new_depth_ptrs;
+                            *motion_ptrs = new_motion_ptrs;
                             *cur_gen = gen_id;
                             free_bufs.clear();
                             free_bufs.push_back(0);
@@ -1215,6 +1256,8 @@ pub fn spawn_render_thread(
                         &mut cur_h,
                         &mut cur_gen,
                         &mut buf_ptrs,
+                        &mut depth_ptrs,
+                        &mut motion_ptrs,
                         &mut free_bufs,
                         &mut settings,
                         &mut camera,
@@ -1250,6 +1293,8 @@ pub fn spawn_render_thread(
                                 &mut cur_h,
                                 &mut cur_gen,
                                 &mut buf_ptrs,
+                                &mut depth_ptrs,
+                                &mut motion_ptrs,
                                 &mut free_bufs,
                                 &mut settings,
                                 &mut camera,
@@ -1428,6 +1473,16 @@ pub fn spawn_render_thread(
                 let sun_y = el.sin();
                 let sun_z = el.cos() * az.cos();
 
+                let jitter = if settings.dlss_on {
+                    accum_count = 0;
+                    [
+                        halton((frame_index % 16) + 1, 2) - 0.5,
+                        halton((frame_index % 16) + 1, 3) - 0.5,
+                    ]
+                } else {
+                    [0.0, 0.0]
+                };
+
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
@@ -1526,7 +1581,9 @@ pub fn spawn_render_thread(
                         if settings.sat_on { 1.0 } else { 0.0 },
                     ],
                     aov_mode: settings.aov_mode,
-                    _pad1: [0; 3],
+                    jitter_x: jitter[0],
+                    jitter_y: jitter[1],
+                    _pad1: 0,
                 };
                 prev_camera = camera;
                 rig.params_buf
@@ -1543,8 +1600,10 @@ pub fn spawn_render_thread(
                 rig.stream.synchronize().expect("rt sync");
                 let rt_ms = t_rt.elapsed().as_secs_f32() * 1000.0;
 
-                let (mut final_f32_ptr, denoise_ms) =
-                    if settings.denoiser_on && settings.aov_mode == 0 {
+                let (mut final_f32_ptr, denoise_ms) = if settings.denoiser_on
+                    && !settings.dlss_on
+                    && settings.aov_mode == 0
+                {
                     let t_den = Instant::now();
                     let flow_img = if rig.denoiser_is_temporal {
                         Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
@@ -1608,7 +1667,7 @@ pub fn spawn_render_thread(
 
                 let bloom_ms = if settings.bloom_on && settings.aov_mode == 0 {
                     if let Some(ref mut bloom) = rig.bloom {
-                        let bloom_ready = if !settings.denoiser_on {
+                        let bloom_ready = if !settings.denoiser_on || settings.dlss_on {
                             // SAFETY: `color_f32` and `denoised_f32` have identical byte size on `rig.stream`.
                             let cp_res = unsafe {
                                 cu::cuMemcpyDtoDAsync_v2(
@@ -1710,6 +1769,32 @@ pub fn spawn_render_thread(
                     cu::cudaError_enum_CUDA_SUCCESS,
                     "tonemap cuLaunchKernel failed"
                 );
+                if settings.dlss_on {
+                    // SAFETY: `rig.depth_f32` and `depth_ptrs[buf_idx]` have `cur_w * cur_h * 4` bytes;
+                    // `rig.motion_f32` and `motion_ptrs[buf_idx]` have `cur_w * cur_h * 8` bytes.
+                    let (depth_res, motion_res) = unsafe {
+                        let d = cu::cuMemcpyDtoDAsync_v2(
+                            depth_ptrs[buf_idx],
+                            rig.depth_f32.cu_deviceptr(),
+                            rig.depth_f32.num_bytes(),
+                            rig.stream.cu_stream(),
+                        );
+                        let m = cu::cuMemcpyDtoDAsync_v2(
+                            motion_ptrs[buf_idx],
+                            rig.motion_f32.cu_deviceptr(),
+                            rig.motion_f32.num_bytes(),
+                            rig.stream.cu_stream(),
+                        );
+                        (d, m)
+                    };
+                    if depth_res != cu::cudaError_enum_CUDA_SUCCESS
+                        || motion_res != cu::cudaError_enum_CUDA_SUCCESS
+                    {
+                        pending_status = Some(format!(
+                            "DLSS guide copy failed (depth={depth_res:?}, motion={motion_res:?})"
+                        ));
+                    }
+                }
                 rig.stream.synchronize().expect("tonemap sync");
                 let tonemap_ms = t_tm.elapsed().as_secs_f32() * 1000.0;
 
@@ -1748,6 +1833,7 @@ pub fn spawn_render_thread(
                         gen_id: cur_gen,
                         accum_count,
                         total_samples: accum_count.saturating_mul(settings.spp),
+                        jitter,
                         rt_ms,
                         denoise_ms,
                         bloom_ms,

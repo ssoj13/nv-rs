@@ -13,7 +13,7 @@ path = "src/ngx.rs"
 [dependencies]
 thiserror.workspace = true
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(target_os = "windows", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 ngx-sys = { path = "../ngx-sys" }
 
 [lints]

@@ -52,10 +52,35 @@ jobs:
             libvulkan-dev
           echo "VULKAN_SDK=/usr" >> "$GITHUB_ENV"
 
-      - name: Setup CUDA Toolkit
+      - name: Setup CUDA Toolkit (Windows)
+        if: matrix.os == 'windows-latest'
         uses: Jimver/cuda-toolkit@v0.2.26
         with:
           cuda: "12.8.0"
+          method: network
+          use-github-cache: false
+          use-local-cache: false
+          sub-packages: '["nvcc_12.8", "cudart_12.8", "nvrtc_12.8", "nvrtc_dev_12.8", "cufft_12.8", "cufft_dev_12.8", "nvjpeg_12.8", "nvjpeg_dev_12.8", "cupti_12.8"]'
+
+      - name: Setup CUDA Toolkit (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-12-8 \
+            cuda-cudart-dev-12-8 \
+            cuda-nvrtc-12-8 \
+            cuda-nvrtc-dev-12-8 \
+            libcufft-12-8 \
+            libcufft-dev-12-8 \
+            libnvjpeg-12-8 \
+            libnvjpeg-dev-12-8 \
+            cuda-cupti-12-8
+          echo "CUDA_PATH=/usr/local/cuda-12.8" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
 
       - name: Fetch OptiX SDK headers (NVIDIA/optix-dev)
         shell: bash

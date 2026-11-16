@@ -421,6 +421,9 @@ impl Navigator {
             if raw.keys_allowed {
                 self.keys(&raw, bindings, &mut requests);
             }
+            if self.drag.is_some() {
+                cursor = CursorRequest::Locked;
+            }
         }
         self.fly.active = engaged;
         self.hovered_last = raw.hovered;

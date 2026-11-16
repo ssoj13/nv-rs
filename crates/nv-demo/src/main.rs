@@ -722,6 +722,10 @@ mod demo_app {
             resp.repaint
         }
 
+        pub fn handle_mouse_motion(&mut self, delta: (f64, f64)) {
+            self.egui_winit.on_mouse_motion(delta);
+        }
+
         pub fn render(&mut self) {
             let now = Instant::now();
             let dt = (now - self.last_frame_at).as_secs_f32().clamp(1e-4, 0.1);
@@ -1419,6 +1423,19 @@ impl ApplicationHandler for Runner {
             app.render();
         }
         app.handle_window_event(&event);
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let (Some(app), winit::event::DeviceEvent::MouseMotion { delta }) =
+            (self.app.as_mut(), event)
+        {
+            app.handle_mouse_motion(delta);
+        }
     }
 }
 

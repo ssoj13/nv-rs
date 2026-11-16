@@ -163,6 +163,11 @@ pub struct DemoSettings {
     pub sat_height_max: f32,
     pub sat_speed_min: f32,
     pub sat_speed_max: f32,
+    pub sat_bob_amp_min: f32,
+    pub sat_bob_amp_max: f32,
+    pub sat_bob_freq_min: f32,
+    pub sat_bob_freq_max: f32,
+    pub sat_hue_spread: f32,
     pub glass_ior: f32,
     pub glass_absorb: f32,
     pub glass_roughness: f32,
@@ -254,8 +259,13 @@ impl Default for DemoSettings {
             sat_orbit_max: 2.85,
             sat_height_min: -0.45,
             sat_height_max: 0.85,
-            sat_speed_min: 0.40,
+            sat_speed_min: -1.20,
             sat_speed_max: 1.60,
+            sat_bob_amp_min: 0.04,
+            sat_bob_amp_max: 0.22,
+            sat_bob_freq_min: 0.80,
+            sat_bob_freq_max: 2.80,
+            sat_hue_spread: 0.35,
             glass_ior: 1.52,
             glass_absorb: 0.45,
             glass_roughness: 0.02,
@@ -638,6 +648,9 @@ struct SceneState {
     sat_orbit_range: [f32; 2],
     sat_height_range: [f32; 2],
     sat_speed_range: [f32; 2],
+    sat_bob_amp_range: [f32; 2],
+    sat_bob_freq_range: [f32; 2],
+    sat_hue_spread: f32,
     sat_on: bool,
     glass_analytic: bool,
     neon_on: bool,
@@ -676,14 +689,19 @@ fn build_ias(
         } else {
             (gas.glass_mesh, 0)
         };
-        let s_min = state.sat_size_range[0].min(state.sat_size_range[1]).max(0.05);
-        let s_max = state.sat_size_range[0].max(state.sat_size_range[1]).max(0.05);
+        let s_min = state.sat_size_range[0].min(state.sat_size_range[1]).max(0.001);
+        let s_max = state.sat_size_range[0].max(state.sat_size_range[1]).max(0.001);
         let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
         let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
         let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
         let h_max = state.sat_height_range[0].max(state.sat_height_range[1]);
         let v_min = state.sat_speed_range[0].min(state.sat_speed_range[1]);
         let v_max = state.sat_speed_range[0].max(state.sat_speed_range[1]);
+        let a_min = state.sat_bob_amp_range[0].min(state.sat_bob_amp_range[1]);
+        let a_max = state.sat_bob_amp_range[0].max(state.sat_bob_amp_range[1]);
+        let f_min = state.sat_bob_freq_range[0].min(state.sat_bob_freq_range[1]);
+        let f_max = state.sat_bob_freq_range[0].max(state.sat_bob_freq_range[1]);
+        let hue_spread = state.sat_hue_spread.clamp(0.0, 1.0);
 
         for idx in 0..count {
             let base = state
@@ -695,6 +713,10 @@ fn build_ias(
             let u2 = splitmix32(base ^ 0x3333_3333);
             let u3 = splitmix32(base ^ 0x4444_4444);
             let u4 = splitmix32(base ^ 0x5555_5555);
+            let u5 = splitmix32(base ^ 0x6666_6666);
+            let u6 = splitmix32(base ^ 0x7777_7777);
+            let u7 = splitmix32(base ^ 0x8888_8888);
+            let u8 = splitmix32(base ^ 0x9999_9999);
 
             let r = s_min + (s_max - s_min) * u0;
             // Stratify orbital radii across the band with seeded jitter so spheres stay spaced.
@@ -704,12 +726,19 @@ fn build_ias(
             let phase0 = u3 * std::f32::consts::TAU;
             let speed = v_min + (v_max - v_min) * u4;
             let angle = phase0 + state.sat_angle * speed;
+            let bob_amp = a_min + (a_max - a_min) * u5;
+            let bob_freq = f_min + (f_max - f_min) * u6;
+            let bob_phase = u7 * std::f32::consts::TAU;
+            let bob = (state.sat_angle * bob_freq + bob_phase).sin() * 0.7
+                + (state.sat_angle * bob_freq * 0.63 + bob_phase * 1.7).cos() * 0.3;
             let px = orbit_r * angle.cos();
-            let py = height + 0.08 * (angle * 1.7 + phase0).sin();
+            let py = height + bob_amp * bob;
             let pz = orbit_r * angle.sin();
+            let hue = (0.48 + (u8 - 0.5) * hue_spread).rem_euclid(1.0);
+            let hue_byte = (hue * 255.0).round().clamp(0.0, 255.0) as u32;
 
             let mut inst = Instance::new(glass_gas);
-            inst.id = 2;
+            inst.id = 2 | (hue_byte << 8);
             inst.sbt_offset = sbt_off;
             inst.transform = [r, 0.0, 0.0, px, 0.0, r, 0.0, py, 0.0, 0.0, r, pz];
             instances.push(inst);
@@ -882,6 +911,15 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
                 initial_settings.sat_speed_min,
                 initial_settings.sat_speed_max,
             ],
+            sat_bob_amp_range: [
+                initial_settings.sat_bob_amp_min,
+                initial_settings.sat_bob_amp_max,
+            ],
+            sat_bob_freq_range: [
+                initial_settings.sat_bob_freq_min,
+                initial_settings.sat_bob_freq_max,
+            ],
+            sat_hue_spread: initial_settings.sat_hue_spread,
             sat_on: initial_settings.sat_on,
             glass_analytic: initial_settings.glass_analytic,
             neon_on: initial_settings.neon_on,
@@ -1000,6 +1038,11 @@ pub fn spawn_render_thread(
                     settings.sat_height_max,
                     settings.sat_speed_min,
                     settings.sat_speed_max,
+                    settings.sat_bob_amp_min,
+                    settings.sat_bob_amp_max,
+                    settings.sat_bob_freq_min,
+                    settings.sat_bob_freq_max,
+                    settings.sat_hue_spread,
                     0.0,
                 ],
             );
@@ -1243,6 +1286,11 @@ pub fn spawn_render_thread(
                         settings.sat_height_max,
                         settings.sat_speed_min,
                         settings.sat_speed_max,
+                        settings.sat_bob_amp_min,
+                        settings.sat_bob_amp_max,
+                        settings.sat_bob_freq_min,
+                        settings.sat_bob_freq_max,
+                        settings.sat_hue_spread,
                         sat_angle,
                     ],
                 );
@@ -1266,6 +1314,12 @@ pub fn spawn_render_thread(
                             sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
                             sat_height_range: [settings.sat_height_min, settings.sat_height_max],
                             sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
+                            sat_bob_amp_range: [settings.sat_bob_amp_min, settings.sat_bob_amp_max],
+                            sat_bob_freq_range: [
+                                settings.sat_bob_freq_min,
+                                settings.sat_bob_freq_max,
+                            ],
+                            sat_hue_spread: settings.sat_hue_spread,
                             sat_on: settings.sat_on,
                             glass_analytic: settings.glass_analytic,
                             neon_on: settings.neon_on,

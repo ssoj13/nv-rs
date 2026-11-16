@@ -149,10 +149,11 @@ mod demo_app {
             let egui_ctx = egui::Context::default();
             install_fonts(&egui_ctx);
             egui_ctx.all_styles_mut(|style| {
-                style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-                style.spacing.window_margin = egui::Margin::same(8);
-                style.spacing.button_padding = egui::vec2(8.0, 3.0);
-                style.spacing.interact_size = egui::vec2(36.0, 18.0);
+                style.spacing.item_spacing = egui::vec2(4.0, 1.0);
+                style.spacing.window_margin = egui::Margin::same(4);
+                style.spacing.button_padding = egui::vec2(5.0, 1.0);
+                style.spacing.interact_size = egui::vec2(28.0, 13.0);
+                style.spacing.slider_rail_height = 3.0;
                 for (ts, fid) in style.text_styles.iter_mut() {
                     fid.size = match ts {
                         egui::TextStyle::Heading => 14.0,

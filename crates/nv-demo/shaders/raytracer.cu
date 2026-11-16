@@ -484,7 +484,7 @@ extern "C" __global__ void __raygen__render() {
                 (float)((p5 >> 8u) & 0xFFu) / 255.0f,
                 (float)((p5 >> 16u) & 0xFFu) / 255.0f
             );
-            unsigned int inst_id = p6;
+            unsigned int inst_id = p6 & 0xFFu;
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
             if (bounce == 0 && s == 0) {
@@ -508,8 +508,16 @@ extern "C" __global__ void __raygen__render() {
                 float absorb = fmaxf(0.0f, params.glass_params[1]);
                 float g_rough = fmaxf(0.0f, fminf(0.5f, params.glass_params[2]));
                 if (!entering && absorb > 0.0f) {
-                    // Subtle cyan-emerald optical glass absorption
-                    float3 sigma = make_float3(0.85f * absorb, 0.22f * absorb, 0.14f * absorb);
+                    float hue = (float)((p6 >> 8u) & 0xFFu) * (1.0f / 255.0f);
+                    float h6 = fmodf(hue * 6.0f, 6.0f);
+                    float r = fminf(1.0f, fmaxf(0.0f, fabsf(h6 - 3.0f) - 1.0f));
+                    float g = fminf(1.0f, fmaxf(0.0f, 2.0f - fabsf(h6 - 2.0f)));
+                    float b = fminf(1.0f, fmaxf(0.0f, 2.0f - fabsf(h6 - 4.0f)));
+                    float3 sigma = make_float3(
+                        (1.05f - r) * absorb,
+                        (1.05f - g) * absorb,
+                        (1.05f - b) * absorb
+                    );
                     throughput = f3_mul3(throughput, make_float3(
                         expf(-sigma.x * hit_t),
                         expf(-sigma.y * hit_t),

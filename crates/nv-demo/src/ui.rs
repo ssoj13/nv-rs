@@ -13,7 +13,7 @@ use crate::renderer::DemoSettings;
 
 const LABEL_W: f32 = 86.0;
 const VAL_W: f32 = 64.0;
-const ROW_H: f32 = 20.0;
+const ROW_H: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
@@ -454,7 +454,7 @@ impl UiContext<'_> {
                 }
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(2.0);
 
         section_header(ui, ic::CUBE, "Formula");
         equal_grid(ui, 3, 3, |ui, idx, w| {
@@ -473,7 +473,7 @@ impl UiContext<'_> {
                 s.fractal_kind = kind;
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(1.0);
 
         match s.fractal_kind {
             0 => {
@@ -539,14 +539,14 @@ impl UiContext<'_> {
             }
         }
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::ARROWS_OUT_CARDINAL, "Transform");
         prop_slider_f32(ui, "Obj Scale", &mut s.obj_scale, 0.25..=2.5, 2, false);
         prop_slider_f32(ui, "Rot X", &mut s.rot_x, -180.0..=180.0, 1, false);
         prop_slider_f32(ui, "Rot Y", &mut s.rot_y, -180.0..=180.0, 1, false);
         prop_slider_f32(ui, "Rot Z", &mut s.rot_z, -180.0..=180.0, 1, false);
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::SLIDERS_HORIZONTAL, "Detail & Shading");
         prop_slider_f32(
             ui,
@@ -584,12 +584,12 @@ impl UiContext<'_> {
         prop_slider_f32(ui, "Haze", &mut s.horizon_haze, 0.4..=2.5, 2, false);
         prop_slider_f32(ui, "Exposure", &mut s.exposure, 0.25..=2.0, 2, false);
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::APERTURE, "Lens DoF");
         prop_slider_f32(ui, "Aperture", &mut s.aperture, 0.0..=0.12, 3, false);
         prop_slider_f32(ui, "Focus Dist", &mut s.focus_dist, 0.5..=12.0, 2, false);
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::SQUARES_FOUR, "Scratched Metal Floor");
         prop_slider_f32(
             ui,
@@ -603,7 +603,7 @@ impl UiContext<'_> {
         prop_slider_f32(ui, "Tile Scale", &mut s.floor_scale, 0.3..=5.0, 2, false);
         prop_slider_f32(ui, "Metallic", &mut s.floor_metallic, 0.0..=1.0, 2, false);
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::GLOBE, "Scene");
         prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
         if s.sat_on {
@@ -615,14 +615,19 @@ impl UiContext<'_> {
                 prop_slider_u32(ui, "V Segs", &mut s.sat_v_segs, 4..=96, false);
             }
             prop_slider_u32(ui, "Orbit Seed", &mut s.sat_seed, 0..=9999, false);
-            prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.05..=0.80, 2, false);
-            prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.05..=0.80, 2, false);
+            prop_slider_f32(ui, "Min Size", &mut s.sat_size_min, 0.001..=0.80, 3, false);
+            prop_slider_f32(ui, "Max Size", &mut s.sat_size_max, 0.001..=0.80, 3, false);
             prop_slider_f32(ui, "Min Orbit", &mut s.sat_orbit_min, 0.6..=4.5, 2, false);
             prop_slider_f32(ui, "Max Orbit", &mut s.sat_orbit_max, 0.6..=4.5, 2, false);
             prop_slider_f32(ui, "Min Height", &mut s.sat_height_min, -1.0..=2.0, 2, false);
             prop_slider_f32(ui, "Max Height", &mut s.sat_height_max, -1.0..=2.0, 2, false);
-            prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, 0.1..=3.0, 2, false);
-            prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, 0.1..=3.0, 2, false);
+            prop_slider_f32(ui, "Min Speed", &mut s.sat_speed_min, -3.0..=3.0, 2, false);
+            prop_slider_f32(ui, "Max Speed", &mut s.sat_speed_max, -3.0..=3.0, 2, false);
+            prop_slider_f32(ui, "Bob Amp Min", &mut s.sat_bob_amp_min, 0.0..=0.80, 2, false);
+            prop_slider_f32(ui, "Bob Amp Max", &mut s.sat_bob_amp_max, 0.0..=0.80, 2, false);
+            prop_slider_f32(ui, "Bob Frq Min", &mut s.sat_bob_freq_min, 0.0..=5.0, 2, false);
+            prop_slider_f32(ui, "Bob Frq Max", &mut s.sat_bob_freq_max, 0.0..=5.0, 2, false);
+            prop_slider_f32(ui, "Hue Spread", &mut s.sat_hue_spread, 0.0..=1.0, 2, false);
             prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
             prop_slider_f32(
                 ui,
@@ -632,11 +637,11 @@ impl UiContext<'_> {
                 3,
                 false,
             );
-            prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=2.50, 2, false);
+            prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=12.0, 2, false);
         }
         prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::SUN_DIM, "FFT Bloom (cuFFT)");
         prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
         if s.bloom_on {
@@ -645,7 +650,7 @@ impl UiContext<'_> {
             prop_slider_u32(ui, "Blades", &mut s.bloom_blades, 3..=12, false);
         }
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::COLUMNS, "A/B Split");
         prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
         if s.split_on {
@@ -667,7 +672,7 @@ impl UiContext<'_> {
             });
         }
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::SPARKLE, "Path Tracer");
         prop_row(ui, "Scale", |ui| {
             let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
@@ -707,7 +712,7 @@ impl UiContext<'_> {
         prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
         prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=2.0, 2, false);
 
-        ui.add_space(4.0);
+        ui.add_space(1.0);
         equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
                 ui.add_sized(
@@ -731,7 +736,7 @@ impl UiContext<'_> {
                 ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(1.0);
         equal_grid(ui, 2, 4, |ui, idx, w| match idx {
             0 => {
                 if ui
@@ -780,7 +785,7 @@ impl UiContext<'_> {
                 }
             }
         });
-        ui.add_space(3.0);
+        ui.add_space(2.0);
         if ui
             .add_sized(
                 [ui.available_width(), ROW_H + 2.0],
@@ -854,7 +859,7 @@ impl UiContext<'_> {
         stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
         stat_row(ui, "NGX", &self.telemetry.ngx_status);
 
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         section_header(ui, ic::CHART_LINE, "Performance");
         sparkline_row(
             ui,
@@ -893,7 +898,6 @@ fn section_header(ui: &mut Ui, icon: &str, title: &str) {
             .strong()
             .color(Color32::from_rgb(166, 209, 137)),
     );
-    ui.add_space(2.0);
 }
 
 fn equal_grid(

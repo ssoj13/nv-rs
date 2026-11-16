@@ -126,6 +126,115 @@ impl TabViewer for UiContext<'_> {
 }
 
 impl UiContext<'_> {
+    pub fn ui_toolbar(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let (prev_m, prev_fly, prev_s, prev_f) = (
+                *self.cam_mode,
+                *self.cam_fly_mode,
+                *self.cam_scheme,
+                *self.cam_feel,
+            );
+
+            ui.label(RichText::new("Orbit").small().weak());
+            egui::ComboBox::from_id_salt("toolbar_cam_mode")
+                .width(96.0)
+                .selected_text(self.cam_mode.label())
+                .show_ui(ui, |ui| {
+                    for m in NavMode::ALL.into_iter().filter(|m| !m.is_fly()) {
+                        ui.selectable_value(self.cam_mode, m, m.label());
+                    }
+                });
+
+            ui.label(RichText::new("Fly (RMB)").small().weak());
+            egui::ComboBox::from_id_salt("toolbar_cam_fly")
+                .width(104.0)
+                .selected_text(self.cam_fly_mode.label())
+                .show_ui(ui, |ui| {
+                    for m in NavMode::ALL.into_iter().filter(|m| m.is_fly()) {
+                        ui.selectable_value(self.cam_fly_mode, m, m.label());
+                    }
+                });
+
+            ui.label(RichText::new("Scheme").small().weak());
+            egui::ComboBox::from_id_salt("toolbar_cam_scheme")
+                .width(74.0)
+                .selected_text(format!("{:?}", *self.cam_scheme))
+                .show_ui(ui, |ui| {
+                    for s in NavScheme::ALL {
+                        ui.selectable_value(self.cam_scheme, s, format!("{s:?}"));
+                    }
+                });
+
+            ui.label(RichText::new("Feel").small().weak());
+            egui::ComboBox::from_id_salt("toolbar_cam_feel")
+                .width(74.0)
+                .selected_text(format!("{:?}", *self.cam_feel))
+                .show_ui(ui, |ui| {
+                    for f in NavFeel::ALL {
+                        ui.selectable_value(self.cam_feel, f, format!("{f:?}"));
+                    }
+                });
+
+            if (
+                *self.cam_mode,
+                *self.cam_fly_mode,
+                *self.cam_scheme,
+                *self.cam_feel,
+            ) != (prev_m, prev_fly, prev_s, prev_f)
+            {
+                self.cam_driver.controller_mut().set_mode(*self.cam_mode);
+                let mut prefs = *self.cam_driver.prefs();
+                prefs.hold_fly_mode = *self.cam_fly_mode;
+                prefs.feel = *self.cam_feel;
+                self.cam_driver.set_prefs(prefs);
+                if *self.cam_scheme != prev_s {
+                    self.cam_driver.set_scheme(*self.cam_scheme);
+                    crate::enable_rmb_fly(self.cam_driver);
+                }
+            }
+
+            if ui.button(format!("{} Home", ic::HOUSE)).clicked() {
+                self.cam_driver.controller_mut().set_pose(self.cam_home);
+                *self.cam_pose = self.cam_home;
+            }
+            if ui.button(format!("{} Frame", ic::CROSSHAIR)).clicked() {
+                let ext = 1.35 * self.settings.obj_scale.max(0.25);
+                self.cam_driver.controller_mut().apply_intent(
+                    CameraIntent::FrameBounds {
+                        min: glam::Vec3::splat(-ext),
+                        max: glam::Vec3::splat(ext),
+                        margin: 1.2,
+                    },
+                    1.0 / 60.0,
+                    ViewportSize::new(self.render_w, self.render_h),
+                );
+                *self.cam_pose = self.cam_driver.controller().pose();
+            }
+
+            ui.separator();
+
+            ui.checkbox(&mut self.settings.auto_rotate, "Spin");
+            ui.add_enabled(
+                self.settings.sat_on,
+                egui::Checkbox::new(&mut self.settings.sat_orbit, "Orbit"),
+            );
+            ui.label(RichText::new("Speed").small().weak());
+            ui.add(
+                egui::DragValue::new(&mut self.settings.spin_speed)
+                    .range(0.0..=2.0)
+                    .speed(0.01)
+                    .fixed_decimals(2),
+            );
+            if ui
+                .button(format!("{} Reset", ic::ARROWS_CLOCKWISE))
+                .clicked()
+            {
+                *self.reset_accum_requested = true;
+            }
+        });
+    }
+
     fn ui_viewport(&mut self, ui: &mut Ui) {
         let avail = ui.available_size();
         let ppp = ui.ctx().pixels_per_point();
@@ -234,10 +343,18 @@ impl UiContext<'_> {
             4 => "MOTION",
             _ => "BEAUTY",
         };
-        let status = if self.settings.auto_rotate {
+        let sat_orbiting = self.settings.sat_on && self.settings.sat_orbit;
+        let status = if self.settings.auto_rotate || sat_orbiting {
+            let anim_tag = match (self.settings.auto_rotate, sat_orbiting) {
+                (true, true) => "SPIN+ORBIT",
+                (true, false) => "SPIN",
+                (false, true) => "ORBIT",
+                (false, false) => unreachable!(),
+            };
             format!(
-                "{} SPIN  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
+                "{} {}  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
                 ic::ARROWS_CLOCKWISE,
+                anim_tag,
                 self.render_w,
                 self.render_h,
                 aov_tag,
@@ -491,7 +608,24 @@ impl UiContext<'_> {
         if s.sat_on {
             prop_toggle(ui, "Orbit", &mut s.sat_orbit, "Animate Orbit");
             prop_slider_f32(ui, "Sat Radius", &mut s.sat_radius, 0.12..=0.80, 2, false);
+            prop_slider_f32(
+                ui,
+                "Orbit Radius",
+                &mut s.sat_orbit_radius,
+                0.6..=3.5,
+                2,
+                false,
+            );
+            prop_slider_f32(ui, "Sat Height", &mut s.sat_height, -0.8..=1.5, 2, false);
             prop_slider_f32(ui, "Glass IOR", &mut s.glass_ior, 1.05..=2.40, 2, false);
+            prop_slider_f32(
+                ui,
+                "Glass Rough",
+                &mut s.glass_roughness,
+                0.0..=0.35,
+                3,
+                false,
+            );
             prop_slider_f32(ui, "Absorb", &mut s.glass_absorb, 0.0..=2.50, 2, false);
         }
         prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
@@ -565,7 +699,7 @@ impl UiContext<'_> {
         });
         prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
         prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
-        prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=0.5, 3, false);
+        prop_slider_f32(ui, "Spin Speed", &mut s.spin_speed, 0.0..=2.0, 2, false);
 
         ui.add_space(4.0);
         equal_grid(ui, 2, 4, |ui, idx, w| match idx {
@@ -660,107 +794,6 @@ impl UiContext<'_> {
     }
 
     fn ui_camera_stats(&mut self, ui: &mut Ui) {
-        section_header(ui, ic::CAMERA, "Navigation (RMB = Fly)");
-        let (prev_m, prev_fly, prev_s, prev_f) = (
-            *self.cam_mode,
-            *self.cam_fly_mode,
-            *self.cam_scheme,
-            *self.cam_feel,
-        );
-
-        prop_row(ui, "Orbit Mode", |ui| {
-            egui::ComboBox::from_id_salt("cam_mode")
-                .width(ui.available_width())
-                .selected_text(self.cam_mode.label())
-                .show_ui(ui, |ui| {
-                    for m in NavMode::ALL.into_iter().filter(|m| !m.is_fly()) {
-                        ui.selectable_value(self.cam_mode, m, m.label());
-                    }
-                });
-        });
-        prop_row(ui, "Fly Mode", |ui| {
-            egui::ComboBox::from_id_salt("cam_fly")
-                .width(ui.available_width())
-                .selected_text(self.cam_fly_mode.label())
-                .show_ui(ui, |ui| {
-                    for m in NavMode::ALL.into_iter().filter(|m| m.is_fly()) {
-                        ui.selectable_value(self.cam_fly_mode, m, m.label());
-                    }
-                });
-        });
-        prop_row(ui, "Scheme", |ui| {
-            egui::ComboBox::from_id_salt("cam_scheme")
-                .width(ui.available_width())
-                .selected_text(format!("{:?}", *self.cam_scheme))
-                .show_ui(ui, |ui| {
-                    for s in NavScheme::ALL {
-                        ui.selectable_value(self.cam_scheme, s, format!("{s:?}"));
-                    }
-                });
-        });
-        prop_row(ui, "Feel", |ui| {
-            egui::ComboBox::from_id_salt("cam_feel")
-                .width(ui.available_width())
-                .selected_text(format!("{:?}", *self.cam_feel))
-                .show_ui(ui, |ui| {
-                    for f in NavFeel::ALL {
-                        ui.selectable_value(self.cam_feel, f, format!("{f:?}"));
-                    }
-                });
-        });
-
-        if (
-            *self.cam_mode,
-            *self.cam_fly_mode,
-            *self.cam_scheme,
-            *self.cam_feel,
-        ) != (prev_m, prev_fly, prev_s, prev_f)
-        {
-            self.cam_driver.controller_mut().set_mode(*self.cam_mode);
-            let mut prefs = *self.cam_driver.prefs();
-            prefs.hold_fly_mode = *self.cam_fly_mode;
-            prefs.feel = *self.cam_feel;
-            self.cam_driver.set_prefs(prefs);
-            self.cam_driver.set_scheme(*self.cam_scheme);
-        }
-
-        ui.add_space(4.0);
-        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
-            0 => {
-                if ui
-                    .add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Home", ic::HOUSE)),
-                    )
-                    .clicked()
-                {
-                    self.cam_driver.controller_mut().set_pose(self.cam_home);
-                    *self.cam_pose = self.cam_home;
-                }
-            }
-            _ => {
-                if ui
-                    .add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Frame", ic::CROSSHAIR)),
-                    )
-                    .clicked()
-                {
-                    self.cam_driver.controller_mut().apply_intent(
-                        CameraIntent::FrameBounds {
-                            min: glam::Vec3::splat(-1.25),
-                            max: glam::Vec3::splat(1.25),
-                            margin: 1.2,
-                        },
-                        1.0 / 60.0,
-                        ViewportSize::new(self.render_w, self.render_h),
-                    );
-                    *self.cam_pose = self.cam_driver.controller().pose();
-                }
-            }
-        });
-
-        ui.add_space(6.0);
         section_header(ui, ic::GAUGE, "Telemetry");
         stat_row(ui, "GPU", &self.telemetry.gpu_name);
         stat_row(

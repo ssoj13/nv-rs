@@ -233,9 +233,9 @@ impl Default for DemoSettings {
             temporal_denoise: false,
             shadows_on: true,
             auto_rotate: false,
-            spin_speed: 0.045,
+            spin_speed: 0.45,
             sat_on: true,
-            sat_orbit: true,
+            sat_orbit: false,
             sat_radius: 0.36,
             sat_orbit_radius: 1.65,
             sat_height: 0.25,
@@ -903,6 +903,10 @@ pub fn spawn_render_thread(
                             tmp.split_on = settings.split_on;
                             tmp.split_x = settings.split_x;
                             tmp.right_is_aov = settings.right_is_aov;
+                            tmp.bloom_on = settings.bloom_on;
+                            tmp.bloom_threshold = settings.bloom_threshold;
+                            tmp.bloom_intensity = settings.bloom_intensity;
+                            tmp.bloom_blades = settings.bloom_blades;
                             if s.aov_mode < 3 && settings.aov_mode < 3 {
                                 tmp.aov_mode = settings.aov_mode;
                             }
@@ -1073,7 +1077,7 @@ pub fn spawn_render_thread(
                     accum_count = 0;
                 }
                 if settings.sat_on && settings.sat_orbit {
-                    sat_angle += dt * 0.65;
+                    sat_angle += dt * settings.spin_speed;
                     accum_count = 0;
                 }
 
@@ -1219,7 +1223,7 @@ pub fn spawn_render_thread(
                     fractal_xform: [
                         settings.obj_scale,
                         settings.rot_x.to_radians(),
-                        settings.rot_y.to_radians(),
+                        settings.rot_y.to_radians() + spin_angle,
                         settings.rot_z.to_radians(),
                     ],
                     fractal_r0: [
@@ -1307,8 +1311,8 @@ pub fn spawn_render_thread(
                 rig.stream.synchronize().expect("rt sync");
                 let rt_ms = t_rt.elapsed().as_secs_f32() * 1000.0;
 
-                let (final_f32_ptr, denoise_ms) = if settings.denoiser_on && settings.aov_mode == 0
-                {
+                let (mut final_f32_ptr, denoise_ms) =
+                    if settings.denoiser_on && settings.aov_mode == 0 {
                     let t_den = Instant::now();
                     let flow_img = if rig.denoiser_is_temporal {
                         Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
@@ -1372,17 +1376,40 @@ pub fn spawn_render_thread(
 
                 let bloom_ms = if settings.bloom_on && settings.aov_mode == 0 {
                     if let Some(ref mut bloom) = rig.bloom {
-                        bloom
-                            .apply(
-                                &rig.stream,
-                                final_f32_ptr,
-                                cur_w,
-                                cur_h,
-                                settings.bloom_threshold,
-                                settings.bloom_intensity,
-                                settings.bloom_blades,
-                            )
-                            .unwrap_or(0.0)
+                        let bloom_ready = if !settings.denoiser_on {
+                            // SAFETY: `color_f32` and `denoised_f32` have identical byte size on `rig.stream`.
+                            let cp_res = unsafe {
+                                cu::cuMemcpyDtoDAsync_v2(
+                                    rig.denoised_f32.cu_deviceptr(),
+                                    rig.color_f32.cu_deviceptr(),
+                                    rig.color_f32.num_bytes(),
+                                    rig.stream.cu_stream(),
+                                )
+                            };
+                            if cp_res == cu::cudaError_enum_CUDA_SUCCESS {
+                                final_f32_ptr = rig.denoised_f32.cu_deviceptr();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        };
+                        if bloom_ready {
+                            bloom
+                                .apply(
+                                    &rig.stream,
+                                    final_f32_ptr,
+                                    cur_w,
+                                    cur_h,
+                                    settings.bloom_threshold,
+                                    settings.bloom_intensity,
+                                    settings.bloom_blades,
+                                )
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
                     } else {
                         0.0
                     }

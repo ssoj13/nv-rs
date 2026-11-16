@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use demo_app::DemoApp;
+use demo_app::{DemoApp, enable_rmb_fly};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -163,7 +163,8 @@ mod demo_app {
             });
 
             let prefs = NavPrefs {
-                hold_fly_mode: NavMode::SpaceSim,
+                hold_fly_mode: NavMode::FpsFly,
+                feel: NavFeel::Sharp,
                 ..NavPrefs::default()
             };
             let scheme = NavScheme::default();
@@ -379,6 +380,9 @@ mod demo_app {
                 last_saved_msg: self.last_saved_msg.as_deref(),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                egui::Panel::top("top_toolbar").show(ui, |ui| {
+                    ui_ctx.ui_toolbar(ui);
+                });
                 DockArea::new(&mut self.dock_state)
                     .style(self.dock_style.clone())
                     .show_close_buttons(false)
@@ -665,7 +669,7 @@ mod demo_app {
         }
     }
 
-    fn enable_rmb_fly(driver: &mut CameraDriver) {
+    pub(crate) fn enable_rmb_fly(driver: &mut CameraDriver) {
         use crate::camera_core::input::{Button, DragBinding, DragRole, Mods};
         let drags = &mut driver.bindings_mut().drags;
         drags.retain(|b| !(b.button == Button::Secondary && b.mods == Mods::NONE));

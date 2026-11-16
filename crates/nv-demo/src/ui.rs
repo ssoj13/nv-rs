@@ -39,6 +39,12 @@ impl DockTab {
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    // Ensure phosphor icons also resolve when a widget sets TextStyle::Monospace.
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("phosphor".to_owned());
     ctx.set_fonts(fonts);
 }
 
@@ -1010,6 +1016,31 @@ impl UiContext<'_> {
         let anim = &mut *self.demo_anim;
 
         collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
+            prop_row(ui, "Background", |ui| {
+                let gap = 4.0;
+                let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                ui.spacing_mut().item_spacing.x = gap;
+                let modes = [
+                    "Daylight",
+                    "Sunset",
+                    "Studio",
+                    "Nebula",
+                    "Cyber Grid",
+                    "Elevated (4k)",
+                    "Unprogress (4k)",
+                    "Offscreen Colonies",
+                ];
+                let idx = (s.sky_mode as usize).min(modes.len() - 1);
+                egui::ComboBox::from_id_salt("sky_mode_combo")
+                    .width(combo_w)
+                    .selected_text(modes[idx])
+                    .show_ui(ui, |ui| {
+                        for (i, label) in modes.iter().enumerate() {
+                            ui.selectable_value(&mut s.sky_mode, i as u32, *label);
+                        }
+                    });
+                anim_toggle_btn_disabled(ui);
+            });
             anim_slider_f32(
                 ui,
                 anim,
@@ -1754,11 +1785,20 @@ fn anim_toggle_btn(ui: &mut Ui, anim: &mut DemoAnimator, key: &str) {
         .frame(active);
     if ui
         .add_sized([ANIM_BTN_W, ROW_H], btn)
-        .on_hover_text("Animate ±Amp*sin(2πt/Period)")
+        .on_hover_text("Animate +/-10% * Amp * range * sin(2*pi*t / Period)")
         .clicked()
     {
         anim.toggle(key);
     }
+}
+
+fn anim_toggle_btn_disabled(ui: &mut Ui) {
+    let col = ui.visuals().weak_text_color().gamma_multiply(0.45);
+    let btn = egui::Button::new(RichText::new(ic::WAVE_SINE).size(11.0).color(col)).frame(false);
+    ui.add_enabled_ui(false, |ui| {
+        ui.add_sized([ANIM_BTN_W, ROW_H], btn)
+            .on_disabled_hover_text("This parameter cannot be animated");
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1781,6 +1821,7 @@ fn anim_slider_f32(
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
+        let prev_style = ui.style().override_text_style.clone();
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         ui.add_sized(
             [VAL_W, ROW_H],
@@ -1789,6 +1830,7 @@ fn anim_slider_f32(
                 .fixed_decimals(decimals)
                 .speed(0.005),
         );
+        ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn(ui, anim, key);
     });
 }
@@ -1796,18 +1838,21 @@ fn anim_slider_f32(
 fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let track_w = (ui.available_width() - VAL_W - gap).max(40.0);
+        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
+        let prev_style = ui.style().override_text_style.clone();
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         ui.add_sized(
             [VAL_W, ROW_H],
             egui::DragValue::new(val).range(range).speed(1.0),
         );
+        ui.style_mut().override_text_style = prev_style;
+        anim_toggle_btn_disabled(ui);
     });
 }
 
@@ -1824,6 +1869,8 @@ fn anim_vec3(
         let gap = 4.0;
         let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(28.0);
         ui.spacing_mut().item_spacing.x = gap;
+        let prev_style = ui.style().override_text_style.clone();
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         for item in v.iter_mut() {
             ui.add_sized(
                 [w, ROW_H],
@@ -1833,13 +1880,24 @@ fn anim_vec3(
                     .fixed_decimals(2),
             );
         }
+        ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn(ui, anim, key);
     });
 }
 
 fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
     prop_row(ui, label, |ui| {
-        ui.checkbox(val, text);
+        let gap = 4.0;
+        let check_w = (ui.available_width() - ANIM_BTN_W - gap).max(40.0);
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.allocate_ui_with_layout(
+            egui::vec2(check_w, ROW_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.checkbox(val, text);
+            },
+        );
+        anim_toggle_btn_disabled(ui);
     });
 }
 

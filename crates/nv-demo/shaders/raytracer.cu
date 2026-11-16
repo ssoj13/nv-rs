@@ -26,7 +26,7 @@ struct Params {
     unsigned int fractal_kind; // 0=Mandelbulb, 1=Mandelbox, 2=KIFS Octahedron
     unsigned int bounces;
     float floor_params[4];     // [roughness, scratch, scale, metallic]
-    float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, pad]
+    float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, sky_mode]
     unsigned int accum_count;
     unsigned int _pad0[3];
     unsigned long long out_motion_f32;
@@ -333,13 +333,433 @@ static __forceinline__ __device__ float floor_height(float x, float z, float sca
     return macro * 0.55f + micro * 0.14f - scratches * 0.42f * scratch_amt;
 }
 
-static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __forceinline__ __device__ float sky_hash3(float3 p) {
+    float3 q = make_float3(
+        fmodf(fabsf(p.x) * 17.31f + fabsf(p.y) * 53.17f + fabsf(p.z) * 97.43f, 1.0f),
+        fmodf(fabsf(p.y) * 31.71f + fabsf(p.z) * 19.83f + fabsf(p.x) * 67.19f, 1.0f),
+        fmodf(fabsf(p.z) * 43.29f + fabsf(p.x) * 71.53f + fabsf(p.y) * 23.11f, 1.0f)
+    );
+    float d = q.x * 12.9898f + q.y * 78.233f + q.z * 37.719f;
+    float s = sinf(d) * 43758.5453f;
+    return s - floorf(s);
+}
+
+static __forceinline__ __device__ float sky_hash2(float x, float z) {
+    float h = sinf(x * 127.1f + z * 311.7f) * 43758.5453123f;
+    return h - floorf(h);
+}
+
+// Inigo Quilez "Elevated" 2D value noise with analytic derivatives: (val, dval/dx, dval/dz)
+static __forceinline__ __device__ float3 elevated_noised(float x, float z) {
+    float ix = floorf(x);
+    float iz = floorf(z);
+    float fx = x - ix;
+    float fz = z - iz;
+
+    float ux = fx * fx * fx * (fx * (fx * 6.0f - 15.0f) + 10.0f);
+    float uz = fz * fz * fz * (fz * (fz * 6.0f - 15.0f) + 10.0f);
+    float dux = 30.0f * fx * fx * (fx * (fx - 2.0f) + 1.0f);
+    float duz = 30.0f * fz * fz * (fz * (fz - 2.0f) + 1.0f);
+
+    float a = sky_hash2(ix + 0.0f, iz + 0.0f);
+    float b = sky_hash2(ix + 1.0f, iz + 0.0f);
+    float c = sky_hash2(ix + 0.0f, iz + 1.0f);
+    float d = sky_hash2(ix + 1.0f, iz + 1.0f);
+
+    float k0 = a;
+    float k1 = b - a;
+    float k2 = c - a;
+    float k3 = a - b - c + d;
+
+    float val = k0 + k1 * ux + k2 * uz + k3 * ux * uz;
+    float dx = dux * (k1 + k3 * uz);
+    float dz = duz * (k2 + k3 * ux);
+    return make_float3(val, dx, dz);
+}
+
+// iq's gradient-damped FBM mountain heightfield (returns height in world units)
+static __forceinline__ __device__ float elevated_terrain(float x, float z, int octaves) {
+    float a = 0.0f;
+    float b = 1.0f;
+    float dx = 0.0f;
+    float dz = 0.0f;
+    float px = x * 0.0022f;
+    float pz = z * 0.0022f;
+    for (int i = 0; i < octaves; ++i) {
+        float3 n = elevated_noised(px, pz);
+        dx += n.y;
+        dz += n.z;
+        a += b * n.x / (1.0f + dx * dx + dz * dz);
+        b *= 0.5f;
+        // Rotate & scale octave (0.8, -0.6; 0.6, 0.8) * 2.0
+        float nx = (0.8f * px - 0.6f * pz) * 2.0f;
+        float nz = (0.6f * px + 0.8f * pz) * 2.0f;
+        px = nx;
+        pz = nz;
+    }
+    return 185.0f * a;
+}
+
+static __forceinline__ __device__ float3 elevated_normal(float x, float z, float t, int octaves) {
+    float eps = fmaxf(0.15f, 0.0015f * t);
+    float hx = elevated_terrain(x - eps, z, octaves) - elevated_terrain(x + eps, z, octaves);
+    float hz = elevated_terrain(x, z - eps, octaves) - elevated_terrain(x, z + eps, octaves);
+    return f3_norm(make_float3(hx, 2.0f * eps, hz));
+}
+
+static __forceinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     float y = fmaxf(0.0f, dir.y);
+
+    // Base atmospheric sky + cirrus clouds
+    float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
+    float3 sky_col = f3_add(
+        f3_mul(make_float3(0.32f, 0.56f, 0.86f), 1.0f - 0.65f * powf(y, 0.5f)),
+        f3_mul(make_float3(0.08f, 0.20f, 0.48f), 0.65f * powf(y, 0.5f))
+    );
+    if (dir.y > 0.02f) {
+        float ct = 500.0f / dir.y;
+        float3 cl = elevated_noised(dir.x * ct * 0.0008f, dir.z * ct * 0.0008f);
+        float cl2 = elevated_noised(dir.x * ct * 0.0017f + 3.1f, dir.z * ct * 0.0017f - 1.7f).x;
+        float cloud = fmaxf(0.0f, (cl.x * 0.65f + cl2 * 0.35f) - 0.52f) * 2.1f;
+        cloud = fminf(1.0f, cloud) * fminf(1.0f, (dir.y - 0.02f) * 6.0f);
+        sky_col = f3_add(f3_mul(sky_col, 1.0f - cloud * 0.7f), f3_mul(make_float3(0.95f, 0.96f, 0.98f), cloud * 0.7f));
+    }
+    sky_col = f3_add(sky_col, f3_mul(make_float3(1.0f, 0.86f, 0.68f), powf(sun_dot, 8.0f) * 0.25f));
+
+    // Raymarch iq's FBM mountain range below horizon/low angles
+    if (dir.y < 0.22f) {
+        float ro_y = fmaxf(195.0f, elevated_terrain(0.0f, 0.0f, 4) + 35.0f);
+        float3 ro = make_float3(0.0f, ro_y, 0.0f);
+        float t = 12.0f;
+        float tmax = is_camera_ray ? 2600.0f : 1100.0f;
+        int steps = is_camera_ray ? 64 : 20;
+        int oct = is_camera_ray ? 7 : 4;
+        bool hit = false;
+        for (int i = 0; i < steps; ++i) {
+            float3 p = f3_add(ro, f3_mul(dir, t));
+            float h = elevated_terrain(p.x, p.z, oct);
+            float d = p.y - h;
+            if (d < 0.003f * t) {
+                hit = true;
+                break;
+            }
+            t += fmaxf(1.5f, d * 0.45f + 0.010f * t);
+            if (t > tmax) break;
+        }
+        if (hit) {
+            float3 p = f3_add(ro, f3_mul(dir, t));
+            float3 n = elevated_normal(p.x, p.z, t, oct);
+            float dif = fmaxf(0.0f, f3_dot(n, sun_dir));
+            float amb = 0.5f + 0.5f * n.y;
+
+            // Snow on flat high peaks, dark granite on steep cliffs
+            float snow = fmaxf(0.0f, fminf(1.0f, (n.y - 0.62f) * 3.5f))
+                       * fmaxf(0.0f, fminf(1.0f, (p.y - 68.0f) * 0.03f));
+            float3 rock = make_float3(0.14f, 0.13f, 0.12f);
+            float3 grass = make_float3(0.11f, 0.16f, 0.09f);
+            float3 base = f3_add(f3_mul(grass, fmaxf(0.0f, n.y - 0.5f)), f3_mul(rock, 1.0f - fmaxf(0.0f, n.y - 0.5f)));
+            base = f3_add(f3_mul(base, 1.0f - snow), f3_mul(make_float3(0.88f, 0.90f, 0.94f), snow));
+
+            float3 lit = f3_mul(base, dif * 1.35f + amb * 0.35f);
+            // Distance & valley exponential fog
+            float fog = 1.0f - expf(-t * (0.00085f * haze_k));
+            float3 fog_col = f3_add(f3_mul(sky_col, 0.75f), make_float3(0.20f, 0.24f, 0.30f));
+            float3 col = f3_add(f3_mul(lit, 1.0f - fog), f3_mul(fog_col, fog));
+            return f3_mul(col, sky_i);
+        }
+    }
+
+    float horizon_band = expf(-fabsf(dir.y) * (7.0f / haze_k));
+    sky_col = f3_add(sky_col, f3_mul(make_float3(0.75f, 0.78f, 0.84f), horizon_band * 0.25f));
+    return f3_mul(sky_col, sky_i);
+}
+
+// Mode 6: "Unprogress" style 4k procedural brutalist sci-fi cityscape & volumetric haze
+static __forceinline__ __device__ float unprogress_map(float3 p, float* out_win) {
+    float cell = 3.6f;
+    float ix = floorf(p.x / cell);
+    float iz = floorf(p.z / cell);
+    float h_rnd = sky_hash2(ix, iz);
+    float h_rnd2 = sky_hash2(ix + 13.7f, iz - 9.3f);
+
+    float lx = p.x - (ix + 0.5f) * cell;
+    float lz = p.z - (iz + 0.5f) * cell;
+
+    // Safe cell-boundary step bound so varying neighbor heights never cause slicing artifacts
+    float d_cell = fminf(0.5f * cell - fabsf(lx), 0.5f * cell - fabsf(lz)) + 0.04f;
+
+    // Keep central avenue clear so towers frame the foreground fractal instead of blocking it
+    float avenue = fabsf(ix + 0.5f);
+    float bw = 0.78f + 0.52f * h_rnd2;
+    float bh = (avenue < 1.2f && fabsf(iz + 0.5f) < 3.5f)
+        ? 0.4f
+        : (2.5f + 11.5f * h_rnd * h_rnd);
+
+    // Brutalist stepped tower SDF
+    float qx = fabsf(lx) - bw;
+    float qy = p.y - bh;
+    float qz = fabsf(lz) - bw;
+    float d_tower = fminf(fmaxf(qx, fmaxf(qy, qz)), 0.0f)
+        + sqrtf(fmaxf(qx, 0.0f) * fmaxf(qx, 0.0f) + fmaxf(qy, 0.0f) * fmaxf(qy, 0.0f) + fmaxf(qz, 0.0f) * fmaxf(qz, 0.0f));
+
+    // Upper brutalist overhang collar
+    float cx = fabsf(lx) - (bw + 0.16f);
+    float cy = fabsf(p.y - bh * 0.68f) - 0.28f;
+    float cz = fabsf(lz) - (bw + 0.16f);
+    float d_collar = fminf(fmaxf(cx, fmaxf(cy, cz)), 0.0f)
+        + sqrtf(fmaxf(cx, 0.0f) * fmaxf(cx, 0.0f) + fmaxf(cy, 0.0f) * fmaxf(cy, 0.0f) + fmaxf(cz, 0.0f) * fmaxf(cz, 0.0f));
+
+    // Fine recessed architectural slit windows
+    float wy = fabsf(fmodf(fabsf(p.y) * 3.2f, 1.0f) - 0.5f);
+    float wx = fabsf(fmodf(fabsf(lx + lz) * 2.8f, 1.0f) - 0.5f);
+    *out_win = (wy < 0.08f && wx < 0.16f && h_rnd > 0.35f && p.y > 0.6f && p.y < bh - 0.4f) ? 1.0f : 0.0f;
+
+    float d_obj = fminf(p.y, fminf(d_tower, d_collar));
+    return fminf(d_obj, d_cell);
+}
+
+static __forceinline__ __device__ float3 sky_unprogress(float3 dir, float3 sun_dir, bool is_camera_ray) {
+    float sky_i = fmaxf(0.05f, params.sky_params[0]);
+    float haze_k = fmaxf(0.5f, params.sky_params[2]);
+    float y = fmaxf(0.0f, dir.y);
+    float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
+
+    float3 overcast = f3_add(
+        f3_mul(make_float3(0.05f, 0.07f, 0.10f), powf(y, 0.5f)),
+        f3_mul(make_float3(0.16f, 0.22f, 0.28f), 1.0f - powf(y, 0.5f))
+    );
+    overcast = f3_add(overcast, f3_mul(make_float3(0.75f, 0.82f, 0.90f), powf(sun_dot, 12.0f) * 0.35f));
+
+    if (dir.y < 0.38f) {
+        float3 ro = make_float3(0.0f, 8.5f, 0.0f);
+        float t = 1.5f;
+        float tmax = is_camera_ray ? 58.0f : 26.0f;
+        int steps = is_camera_ray ? 64 : 22;
+        float win = 0.0f;
+        bool hit = false;
+        float glow = 0.0f;
+        for (int i = 0; i < steps; ++i) {
+            float3 p = f3_add(ro, f3_mul(dir, t));
+            float d = unprogress_map(p, &win);
+            glow += expf(-fabsf(d) * 3.5f) * 0.010f;
+            if (d < 0.015f) {
+                hit = true;
+                break;
+            }
+            t += fmaxf(0.04f, d * 0.85f);
+            if (t > tmax) break;
+        }
+        if (hit) {
+            float3 p = f3_add(ro, f3_mul(dir, t));
+            float w_dummy = 0.0f;
+            float e = 0.02f;
+            float3 n = f3_norm(make_float3(
+                unprogress_map(make_float3(p.x + e, p.y, p.z), &w_dummy) - unprogress_map(make_float3(p.x - e, p.y, p.z), &w_dummy),
+                unprogress_map(make_float3(p.x, p.y + e, p.z), &w_dummy) - unprogress_map(make_float3(p.x, p.y - e, p.z), &w_dummy),
+                unprogress_map(make_float3(p.x, p.y, p.z + e), &w_dummy) - unprogress_map(make_float3(p.x, p.y, p.z - e), &w_dummy)
+            ));
+            float dif = fmaxf(0.0f, f3_dot(n, sun_dir));
+            float3 concrete = make_float3(0.065f, 0.075f, 0.09f);
+            float3 lit = f3_mul(concrete, dif * 1.4f + 0.16f + 0.12f * fmaxf(0.0f, n.y));
+            if (win > 0.5f && n.y < 0.5f) {
+                float tint = sky_hash2(floorf(p.x * 2.0f), floorf(p.y * 2.0f));
+                float3 wc = (tint > 0.65f) ? make_float3(0.95f, 0.52f, 0.18f) : make_float3(0.24f, 0.72f, 0.95f);
+                lit = f3_add(lit, f3_mul(wc, 0.85f));
+            }
+            float fog = 1.0f - expf(-t * (0.042f * haze_k));
+            float3 fog_col = f3_add(overcast, f3_mul(make_float3(0.18f, 0.28f, 0.36f), glow));
+            return f3_mul(f3_add(f3_mul(lit, 1.0f - fog), f3_mul(fog_col, fog)), sky_i);
+        }
+        overcast = f3_add(overcast, f3_mul(make_float3(0.22f, 0.34f, 0.44f), glow));
+    }
+    return f3_mul(overcast, sky_i);
+}
+
+// Mode 7: "Offscreen Colonies" style orbital megastructure ring + modular trusses in deep space
+static __forceinline__ __device__ float colonies_map(float3 p, float* out_emissive) {
+    // Tilted orbital ring centered at (0, -2.0, 26.0)
+    float3 q = make_float3(p.x, p.y + 2.0f, p.z - 26.0f);
+    // Tilt around X by ~0.42 rad
+    float cy = 0.913f * q.y - 0.408f * q.z;
+    float cz = 0.408f * q.y + 0.913f * q.z;
+    q.y = cy;
+    q.z = cz;
+
+    float r_major = 22.0f;
+    float r_xy = sqrtf(q.x * q.x + q.y * q.y);
+    float ang = atan2f(q.y, q.x);
+    float sector = fmodf(fabsf(ang) * 24.0f / 3.14159265f, 1.0f) - 0.5f;
+
+    // Main outer structural ring (torus-box cross section)
+    float dx = fabsf(r_xy - r_major) - 1.6f;
+    float dz = fabsf(q.z) - 2.6f;
+    float d_ring = fminf(fmaxf(dx, dz), 0.0f) + sqrtf(fmaxf(dx, 0.0f) * fmaxf(dx, 0.0f) + fmaxf(dz, 0.0f) * fmaxf(dz, 0.0f));
+
+    // Inner ribbed truss struts
+    float rx = fabsf(r_xy - (r_major - 2.4f)) - 1.1f;
+    float rz = fabsf(q.z) - 0.55f;
+    float rs = fabsf(sector) - 0.18f;
+    float d_rib = fmaxf(fmaxf(rx, rz), rs * 2.2f);
+
+    // Glowing colony habitat strip on inner rim
+    *out_emissive = (fabsf(r_xy - (r_major - 1.6f)) < 0.25f && fabsf(q.z) < 0.85f && fabsf(sector) < 0.32f) ? 1.0f : 0.0f;
+    return fminf(d_ring, d_rib);
+}
+
+static __forceinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, bool is_camera_ray) {
+    float sky_i = fmaxf(0.05f, params.sky_params[0]);
+    float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
+
+    // Deep space background + subtle atmospheric planet limb + pinpoint stars
+    float3 col = make_float3(0.015f, 0.020f, 0.038f);
+    float limb = expf(-fabsf(dir.y + 0.35f) * 8.0f) * fmaxf(0.0f, 0.6f - fabsf(dir.x));
+    col = f3_add(col, f3_mul(make_float3(0.08f, 0.24f, 0.48f), limb * 0.8f));
+    col = f3_add(col, f3_mul(make_float3(0.85f, 0.90f, 1.0f), powf(sun_dot, 32.0f) * 0.45f));
+
+    if (is_camera_ray) {
+        float3 cell = make_float3(floorf(dir.x * 190.0f), floorf(dir.y * 190.0f), floorf(dir.z * 190.0f));
+        float h = sky_hash3(cell);
+        if (h > 0.9968f) {
+            float b = (h - 0.9968f) / 0.0032f;
+            col = f3_add(col, make_float3(b * 1.4f, b * 1.5f, b * 1.8f));
+        }
+    }
+
+    // Raymarch the orbital colony megastructure
+    float t = 4.0f;
+    float tmax = 58.0f;
+    int steps = is_camera_ray ? 48 : 20;
+    float em = 0.0f;
+    bool hit = false;
+    for (int i = 0; i < steps; ++i) {
+        float3 p = f3_mul(dir, t);
+        float d = colonies_map(p, &em);
+        if (d < 0.03f) {
+            hit = true;
+            break;
+        }
+        t += fmaxf(0.08f, d * 0.7f);
+        if (t > tmax) break;
+    }
+    if (hit) {
+        float3 p = f3_mul(dir, t);
+        float e = 0.04f;
+        float ed = 0.0f;
+        float3 n = f3_norm(make_float3(
+            colonies_map(make_float3(p.x + e, p.y, p.z), &ed) - colonies_map(make_float3(p.x - e, p.y, p.z), &ed),
+            colonies_map(make_float3(p.x, p.y + e, p.z), &ed) - colonies_map(make_float3(p.x, p.y - e, p.z), &ed),
+            colonies_map(make_float3(p.x, p.y, p.z + e), &ed) - colonies_map(make_float3(p.x, p.y, p.z - e), &ed)
+        ));
+        float dif = fmaxf(0.0f, f3_dot(n, sun_dir));
+        float rim = powf(1.0f - fmaxf(0.0f, -f3_dot(n, dir)), 3.0f);
+        float3 metal = make_float3(0.14f, 0.16f, 0.20f);
+        col = f3_add(f3_mul(metal, dif * 1.8f + 0.10f), f3_mul(make_float3(0.22f, 0.42f, 0.68f), rim * 0.35f));
+        if (em > 0.5f) {
+            col = f3_add(col, make_float3(0.35f, 0.85f, 1.15f));
+        }
+    }
+    return f3_mul(col, sky_i);
+}
+
+static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+    float sky_i = fmaxf(0.05f, params.sky_params[0]);
+    float haze_k = fmaxf(0.5f, params.sky_params[2]);
+    int mode = (int)(params.sky_params[3] + 0.5f);
+    if (mode == 5) return sky_elevated(dir, sun_dir, is_camera_ray);
+    if (mode == 6) return sky_unprogress(dir, sun_dir, is_camera_ray);
+    if (mode == 7) return sky_colonies(dir, sun_dir, is_camera_ray);
+    float y = fmaxf(0.0f, dir.y);
     float horizon_band = expf(-fabsf(dir.y) * (6.0f / haze_k));
 
-    // Balanced Rayleigh zenith-to-horizon gradient
+    if (mode == 1) {
+        // Golden Sunset: deep indigo zenith -> warm coral/amber horizon
+        float3 zenith  = make_float3(0.05f, 0.07f, 0.22f);
+        float3 horizon = make_float3(0.85f, 0.36f, 0.18f);
+        float t = powf(y, 0.45f);
+        float3 col = f3_add(f3_mul(horizon, 1.0f - t), f3_mul(zenith, t));
+        float3 haze_col = make_float3(1.0f, 0.62f, 0.28f);
+        col = f3_add(col, f3_mul(haze_col, horizon_band * 0.42f));
+        if (dir.y < 0.0f) {
+            float g = fminf(1.0f, -dir.y * 4.0f);
+            col = f3_add(f3_mul(col, 1.0f - g), f3_mul(make_float3(0.08f, 0.05f, 0.07f), g));
+        }
+        float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
+        float mie = powf(sun_dot, 5.0f) * 0.35f + powf(sun_dot, 48.0f) * 0.65f;
+        float disc_t = fmaxf(0.0f, fminf(1.0f, (sun_dot - 0.9985f) / 0.0008f));
+        float sun_disc = disc_t * disc_t * (3.0f - 2.0f * disc_t) * (is_camera_ray ? 4.0f : 1.3f);
+        col = f3_add(col, f3_mul(make_float3(1.0f, 0.55f, 0.25f), mie + sun_disc));
+        return f3_mul(col, sky_i);
+    }
+
+    if (mode == 2) {
+        // Studio Softbox: clean neutral cyclorama with overhead & rim softboxes
+        float3 top = make_float3(0.14f, 0.15f, 0.17f);
+        float3 mid = make_float3(0.06f, 0.065f, 0.075f);
+        float3 bot = make_float3(0.03f, 0.032f, 0.036f);
+        float3 col = (dir.y >= 0.0f)
+            ? f3_add(f3_mul(mid, 1.0f - y), f3_mul(top, y))
+            : f3_add(f3_mul(mid, 1.0f + dir.y), f3_mul(bot, -dir.y));
+        // Overhead key softbox
+        float box_top = (dir.y > 0.68f && fabsf(dir.x) < 0.45f && fabsf(dir.z) < 0.45f) ? 1.0f : 0.0f;
+        // Left cool rim softbox & right warm fill softbox
+        float box_l = (dir.x < -0.62f && fabsf(dir.y - 0.18f) < 0.32f && fabsf(dir.z) < 0.48f) ? 1.0f : 0.0f;
+        float box_r = (dir.x > 0.62f && fabsf(dir.y - 0.12f) < 0.28f && fabsf(dir.z) < 0.44f) ? 1.0f : 0.0f;
+        float panel_gain = is_camera_ray ? 1.15f : 2.2f;
+        col = f3_add(col, f3_mul(make_float3(0.95f, 0.97f, 1.0f), box_top * panel_gain));
+        col = f3_add(col, f3_mul(make_float3(0.65f, 0.82f, 1.0f), box_l * panel_gain * 0.85f));
+        col = f3_add(col, f3_mul(make_float3(1.0f, 0.86f, 0.70f), box_r * panel_gain * 0.75f));
+        return f3_mul(col, sky_i);
+    }
+
+    if (mode == 3) {
+        // Deep Nebula: procedural 3D sinusoidal nebula clouds + pinpoint starfield
+        float3 p = f3_mul(dir, 3.2f);
+        float n = 0.0f;
+        float amp = 0.55f;
+        for (int i = 0; i < 4; ++i) {
+            n += amp * (sinf(p.x * 1.3f + cosf(p.y * 1.7f)) * cosf(p.z * 1.5f + sinf(p.x * 0.9f)));
+            p = make_float3(p.y * 1.8f + 1.3f, p.z * 1.8f - 0.7f, p.x * 1.8f + 0.5f);
+            amp *= 0.5f;
+        }
+        float neb = fmaxf(0.0f, fminf(1.0f, 0.5f + 0.5f * n));
+        float3 c1 = make_float3(0.03f, 0.04f, 0.10f);
+        float3 c2 = make_float3(0.24f, 0.08f, 0.42f);
+        float3 c3 = make_float3(0.06f, 0.48f, 0.62f);
+        float3 col = f3_add(f3_mul(c1, 1.0f - neb), f3_mul(c2, neb * 0.85f));
+        col = f3_add(col, f3_mul(c3, powf(neb, 2.2f) * 0.75f));
+        if (is_camera_ray) {
+            float3 cell = make_float3(floorf(dir.x * 180.0f), floorf(dir.y * 180.0f), floorf(dir.z * 180.0f));
+            float h = sky_hash3(cell);
+            if (h > 0.9965f) {
+                float b = (h - 0.9965f) / 0.0035f;
+                col = f3_add(col, make_float3(b * 1.6f, b * 1.7f, b * 2.0f));
+            }
+        }
+        return f3_mul(col, sky_i);
+    }
+
+    if (mode == 4) {
+        // Cyber Grid: dark slate/indigo gradient + spherical lat/lon wireframe grid
+        float3 zenith = make_float3(0.02f, 0.03f, 0.08f);
+        float3 horiz  = make_float3(0.05f, 0.10f, 0.20f);
+        float3 col = f3_add(f3_mul(horiz, 1.0f - powf(y, 0.6f)), f3_mul(zenith, powf(y, 0.6f)));
+        float lon = atan2f(dir.z, dir.x) * (12.0f / 3.14159265f);
+        float lat = asinf(fmaxf(-1.0f, fminf(1.0f, dir.y))) * (12.0f / 3.14159265f);
+        float gx = fabsf(lon - floorf(lon + 0.5f));
+        float gy = fabsf(lat - floorf(lat + 0.5f));
+        float line = fmaxf(
+            fmaxf(0.0f, 1.0f - gx * 28.0f),
+            fmaxf(0.0f, 1.0f - gy * 28.0f)
+        );
+        float3 grid_col = make_float3(0.12f, 0.68f, 0.95f);
+        col = f3_add(col, f3_mul(grid_col, line * (is_camera_ray ? 0.55f : 0.30f)));
+        col = f3_add(col, f3_mul(make_float3(0.10f, 0.45f, 0.75f), horizon_band * 0.25f));
+        return f3_mul(col, sky_i);
+    }
+
+    // Mode 0: Balanced Rayleigh zenith-to-horizon gradient
     float3 zenith  = make_float3(0.08f, 0.21f, 0.52f);
     float3 horizon = make_float3(0.46f, 0.59f, 0.76f);
     float3 col = f3_add(f3_mul(horizon, 1.0f - powf(y, 0.55f)), f3_mul(zenith, powf(y, 0.55f)));

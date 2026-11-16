@@ -72,6 +72,7 @@ jobs:
           $proc = Start-Process -FilePath $installer -ArgumentList @(
             "-s",
             "nvcc_13.3",
+            "crt_13.3",
             "cudart_13.3",
             "curand_13.3",
             "curand_dev_13.3",

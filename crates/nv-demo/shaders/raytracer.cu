@@ -1052,7 +1052,11 @@ extern "C" __global__ void __raygen__render() {
                             float py_ndc = f3_dot(dir, prev_up)  / (pz * prev_tan_fov);
                             float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
                             float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
-                            first_motion = make_float2(prev_x - ((float)idx.x + 0.5f), prev_y - ((float)idx.y + 0.5f));
+                            // Subtract the subpixel jitter used to cast `dir` so static cameras produce 0 motion.
+                            first_motion = make_float2(
+                                prev_x - ((float)idx.x + 0.5f + jx),
+                                prev_y - ((float)idx.y + 0.5f + jy)
+                            );
                         }
                     }
                 }
@@ -1081,7 +1085,11 @@ extern "C" __global__ void __raygen__render() {
                         float py_ndc = f3_dot(rel, prev_up)  / (pz * prev_tan_fov);
                         float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
                         float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
-                        first_motion = make_float2(prev_x - ((float)idx.x + 0.5f), prev_y - ((float)idx.y + 0.5f));
+                        // Subtract the subpixel jitter used to cast `dir` so static cameras produce 0 motion.
+                        first_motion = make_float2(
+                            prev_x - ((float)idx.x + 0.5f + jx),
+                            prev_y - ((float)idx.y + 0.5f + jy)
+                        );
                     }
                 }
             }

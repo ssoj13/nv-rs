@@ -118,6 +118,27 @@ pub struct DlssOptimalSettings {
 }
 
 #[cfg(has_ngx_sdk)]
+fn with_feature_common_info<R>(
+    wide_path: *const ngx_sys::wchar_t,
+    f: impl FnOnce(*const ngx_sys::NVSDK_NGX_FeatureCommonInfo) -> R,
+) -> R {
+    let path_ptrs = [wide_path];
+    let feature_info = ngx_sys::NVSDK_NGX_FeatureCommonInfo {
+        PathListInfo: ngx_sys::NVSDK_NGX_PathListInfo {
+            Path: path_ptrs.as_ptr(),
+            Length: 1,
+        },
+        InternalData: std::ptr::null_mut(),
+        LoggingInfo: ngx_sys::NVSDK_NGX_LoggingInfo {
+            LoggingCallback: None,
+            MinimumLoggingLevel: ngx_sys::NVSDK_NGX_Logging_Level_NVSDK_NGX_LOGGING_LEVEL_OFF,
+            DisableOtherLoggingSinks: false,
+        },
+    };
+    f(&feature_info)
+}
+
+#[cfg(has_ngx_sdk)]
 pub(crate) struct VulkanSession {
     device: ngx_sys::VkDevice,
 }
@@ -215,19 +236,21 @@ impl NgxVulkan {
                     handles,
                     "NVSDK_NGX_VULKAN_Init_with_ProjectID",
                     |wide_path, h| {
-                        ngx_sys::NVSDK_NGX_VULKAN_Init_with_ProjectID(
-                            project_id.guid_cstr().as_ptr(),
-                            ngx_sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-                            engine_version_ptr,
-                            wide_path,
-                            h.instance,
-                            h.physical_device,
-                            h.device,
-                            h.gipa,
-                            h.gdpa,
-                            std::ptr::null(),
-                            ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
-                        )
+                        with_feature_common_info(wide_path, |feature_info| {
+                            ngx_sys::NVSDK_NGX_VULKAN_Init_with_ProjectID(
+                                project_id.guid_cstr().as_ptr(),
+                                ngx_sys::NVSDK_NGX_EngineType_NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                engine_version_ptr,
+                                wide_path,
+                                h.instance,
+                                h.physical_device,
+                                h.device,
+                                h.gipa,
+                                h.gdpa,
+                                feature_info,
+                                ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
+                            )
+                        })
                     },
                 )
             }
@@ -267,17 +290,19 @@ impl NgxVulkan {
                     handles,
                     "NVSDK_NGX_VULKAN_Init",
                     |wide_path, h| {
-                        ngx_sys::NVSDK_NGX_VULKAN_Init(
-                            app_id as std::os::raw::c_ulonglong,
-                            wide_path,
-                            h.instance,
-                            h.physical_device,
-                            h.device,
-                            h.gipa,
-                            h.gdpa,
-                            std::ptr::null(),
-                            ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
-                        )
+                        with_feature_common_info(wide_path, |feature_info| {
+                            ngx_sys::NVSDK_NGX_VULKAN_Init(
+                                app_id as std::os::raw::c_ulonglong,
+                                wide_path,
+                                h.instance,
+                                h.physical_device,
+                                h.device,
+                                h.gipa,
+                                h.gdpa,
+                                feature_info,
+                                ngx_sys::NVSDK_NGX_Version_NVSDK_NGX_Version_API,
+                            )
+                        })
                     },
                 )
             }
@@ -611,8 +636,18 @@ impl FeatureHandle {
             output.validate("output")?;
 
             // `VK_IMAGE_ASPECT_COLOR_BIT = 1`, `VK_IMAGE_ASPECT_DEPTH_BIT = 2`.
+            // Depth may be supplied either as a depth/stencil format (`124..=130`) or as a
+            // linear `R32_SFLOAT` (`100`) color texture; using `DEPTH_BIT` on `R32_SFLOAT` is invalid.
+            const VK_FORMAT_D16_UNORM: u32 = 124;
+            const VK_FORMAT_D32_SFLOAT_S8_UINT: u32 = 130;
+            let depth_aspect =
+                if (VK_FORMAT_D16_UNORM..=VK_FORMAT_D32_SFLOAT_S8_UINT).contains(&depth.format) {
+                    2
+                } else {
+                    1
+                };
             let mut color_res = color.into_ngx_resource(1);
-            let mut depth_res = depth.into_ngx_resource(2);
+            let mut depth_res = depth.into_ngx_resource(depth_aspect);
             let mut motion_res = motion.into_ngx_resource(1);
             let mut output_res = output.into_ngx_resource(1);
 

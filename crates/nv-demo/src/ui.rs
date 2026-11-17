@@ -1594,14 +1594,13 @@ impl UiContext<'_> {
                 prop_row(ui, "DLSS Qual", |ui| {
                     let gap = 4.0;
                     let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                    let w = ((inner_w - gap * 5.0) / 6.0).max(22.0);
+                    let w = ((inner_w - gap * 4.0) / 5.0).max(24.0);
                     ui.spacing_mut().item_spacing.x = gap;
                     for (q, lbl) in [
                         (0u32, "UltraP"),
                         (1u32, "Perf"),
                         (2u32, "Bal"),
                         (3u32, "Qual"),
-                        (4u32, "UltraQ"),
                         (5u32, "DLAA"),
                     ] {
                         if ui
@@ -1905,20 +1904,35 @@ fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
 
 fn anim_toggle_btn(ui: &mut Ui, anim: &mut DemoAnimator, key: &str) {
     let active = anim.is_active(key);
-    let col = if active {
-        if ui.visuals().dark_mode {
-            UiTheme::Obsidian.section_color()
-        } else {
-            UiTheme::Light.section_color()
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ANIM_BTN_W, ROW_H), Sense::click());
+    if ui.is_rect_visible(rect) {
+        if active {
+            let bg = ui.visuals().selection.bg_fill;
+            ui.painter().rect_filled(rect, 3.0, bg);
+        } else if resp.hovered() {
+            let bg = ui.visuals().widgets.hovered.weak_bg_fill;
+            ui.painter().rect_filled(rect, 3.0, bg);
         }
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    let btn = egui::Button::new(RichText::new(ic::WAVE_SINE).size(11.0).color(col))
-        .selected(active)
-        .frame(active);
-    if ui
-        .add_sized([ANIM_BTN_W, ROW_H], btn)
+        let col = if active {
+            if ui.visuals().dark_mode {
+                UiTheme::Obsidian.section_color()
+            } else {
+                UiTheme::Light.section_color()
+            }
+        } else if resp.hovered() {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            ic::WAVE_SINE,
+            egui::FontId::proportional(11.0),
+            col,
+        );
+    }
+    if resp
         .on_hover_text("Animate +/-10% * Amp * range * sin(2*pi*t / Period)")
         .clicked()
     {
@@ -1927,12 +1941,18 @@ fn anim_toggle_btn(ui: &mut Ui, anim: &mut DemoAnimator, key: &str) {
 }
 
 fn anim_toggle_btn_disabled(ui: &mut Ui) {
-    let col = ui.visuals().weak_text_color().gamma_multiply(0.45);
-    let btn = egui::Button::new(RichText::new(ic::WAVE_SINE).size(11.0).color(col)).frame(false);
-    ui.add_enabled_ui(false, |ui| {
-        ui.add_sized([ANIM_BTN_W, ROW_H], btn)
-            .on_disabled_hover_text("This parameter cannot be animated");
-    });
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ANIM_BTN_W, ROW_H), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let col = ui.visuals().weak_text_color().gamma_multiply(0.45);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            ic::WAVE_SINE,
+            egui::FontId::proportional(11.0),
+            col,
+        );
+    }
+    resp.on_hover_text("This parameter cannot be animated");
 }
 
 #[allow(clippy::too_many_arguments)]

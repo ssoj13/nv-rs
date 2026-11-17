@@ -51,8 +51,8 @@ mod demo_app {
             1 => ngx::DlssPerfQuality::MaxPerf,
             2 => ngx::DlssPerfQuality::Balanced,
             3 => ngx::DlssPerfQuality::MaxQuality,
-            4 => ngx::DlssPerfQuality::UltraQuality,
             5 => ngx::DlssPerfQuality::Dlaa,
+            // `UltraQuality` (4) is deprecated/unsupported in DLSS 3.x+ runtime.
             _ => ngx::DlssPerfQuality::MaxQuality,
         }
     }
@@ -271,8 +271,9 @@ mod demo_app {
                             output,
                             self.render_w,
                             self.render_h,
-                            jitter[0],
-                            jitter[1],
+                            // NGX expects projection-space jitter (opposite of our ray sample offset).
+                            -jitter[0],
+                            -jitter[1],
                             1.0,
                             1.0,
                             sharpness,
@@ -332,6 +333,7 @@ mod demo_app {
         last_resize_at: Instant,
         front_buf_idx: usize,
         has_frame: bool,
+        dlss_dirty: bool,
         display_texture: wgpu::Texture,
         display_view: wgpu::TextureView,
         display_tex_id: egui::TextureId,
@@ -622,6 +624,7 @@ mod demo_app {
                 last_resize_at: Instant::now(),
                 front_buf_idx: 0,
                 has_frame: false,
+                dlss_dirty: false,
                 display_texture,
                 display_view,
                 display_tex_id,
@@ -751,6 +754,7 @@ mod demo_app {
                 }
                 self.front_buf_idx = msg.buf_idx;
                 self.has_frame = true;
+                self.dlss_dirty = true;
                 self.accum_count = msg.accum_count;
                 self.total_samples = msg.total_samples;
                 self.last_jitter = msg.jitter;
@@ -861,11 +865,15 @@ mod demo_app {
                     };
                     match opt_res {
                         Ok(opt) => {
-                            let min_w = 256.min(out_w);
-                            let min_h = 144.min(out_h);
+                            // `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT = 256` requires `render_w % 64 == 0`
+                            // for 4-byte formats (`Rgba8Unorm`, `R32Float`).
+                            let max_w = (opt.max_width.min(out_w) & !63).max(64);
+                            let min_w = ((opt.min_width.max(64) + 63) & !63).min(max_w);
+                            let min_h = opt.min_height.max(144.min(out_h)).min(out_h);
+                            let max_h = opt.max_height.min(out_h).max(min_h);
                             (
-                                ((opt.render_width + 31) & !63).clamp(min_w, out_w),
-                                (opt.render_height & !1).clamp(min_h, out_h),
+                                ((opt.render_width + 31) & !63).clamp(min_w, max_w),
+                                (opt.render_height & !1).clamp(min_h, max_h),
                             )
                         }
                         Err(e) => {
@@ -932,6 +940,7 @@ mod demo_app {
                         self.render_h = target_h;
                         self.buf_gen = self.buf_gen.wrapping_add(1);
                         self.has_frame = false;
+                        self.dlss_dirty = false;
                         self.front_buf_idx = 0;
                         self.accum_count = 0;
                         self.total_samples = 0;
@@ -987,6 +996,7 @@ mod demo_app {
                                     self.display_tex_id,
                                 );
                                 self.using_dlss_tex = true;
+                                self.dlss_dirty = self.has_frame;
                                 self.dlss_pass = Some(pass);
                             }
                             Err(e) => {
@@ -1083,6 +1093,32 @@ mod demo_app {
 
             self.egui_winit
                 .handle_platform_output(&self.window, full_output.platform_output);
+            if let Some(vo) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+                for cmd in &vo.commands {
+                    match cmd {
+                        egui::ViewportCommand::CursorGrab(grab) => {
+                            let mode = match grab {
+                                egui::CursorGrab::None => winit::window::CursorGrabMode::None,
+                                egui::CursorGrab::Confined => {
+                                    winit::window::CursorGrabMode::Confined
+                                }
+                                egui::CursorGrab::Locked => winit::window::CursorGrabMode::Locked,
+                            };
+                            if self.window.set_cursor_grab(mode).is_err()
+                                && matches!(mode, winit::window::CursorGrabMode::Locked)
+                            {
+                                let _ = self
+                                    .window
+                                    .set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                            }
+                        }
+                        egui::ViewportCommand::CursorVisible(visible) => {
+                            self.window.set_cursor_visible(*visible);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let tris = self
                 .egui_ctx
                 .tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1102,74 +1138,77 @@ mod demo_app {
                 if self.settings.dlss_on
                     && let Some(ref mut dlss) = self.dlss_pass
                 {
-                    let mut copy_enc = self.interop.device().create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
-                            label: Some("dlss-copy-inputs"),
-                        },
-                    );
-                    let extent = wgpu::Extent3d {
-                        width: self.render_w,
-                        height: self.render_h,
-                        depth_or_array_layers: 1,
-                    };
-                    let copy_buf = |enc: &mut wgpu::CommandEncoder,
-                                    buf: &wgpu::Buffer,
-                                    tex: &wgpu::Texture,
-                                    bpp: u32| {
-                        enc.copy_buffer_to_texture(
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: buf,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(self.render_w * bpp),
-                                    rows_per_image: Some(self.render_h),
-                                },
+                    if self.dlss_dirty {
+                        self.dlss_dirty = false;
+                        let mut copy_enc = self.interop.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("dlss-copy-inputs"),
                             },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: tex,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            extent,
                         );
-                    };
-                    copy_buf(
-                        &mut copy_enc,
-                        self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
-                        dlss.color_in.wgpu_texture(),
-                        4,
-                    );
-                    copy_buf(
-                        &mut copy_enc,
-                        self.shared_depth[self.front_buf_idx].wgpu_buffer(),
-                        dlss.depth_in.wgpu_texture(),
-                        4,
-                    );
-                    copy_buf(
-                        &mut copy_enc,
-                        self.shared_motion[self.front_buf_idx].wgpu_buffer(),
-                        dlss.motion_in.wgpu_texture(),
-                        8,
-                    );
-                    self.interop.queue().submit(Some(copy_enc.finish()));
-                    if let Err(e) = dlss.evaluate(
-                        &self.interop,
-                        self.last_jitter,
-                        self.settings.dlss_sharpness,
-                    ) {
-                        self.settings.dlss_on = false;
-                        if self.using_dlss_tex {
-                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
-                                self.interop.device(),
-                                &self.display_view,
-                                wgpu::FilterMode::Linear,
-                                self.display_tex_id,
+                        let extent = wgpu::Extent3d {
+                            width: self.render_w,
+                            height: self.render_h,
+                            depth_or_array_layers: 1,
+                        };
+                        let copy_buf = |enc: &mut wgpu::CommandEncoder,
+                                        buf: &wgpu::Buffer,
+                                        tex: &wgpu::Texture,
+                                        bpp: u32| {
+                            enc.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: buf,
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(self.render_w * bpp),
+                                        rows_per_image: Some(self.render_h),
+                                    },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                extent,
                             );
-                            self.using_dlss_tex = false;
+                        };
+                        copy_buf(
+                            &mut copy_enc,
+                            self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
+                            dlss.color_in.wgpu_texture(),
+                            4,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            self.shared_depth[self.front_buf_idx].wgpu_buffer(),
+                            dlss.depth_in.wgpu_texture(),
+                            4,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            self.shared_motion[self.front_buf_idx].wgpu_buffer(),
+                            dlss.motion_in.wgpu_texture(),
+                            8,
+                        );
+                        self.interop.queue().submit(Some(copy_enc.finish()));
+                        if let Err(e) = dlss.evaluate(
+                            &self.interop,
+                            self.last_jitter,
+                            self.settings.dlss_sharpness,
+                        ) {
+                            self.settings.dlss_on = false;
+                            if self.using_dlss_tex {
+                                self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    self.interop.device(),
+                                    &self.display_view,
+                                    wgpu::FilterMode::Linear,
+                                    self.display_tex_id,
+                                );
+                                self.using_dlss_tex = false;
+                            }
+                            self.dlss_pass = None;
+                            self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
                         }
-                        self.dlss_pass = None;
-                        self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
                     }
                 } else {
                     encoder.copy_buffer_to_texture(

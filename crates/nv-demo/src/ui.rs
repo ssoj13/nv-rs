@@ -179,6 +179,20 @@ impl UiTheme {
         };
         ctx.set_theme(egui_theme);
         ctx.set_visuals_of(egui_theme, visuals);
+        ctx.style_mut_of(egui_theme, |s| {
+            let mut scroll = egui::style::ScrollStyle::solid();
+            scroll.bar_width = 4.0;
+            scroll.floating_width = 4.0;
+            scroll.bar_inner_margin = 2.0;
+            scroll.bar_outer_margin = 2.0;
+            scroll.handle_min_length = 16.0;
+            scroll.dormant_background_opacity = 0.0;
+            scroll.active_background_opacity = 0.14;
+            scroll.dormant_handle_opacity = 0.25;
+            scroll.active_handle_opacity = 0.55;
+            scroll.interact_handle_opacity = 0.85;
+            s.spacing.scroll = scroll;
+        });
 
         let mut style = Style::from_egui(ctx.style_of(egui_theme).as_ref());
         style.tab_bar.height = 24.0;
@@ -1103,6 +1117,187 @@ impl UiContext<'_> {
             );
         });
 
+        collapsing_section(ui, "sec_env", ic::SPARKLE, "Environment", true, |ui| {
+            let def = crate::renderer::EnvSettings::default();
+            match s.sky_mode {
+                0 | 1 => {
+                    env_slider(
+                        ui,
+                        "Cloud Cover",
+                        &mut s.env.cloud_cover,
+                        def.cloud_cover,
+                        0.0..=1.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Cloud Density",
+                        &mut s.env.cloud_density,
+                        def.cloud_density,
+                        0.0..=1.5,
+                        2,
+                    );
+                }
+                2 => {
+                    env_slider(
+                        ui,
+                        "Panel Power",
+                        &mut s.env.softbox_power,
+                        def.softbox_power,
+                        0.2..=3.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Edge Softness",
+                        &mut s.env.softbox_softness,
+                        def.softbox_softness,
+                        0.02..=0.5,
+                        2,
+                    );
+                }
+                3 => {
+                    env_slider(
+                        ui,
+                        "Nebula Density",
+                        &mut s.env.nebula_density,
+                        def.nebula_density,
+                        0.2..=2.5,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Contrast",
+                        &mut s.env.nebula_contrast,
+                        def.nebula_contrast,
+                        0.5..=3.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Dark Dust",
+                        &mut s.env.nebula_dust,
+                        def.nebula_dust,
+                        0.0..=3.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Cloud Scale",
+                        &mut s.env.nebula_scale,
+                        def.nebula_scale,
+                        0.5..=4.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Star Density",
+                        &mut s.env.star_density,
+                        def.star_density,
+                        0.0..=2.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Star Bright",
+                        &mut s.env.star_brightness,
+                        def.star_brightness,
+                        0.0..=4.0,
+                        2,
+                    );
+                }
+                4 => {
+                    env_slider(
+                        ui,
+                        "Grid Glow",
+                        &mut s.env.grid_glow,
+                        def.grid_glow,
+                        0.1..=3.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Grid Density",
+                        &mut s.env.grid_density,
+                        def.grid_density,
+                        4.0..=32.0,
+                        1,
+                    );
+                }
+                5 => {
+                    env_slider(
+                        ui,
+                        "Cloud Cover",
+                        &mut s.env.elev_cloud_cover,
+                        def.elev_cloud_cover,
+                        0.0..=1.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Valley Fog",
+                        &mut s.env.elev_fog,
+                        def.elev_fog,
+                        0.2..=2.5,
+                        2,
+                    );
+                }
+                6 => {
+                    env_slider(
+                        ui,
+                        "City Fog",
+                        &mut s.env.city_fog,
+                        def.city_fog,
+                        0.2..=2.5,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Window Glow",
+                        &mut s.env.city_windows,
+                        def.city_windows,
+                        0.0..=3.0,
+                        2,
+                    );
+                }
+                7 => {
+                    env_slider(
+                        ui,
+                        "Star Density",
+                        &mut s.env.star_density,
+                        def.star_density,
+                        0.0..=2.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Star Bright",
+                        &mut s.env.star_brightness,
+                        def.star_brightness,
+                        0.0..=4.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Colony Glow",
+                        &mut s.env.colony_glow,
+                        def.colony_glow,
+                        0.0..=3.0,
+                        2,
+                    );
+                    env_slider(
+                        ui,
+                        "Planet Limb",
+                        &mut s.env.planet_limb,
+                        def.planet_limb,
+                        0.0..=2.5,
+                        2,
+                    );
+                }
+                _ => {}
+            }
+        });
+
         collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", true, |ui| {
             anim_slider_f32(
                 ui,
@@ -1699,6 +1894,26 @@ impl UiContext<'_> {
     }
 }
 
+fn section_accent(id_salt: &str) -> Color32 {
+    match id_salt {
+        "sec_sky" => Color32::from_rgb(232, 178, 84),
+        "sec_env" => Color32::from_rgb(98, 162, 208),
+        "sec_dof" => Color32::from_rgb(198, 118, 162),
+        "sec_floor" => Color32::from_rgb(154, 134, 212),
+        "sec_scene" => Color32::from_rgb(122, 184, 156),
+        "sec_bloom" => Color32::from_rgb(224, 132, 88),
+        "sec_split" => Color32::from_rgb(186, 156, 96),
+        "sec_pt" => Color32::from_rgb(196, 96, 96),
+        "sec_presets" => Color32::from_rgb(216, 156, 78),
+        "sec_formula" => Color32::from_rgb(92, 188, 168),
+        "sec_transform" => Color32::from_rgb(138, 164, 212),
+        "sec_detail" => Color32::from_rgb(166, 209, 137),
+        "sec_telemetry" => Color32::from_rgb(112, 172, 216),
+        "sec_perf" => Color32::from_rgb(112, 184, 156),
+        _ => Color32::from_rgb(142, 149, 163),
+    }
+}
+
 fn collapsing_section(
     ui: &mut Ui,
     id_salt: &str,
@@ -1707,16 +1922,84 @@ fn collapsing_section(
     default_open: bool,
     add_body: impl FnOnce(&mut Ui),
 ) {
-    egui::CollapsingHeader::new(RichText::new(format!("{icon}  {title}")).strong().color(
-        if ui.visuals().dark_mode {
-            UiTheme::Obsidian.section_color()
-        } else {
-            UiTheme::Light.section_color()
-        },
-    ))
-    .id_salt(id_salt)
-    .default_open(default_open)
-    .show(ui, add_body);
+    let accent = section_accent(id_salt);
+    let id = ui.make_persistent_id(id_salt);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let header_h = 22.0;
+    let total_w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, header_h), Sense::click());
+    if resp.clicked() {
+        state.toggle(ui);
+    }
+    let base_bg = ui.visuals().faint_bg_color;
+    let tint_amt = if resp.hovered() { 0.22 } else { 0.14 };
+    let fill = base_bg.lerp_to_gamma(accent, tint_amt);
+    ui.painter().rect_filled(rect, 3.0, fill);
+    let bar_rect = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+    ui.painter().rect_filled(bar_rect, 1.5, accent);
+
+    let caret = if state.is_open() {
+        ic::CARET_DOWN
+    } else {
+        ic::CARET_RIGHT
+    };
+    let text_col = ui.visuals().text_color().lerp_to_gamma(accent, 0.45);
+    ui.painter().text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{caret}  {icon}  {title}"),
+        egui::FontId::proportional(12.0),
+        text_col,
+    );
+    state.show_body_indented(&resp, ui, |ui| {
+        ui.add_space(2.0);
+        add_body(ui);
+        ui.add_space(2.0);
+    });
+}
+
+fn env_slider(
+    ui: &mut Ui,
+    label: &str,
+    val: &mut f32,
+    default_val: f32,
+    range: std::ops::RangeInclusive<f32>,
+    decimals: usize,
+) {
+    prop_row(ui, label, |ui| {
+        let gap = 4.0;
+        let total_w = ui.available_width();
+        let track_w = (total_w - VAL_W - ANIM_BTN_W - gap * 2.0).max(36.0);
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.add_sized(
+            [track_w, ROW_H],
+            egui::Slider::new(val, range.clone()).show_value(false),
+        );
+        let prev_style = ui.style().override_text_style.clone();
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+        ui.add_sized(
+            [VAL_W, ROW_H],
+            egui::DragValue::new(val)
+                .range(range)
+                .speed(0.01)
+                .fixed_decimals(decimals),
+        );
+        ui.style_mut().override_text_style = prev_style;
+        let is_default = (*val - default_val).abs() < 1e-4;
+        let btn =
+            egui::Button::new(RichText::new("~").small()).min_size(egui::vec2(ANIM_BTN_W, ROW_H));
+        if ui
+            .add_enabled(!is_default, btn)
+            .on_hover_text("Reset to default")
+            .clicked()
+        {
+            *val = default_val;
+        }
+    });
 }
 
 fn equal_grid(

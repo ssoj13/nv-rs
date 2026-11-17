@@ -90,9 +90,144 @@ struct LaunchParams {
     jitter_x: f32,
     jitter_y: f32,
     _pad1: u32,
+    env_params: [f32; 8],
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 432);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 464);
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct EnvSettings {
+    // Day Sky (0) & Sunset (1)
+    pub cloud_cover: f32,
+    pub cloud_density: f32,
+    // Studio Softbox (2)
+    pub softbox_power: f32,
+    pub softbox_softness: f32,
+    // Deep Nebula (3)
+    pub nebula_density: f32,
+    pub nebula_contrast: f32,
+    pub nebula_dust: f32,
+    pub nebula_scale: f32,
+    // Starfield (Deep Nebula & Offscreen Colonies)
+    pub star_density: f32,
+    pub star_brightness: f32,
+    // Cyber Grid (4)
+    pub grid_glow: f32,
+    pub grid_density: f32,
+    // Elevated (5)
+    pub elev_cloud_cover: f32,
+    pub elev_fog: f32,
+    // Unprogress (6)
+    pub city_fog: f32,
+    pub city_windows: f32,
+    // Offscreen Colonies (7)
+    pub colony_glow: f32,
+    pub planet_limb: f32,
+}
+
+impl Default for EnvSettings {
+    fn default() -> Self {
+        Self {
+            cloud_cover: 0.45,
+            cloud_density: 1.0,
+            softbox_power: 1.0,
+            softbox_softness: 0.14,
+            nebula_density: 1.15,
+            nebula_contrast: 1.45,
+            nebula_dust: 1.35,
+            nebula_scale: 1.65,
+            star_density: 1.0,
+            star_brightness: 1.35,
+            grid_glow: 1.0,
+            grid_density: 12.0,
+            elev_cloud_cover: 0.48,
+            elev_fog: 1.0,
+            city_fog: 1.0,
+            city_windows: 1.0,
+            colony_glow: 1.2,
+            planet_limb: 1.0,
+        }
+    }
+}
+
+impl EnvSettings {
+    pub fn pack(&self, sky_mode: u32) -> [f32; 8] {
+        match sky_mode {
+            0 | 1 => [
+                self.cloud_cover,
+                self.cloud_density,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            2 => [
+                self.softbox_power,
+                self.softbox_softness,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            3 => [
+                self.nebula_density,
+                self.nebula_contrast,
+                self.nebula_dust,
+                self.nebula_scale,
+                self.star_density,
+                self.star_brightness,
+                0.0,
+                0.0,
+            ],
+            4 => [
+                self.grid_glow,
+                self.grid_density,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            5 => [
+                self.elev_cloud_cover,
+                self.elev_fog,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            6 => [
+                self.city_fog,
+                self.city_windows,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            7 => [
+                self.star_density,
+                self.star_brightness,
+                self.colony_glow,
+                self.planet_limb,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            _ => [0.0; 8],
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -203,6 +338,8 @@ pub struct DemoSettings {
     pub dlss_on: bool,
     pub dlss_quality: u32,
     pub dlss_sharpness: f32,
+    // Per-environment procedural parameters (persisted in PersistedState)
+    pub env: EnvSettings,
 }
 
 impl Default for DemoSettings {
@@ -303,6 +440,7 @@ impl Default for DemoSettings {
             dlss_on: false,
             dlss_quality: 3,
             dlss_sharpness: 0.35,
+            env: EnvSettings::default(),
         }
     }
 }
@@ -1546,7 +1684,12 @@ pub fn spawn_render_thread(
                         settings.floor_scale,
                         settings.floor_metallic,
                     ],
-                    sky_params: [settings.sky_intensity, 1.0, settings.horizon_haze, settings.sky_mode as f32],
+                    sky_params: [
+                        settings.sky_intensity,
+                        1.0,
+                        settings.horizon_haze,
+                        settings.sky_mode as f32,
+                    ],
                     accum_count,
                     _pad0: [0; 3],
                     out_motion_f32: rig.motion_f32.cu_deviceptr(),
@@ -1586,6 +1729,7 @@ pub fn spawn_render_thread(
                     jitter_x: jitter[0],
                     jitter_y: jitter[1],
                     _pad1: 0,
+                    env_params: settings.env.pack(settings.sky_mode),
                 };
                 prev_camera = camera;
                 rig.params_buf

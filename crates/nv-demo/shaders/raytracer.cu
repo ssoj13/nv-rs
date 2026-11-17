@@ -1033,7 +1033,7 @@ extern "C" __global__ void __raygen__render() {
         float3 sample_col = make_float3(0.0f, 0.0f, 0.0f);
 
         int max_bounces = (int)params.bounces;
-        for (int bounce = 0; bounce < 8; ++bounce) {
+        for (int bounce = 0; bounce < 16; ++bounce) {
             if (bounce >= max_bounces) break;
             unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
             trace_primary(origin, dir, p0, p1, p2, p3, p4, p5, p6, p7);

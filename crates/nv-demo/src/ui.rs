@@ -1021,7 +1021,7 @@ impl UiContext<'_> {
                     2,
                     false,
                 );
-                prop_slider_u32(ui, "Bounces", &mut s.bounces, 1..=6, false);
+                prop_slider_u32(ui, "Bounces", &mut s.bounces, 1..=16, false);
                 anim_slider_f32(
                     ui,
                     anim,

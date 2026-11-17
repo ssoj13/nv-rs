@@ -535,6 +535,8 @@ fn search_dirs(probe: &dyn Probe, group: Group) -> Vec<PathBuf> {
                 for dir in [
                     root.join("bin").join("x64"),
                     root.join("bin"),
+                    root.join("lib").join("Windows_x86_64").join("rel"),
+                    root.join("lib").join("Linux_x86_64").join("rel"),
                     root.join("lib"),
                 ] {
                     push_unique_dir(&mut dirs, dir);

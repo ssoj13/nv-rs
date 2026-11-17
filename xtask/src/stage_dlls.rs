@@ -142,6 +142,15 @@ const SPECS: &[DllSpec] = &[
         linux: &["libnvidia-encode.so.1"],
     },
     DllSpec {
+        lib: "dlss",
+        group: Group::Sdk {
+            root_var: "NGX_SDK_ROOT",
+            hint: None,
+        },
+        windows: &["nvngx_dlss.dll"],
+        linux: &["libnvidia-ngx-dlss.so*"],
+    },
+    DllSpec {
         lib: "nvjpeg",
         group: Group::Toolkit,
         windows: &["nvjpeg64_*"],

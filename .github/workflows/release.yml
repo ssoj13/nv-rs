@@ -155,16 +155,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/crates/nv-demo/shaders | Out-Null
           Copy-Item target/release/nv-demo.exe dist/
-          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss
           foreach ($dir in @("$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin")) {
             if (Test-Path $dir) {
               Get-ChildItem -Path $dir -Filter "nvrtc-builtins64_*.dll" -ErrorAction SilentlyContinue |
                 Copy-Item -Destination dist/ -Force
             }
-          }
-          $dlssDll = Join-Path $env:NGX_SDK_ROOT "lib/Windows_x86_64/rel/nvngx_dlss.dll"
-          if (Test-Path $dlssDll) {
-            Copy-Item $dlssDll -Destination dist/ -Force
           }
           Copy-Item crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
           Copy-Item README.md dist/
@@ -177,15 +173,12 @@ jobs:
         run: |
           mkdir -p dist/crates/nv-demo/shaders
           cp target/release/nv-demo dist/
-          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss
           for dir in "${CUDA_PATH}/lib64" "${CUDA_PATH}/targets/x86_64-linux/lib"; do
             if [ -d "$dir" ]; then
               cp -L "$dir"/libnvrtc-builtins.so* dist/ 2>/dev/null || true
             fi
           done
-          if [ -d "${NGX_SDK_ROOT}/lib/Linux_x86_64/rel" ]; then
-            cp -L "${NGX_SDK_ROOT}/lib/Linux_x86_64/rel"/libnvidia-ngx-dlss.so* dist/ 2>/dev/null || true
-          fi
           cp crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
           cp README.md LICENSE* dist/ 2>/dev/null || true
           cat << 'EOF' > dist/run-nv-demo.sh

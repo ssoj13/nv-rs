@@ -83,6 +83,48 @@ fn compile_ptx(
     Ok(())
 }
 
+fn stage_dlss_runtime(out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=NGX_SDK_ROOT");
+    let ngx_root = env::var_os("NGX_SDK_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let p = Path::new("../../.sdk/ngx");
+            p.is_dir().then(|| p.to_path_buf())
+        });
+    let Some(ngx_root) = ngx_root else {
+        return;
+    };
+    let Some(target_dir) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    if cfg!(windows) {
+        let src = ngx_root.join("lib/Windows_x86_64/rel/nvngx_dlss.dll");
+        if src.is_file() {
+            let dst = target_dir.join("nvngx_dlss.dll");
+            let needs_copy = std::fs::metadata(&dst)
+                .and_then(|d| Ok((d.len(), std::fs::metadata(&src)?.len())))
+                .map(|(a, b)| a != b)
+                .unwrap_or(true);
+            if needs_copy {
+                let _ = std::fs::copy(&src, &dst);
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        let rel_dir = ngx_root.join("lib/Linux_x86_64/rel");
+        if let Ok(entries) = std::fs::read_dir(&rel_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("libnvidia-ngx-dlss.so") {
+                    let dst = target_dir.join(&name);
+                    if !dst.exists() {
+                        let _ = std::fs::copy(entry.path(), &dst);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_embedded_ptx)");
     println!("cargo:rerun-if-changed=shaders/raytracer.cu");
@@ -91,6 +133,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    stage_dlss_runtime(&out_dir);
     let Some(nvcc) = find_nvcc() else {
         return;
     };

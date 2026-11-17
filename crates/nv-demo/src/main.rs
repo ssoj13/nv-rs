@@ -1043,7 +1043,11 @@ mod demo_app {
 
             // 4. Advance demo animator & push camera/settings updates when changed.
             self.demo_anim.tick(dt);
-            let effective_settings = self.demo_anim.apply(&self.settings);
+            let mut effective_settings = self.demo_anim.apply(&self.settings);
+            if !self.demo_anim.playing {
+                effective_settings.auto_rotate = false;
+                effective_settings.sat_orbit = false;
+            }
             let cam_frame = pose_to_frame(self.cam_pose);
             if reset_accum_requested
                 || effective_settings != self.last_sent_settings

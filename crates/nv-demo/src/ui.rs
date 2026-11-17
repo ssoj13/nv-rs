@@ -363,44 +363,85 @@ impl UiContext<'_> {
                 *self.cam_pose = self.cam_driver.controller().pose();
             }
 
-            ui.separator();
-
-            ui.checkbox(&mut self.settings.auto_rotate, "Spin");
-            ui.add_enabled(
-                self.settings.sat_on,
-                egui::Checkbox::new(&mut self.settings.sat_orbit, "Orbit"),
-            );
-            ui.label(RichText::new("Speed").small().weak());
-            ui.add(
-                egui::DragValue::new(&mut self.settings.spin_speed)
-                    .range(0.0..=2.0)
-                    .speed(0.01)
-                    .fixed_decimals(2),
-            );
             if ui
                 .button(format!("{} Reset", ic::ARROWS_CLOCKWISE))
+                .on_hover_text("Reset path-tracer accumulation")
                 .clicked()
             {
                 *self.reset_accum_requested = true;
             }
 
             ui.separator();
-            ui.checkbox(&mut self.demo_anim.enabled, "Demo");
+
+            // Master Play / Pause + what is animated (Space shortcut outside fly mode)
+            let in_fly = self.cam_driver.controller().is_fly() || self.cam_driver.is_hold_flying();
+            if !ui.ctx().egui_wants_keyboard_input()
+                && !in_fly
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+            {
+                self.demo_anim.toggle_play(self.settings);
+            }
+            let playing = self.demo_anim.playing;
+            let play_label = if playing {
+                format!("{} Pause", ic::PAUSE)
+            } else {
+                format!("{} Play", ic::PLAY)
+            };
+            let play_btn = egui::Button::new(play_label).selected(playing);
+            if ui
+                .add_sized([68.0, 22.0], play_btn)
+                .on_hover_text("Play / Pause selected animations (Space)")
+                .clicked()
+            {
+                self.demo_anim.toggle_play(self.settings);
+            }
+
+            ui.checkbox(&mut self.settings.auto_rotate, "Spin")
+                .on_hover_text("Rotate fractal");
+            ui.add_enabled(
+                self.settings.sat_on,
+                egui::Checkbox::new(&mut self.settings.sat_orbit, "Orbit"),
+            )
+            .on_hover_text("Orbit glass satellites");
+            ui.checkbox(&mut self.demo_anim.enabled, "Params")
+                .on_hover_text("Sinusoidal parameter animation");
+
+            ui.separator();
+
+            let prev_style = ui.style().override_text_style.clone();
+            ui.label(RichText::new("Speed").small().weak());
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.add_sized(
+                [46.0, 20.0],
+                egui::DragValue::new(&mut self.settings.spin_speed)
+                    .range(0.0..=2.0)
+                    .speed(0.01)
+                    .fixed_decimals(2),
+            );
+            ui.style_mut().override_text_style = prev_style.clone();
+
             ui.label(RichText::new("Period").small().weak());
-            ui.add(
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.add_sized(
+                [48.0, 20.0],
                 egui::DragValue::new(&mut self.demo_anim.period_s)
                     .range(0.5..=60.0)
                     .speed(0.1)
                     .fixed_decimals(1)
                     .suffix("s"),
             );
+            ui.style_mut().override_text_style = prev_style.clone();
+
             ui.label(RichText::new("Amp").small().weak());
-            ui.add(
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.add_sized(
+                [46.0, 20.0],
                 egui::DragValue::new(&mut self.demo_anim.amp)
                     .range(0.05..=5.0)
                     .speed(0.02)
                     .fixed_decimals(2),
             );
+            ui.style_mut().override_text_style = prev_style;
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let theme_btn = ui
@@ -1115,184 +1156,41 @@ impl UiContext<'_> {
                 2,
                 false,
             );
-        });
 
-        collapsing_section(ui, "sec_env", ic::SPARKLE, "Environment", true, |ui| {
-            let def = crate::renderer::EnvSettings::default();
             match s.sky_mode {
                 0 | 1 => {
-                    env_slider(
-                        ui,
-                        "Cloud Cover",
-                        &mut s.env.cloud_cover,
-                        def.cloud_cover,
-                        0.0..=1.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Cloud Density",
-                        &mut s.env.cloud_density,
-                        def.cloud_density,
-                        0.0..=1.5,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_cloud_cover", "Cloud Cover", &mut s.env.cloud_cover, 0.0..=1.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_cloud_density", "Cloud Density", &mut s.env.cloud_density, 0.0..=1.5, 2, false);
                 }
                 2 => {
-                    env_slider(
-                        ui,
-                        "Panel Power",
-                        &mut s.env.softbox_power,
-                        def.softbox_power,
-                        0.2..=3.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Edge Softness",
-                        &mut s.env.softbox_softness,
-                        def.softbox_softness,
-                        0.02..=0.5,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_softbox_power", "Panel Power", &mut s.env.softbox_power, 0.2..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_softbox_softness", "Edge Softness", &mut s.env.softbox_softness, 0.02..=0.5, 2, false);
                 }
                 3 => {
-                    env_slider(
-                        ui,
-                        "Nebula Density",
-                        &mut s.env.nebula_density,
-                        def.nebula_density,
-                        0.2..=2.5,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Contrast",
-                        &mut s.env.nebula_contrast,
-                        def.nebula_contrast,
-                        0.5..=3.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Dark Dust",
-                        &mut s.env.nebula_dust,
-                        def.nebula_dust,
-                        0.0..=3.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Cloud Scale",
-                        &mut s.env.nebula_scale,
-                        def.nebula_scale,
-                        0.5..=4.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Star Density",
-                        &mut s.env.star_density,
-                        def.star_density,
-                        0.0..=2.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Star Bright",
-                        &mut s.env.star_brightness,
-                        def.star_brightness,
-                        0.0..=4.0,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_nebula_density", "Nebula Density", &mut s.env.nebula_density, 0.2..=2.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_contrast", "Contrast", &mut s.env.nebula_contrast, 0.5..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_dust", "Dark Dust", &mut s.env.nebula_dust, 0.0..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_scale", "Cloud Scale", &mut s.env.nebula_scale, 0.5..=4.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 0.0..=2.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 0.0..=4.0, 2, false);
                 }
                 4 => {
-                    env_slider(
-                        ui,
-                        "Grid Glow",
-                        &mut s.env.grid_glow,
-                        def.grid_glow,
-                        0.1..=3.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Grid Density",
-                        &mut s.env.grid_density,
-                        def.grid_density,
-                        4.0..=32.0,
-                        1,
-                    );
+                    anim_slider_f32(ui, anim, "env_grid_glow", "Grid Glow", &mut s.env.grid_glow, 0.1..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_grid_density", "Grid Density", &mut s.env.grid_density, 4.0..=32.0, 1, false);
                 }
                 5 => {
-                    env_slider(
-                        ui,
-                        "Cloud Cover",
-                        &mut s.env.elev_cloud_cover,
-                        def.elev_cloud_cover,
-                        0.0..=1.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Valley Fog",
-                        &mut s.env.elev_fog,
-                        def.elev_fog,
-                        0.2..=2.5,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_elev_cloud_cover", "Cloud Cover", &mut s.env.elev_cloud_cover, 0.0..=1.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_elev_fog", "Valley Fog", &mut s.env.elev_fog, 0.2..=2.5, 2, false);
                 }
                 6 => {
-                    env_slider(
-                        ui,
-                        "City Fog",
-                        &mut s.env.city_fog,
-                        def.city_fog,
-                        0.2..=2.5,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Window Glow",
-                        &mut s.env.city_windows,
-                        def.city_windows,
-                        0.0..=3.0,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_city_fog", "City Fog", &mut s.env.city_fog, 0.2..=2.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_city_windows", "Window Glow", &mut s.env.city_windows, 0.0..=3.0, 2, false);
                 }
                 7 => {
-                    env_slider(
-                        ui,
-                        "Star Density",
-                        &mut s.env.star_density,
-                        def.star_density,
-                        0.0..=2.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Star Bright",
-                        &mut s.env.star_brightness,
-                        def.star_brightness,
-                        0.0..=4.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Colony Glow",
-                        &mut s.env.colony_glow,
-                        def.colony_glow,
-                        0.0..=3.0,
-                        2,
-                    );
-                    env_slider(
-                        ui,
-                        "Planet Limb",
-                        &mut s.env.planet_limb,
-                        def.planet_limb,
-                        0.0..=2.5,
-                        2,
-                    );
+                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 0.0..=2.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 0.0..=4.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_colony_glow", "Colony Glow", &mut s.env.colony_glow, 0.0..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_planet_limb", "Planet Limb", &mut s.env.planet_limb, 0.0..=2.5, 2, false);
                 }
                 _ => {}
             }
@@ -1616,23 +1514,30 @@ impl UiContext<'_> {
             }
         });
 
-        collapsing_section(ui, "sec_pt", ic::SPARKLE, "Path Tracer", true, |ui| {
+        collapsing_section(ui, "sec_pt", ic::LIGHTNING, "Path Tracer", true, |ui| {
             prop_row(ui, "Scale", |ui| {
-                let w = ((ui.available_width() - 12.0) / 4.0).max(28.0);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
-                    let selected = (s.render_scale - val).abs() < 0.05;
-                    if ui
-                        .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
-                        .clicked()
-                    {
-                        s.render_scale = val;
+                let gap = 4.0;
+                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.add_enabled_ui(!s.dlss_on, |ui| {
+                    let w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
+                    for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
+                        let selected = (s.render_scale - val).abs() < 0.05;
+                        if ui
+                            .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
+                            .clicked()
+                        {
+                            s.render_scale = val;
+                        }
                     }
-                }
+                });
+                anim_toggle_btn_disabled(ui);
             });
             prop_row(ui, "AOV", |ui| {
-                let w = ((ui.available_width() - 16.0) / 5.0).max(28.0);
-                ui.spacing_mut().item_spacing.x = 4.0;
+                let gap = 4.0;
+                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                let w = ((inner_w - gap * 4.0) / 5.0).max(24.0);
+                ui.spacing_mut().item_spacing.x = gap;
                 for (mode, lbl) in [
                     (0u32, "Beauty"),
                     (1u32, "Albedo"),
@@ -1650,92 +1555,78 @@ impl UiContext<'_> {
                         s.aov_mode = mode;
                     }
                 }
+                anim_toggle_btn_disabled(ui);
             });
             prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
             prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
-            anim_slider_f32(
-                ui,
-                anim,
-                "spin_speed",
-                "Spin Speed",
-                &mut s.spin_speed,
-                0.0..=2.0,
-                2,
-                false,
-            );
+            prop_toggle(ui, "Shadows", &mut s.shadows_on, "Direct Sun & Soft Shadows");
 
-            ui.add_space(1.0);
-            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
-                0 => {
-                    ui.add_sized(
-                        [w, ROW_H],
-                        egui::Checkbox::new(&mut s.shadows_on, "Shadows"),
-                    );
-                }
-                1 => {
+            // Unified 3-way Upscale / Denoise selector (mutually exclusive SSOT)
+            prop_row(ui, "Upscale / AI", |ui| {
+                let gap = 4.0;
+                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                let w = ((inner_w - gap * 2.0) / 3.0).max(28.0);
+                ui.spacing_mut().item_spacing.x = gap;
+                let mode = if s.dlss_on {
+                    2u32
+                } else if s.denoiser_on {
+                    1
+                } else {
+                    0
+                };
+                for (m, lbl) in [(0u32, "Off"), (1, "OptiX AI"), (2, "DLSS SR")] {
                     if ui
-                        .add_sized(
-                            [w, ROW_H],
-                            egui::Checkbox::new(&mut s.denoiser_on, "AI Denoise"),
-                        )
-                        .changed()
-                        && s.denoiser_on
-                    {
-                        s.dlss_on = false;
-                    }
-                }
-                2 => {
-                    ui.add_sized(
-                        [w, ROW_H],
-                        egui::Checkbox::new(&mut s.temporal_denoise, "Temporal AI"),
-                    );
-                }
-                _ => {
-                    ui.add_sized([w, ROW_H], egui::Checkbox::new(&mut s.auto_rotate, "Spin"));
-                }
-            });
-            ui.add_space(1.0);
-            prop_row(ui, "DLSS", |ui| {
-                if ui
-                    .checkbox(&mut s.dlss_on, "DLSS Super Resolution")
-                    .changed()
-                    && s.dlss_on
-                {
-                    s.denoiser_on = false;
-                }
-            });
-            prop_row(ui, "DLSS Qual", |ui| {
-                let w = ((ui.available_width() - 20.0) / 6.0).max(24.0);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (q, lbl) in [
-                    (0u32, "UltraP"),
-                    (1u32, "Perf"),
-                    (2u32, "Bal"),
-                    (3u32, "Qual"),
-                    (4u32, "UltraQ"),
-                    (5u32, "DLAA"),
-                ] {
-                    if ui
-                        .add_sized(
-                            [w, ROW_H],
-                            egui::Button::selectable(s.dlss_quality == q, lbl),
-                        )
+                        .add_sized([w, ROW_H], egui::Button::selectable(mode == m, lbl))
                         .clicked()
                     {
-                        s.dlss_quality = q;
+                        s.denoiser_on = m == 1;
+                        s.dlss_on = m == 2;
                     }
                 }
+                anim_toggle_btn_disabled(ui);
             });
-            anim_slider_f32(
-                ui,
-                anim,
-                "dlss_sharpness",
-                "DLSS Sharp",
-                &mut s.dlss_sharpness,
-                0.0..=1.0,
-                2,
-                false,
-            );
+
+            if s.denoiser_on {
+                prop_toggle(ui, "Temporal AI", &mut s.temporal_denoise, "Temporal Accumulation");
+            }
+
+            if s.dlss_on {
+                prop_row(ui, "DLSS Qual", |ui| {
+                    let gap = 4.0;
+                    let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                    let w = ((inner_w - gap * 5.0) / 6.0).max(22.0);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (q, lbl) in [
+                        (0u32, "UltraP"),
+                        (1u32, "Perf"),
+                        (2u32, "Bal"),
+                        (3u32, "Qual"),
+                        (4u32, "UltraQ"),
+                        (5u32, "DLAA"),
+                    ] {
+                        if ui
+                            .add_sized(
+                                [w, ROW_H],
+                                egui::Button::selectable(s.dlss_quality == q, lbl),
+                            )
+                            .clicked()
+                        {
+                            s.dlss_quality = q;
+                        }
+                    }
+                    anim_toggle_btn_disabled(ui);
+                });
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "dlss_sharpness",
+                    "DLSS Sharp",
+                    &mut s.dlss_sharpness,
+                    0.0..=1.0,
+                    2,
+                    false,
+                );
+            }
             ui.add_space(1.0);
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
@@ -1959,46 +1850,6 @@ fn collapsing_section(
         ui.add_space(2.0);
         add_body(ui);
         ui.add_space(2.0);
-    });
-}
-
-fn env_slider(
-    ui: &mut Ui,
-    label: &str,
-    val: &mut f32,
-    default_val: f32,
-    range: std::ops::RangeInclusive<f32>,
-    decimals: usize,
-) {
-    prop_row(ui, label, |ui| {
-        let gap = 4.0;
-        let total_w = ui.available_width();
-        let track_w = (total_w - VAL_W - ANIM_BTN_W - gap * 2.0).max(36.0);
-        ui.spacing_mut().item_spacing.x = gap;
-        ui.add_sized(
-            [track_w, ROW_H],
-            egui::Slider::new(val, range.clone()).show_value(false),
-        );
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-        ui.add_sized(
-            [VAL_W, ROW_H],
-            egui::DragValue::new(val)
-                .range(range)
-                .speed(0.01)
-                .fixed_decimals(decimals),
-        );
-        ui.style_mut().override_text_style = prev_style;
-        let is_default = (*val - default_val).abs() < 1e-4;
-        let btn =
-            egui::Button::new(RichText::new("~").small()).min_size(egui::vec2(ANIM_BTN_W, ROW_H));
-        if ui
-            .add_enabled(!is_default, btn)
-            .on_hover_text("Reset to default")
-            .clicked()
-        {
-            *val = default_val;
-        }
     });
 }
 

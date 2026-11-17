@@ -17,6 +17,7 @@ use crate::renderer::DemoSettings;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DemoAnimator {
+    pub playing: bool,
     pub enabled: bool,
     pub period_s: f32,
     pub amp: f32,
@@ -28,6 +29,7 @@ pub struct DemoAnimator {
 impl Default for DemoAnimator {
     fn default() -> Self {
         Self {
+            playing: false,
             enabled: false,
             period_s: 8.0,
             amp: 1.0,
@@ -39,7 +41,7 @@ impl Default for DemoAnimator {
 
 impl DemoAnimator {
     pub fn is_running(&self) -> bool {
-        self.enabled && !self.active.is_empty()
+        self.playing && self.enabled && !self.active.is_empty()
     }
 
     pub fn is_active(&self, key: &str) -> bool {
@@ -52,6 +54,25 @@ impl DemoAnimator {
             if !self.enabled {
                 self.enabled = true;
                 self.time_s = 0.0;
+            }
+            self.playing = true;
+        }
+    }
+
+    /// Toggles master playback; if resuming with no active target, enables `Params` (when keys
+    /// are armed) or `auto_rotate` so Play always produces visible motion.
+    pub fn toggle_play(&mut self, settings: &mut DemoSettings) {
+        let next = !self.playing;
+        self.playing = next;
+        if next
+            && !settings.auto_rotate
+            && !(settings.sat_on && settings.sat_orbit)
+            && !self.enabled
+        {
+            if !self.active.is_empty() {
+                self.enabled = true;
+            } else {
+                settings.auto_rotate = true;
             }
         }
     }
@@ -137,6 +158,25 @@ fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
         "sky_intensity" => anim_f32(&mut s.sky_intensity, amp, phase, 0.1, 2.0),
         "horizon_haze" => anim_f32(&mut s.horizon_haze, amp, phase, 0.4, 2.5),
         "exposure" => anim_f32(&mut s.exposure, amp, phase, 0.25, 2.0),
+        // Environment (per-sky_mode)
+        "env_cloud_cover" => anim_f32(&mut s.env.cloud_cover, amp, phase, 0.0, 1.0),
+        "env_cloud_density" => anim_f32(&mut s.env.cloud_density, amp, phase, 0.0, 1.5),
+        "env_softbox_power" => anim_f32(&mut s.env.softbox_power, amp, phase, 0.2, 3.0),
+        "env_softbox_softness" => anim_f32(&mut s.env.softbox_softness, amp, phase, 0.02, 0.5),
+        "env_nebula_density" => anim_f32(&mut s.env.nebula_density, amp, phase, 0.2, 2.5),
+        "env_nebula_contrast" => anim_f32(&mut s.env.nebula_contrast, amp, phase, 0.5, 3.0),
+        "env_nebula_dust" => anim_f32(&mut s.env.nebula_dust, amp, phase, 0.0, 3.0),
+        "env_nebula_scale" => anim_f32(&mut s.env.nebula_scale, amp, phase, 0.5, 4.0),
+        "env_star_density" => anim_f32(&mut s.env.star_density, amp, phase, 0.0, 2.0),
+        "env_star_brightness" => anim_f32(&mut s.env.star_brightness, amp, phase, 0.0, 4.0),
+        "env_grid_glow" => anim_f32(&mut s.env.grid_glow, amp, phase, 0.1, 3.0),
+        "env_grid_density" => anim_f32(&mut s.env.grid_density, amp, phase, 4.0, 32.0),
+        "env_elev_cloud_cover" => anim_f32(&mut s.env.elev_cloud_cover, amp, phase, 0.0, 1.0),
+        "env_elev_fog" => anim_f32(&mut s.env.elev_fog, amp, phase, 0.2, 2.5),
+        "env_city_fog" => anim_f32(&mut s.env.city_fog, amp, phase, 0.2, 2.5),
+        "env_city_windows" => anim_f32(&mut s.env.city_windows, amp, phase, 0.0, 3.0),
+        "env_colony_glow" => anim_f32(&mut s.env.colony_glow, amp, phase, 0.0, 3.0),
+        "env_planet_limb" => anim_f32(&mut s.env.planet_limb, amp, phase, 0.0, 2.5),
         // Lens DoF
         "aperture" => anim_f32(&mut s.aperture, amp, phase, 0.0, 0.12),
         "focus_dist" => anim_f32(&mut s.focus_dist, amp, phase, 0.5, 12.0),
@@ -183,6 +223,7 @@ mod tests {
             ..Default::default()
         };
         let mut anim = DemoAnimator {
+            playing: true,
             enabled: true,
             period_s: 4.0,
             amp: 1.0,
@@ -214,6 +255,7 @@ mod tests {
     fn disabled_animator_preserves_base_settings() {
         let base = DemoSettings::default();
         let anim = DemoAnimator {
+            playing: true,
             enabled: false,
             period_s: 4.0,
             amp: 1.0,
@@ -221,5 +263,20 @@ mod tests {
             time_s: 1.0,
         };
         assert_eq!(anim.apply(&base), base);
+    }
+
+    #[test]
+    fn toggle_play_activates_target_when_none_selected() {
+        let mut settings = DemoSettings::default();
+        let mut anim = DemoAnimator::default();
+        assert!(!anim.playing);
+        assert!(!settings.auto_rotate);
+
+        anim.toggle_play(&mut settings);
+        assert!(anim.playing);
+        assert!(settings.auto_rotate);
+
+        anim.toggle_play(&mut settings);
+        assert!(!anim.playing);
     }
 }

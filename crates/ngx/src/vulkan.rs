@@ -122,11 +122,42 @@ fn with_feature_common_info<R>(
     wide_path: *const ngx_sys::wchar_t,
     f: impl FnOnce(*const ngx_sys::NVSDK_NGX_FeatureCommonInfo) -> R,
 ) -> R {
-    let path_ptrs = [wide_path];
+    let mut extra_wides: Vec<Vec<NgxWchar>> = Vec::with_capacity(4);
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        extra_wides.push(to_wchar_nul(dir));
+    }
+    for var in ["NGX_SDK_ROOT", "DLSS_ROOT", "NVSDK_NGX_ROOT"] {
+        if let Some(root) = std::env::var_os(var) {
+            let base = Path::new(&root);
+            #[cfg(windows)]
+            let rel = base.join("lib").join("Windows_x86_64").join("rel");
+            #[cfg(not(windows))]
+            let rel = base.join("lib").join("Linux_x86_64");
+            if rel.is_dir() {
+                extra_wides.push(to_wchar_nul(&rel));
+            }
+            if base.is_dir() {
+                extra_wides.push(to_wchar_nul(base));
+            }
+        }
+    }
+    if let Some(sdk_bin) = ngx_sys::SDK_BIN {
+        let p = Path::new(sdk_bin);
+        if p.is_dir() {
+            extra_wides.push(to_wchar_nul(p));
+        }
+    }
+    let mut path_ptrs: Vec<*const ngx_sys::wchar_t> = Vec::with_capacity(1 + extra_wides.len());
+    path_ptrs.push(wide_path);
+    for w in &extra_wides {
+        path_ptrs.push(w.as_ptr().cast::<ngx_sys::wchar_t>());
+    }
     let feature_info = ngx_sys::NVSDK_NGX_FeatureCommonInfo {
         PathListInfo: ngx_sys::NVSDK_NGX_PathListInfo {
             Path: path_ptrs.as_ptr(),
-            Length: 1,
+            Length: u32::try_from(path_ptrs.len()).unwrap_or(1),
         },
         InternalData: std::ptr::null_mut(),
         LoggingInfo: ngx_sys::NVSDK_NGX_LoggingInfo {

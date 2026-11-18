@@ -39,6 +39,7 @@ Safe NVIDIA NGX (DLSS) wrapper over `ngx-sys`.
 - **Static linking & platform behavior**: `ngx-sys` is statically linked and included only on `cfg(target_os = "windows")`. Non-Windows targets compile clean stubs returning `Error::Unsupported`.
 - **Project identity (`types`)**: `ProjectId` / `Guid` (`NVSDK_NGX_ENGINE_TYPE_CUSTOM` with optional engine name and version), plus `DlssPerfQuality` (`DlssQuality`), `Feature`, `BufferFormat`, `DlssFeatureFlags`, and `RequiredExtensions`.
 - **Parameters & Vulkan RAII (`params`, `vulkan`)**: `Parameters` (`AllocateParameters` / `GetCapabilityParameters` / `DestroyParameters`) and `NgxVulkan` / `FeatureHandle`, supporting both `NVSDK_NGX_VULKAN_Init_with_ProjectID` (via `ProjectId`) and `NVSDK_NGX_VULKAN_Init` (with an NVIDIA-issued `ApplicationId`), `Shutdown1`, `CreateFeature`, `EvaluateFeature_C`, and `ReleaseFeature`.
+- **Runtime DLL discovery**: `NgxVulkan::with_feature_common_info` populates `NVSDK_NGX_PathListInfo` with `app_data_path`, the current executable directory, `NGX_SDK_ROOT` / `DLSS_ROOT` / `NVSDK_NGX_ROOT`, and `ngx_sys::SDK_BIN` (`option_env!("NV_RS_SDK_BIN")`).
 
 :::note[Redistribution]
 `ngx-sys` and `ngx` only bind the NGX SDK. Applications that redistribute NVIDIA DLSS DLLs (`nvngx_dlss*.dll`) remain responsible for NVIDIA RTX SDK license compliance and pre-release notification.

@@ -1,0 +1,41 @@
+{
+  "lib": "nvrtc",
+  "headers": [
+    {
+      "name": "nvrtc.h",
+      "sha256": "316a1375c18c69c5f1857dfc154c47a58a6795ffe462d2fcb50f5272ea472d21"
+    }
+  ],
+  "symbols": [
+    "nvrtcAddNameExpression",
+    "nvrtcCompileProgram",
+    "nvrtcCreateProgram",
+    "nvrtcDestroyProgram",
+    "nvrtcGetBundledHeadersInfo",
+    "nvrtcGetCUBIN",
+    "nvrtcGetCUBINSize",
+    "nvrtcGetErrorString",
+    "nvrtcGetLTOIR",
+    "nvrtcGetLTOIRSize",
+    "nvrtcGetLoweredName",
+    "nvrtcGetNumSupportedArchs",
+    "nvrtcGetOptiXIR",
+    "nvrtcGetOptiXIRSize",
+    "nvrtcGetPCHCreateStatus",
+    "nvrtcGetPCHHeapSize",
+    "nvrtcGetPCHHeapSizeRequired",
+    "nvrtcGetPTX",
+    "nvrtcGetPTXSize",
+    "nvrtcGetProgramLog",
+    "nvrtcGetProgramLogSize",
+    "nvrtcGetSupportedArchs",
+    "nvrtcGetTileIR",
+    "nvrtcGetTileIRSize",
+    "nvrtcInstallBundledHeaders",
+    "nvrtcRemoveBundledHeaders",
+    "nvrtcSetFlowCallback",
+    "nvrtcSetPCHHeapSize",
+    "nvrtcVersion"
+  ],
+  "unshimmed": []
+}

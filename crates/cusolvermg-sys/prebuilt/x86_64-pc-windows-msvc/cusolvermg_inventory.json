@@ -1,0 +1,31 @@
+{
+  "lib": "cusolvermg",
+  "headers": [
+    {
+      "name": "cusolverMg.h",
+      "sha256": "367813f725393401c7ede670e943ebdfb8569ab5e4054d0c254f07755a9fec90"
+    }
+  ],
+  "symbols": [
+    "cusolverMgCreate",
+    "cusolverMgCreateDeviceGrid",
+    "cusolverMgCreateMatrixDesc",
+    "cusolverMgDestroy",
+    "cusolverMgDestroyGrid",
+    "cusolverMgDestroyMatrixDesc",
+    "cusolverMgDeviceSelect",
+    "cusolverMgGetrf",
+    "cusolverMgGetrf_bufferSize",
+    "cusolverMgGetrs",
+    "cusolverMgGetrs_bufferSize",
+    "cusolverMgPotrf",
+    "cusolverMgPotrf_bufferSize",
+    "cusolverMgPotri",
+    "cusolverMgPotri_bufferSize",
+    "cusolverMgPotrs",
+    "cusolverMgPotrs_bufferSize",
+    "cusolverMgSyevd",
+    "cusolverMgSyevd_bufferSize"
+  ],
+  "unshimmed": []
+}

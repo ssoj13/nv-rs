@@ -1,0 +1,38 @@
+{
+  "lib": "nvcuvid",
+  "headers": [
+    {
+      "name": "nvcuvid.h",
+      "sha256": "8980e3d9c1e41b116240a451b6249b3ab9e8e9582f4792ccc6eade42a6024e0d"
+    }
+  ],
+  "symbols": [
+    "cuvidCreateDecoder",
+    "cuvidCreateVideoParser",
+    "cuvidCreateVideoSource",
+    "cuvidCreateVideoSourceW",
+    "cuvidCtxLock",
+    "cuvidCtxLockCreate",
+    "cuvidCtxLockDestroy",
+    "cuvidCtxUnlock",
+    "cuvidDecodePicture",
+    "cuvidDecodePictureAsync",
+    "cuvidDestroyDecoder",
+    "cuvidDestroyVideoParser",
+    "cuvidDestroyVideoSource",
+    "cuvidGetDecodeStatus",
+    "cuvidGetDecoderCaps",
+    "cuvidGetSourceAudioFormat",
+    "cuvidGetSourceVideoFormat",
+    "cuvidGetVideoSourceState",
+    "cuvidMapVideoFrame64",
+    "cuvidParseVideoData",
+    "cuvidReconfigureDecoder",
+    "cuvidRegisterDecodeSurfaces",
+    "cuvidSetVideoSourceState",
+    "cuvidUnmapVideoFrame64"
+  ],
+  "unshimmed": [
+    "cuvidGetVideoSourceState"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "lib": "nvofa",
+  "headers": [
+    {
+      "name": "nvOpticalFlowCuda.h",
+      "sha256": "6c6c2f4ac11151aceecb7ba8f1da317be3d7862b4cdb0b280a467c4151ffee8c"
+    }
+  ],
+  "symbols": [
+    "nvCreateOpticalFlowCuda",
+    "nvOFCreateGPUBufferCuda",
+    "nvOFDestroy",
+    "nvOFDestroyGPUBufferCuda",
+    "nvOFExecute",
+    "nvOFGPUBufferGetCUarray",
+    "nvOFGPUBufferGetCUdeviceptr",
+    "nvOFGPUBufferGetStrideInfo",
+    "nvOFGetCaps",
+    "nvOFGetLastError",
+    "nvOFInit",
+    "nvOFSetIOCudaStreams"
+  ],
+  "unshimmed": []
+}

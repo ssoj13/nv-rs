@@ -1,0 +1,193 @@
+{
+  "lib": "nvcomp",
+  "headers": [
+    {
+      "name": "nvcomp.h",
+      "sha256": "0737ae854cacff07c5003fbf9a40003260393518ef6abe3e592a6fe64e219972"
+    },
+    {
+      "name": "nvcomp_export.h",
+      "sha256": "634f474f4123928231943b32e624311ebf49d1673fa33c709052e55666a9bac8"
+    },
+    {
+      "name": "nvcomp/shared_types.h",
+      "sha256": "d7d9d12955e9e70f7d73ce2679e9eb130e4f54821a3a255017a2a40d34f0abdd"
+    },
+    {
+      "name": "nvcomp/version.h",
+      "sha256": "eac322d1c8db7c77807f981b25f9b5d836e56712efdeef664247a6e67231c98b"
+    },
+    {
+      "name": "nvcomp/ans.h",
+      "sha256": "f2b8661a76eb9093ca2f4304023ffe99c59ad25a89dc5389bd5df89205b718ca"
+    },
+    {
+      "name": "nvcomp/bitcomp.h",
+      "sha256": "f09db7ed492bf443bdaf88be4137bdfd032b2cee148a169292f5b25b2435cb55"
+    },
+    {
+      "name": "nvcomp/cascaded.h",
+      "sha256": "aae8ffadc03d74d02acd732706e679aabca4458695895ad6872e3fc95a3ad51f"
+    },
+    {
+      "name": "nvcomp/crc32.h",
+      "sha256": "2d53f4b05c36cfc564e88b0b01f32d24fb4259cbc7df2c54fdf9c2cef8d4a309"
+    },
+    {
+      "name": "nvcomp/deflate.h",
+      "sha256": "6c49a24f8e7a1b0648021dd33ccdd6f69ee40ca68b5b1d4693ce7547cf0cd8bc"
+    },
+    {
+      "name": "nvcomp/gdeflate.h",
+      "sha256": "b39c4b058a7eb8a3dc3d32c7dd5f819ab4c981dbf62414244643e5bb05dc6f94"
+    },
+    {
+      "name": "nvcomp/gzip.h",
+      "sha256": "b905e26c740f375c161b79bd1129c61ce19da1b55c5a62bcde56ecdb9860d42f"
+    },
+    {
+      "name": "nvcomp/lz4.h",
+      "sha256": "79a533a9cd04b32ff0879b7e35c7a91107360e6feb6c46cadd6b6432b4269080"
+    },
+    {
+      "name": "nvcomp/snappy.h",
+      "sha256": "879e25b7b78708ef3d3c14588451955bbf2066811d495e1852afcf23d1248d38"
+    },
+    {
+      "name": "nvcomp/zstd.h",
+      "sha256": "2d18f269b46df65b9721b262713512ff9ef8f399b791d10e3fc6377e38f1bfa7"
+    },
+    {
+      "name": "nvcomp/native/bitcomp.h",
+      "sha256": "ace0ba5b0da4cbb097762cadf3036570d139c76e6d95fe1661430c621652b7c7"
+    },
+    {
+      "name": "nvcomp/native/bitcomp_mode.h",
+      "sha256": "3996fc944a2e30db4c55f6fd14e3abef14952e0511b6af654faa4402573026c1"
+    }
+  ],
+  "symbols": [
+    "bitcompAccelerateRemoteCompression",
+    "bitcompCompressLossless",
+    "bitcompCompressLossy_fp16",
+    "bitcompCompressLossy_fp32",
+    "bitcompCompressLossy_fp64",
+    "bitcompCreatePlan",
+    "bitcompCreatePlanFromCompressedData",
+    "bitcompDestroyPlan",
+    "bitcompGetCompressedInfo",
+    "bitcompGetCompressedSize",
+    "bitcompGetCompressedSizeAsync",
+    "bitcompGetDataTypeFromHandle",
+    "bitcompGetUncompressedSize",
+    "bitcompGetUncompressedSizeFromHandle",
+    "bitcompHostCompressLossless",
+    "bitcompHostCompressLossy_fp16",
+    "bitcompHostCompressLossy_fp32",
+    "bitcompHostCompressLossy_fp64",
+    "bitcompHostPartialUncompress",
+    "bitcompHostUncompress",
+    "bitcompMaxBuflen",
+    "bitcompPartialUncompress",
+    "bitcompSetStream",
+    "bitcompUncompress",
+    "nvcompBatchedANSCompressAsync",
+    "nvcompBatchedANSCompressGetMaxOutputChunkSize",
+    "nvcompBatchedANSCompressGetRequiredAlignments",
+    "nvcompBatchedANSCompressGetTempSize",
+    "nvcompBatchedANSCompressGetTempSizeSync",
+    "nvcompBatchedANSDecompressAsync",
+    "nvcompBatchedANSDecompressGetRequiredAlignments",
+    "nvcompBatchedANSDecompressGetTempSize",
+    "nvcompBatchedANSDecompressGetTempSizeSync",
+    "nvcompBatchedANSGetDecompressSizeAsync",
+    "nvcompBatchedBitcompCompressAsync",
+    "nvcompBatchedBitcompCompressGetMaxOutputChunkSize",
+    "nvcompBatchedBitcompCompressGetRequiredAlignments",
+    "nvcompBatchedBitcompCompressGetTempSize",
+    "nvcompBatchedBitcompCompressGetTempSizeSync",
+    "nvcompBatchedBitcompDecompressAsync",
+    "nvcompBatchedBitcompDecompressGetRequiredAlignments",
+    "nvcompBatchedBitcompDecompressGetTempSize",
+    "nvcompBatchedBitcompDecompressGetTempSizeSync",
+    "nvcompBatchedBitcompGetDecompressSizeAsync",
+    "nvcompBatchedCRC32Async",
+    "nvcompBatchedCRC32GetHeuristicConf",
+    "nvcompBatchedCRC32SearchConf",
+    "nvcompBatchedCascadedCompressAsync",
+    "nvcompBatchedCascadedCompressGetMaxOutputChunkSize",
+    "nvcompBatchedCascadedCompressGetRequiredAlignments",
+    "nvcompBatchedCascadedCompressGetTempSize",
+    "nvcompBatchedCascadedCompressGetTempSizeSync",
+    "nvcompBatchedCascadedDecompressAsync",
+    "nvcompBatchedCascadedDecompressGetRequiredAlignments",
+    "nvcompBatchedCascadedDecompressGetTempSize",
+    "nvcompBatchedCascadedDecompressGetTempSizeSync",
+    "nvcompBatchedCascadedGetDecompressSizeAsync",
+    "nvcompBatchedDeflateCompressAsync",
+    "nvcompBatchedDeflateCompressGetMaxOutputChunkSize",
+    "nvcompBatchedDeflateCompressGetRequiredAlignments",
+    "nvcompBatchedDeflateCompressGetTempSize",
+    "nvcompBatchedDeflateCompressGetTempSizeSync",
+    "nvcompBatchedDeflateDecompressAsync",
+    "nvcompBatchedDeflateDecompressGetRequiredAlignments",
+    "nvcompBatchedDeflateDecompressGetTempSize",
+    "nvcompBatchedDeflateDecompressGetTempSizeSync",
+    "nvcompBatchedDeflateGetDecompressSizeAsync",
+    "nvcompBatchedGdeflateCompressAsync",
+    "nvcompBatchedGdeflateCompressGetMaxOutputChunkSize",
+    "nvcompBatchedGdeflateCompressGetRequiredAlignments",
+    "nvcompBatchedGdeflateCompressGetTempSize",
+    "nvcompBatchedGdeflateCompressGetTempSizeSync",
+    "nvcompBatchedGdeflateDecompressAsync",
+    "nvcompBatchedGdeflateDecompressGetRequiredAlignments",
+    "nvcompBatchedGdeflateDecompressGetTempSize",
+    "nvcompBatchedGdeflateDecompressGetTempSizeSync",
+    "nvcompBatchedGdeflateGetDecompressSizeAsync",
+    "nvcompBatchedGzipCompressAsync",
+    "nvcompBatchedGzipCompressGetMaxOutputChunkSize",
+    "nvcompBatchedGzipCompressGetRequiredAlignments",
+    "nvcompBatchedGzipCompressGetTempSize",
+    "nvcompBatchedGzipCompressGetTempSizeSync",
+    "nvcompBatchedGzipDecompressAsync",
+    "nvcompBatchedGzipDecompressGetRequiredAlignments",
+    "nvcompBatchedGzipDecompressGetTempSize",
+    "nvcompBatchedGzipDecompressGetTempSizeSync",
+    "nvcompBatchedGzipGetDecompressSizeAsync",
+    "nvcompBatchedLZ4CompressAsync",
+    "nvcompBatchedLZ4CompressGetMaxOutputChunkSize",
+    "nvcompBatchedLZ4CompressGetRequiredAlignments",
+    "nvcompBatchedLZ4CompressGetTempSize",
+    "nvcompBatchedLZ4CompressGetTempSizeSync",
+    "nvcompBatchedLZ4DecompressAsync",
+    "nvcompBatchedLZ4DecompressGetRequiredAlignments",
+    "nvcompBatchedLZ4DecompressGetTempSize",
+    "nvcompBatchedLZ4DecompressGetTempSizeSync",
+    "nvcompBatchedLZ4GetDecompressSizeAsync",
+    "nvcompBatchedSnappyCompressAsync",
+    "nvcompBatchedSnappyCompressGetMaxOutputChunkSize",
+    "nvcompBatchedSnappyCompressGetRequiredAlignments",
+    "nvcompBatchedSnappyCompressGetTempSize",
+    "nvcompBatchedSnappyCompressGetTempSizeSync",
+    "nvcompBatchedSnappyDecompressAsync",
+    "nvcompBatchedSnappyDecompressGetRequiredAlignments",
+    "nvcompBatchedSnappyDecompressGetTempSize",
+    "nvcompBatchedSnappyDecompressGetTempSizeSync",
+    "nvcompBatchedSnappyGetDecompressSizeAsync",
+    "nvcompBatchedZstdCompressAsync",
+    "nvcompBatchedZstdCompressGetMaxOutputChunkSize",
+    "nvcompBatchedZstdCompressGetRequiredAlignments",
+    "nvcompBatchedZstdCompressGetTempSize",
+    "nvcompBatchedZstdCompressGetTempSizeSync",
+    "nvcompBatchedZstdDecompressAsync",
+    "nvcompBatchedZstdDecompressGetRequiredAlignments",
+    "nvcompBatchedZstdDecompressGetTempSize",
+    "nvcompBatchedZstdDecompressGetTempSizeSync",
+    "nvcompBatchedZstdGetDecompressSizeAsync",
+    "nvcompGetProperties",
+    "nvcompGetStatusString"
+  ],
+  "unshimmed": [
+    "bitcompMaxBuflen"
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "lib": "cufft",
+  "headers": [
+    {
+      "name": "cufft.h",
+      "sha256": "43aee89d781b9e16705320cf36e5228dbc73b4865124ed9b8aa7ce5954d72d81"
+    }
+  ],
+  "symbols": [
+    "cufftCreate",
+    "cufftDestroy",
+    "cufftEstimate1d",
+    "cufftEstimate2d",
+    "cufftEstimate3d",
+    "cufftEstimateMany",
+    "cufftExecC2C",
+    "cufftExecC2R",
+    "cufftExecD2Z",
+    "cufftExecR2C",
+    "cufftExecZ2D",
+    "cufftExecZ2Z",
+    "cufftGetPlanPropertyInt64",
+    "cufftGetProperty",
+    "cufftGetSize",
+    "cufftGetSize1d",
+    "cufftGetSize2d",
+    "cufftGetSize3d",
+    "cufftGetSizeMany",
+    "cufftGetSizeMany64",
+    "cufftGetVersion",
+    "cufftMakePlan1d",
+    "cufftMakePlan2d",
+    "cufftMakePlan3d",
+    "cufftMakePlanMany",
+    "cufftMakePlanMany64",
+    "cufftPlan1d",
+    "cufftPlan2d",
+    "cufftPlan3d",
+    "cufftPlanMany",
+    "cufftResetPlanProperty",
+    "cufftSetAutoAllocation",
+    "cufftSetPlanPropertyInt64",
+    "cufftSetStream",
+    "cufftSetWorkArea"
+  ],
+  "unshimmed": []
+}

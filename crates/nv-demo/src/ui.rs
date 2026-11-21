@@ -345,11 +345,19 @@ impl UiContext<'_> {
                 }
             }
 
-            if ui.button(format!("{} Home", ic::HOUSE)).clicked() {
+            if ui
+                .button(format!("{} Home", ic::HOUSE))
+                .on_hover_text("Reset the camera back to its starting viewpoint.")
+                .clicked()
+            {
                 self.cam_driver.controller_mut().set_pose(self.cam_home);
                 *self.cam_pose = self.cam_home;
             }
-            if ui.button(format!("{} Frame", ic::CROSSHAIR)).clicked() {
+            if ui
+                .button(format!("{} Frame", ic::CROSSHAIR))
+                .on_hover_text("Automatically zoom and center the camera on the fractal (shortcut: A).")
+                .clicked()
+            {
                 let ext = 1.35 * self.settings.obj_scale.max(0.25);
                 self.cam_driver.controller_mut().apply_intent(
                     CameraIntent::FrameBounds {
@@ -365,7 +373,7 @@ impl UiContext<'_> {
 
             if ui
                 .button(format!("{} Reset", ic::ARROWS_CLOCKWISE))
-                .on_hover_text("Reset path-tracer accumulation")
+                .on_hover_text("Clear accumulated samples and restart path-tracing from frame 1.")
                 .clicked()
             {
                 *self.reset_accum_requested = true;
@@ -630,6 +638,7 @@ impl UiContext<'_> {
                 0 => {
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb"))
+                        .on_hover_text("Load a classic 3D Mandelbulb preset with warm metallic gold shading.")
                         .clicked()
                     {
                         s.fractal_kind = 0;
@@ -645,6 +654,7 @@ impl UiContext<'_> {
                 1 => {
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box"))
+                        .on_hover_text("Load an architectural Mandelbox preset with polished chrome reflections.")
                         .clicked()
                     {
                         s.fractal_kind = 1;
@@ -660,6 +670,7 @@ impl UiContext<'_> {
                 2 => {
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS"))
+                        .on_hover_text("Load a geometric KIFS/Menger folding fractal with dark glossy material.")
                         .clicked()
                     {
                         s.fractal_kind = 2;
@@ -676,6 +687,7 @@ impl UiContext<'_> {
                 _ => {
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral"))
+                        .on_hover_text("Load an organic Julia-set Mandelbulb preset with soft coral tones.")
                         .clicked()
                     {
                         s.fractal_kind = 0;
@@ -1450,18 +1462,22 @@ impl UiContext<'_> {
             prop_row(ui, "OMM Halo", |ui| {
                 let gap = 4.0;
                 let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                let w = ((inner_w - gap * 2.0) / 3.0).max(28.0);
                 ui.spacing_mut().item_spacing.x = gap;
-                for (m, lbl) in [(0u32, "Off"), (1, "OMM"), (2, "Any-Hit")] {
-                    if ui
-                        .add_sized(
-                            [w, ROW_H],
-                            egui::Button::selectable(s.omm_mode == m, lbl),
-                        )
-                        .clicked()
-                    {
-                        s.omm_mode = m;
-                    }
+                let lbl = match s.omm_mode {
+                    1 => "OMM (HW)",
+                    2 => "Any-Hit (SW)",
+                    _ => "Off",
+                };
+                let step = cycle_toggle_btn(
+                    ui,
+                    inner_w,
+                    "Halo",
+                    lbl,
+                    "Adds a perforated gold ring around the fractal to compare hardware Opacity Micro-Maps (OMM) vs software Any-Hit cutouts.",
+                    true,
+                );
+                if step != 0 {
+                    s.omm_mode = ((s.omm_mode as i32 + step).rem_euclid(3)) as u32;
                 }
                 anim_toggle_btn_disabled(ui);
             });
@@ -1515,66 +1531,102 @@ impl UiContext<'_> {
                     false,
                 );
                 prop_row(ui, "Right AOV", |ui| {
-                    let w = ((ui.available_width() - 8.0) / 3.0).max(36.0);
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for (mode, lbl) in [(0u32, "Raw"), (1u32, "Albedo"), (2u32, "Normal")] {
-                        if ui
-                            .add_sized(
-                                [w, ROW_H],
-                                egui::Button::selectable(s.right_is_aov == mode, lbl),
-                            )
-                            .clicked()
-                        {
-                            s.right_is_aov = mode;
-                        }
+                    let lbl = match s.right_is_aov {
+                        1 => "Albedo",
+                        2 => "Normal",
+                        _ => "Raw",
+                    };
+                    let step = cycle_toggle_btn(
+                        ui,
+                        ui.available_width(),
+                        "Right",
+                        lbl,
+                        "Choose what appears on the right half of the split screen: raw noisy render, base surface color (Albedo), or surface direction (Normal).",
+                        true,
+                    );
+                    if step != 0 {
+                        s.right_is_aov = ((s.right_is_aov as i32 + step).rem_euclid(3)) as u32;
                     }
                 });
             }
         });
 
         collapsing_section(ui, "sec_pt", ic::LIGHTNING, "Path Tracer", true, |ui| {
-            prop_row(ui, "Scale", |ui| {
-                let gap = 4.0;
-                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                ui.spacing_mut().item_spacing.x = gap;
-                ui.add_enabled_ui(!s.dlss_on && !s.dlss_rr_on, |ui| {
-                    let w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
-                    for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
-                        let selected = (s.render_scale - val).abs() < 0.05;
-                        if ui
-                            .add_sized([w, ROW_H], egui::Button::selectable(selected, lbl))
-                            .clicked()
-                        {
-                            s.render_scale = val;
-                        }
-                    }
-                });
-                anim_toggle_btn_disabled(ui);
-            });
-            prop_row(ui, "AOV", |ui| {
-                let gap = 4.0;
-                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                let w = ((inner_w - gap * 4.0) / 5.0).max(24.0);
-                ui.spacing_mut().item_spacing.x = gap;
-                for (mode, lbl) in [
-                    (0u32, "Beauty"),
-                    (1u32, "Albedo"),
-                    (2u32, "Normal"),
-                    (3u32, "Depth"),
-                    (4u32, "Motion"),
-                ] {
-                    if ui
-                        .add_sized(
-                            [w, ROW_H],
-                            egui::Button::selectable(s.aov_mode == mode, lbl),
-                        )
-                        .clicked()
-                    {
-                        s.aov_mode = mode;
+            // Compact 3-toggle row replacing 13 separate buttons (Scale / AOV / AI mode)
+            equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+                0 => {
+                    const SCALES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
+                    let cur = SCALES
+                        .iter()
+                        .position(|&v| (s.render_scale - v).abs() < 0.05)
+                        .unwrap_or(1);
+                    let lbl = format!("{:.1}x", SCALES[cur]);
+                    let tip = if s.dlss_on || s.dlss_rr_on {
+                        "Render resolution scale (controlled automatically while DLSS is active)."
+                    } else {
+                        "Internal render resolution multiplier. Lower = faster FPS, higher = sharper edges."
+                    };
+                    let step = cycle_toggle_btn(
+                        ui,
+                        w,
+                        "Scale",
+                        &lbl,
+                        tip,
+                        !s.dlss_on && !s.dlss_rr_on,
+                    );
+                    if step != 0 {
+                        let next = (cur as i32 + step).rem_euclid(SCALES.len() as i32) as usize;
+                        s.render_scale = SCALES[next];
                     }
                 }
-                anim_toggle_btn_disabled(ui);
+                1 => {
+                    const AOVS: [&str; 5] = ["Beauty", "Albedo", "Normal", "Depth", "Motion"];
+                    let cur = (s.aov_mode as usize).min(AOVS.len() - 1);
+                    let step = cycle_toggle_btn(
+                        ui,
+                        w,
+                        "AOV",
+                        AOVS[cur],
+                        "Inspect what the renderer sees: final Beauty image, base color (Albedo), surface direction (Normal), distance (Depth), or pixel motion.",
+                        true,
+                    );
+                    if step != 0 {
+                        s.aov_mode =
+                            ((cur as i32 + step).rem_euclid(AOVS.len() as i32)) as u32;
+                    }
+                }
+                _ => {
+                    let cur = if s.dlss_rr_on {
+                        3i32
+                    } else if s.dlss_on {
+                        2
+                    } else if s.denoiser_on {
+                        1
+                    } else {
+                        0
+                    };
+                    let lbl = match cur {
+                        1 => "OptiX",
+                        2 => "DLSS SR",
+                        3 => "DLSS RR",
+                        _ => "Off",
+                    };
+                    let tip = if self.dlss_rr_available {
+                        "AI noise removal & upscaling: Off (raw path tracing), OptiX (denoiser), DLSS SR (upscaler), or DLSS RR (AI denoiser + upscaler in one pass)."
+                    } else {
+                        "AI noise removal & upscaling: Off (raw path tracing), OptiX (denoiser), or DLSS SR (upscaler). DLSS RR is unavailable on this GPU/driver."
+                    };
+                    let step = cycle_toggle_btn(ui, w, "AI", lbl, tip, true);
+                    if step != 0 {
+                        let count = if self.dlss_rr_available { 4 } else { 3 };
+                        let next = (cur + step).rem_euclid(count);
+                        s.denoiser_on = next == 1;
+                        s.dlss_on = next == 2;
+                        s.dlss_rr_on = next == 3;
+                    }
+                }
             });
+            ui.add_space(1.0);
             prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
             prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
             prop_toggle(ui, "Shadows", &mut s.shadows_on, "Direct Sun & Soft Shadows");
@@ -1589,46 +1641,6 @@ impl UiContext<'_> {
                 },
             );
 
-            // Unified 4-way Upscale / AI Denoise selector (mutually exclusive SSOT)
-            prop_row(ui, "Upscale / AI", |ui| {
-                let gap = 4.0;
-                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                let w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
-                ui.spacing_mut().item_spacing.x = gap;
-                let mode = if s.dlss_rr_on {
-                    3u32
-                } else if s.dlss_on {
-                    2
-                } else if s.denoiser_on {
-                    1
-                } else {
-                    0
-                };
-                for (m, lbl) in [
-                    (0u32, "Off"),
-                    (1, "OptiX AI"),
-                    (2, "DLSS SR"),
-                    (3, "DLSS RR"),
-                ] {
-                    let resp = ui.add_sized([w, ROW_H], egui::Button::selectable(mode == m, lbl));
-                    let resp = if m == 3 {
-                        resp.on_hover_text(if self.dlss_rr_available {
-                            "DLSS Ray Reconstruction (available)"
-                        } else {
-                            "DLSS Ray Reconstruction (unavailable on this host/runtime)"
-                        })
-                    } else {
-                        resp
-                    };
-                    if resp.clicked() {
-                        s.denoiser_on = m == 1;
-                        s.dlss_on = m == 2;
-                        s.dlss_rr_on = m == 3;
-                    }
-                }
-                anim_toggle_btn_disabled(ui);
-            });
-
             if s.denoiser_on {
                 prop_toggle(ui, "Temporal AI", &mut s.temporal_denoise, "Temporal Accumulation");
             }
@@ -1637,24 +1649,29 @@ impl UiContext<'_> {
                 prop_row(ui, "DLSS Qual", |ui| {
                     let gap = 4.0;
                     let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                    let w = ((inner_w - gap * 4.0) / 5.0).max(24.0);
                     ui.spacing_mut().item_spacing.x = gap;
-                    for (q, lbl) in [
-                        (0u32, "UltraP"),
-                        (1u32, "Perf"),
-                        (2u32, "Bal"),
-                        (3u32, "Qual"),
-                        (5u32, "DLAA"),
-                    ] {
-                        if ui
-                            .add_sized(
-                                [w, ROW_H],
-                                egui::Button::selectable(s.dlss_quality == q, lbl),
-                            )
-                            .clicked()
-                        {
-                            s.dlss_quality = q;
-                        }
+                    const QUALS: [(u32, &str); 5] = [
+                        (0, "Ultra Perf"),
+                        (1, "Performance"),
+                        (2, "Balanced"),
+                        (3, "Quality"),
+                        (5, "DLAA"),
+                    ];
+                    let cur = QUALS
+                        .iter()
+                        .position(|&(q, _)| q == s.dlss_quality)
+                        .unwrap_or(3);
+                    let step = cycle_toggle_btn(
+                        ui,
+                        inner_w,
+                        "Quality",
+                        QUALS[cur].1,
+                        "Balance between frame rate and sharpness: Ultra Perf is fastest, Quality and DLAA give the sharpest image.",
+                        true,
+                    );
+                    if step != 0 {
+                        let next = (cur as i32 + step).rem_euclid(QUALS.len() as i32) as usize;
+                        s.dlss_quality = QUALS[next].0;
                     }
                     anim_toggle_btn_disabled(ui);
                 });
@@ -1679,6 +1696,7 @@ impl UiContext<'_> {
                             [w, ROW_H + 2.0],
                             egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE)),
                         )
+                        .on_hover_text("Clear accumulated samples and restart rendering cleanly from frame 1.")
                         .clicked()
                     {
                         *self.reset_accum_requested = true;
@@ -1690,6 +1708,7 @@ impl UiContext<'_> {
                             [w, ROW_H + 2.0],
                             egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
                         )
+                        .on_hover_text("Save a lossless PNG screenshot into the renders/ folder.")
                         .clicked()
                     {
                         *self.save_png_requested = true;
@@ -1701,6 +1720,7 @@ impl UiContext<'_> {
                             [w, ROW_H + 2.0],
                             egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
                         )
+                        .on_hover_text("Encode a fast GPU-accelerated JPEG snapshot (nvJPEG) into renders/.")
                         .clicked()
                     {
                         *self.save_jpeg_requested = true;
@@ -1720,8 +1740,16 @@ impl UiContext<'_> {
                     } else {
                         format!("{}  Record MP4", ic::VIDEO_CAMERA)
                     };
+                    let rec_tip = if self.is_recording {
+                        "Stop recording and finalize the MP4 video file."
+                    } else if use_pq10 {
+                        "Start recording a 10-bit HDR10 PQ10 HEVC MP4 video (plays in full HDR on iPhone Pro Max and HDR displays)."
+                    } else {
+                        "Start recording an iPhone-compatible H.264 MP4 video into renders/."
+                    };
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
+                        .on_hover_text(rec_tip)
                         .clicked()
                     {
                         *self.toggle_record_requested = true;
@@ -1734,9 +1762,9 @@ impl UiContext<'_> {
                     let hdr_active = s.hdr_display && self.hdr_surface_supported;
                     let val = if hdr_active { "HDR" } else { "SDR" };
                     let tip = if self.hdr_surface_supported {
-                        "Viewport output: SDR (8-bit ACES) / HDR (Rgba16Float scRGB 1000 nit)"
+                        "Switch the live window between standard SDR and true bright HDR (matches PQ10 video)."
                     } else {
-                        "HDR unavailable — enable HDR in Windows Display Settings"
+                        "HDR display is currently off — enable HDR in Windows Display Settings to unlock."
                     };
                     if cycle_toggle_btn(ui, w, "View", val, tip, self.hdr_surface_supported) != 0 {
                         s.hdr_display = !s.hdr_display;
@@ -1753,7 +1781,7 @@ impl UiContext<'_> {
                         w,
                         "Video",
                         val,
-                        "MP4 profile: Auto (matches View) / SDR (H.264 avc1) / PQ10 (HEVC Main10 hvc1)",
+                        "Video format: Auto follows the current View, SDR saves standard H.264 MP4, PQ10 saves 10-bit HDR10 HEVC MP4 for iPhone Pro Max.",
                         !self.is_recording,
                     );
                     if step != 0 {
@@ -1772,7 +1800,7 @@ impl UiContext<'_> {
                         w,
                         "Timing",
                         val,
-                        "MP4 timing: Live RT (real-time 90 kHz stts) / Smooth 60 (fixed 1/60s per frame)",
+                        "Live RT keeps real-time speed even when FPS drops; Smooth 60 renders animations at a locked cinematic 60 FPS.",
                         !self.is_recording,
                     ) != 0
                     {
@@ -1786,6 +1814,7 @@ impl UiContext<'_> {
                     [ui.available_width(), ROW_H + 2.0],
                     egui::Button::new(format!("{}  Hot-Reload Shader (NVRTC)", ic::LIGHTNING)),
                 )
+                .on_hover_text("Recompile raytracer.cu from disk on the fly without restarting the app.")
                 .clicked()
             {
                 *self.reload_shader_requested = true;

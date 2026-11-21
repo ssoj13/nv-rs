@@ -137,3 +137,89 @@ extern "C" __global__ void pack_dlss_rr_aovs_f16(
         sanitize_range(n.w, 0.0f, 1.0f)
     );
 }
+
+static __forceinline__ __device__ ushort4 eval_scrgb_pixel(float4 c, float exposure, unsigned int mode) {
+    // scRGB linear Rec.709: 1.0 = 80 nits, 2.5375 = 203 nits (paper white), 12.5 = 1000 nits peak.
+    const float paper_white_scrgb = 203.0f / 80.0f;
+    if (mode == 2u) {
+        float r = sanitize_range(c.x * 0.5f + 0.5f, 0.0f, 1.0f);
+        float g = sanitize_range(c.y * 0.5f + 0.5f, 0.0f, 1.0f);
+        float b = sanitize_range(c.z * 0.5f + 0.5f, 0.0f, 1.0f);
+        return pack_f16_4(
+            powf(r, 2.2f) * paper_white_scrgb,
+            powf(g, 2.2f) * paper_white_scrgb,
+            powf(b, 2.2f) * paper_white_scrgb,
+            1.0f
+        );
+    }
+    if (mode == 1u) {
+        return pack_f16_4(
+            sanitize_range(c.x, 0.0f, 1.0f) * paper_white_scrgb,
+            sanitize_range(c.y, 0.0f, 1.0f) * paper_white_scrgb,
+            sanitize_range(c.z, 0.0f, 1.0f) * paper_white_scrgb,
+            1.0f
+        );
+    }
+    if (mode == 3u || mode == 4u) {
+        float r = sanitize_range(c.x, 0.0f, 1.0f);
+        float g = sanitize_range(c.y, 0.0f, 1.0f);
+        float b = sanitize_range(c.z, 0.0f, 1.0f);
+        return pack_f16_4(
+            powf(r, 2.2f) * paper_white_scrgb,
+            powf(g, 2.2f) * paper_white_scrgb,
+            powf(b, 2.2f) * paper_white_scrgb,
+            1.0f
+        );
+    }
+    // Exact same HDR10 203-nit paper-white + 750->1000-nit soft rolloff as `hdr_f32_to_p010_pq`.
+    float rn = sanitize_range(c.x * exposure, 0.0f, 1000.0f) * 203.0f;
+    float gn = sanitize_range(c.y * exposure, 0.0f, 1000.0f) * 203.0f;
+    float bn = sanitize_range(c.z * exposure, 0.0f, 1000.0f) * 203.0f;
+    float mx = fmaxf(rn, fmaxf(gn, bn));
+    const float knee = 750.0f;
+    const float peak = 1000.0f;
+    if (mx > knee) {
+        float excess = mx - knee;
+        float span = peak - knee;
+        float compressed = knee + span * (excess / (excess + span));
+        float s = compressed / mx;
+        rn *= s;
+        gn *= s;
+        bn *= s;
+    }
+    return pack_f16_4(rn * 0.0125f, gn * 0.0125f, bn * 0.0125f, 1.0f);
+}
+
+extern "C" __global__ void tonemap_f32_to_scrgb_f16(
+    const float4* src,
+    ushort4* dst,
+    unsigned int width,
+    unsigned int height,
+    float exposure,
+    unsigned int mode,
+    const float4* right_f32,
+    float split_x,
+    int right_is_aov
+) {
+    unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    unsigned int idx = y * width + x;
+
+    if (split_x >= 0.0f && right_f32 != nullptr) {
+        int split_px = (int)(split_x * (float)width + 0.5f);
+        int ix = (int)x;
+        if (ix == split_px || ix + 1 == split_px) {
+            const float div = 203.0f / 80.0f;
+            dst[idx] = pack_f16_4(div, div, div, 1.0f);
+            return;
+        }
+        if (ix > split_px) {
+            unsigned int r_mode = (right_is_aov > 0) ? (unsigned int)right_is_aov : 0u;
+            dst[idx] = eval_scrgb_pixel(right_f32[idx], exposure, r_mode);
+            return;
+        }
+    }
+
+    dst[idx] = eval_scrgb_pixel(src[idx], exposure, mode);
+}

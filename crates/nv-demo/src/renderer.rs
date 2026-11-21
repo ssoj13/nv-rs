@@ -346,8 +346,10 @@ pub struct DemoSettings {
     pub dlss_rr_on: bool,
     pub dlss_quality: u32,
     pub dlss_sharpness: f32,
-    // Video Export (MP4 H.264 SDR / HEVC PQ10 HDR10 + Timing)
-    pub record_hdr_pq: bool,
+    // Display & Video Export (HDR scRGB viewport + MP4 Match/SDR/PQ10 + Timing)
+    pub hdr_display: bool,
+    /// `0 = Match View`, `1 = SDR H.264`, `2 = PQ10 HDR10 HEVC`.
+    pub record_video_mode: u32,
     pub record_fixed_fps: bool,
     // Per-environment procedural parameters (persisted in PersistedState)
     pub env: EnvSettings,
@@ -454,7 +456,8 @@ impl Default for DemoSettings {
             dlss_rr_on: false,
             dlss_quality: 3,
             dlss_sharpness: 0.35,
-            record_hdr_pq: false,
+            hdr_display: false,
+            record_video_mode: 0,
             record_fixed_fps: false,
             env: EnvSettings::default(),
         }
@@ -491,6 +494,7 @@ pub enum RenderCmd {
         buf_ptrs: [u64; 2],
         depth_ptrs: [u64; 2],
         motion_ptrs: [u64; 2],
+        hdr_ptrs: Option<[u64; 2]>,
         rr_ptrs: Option<DlssRrBufferPtrs>,
         gen_id: u64,
     },
@@ -530,6 +534,7 @@ pub struct FrameReady {
 struct TonemapKernel {
     module: cu::CUmodule,
     func: cu::CUfunction,
+    scrgb_func: cu::CUfunction,
     pack_rr_func: cu::CUfunction,
 }
 
@@ -1194,6 +1199,15 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         cu::cudaError_enum_CUDA_SUCCESS,
         "cuModuleGetFunction failed"
     );
+    let mut scrgb_func: cu::CUfunction = std::ptr::null_mut();
+    let scrgb_name = CString::new("tonemap_f32_to_scrgb_f16").unwrap();
+    // SAFETY: `cu_mod` is valid and `scrgb_name` is NUL-terminated.
+    let res = unsafe { cu::cuModuleGetFunction(&mut scrgb_func, cu_mod, scrgb_name.as_ptr()) };
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleGetFunction(tonemap_f32_to_scrgb_f16) failed"
+    );
     let mut pack_rr_func: cu::CUfunction = std::ptr::null_mut();
     let pack_name = CString::new("pack_dlss_rr_aovs_f16").unwrap();
     // SAFETY: `cu_mod` is valid and `pack_name` is NUL-terminated.
@@ -1206,6 +1220,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     let tonemap = TonemapKernel {
         module: cu_mod,
         func: cu_func,
+        scrgb_func,
         pack_rr_func,
     };
 
@@ -1463,6 +1478,7 @@ pub fn spawn_render_thread(
             let mut buf_ptrs = initial_buf_ptrs;
             let mut depth_ptrs = initial_depth_ptrs;
             let mut motion_ptrs = initial_motion_ptrs;
+            let mut hdr_ptrs: Option<[u64; 2]> = None;
             let mut rr_ptrs: Option<DlssRrBufferPtrs> = None;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut settings = initial_settings;
@@ -1515,6 +1531,7 @@ pub fn spawn_render_thread(
                                  buf_ptrs: &mut [u64; 2],
                                  depth_ptrs: &mut [u64; 2],
                                  motion_ptrs: &mut [u64; 2],
+                                 hdr_ptrs: &mut Option<[u64; 2]>,
                                  rr_ptrs: &mut Option<DlssRrBufferPtrs>,
                                  free_bufs: &mut VecDeque<usize>,
                                  settings: &mut DemoSettings,
@@ -1541,7 +1558,8 @@ pub fn spawn_render_thread(
                             tmp.bloom_intensity = settings.bloom_intensity;
                             tmp.bloom_blades = settings.bloom_blades;
                             tmp.dlss_sharpness = settings.dlss_sharpness;
-                            tmp.record_hdr_pq = settings.record_hdr_pq;
+                            tmp.hdr_display = settings.hdr_display;
+                            tmp.record_video_mode = settings.record_video_mode;
                             tmp.record_fixed_fps = settings.record_fixed_fps;
                             if s.aov_mode < 3 && settings.aov_mode < 3 {
                                 tmp.aov_mode = settings.aov_mode;
@@ -1561,6 +1579,7 @@ pub fn spawn_render_thread(
                             buf_ptrs: new_ptrs,
                             depth_ptrs: new_depth_ptrs,
                             motion_ptrs: new_motion_ptrs,
+                            hdr_ptrs: new_hdr_ptrs,
                             rr_ptrs: new_rr_ptrs,
                             gen_id,
                         } => {
@@ -1577,6 +1596,7 @@ pub fn spawn_render_thread(
                             *buf_ptrs = new_ptrs;
                             *depth_ptrs = new_depth_ptrs;
                             *motion_ptrs = new_motion_ptrs;
+                            *hdr_ptrs = new_hdr_ptrs;
                             *rr_ptrs = new_rr_ptrs;
                             *cur_gen = gen_id;
                             free_bufs.clear();
@@ -1664,6 +1684,7 @@ pub fn spawn_render_thread(
                         &mut buf_ptrs,
                         &mut depth_ptrs,
                         &mut motion_ptrs,
+                        &mut hdr_ptrs,
                         &mut rr_ptrs,
                         &mut free_bufs,
                         &mut settings,
@@ -1703,6 +1724,7 @@ pub fn spawn_render_thread(
                                 &mut buf_ptrs,
                                 &mut depth_ptrs,
                                 &mut motion_ptrs,
+                                &mut hdr_ptrs,
                                 &mut rr_ptrs,
                                 &mut free_bufs,
                                 &mut settings,
@@ -2224,6 +2246,42 @@ pub fn spawn_render_thread(
                         cu::cudaError_enum_CUDA_SUCCESS,
                         "tonemap cuLaunchKernel failed"
                     );
+                    if let Some(hdr_dsts) = hdr_ptrs {
+                        let mut hdr_dst_ptr = hdr_dsts[buf_idx];
+                        let mut hdr_args: [*mut c_void; 9] = [
+                            (&raw mut src_ptr).cast(),
+                            (&raw mut hdr_dst_ptr).cast(),
+                            (&raw mut w).cast(),
+                            (&raw mut h).cast(),
+                            (&raw mut exposure).cast(),
+                            (&raw mut aov_mode).cast(),
+                            (&raw mut right_ptr).cast(),
+                            (&raw mut split_x).cast(),
+                            (&raw mut right_is_aov).cast(),
+                        ];
+                        // SAFETY: `tonemap_f32_to_scrgb_f16` writes `cur_w * cur_h * 8` bytes of
+                        // scRGB FP16 into `hdr_dsts[buf_idx]`, valid through `stream.synchronize()`.
+                        let hdr_res = unsafe {
+                            cu::cuLaunchKernel(
+                                rig.tonemap.scrgb_func,
+                                gx,
+                                gy,
+                                1,
+                                16,
+                                16,
+                                1,
+                                0,
+                                rig.stream.cu_stream(),
+                                hdr_args.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        assert_eq!(
+                            hdr_res,
+                            cu::cudaError_enum_CUDA_SUCCESS,
+                            "tonemap_f32_to_scrgb_f16 cuLaunchKernel failed"
+                        );
+                    }
                     if dlss_any {
                         // SAFETY: `rig.depth_f32` and `depth_ptrs[buf_idx]` have `cur_w * cur_h * 4` bytes;
                         // `rig.motion_f32` and `motion_ptrs[buf_idx]` have `cur_w * cur_h * 8` bytes.

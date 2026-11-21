@@ -238,6 +238,7 @@ pub struct UiContext<'a> {
     pub record_frames: u64,
     pub ser_supported: bool,
     pub dlss_rr_available: bool,
+    pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
     pub reset_accum_requested: &'a mut bool,
     pub save_png_requested: &'a mut bool,
@@ -1709,9 +1710,15 @@ impl UiContext<'_> {
                     }
                 }
                 _ => {
+                    let hdr_active = s.hdr_display && self.hdr_surface_supported;
+                    let use_pq10 = match s.record_video_mode {
+                        1 => false,
+                        2 => true,
+                        _ => hdr_active,
+                    };
                     let rec_lbl = if self.is_recording {
                         format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
-                    } else if s.record_hdr_pq {
+                    } else if use_pq10 {
                         format!("{}  Record PQ10", ic::VIDEO_CAMERA)
                     } else {
                         format!("{}  Record MP4", ic::VIDEO_CAMERA)
@@ -1725,28 +1732,35 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
-            ui.add_enabled_ui(!self.is_recording, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Video")
-                            .size(11.0)
-                            .color(Color32::from_rgb(165, 173, 203)),
-                    );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("View")
+                        .size(11.0)
+                        .color(Color32::from_rgb(165, 173, 203)),
+                );
+                if ui
+                    .selectable_label(!s.hdr_display, "SDR")
+                    .on_hover_text("8-bit sRGB/BT.709 ACES viewport")
+                    .clicked()
+                {
+                    s.hdr_display = false;
+                }
+                ui.add_enabled_ui(self.hdr_surface_supported, |ui| {
+                    let hdr_tip = if self.hdr_surface_supported {
+                        "True HDR (Rgba16Float scRGB, 203-nit white / 1000-nit peak, matches PQ10 video)"
+                    } else {
+                        "HDR unavailable — enable HDR in Windows Display Settings"
+                    };
                     if ui
-                        .selectable_label(!s.record_hdr_pq, "SDR")
-                        .on_hover_text("iPhone-compatible H.264 8-bit BT.709 MP4 (avc1)")
+                        .selectable_label(s.hdr_display && self.hdr_surface_supported, "HDR")
+                        .on_hover_text(hdr_tip)
                         .clicked()
                     {
-                        s.record_hdr_pq = false;
+                        s.hdr_display = true;
                     }
-                    if ui
-                        .selectable_label(s.record_hdr_pq, "PQ10")
-                        .on_hover_text("iPhone Pro Max HDR10 HEVC Main10 BT.2020 PQ MP4 (hvc1)")
-                        .clicked()
-                    {
-                        s.record_hdr_pq = true;
-                    }
-                    ui.separator();
+                });
+                ui.separator();
+                ui.add_enabled_ui(!self.is_recording, |ui| {
                     ui.label(
                         RichText::new("Timing")
                             .size(11.0)
@@ -1765,6 +1779,36 @@ impl UiContext<'_> {
                         .clicked()
                     {
                         s.record_fixed_fps = true;
+                    }
+                });
+            });
+            ui.add_enabled_ui(!self.is_recording, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Video")
+                            .size(11.0)
+                            .color(Color32::from_rgb(165, 173, 203)),
+                    );
+                    if ui
+                        .selectable_label(s.record_video_mode == 0, "Match")
+                        .on_hover_text("Match View: SDR view -> H.264 MP4, HDR view -> PQ10 HEVC MP4")
+                        .clicked()
+                    {
+                        s.record_video_mode = 0;
+                    }
+                    if ui
+                        .selectable_label(s.record_video_mode == 1, "SDR")
+                        .on_hover_text("Force H.264 8-bit BT.709 MP4 (avc1)")
+                        .clicked()
+                    {
+                        s.record_video_mode = 1;
+                    }
+                    if ui
+                        .selectable_label(s.record_video_mode == 2, "PQ10")
+                        .on_hover_text("Force iPhone Pro Max HDR10 HEVC Main10 BT.2020 PQ MP4 (hvc1)")
+                        .clicked()
+                    {
+                        s.record_video_mode = 2;
                     }
                 });
             });

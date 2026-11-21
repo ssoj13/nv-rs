@@ -349,6 +349,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+    const HDR_SCRGB_WGSL: &str = r#"
+struct TonemapParams {
+    exposure: f32,
+    width: u32,
+    height: u32,
+    _pad: u32,
+};
+
+@group(0) @binding(0) var src_hdr: texture_2d<f32>;
+@group(0) @binding(1) var dst_scrgb: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> u: TonemapParams;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= u.width || gid.y >= u.height) {
+        return;
+    }
+    let c = textureLoad(src_hdr, vec2<i32>(gid.xy), 0);
+    let e = max(u.exposure, 0.0);
+    var nits = max(c.rgb * e, vec3<f32>(0.0)) * 203.0;
+    let mx = max(nits.r, max(nits.g, nits.b));
+    let knee = 750.0;
+    let peak = 1000.0;
+    if (mx > knee) {
+        let excess = mx - knee;
+        let span = peak - knee;
+        let compressed = knee + span * (excess / (excess + span));
+        nits = nits * (compressed / mx);
+    }
+    textureStore(dst_scrgb, vec2<i32>(gid.xy), vec4<f32>(nits * 0.0125, 1.0));
+}
+"#;
+
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
     struct HdrTonemapUniform {
@@ -361,6 +394,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     struct HdrTonemapPipeline {
         pipeline: wgpu::ComputePipeline,
         bgl: wgpu::BindGroupLayout,
+        scrgb_pipeline: wgpu::ComputePipeline,
+        scrgb_bgl: wgpu::BindGroupLayout,
         uniform_buf: wgpu::Buffer,
     }
 
@@ -370,50 +405,71 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("dlss-rr-hdr-tonemap-wgsl"),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(HDR_TONEMAP_WGSL)),
             });
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("dlss-rr-hdr-tonemap-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
+            let scrgb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("dlss-rr-hdr-scrgb-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(HDR_SCRGB_WGSL)),
             });
+            let make_bgl = |label, dst_fmt| {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some(label),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::StorageTexture {
+                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                format: dst_fmt,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            };
+            let bgl = make_bgl("dlss-rr-hdr-tonemap-bgl", wgpu::TextureFormat::Rgba8Unorm);
+            let scrgb_bgl = make_bgl("dlss-rr-hdr-scrgb-bgl", wgpu::TextureFormat::Rgba16Float);
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("dlss-rr-hdr-tonemap-layout"),
                 bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let scrgb_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dlss-rr-hdr-scrgb-layout"),
+                bind_group_layouts: &[Some(&scrgb_bgl)],
                 immediate_size: 0,
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("dlss-rr-hdr-tonemap"),
                 layout: Some(&layout),
                 module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            let scrgb_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("dlss-rr-hdr-scrgb"),
+                layout: Some(&scrgb_layout),
+                module: &scrgb_shader,
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
@@ -427,6 +483,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             Self {
                 pipeline,
                 bgl,
+                scrgb_pipeline,
+                scrgb_bgl,
                 uniform_buf,
             }
         }
@@ -457,14 +515,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             })
         }
 
+        fn create_scrgb_bind_group(
+            &self,
+            device: &wgpu::Device,
+            src_hdr_view: &wgpu::TextureView,
+            dst_scrgb_view: &wgpu::TextureView,
+        ) -> wgpu::BindGroup {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dlss-rr-hdr-scrgb-bg"),
+                layout: &self.scrgb_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_hdr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(dst_scrgb_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        }
+
         fn dispatch(
             &self,
             queue: &wgpu::Queue,
             encoder: &mut wgpu::CommandEncoder,
             bind_group: &wgpu::BindGroup,
-            width: u32,
-            height: u32,
+            (width, height): (u32, u32),
             exposure: f32,
+            hdr_scrgb: bool,
         ) {
             let uniform = HdrTonemapUniform {
                 exposure,
@@ -477,7 +561,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("dlss-rr-hdr-tonemap-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if hdr_scrgb {
+                &self.scrgb_pipeline
+            } else {
+                &self.pipeline
+            });
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
         }
@@ -563,6 +651,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         _display_ldr: wgpu::Texture,
         display_view: wgpu::TextureView,
         tonemap_bg: wgpu::BindGroup,
+        _display_hdr: wgpu::Texture,
+        display_hdr_view: wgpu::TextureView,
+        scrgb_bg: wgpu::BindGroup,
         render_w: u32,
         render_h: u32,
         out_w: u32,
@@ -658,6 +749,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
+            let display_hdr = interop.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("dlss-rr-display-hdr"),
+                size: wgpu::Extent3d {
+                    width: out_w,
+                    height: out_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
 
             let view_of = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
             let color_view = view_of(color_in.wgpu_texture());
@@ -670,6 +775,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let display_view = view_of(&display_ldr);
             let tonemap_bg =
                 tonemap.create_bind_group(interop.device(), &output_hdr_view, &display_view);
+            let display_hdr_view = view_of(&display_hdr);
+            let scrgb_bg = tonemap.create_scrgb_bind_group(
+                interop.device(),
+                &output_hdr_view,
+                &display_hdr_view,
+            );
 
             let config = ngx::DlssRrCreateParams {
                 render_width: render_w,
@@ -717,6 +828,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 _display_ldr: display_ldr,
                 display_view,
                 tonemap_bg,
+                _display_hdr: display_hdr,
+                display_hdr_view,
+                scrgb_bg,
                 render_w,
                 render_h,
                 out_w,
@@ -864,6 +978,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
         surface_config: wgpu::SurfaceConfiguration,
+        sdr_surface_format: wgpu::TextureFormat,
+        hdr_surface_supported: bool,
         dlss_pass: Option<DlssPass>,
         dlss_rr_pass: Option<DlssRrPass>,
         dlss_rr_available: bool,
@@ -876,9 +992,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         egui_ctx: egui::Context,
         egui_winit: egui_winit::State,
         egui_renderer: egui_wgpu::Renderer,
+        egui_renderer_hdr: Option<egui_wgpu::Renderer>,
         shared_rgba: [SharedBuffer; 2],
         shared_depth: [SharedBuffer; 2],
         shared_motion: [SharedBuffer; 2],
+        shared_hdr: Option<[SharedBuffer; 2]>,
         rr_shared: Option<DlssRrSharedBuffers>,
         retired_buffers: Vec<(u64, [SharedBuffer; 2])>,
         buf_gen: u64,
@@ -891,8 +1009,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         dlss_dirty: bool,
         display_texture: wgpu::Texture,
         display_view: wgpu::TextureView,
+        display_texture_hdr: Option<wgpu::Texture>,
+        display_view_hdr: Option<wgpu::TextureView>,
         display_tex_id: egui::TextureId,
         using_dlss_tex: bool,
+        bound_hdr_tex: bool,
         last_jitter: [f32; 2],
         last_saved_msg: Option<String>,
         cmd_tx: Sender<RenderCmd>,
@@ -1048,14 +1169,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .expect("surface default config");
             surface_config.present_mode = wgpu::PresentMode::AutoVsync;
             let caps = surface.get_capabilities(&adapter);
-            if let Some(fmt) = caps.formats.iter().copied().find(|f| {
-                matches!(
-                    f,
-                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
-                )
-            }) {
-                surface_config.format = fmt;
-            }
+            let sdr_surface_format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| {
+                    matches!(
+                        f,
+                        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                    )
+                })
+                .unwrap_or(surface_config.format);
+            let hdr_surface_supported = caps.formats.contains(&wgpu::TextureFormat::Rgba16Float);
+            let initial_hdr = persisted.settings.hdr_display && hdr_surface_supported;
+            surface_config.format = if initial_hdr {
+                wgpu::TextureFormat::Rgba16Float
+            } else {
+                sdr_surface_format
+            };
             surface.configure(interop.device(), &surface_config);
 
             let egui_ctx = egui::Context::default();
@@ -1113,9 +1244,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
             let mut egui_renderer = egui_wgpu::Renderer::new(
                 interop.device(),
-                surface_config.format,
+                sdr_surface_format,
                 egui_wgpu::RendererOptions::default(),
             );
+            let mut egui_renderer_hdr = hdr_surface_supported.then(|| {
+                egui_wgpu::Renderer::new(
+                    interop.device(),
+                    wgpu::TextureFormat::Rgba16Float,
+                    egui_wgpu::RendererOptions::default(),
+                )
+            });
 
             // Double-buffered CUDA<->wgpu SharedBuffers so GUI 60 FPS never stalls on OptiX.
             let RenderTargets {
@@ -1140,8 +1278,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 &display_view,
                 wgpu::FilterMode::Linear,
             );
+            if let Some(ref mut hdr_r) = egui_renderer_hdr {
+                let hdr_id = hdr_r.register_native_texture(
+                    interop.device(),
+                    &display_view,
+                    wgpu::FilterMode::Linear,
+                );
+                assert_eq!(hdr_id, display_tex_id);
+            }
 
             let mut settings = persisted.settings;
+            if settings.hdr_display && !hdr_surface_supported {
+                settings.hdr_display = false;
+            }
             if settings.dlss_rr_on && !dlss_rr_available {
                 settings.dlss_rr_on = false;
             }
@@ -1174,6 +1323,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 window,
                 surface,
                 surface_config,
+                sdr_surface_format,
+                hdr_surface_supported,
                 dlss_pass: None,
                 dlss_rr_pass: None,
                 dlss_rr_available,
@@ -1186,9 +1337,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 egui_ctx,
                 egui_winit,
                 egui_renderer,
+                egui_renderer_hdr,
                 shared_rgba,
                 shared_depth,
                 shared_motion,
+                shared_hdr: None,
                 rr_shared: None,
                 retired_buffers: Vec::new(),
                 buf_gen: 0,
@@ -1201,8 +1354,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dlss_dirty: false,
                 display_texture,
                 display_view,
+                display_texture_hdr: None,
+                display_view_hdr: None,
                 display_tex_id,
                 using_dlss_tex: false,
+                bound_hdr_tex: false,
                 last_jitter: [0.0, 0.0],
                 last_saved_msg: None,
                 cmd_tx,
@@ -1391,6 +1547,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
                 dlss_rr_available: self.dlss_rr_available,
+                hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
                 reset_accum_requested: &mut reset_accum_requested,
                 save_png_requested: &mut save_png_requested,
@@ -1506,19 +1663,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 )
             };
 
+            let hdr_active = self.settings.hdr_display && self.hdr_surface_supported;
+            let desired_surface_fmt = if hdr_active {
+                wgpu::TextureFormat::Rgba16Float
+            } else {
+                self.sdr_surface_format
+            };
+            if desired_surface_fmt != self.surface_config.format {
+                self.surface_config.format = desired_surface_fmt;
+                self.surface
+                    .configure(self.interop.device(), &self.surface_config);
+                self.rr_last_exposure = f32::NAN;
+            }
+
             let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
                 || self.settings.dlss_rr_on != self.last_sent_settings.dlss_rr_on
                 || self.settings.dlss_quality != self.last_sent_settings.dlss_quality;
             let needs_rr_bufs = self.settings.dlss_rr_on && self.rr_shared.is_none();
             let drop_rr_bufs = !self.settings.dlss_rr_on && self.rr_shared.is_some();
+            let needs_hdr_bufs = hdr_active && self.shared_hdr.is_none();
+            let drop_hdr_bufs = !hdr_active && self.shared_hdr.is_some();
             if (target_w != self.render_w
                 || target_h != self.render_h
                 || needs_rr_bufs
-                || drop_rr_bufs)
+                || drop_rr_bufs
+                || needs_hdr_bufs
+                || drop_hdr_bufs)
                 && (self.last_resize_at.elapsed().as_millis() >= 120
                     || dlss_toggled
                     || needs_rr_bufs
-                    || drop_rr_bufs)
+                    || drop_rr_bufs
+                    || needs_hdr_bufs
+                    || drop_hdr_bufs)
             {
                 self.last_resize_at = Instant::now();
                 let rr_alloc = if self.settings.dlss_rr_on {
@@ -1526,9 +1702,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 } else {
                     Ok(None)
                 };
+                let hdr_alloc = if hdr_active {
+                    allocate_hdr_target(&self.interop, target_w, target_h).map(Some)
+                } else {
+                    Ok(None)
+                };
                 match (
                     allocate_render_targets(&self.interop, target_w, target_h),
                     rr_alloc,
+                    hdr_alloc,
                 ) {
                     (
                         Ok(RenderTargets {
@@ -1538,21 +1720,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             display_texture: new_tex,
                         }),
                         Ok(new_rr_shared),
+                        Ok(new_hdr_target),
                     ) => {
                         let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
                         let new_depth_ptrs =
                             [new_depth[0].cu_deviceptr(), new_depth[1].cu_deviceptr()];
                         let new_motion_ptrs =
                             [new_motion[0].cu_deviceptr(), new_motion[1].cu_deviceptr()];
+                        let (new_hdr_shared, new_hdr_tex, new_hdr_view, new_hdr_ptrs) =
+                            if let Some((h_bufs, h_tex)) = new_hdr_target {
+                                let ptrs = [h_bufs[0].cu_deviceptr(), h_bufs[1].cu_deviceptr()];
+                                let v = h_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                                (Some(h_bufs), Some(h_tex), Some(v), Some(ptrs))
+                            } else {
+                                (None, None, None, None)
+                            };
                         let new_rr_ptrs = new_rr_shared.as_ref().map(DlssRrSharedBuffers::ptrs);
                         let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
                         if !self.using_dlss_tex {
-                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            let active_v = if hdr_active {
+                                new_hdr_view.as_ref().unwrap_or(&new_view)
+                            } else {
+                                &new_view
+                            };
+                            bind_display_view(
+                                &mut self.egui_renderer,
+                                self.egui_renderer_hdr.as_mut(),
                                 self.interop.device(),
-                                &new_view,
-                                wgpu::FilterMode::Linear,
+                                active_v,
                                 self.display_tex_id,
                             );
+                            self.bound_hdr_tex = hdr_active && new_hdr_view.is_some();
                         }
                         let old_shared = std::mem::replace(&mut self.shared_rgba, new_shared);
                         let old_depth = std::mem::replace(&mut self.shared_depth, new_depth);
@@ -1560,12 +1758,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.retired_buffers.push((self.buf_gen, old_shared));
                         self.retired_buffers.push((self.buf_gen, old_depth));
                         self.retired_buffers.push((self.buf_gen, old_motion));
+                        if let Some(old_hdr) =
+                            std::mem::replace(&mut self.shared_hdr, new_hdr_shared)
+                        {
+                            self.retired_buffers.push((self.buf_gen, old_hdr));
+                        }
                         if let Some(old_rr) = std::mem::replace(&mut self.rr_shared, new_rr_shared)
                         {
                             old_rr.retire_into(self.buf_gen, &mut self.retired_buffers);
                         }
                         self.display_texture = new_tex;
                         self.display_view = new_view;
+                        self.display_texture_hdr = new_hdr_tex;
+                        self.display_view_hdr = new_hdr_view;
                         self.render_w = target_w;
                         self.render_h = target_h;
                         self.buf_gen = self.buf_gen.wrapping_add(1);
@@ -1580,13 +1785,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             buf_ptrs: new_ptrs,
                             depth_ptrs: new_depth_ptrs,
                             motion_ptrs: new_motion_ptrs,
+                            hdr_ptrs: new_hdr_ptrs,
                             rr_ptrs: new_rr_ptrs,
                             gen_id: self.buf_gen,
                         });
                     }
-                    (Err(e), _) | (_, Err(e)) => {
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                         if self.settings.dlss_rr_on && self.rr_shared.is_none() {
                             self.settings.dlss_rr_on = false;
+                        }
+                        if self.settings.hdr_display && self.shared_hdr.is_none() {
+                            self.settings.hdr_display = false;
                         }
                         self.last_saved_msg = Some(format!("Resize failed: {e}"));
                     }
@@ -1604,13 +1813,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 });
                 if needs_rebuild {
                     if self.using_dlss_tex {
-                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        let base_v = if hdr_active {
+                            self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                        } else {
+                            &self.display_view
+                        };
+                        bind_display_view(
+                            &mut self.egui_renderer,
+                            self.egui_renderer_hdr.as_mut(),
                             self.interop.device(),
-                            &self.display_view,
-                            wgpu::FilterMode::Linear,
+                            base_v,
                             self.display_tex_id,
                         );
                         self.using_dlss_tex = false;
+                        self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
                     }
                     self.dlss_rr_pass = None;
                     if let Some(ref ngx) = self.ngx_vulkan {
@@ -1626,13 +1842,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         ) {
                             Ok(pass) => {
                                 if self.settings.aov_mode == 0 {
-                                    self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    let rr_v = if hdr_active {
+                                        &pass.display_hdr_view
+                                    } else {
+                                        &pass.display_view
+                                    };
+                                    bind_display_view(
+                                        &mut self.egui_renderer,
+                                        self.egui_renderer_hdr.as_mut(),
                                         self.interop.device(),
-                                        &pass.display_view,
-                                        wgpu::FilterMode::Linear,
+                                        rr_v,
                                         self.display_tex_id,
                                     );
                                     self.using_dlss_tex = true;
+                                    self.bound_hdr_tex = hdr_active;
                                 }
                                 self.dlss_dirty = self.has_frame;
                                 self.rr_last_exposure = f32::NAN;
@@ -1647,25 +1870,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 if let Some(ref mut pass) = self.dlss_rr_pass {
                     if self.settings.aov_mode == 0 {
-                        if !self.using_dlss_tex {
-                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        if !self.using_dlss_tex || self.bound_hdr_tex != hdr_active {
+                            let rr_v = if hdr_active {
+                                &pass.display_hdr_view
+                            } else {
+                                &pass.display_view
+                            };
+                            bind_display_view(
+                                &mut self.egui_renderer,
+                                self.egui_renderer_hdr.as_mut(),
                                 self.interop.device(),
-                                &pass.display_view,
-                                wgpu::FilterMode::Linear,
+                                rr_v,
                                 self.display_tex_id,
                             );
+                            let was_aov = !self.using_dlss_tex;
                             self.using_dlss_tex = true;
-                            self.dlss_dirty = self.has_frame;
-                            pass.reset_next = true;
+                            self.bound_hdr_tex = hdr_active;
+                            if was_aov {
+                                self.dlss_dirty = self.has_frame;
+                                pass.reset_next = true;
+                            }
+                            self.rr_last_exposure = f32::NAN;
                         }
                     } else if self.using_dlss_tex {
-                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        let base_v = if hdr_active {
+                            self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                        } else {
+                            &self.display_view
+                        };
+                        bind_display_view(
+                            &mut self.egui_renderer,
+                            self.egui_renderer_hdr.as_mut(),
                             self.interop.device(),
-                            &self.display_view,
-                            wgpu::FilterMode::Linear,
+                            base_v,
                             self.display_tex_id,
                         );
                         self.using_dlss_tex = false;
+                        self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
                     }
                 }
             } else if self.settings.dlss_on {
@@ -1679,13 +1920,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 });
                 if needs_rebuild {
                     if self.using_dlss_tex {
-                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        let base_v = if hdr_active {
+                            self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                        } else {
+                            &self.display_view
+                        };
+                        bind_display_view(
+                            &mut self.egui_renderer,
+                            self.egui_renderer_hdr.as_mut(),
                             self.interop.device(),
-                            &self.display_view,
-                            wgpu::FilterMode::Linear,
+                            base_v,
                             self.display_tex_id,
                         );
                         self.using_dlss_tex = false;
+                        self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
                     }
                     self.dlss_pass = None;
                     if let Some(ref ngx) = self.ngx_vulkan {
@@ -1699,13 +1947,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.settings.dlss_quality,
                         ) {
                             Ok(pass) => {
-                                self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                bind_display_view(
+                                    &mut self.egui_renderer,
+                                    self.egui_renderer_hdr.as_mut(),
                                     self.interop.device(),
                                     &pass.output_view,
-                                    wgpu::FilterMode::Linear,
                                     self.display_tex_id,
                                 );
                                 self.using_dlss_tex = true;
+                                self.bound_hdr_tex = false;
                                 self.dlss_dirty = self.has_frame;
                                 self.dlss_pass = Some(pass);
                             }
@@ -1717,14 +1967,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             } else {
-                if self.using_dlss_tex {
-                    self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                let want_hdr_view = hdr_active && self.display_view_hdr.is_some();
+                if self.using_dlss_tex || self.bound_hdr_tex != want_hdr_view {
+                    let base_v = if want_hdr_view {
+                        self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                    } else {
+                        &self.display_view
+                    };
+                    bind_display_view(
+                        &mut self.egui_renderer,
+                        self.egui_renderer_hdr.as_mut(),
                         self.interop.device(),
-                        &self.display_view,
-                        wgpu::FilterMode::Linear,
+                        base_v,
                         self.display_tex_id,
                     );
                     self.using_dlss_tex = false;
+                    self.bound_hdr_tex = want_hdr_view;
                 }
                 self.dlss_pass = None;
                 self.dlss_rr_pass = None;
@@ -1764,16 +2022,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let profile = if self.settings.record_hdr_pq {
+                let use_pq10 = match self.settings.record_video_mode {
+                    1 => false,
+                    2 => true,
+                    _ => hdr_active,
+                };
+                let profile = if use_pq10 {
                     crate::gpu_export::VideoProfile::Hdr10Pq
                 } else {
                     crate::gpu_export::VideoProfile::SdrH264
                 };
-                let tag = if self.settings.record_hdr_pq {
-                    "pq10"
-                } else {
-                    "sdr"
-                };
+                let tag = if use_pq10 { "pq10" } else { "sdr" };
                 let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
                 let _ = self.cmd_tx.send(RenderCmd::ToggleRecord {
                     path,
@@ -1986,13 +2245,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if rr_failed {
                         self.settings.dlss_rr_on = false;
                         if self.using_dlss_tex {
-                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            let base_v = if hdr_active {
+                                self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                            } else {
+                                &self.display_view
+                            };
+                            bind_display_view(
+                                &mut self.egui_renderer,
+                                self.egui_renderer_hdr.as_mut(),
                                 self.interop.device(),
-                                &self.display_view,
-                                wgpu::FilterMode::Linear,
+                                base_v,
                                 self.display_tex_id,
                             );
                             self.using_dlss_tex = false;
+                            self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
                         }
                         self.dlss_rr_pass = None;
                     } else if ran_rr
@@ -2001,10 +2267,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.hdr_tonemap.dispatch(
                             self.interop.queue(),
                             &mut encoder,
-                            &rr.tonemap_bg,
-                            rr.out_w,
-                            rr.out_h,
+                            if hdr_active {
+                                &rr.scrgb_bg
+                            } else {
+                                &rr.tonemap_bg
+                            },
+                            (rr.out_w, rr.out_h),
                             self.settings.exposure,
+                            hdr_active,
                         );
                         self.rr_last_exposure = self.settings.exposure;
                     }
@@ -2073,18 +2343,50 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         ) {
                             self.settings.dlss_on = false;
                             if self.using_dlss_tex {
-                                self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                let base_v = if hdr_active {
+                                    self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
+                                } else {
+                                    &self.display_view
+                                };
+                                bind_display_view(
+                                    &mut self.egui_renderer,
+                                    self.egui_renderer_hdr.as_mut(),
                                     self.interop.device(),
-                                    &self.display_view,
-                                    wgpu::FilterMode::Linear,
+                                    base_v,
                                     self.display_tex_id,
                                 );
                                 self.using_dlss_tex = false;
+                                self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
                             }
                             self.dlss_pass = None;
                             self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
                         }
                     }
+                } else if hdr_active
+                    && let (Some(hdr_bufs), Some(hdr_tex)) =
+                        (&self.shared_hdr, &self.display_texture_hdr)
+                {
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: hdr_bufs[self.front_buf_idx].wgpu_buffer(),
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(self.render_w * 8),
+                                rows_per_image: Some(self.render_h),
+                            },
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: hdr_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: self.render_w,
+                            height: self.render_h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
                 } else {
                     encoder.copy_buffer_to_texture(
                         wgpu::TexelCopyBufferInfo {
@@ -2118,9 +2420,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         *id,
                         delta,
                     );
+                    if let Some(ref mut hdr_r) = self.egui_renderer_hdr {
+                        hdr_r.update_texture(
+                            self.interop.device(),
+                            self.interop.queue(),
+                            *id,
+                            delta,
+                        );
+                    }
                 }
             }
-            self.egui_renderer.update_buffers(
+            let active_egui = if hdr_active {
+                self.egui_renderer_hdr
+                    .as_mut()
+                    .unwrap_or(&mut self.egui_renderer)
+            } else {
+                &mut self.egui_renderer
+            };
+            active_egui.update_buffers(
                 self.interop.device(),
                 self.interop.queue(),
                 &mut encoder,
@@ -2145,10 +2462,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     multiview_mask: None,
                 });
                 let mut pass = pass.forget_lifetime();
-                self.egui_renderer.render(&mut pass, &tris, &screen_desc);
+                active_egui.render(&mut pass, &tris, &screen_desc);
             }
             for id in &full_output.textures_delta.free {
                 self.egui_renderer.free_texture(id);
+                if let Some(ref mut hdr_r) = self.egui_renderer_hdr {
+                    hdr_r.free_texture(id);
+                }
             }
 
             self.interop.queue().submit(Some(encoder.finish()));
@@ -2213,6 +2533,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             motion,
             display_texture,
         })
+    }
+
+    fn allocate_hdr_target(
+        interop: &InteropContext,
+        width: u32,
+        height: u32,
+    ) -> Result<([SharedBuffer; 2], wgpu::Texture), nv_wgpu::Error> {
+        let bytes = u64::from(width) * u64::from(height) * 8; // Rgba16Float scRGB
+        let make = |label| {
+            interop.create_buffer(&SharedBufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+            })
+        };
+        let bufs = [make("optix-scrgb-0")?, make("optix-scrgb-1")?];
+        let tex = interop.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("optix-viewport-hdr"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        Ok((bufs, tex))
+    }
+
+    fn bind_display_view(
+        egui_sdr: &mut egui_wgpu::Renderer,
+        egui_hdr: Option<&mut egui_wgpu::Renderer>,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        tex_id: egui::TextureId,
+    ) {
+        egui_sdr.update_egui_texture_from_wgpu_texture(
+            device,
+            view,
+            wgpu::FilterMode::Linear,
+            tex_id,
+        );
+        if let Some(hdr_r) = egui_hdr {
+            hdr_r.update_egui_texture_from_wgpu_texture(
+                device,
+                view,
+                wgpu::FilterMode::Linear,
+                tex_id,
+            );
+        }
     }
 
     fn save_front_png(interop: &InteropContext, dev_ptr: u64, width: u32, height: u32) -> String {

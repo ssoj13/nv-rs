@@ -129,9 +129,9 @@ fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
         "box_min_r" => anim_f32(&mut s.box_min_r, amp, phase, 0.05, 1.2),
         "box_fixed_r" => anim_f32(&mut s.box_fixed_r, amp, phase, 0.4, 2.5),
         "box_iter_rot" => anim_f32(&mut s.box_iter_rot, amp, phase, -45.0, 45.0),
-        "box_bailout" => anim_f32(&mut s.box_bailout, amp, phase, 4.0, 64.0),
+        "box_bailout" => anim_f32(&mut s.box_bailout, amp, phase, 4.0, 128.0),
         // KIFS Octahedron
-        "kifs_scale" => anim_f32(&mut s.kifs_scale, amp, phase, 1.3, 2.8),
+        "kifs_scale" => anim_f32(&mut s.kifs_scale, amp, phase, 1.3, 3.5),
         "kifs_rot1" => anim_f32(&mut s.kifs_rot1, amp, phase, -180.0, 180.0),
         "kifs_rot2" => anim_f32(&mut s.kifs_rot2, amp, phase, -180.0, 180.0),
         "kifs_offset" => anim_vec3(&mut s.kifs_offset, amp, phase, 0.1, 2.0),
@@ -144,8 +144,8 @@ fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
         "rot_y" => anim_f32(&mut s.rot_y, amp, phase, -180.0, 180.0),
         "rot_z" => anim_f32(&mut s.rot_z, amp, phase, -180.0, 180.0),
         // Detail & Shading
-        "detail_eps" => anim_f32(&mut s.detail_eps, amp, phase, 0.00005, 0.005),
-        "norm_eps" => anim_f32(&mut s.norm_eps, amp, phase, 0.00005, 0.005),
+        "detail_eps" => anim_f32(&mut s.detail_eps, amp, phase, 0.00002, 0.005),
+        "norm_eps" => anim_f32(&mut s.norm_eps, amp, phase, 0.00002, 0.005),
         "fudge" => anim_f32(&mut s.fudge, amp, phase, 0.3, 1.1),
         "metallic" => anim_f32(&mut s.metallic, amp, phase, 0.0, 1.0),
         "roughness" => anim_f32(&mut s.roughness, amp, phase, 0.02, 0.85),

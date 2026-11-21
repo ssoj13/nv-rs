@@ -51,12 +51,9 @@ pub fn install_fonts(ctx: &egui::Context) {
 pub fn default_dock_state() -> DockState<DockTab> {
     let mut state = DockState::new(vec![DockTab::Viewport]);
     let surface = state.main_surface_mut();
-    let [_vp, right] = surface.split_right(NodeIndex::root(), 0.74, vec![DockTab::Fractal]);
-    let [_top, _bot] = surface.split_below(
-        right,
-        0.54,
-        vec![DockTab::RenderFloor, DockTab::CameraStats],
-    );
+    let [vp, _left] = surface.split_left(NodeIndex::root(), 0.17, vec![DockTab::CameraStats]);
+    let [_vp, right] = surface.split_right(vp, 0.70, vec![DockTab::Fractal]);
+    let [_top, _bot] = surface.split_below(right, 0.41, vec![DockTab::RenderFloor]);
     state
 }
 
@@ -1984,6 +1981,18 @@ fn section_group_for(id_salt: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+fn section_default_open(id_salt: &str) -> bool {
+    matches!(
+        id_salt,
+        "sec_telemetry"
+            | "sec_perf"
+            | "sec_presets"
+            | "sec_formula"
+            | "sec_sky"
+            | "sec_pt"
+    )
+}
+
 fn collapsing_section(
     ui: &mut Ui,
     id_salt: &str,
@@ -1995,7 +2004,11 @@ fn collapsing_section(
     let accent = section_accent(id_salt);
     let ctx = ui.ctx().clone();
     let id = egui::Id::new(id_salt);
-    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, id, false);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        &ctx,
+        id,
+        section_default_open(id_salt),
+    );
     let header_h = 22.0;
     let total_w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, header_h), Sense::hover());
@@ -2024,15 +2037,18 @@ fn collapsing_section(
             egui::collapsing_header::CollapsingState::load_with_default_open(
                 &ctx,
                 egui::Id::new(sec),
-                false,
+                section_default_open(sec),
             )
             .is_open()
         });
         let target_open = !any_open;
         for &sec in group {
             let sec_id = egui::Id::new(sec);
-            let mut st =
-                egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, sec_id, false);
+            let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(
+                &ctx,
+                sec_id,
+                section_default_open(sec),
+            );
             st.set_open(target_open);
             st.store(&ctx);
         }

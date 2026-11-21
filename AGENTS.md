@@ -34,7 +34,7 @@ wgpu Vulkan or DX12 allocation
 | Wrapper crates | Validation, native status conversion, resource ownership |
 | `crates/cuda-core-ext` | External memory/semaphores, arrays, textures, sparse and green-context extensions |
 | `crates/nv-wgpu` | GPU identity matching, external memory and semaphore interop |
-| `crates/nv-demo` | Interactive OptiX 9 renderer (SER, OMM, DLSS SR/RR, Aov/TemporalAov denoiser), camera controllers, exports, and NVTX3/CUPTI profiling |
+| `crates/nv-demo` | Interactive OptiX 9 renderer (SER, OMM, DLSS SR/RR, Aov/TemporalAov denoiser), camera controllers, MP4 SDR/PQ10 & JPEG exports, and NVTX3/CUPTI profiling |
 | `xtask` | Coverage inventories, prebuilt artifacts and runtime deployment tooling |
 | `device/` | Separately compiled CUDA/OptiX device code |
 | `python/` | Separate Python extension workspace |

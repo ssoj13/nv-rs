@@ -53,7 +53,7 @@ Safe NVENC hardware video encoder wrapper over `nvenc-sys` and `cuda-core` (H.26
 
 - **Session lifecycle**: `EncodeSession` opens an NVENC session bound to a `cuda_core::Context`, serializes all NVENC API calls and `Drop` paths through an internal `Mutex<()>` for sound `Sync` sharing, queries capabilities (`EncodeSession::caps`) and preset configs (`EncodeSession::preset_config`), initializes the encoder (`EncodeSession::initialize`), and encodes frames or flushes EOS with zero per-frame heap allocations.
 - **Input & output buffers**: `InputBuffer` / `InputLock` (host-accessible driver-allocated buffers), `RegisteredResource` / `MappedResource` (zero-copy CUDA device-pointer or CUDA-array input registration), and `OutputBitstream` / `BitstreamLock` (yielding `&[u8]` encoded packets).
-- **GUIDs (`guid`)**: Authoritative H.264, HEVC, AV1, profile, and `P1`–`P7` preset GUIDs.
+- **GUIDs & color VUI (`guid`, `EncodeConfig`)**: Authoritative H.264, HEVC, AV1, profile, and `P1`–`P7` preset GUIDs, plus `EncodeConfig::set_h264_bt709_vui` (H.264 High 8-bit BT.709) and `EncodeConfig::set_hevc_10bit_pq` (HEVC Main 10 10-bit BT.2020 SMPTE ST 2084 PQ).
 
 ---
 

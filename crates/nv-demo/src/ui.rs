@@ -1959,21 +1959,30 @@ fn section_accent(id_salt: &str) -> Color32 {
     }
 }
 
-const ALL_SECTION_IDS: &[&str] = &[
-    "sec_presets",
-    "sec_formula",
-    "sec_transform",
-    "sec_detail",
-    "sec_sky",
-    "sec_dof",
-    "sec_floor",
-    "sec_scene",
-    "sec_bloom",
-    "sec_split",
-    "sec_pt",
-    "sec_telemetry",
-    "sec_perf",
+const SECTION_GROUPS: &[&[&str]] = &[
+    // Fractal panel
+    &["sec_presets", "sec_formula", "sec_transform", "sec_detail"],
+    // Render & Floor panel
+    &[
+        "sec_sky",
+        "sec_dof",
+        "sec_floor",
+        "sec_scene",
+        "sec_bloom",
+        "sec_split",
+        "sec_pt",
+    ],
+    // Camera & Stats panel
+    &["sec_telemetry", "sec_perf"],
 ];
+
+fn section_group_for(id_salt: &str) -> &'static [&'static str] {
+    SECTION_GROUPS
+        .iter()
+        .copied()
+        .find(|group| group.contains(&id_salt))
+        .unwrap_or(&[])
+}
 
 fn collapsing_section(
     ui: &mut Ui,
@@ -1991,7 +2000,7 @@ fn collapsing_section(
     let total_w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, header_h), Sense::hover());
 
-    // Icon button at the very start of the title bar: collapses/expands all sections at once.
+    // Icon button at the very start of the title bar: collapses/expands all sections in this panel.
     let icon_rect = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 4.0, rect.top() + 1.0),
         egui::vec2(20.0, header_h - 2.0),
@@ -2003,14 +2012,15 @@ fn collapsing_section(
 
     let icon_resp = ui
         .interact(icon_rect, egui::Id::new((id_salt, "toggle_all")), Sense::click())
-        .on_hover_text("Collapse / Expand all panels")
+        .on_hover_text("Collapse / Expand all sections in this panel")
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let title_resp = ui
         .interact(title_rect, egui::Id::new((id_salt, "toggle_one")), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
 
     if icon_resp.clicked() {
-        let any_open = ALL_SECTION_IDS.iter().any(|&sec| {
+        let group = section_group_for(id_salt);
+        let any_open = group.iter().any(|&sec| {
             egui::collapsing_header::CollapsingState::load_with_default_open(
                 &ctx,
                 egui::Id::new(sec),
@@ -2019,7 +2029,7 @@ fn collapsing_section(
             .is_open()
         });
         let target_open = !any_open;
-        for &sec in ALL_SECTION_IDS {
+        for &sec in group {
             let sec_id = egui::Id::new(sec);
             let mut st =
                 egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, sec_id, false);

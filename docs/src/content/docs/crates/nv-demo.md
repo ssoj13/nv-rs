@@ -63,7 +63,7 @@ The scene builds separate Geometry Acceleration Structures (GAS) combined into a
 - **Triangle GAS & Resize Resilience**: triangle GAS builders enable `random_vertex_access: true` for `optixGetTriangleVertexData`, and runtime viewport resize / PNG export paths propagate `nv_wgpu` and CUDA context errors cleanly without panicking on OOM.
 - **`nvjpeg` & `nvenc` Zero-Copy Export**:
   - **JPEG Snapshot**: converts the device `RGBA8` frame to `RGB8` via an NVRTC kernel and encodes on the GPU with `nvjpeg`.
-  - **H.264 Recording**: converts each `RGBA8` frame to `NV12` (BT.709 limited range) via an NVRTC kernel and encodes zero-copy with `nvenc` (`RegisteredResource`) into an Annex-B `.h264` stream.
+  - **MP4 Video Recording (`SDR` / `PQ10` + `Live RT` / `Smooth 60`)**: zero-copy GPU color conversion (`RGBA8 -> NV12` BT.709 for **SDR** H.264 `avc1`, or linear HDR `float4 -> P010` BT.2020 SMPTE ST 2084 PQ for **PQ10** HEVC Main10 `hvc1` with `colr`/`mdcv`/`clli` metadata) encoded with `nvenc` and muxed directly into an iPhone/QuickTime-compatible `.mp4` container (`mp4_muxer.rs`). Supports **Live RT** (per-frame 90 kHz `stts` timestamps so close-up FPS dips never speed up playback) and **Smooth 60** (fixed `1/60s` step per rendered frame for silky-smooth animations).
 
 ---
 

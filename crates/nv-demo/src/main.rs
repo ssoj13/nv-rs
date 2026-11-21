@@ -10,6 +10,7 @@ mod camera_egui;
 mod demo_anim;
 mod fft_bloom;
 mod gpu_export;
+mod mp4_muxer;
 mod nvtx;
 mod persist;
 mod profiler;
@@ -1316,10 +1317,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             // 1. Drain completed frames from the async OptiX render thread.
+            let mut frames_received = 0u32;
             while let Ok(msg) = self.frame_rx.try_recv() {
                 if msg.gen_id != self.buf_gen {
                     continue;
                 }
+                frames_received += 1;
                 if self.has_frame && self.front_buf_idx != msg.buf_idx {
                     let _ = self.cmd_tx.send(RenderCmd::ReturnBuffer {
                         buf_idx: self.front_buf_idx,
@@ -1761,15 +1764,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let path = dir.join(format!("nv-demo-{ts}.h264"));
-                let _ = self.cmd_tx.send(RenderCmd::ToggleRecord { path, fps: 60 });
+                let profile = if self.settings.record_hdr_pq {
+                    crate::gpu_export::VideoProfile::Hdr10Pq
+                } else {
+                    crate::gpu_export::VideoProfile::SdrH264
+                };
+                let tag = if self.settings.record_hdr_pq {
+                    "pq10"
+                } else {
+                    "sdr"
+                };
+                let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
+                let _ = self.cmd_tx.send(RenderCmd::ToggleRecord {
+                    path,
+                    fps: 60,
+                    profile,
+                });
             }
             if reload_shader_requested {
                 let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
             }
 
             // 4. Advance demo animator & push camera/settings updates when changed.
-            self.demo_anim.tick(dt);
+            // In Smooth 60 FPS recording mode, step animation by an exact 1/60s per rendered frame
+            // so slow close-up fractal frames produce silky 60 FPS playback instead of cartoon speedup.
+            let anim_dt = if self.is_recording && self.settings.record_fixed_fps {
+                frames_received as f32 / 60.0
+            } else {
+                dt
+            };
+            self.demo_anim.tick(anim_dt);
             let mut effective_settings = self.demo_anim.apply(&self.settings);
             if !self.demo_anim.playing {
                 effective_settings.auto_rotate = false;

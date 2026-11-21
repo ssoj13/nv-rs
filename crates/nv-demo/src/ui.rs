@@ -1711,8 +1711,10 @@ impl UiContext<'_> {
                 _ => {
                     let rec_lbl = if self.is_recording {
                         format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
+                    } else if s.record_hdr_pq {
+                        format!("{}  Record PQ10", ic::VIDEO_CAMERA)
                     } else {
-                        format!("{}  Record H.264", ic::VIDEO_CAMERA)
+                        format!("{}  Record MP4", ic::VIDEO_CAMERA)
                     };
                     if ui
                         .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
@@ -1721,6 +1723,50 @@ impl UiContext<'_> {
                         *self.toggle_record_requested = true;
                     }
                 }
+            });
+            ui.add_space(2.0);
+            ui.add_enabled_ui(!self.is_recording, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Video")
+                            .size(11.0)
+                            .color(Color32::from_rgb(165, 173, 203)),
+                    );
+                    if ui
+                        .selectable_label(!s.record_hdr_pq, "SDR")
+                        .on_hover_text("iPhone-compatible H.264 8-bit BT.709 MP4 (avc1)")
+                        .clicked()
+                    {
+                        s.record_hdr_pq = false;
+                    }
+                    if ui
+                        .selectable_label(s.record_hdr_pq, "PQ10")
+                        .on_hover_text("iPhone Pro Max HDR10 HEVC Main10 BT.2020 PQ MP4 (hvc1)")
+                        .clicked()
+                    {
+                        s.record_hdr_pq = true;
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Timing")
+                            .size(11.0)
+                            .color(Color32::from_rgb(165, 173, 203)),
+                    );
+                    if ui
+                        .selectable_label(!s.record_fixed_fps, "Live RT")
+                        .on_hover_text("Real-time MP4 timestamps (no speedup when FPS dips)")
+                        .clicked()
+                    {
+                        s.record_fixed_fps = false;
+                    }
+                    if ui
+                        .selectable_label(s.record_fixed_fps, "Smooth 60")
+                        .on_hover_text("Fixed 1/60s per rendered frame for smooth offline animations")
+                        .clicked()
+                    {
+                        s.record_fixed_fps = true;
+                    }
+                });
             });
             ui.add_space(2.0);
             if ui

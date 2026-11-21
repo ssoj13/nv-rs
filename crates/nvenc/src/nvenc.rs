@@ -415,6 +415,47 @@ impl EncodeConfig {
     pub fn set_average_bitrate(&mut self, bps: u32) {
         self.raw.rcParams.averageBitRate = bps;
     }
+
+    /// Configures H.264 High profile with BT.709 limited-range VUI color signaling.
+    ///
+    /// Call only on an [`EncodeConfig`] created for [`Codec::H264`].
+    pub fn set_h264_bt709_vui(&mut self) {
+        self.raw.profileGUID = guid::H264_HIGH;
+        // SAFETY: Caller created this config for `Codec::H264`, so the `h264Config` union arm is active.
+        let h264 = unsafe { &mut self.raw.encodeCodecConfig.h264Config };
+        h264.inputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
+        h264.outputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
+        let vui = &mut h264.h264VUIParameters;
+        vui.videoSignalTypePresentFlag = 1;
+        vui.videoFullRangeFlag = 0;
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries =
+            sys::_NV_ENC_VUI_COLOR_PRIMARIES_NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        vui.transferCharacteristics =
+            sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        vui.colourMatrix = sys::_NV_ENC_VUI_MATRIX_COEFFS_NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    }
+
+    /// Configures HEVC Main 10 profile (10-bit input/output) with HDR10 BT.2020 PQ (SMPTE ST 2084)
+    /// limited-range VUI color signaling.
+    ///
+    /// Call only on an [`EncodeConfig`] created for [`Codec::Hevc`].
+    pub fn set_hevc_10bit_pq(&mut self) {
+        self.raw.profileGUID = guid::HEVC_MAIN10;
+        // SAFETY: Caller created this config for `Codec::Hevc`, so the `hevcConfig` union arm is active.
+        let hevc = unsafe { &mut self.raw.encodeCodecConfig.hevcConfig };
+        hevc.inputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_10;
+        hevc.outputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_10;
+        let vui = &mut hevc.hevcVUIParameters;
+        vui.videoSignalTypePresentFlag = 1;
+        vui.videoFullRangeFlag = 0;
+        vui.colourDescriptionPresentFlag = 1;
+        vui.colourPrimaries =
+            sys::_NV_ENC_VUI_COLOR_PRIMARIES_NV_ENC_VUI_COLOR_PRIMARIES_BT2020;
+        vui.transferCharacteristics =
+            sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
+        vui.colourMatrix = sys::_NV_ENC_VUI_MATRIX_COEFFS_NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+    }
 }
 
 /// High-level encoder initialization parameters.

@@ -21,7 +21,7 @@ use optix::{
 };
 
 use crate::fft_bloom::FftBloomPass;
-use crate::gpu_export::{VideoRecorder, save_jpeg_from_rgba8};
+use crate::gpu_export::{VideoProfile, VideoRecorder, save_jpeg_from_rgba8};
 
 #[cfg(has_embedded_ptx)]
 const EMBEDDED_RAYTRACER_PTX: &str = concat!(
@@ -346,6 +346,9 @@ pub struct DemoSettings {
     pub dlss_rr_on: bool,
     pub dlss_quality: u32,
     pub dlss_sharpness: f32,
+    // Video Export (MP4 H.264 SDR / HEVC PQ10 HDR10 + Timing)
+    pub record_hdr_pq: bool,
+    pub record_fixed_fps: bool,
     // Per-environment procedural parameters (persisted in PersistedState)
     pub env: EnvSettings,
 }
@@ -451,6 +454,8 @@ impl Default for DemoSettings {
             dlss_rr_on: false,
             dlss_quality: 3,
             dlss_sharpness: 0.35,
+            record_hdr_pq: false,
+            record_fixed_fps: false,
             env: EnvSettings::default(),
         }
     }
@@ -500,6 +505,7 @@ pub enum RenderCmd {
     ToggleRecord {
         path: PathBuf,
         fps: u32,
+        profile: VideoProfile,
     },
     ReloadShader,
     Shutdown,
@@ -1493,8 +1499,9 @@ pub fn spawn_render_thread(
                 ],
             );
             let mut last_tick = Instant::now();
+            let mut last_record_at: Option<Instant> = None;
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
-            let mut recorder: Option<VideoRecorder> = None;
+            let mut recorder: Option<(VideoRecorder, u32)> = None;
             let mut pending_status: Option<String> = None;
 
             loop {
@@ -1514,7 +1521,8 @@ pub fn spawn_render_thread(
                                  camera: &mut CameraFrame,
                                  accum_count: &mut u32,
                                  pending_jpeg: &mut Option<(PathBuf, u8)>,
-                                 recorder: &mut Option<VideoRecorder>,
+                                 recorder: &mut Option<(VideoRecorder, u32)>,
+                                 last_record_at: &mut Option<Instant>,
                                  pending_status: &mut Option<String>|
                  -> bool {
                     match cmd {
@@ -1533,6 +1541,8 @@ pub fn spawn_render_thread(
                             tmp.bloom_intensity = settings.bloom_intensity;
                             tmp.bloom_blades = settings.bloom_blades;
                             tmp.dlss_sharpness = settings.dlss_sharpness;
+                            tmp.record_hdr_pq = settings.record_hdr_pq;
+                            tmp.record_fixed_fps = settings.record_fixed_fps;
                             if s.aov_mode < 3 && settings.aov_mode < 3 {
                                 tmp.aov_mode = settings.aov_mode;
                             }
@@ -1554,8 +1564,9 @@ pub fn spawn_render_thread(
                             rr_ptrs: new_rr_ptrs,
                             gen_id,
                         } => {
-                            if let Some(rec) = recorder.take() {
+                            if let Some((rec, _)) = recorder.take() {
                                 let _ = rec.finish();
+                                *last_record_at = None;
                                 *pending_status = Some("Recording stopped on resize".to_string());
                             }
                             if width != *cur_w || height != *cur_h {
@@ -1585,17 +1596,21 @@ pub fn spawn_render_thread(
                             *accum_count = (*accum_count).min(settings.max_accum.saturating_sub(1));
                             false
                         }
-                        RenderCmd::ToggleRecord { path, fps } => {
-                            if let Some(rec) = recorder.take() {
+                        RenderCmd::ToggleRecord { path, fps, profile } => {
+                            if let Some((rec, _)) = recorder.take() {
+                                *last_record_at = None;
                                 let frames = rec.frame_count();
                                 *pending_status = Some(match rec.finish() {
-                                    Ok(n) => format!("Saved video ({n} frames)"),
+                                    Ok(n) => format!("Saved MP4 ({n} frames)"),
                                     Err(e) => format!("Video finish failed ({frames}f): {e}"),
                                 });
                             } else {
-                                match VideoRecorder::start(cuda, *cur_w, *cur_h, fps, &path) {
+                                match VideoRecorder::start(
+                                    cuda, *cur_w, *cur_h, fps, profile, &path,
+                                ) {
                                     Ok(rec) => {
-                                        *recorder = Some(rec);
+                                        *recorder = Some((rec, fps));
+                                        *last_record_at = None;
                                         *pending_status =
                                             Some(format!("Recording to {}", path.display()));
                                     }
@@ -1629,9 +1644,10 @@ pub fn spawn_render_thread(
                             false
                         }
                         RenderCmd::Shutdown => {
-                            if let Some(rec) = recorder.take() {
+                            if let Some((rec, _)) = recorder.take() {
                                 let _ = rec.finish();
                             }
+                            *last_record_at = None;
                             true
                         }
                     }
@@ -1655,6 +1671,7 @@ pub fn spawn_render_thread(
                         &mut accum_count,
                         &mut pending_jpeg,
                         &mut recorder,
+                        &mut last_record_at,
                         &mut pending_status,
                     ) {
                         should_exit = true;
@@ -1693,6 +1710,7 @@ pub fn spawn_render_thread(
                                 &mut accum_count,
                                 &mut pending_jpeg,
                                 &mut recorder,
+                                &mut last_record_at,
                                 &mut pending_status,
                             ) {
                                 break;
@@ -1708,7 +1726,13 @@ pub fn spawn_render_thread(
                 };
 
                 let now = Instant::now();
-                let dt = now.duration_since(last_tick).as_secs_f32().min(0.1);
+                let dt = if let Some((_, rec_fps)) = recorder.as_ref()
+                    && settings.record_fixed_fps
+                {
+                    1.0 / (*rec_fps).max(1) as f32
+                } else {
+                    now.duration_since(last_tick).as_secs_f32().min(0.1)
+                };
                 last_tick = now;
                 if settings.auto_rotate {
                     spin_angle += dt * settings.spin_speed;
@@ -2293,12 +2317,29 @@ pub fn spawn_render_thread(
                     );
                 }
 
-                if let Some(ref mut rec) = recorder
-                    && let Err(e) = rec.push_frame(&rig.stream, buf_ptrs[buf_idx])
-                {
-                    pending_status = Some(format!("Video encode error: {e}"));
-                    if let Some(failed) = recorder.take() {
-                        let _ = failed.finish();
+                if let Some((ref mut rec, rec_fps)) = recorder {
+                    let rec_now = Instant::now();
+                    let frame_dur = if settings.record_fixed_fps {
+                        1.0 / f64::from(rec_fps.max(1))
+                    } else {
+                        let d = last_record_at.map_or(1.0 / f64::from(rec_fps.max(1)), |prev| {
+                            rec_now.duration_since(prev).as_secs_f64()
+                        });
+                        d.clamp(1.0 / 240.0, 2.0)
+                    };
+                    last_record_at = Some(rec_now);
+                    if let Err(e) = rec.push_frame(
+                        &rig.stream,
+                        buf_ptrs[buf_idx],
+                        final_f32_ptr,
+                        settings.exposure,
+                        frame_dur,
+                    ) {
+                        pending_status = Some(format!("Video encode error: {e}"));
+                        if let Some((failed, _)) = recorder.take() {
+                            let _ = failed.finish();
+                        }
+                        last_record_at = None;
                     }
                 }
 
@@ -2317,7 +2358,7 @@ pub fn spawn_render_thread(
                         bloom_ms,
                         tonemap_ms,
                         is_recording: recorder.is_some(),
-                        record_frames: recorder.as_ref().map_or(0, VideoRecorder::frame_count),
+                        record_frames: recorder.as_ref().map_or(0, |(r, _)| r.frame_count()),
                         ser_supported: rig.ser_supported,
                         status_msg: pending_status.take(),
                     })

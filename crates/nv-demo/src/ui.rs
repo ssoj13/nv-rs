@@ -395,10 +395,23 @@ impl UiContext<'_> {
             } else {
                 format!("{} Play", ic::PLAY)
             };
-            let play_btn = egui::Button::new(play_label).selected(playing);
+            let dark = ui.visuals().dark_mode;
+            let play_btn = if playing {
+                let fill = if dark {
+                    Color32::from_rgb(38, 112, 68)
+                } else {
+                    Color32::from_rgb(44, 142, 82)
+                };
+                egui::Button::new(RichText::new(play_label).color(Color32::WHITE))
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(82, 178, 116)))
+            } else {
+                egui::Button::new(RichText::new(play_label).color(ui.visuals().weak_text_color()))
+                    .fill(ui.visuals().widgets.inactive.weak_bg_fill)
+            };
             if ui
                 .add_sized([68.0, 22.0], play_btn)
-                .on_hover_text("Play / Pause selected animations (Space)")
+                .on_hover_text("Play / Pause selected animations (Space). Green = Playing, Gray = Paused.")
                 .clicked()
             {
                 self.demo_anim.toggle_play(self.settings);
@@ -1468,6 +1481,7 @@ impl UiContext<'_> {
                     2 => "Any-Hit (SW)",
                     _ => "Off",
                 };
+                let tint = (s.omm_mode != 0).then(|| active_accent_tint(ui));
                 let step = cycle_toggle_btn(
                     ui,
                     inner_w,
@@ -1475,6 +1489,7 @@ impl UiContext<'_> {
                     lbl,
                     "Adds a perforated gold ring around the fractal to compare hardware Opacity Micro-Maps (OMM) vs software Any-Hit cutouts.",
                     true,
+                    tint,
                 );
                 if step != 0 {
                     s.omm_mode = ((s.omm_mode as i32 + step).rem_euclid(3)) as u32;
@@ -1543,6 +1558,7 @@ impl UiContext<'_> {
                         lbl,
                         "Choose what appears on the right half of the split screen: raw noisy render, base surface color (Albedo), or surface direction (Normal).",
                         true,
+                        None,
                     );
                     if step != 0 {
                         s.right_is_aov = ((s.right_is_aov as i32 + step).rem_euclid(3)) as u32;
@@ -1573,6 +1589,7 @@ impl UiContext<'_> {
                         &lbl,
                         tip,
                         !s.dlss_on && !s.dlss_rr_on,
+                        None,
                     );
                     if step != 0 {
                         let next = (cur as i32 + step).rem_euclid(SCALES.len() as i32) as usize;
@@ -1582,6 +1599,7 @@ impl UiContext<'_> {
                 1 => {
                     const AOVS: [&str; 5] = ["Beauty", "Albedo", "Normal", "Depth", "Motion"];
                     let cur = (s.aov_mode as usize).min(AOVS.len() - 1);
+                    let tint = (cur != 0).then(|| active_accent_tint(ui));
                     let step = cycle_toggle_btn(
                         ui,
                         w,
@@ -1589,6 +1607,7 @@ impl UiContext<'_> {
                         AOVS[cur],
                         "Inspect what the renderer sees: final Beauty image, base color (Albedo), surface direction (Normal), distance (Depth), or pixel motion.",
                         true,
+                        tint,
                     );
                     if step != 0 {
                         s.aov_mode =
@@ -1616,7 +1635,8 @@ impl UiContext<'_> {
                     } else {
                         "AI noise removal & upscaling: Off (raw path tracing), OptiX (denoiser), or DLSS SR (upscaler). DLSS RR is unavailable on this GPU/driver."
                     };
-                    let step = cycle_toggle_btn(ui, w, "AI", lbl, tip, true);
+                    let tint = (cur != 0).then(|| active_accent_tint(ui));
+                    let step = cycle_toggle_btn(ui, w, "AI", lbl, tip, true, tint);
                     if step != 0 {
                         let count = if self.dlss_rr_available { 4 } else { 3 };
                         let next = (cur + step).rem_euclid(count);
@@ -1668,6 +1688,7 @@ impl UiContext<'_> {
                         QUALS[cur].1,
                         "Balance between frame rate and sharpness: Ultra Perf is fastest, Quality and DLAA give the sharpest image.",
                         true,
+                        None,
                     );
                     if step != 0 {
                         let next = (cur as i32 + step).rem_euclid(QUALS.len() as i32) as usize;
@@ -1741,14 +1762,39 @@ impl UiContext<'_> {
                         format!("{}  Record MP4", ic::VIDEO_CAMERA)
                     };
                     let rec_tip = if self.is_recording {
-                        "Stop recording and finalize the MP4 video file."
+                        "Stop recording and finalize the MP4 video file (Red = Recording)."
                     } else if use_pq10 {
-                        "Start recording a 10-bit HDR10 PQ10 HEVC MP4 video (plays in full HDR on iPhone Pro Max and HDR displays)."
+                        "Start recording a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
                     } else {
-                        "Start recording an iPhone-compatible H.264 MP4 video into renders/."
+                        "Start recording an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
+                    };
+                    let dark = ui.visuals().dark_mode;
+                    let rec_btn = if self.is_recording {
+                        let fill = if dark {
+                            Color32::from_rgb(176, 42, 50)
+                        } else {
+                            Color32::from_rgb(202, 46, 54)
+                        };
+                        egui::Button::new(RichText::new(rec_lbl).color(Color32::WHITE))
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(235, 96, 104)))
+                    } else {
+                        let fill = if dark {
+                            Color32::from_rgb(32, 86, 56)
+                        } else {
+                            Color32::from_rgb(204, 238, 216)
+                        };
+                        let txt = if dark {
+                            Color32::from_rgb(220, 248, 228)
+                        } else {
+                            Color32::from_rgb(22, 86, 46)
+                        };
+                        egui::Button::new(RichText::new(rec_lbl).color(txt))
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)))
                     };
                     if ui
-                        .add_sized([w, ROW_H + 2.0], egui::Button::new(rec_lbl))
+                        .add_sized([w, ROW_H + 2.0], rec_btn)
                         .on_hover_text(rec_tip)
                         .clicked()
                     {
@@ -1766,7 +1812,10 @@ impl UiContext<'_> {
                     } else {
                         "HDR display is currently off — enable HDR in Windows Display Settings to unlock."
                     };
-                    if cycle_toggle_btn(ui, w, "View", val, tip, self.hdr_surface_supported) != 0 {
+                    let tint = hdr_active.then(|| hdr_amber_tint(ui));
+                    if cycle_toggle_btn(ui, w, "View", val, tip, self.hdr_surface_supported, tint)
+                        != 0
+                    {
                         s.hdr_display = !s.hdr_display;
                     }
                 }
@@ -1776,6 +1825,11 @@ impl UiContext<'_> {
                         2 => "PQ10",
                         _ => "Auto",
                     };
+                    let tint = match s.record_video_mode {
+                        2 => Some(hdr_amber_tint(ui)),
+                        1 => Some(active_accent_tint(ui)),
+                        _ => None,
+                    };
                     let step = cycle_toggle_btn(
                         ui,
                         w,
@@ -1783,6 +1837,7 @@ impl UiContext<'_> {
                         val,
                         "Video format: Auto follows the current View, SDR saves standard H.264 MP4, PQ10 saves 10-bit HDR10 HEVC MP4 for iPhone Pro Max.",
                         !self.is_recording,
+                        tint,
                     );
                     if step != 0 {
                         s.record_video_mode =
@@ -1795,6 +1850,7 @@ impl UiContext<'_> {
                     } else {
                         "Live RT"
                     };
+                    let tint = s.record_fixed_fps.then(|| active_accent_tint(ui));
                     if cycle_toggle_btn(
                         ui,
                         w,
@@ -1802,6 +1858,7 @@ impl UiContext<'_> {
                         val,
                         "Live RT keeps real-time speed even when FPS drops; Smooth 60 renders animations at a locked cinematic 60 FPS.",
                         !self.is_recording,
+                        tint,
                     ) != 0
                     {
                         s.record_fixed_fps = !s.record_fixed_fps;
@@ -2105,6 +2162,22 @@ fn collapsing_section(
     });
 }
 
+fn active_accent_tint(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(38, 70, 110)
+    } else {
+        Color32::from_rgb(208, 226, 250)
+    }
+}
+
+fn hdr_amber_tint(ui: &Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(106, 78, 30)
+    } else {
+        Color32::from_rgb(252, 232, 184)
+    }
+}
+
 /// Compact cyclic toggle button: LMB steps forward (`+1`), RMB steps backward (`-1`).
 fn cycle_toggle_btn(
     ui: &mut Ui,
@@ -2113,14 +2186,16 @@ fn cycle_toggle_btn(
     value: &str,
     tooltip: &str,
     enabled: bool,
+    tint: Option<Color32>,
 ) -> i32 {
     let mut step = 0;
     ui.add_enabled_ui(enabled, |ui| {
+        let mut btn = egui::Button::new(format!("{label}: {value}"));
+        if let Some(fill) = tint {
+            btn = btn.fill(fill);
+        }
         let resp = ui
-            .add_sized(
-                [width, ROW_H + 2.0],
-                egui::Button::new(format!("{label}: {value}")),
-            )
+            .add_sized([width, ROW_H + 2.0], btn)
             .on_hover_text(format!("{tooltip}\nLMB: next | RMB: prev"));
         if resp.clicked() {
             step = 1;

@@ -2311,12 +2311,17 @@ fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     prop_row(ui, label, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(value)
-                    .monospace()
-                    .size(11.5)
-                    .color(ui.visuals().text_color()),
+            let resp = ui.add(
+                egui::Label::new(
+                    RichText::new(value)
+                        .size(11.5)
+                        .color(ui.visuals().text_color()),
+                )
+                .truncate(),
             );
+            if resp.hovered() {
+                resp.on_hover_text(value);
+            }
         });
     });
 }
@@ -2357,7 +2362,7 @@ fn sparkline_row(
             format!("{:.1} {unit}", ring.latest())
         };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(txt).monospace().size(11.0).color(color));
+            ui.add(egui::Label::new(RichText::new(txt).size(11.5).color(color)).truncate());
         });
     });
 }

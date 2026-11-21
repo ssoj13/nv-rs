@@ -1915,33 +1915,93 @@ fn section_accent(id_salt: &str) -> Color32 {
     }
 }
 
+const ALL_SECTION_IDS: &[&str] = &[
+    "sec_presets",
+    "sec_formula",
+    "sec_transform",
+    "sec_detail",
+    "sec_sky",
+    "sec_dof",
+    "sec_floor",
+    "sec_scene",
+    "sec_bloom",
+    "sec_split",
+    "sec_pt",
+    "sec_telemetry",
+    "sec_perf",
+];
+
 fn collapsing_section(
     ui: &mut Ui,
     id_salt: &str,
     icon: &str,
     title: &str,
-    default_open: bool,
+    _default_open: bool,
     add_body: impl FnOnce(&mut Ui),
 ) {
     let accent = section_accent(id_salt);
-    let id = ui.make_persistent_id(id_salt);
-    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        default_open,
-    );
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::new(id_salt);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, id, false);
     let header_h = 22.0;
     let total_w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, header_h), Sense::click());
-    if resp.clicked() {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, header_h), Sense::hover());
+
+    // Icon button at the very start of the title bar: collapses/expands all sections at once.
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 4.0, rect.top() + 1.0),
+        egui::vec2(20.0, header_h - 2.0),
+    );
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(icon_rect.right(), rect.top()),
+        rect.max,
+    );
+
+    let icon_resp = ui
+        .interact(icon_rect, egui::Id::new((id_salt, "toggle_all")), Sense::click())
+        .on_hover_text("Collapse / Expand all panels")
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let title_resp = ui
+        .interact(title_rect, egui::Id::new((id_salt, "toggle_one")), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if icon_resp.clicked() {
+        let any_open = ALL_SECTION_IDS.iter().any(|&sec| {
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                &ctx,
+                egui::Id::new(sec),
+                false,
+            )
+            .is_open()
+        });
+        let target_open = !any_open;
+        for &sec in ALL_SECTION_IDS {
+            let sec_id = egui::Id::new(sec);
+            let mut st =
+                egui::collapsing_header::CollapsingState::load_with_default_open(&ctx, sec_id, false);
+            st.set_open(target_open);
+            st.store(&ctx);
+        }
+        state.set_open(target_open);
+    } else if title_resp.clicked() {
         state.toggle(ui);
     }
+
     let base_bg = ui.visuals().faint_bg_color;
-    let tint_amt = if resp.hovered() { 0.22 } else { 0.14 };
+    let tint_amt = if title_resp.hovered() || icon_resp.hovered() {
+        0.22
+    } else {
+        0.14
+    };
     let fill = base_bg.lerp_to_gamma(accent, tint_amt);
     ui.painter().rect_filled(rect, 3.0, fill);
     let bar_rect = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
     ui.painter().rect_filled(bar_rect, 1.5, accent);
+
+    if icon_resp.hovered() {
+        ui.painter()
+            .rect_filled(icon_rect, 3.0, accent.gamma_multiply(0.32));
+    }
 
     let caret = if state.is_open() {
         ic::CARET_DOWN
@@ -1949,14 +2009,26 @@ fn collapsing_section(
         ic::CARET_RIGHT
     };
     let text_col = ui.visuals().text_color().lerp_to_gamma(accent, 0.45);
+    let icon_col = if icon_resp.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        text_col
+    };
     ui.painter().text(
-        egui::pos2(rect.left() + 8.0, rect.center().y),
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(12.0),
+        icon_col,
+    );
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + 4.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{caret}  {icon}  {title}"),
+        format!("{caret}  {title}"),
         egui::FontId::proportional(12.0),
         text_col,
     );
-    state.show_body_indented(&resp, ui, |ui| {
+    state.show_body_indented(&title_resp, ui, |ui| {
         ui.add_space(2.0);
         add_body(ui);
         ui.add_space(2.0);

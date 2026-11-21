@@ -1729,85 +1729,56 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("View")
-                        .size(11.0)
-                        .color(Color32::from_rgb(165, 173, 203)),
-                );
-                if ui
-                    .selectable_label(!s.hdr_display, "SDR")
-                    .on_hover_text("8-bit sRGB/BT.709 ACES viewport")
-                    .clicked()
-                {
-                    s.hdr_display = false;
-                }
-                ui.add_enabled_ui(self.hdr_surface_supported, |ui| {
-                    let hdr_tip = if self.hdr_surface_supported {
-                        "True HDR (Rgba16Float scRGB, 203-nit white / 1000-nit peak, matches PQ10 video)"
+            equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+                0 => {
+                    let hdr_active = s.hdr_display && self.hdr_surface_supported;
+                    let val = if hdr_active { "HDR" } else { "SDR" };
+                    let tip = if self.hdr_surface_supported {
+                        "Viewport output: SDR (8-bit ACES) / HDR (Rgba16Float scRGB 1000 nit)"
                     } else {
                         "HDR unavailable — enable HDR in Windows Display Settings"
                     };
-                    if ui
-                        .selectable_label(s.hdr_display && self.hdr_surface_supported, "HDR")
-                        .on_hover_text(hdr_tip)
-                        .clicked()
-                    {
-                        s.hdr_display = true;
+                    if cycle_toggle_btn(ui, w, "View", val, tip, self.hdr_surface_supported) != 0 {
+                        s.hdr_display = !s.hdr_display;
                     }
-                });
-                ui.separator();
-                ui.add_enabled_ui(!self.is_recording, |ui| {
-                    ui.label(
-                        RichText::new("Timing")
-                            .size(11.0)
-                            .color(Color32::from_rgb(165, 173, 203)),
+                }
+                1 => {
+                    let val = match s.record_video_mode {
+                        1 => "SDR",
+                        2 => "PQ10",
+                        _ => "Auto",
+                    };
+                    let step = cycle_toggle_btn(
+                        ui,
+                        w,
+                        "Video",
+                        val,
+                        "MP4 profile: Auto (matches View) / SDR (H.264 avc1) / PQ10 (HEVC Main10 hvc1)",
+                        !self.is_recording,
                     );
-                    if ui
-                        .selectable_label(!s.record_fixed_fps, "Live RT")
-                        .on_hover_text("Real-time MP4 timestamps (no speedup when FPS dips)")
-                        .clicked()
-                    {
-                        s.record_fixed_fps = false;
+                    if step != 0 {
+                        s.record_video_mode =
+                            ((s.record_video_mode as i32 + step).rem_euclid(3)) as u32;
                     }
-                    if ui
-                        .selectable_label(s.record_fixed_fps, "Smooth 60")
-                        .on_hover_text("Fixed 1/60s per rendered frame for smooth offline animations")
-                        .clicked()
+                }
+                _ => {
+                    let val = if s.record_fixed_fps {
+                        "Smooth 60"
+                    } else {
+                        "Live RT"
+                    };
+                    if cycle_toggle_btn(
+                        ui,
+                        w,
+                        "Timing",
+                        val,
+                        "MP4 timing: Live RT (real-time 90 kHz stts) / Smooth 60 (fixed 1/60s per frame)",
+                        !self.is_recording,
+                    ) != 0
                     {
-                        s.record_fixed_fps = true;
+                        s.record_fixed_fps = !s.record_fixed_fps;
                     }
-                });
-            });
-            ui.add_enabled_ui(!self.is_recording, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Video")
-                            .size(11.0)
-                            .color(Color32::from_rgb(165, 173, 203)),
-                    );
-                    if ui
-                        .selectable_label(s.record_video_mode == 0, "Match")
-                        .on_hover_text("Match View: SDR view -> H.264 MP4, HDR view -> PQ10 HEVC MP4")
-                        .clicked()
-                    {
-                        s.record_video_mode = 0;
-                    }
-                    if ui
-                        .selectable_label(s.record_video_mode == 1, "SDR")
-                        .on_hover_text("Force H.264 8-bit BT.709 MP4 (avc1)")
-                        .clicked()
-                    {
-                        s.record_video_mode = 1;
-                    }
-                    if ui
-                        .selectable_label(s.record_video_mode == 2, "PQ10")
-                        .on_hover_text("Force iPhone Pro Max HDR10 HEVC Main10 BT.2020 PQ MP4 (hvc1)")
-                        .clicked()
-                    {
-                        s.record_video_mode = 2;
-                    }
-                });
+                }
             });
             ui.add_space(2.0);
             if ui
@@ -2103,6 +2074,32 @@ fn collapsing_section(
         add_body(ui);
         ui.add_space(2.0);
     });
+}
+
+/// Compact cyclic toggle button: LMB steps forward (`+1`), RMB steps backward (`-1`).
+fn cycle_toggle_btn(
+    ui: &mut Ui,
+    width: f32,
+    label: &str,
+    value: &str,
+    tooltip: &str,
+    enabled: bool,
+) -> i32 {
+    let mut step = 0;
+    ui.add_enabled_ui(enabled, |ui| {
+        let resp = ui
+            .add_sized(
+                [width, ROW_H + 2.0],
+                egui::Button::new(format!("{label}: {value}")),
+            )
+            .on_hover_text(format!("{tooltip}\nLMB: next | RMB: prev"));
+        if resp.clicked() {
+            step = 1;
+        } else if resp.secondary_clicked() {
+            step = -1;
+        }
+    });
+    step
 }
 
 fn equal_grid(

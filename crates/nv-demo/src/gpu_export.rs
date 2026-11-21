@@ -60,13 +60,14 @@ extern "C" __global__ void rgba8_to_nv12(
     unsigned char* __restrict__ nv12,
     unsigned int w,
     unsigned int h,
+    unsigned int src_pitch_px,
     unsigned int nv12_pitch
 ) {
     unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
-    unsigned int s = (y * w + x) * 4u;
+    unsigned int s = (y * src_pitch_px + x) * 4u;
     float r = static_cast<float>(rgba[s + 0u]);
     float g = static_cast<float>(rgba[s + 1u]);
     float b = static_cast<float>(rgba[s + 2u]);
@@ -77,9 +78,9 @@ extern "C" __global__ void rgba8_to_nv12(
 
     // Subsampled 4:2:0 chroma (2x2 box filter) on even coordinates.
     if ((x & 1u) == 0u && (y & 1u) == 0u) {
-        unsigned int s01 = (y * w + (x + 1u)) * 4u;
-        unsigned int s10 = ((y + 1u) * w + x) * 4u;
-        unsigned int s11 = ((y + 1u) * w + (x + 1u)) * 4u;
+        unsigned int s01 = (y * src_pitch_px + (x + 1u)) * 4u;
+        unsigned int s10 = ((y + 1u) * src_pitch_px + x) * 4u;
+        unsigned int s11 = ((y + 1u) * src_pitch_px + (x + 1u)) * 4u;
 
         float r_avg = 0.25f * (r + static_cast<float>(rgba[s01 + 0u])
             + static_cast<float>(rgba[s10 + 0u]) + static_cast<float>(rgba[s11 + 0u]));
@@ -99,7 +100,13 @@ extern "C" __global__ void rgba8_to_nv12(
 }
 "#;
 
-const HDR_F32_TO_P010_PQ_CU: &str = r#"
+const SCRGB_F16_TO_P010_PQ_CU: &str = r#"
+__device__ __forceinline__ float f16_to_f32(unsigned short h) {
+    float v;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(v) : "h"(h));
+    return v;
+}
+
 __device__ __forceinline__ unsigned short pack_p010(float v10) {
     float c = v10 < 0.0f ? 0.0f : (v10 > 1023.0f ? 1023.0f : v10);
     unsigned int q = static_cast<unsigned int>(c + 0.5f);
@@ -108,7 +115,7 @@ __device__ __forceinline__ unsigned short pack_p010(float v10) {
 
 __device__ __forceinline__ float pq_oetf(float nits) {
     float L = nits * 0.0001f; // normalized to 10,000 nits
-    if (L <= 0.0f) return 0.0f;
+    if (!(L > 0.0f)) return 0.0f;
     if (L > 1.0f) L = 1.0f;
     const float m1 = 0.1593017578125f;
     const float m2 = 78.84375f;
@@ -121,55 +128,38 @@ __device__ __forceinline__ float pq_oetf(float nits) {
     return powf(num / den, m2);
 }
 
-__device__ __forceinline__ float3 hdr_to_pq2020(float4 px, float exposure) {
-    float r = fmaxf(0.0f, px.x * exposure);
-    float g = fmaxf(0.0f, px.y * exposure);
-    float b = fmaxf(0.0f, px.z * exposure);
-    // Soft highlight rolloff toward 1000 nits peak (paper white = 203 nits, knee = 750 nits).
-    const float paper_white = 203.0f;
-    const float peak = 1000.0f;
-    const float knee = 750.0f;
-    float rn = r * paper_white;
-    float gn = g * paper_white;
-    float bn = b * paper_white;
-    float mx = fmaxf(rn, fmaxf(gn, bn));
-    if (mx > knee) {
-        float excess = mx - knee;
-        float span = peak - knee;
-        float compressed = knee + span * (excess / (excess + span));
-        float s = compressed / mx;
-        rn *= s;
-        gn *= s;
-        bn *= s;
-    }
-    // Linear Rec.709 -> Linear Rec.2020 exact matrix.
+__device__ __forceinline__ float3 scrgb_to_pq2020(ushort4 px) {
+    // scRGB linear Rec.709 (1.0 = 80 nits) -> nits -> Linear Rec.2020 -> SMPTE ST 2084 PQ.
+    float rn = fmaxf(0.0f, f16_to_f32(px.x) * 80.0f);
+    float gn = fmaxf(0.0f, f16_to_f32(px.y) * 80.0f);
+    float bn = fmaxf(0.0f, f16_to_f32(px.z) * 80.0f);
     float r2020 = fmaxf(0.0f, 0.6274039f * rn + 0.3292830f * gn + 0.0433131f * bn);
     float g2020 = fmaxf(0.0f, 0.0690973f * rn + 0.9195404f * gn + 0.0113623f * bn);
     float b2020 = fmaxf(0.0f, 0.0163914f * rn + 0.0880133f * gn + 0.8955953f * bn);
     return make_float3(pq_oetf(r2020), pq_oetf(g2020), pq_oetf(b2020));
 }
 
-extern "C" __global__ void hdr_f32_to_p010_pq(
-    const float4* __restrict__ hdr,
+extern "C" __global__ void scrgb_f16_to_p010_pq(
+    const ushort4* __restrict__ scrgb,
     unsigned short* __restrict__ p010,
     unsigned int w,
     unsigned int h,
-    unsigned int p010_pitch_u16,
-    float exposure
+    unsigned int src_pitch_px,
+    unsigned int p010_pitch_u16
 ) {
     unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
-    float3 pq = hdr_to_pq2020(hdr[y * w + x], exposure);
+    float3 pq = scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + x]);
     // BT.2020 NCL luma (10-bit limited range: Y in [64, 940]).
     float yn = 0.2627f * pq.x + 0.6780f * pq.y + 0.0593f * pq.z;
     p010[static_cast<size_t>(y) * p010_pitch_u16 + x] = pack_p010(64.0f + 876.0f * yn);
 
     if ((x & 1u) == 0u && (y & 1u) == 0u) {
-        float3 p01 = hdr_to_pq2020(hdr[y * w + (x + 1u)], exposure);
-        float3 p10 = hdr_to_pq2020(hdr[(y + 1u) * w + x], exposure);
-        float3 p11 = hdr_to_pq2020(hdr[(y + 1u) * w + (x + 1u)], exposure);
+        float3 p01 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + (x + 1u)]);
+        float3 p10 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + x]);
+        float3 p11 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + (x + 1u)]);
         float r_avg = 0.25f * (pq.x + p01.x + p10.x + p11.x);
         float g_avg = 0.25f * (pq.y + p01.y + p10.y + p11.y);
         float b_avg = 0.25f * (pq.z + p01.z + p10.z + p11.z);
@@ -371,8 +361,8 @@ pub fn save_jpeg_from_rgba8(
 /// (`hvc1`, BT.2020 SMPTE ST 2084 PQ) with per-frame `stts` timestamps.
 pub struct VideoRecorder {
     cuda: Arc<CudaContext>,
+    stream: Arc<Stream>,
     kernel: CudaKernel,
-    profile: VideoProfile,
     // Drop order invariant: `yuv_res` and `bitstream` must drop before `yuv_buf` and `session`.
     yuv_res: RegisteredResource,
     bitstream: OutputBitstream,
@@ -420,9 +410,9 @@ impl VideoRecorder {
             VideoProfile::Hdr10Pq => (
                 CudaKernel::compile(
                     cuda,
-                    HDR_F32_TO_P010_PQ_CU,
-                    "hdr_f32_to_p010_pq.cu",
-                    "hdr_f32_to_p010_pq",
+                    SCRGB_F16_TO_P010_PQ_CU,
+                    "scrgb_f16_to_p010_pq.cu",
+                    "scrgb_f16_to_p010_pq",
                 )?,
                 Codec::Hevc,
                 BufferFormat::Yuv420_10Bit,
@@ -508,8 +498,8 @@ impl VideoRecorder {
 
         Ok(Self {
             cuda: cuda.clone(),
+            stream,
             kernel,
-            profile,
             yuv_res,
             bitstream,
             yuv_buf,
@@ -524,96 +514,68 @@ impl VideoRecorder {
 
     /// Encodes one frame into the MP4 stream with explicit `duration_secs` (real-time or fixed).
     ///
-    /// Uses `rgba_dev_ptr` (`RGBA8`) for [`VideoProfile::SdrH264`] and `hdr_f32_dev_ptr` (linear
-    /// HDR `float4`) with `exposure` for [`VideoProfile::Hdr10Pq`].
+    /// Expects `RGBA8` (`src_pitch_px * height * 4` bytes) for [`VideoProfile::SdrH264`] or
+    /// scRGB `Rgba16Float` (`src_pitch_px * height * 8` bytes, `1.0 = 80 nits`) for
+    /// [`VideoProfile::Hdr10Pq`].
     pub fn push_frame(
         &mut self,
-        stream: &Stream,
-        rgba_dev_ptr: u64,
-        hdr_f32_dev_ptr: u64,
-        exposure: f32,
+        src_dev_ptr: u64,
+        src_pitch_px: u32,
         duration_secs: f64,
     ) -> Result<(), String> {
+        if src_dev_ptr == 0 {
+            return Err("video source device pointer is null".to_string());
+        }
+        if src_pitch_px < self.width {
+            return Err(format!(
+                "video source pitch ({src_pitch_px}) < width ({})",
+                self.width
+            ));
+        }
+
         self.cuda
             .bind_to_thread()
             .map_err(|e| format!("CUDA bind failed: {e}"))?;
 
         let gx = self.width.div_ceil(16);
         let gy = self.height.div_ceil(16);
+        let mut src_ptr = src_dev_ptr;
         let mut dst_ptr = self.yuv_buf.cu_deviceptr();
         let mut w = self.width;
         let mut h = self.height;
-        let mut pitch = self.yuv_pitch_elems;
-
-        let launch_res = match self.profile {
-            VideoProfile::SdrH264 => {
-                if rgba_dev_ptr == 0 {
-                    return Err("rgba_dev_ptr is null".to_string());
-                }
-                let mut src_ptr = rgba_dev_ptr;
-                let mut args: [*mut c_void; 5] = [
-                    (&raw mut src_ptr).cast(),
-                    (&raw mut dst_ptr).cast(),
-                    (&raw mut w).cast(),
-                    (&raw mut h).cast(),
-                    (&raw mut pitch).cast(),
-                ];
-                // SAFETY: `rgba8_to_nv12` expects `(const u8*, u8*, u32, u32, u32)` with valid
-                // device buffers; `stream.synchronize()` completes before NVENC maps `yuv_buf`.
-                unsafe {
-                    cu::cuLaunchKernel(
-                        self.kernel.func,
-                        gx,
-                        gy,
-                        1,
-                        16,
-                        16,
-                        1,
-                        0,
-                        stream.cu_stream(),
-                        args.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                }
-            }
-            VideoProfile::Hdr10Pq => {
-                if hdr_f32_dev_ptr == 0 {
-                    return Err("hdr_f32_dev_ptr is null".to_string());
-                }
-                let mut src_ptr = hdr_f32_dev_ptr;
-                let mut exp = exposure;
-                let mut args: [*mut c_void; 6] = [
-                    (&raw mut src_ptr).cast(),
-                    (&raw mut dst_ptr).cast(),
-                    (&raw mut w).cast(),
-                    (&raw mut h).cast(),
-                    (&raw mut pitch).cast(),
-                    (&raw mut exp).cast(),
-                ];
-                // SAFETY: `hdr_f32_to_p010_pq` expects `(const float4*, u16*, u32, u32, u32, f32)`
-                // with valid device buffers; `stream.synchronize()` completes before NVENC maps.
-                unsafe {
-                    cu::cuLaunchKernel(
-                        self.kernel.func,
-                        gx,
-                        gy,
-                        1,
-                        16,
-                        16,
-                        1,
-                        0,
-                        stream.cu_stream(),
-                        args.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                }
-            }
+        let mut src_pitch = src_pitch_px;
+        let mut dst_pitch = self.yuv_pitch_elems;
+        let mut args: [*mut c_void; 6] = [
+            (&raw mut src_ptr).cast(),
+            (&raw mut dst_ptr).cast(),
+            (&raw mut w).cast(),
+            (&raw mut h).cast(),
+            (&raw mut src_pitch).cast(),
+            (&raw mut dst_pitch).cast(),
+        ];
+        // SAFETY: Both `rgba8_to_nv12` and `scrgb_f16_to_p010_pq` take
+        // `(const ptr*, dst ptr*, u32 w, u32 h, u32 src_pitch_px, u32 dst_pitch_elems)` with valid
+        // device buffers; `self.stream.synchronize()` completes before NVENC maps `yuv_buf`.
+        let launch_res = unsafe {
+            cu::cuLaunchKernel(
+                self.kernel.func,
+                gx,
+                gy,
+                1,
+                16,
+                16,
+                1,
+                0,
+                self.stream.cu_stream(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
         };
         if launch_res != cu::cudaError_enum_CUDA_SUCCESS {
             return Err(format!("YUV conversion cuLaunchKernel failed: {launch_res:?}"));
         }
 
-        stream
+        self.stream
             .synchronize()
             .map_err(|e| format!("CUDA stream synchronize failed: {e}"))?;
 

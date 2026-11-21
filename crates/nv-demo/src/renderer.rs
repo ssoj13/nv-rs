@@ -21,7 +21,7 @@ use optix::{
 };
 
 use crate::fft_bloom::FftBloomPass;
-use crate::gpu_export::{VideoProfile, VideoRecorder, save_jpeg_from_rgba8};
+use crate::gpu_export::save_jpeg_from_rgba8;
 
 #[cfg(has_embedded_ptx)]
 const EMBEDDED_RAYTRACER_PTX: &str = concat!(
@@ -506,10 +506,9 @@ pub enum RenderCmd {
         path: PathBuf,
         quality: u8,
     },
-    ToggleRecord {
-        path: PathBuf,
-        fps: u32,
-        profile: VideoProfile,
+    SetRecording {
+        active: bool,
+        fixed_fps: u32,
     },
     ReloadShader,
     Shutdown,
@@ -525,8 +524,6 @@ pub struct FrameReady {
     pub denoise_ms: f32,
     pub bloom_ms: f32,
     pub tonemap_ms: f32,
-    pub is_recording: bool,
-    pub record_frames: u64,
     pub ser_supported: bool,
     pub status_msg: Option<String>,
 }
@@ -1515,15 +1512,14 @@ pub fn spawn_render_thread(
                 ],
             );
             let mut last_tick = Instant::now();
-            let mut last_record_at: Option<Instant> = None;
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
-            let mut recorder: Option<(VideoRecorder, u32)> = None;
+            let mut rec_active = false;
+            let mut rec_fixed_fps: u32 = 0;
             let mut pending_status: Option<String> = None;
 
             loop {
                 let mut should_exit = false;
                 let apply_cmd = |cmd: RenderCmd,
-                                 cuda: &Arc<CudaContext>,
                                  rig: &mut OptixRig,
                                  cur_w: &mut u32,
                                  cur_h: &mut u32,
@@ -1538,8 +1534,8 @@ pub fn spawn_render_thread(
                                  camera: &mut CameraFrame,
                                  accum_count: &mut u32,
                                  pending_jpeg: &mut Option<(PathBuf, u8)>,
-                                 recorder: &mut Option<(VideoRecorder, u32)>,
-                                 last_record_at: &mut Option<Instant>,
+                                 rec_active: &mut bool,
+                                 rec_fixed_fps: &mut u32,
                                  pending_status: &mut Option<String>|
                  -> bool {
                     match cmd {
@@ -1583,11 +1579,6 @@ pub fn spawn_render_thread(
                             rr_ptrs: new_rr_ptrs,
                             gen_id,
                         } => {
-                            if let Some((rec, _)) = recorder.take() {
-                                let _ = rec.finish();
-                                *last_record_at = None;
-                                *pending_status = Some("Recording stopped on resize".to_string());
-                            }
                             if width != *cur_w || height != *cur_h {
                                 resize_rig(rig, width, height, settings.temporal_denoise);
                                 *cur_w = width;
@@ -1616,29 +1607,9 @@ pub fn spawn_render_thread(
                             *accum_count = (*accum_count).min(settings.max_accum.saturating_sub(1));
                             false
                         }
-                        RenderCmd::ToggleRecord { path, fps, profile } => {
-                            if let Some((rec, _)) = recorder.take() {
-                                *last_record_at = None;
-                                let frames = rec.frame_count();
-                                *pending_status = Some(match rec.finish() {
-                                    Ok(n) => format!("Saved MP4 ({n} frames)"),
-                                    Err(e) => format!("Video finish failed ({frames}f): {e}"),
-                                });
-                            } else {
-                                match VideoRecorder::start(
-                                    cuda, *cur_w, *cur_h, fps, profile, &path,
-                                ) {
-                                    Ok(rec) => {
-                                        *recorder = Some((rec, fps));
-                                        *last_record_at = None;
-                                        *pending_status =
-                                            Some(format!("Recording to {}", path.display()));
-                                    }
-                                    Err(e) => {
-                                        *pending_status = Some(format!("Record start failed: {e}"));
-                                    }
-                                }
-                            }
+                        RenderCmd::SetRecording { active, fixed_fps } => {
+                            *rec_active = active;
+                            *rec_fixed_fps = fixed_fps;
                             false
                         }
                         RenderCmd::ReloadShader => {
@@ -1663,20 +1634,13 @@ pub fn spawn_render_thread(
                             }
                             false
                         }
-                        RenderCmd::Shutdown => {
-                            if let Some((rec, _)) = recorder.take() {
-                                let _ = rec.finish();
-                            }
-                            *last_record_at = None;
-                            true
-                        }
+                        RenderCmd::Shutdown => true,
                     }
                 };
 
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     if apply_cmd(
                         cmd,
-                        &cuda,
                         &mut rig,
                         &mut cur_w,
                         &mut cur_h,
@@ -1691,8 +1655,8 @@ pub fn spawn_render_thread(
                         &mut camera,
                         &mut accum_count,
                         &mut pending_jpeg,
-                        &mut recorder,
-                        &mut last_record_at,
+                        &mut rec_active,
+                        &mut rec_fixed_fps,
                         &mut pending_status,
                     ) {
                         should_exit = true;
@@ -1705,7 +1669,7 @@ pub fn spawn_render_thread(
 
                 let converged = !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
-                    && recorder.is_none()
+                    && !rec_active
                     && pending_jpeg.is_none()
                     && pending_status.is_none()
                     && settings.max_accum > 0
@@ -1716,7 +1680,6 @@ pub fn spawn_render_thread(
                         Ok(cmd) => {
                             if apply_cmd(
                                 cmd,
-                                &cuda,
                                 &mut rig,
                                 &mut cur_w,
                                 &mut cur_h,
@@ -1731,8 +1694,8 @@ pub fn spawn_render_thread(
                                 &mut camera,
                                 &mut accum_count,
                                 &mut pending_jpeg,
-                                &mut recorder,
-                                &mut last_record_at,
+                                &mut rec_active,
+                                &mut rec_fixed_fps,
                                 &mut pending_status,
                             ) {
                                 break;
@@ -1748,10 +1711,8 @@ pub fn spawn_render_thread(
                 };
 
                 let now = Instant::now();
-                let dt = if let Some((_, rec_fps)) = recorder.as_ref()
-                    && settings.record_fixed_fps
-                {
-                    1.0 / (*rec_fps).max(1) as f32
+                let dt = if rec_active && rec_fixed_fps > 0 {
+                    1.0 / rec_fixed_fps as f32
                 } else {
                     now.duration_since(last_tick).as_secs_f32().min(0.1)
                 };
@@ -2375,32 +2336,6 @@ pub fn spawn_render_thread(
                     );
                 }
 
-                if let Some((ref mut rec, rec_fps)) = recorder {
-                    let rec_now = Instant::now();
-                    let frame_dur = if settings.record_fixed_fps {
-                        1.0 / f64::from(rec_fps.max(1))
-                    } else {
-                        let d = last_record_at.map_or(1.0 / f64::from(rec_fps.max(1)), |prev| {
-                            rec_now.duration_since(prev).as_secs_f64()
-                        });
-                        d.clamp(1.0 / 240.0, 2.0)
-                    };
-                    last_record_at = Some(rec_now);
-                    if let Err(e) = rec.push_frame(
-                        &rig.stream,
-                        buf_ptrs[buf_idx],
-                        final_f32_ptr,
-                        settings.exposure,
-                        frame_dur,
-                    ) {
-                        pending_status = Some(format!("Video encode error: {e}"));
-                        if let Some((failed, _)) = recorder.take() {
-                            let _ = failed.finish();
-                        }
-                        last_record_at = None;
-                    }
-                }
-
                 accum_count = accum_count.saturating_add(1);
                 frame_index = frame_index.wrapping_add(1);
 
@@ -2415,8 +2350,6 @@ pub fn spawn_render_thread(
                         denoise_ms,
                         bloom_ms,
                         tonemap_ms,
-                        is_recording: recorder.is_some(),
-                        record_frames: recorder.as_ref().map_or(0, |(r, _)| r.frame_count()),
                         ser_supported: rig.ser_supported,
                         status_msg: pending_status.take(),
                     })

@@ -121,7 +121,9 @@ mod demo_app {
                 out_w,
                 out_h,
                 wgpu::TextureFormat::Rgba8Unorm,
-                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 "dlss-output",
             )?;
 
@@ -648,10 +650,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         normals_view: wgpu::TextureView,
         output_hdr: SharedTexture,
         output_hdr_view: wgpu::TextureView,
-        _display_ldr: wgpu::Texture,
+        display_ldr: wgpu::Texture,
         display_view: wgpu::TextureView,
         tonemap_bg: wgpu::BindGroup,
-        _display_hdr: wgpu::Texture,
+        display_hdr: wgpu::Texture,
         display_hdr_view: wgpu::TextureView,
         scrgb_bg: wgpu::BindGroup,
         render_w: u32,
@@ -746,7 +748,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let display_hdr = interop.device().create_texture(&wgpu::TextureDescriptor {
@@ -760,7 +764,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
 
@@ -825,10 +831,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 normals_view,
                 output_hdr,
                 output_hdr_view,
-                _display_ldr: display_ldr,
+                display_ldr,
                 display_view,
                 tonemap_bg,
-                _display_hdr: display_hdr,
+                display_hdr,
                 display_hdr_view,
                 scrgb_bg,
                 render_w,
@@ -974,6 +980,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    struct ActiveRecorder {
+        recorder: crate::gpu_export::VideoRecorder,
+        profile: crate::gpu_export::VideoProfile,
+        width: u32,
+        height: u32,
+        fps: u32,
+        copy_buf: Option<SharedBuffer>,
+        copy_pitch_px: u32,
+        last_frame_at: Option<Instant>,
+    }
+
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
@@ -1034,6 +1051,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         fps: f32,
         is_recording: bool,
         record_frames: u64,
+        video_recorder: Option<ActiveRecorder>,
         ser_supported: bool,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
@@ -1057,6 +1075,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     impl Drop for DemoApp {
         fn drop(&mut self) {
+            if let Some(active) = self.video_recorder.take() {
+                let _ = active.recorder.finish();
+            }
             self.save_persisted();
             let _ = self.cmd_tx.send(RenderCmd::Shutdown);
             if let Some(handle) = self.render_thread.take() {
@@ -1379,6 +1400,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 fps: 60.0,
                 is_recording: false,
                 record_frames: 0,
+                video_recorder: None,
                 ser_supported: false,
                 settings,
                 last_sent_settings: settings,
@@ -1495,8 +1517,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.denoise_ms = msg.denoise_ms;
                 self.bloom_ms = msg.bloom_ms;
                 self.tonemap_ms = msg.tonemap_ms;
-                self.is_recording = msg.is_recording;
-                self.record_frames = msg.record_frames;
                 self.ser_supported = msg.ser_supported;
                 if let Some(status) = msg.status_msg {
                     self.last_saved_msg = Some(status);
@@ -1676,13 +1696,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.rr_last_exposure = f32::NAN;
             }
 
+            let recording_pq10 = self
+                .video_recorder
+                .as_ref()
+                .is_some_and(|r| r.profile == crate::gpu_export::VideoProfile::Hdr10Pq);
+            let need_hdr_buf = hdr_active || (recording_pq10 && !self.settings.dlss_rr_on);
             let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
                 || self.settings.dlss_rr_on != self.last_sent_settings.dlss_rr_on
                 || self.settings.dlss_quality != self.last_sent_settings.dlss_quality;
             let needs_rr_bufs = self.settings.dlss_rr_on && self.rr_shared.is_none();
             let drop_rr_bufs = !self.settings.dlss_rr_on && self.rr_shared.is_some();
-            let needs_hdr_bufs = hdr_active && self.shared_hdr.is_none();
-            let drop_hdr_bufs = !hdr_active && self.shared_hdr.is_some();
+            let needs_hdr_bufs = need_hdr_buf && self.shared_hdr.is_none();
+            let drop_hdr_bufs = !need_hdr_buf && self.shared_hdr.is_some();
             if (target_w != self.render_w
                 || target_h != self.render_h
                 || needs_rr_bufs
@@ -1702,7 +1727,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 } else {
                     Ok(None)
                 };
-                let hdr_alloc = if hdr_active {
+                let hdr_alloc = if need_hdr_buf {
                     allocate_hdr_target(&self.interop, target_w, target_h).map(Some)
                 } else {
                     Ok(None)
@@ -2016,29 +2041,109 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let _ = self.cmd_tx.send(RenderCmd::SaveJpeg { path, quality: 92 });
             }
             if toggle_record_requested {
-                let dir = std::path::Path::new("renders");
-                let _ = std::fs::create_dir_all(dir);
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let use_pq10 = match self.settings.record_video_mode {
-                    1 => false,
-                    2 => true,
-                    _ => hdr_active,
-                };
-                let profile = if use_pq10 {
-                    crate::gpu_export::VideoProfile::Hdr10Pq
+                if let Some(active) = self.video_recorder.take() {
+                    let frames = active.recorder.frame_count();
+                    self.last_saved_msg = Some(match active.recorder.finish() {
+                        Ok(n) => format!("Saved MP4 ({n} frames)"),
+                        Err(e) => format!("Video finish failed ({frames}f): {e}"),
+                    });
+                    self.is_recording = false;
+                    self.record_frames = 0;
+                    let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+                        active: false,
+                        fixed_fps: 0,
+                    });
                 } else {
-                    crate::gpu_export::VideoProfile::SdrH264
-                };
-                let tag = if use_pq10 { "pq10" } else { "sdr" };
-                let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
-                let _ = self.cmd_tx.send(RenderCmd::ToggleRecord {
-                    path,
-                    fps: 60,
-                    profile,
-                });
+                    let use_pq10 = match self.settings.record_video_mode {
+                        1 => false,
+                        2 => true,
+                        _ => hdr_active,
+                    };
+                    if use_pq10 && self.settings.dlss_on && !self.settings.dlss_rr_on {
+                        self.last_saved_msg = Some(
+                            "PQ10 requires DLSS RR or OptiX/Raw (DLSS SR is 8-bit SDR)".to_string(),
+                        );
+                    } else {
+                        let (src_w, src_h, uses_dlss_tex) =
+                            if self.settings.dlss_rr_on
+                                && self.settings.aov_mode == 0
+                                && let Some(ref rr) = self.dlss_rr_pass
+                            {
+                                (rr.out_w & !1, rr.out_h & !1, true)
+                            } else if self.settings.dlss_on
+                                && let Some(ref dlss) = self.dlss_pass
+                            {
+                                (dlss.out_w & !1, dlss.out_h & !1, true)
+                            } else {
+                                (self.render_w & !1, self.render_h & !1, false)
+                            };
+                        let profile = if use_pq10 {
+                            crate::gpu_export::VideoProfile::Hdr10Pq
+                        } else {
+                            crate::gpu_export::VideoProfile::SdrH264
+                        };
+                        let tag = if use_pq10 { "pq10" } else { "sdr" };
+                        let dir = std::path::Path::new("renders");
+                        let _ = std::fs::create_dir_all(dir);
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
+
+                        let bpp: u32 = if use_pq10 { 8 } else { 4 };
+                        let copy_bpr = (src_w * bpp).next_multiple_of(256);
+                        let copy_pitch_px = copy_bpr / bpp;
+                        let copy_buf_res = if uses_dlss_tex {
+                            self.interop
+                                .create_buffer(&SharedBufferDescriptor {
+                                    label: Some("video-rec-copy"),
+                                    size: u64::from(copy_bpr) * u64::from(src_h),
+                                    usage: wgpu::BufferUsages::COPY_DST,
+                                })
+                                .map(Some)
+                                .map_err(|e| format!("record copy buffer: {e}"))
+                        } else {
+                            Ok(None)
+                        };
+                        match copy_buf_res.and_then(|copy_buf| {
+                            crate::gpu_export::VideoRecorder::start(
+                                self.interop.cuda_context(),
+                                src_w,
+                                src_h,
+                                60,
+                                profile,
+                                &path,
+                            )
+                            .map(|recorder| (recorder, copy_buf))
+                        }) {
+                            Ok((recorder, copy_buf)) => {
+                                self.video_recorder = Some(ActiveRecorder {
+                                    recorder,
+                                    profile,
+                                    width: src_w,
+                                    height: src_h,
+                                    fps: 60,
+                                    copy_buf,
+                                    copy_pitch_px,
+                                    last_frame_at: None,
+                                });
+                                self.is_recording = true;
+                                self.record_frames = 0;
+                                self.rr_last_exposure = f32::NAN;
+                                let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+                                    active: true,
+                                    fixed_fps: if self.settings.record_fixed_fps { 60 } else { 0 },
+                                });
+                                self.last_saved_msg =
+                                    Some(format!("Recording to {}", path.display()));
+                            }
+                            Err(e) => {
+                                self.last_saved_msg = Some(format!("Record start failed: {e}"));
+                            }
+                        }
+                    }
+                }
             }
             if reload_shader_requested {
                 let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
@@ -2264,18 +2369,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     } else if ran_rr
                         || (self.settings.exposure - self.rr_last_exposure).abs() > 1e-5
                     {
-                        self.hdr_tonemap.dispatch(
-                            self.interop.queue(),
-                            &mut encoder,
-                            if hdr_active {
-                                &rr.scrgb_bg
-                            } else {
-                                &rr.tonemap_bg
-                            },
-                            (rr.out_w, rr.out_h),
-                            self.settings.exposure,
-                            hdr_active,
-                        );
+                        let rec_wants_pq10 = self.video_recorder.as_ref().is_some_and(|r| {
+                            r.profile == crate::gpu_export::VideoProfile::Hdr10Pq
+                        });
+                        let rec_wants_sdr = self.video_recorder.as_ref().is_some_and(|r| {
+                            r.profile == crate::gpu_export::VideoProfile::SdrH264
+                        });
+                        if !hdr_active || rec_wants_sdr {
+                            self.hdr_tonemap.dispatch(
+                                self.interop.queue(),
+                                &mut encoder,
+                                &rr.tonemap_bg,
+                                (rr.out_w, rr.out_h),
+                                self.settings.exposure,
+                                false,
+                            );
+                        }
+                        if hdr_active || rec_wants_pq10 {
+                            self.hdr_tonemap.dispatch(
+                                self.interop.queue(),
+                                &mut encoder,
+                                &rr.scrgb_bg,
+                                (rr.out_w, rr.out_h),
+                                self.settings.exposure,
+                                true,
+                            );
+                        }
                         self.rr_last_exposure = self.settings.exposure;
                     }
                 } else if self.settings.dlss_on
@@ -2471,7 +2590,149 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
+            // Capture the final post-DLSS-RR / post-DLSS-SR / post-OptiX frame into MP4 when a new frame arrived.
+            let mut rec_gpu_copied = false;
+            if frames_received > 0
+                && self.has_frame
+                && let Some(ref mut active) = self.video_recorder
+            {
+                let is_pq = active.profile == crate::gpu_export::VideoProfile::Hdr10Pq;
+                let src_tex: Option<(&wgpu::Texture, u32, u32, u32)> =
+                    if self.settings.dlss_rr_on
+                        && self.settings.aov_mode == 0
+                        && let Some(ref rr) = self.dlss_rr_pass
+                    {
+                        let tex = if is_pq {
+                            &rr.display_hdr
+                        } else {
+                            &rr.display_ldr
+                        };
+                        Some((tex, rr.out_w & !1, rr.out_h & !1, if is_pq { 8 } else { 4 }))
+                    } else if !is_pq
+                        && self.settings.dlss_on
+                        && let Some(ref dlss) = self.dlss_pass
+                    {
+                        Some((
+                            dlss.output_out.wgpu_texture(),
+                            dlss.out_w & !1,
+                            dlss.out_h & !1,
+                            4,
+                        ))
+                    } else {
+                        None
+                    };
+                if let (Some((tex, w, h, bpp)), Some(copy_buf)) = (src_tex, &active.copy_buf)
+                    && w == active.width
+                    && h == active.height
+                {
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: copy_buf.wgpu_buffer(),
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(active.copy_pitch_px * bpp),
+                                rows_per_image: Some(h),
+                            },
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    rec_gpu_copied = true;
+                }
+            }
+
             self.interop.queue().submit(Some(encoder.finish()));
+
+            if frames_received > 0
+                && self.has_frame
+                && let Some(mut active) = self.video_recorder.take()
+            {
+                let is_pq = active.profile == crate::gpu_export::VideoProfile::Hdr10Pq;
+                let (src_ptr, src_pitch, dims_ok) = if rec_gpu_copied {
+                    let _ = self
+                        .interop
+                        .device()
+                        .poll(wgpu::PollType::wait_indefinitely());
+                    let ptr = active
+                        .copy_buf
+                        .as_ref()
+                        .map_or(0, SharedBuffer::cu_deviceptr);
+                    (ptr, active.copy_pitch_px, ptr != 0)
+                } else if active.copy_buf.is_none()
+                    && (self.render_w & !1) == active.width
+                    && (self.render_h & !1) == active.height
+                {
+                    if is_pq {
+                        if let Some(ref hdr_bufs) = self.shared_hdr {
+                            (hdr_bufs[self.front_buf_idx].cu_deviceptr(), self.render_w, true)
+                        } else {
+                            // Waiting one frame for `shared_hdr` allocation after recording started.
+                            self.video_recorder = Some(active);
+                            self.interop.queue().present(frame);
+                            self.window.request_redraw();
+                            return;
+                        }
+                    } else {
+                        (
+                            self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
+                            self.render_w,
+                            true,
+                        )
+                    }
+                } else {
+                    (0, 0, false)
+                };
+
+                if !dims_ok {
+                    let _ = active.recorder.finish();
+                    self.is_recording = false;
+                    self.record_frames = 0;
+                    let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+                        active: false,
+                        fixed_fps: 0,
+                    });
+                    self.last_saved_msg =
+                        Some("Recording stopped (resolution or upscale mode changed)".to_string());
+                } else {
+                    let rec_now = Instant::now();
+                    let frame_dur = if self.settings.record_fixed_fps {
+                        1.0 / f64::from(active.fps.max(1))
+                    } else {
+                        let d = active.last_frame_at.map_or(
+                            1.0 / f64::from(active.fps.max(1)),
+                            |prev| rec_now.duration_since(prev).as_secs_f64(),
+                        );
+                        d.clamp(1.0 / 240.0, 2.0)
+                    };
+                    active.last_frame_at = Some(rec_now);
+                    match active.recorder.push_frame(src_ptr, src_pitch, frame_dur) {
+                        Ok(()) => {
+                            self.record_frames = active.recorder.frame_count();
+                            self.video_recorder = Some(active);
+                        }
+                        Err(e) => {
+                            let _ = active.recorder.finish();
+                            self.is_recording = false;
+                            self.record_frames = 0;
+                            let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+                                active: false,
+                                fixed_fps: 0,
+                            });
+                            self.last_saved_msg = Some(format!("Video encode error: {e}"));
+                        }
+                    }
+                }
+            }
+
             self.interop.queue().present(frame);
             if self.last_persist_at.elapsed().as_secs_f32() >= 1.5 {
                 self.update_window_geometry();

@@ -236,6 +236,8 @@ pub struct UiContext<'a> {
     pub fps: f32,
     pub is_recording: bool,
     pub record_frames: u64,
+    pub ser_supported: bool,
+    pub dlss_rr_available: bool,
     pub viewport_focused: &'a mut bool,
     pub reset_accum_requested: &'a mut bool,
     pub save_png_requested: &'a mut bool,
@@ -731,7 +733,7 @@ impl UiContext<'_> {
                         1,
                         false,
                     );
-                    prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=24, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.bulb_iter, 4..=32, false);
                     anim_slider_f32(
                         ui,
                         anim,
@@ -846,14 +848,14 @@ impl UiContext<'_> {
                         1,
                         false,
                     );
-                    prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=24, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.box_iter, 4..=32, false);
                     anim_slider_f32(
                         ui,
                         anim,
                         "box_bailout",
                         "Bailout",
                         &mut s.box_bailout,
-                        4.0..=64.0,
+                        4.0..=128.0,
                         1,
                         false,
                     );
@@ -865,7 +867,7 @@ impl UiContext<'_> {
                         "kifs_scale",
                         "Scale",
                         &mut s.kifs_scale,
-                        1.3..=2.8,
+                        1.3..=3.5,
                         2,
                         false,
                     );
@@ -918,7 +920,7 @@ impl UiContext<'_> {
                         2,
                         false,
                     );
-                    prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=24, false);
+                    prop_slider_u32(ui, "Iterations", &mut s.kifs_iter, 4..=32, false);
                     anim_slider_f32(
                         ui,
                         anim,
@@ -996,7 +998,7 @@ impl UiContext<'_> {
                     "detail_eps",
                     "Detail Eps",
                     &mut s.detail_eps,
-                    0.00005..=0.005,
+                    0.00002..=0.005,
                     5,
                     true,
                 );
@@ -1006,11 +1008,11 @@ impl UiContext<'_> {
                     "norm_eps",
                     "Normal Eps",
                     &mut s.norm_eps,
-                    0.00005..=0.005,
+                    0.00002..=0.005,
                     5,
                     true,
                 );
-                prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=320, false);
+                prop_slider_u32(ui, "March Steps", &mut s.march_steps, 32..=512, false);
                 anim_slider_f32(
                     ui,
                     anim,
@@ -1447,6 +1449,24 @@ impl UiContext<'_> {
                 );
             }
             prop_toggle(ui, "Neon Ring", &mut s.neon_on, "Emissive Accent");
+            prop_row(ui, "OMM Halo", |ui| {
+                let gap = 4.0;
+                let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                let w = ((inner_w - gap * 2.0) / 3.0).max(28.0);
+                ui.spacing_mut().item_spacing.x = gap;
+                for (m, lbl) in [(0u32, "Off"), (1, "OMM"), (2, "Any-Hit")] {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H],
+                            egui::Button::selectable(s.omm_mode == m, lbl),
+                        )
+                        .clicked()
+                    {
+                        s.omm_mode = m;
+                    }
+                }
+                anim_toggle_btn_disabled(ui);
+            });
         });
 
         collapsing_section(
@@ -1519,7 +1539,7 @@ impl UiContext<'_> {
                 let gap = 4.0;
                 let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
                 ui.spacing_mut().item_spacing.x = gap;
-                ui.add_enabled_ui(!s.dlss_on, |ui| {
+                ui.add_enabled_ui(!s.dlss_on && !s.dlss_rr_on, |ui| {
                     let w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
                     for (val, lbl) in [(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
                         let selected = (s.render_scale - val).abs() < 0.05;
@@ -1560,27 +1580,52 @@ impl UiContext<'_> {
             prop_slider_u32(ui, "SPP / Pass", &mut s.spp, 1..=64, true);
             prop_slider_u32(ui, "Max Accum", &mut s.max_accum, 1..=1024, true);
             prop_toggle(ui, "Shadows", &mut s.shadows_on, "Direct Sun & Soft Shadows");
+            prop_toggle(
+                ui,
+                "OptiX SER",
+                &mut s.ser_on,
+                if self.ser_supported {
+                    "HW Shader Execution Reordering"
+                } else {
+                    "Shader Execution Reordering (no HW)"
+                },
+            );
 
-            // Unified 3-way Upscale / Denoise selector (mutually exclusive SSOT)
+            // Unified 4-way Upscale / AI Denoise selector (mutually exclusive SSOT)
             prop_row(ui, "Upscale / AI", |ui| {
                 let gap = 4.0;
                 let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                let w = ((inner_w - gap * 2.0) / 3.0).max(28.0);
+                let w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
                 ui.spacing_mut().item_spacing.x = gap;
-                let mode = if s.dlss_on {
-                    2u32
+                let mode = if s.dlss_rr_on {
+                    3u32
+                } else if s.dlss_on {
+                    2
                 } else if s.denoiser_on {
                     1
                 } else {
                     0
                 };
-                for (m, lbl) in [(0u32, "Off"), (1, "OptiX AI"), (2, "DLSS SR")] {
-                    if ui
-                        .add_sized([w, ROW_H], egui::Button::selectable(mode == m, lbl))
-                        .clicked()
-                    {
+                for (m, lbl) in [
+                    (0u32, "Off"),
+                    (1, "OptiX AI"),
+                    (2, "DLSS SR"),
+                    (3, "DLSS RR"),
+                ] {
+                    let resp = ui.add_sized([w, ROW_H], egui::Button::selectable(mode == m, lbl));
+                    let resp = if m == 3 {
+                        resp.on_hover_text(if self.dlss_rr_available {
+                            "DLSS Ray Reconstruction (available)"
+                        } else {
+                            "DLSS Ray Reconstruction (unavailable on this host/runtime)"
+                        })
+                    } else {
+                        resp
+                    };
+                    if resp.clicked() {
                         s.denoiser_on = m == 1;
                         s.dlss_on = m == 2;
+                        s.dlss_rr_on = m == 3;
                     }
                 }
                 anim_toggle_btn_disabled(ui);
@@ -1590,7 +1635,7 @@ impl UiContext<'_> {
                 prop_toggle(ui, "Temporal AI", &mut s.temporal_denoise, "Temporal Accumulation");
             }
 
-            if s.dlss_on {
+            if s.dlss_on || s.dlss_rr_on {
                 prop_row(ui, "DLSS Qual", |ui| {
                     let gap = 4.0;
                     let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
@@ -1615,16 +1660,18 @@ impl UiContext<'_> {
                     }
                     anim_toggle_btn_disabled(ui);
                 });
-                anim_slider_f32(
-                    ui,
-                    anim,
-                    "dlss_sharpness",
-                    "DLSS Sharp",
-                    &mut s.dlss_sharpness,
-                    0.0..=1.0,
-                    2,
-                    false,
-                );
+                if s.dlss_on {
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "dlss_sharpness",
+                        "DLSS Sharp",
+                        &mut s.dlss_sharpness,
+                        0.0..=1.0,
+                        2,
+                        false,
+                    );
+                }
             }
             ui.add_space(1.0);
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
@@ -1724,6 +1771,15 @@ impl UiContext<'_> {
             stat_row(ui, "Denoiser", &format!("{:.1} ms", self.denoise_ms));
             stat_row(
                 ui,
+                "OptiX SER",
+                match (self.ser_supported, self.settings.ser_on) {
+                    (true, true) => "HW Active",
+                    (true, false) => "HW Off",
+                    (false, _) => "Unsupported",
+                },
+            );
+            stat_row(
+                ui,
                 "VRAM",
                 &format!(
                     "{} / {} MiB",
@@ -1749,6 +1805,15 @@ impl UiContext<'_> {
             stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
             stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
             stat_row(ui, "NGX", &self.telemetry.ngx_status);
+            stat_row(
+                ui,
+                "DLSS RR",
+                match (self.dlss_rr_available, self.settings.dlss_rr_on) {
+                    (true, true) => "Active",
+                    (true, false) => "Available",
+                    (false, _) => "Unavailable",
+                },
+            );
         });
 
         collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {

@@ -13,9 +13,11 @@ use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use optix::{
     Aabb, Accel, AovType, BuildOptions, CustomPrimitives, Denoiser, DenoiserModel, DenoiserOptions,
-    DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, Layer, LinkOptions, Module,
-    ModuleOptions, Params as DenoiserParams, Pipeline, PipelineOptions, ProgramGroup, SbtRecord,
-    Scratch, ShaderBindingTable, TriangleMesh,
+    DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, Layer, LinkOptions,
+    MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapUse,
+    Module, ModuleOptions, OpacityMicromapArray, Params as DenoiserParams, Pipeline,
+    PipelineOptions, ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
+    micro_to_base_bary,
 };
 
 use crate::fft_bloom::FftBloomPass;
@@ -77,7 +79,8 @@ struct LaunchParams {
     floor_params: [f32; 4],
     sky_params: [f32; 4],
     accum_count: u32,
-    _pad0: [u32; 3],
+    enable_ser: u32,
+    _pad0: [u32; 2],
     out_motion_f32: u64,
     out_depth_f32: u64,
     prev_cam_pos: [f32; 4],
@@ -91,9 +94,11 @@ struct LaunchParams {
     jitter_y: f32,
     _pad1: u32,
     env_params: [f32; 8],
+    out_diffuse_albedo_f32: u64,
+    out_spec_albedo_f32: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 464);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 480);
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -297,6 +302,8 @@ pub struct DemoSettings {
     pub render_scale: f32,
     pub denoiser_on: bool,
     pub temporal_denoise: bool,
+    pub ser_on: bool,
+    pub omm_mode: u32,
     pub shadows_on: bool,
     pub auto_rotate: bool,
     pub spin_speed: f32,
@@ -334,8 +341,9 @@ pub struct DemoSettings {
     pub split_on: bool,
     pub split_x: f32,
     pub right_is_aov: u32,
-    // DLSS Super Resolution (NGX)
+    // DLSS Super Resolution & Ray Reconstruction (NGX)
     pub dlss_on: bool,
+    pub dlss_rr_on: bool,
     pub dlss_quality: u32,
     pub dlss_sharpness: f32,
     // Per-environment procedural parameters (persisted in PersistedState)
@@ -352,7 +360,7 @@ impl Default for DemoSettings {
             rot_z: 0.0,
             bulb_power: 8.0,
             bulb_bailout: 8.0,
-            bulb_iter: 12,
+            bulb_iter: 16,
             bulb_julia: false,
             bulb_c: [-0.2, 0.6, 0.2],
             bulb_theta_mult: 1.0,
@@ -363,22 +371,22 @@ impl Default for DemoSettings {
             box_fold: 1.0,
             box_min_r: 0.5,
             box_fixed_r: 1.0,
-            box_iter: 12,
-            box_bailout: 16.0,
+            box_iter: 18,
+            box_bailout: 64.0,
             box_fold_mult: 2.0,
             box_iter_rot: 0.0,
-            kifs_scale: 2.0,
+            kifs_scale: 3.0,
             kifs_rot1: 0.0,
             kifs_rot2: 0.0,
             kifs_offset: [1.0, 1.0, 1.0],
-            kifs_iter: 12,
-            kifs_bailout: 12.0,
+            kifs_iter: 14,
+            kifs_bailout: 16.0,
             kifs_thickness: 0.05,
             kifs_z_bias: 0.5,
-            detail_eps: 0.0005,
-            fudge: 0.95,
-            norm_eps: 0.0006,
-            march_steps: 128,
+            detail_eps: 0.0002,
+            fudge: 0.80,
+            norm_eps: 0.0002,
+            march_steps: 256,
             bounces: 3,
             metallic: 0.45,
             trap_scale: 0.85,
@@ -403,6 +411,8 @@ impl Default for DemoSettings {
             render_scale: 1.0,
             denoiser_on: false,
             temporal_denoise: false,
+            ser_on: true,
+            omm_mode: 0,
             shadows_on: true,
             auto_rotate: false,
             spin_speed: 0.45,
@@ -438,6 +448,7 @@ impl Default for DemoSettings {
             split_x: 0.5,
             right_is_aov: 0,
             dlss_on: false,
+            dlss_rr_on: false,
             dlss_quality: 3,
             dlss_sharpness: 0.35,
             env: EnvSettings::default(),
@@ -454,6 +465,15 @@ pub struct CameraFrame {
     pub tan_half_fov: f32,
 }
 
+/// Double-buffered CUDA device pointers for optional DLSS Ray Reconstruction FP16 AOV buffers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DlssRrBufferPtrs {
+    pub hdr_color: [u64; 2],
+    pub diffuse_albedo: [u64; 2],
+    pub spec_albedo: [u64; 2],
+    pub normal_rough: [u64; 2],
+}
+
 pub enum RenderCmd {
     Update {
         settings: Box<DemoSettings>,
@@ -466,6 +486,7 @@ pub enum RenderCmd {
         buf_ptrs: [u64; 2],
         depth_ptrs: [u64; 2],
         motion_ptrs: [u64; 2],
+        rr_ptrs: Option<DlssRrBufferPtrs>,
         gen_id: u64,
     },
     ReturnBuffer {
@@ -496,12 +517,14 @@ pub struct FrameReady {
     pub tonemap_ms: f32,
     pub is_recording: bool,
     pub record_frames: u64,
+    pub ser_supported: bool,
     pub status_msg: Option<String>,
 }
 
 struct TonemapKernel {
     module: cu::CUmodule,
     func: cu::CUfunction,
+    pack_rr_func: cu::CUfunction,
 }
 
 impl Drop for TonemapKernel {
@@ -523,14 +546,19 @@ struct OptixRig {
     glass_mesh_gas: Arc<Accel>,
     glass_mesh_segs: (u32, u32),
     neon_gas: Arc<Accel>,
+    omm_gas: Arc<Accel>,
+    omm_anyhit_gas: Arc<Accel>,
     ias: Arc<Accel>,
     pipeline: Pipeline,
     sbt: ShaderBindingTable,
+    ser_supported: bool,
     denoiser: Denoiser,
     denoiser_is_temporal: bool,
     temporal_has_prev: bool,
     color_f32: DeviceBuffer<[f32; 4]>,
     albedo_f32: DeviceBuffer<[f32; 4]>,
+    diffuse_albedo_f32: DeviceBuffer<[f32; 4]>,
+    spec_albedo_f32: DeviceBuffer<[f32; 4]>,
     normal_f32: DeviceBuffer<[f32; 4]>,
     denoised_f32: DeviceBuffer<[f32; 4]>,
     prev_denoised_f32: DeviceBuffer<[f32; 4]>,
@@ -616,6 +644,7 @@ fn build_optix_pipeline(
         .map_err(|e| format!("PipelineOptions: {e}"))?;
     opts.attribute_values = 4;
     opts.primitive_types = 0; // custom AABB + triangles
+    opts.opacity_micromaps = true;
     let (module, _) = Module::new(optix_ctx, &ModuleOptions::default(), &opts, rt_ptx)
         .map_err(|e| format!("Module::new: {e}"))?;
 
@@ -650,6 +679,15 @@ fn build_optix_pipeline(
         },
     )
     .map_err(|e| format!("hit_sphere: {e}"))?;
+    let hit_omm = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__hit")),
+            any_hit: Some((&module, "__anyhit__omm")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_omm: {e}"))?;
 
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
@@ -662,6 +700,7 @@ fn build_optix_pipeline(
             hit_floor.clone(),
             hit_fractal.clone(),
             hit_sphere.clone(),
+            hit_omm.clone(),
         ],
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
@@ -677,6 +716,7 @@ fn build_optix_pipeline(
             SbtRecord::new(&hit_floor, 0u32).map_err(|e| format!("sbt hit0: {e}"))?,
             SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
             SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
+            SbtRecord::new(&hit_omm, 0u32).map_err(|e| format!("sbt hit3: {e}"))?,
         ],
     )
     .map_err(|e| format!("SBT::new: {e}"))?;
@@ -711,7 +751,7 @@ fn create_denoiser(
         optix_ctx,
         stream,
         DenoiserOptions {
-            model: DenoiserModel::Hdr,
+            model: DenoiserModel::Aov,
             albedo: true,
             normal: true,
             ..Default::default()
@@ -796,12 +836,176 @@ fn build_torus_ring(major_r: f32, minor_r: f32, segs: u32, tube_segs: u32) -> Ve
     tris
 }
 
+/// Exact 1-Lipschitz 2D SDF for the perforated filigree halo band; matches `filigree_sdf` in
+/// `shaders/raytracer.cu` bit-for-bit. `<= 0` is solid metal, `> 0` is transparent cutout.
+fn filigree_sdf(u: f32, v: f32) -> f32 {
+    let d_border = v.min(1.0 - v) - 0.06;
+    let s1 = u * 2.0 + v * 2.0;
+    let f1 = s1 - s1.floor();
+    let d_diag1 = ((f1 - 0.5).abs() - 0.075) * 0.353_553_38;
+    let s2 = u * 2.0 - v * 2.0 + 4.0;
+    let f2 = s2 - s2.floor();
+    let d_diag2 = ((f2 - 0.5).abs() - 0.075) * 0.353_553_38;
+    let dx = u - 0.5;
+    let dy = v - 0.5;
+    let d_ring = ((dx * dx + dy * dy).sqrt() - 0.30).abs() - 0.042;
+    let cu = u.min(1.0 - u);
+    let cv = v.min(1.0 - v);
+    let d_corner = ((cu * cu + cv * cv).sqrt() - 0.22).abs() - 0.036;
+    d_border.min(d_diag1.min(d_diag2).min(d_ring.min(d_corner)))
+}
+
+/// Builds a cylindrical filigree halo band (`segs` quads = `2 * segs` triangles).
+/// Even triangles `(p00, p10, p11)` have UVs `(0,0)-(1,0)-(1,1)`; odd triangles `(p00, p11, p01)`
+/// have UVs `(0,0)-(1,1)-(0,1)` so all quads share just two opacity micromaps.
+fn build_filigree_band_tris(radius: f32, half_h: f32, segs: u32) -> Vec<[f32; 3]> {
+    use std::f32::consts::TAU;
+    let mut tris = Vec::with_capacity((segs * 6) as usize);
+    for i in 0..segs {
+        let a0 = TAU * (i as f32 / segs as f32);
+        let a1 = TAU * ((i + 1) as f32 / segs as f32);
+        let p00 = [radius * a0.cos(), -half_h, radius * a0.sin()];
+        let p10 = [radius * a1.cos(), -half_h, radius * a1.sin()];
+        let p11 = [radius * a1.cos(), half_h, radius * a1.sin()];
+        let p01 = [radius * a0.cos(), half_h, radius * a0.sin()];
+        tris.extend_from_slice(&[p00, p10, p11, p00, p11, p01]);
+    }
+    tris
+}
+
+/// Bakes 2 shared 4-state opacity micromaps (`[even, odd]`) at subdivision `level` using
+/// 1-Lipschitz SDF circumradius bounds so OMM and Any-Hit are pixel-identical.
+fn bake_filigree_omm_bytes(level: u32) -> Vec<u8> {
+    const STATE_TRANSPARENT: u8 = 0;
+    const STATE_OPAQUE: u8 = 1;
+    const STATE_UNKNOWN_TRANSPARENT: u8 = 2;
+    const STATE_UNKNOWN_OPAQUE: u8 = 3;
+
+    let micro_count = 1u32 << (2 * level);
+    let bytes_per_map = ((micro_count as usize) * 2).div_ceil(8);
+    let mut bytes = vec![0u8; bytes_per_map * 2];
+
+    for (map_idx, odd) in [false, true].into_iter().enumerate() {
+        let map_slice = &mut bytes[map_idx * bytes_per_map..(map_idx + 1) * bytes_per_map];
+        for idx in 0..micro_count {
+            let barys = micro_to_base_bary(idx, level).expect("micro_to_base_bary");
+            let uvs: [[f32; 2]; 3] = barys.map(|[b1, b2]| {
+                if odd {
+                    [b1, b1 + b2]
+                } else {
+                    [b1 + b2, b2]
+                }
+            });
+            let uc = (uvs[0][0] + uvs[1][0] + uvs[2][0]) * (1.0 / 3.0);
+            let vc = (uvs[0][1] + uvs[1][1] + uvs[2][1]) * (1.0 / 3.0);
+            let mut rad = 0.0f32;
+            for [u, v] in uvs {
+                let du = u - uc;
+                let dv = v - vc;
+                rad = rad.max((du * du + dv * dv).sqrt());
+            }
+            // Small safety margin covers f32 rounding so opaque/transparent claims are exact.
+            let margin = rad * 1.02 + 1.0e-5;
+            let d = filigree_sdf(uc, vc);
+            let state = if d <= -margin {
+                STATE_OPAQUE
+            } else if d > margin {
+                STATE_TRANSPARENT
+            } else if d <= 0.0 {
+                STATE_UNKNOWN_OPAQUE
+            } else {
+                STATE_UNKNOWN_TRANSPARENT
+            };
+            map_slice[(idx / 4) as usize] |= state << ((idx % 4) * 2);
+        }
+    }
+    bytes
+}
+
+/// Builds both the hardware OMM GAS and the unaccelerated Any-Hit GAS over the same filigree halo
+/// geometry so toggling `OMM` vs `Any-Hit` is a fair, zero-overhead benchmark comparison.
+fn build_omm_gases(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+) -> (Arc<Accel>, Arc<Accel>) {
+    const OMM_SEGS: u32 = 24;
+    const OMM_LEVEL: u32 = 5;
+    let tris = build_filigree_band_tris(2.15, 0.45, OMM_SEGS);
+    let tri_count = (tris.len() / 3) as u32;
+    let verts = DeviceBuffer::from_host(stream, &tris).expect("omm verts");
+
+    let omm_bytes = bake_filigree_omm_bytes(OMM_LEVEL);
+    let per_map_bytes = (omm_bytes.len() / 2) as u32;
+    let omm_data = DeviceBuffer::from_host(stream, &omm_bytes).expect("omm data");
+    let descs = [
+        MicromapDesc::new(0, OMM_LEVEL as u16, MicromapFormat::FourState),
+        MicromapDesc::new(per_map_bytes, OMM_LEVEL as u16, MicromapFormat::FourState),
+    ];
+    let omm_array = OpacityMicromapArray::build(
+        optix_ctx,
+        stream,
+        scratch,
+        &omm_data,
+        &descs,
+        MicromapOptions::default(),
+    )
+    .expect("OpacityMicromapArray");
+
+    let indices_host: Vec<i16> = (0..tri_count).map(|i| (i & 1) as i16).collect();
+    let indices_buf = DeviceBuffer::from_host(stream, &indices_host).expect("omm indices");
+    let usage = [MicromapCount {
+        count: tri_count,
+        level: OMM_LEVEL,
+        format: MicromapFormat::FourState,
+    }];
+    let build_opts = BuildOptions {
+        prefer_fast_trace: true,
+        random_vertex_access: true,
+        ..Default::default()
+    };
+
+    // SAFETY: every index in `indices_buf` is `0` or `1` (both valid micromaps of `omm_array`
+    // at `OMM_LEVEL` / `FourState`), and `usage` counts all `tri_count` references.
+    let omm_use = unsafe {
+        MicromapUse::indexed(&omm_array, MicromapIndices::I16(&indices_buf), 0, &usage)
+    };
+    let omm_gas = Accel::triangles(
+        optix_ctx,
+        stream,
+        scratch,
+        &[TriangleMesh {
+            flags: &[GeometryFlags::NONE],
+            micromap: Some(omm_use),
+            ..TriangleMesh::new(&verts)
+        }],
+        build_opts,
+    )
+    .expect("omm GAS");
+
+    let omm_anyhit_gas = Accel::triangles(
+        optix_ctx,
+        stream,
+        scratch,
+        &[TriangleMesh {
+            flags: &[GeometryFlags::NONE],
+            ..TriangleMesh::new(&verts)
+        }],
+        build_opts,
+    )
+    .expect("omm anyhit GAS");
+
+    (omm_gas, omm_anyhit_gas)
+}
+
 struct SceneGas<'a> {
     floor: &'a Arc<Accel>,
     fractal: &'a Arc<Accel>,
     glass_analytic: &'a Arc<Accel>,
     glass_mesh: &'a Arc<Accel>,
     neon: &'a Arc<Accel>,
+    omm: &'a Arc<Accel>,
+    omm_anyhit: &'a Arc<Accel>,
 }
 
 struct SceneState {
@@ -818,6 +1022,7 @@ struct SceneState {
     sat_on: bool,
     glass_analytic: bool,
     neon_on: bool,
+    omm_mode: u32,
 }
 
 fn splitmix32(mut x: u32) -> f32 {
@@ -921,6 +1126,18 @@ fn build_ias(
         instances.push(i3);
     }
 
+    if state.omm_mode == 1 || state.omm_mode == 2 {
+        let omm_accel = if state.omm_mode == 1 {
+            gas.omm
+        } else {
+            gas.omm_anyhit
+        };
+        let mut i4 = Instance::new(omm_accel);
+        i4.id = 4;
+        i4.sbt_offset = 3;
+        instances.push(i4);
+    }
+
     Accel::instances(
         optix_ctx,
         stream,
@@ -950,6 +1167,7 @@ fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
 fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
     let stream = cuda.default_stream();
     let optix_ctx = DeviceContext::new(cuda, None, 0, false).expect("OptiX DeviceContext");
+    let ser_supported = optix_ctx.shader_reordering().unwrap_or(false);
     let mut scratch = Scratch::new(&stream);
 
     let (rt_ptx, tm_ptx) = initial_ptx();
@@ -970,9 +1188,19 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         cu::cudaError_enum_CUDA_SUCCESS,
         "cuModuleGetFunction failed"
     );
+    let mut pack_rr_func: cu::CUfunction = std::ptr::null_mut();
+    let pack_name = CString::new("pack_dlss_rr_aovs_f16").unwrap();
+    // SAFETY: `cu_mod` is valid and `pack_name` is NUL-terminated.
+    let res = unsafe { cu::cuModuleGetFunction(&mut pack_rr_func, cu_mod, pack_name.as_ptr()) };
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleGetFunction(pack_dlss_rr_aovs_f16) failed"
+    );
     let tonemap = TonemapKernel {
         module: cu_mod,
         func: cu_func,
+        pack_rr_func,
     };
 
     let (pipeline, sbt) =
@@ -1007,12 +1235,12 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     )
     .expect("floor GAS");
 
-    // Fractal AABB custom primitive [-1.5, 1.5]^3
+    // Fractal AABB custom primitive [-1.85, 1.85]^3 (matches raytracer.cu; avoids rotated KIFS corner clipping)
     let aabb_buf = DeviceBuffer::from_host(
         &stream,
         &[Aabb {
-            min: [-1.5, -1.5, -1.5],
-            max: [1.5, 1.5, 1.5],
+            min: [-1.85, -1.85, -1.85],
+            max: [1.85, 1.85, 1.85],
         }],
     )
     .expect("aabb");
@@ -1066,6 +1294,9 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     )
     .expect("neon GAS");
 
+    // Perforated filigree halo GAS pair (hardware OMM vs pure Any-Hit benchmark)
+    let (omm_gas, omm_anyhit_gas) = build_omm_gases(&optix_ctx, &stream, &mut scratch);
+
     let ias = build_ias(
         &optix_ctx,
         &stream,
@@ -1076,6 +1307,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             glass_analytic: &glass_analytic_gas,
             glass_mesh: &glass_mesh_gas,
             neon: &neon_gas,
+            omm: &omm_gas,
+            omm_anyhit: &omm_anyhit_gas,
         },
         SceneState {
             sat_angle: 0.0,
@@ -1106,6 +1339,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             sat_on: initial_settings.sat_on,
             glass_analytic: initial_settings.glass_analytic,
             neon_on: initial_settings.neon_on,
+            omm_mode: initial_settings.omm_mode,
         },
     );
 
@@ -1120,6 +1354,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     let n = (DEFAULT_W * DEFAULT_H) as usize;
     let color_f32 = DeviceBuffer::zeroed(&stream, n).expect("color_f32");
     let albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("albedo_f32");
+    let diffuse_albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("diffuse_albedo_f32");
+    let spec_albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("spec_albedo_f32");
     let normal_f32 = DeviceBuffer::zeroed(&stream, n).expect("normal_f32");
     let denoised_f32 = DeviceBuffer::zeroed(&stream, n).expect("denoised_f32");
     let prev_denoised_f32 = DeviceBuffer::zeroed(&stream, n).expect("prev_denoised_f32");
@@ -1140,14 +1376,19 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         glass_mesh_gas,
         glass_mesh_segs,
         neon_gas,
+        omm_gas,
+        omm_anyhit_gas,
         ias,
         pipeline,
         sbt,
+        ser_supported,
         denoiser,
         denoiser_is_temporal,
         temporal_has_prev: false,
         color_f32,
         albedo_f32,
+        diffuse_albedo_f32,
+        spec_albedo_f32,
         normal_f32,
         denoised_f32,
         prev_denoised_f32,
@@ -1164,6 +1405,9 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     let n = (width * height) as usize;
     rig.color_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("color_f32 resize");
     rig.albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("albedo_f32 resize");
+    rig.diffuse_albedo_f32 =
+        DeviceBuffer::zeroed(&rig.stream, n).expect("diffuse_albedo_f32 resize");
+    rig.spec_albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("spec_albedo_f32 resize");
     rig.normal_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("normal_f32 resize");
     rig.denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("denoised_f32 resize");
     rig.prev_denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("prev_denoised_f32 resize");
@@ -1203,6 +1447,7 @@ pub fn spawn_render_thread(
     let handle = thread::Builder::new()
         .name("optix-render".to_string())
         .spawn(move || {
+            crate::nvtx::name_current_thread(c"optix-render");
             cuda.bind_to_thread()
                 .expect("cuda bind_to_thread on render thread");
             let mut rig = init_optix(&cuda, &initial_settings);
@@ -1212,6 +1457,7 @@ pub fn spawn_render_thread(
             let mut buf_ptrs = initial_buf_ptrs;
             let mut depth_ptrs = initial_depth_ptrs;
             let mut motion_ptrs = initial_motion_ptrs;
+            let mut rr_ptrs: Option<DlssRrBufferPtrs> = None;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut settings = initial_settings;
             let mut camera = initial_camera;
@@ -1228,6 +1474,7 @@ pub fn spawn_render_thread(
                 settings.sat_count,
                 settings.sat_seed,
                 settings.neon_on,
+                settings.omm_mode,
                 [
                     settings.sat_size_min,
                     settings.sat_size_max,
@@ -1261,6 +1508,7 @@ pub fn spawn_render_thread(
                                  buf_ptrs: &mut [u64; 2],
                                  depth_ptrs: &mut [u64; 2],
                                  motion_ptrs: &mut [u64; 2],
+                                 rr_ptrs: &mut Option<DlssRrBufferPtrs>,
                                  free_bufs: &mut VecDeque<usize>,
                                  settings: &mut DemoSettings,
                                  camera: &mut CameraFrame,
@@ -1303,6 +1551,7 @@ pub fn spawn_render_thread(
                             buf_ptrs: new_ptrs,
                             depth_ptrs: new_depth_ptrs,
                             motion_ptrs: new_motion_ptrs,
+                            rr_ptrs: new_rr_ptrs,
                             gen_id,
                         } => {
                             if let Some(rec) = recorder.take() {
@@ -1317,6 +1566,7 @@ pub fn spawn_render_thread(
                             *buf_ptrs = new_ptrs;
                             *depth_ptrs = new_depth_ptrs;
                             *motion_ptrs = new_motion_ptrs;
+                            *rr_ptrs = new_rr_ptrs;
                             *cur_gen = gen_id;
                             free_bufs.clear();
                             free_bufs.push_back(0);
@@ -1398,6 +1648,7 @@ pub fn spawn_render_thread(
                         &mut buf_ptrs,
                         &mut depth_ptrs,
                         &mut motion_ptrs,
+                        &mut rr_ptrs,
                         &mut free_bufs,
                         &mut settings,
                         &mut camera,
@@ -1435,6 +1686,7 @@ pub fn spawn_render_thread(
                                 &mut buf_ptrs,
                                 &mut depth_ptrs,
                                 &mut motion_ptrs,
+                                &mut rr_ptrs,
                                 &mut free_bufs,
                                 &mut settings,
                                 &mut camera,
@@ -1487,6 +1739,7 @@ pub fn spawn_render_thread(
                     settings.sat_count,
                     settings.sat_seed,
                     settings.neon_on,
+                    settings.omm_mode,
                     [
                         settings.sat_size_min,
                         settings.sat_size_max,
@@ -1515,6 +1768,8 @@ pub fn spawn_render_thread(
                             glass_analytic: &rig.glass_analytic_gas,
                             glass_mesh: &rig.glass_mesh_gas,
                             neon: &rig.neon_gas,
+                            omm: &rig.omm_gas,
+                            omm_anyhit: &rig.omm_anyhit_gas,
                         },
                         SceneState {
                             sat_angle,
@@ -1533,6 +1788,7 @@ pub fn spawn_render_thread(
                             sat_on: settings.sat_on,
                             glass_analytic: settings.glass_analytic,
                             neon_on: settings.neon_on,
+                            omm_mode: settings.omm_mode,
                         },
                     );
                     last_ias_state = ias_state;
@@ -1613,11 +1869,14 @@ pub fn spawn_render_thread(
                 let sun_y = el.sin();
                 let sun_z = el.cos() * az.cos();
 
-                let jitter = if settings.dlss_on {
+                let rr_export = settings.dlss_rr_on || rr_ptrs.is_some();
+                let dlss_any = settings.dlss_on || rr_export;
+                let jitter = if dlss_any {
                     accum_count = 0;
+                    let period = if rr_export { 64 } else { 16 };
                     [
-                        halton((frame_index % 16) + 1, 2) - 0.5,
-                        halton((frame_index % 16) + 1, 3) - 0.5,
+                        halton((frame_index % period) + 1, 2) - 0.5,
+                        halton((frame_index % period) + 1, 3) - 0.5,
                     ]
                 } else {
                     [0.0, 0.0]
@@ -1691,7 +1950,8 @@ pub fn spawn_render_thread(
                         settings.sky_mode as f32,
                     ],
                     accum_count,
-                    _pad0: [0; 3],
+                    enable_ser: u32::from(settings.ser_on),
+                    _pad0: [0; 2],
                     out_motion_f32: rig.motion_f32.cu_deviceptr(),
                     out_depth_f32: rig.depth_f32.cu_deviceptr(),
                     prev_cam_pos: [
@@ -1730,26 +1990,45 @@ pub fn spawn_render_thread(
                     jitter_y: jitter[1],
                     _pad1: 0,
                     env_params: settings.env.pack(settings.sky_mode),
+                    out_diffuse_albedo_f32: if rr_export {
+                        rig.diffuse_albedo_f32.cu_deviceptr()
+                    } else {
+                        0
+                    },
+                    out_spec_albedo_f32: if rr_export {
+                        rig.spec_albedo_f32.cu_deviceptr()
+                    } else {
+                        0
+                    },
                 };
                 prev_camera = camera;
                 rig.params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
                     .expect("params upload");
 
-                let t_rt = Instant::now();
-                // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive `synchronize`.
-                unsafe {
-                    rig.pipeline
-                        .launch(&rig.stream, &rig.params_buf, &rig.sbt, [cur_w, cur_h, 1])
-                }
-                .expect("optix launch");
-                rig.stream.synchronize().expect("rt sync");
-                let rt_ms = t_rt.elapsed().as_secs_f32() * 1000.0;
+                let rt_ms = {
+                    let _nvtx = crate::nvtx::NvtxRange::new(c"OptiX RT", crate::nvtx::COLOR_RT);
+                    let t_rt = Instant::now();
+                    // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive `synchronize`.
+                    unsafe {
+                        rig.pipeline.launch(
+                            &rig.stream,
+                            &rig.params_buf,
+                            &rig.sbt,
+                            [cur_w, cur_h, 1],
+                        )
+                    }
+                    .expect("optix launch");
+                    rig.stream.synchronize().expect("rt sync");
+                    t_rt.elapsed().as_secs_f32() * 1000.0
+                };
 
                 let (mut final_f32_ptr, denoise_ms) = if settings.denoiser_on
-                    && !settings.dlss_on
+                    && !dlss_any
                     && settings.aov_mode == 0
                 {
+                    let _nvtx =
+                        crate::nvtx::NvtxRange::new(c"OptiX Denoise", crate::nvtx::COLOR_DENOISE);
                     let t_den = Instant::now();
                     let flow_img = if rig.denoiser_is_temporal {
                         Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
@@ -1811,9 +2090,12 @@ pub fn spawn_render_thread(
                     (rig.color_f32.cu_deviceptr(), 0.0)
                 };
 
-                let bloom_ms = if settings.bloom_on && settings.aov_mode == 0 {
-                    if let Some(ref mut bloom) = rig.bloom {
-                        let bloom_ready = if !settings.denoiser_on || settings.dlss_on {
+                let bloom_ms =
+                    if settings.bloom_on && !rr_export && settings.aov_mode == 0 {
+                        let _nvtx =
+                            crate::nvtx::NvtxRange::new(c"cuFFT Bloom", crate::nvtx::COLOR_BLOOM);
+                        if let Some(ref mut bloom) = rig.bloom {
+                            let bloom_ready = if !settings.denoiser_on || dlss_any {
                             // SAFETY: `color_f32` and `denoised_f32` have identical byte size on `rig.stream`.
                             let cp_res = unsafe {
                                 cu::cuMemcpyDtoDAsync_v2(
@@ -1854,95 +2136,145 @@ pub fn spawn_render_thread(
                     0.0
                 };
 
-                let t_tm = Instant::now();
-                let mut src_ptr = match settings.aov_mode {
-                    1 => rig.albedo_f32.cu_deviceptr(),
-                    2 => rig.normal_f32.cu_deviceptr(),
-                    _ => final_f32_ptr,
-                };
-                let mut dst_ptr = buf_ptrs[buf_idx];
-                let mut w = cur_w;
-                let mut h = cur_h;
-                let mut exposure = settings.exposure;
-                let mut aov_mode = settings.aov_mode;
-                let mut right_ptr: u64 = if settings.split_on {
-                    match settings.right_is_aov {
+                let tonemap_ms = {
+                    let _nvtx =
+                        crate::nvtx::NvtxRange::new(c"Tonemap", crate::nvtx::COLOR_TONEMAP);
+                    let t_tm = Instant::now();
+                    let mut src_ptr = match settings.aov_mode {
                         1 => rig.albedo_f32.cu_deviceptr(),
                         2 => rig.normal_f32.cu_deviceptr(),
-                        _ => rig.color_f32.cu_deviceptr(),
-                    }
-                } else {
-                    0
-                };
-                let mut split_x: f32 = if settings.split_on {
-                    settings.split_x.clamp(0.0, 1.0)
-                } else {
-                    -1.0
-                };
-                let mut right_is_aov: i32 = settings.right_is_aov as i32;
-                let mut kernel_args: [*mut c_void; 9] = [
-                    (&raw mut src_ptr).cast(),
-                    (&raw mut dst_ptr).cast(),
-                    (&raw mut w).cast(),
-                    (&raw mut h).cast(),
-                    (&raw mut exposure).cast(),
-                    (&raw mut aov_mode).cast(),
-                    (&raw mut right_ptr).cast(),
-                    (&raw mut split_x).cast(),
-                    (&raw mut right_is_aov).cast(),
-                ];
-                let gx = cur_w.div_ceil(16);
-                let gy = cur_h.div_ceil(16);
-                // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32, float4*, f32, i32)`
-                // and all pointers/buffers remain valid through `stream.synchronize()`.
-                let res = unsafe {
-                    cu::cuLaunchKernel(
-                        rig.tonemap.func,
-                        gx,
-                        gy,
-                        1,
-                        16,
-                        16,
-                        1,
-                        0,
-                        rig.stream.cu_stream(),
-                        kernel_args.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                assert_eq!(
-                    res,
-                    cu::cudaError_enum_CUDA_SUCCESS,
-                    "tonemap cuLaunchKernel failed"
-                );
-                if settings.dlss_on {
-                    // SAFETY: `rig.depth_f32` and `depth_ptrs[buf_idx]` have `cur_w * cur_h * 4` bytes;
-                    // `rig.motion_f32` and `motion_ptrs[buf_idx]` have `cur_w * cur_h * 8` bytes.
-                    let (depth_res, motion_res) = unsafe {
-                        let d = cu::cuMemcpyDtoDAsync_v2(
-                            depth_ptrs[buf_idx],
-                            rig.depth_f32.cu_deviceptr(),
-                            rig.depth_f32.num_bytes(),
-                            rig.stream.cu_stream(),
-                        );
-                        let m = cu::cuMemcpyDtoDAsync_v2(
-                            motion_ptrs[buf_idx],
-                            rig.motion_f32.cu_deviceptr(),
-                            rig.motion_f32.num_bytes(),
-                            rig.stream.cu_stream(),
-                        );
-                        (d, m)
+                        _ => final_f32_ptr,
                     };
-                    if depth_res != cu::cudaError_enum_CUDA_SUCCESS
-                        || motion_res != cu::cudaError_enum_CUDA_SUCCESS
-                    {
-                        pending_status = Some(format!(
-                            "DLSS guide copy failed (depth={depth_res:?}, motion={motion_res:?})"
-                        ));
+                    let mut dst_ptr = buf_ptrs[buf_idx];
+                    let mut w = cur_w;
+                    let mut h = cur_h;
+                    let mut exposure = settings.exposure;
+                    let mut aov_mode = settings.aov_mode;
+                    let mut right_ptr: u64 = if settings.split_on {
+                        match settings.right_is_aov {
+                            1 => rig.albedo_f32.cu_deviceptr(),
+                            2 => rig.normal_f32.cu_deviceptr(),
+                            _ => rig.color_f32.cu_deviceptr(),
+                        }
+                    } else {
+                        0
+                    };
+                    let mut split_x: f32 = if settings.split_on {
+                        settings.split_x.clamp(0.0, 1.0)
+                    } else {
+                        -1.0
+                    };
+                    let mut right_is_aov: i32 = settings.right_is_aov as i32;
+                    let mut kernel_args: [*mut c_void; 9] = [
+                        (&raw mut src_ptr).cast(),
+                        (&raw mut dst_ptr).cast(),
+                        (&raw mut w).cast(),
+                        (&raw mut h).cast(),
+                        (&raw mut exposure).cast(),
+                        (&raw mut aov_mode).cast(),
+                        (&raw mut right_ptr).cast(),
+                        (&raw mut split_x).cast(),
+                        (&raw mut right_is_aov).cast(),
+                    ];
+                    let gx = cur_w.div_ceil(16);
+                    let gy = cur_h.div_ceil(16);
+                    // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32, float4*, f32, i32)`
+                    // and all pointers/buffers remain valid through `stream.synchronize()`.
+                    let res = unsafe {
+                        cu::cuLaunchKernel(
+                            rig.tonemap.func,
+                            gx,
+                            gy,
+                            1,
+                            16,
+                            16,
+                            1,
+                            0,
+                            rig.stream.cu_stream(),
+                            kernel_args.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    assert_eq!(
+                        res,
+                        cu::cudaError_enum_CUDA_SUCCESS,
+                        "tonemap cuLaunchKernel failed"
+                    );
+                    if dlss_any {
+                        // SAFETY: `rig.depth_f32` and `depth_ptrs[buf_idx]` have `cur_w * cur_h * 4` bytes;
+                        // `rig.motion_f32` and `motion_ptrs[buf_idx]` have `cur_w * cur_h * 8` bytes.
+                        let (depth_res, motion_res) = unsafe {
+                            let d = cu::cuMemcpyDtoDAsync_v2(
+                                depth_ptrs[buf_idx],
+                                rig.depth_f32.cu_deviceptr(),
+                                rig.depth_f32.num_bytes(),
+                                rig.stream.cu_stream(),
+                            );
+                            let m = cu::cuMemcpyDtoDAsync_v2(
+                                motion_ptrs[buf_idx],
+                                rig.motion_f32.cu_deviceptr(),
+                                rig.motion_f32.num_bytes(),
+                                rig.stream.cu_stream(),
+                            );
+                            (d, m)
+                        };
+                        if depth_res != cu::cudaError_enum_CUDA_SUCCESS
+                            || motion_res != cu::cudaError_enum_CUDA_SUCCESS
+                        {
+                            pending_status = Some(format!(
+                                "DLSS guide copy failed (depth={depth_res:?}, motion={motion_res:?})"
+                            ));
+                        }
                     }
-                }
-                rig.stream.synchronize().expect("tonemap sync");
-                let tonemap_ms = t_tm.elapsed().as_secs_f32() * 1000.0;
+                    if rr_export
+                        && let Some(rr) = rr_ptrs
+                    {
+                        let mut c_src = rig.color_f32.cu_deviceptr();
+                        let mut d_src = rig.diffuse_albedo_f32.cu_deviceptr();
+                        let mut s_src = rig.spec_albedo_f32.cu_deviceptr();
+                        let mut n_src = rig.normal_f32.cu_deviceptr();
+                        let mut c_dst = rr.hdr_color[buf_idx];
+                        let mut d_dst = rr.diffuse_albedo[buf_idx];
+                        let mut s_dst = rr.spec_albedo[buf_idx];
+                        let mut n_dst = rr.normal_rough[buf_idx];
+                        let mut pack_args: [*mut c_void; 10] = [
+                            (&raw mut c_src).cast(),
+                            (&raw mut d_src).cast(),
+                            (&raw mut s_src).cast(),
+                            (&raw mut n_src).cast(),
+                            (&raw mut c_dst).cast(),
+                            (&raw mut d_dst).cast(),
+                            (&raw mut s_dst).cast(),
+                            (&raw mut n_dst).cast(),
+                            (&raw mut w).cast(),
+                            (&raw mut h).cast(),
+                        ];
+                        // SAFETY: `pack_dlss_rr_aovs_f16` takes 4 `float4*` inputs, 4 `ushort4*`
+                        // outputs (`cur_w * cur_h * 8` bytes each), and `(u32, u32)`; all buffers
+                        // remain alive through `rig.stream.synchronize()`.
+                        let pack_res = unsafe {
+                            cu::cuLaunchKernel(
+                                rig.tonemap.pack_rr_func,
+                                gx,
+                                gy,
+                                1,
+                                16,
+                                16,
+                                1,
+                                0,
+                                rig.stream.cu_stream(),
+                                pack_args.as_mut_ptr(),
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if pack_res != cu::cudaError_enum_CUDA_SUCCESS {
+                            pending_status =
+                                Some(format!("DLSS-RR AOV pack kernel failed ({pack_res:?})"));
+                        }
+                    }
+                    rig.stream.synchronize().expect("tonemap sync");
+                    t_tm.elapsed().as_secs_f32() * 1000.0
+                };
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
                     pending_status = Some(
@@ -1986,6 +2318,7 @@ pub fn spawn_render_thread(
                         tonemap_ms,
                         is_recording: recorder.is_some(),
                         record_frames: recorder.as_ref().map_or(0, VideoRecorder::frame_count),
+                        ser_supported: rig.ser_supported,
                         status_msg: pending_status.take(),
                     })
                     .is_err()
@@ -1997,4 +2330,41 @@ pub fn spawn_render_thread(
         .expect("spawn optix-render thread");
 
     (cmd_tx, frame_rx, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filigree_omm_bake_produces_valid_four_state_coverage() {
+        let level = 5u32;
+        let bytes = bake_filigree_omm_bytes(level);
+        // 2 shared micromaps * (4^5 = 1024 micro-tris) * 2 bits / 8 = 512 bytes
+        assert_eq!(bytes.len(), 512);
+        let mut counts = [0u32; 4];
+        for b in &bytes {
+            for shift in [0, 2, 4, 6] {
+                counts[((b >> shift) & 0x3) as usize] += 1;
+            }
+        }
+        assert_eq!(counts.iter().sum::<u32>(), 2048);
+        // Both definitive states must dominate so hardware OMM skips the vast majority of any-hit calls.
+        assert!(counts[0] > 300, "expected substantial transparent cutouts: {counts:?}");
+        assert!(counts[1] > 100, "expected substantial opaque filigree struts: {counts:?}");
+        assert!(
+            counts[2] + counts[3] > 0,
+            "expected unknown boundary micro-tris for pixel-exact edges: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn filigree_band_geometry_and_sdf_borders() {
+        let tris = build_filigree_band_tris(2.15, 0.45, 24);
+        assert_eq!(tris.len(), 24 * 6);
+        // Top and bottom borders are solid (<= 0), empty pocket inside center ring is transparent (> 0).
+        assert!(filigree_sdf(0.5, 0.02) < 0.0);
+        assert!(filigree_sdf(0.5, 0.98) < 0.0);
+        assert!(filigree_sdf(0.5, 0.5) > 0.0);
+    }
 }

@@ -72,3 +72,68 @@ extern "C" __global__ void tonemap_f32_to_rgba8(
 
     dst[idx] = eval_tonemap_pixel(src[idx], exposure, mode);
 }
+
+static __forceinline__ __device__ unsigned short f32_to_f16(float v) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    return h;
+}
+
+static __forceinline__ __device__ float sanitize_range(float v, float lo, float hi) {
+    if (!(v == v)) return 0.0f;
+    return fmaxf(lo, fminf(hi, v));
+}
+
+static __forceinline__ __device__ ushort4 pack_f16_4(float x, float y, float z, float w) {
+    return make_ushort4(f32_to_f16(x), f32_to_f16(y), f32_to_f16(z), f32_to_f16(w));
+}
+
+extern "C" __global__ void pack_dlss_rr_aovs_f16(
+    const float4* src_color,
+    const float4* src_diffuse,
+    const float4* src_specular,
+    const float4* src_normal,
+    ushort4* dst_color,
+    ushort4* dst_diffuse,
+    ushort4* dst_specular,
+    ushort4* dst_normal,
+    unsigned int width,
+    unsigned int height
+) {
+    unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    unsigned int idx = y * width + x;
+
+    float4 c = src_color[idx];
+    dst_color[idx] = pack_f16_4(
+        sanitize_range(c.x, 0.0f, 65000.0f),
+        sanitize_range(c.y, 0.0f, 65000.0f),
+        sanitize_range(c.z, 0.0f, 65000.0f),
+        1.0f
+    );
+
+    float4 d = src_diffuse[idx];
+    dst_diffuse[idx] = pack_f16_4(
+        sanitize_range(d.x, 0.0f, 1.0f),
+        sanitize_range(d.y, 0.0f, 1.0f),
+        sanitize_range(d.z, 0.0f, 1.0f),
+        1.0f
+    );
+
+    float4 s = src_specular[idx];
+    dst_specular[idx] = pack_f16_4(
+        sanitize_range(s.x, 0.0f, 1.0f),
+        sanitize_range(s.y, 0.0f, 1.0f),
+        sanitize_range(s.z, 0.0f, 1.0f),
+        1.0f
+    );
+
+    float4 n = src_normal[idx];
+    dst_normal[idx] = pack_f16_4(
+        sanitize_range(n.x, -1.0f, 1.0f),
+        sanitize_range(n.y, -1.0f, 1.0f),
+        sanitize_range(n.z, -1.0f, 1.0f),
+        sanitize_range(n.w, 0.0f, 1.0f)
+    );
+}

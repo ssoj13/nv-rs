@@ -10,7 +10,10 @@
 //! **Used by** [`crate::NgxVulkan`] and [`crate::FeatureHandle`].
 
 use crate::error::{Error, Result};
-use crate::types::{DlssFeatureFlags, DlssPerfQuality};
+use crate::types::{
+    DlssDenoiseMode, DlssDepthType, DlssFeatureFlags, DlssPerfQuality, DlssRoughnessMode,
+    DlssRrPreset,
+};
 use std::ffi::c_void;
 
 #[cfg(has_ngx_sdk)]
@@ -38,8 +41,50 @@ pub mod keys {
     pub const DLSS_FEATURE_CREATE_FLAGS: &str = "DLSS.Feature.Create.Flags";
     /// Super-sampling availability flag (`"SuperSampling.Available"`).
     pub const SUPER_SAMPLING_AVAILABLE: &str = "SuperSampling.Available";
-    /// Ray-reconstruction availability flag (`"RayReconstruction.Available"`).
-    pub const RAY_RECONSTRUCTION_AVAILABLE: &str = "RayReconstruction.Available";
+    /// Ray-reconstruction availability flag (`"SuperSamplingDenoising.Available"`).
+    pub const RAY_RECONSTRUCTION_AVAILABLE: &str = "SuperSamplingDenoising.Available";
+    /// Ray-reconstruction optimal-settings callback pointer (`"DLSSDOptimalSettingsCallback"`).
+    pub const DLSSD_OPTIMAL_SETTINGS_CALLBACK: &str = "DLSSDOptimalSettingsCallback";
+    /// Ray-reconstruction denoise mode (`"DLSS.Denoise.Mode"`).
+    pub const DLSS_DENOISE_MODE: &str = "DLSS.Denoise.Mode";
+    /// Ray-reconstruction roughness layout mode (`"DLSS.Roughness.Mode"`).
+    pub const DLSS_ROUGHNESS_MODE: &str = "DLSS.Roughness.Mode";
+    /// Ray-reconstruction depth encoding flag (`"DLSS.Use.HW.Depth"`).
+    pub const DLSS_USE_HW_DEPTH: &str = "DLSS.Use.HW.Depth";
+    /// Diffuse albedo input resource (`"DLSS.Input.DiffuseAlbedo"`).
+    pub const DLSS_INPUT_DIFFUSE_ALBEDO: &str = "DLSS.Input.DiffuseAlbedo";
+    /// Specular albedo input resource (`"DLSS.Input.SpecularAlbedo"`).
+    pub const DLSS_INPUT_SPECULAR_ALBEDO: &str = "DLSS.Input.SpecularAlbedo";
+    /// G-buffer normals input resource (`"GBuffer.Normals"`).
+    pub const GBUFFER_NORMALS: &str = "GBuffer.Normals";
+    /// G-buffer roughness input resource (`"GBuffer.Roughness"`).
+    pub const GBUFFER_ROUGHNESS: &str = "GBuffer.Roughness";
+    /// World-to-view 4x4 matrix pointer (`"WorldToViewMatrix"`).
+    pub const WORLD_TO_VIEW_MATRIX: &str = "WorldToViewMatrix";
+    /// View-to-clip 4x4 matrix pointer (`"ViewToClipMatrix"`).
+    pub const VIEW_TO_CLIP_MATRIX: &str = "ViewToClipMatrix";
+    /// Tonemapper type (`"TonemapperType"`).
+    pub const TONEMAPPER_TYPE: &str = "TonemapperType";
+    /// Frame time delta in milliseconds (`"FrameTimeDeltaInMsec"`).
+    pub const FRAME_TIME_DELTA_IN_MSEC: &str = "FrameTimeDeltaInMsec";
+    /// Ray-tracing hit distance input resource (`"RayTracingHitDistance"`).
+    pub const RAY_TRACING_HIT_DISTANCE: &str = "RayTracingHitDistance";
+    /// Ray-reconstruction render preset hint for DLAA.
+    pub const RR_HINT_RENDER_PRESET_DLAA: &str = "RayReconstruction.Hint.Render.Preset.DLAA";
+    /// Ray-reconstruction render preset hint for Quality.
+    pub const RR_HINT_RENDER_PRESET_QUALITY: &str = "RayReconstruction.Hint.Render.Preset.Quality";
+    /// Ray-reconstruction render preset hint for Balanced.
+    pub const RR_HINT_RENDER_PRESET_BALANCED: &str =
+        "RayReconstruction.Hint.Render.Preset.Balanced";
+    /// Ray-reconstruction render preset hint for Performance.
+    pub const RR_HINT_RENDER_PRESET_PERFORMANCE: &str =
+        "RayReconstruction.Hint.Render.Preset.Performance";
+    /// Ray-reconstruction render preset hint for Ultra Performance.
+    pub const RR_HINT_RENDER_PRESET_ULTRA_PERFORMANCE: &str =
+        "RayReconstruction.Hint.Render.Preset.UltraPerformance";
+    /// Ray-reconstruction render preset hint for Ultra Quality.
+    pub const RR_HINT_RENDER_PRESET_ULTRA_QUALITY: &str =
+        "RayReconstruction.Hint.Render.Preset.UltraQuality";
     /// Sharpness (`"Sharpness"`).
     pub const SHARPNESS: &str = "Sharpness";
     /// Legacy RTX value flag (`"RTXValue"`).
@@ -403,6 +448,59 @@ impl Parameters {
     /// Sets DLSS feature creation flags (`DLSS.Feature.Create.Flags`).
     pub fn set_dlss_feature_flags(&mut self, flags: DlssFeatureFlags) -> Result<()> {
         self.set_i32(keys::DLSS_FEATURE_CREATE_FLAGS, flags.0)
+    }
+
+    /// Sets the DLSS Ray Reconstruction denoise mode (`DLSS.Denoise.Mode`).
+    pub fn set_dlss_denoise_mode(&mut self, mode: DlssDenoiseMode) -> Result<()> {
+        self.set_i32(keys::DLSS_DENOISE_MODE, mode.to_raw())
+    }
+
+    /// Reads the DLSS Ray Reconstruction denoise mode (`DLSS.Denoise.Mode`).
+    pub fn get_dlss_denoise_mode(&self) -> Result<Option<DlssDenoiseMode>> {
+        Ok(DlssDenoiseMode::from_raw(
+            self.get_i32(keys::DLSS_DENOISE_MODE)?,
+        ))
+    }
+
+    /// Sets the DLSS Ray Reconstruction roughness layout (`DLSS.Roughness.Mode`).
+    pub fn set_dlss_roughness_mode(&mut self, mode: DlssRoughnessMode) -> Result<()> {
+        self.set_u32(keys::DLSS_ROUGHNESS_MODE, mode.to_raw())
+    }
+
+    /// Reads the DLSS Ray Reconstruction roughness layout (`DLSS.Roughness.Mode`).
+    pub fn get_dlss_roughness_mode(&self) -> Result<Option<DlssRoughnessMode>> {
+        Ok(DlssRoughnessMode::from_raw(
+            self.get_u32(keys::DLSS_ROUGHNESS_MODE)?,
+        ))
+    }
+
+    /// Sets the DLSS Ray Reconstruction depth encoding (`DLSS.Use.HW.Depth`).
+    pub fn set_dlss_depth_type(&mut self, depth_type: DlssDepthType) -> Result<()> {
+        self.set_u32(keys::DLSS_USE_HW_DEPTH, depth_type.to_raw())
+    }
+
+    /// Reads the DLSS Ray Reconstruction depth encoding (`DLSS.Use.HW.Depth`).
+    pub fn get_dlss_depth_type(&self) -> Result<Option<DlssDepthType>> {
+        Ok(DlssDepthType::from_raw(
+            self.get_u32(keys::DLSS_USE_HW_DEPTH)?,
+        ))
+    }
+
+    /// Sets the DLSS Ray Reconstruction render preset hint for `quality`.
+    pub fn set_dlss_rr_preset(
+        &mut self,
+        quality: DlssPerfQuality,
+        preset: DlssRrPreset,
+    ) -> Result<()> {
+        let key = match quality {
+            DlssPerfQuality::Dlaa => keys::RR_HINT_RENDER_PRESET_DLAA,
+            DlssPerfQuality::MaxQuality => keys::RR_HINT_RENDER_PRESET_QUALITY,
+            DlssPerfQuality::Balanced => keys::RR_HINT_RENDER_PRESET_BALANCED,
+            DlssPerfQuality::MaxPerf => keys::RR_HINT_RENDER_PRESET_PERFORMANCE,
+            DlssPerfQuality::UltraPerformance => keys::RR_HINT_RENDER_PRESET_ULTRA_PERFORMANCE,
+            DlssPerfQuality::UltraQuality => keys::RR_HINT_RENDER_PRESET_ULTRA_QUALITY,
+        };
+        self.set_u32(key, preset.to_raw())
     }
 }
 

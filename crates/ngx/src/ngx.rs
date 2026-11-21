@@ -24,11 +24,12 @@ pub mod vulkan;
 pub use error::{Error, NGX_RESULT_SUCCESS, Result, ResultCode};
 pub use params::Parameters;
 pub use types::{
-    BufferFormat, DlssFeatureFlags, DlssPerfQuality, DlssQuality, Feature, Guid, ProjectId,
-    RequiredExtensions,
+    BufferFormat, DlssDenoiseMode, DlssDepthType, DlssFeatureFlags, DlssPerfQuality, DlssQuality,
+    DlssRoughnessMode, DlssRrPreset, Feature, Guid, ProjectId, RequiredExtensions,
 };
 pub use vulkan::{
-    DlssOptimalSettings, FeatureHandle, NgxVulkan, VkImageResourceInfo, VulkanDeviceHandles,
+    DlssOptimalSettings, DlssRrCreateParams, DlssRrEvalParams, FeatureHandle, NgxVulkan,
+    VkImageResourceInfo, VulkanDeviceHandles,
 };
 
 #[cfg(has_ngx_sdk)]
@@ -264,6 +265,111 @@ mod tests {
         let settings = DlssOptimalSettings::default();
         assert_eq!(settings.render_width, 0);
         assert_eq!(settings.sharpness, 0.0);
+
+        let rr_create = DlssRrCreateParams {
+            render_width: 960,
+            render_height: 540,
+            out_width: 1920,
+            out_height: 1080,
+            quality: DlssPerfQuality::MaxQuality,
+            flags: DlssFeatureFlags::IS_HDR | DlssFeatureFlags::MV_LOW_RES,
+            roughness_mode: DlssRoughnessMode::Packed,
+            depth_type: DlssDepthType::Linear,
+            preset: DlssRrPreset::Default,
+        };
+        assert_eq!(rr_create.roughness_mode, DlssRoughnessMode::Packed);
+        assert_eq!(rr_create.depth_type, DlssDepthType::Linear);
+
+        let rr_eval = DlssRrEvalParams {
+            color: info,
+            depth: info,
+            motion: info,
+            diffuse_albedo: info,
+            specular_albedo: info,
+            normals: info,
+            roughness: None,
+            output: info,
+            render_width: 960,
+            render_height: 540,
+            jitter_x: 0.25,
+            jitter_y: -0.25,
+            mv_scale_x: 1.0,
+            mv_scale_y: 1.0,
+            pre_exposure: 1.0,
+            exposure_scale: 1.0,
+            reset: true,
+            world_to_view: None,
+            view_to_clip: None,
+        };
+        assert!(rr_eval.reset);
+        assert!(rr_eval.roughness.is_none());
+    }
+
+    #[test]
+    fn dlss_rr_enum_roundtrips() {
+        for (variant, raw) in [(DlssDenoiseMode::Off, 0), (DlssDenoiseMode::DlUnified, 1)] {
+            assert_eq!(variant.to_raw(), raw);
+            assert_eq!(DlssDenoiseMode::from_raw(raw), Some(variant));
+        }
+        assert_eq!(DlssDenoiseMode::default(), DlssDenoiseMode::DlUnified);
+        assert_eq!(DlssDenoiseMode::from_raw(2), None);
+
+        for (variant, raw) in [
+            (DlssRoughnessMode::Unpacked, 0),
+            (DlssRoughnessMode::Packed, 1),
+        ] {
+            assert_eq!(variant.to_raw(), raw);
+            assert_eq!(DlssRoughnessMode::from_raw(raw), Some(variant));
+        }
+        assert_eq!(DlssRoughnessMode::default(), DlssRoughnessMode::Unpacked);
+        assert_eq!(DlssRoughnessMode::from_raw(2), None);
+
+        for (variant, raw) in [(DlssDepthType::Linear, 0), (DlssDepthType::Hw, 1)] {
+            assert_eq!(variant.to_raw(), raw);
+            assert_eq!(DlssDepthType::from_raw(raw), Some(variant));
+        }
+        assert_eq!(DlssDepthType::default(), DlssDepthType::Linear);
+        assert_eq!(DlssDepthType::from_raw(2), None);
+
+        for (variant, raw) in [
+            (DlssRrPreset::Default, 0),
+            (DlssRrPreset::D, 4),
+            (DlssRrPreset::E, 5),
+            (DlssRrPreset::F, 6),
+        ] {
+            assert_eq!(variant.to_raw(), raw);
+            assert_eq!(DlssRrPreset::from_raw(raw), Some(variant));
+        }
+        assert_eq!(DlssRrPreset::default(), DlssRrPreset::Default);
+        assert_eq!(DlssRrPreset::from_raw(1), None);
+        assert_eq!(DlssRrPreset::from_raw(99), None);
+    }
+
+    #[test]
+    fn dlss_rr_keys_match_sdk_defs() {
+        assert_eq!(
+            params::keys::RAY_RECONSTRUCTION_AVAILABLE,
+            "SuperSamplingDenoising.Available"
+        );
+        assert_eq!(
+            params::keys::DLSSD_OPTIMAL_SETTINGS_CALLBACK,
+            "DLSSDOptimalSettingsCallback"
+        );
+        assert_eq!(params::keys::DLSS_DENOISE_MODE, "DLSS.Denoise.Mode");
+        assert_eq!(params::keys::DLSS_ROUGHNESS_MODE, "DLSS.Roughness.Mode");
+        assert_eq!(params::keys::DLSS_USE_HW_DEPTH, "DLSS.Use.HW.Depth");
+        assert_eq!(
+            params::keys::DLSS_INPUT_DIFFUSE_ALBEDO,
+            "DLSS.Input.DiffuseAlbedo"
+        );
+        assert_eq!(
+            params::keys::DLSS_INPUT_SPECULAR_ALBEDO,
+            "DLSS.Input.SpecularAlbedo"
+        );
+        assert_eq!(params::keys::GBUFFER_NORMALS, "GBuffer.Normals");
+        assert_eq!(params::keys::GBUFFER_ROUGHNESS, "GBuffer.Roughness");
+        assert_eq!(params::keys::WORLD_TO_VIEW_MATRIX, "WorldToViewMatrix");
+        assert_eq!(params::keys::VIEW_TO_CLIP_MATRIX, "ViewToClipMatrix");
     }
 
     #[cfg(has_ngx_sdk)]

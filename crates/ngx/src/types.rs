@@ -1,5 +1,6 @@
 //! Cross-platform NGX value types: [`ProjectId`], [`Guid`], [`DlssPerfQuality`], [`Feature`],
-//! [`BufferFormat`], and [`DlssFeatureFlags`].
+//! [`BufferFormat`], [`DlssFeatureFlags`], and DLSS Ray Reconstruction configuration enums
+//! ([`DlssDenoiseMode`], [`DlssRoughnessMode`], [`DlssDepthType`], [`DlssRrPreset`]).
 //!
 //! **What.** Defines the pure-Rust configuration and enum types shared between Windows NGX FFI
 //! calls and non-Windows stubs.
@@ -382,4 +383,118 @@ pub struct RequiredExtensions {
     pub instance_extensions: Vec<String>,
     /// Required Vulkan device extensions.
     pub device_extensions: Vec<String>,
+}
+
+/// DLSS Ray Reconstruction denoise mode (`NVSDK_NGX_DLSS_Denoise_Mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum DlssDenoiseMode {
+    /// Denoising disabled (`NVSDK_NGX_DLSS_Denoise_Mode_Off = 0`).
+    Off = 0,
+    /// Deep-learning unified denoiser and upscaler (`NVSDK_NGX_DLSS_Denoise_Mode_DLUnified = 1`).
+    #[default]
+    DlUnified = 1,
+}
+
+impl DlssDenoiseMode {
+    /// Converts to the raw `NVSDK_NGX_DLSS_Denoise_Mode` integer.
+    pub const fn to_raw(self) -> i32 {
+        self as i32
+    }
+
+    /// Converts from a raw `NVSDK_NGX_DLSS_Denoise_Mode` integer.
+    pub const fn from_raw(raw: i32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Off),
+            1 => Some(Self::DlUnified),
+            _ => None,
+        }
+    }
+}
+
+/// DLSS Ray Reconstruction roughness input layout (`NVSDK_NGX_DLSS_Roughness_Mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum DlssRoughnessMode {
+    /// Read roughness from its own `GBuffer.Roughness` texture (`0`).
+    #[default]
+    Unpacked = 0,
+    /// Read roughness packed in the `.w` channel of `GBuffer.Normals` (`1`).
+    Packed = 1,
+}
+
+impl DlssRoughnessMode {
+    /// Converts to the raw `NVSDK_NGX_DLSS_Roughness_Mode` unsigned integer.
+    pub const fn to_raw(self) -> u32 {
+        self as u32
+    }
+
+    /// Converts from a raw `NVSDK_NGX_DLSS_Roughness_Mode` unsigned integer.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Unpacked),
+            1 => Some(Self::Packed),
+            _ => None,
+        }
+    }
+}
+
+/// DLSS Ray Reconstruction depth buffer encoding (`NVSDK_NGX_DLSS_Depth_Type`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum DlssDepthType {
+    /// Linear view-space depth (`NVSDK_NGX_DLSS_Depth_Type_Linear = 0`).
+    #[default]
+    Linear = 0,
+    /// Hardware projected depth (`NVSDK_NGX_DLSS_Depth_Type_HW = 1`).
+    Hw = 1,
+}
+
+impl DlssDepthType {
+    /// Converts to the raw `NVSDK_NGX_DLSS_Depth_Type` unsigned integer.
+    pub const fn to_raw(self) -> u32 {
+        self as u32
+    }
+
+    /// Converts from a raw `NVSDK_NGX_DLSS_Depth_Type` unsigned integer.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Linear),
+            1 => Some(Self::Hw),
+            _ => None,
+        }
+    }
+}
+
+/// DLSS Ray Reconstruction render preset hint (`NVSDK_NGX_RayReconstruction_Hint_Render_Preset`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum DlssRrPreset {
+    /// Runtime default preset (`0`).
+    #[default]
+    Default = 0,
+    /// Transformer model (`4`).
+    D = 4,
+    /// Latest transformer model (`5`; required when using the DoF guide).
+    E = 5,
+    /// Default RR2 model (`6`).
+    F = 6,
+}
+
+impl DlssRrPreset {
+    /// Converts to the raw `NVSDK_NGX_RayReconstruction_Hint_Render_Preset` unsigned integer.
+    pub const fn to_raw(self) -> u32 {
+        self as u32
+    }
+
+    /// Converts from a raw `NVSDK_NGX_RayReconstruction_Hint_Render_Preset` unsigned integer.
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Default),
+            4 => Some(Self::D),
+            5 => Some(Self::E),
+            6 => Some(Self::F),
+            _ => None,
+        }
+    }
 }

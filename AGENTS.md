@@ -1,10 +1,10 @@
 # Repository guide
 
-Verified against source on 2026-11-15. See [crate guidance](crates/AGENTS.md), [architecture diagrams](DIAGRAMS.md), and [build instructions](README.md#building--verification).
+Verified against source on 2026-11-21. See [crate guidance](crates/AGENTS.md), [architecture diagrams](DIAGRAMS.md), and [build instructions](README.md#building--verification).
 
 ## Workspace boundaries
 
-The root Cargo workspace contains `crates/*` and `xtask`. `device/`, `python/`, and `spikes/` are excluded and have separate build requirements. A successful root workspace check does not validate them.
+The root Cargo workspace contains `crates/*` and `xtask`. `device/` and `python/` are excluded and have separate build requirements. A successful root workspace check does not validate them.
 
 ## Dataflow
 
@@ -34,7 +34,7 @@ wgpu Vulkan or DX12 allocation
 | Wrapper crates | Validation, native status conversion, resource ownership |
 | `crates/cuda-core-ext` | External memory/semaphores, arrays, textures, sparse and green-context extensions |
 | `crates/nv-wgpu` | GPU identity matching, external memory and semaphore interop |
-| `crates/nv-demo` | Interactive renderer, camera controllers, exports and profiling |
+| `crates/nv-demo` | Interactive OptiX 9 renderer (SER, OMM, DLSS SR/RR, Aov/TemporalAov denoiser), camera controllers, exports, and NVTX3/CUPTI profiling |
 | `xtask` | Coverage inventories, prebuilt artifacts and runtime deployment tooling |
 | `device/` | Separately compiled CUDA/OptiX device code |
 | `python/` | Separate Python extension workspace |
@@ -45,7 +45,9 @@ wgpu Vulkan or DX12 allocation
 - Inspect each crate's Cargo `[lib].path`; entry points commonly use names such as `nv_loader.rs`, not `lib.rs`.
 - Configure runtime search directories before the first sys call. The loader macros cache both success and failure in `OnceLock<Result<...>>`; later search-directory additions do not retry a failed initialization.
 - Generated output belongs in `OUT_DIR`; change `LibSpec`, generator logic, or loader macros rather than patching generated files.
-- NGX uses static linking; prebuilt Rust bindings do not supply its native libraries.
+- NGX uses static linking; prebuilt Rust bindings do not supply its native libraries (`nvngx_dlss.dll` / `nvngx_dlssd.dll`). `crates/nv-demo/build.rs` stages both DLLs alongside the binary when present in `.sdk/ngx/`.
+- `nv-demo` `LaunchParams` (`renderer.rs`) and `Params` (`raytracer.cu`) share a strict 480-byte C ABI checked by a compile-time `assert!`; keep both definitions synchronized when adding launch fields.
+- `nv-demo` compiles `nvtx_shim.c` (`cfg(has_nvtx3)`) only when `<nvtx3/nvToolsExt.h>` is found under `CUDA_PATH`/`CUDA_HOME`/`CUDA_ROOT`, falling back to inline Rust no-ops otherwise.
 - GPU integration tests marked `#[ignore]` need explicit execution on suitable hardware. Compile success alone does not verify driver behavior, stream ordering, callbacks, or interop.
 - Check OS-gated branches separately: Windows-only NVAPI and Linux storage/collective paths cannot all execute on one host.
 - Preserve CUDA context ownership and stream ordering when changing wrappers. Keep parent objects alive until dependent native objects and queued operations are finished.

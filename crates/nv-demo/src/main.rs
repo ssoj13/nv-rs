@@ -10,6 +10,7 @@ mod camera_egui;
 mod demo_anim;
 mod fft_bloom;
 mod gpu_export;
+mod nvtx;
 mod persist;
 mod profiler;
 mod renderer;
@@ -34,10 +35,11 @@ mod demo_app {
     };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
-        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, FrameReady, RenderCmd, align_render_size,
-        spawn_render_thread,
+        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs, FrameReady, RenderCmd,
+        align_render_size, spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
+    use bytemuck::{Pod, Zeroable};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
     use nv_wgpu::{
@@ -310,21 +312,573 @@ mod demo_app {
         }
     }
 
+    const HDR_TONEMAP_WGSL: &str = r#"
+struct TonemapParams {
+    exposure: f32,
+    width: u32,
+    height: u32,
+    _pad: u32,
+};
+
+@group(0) @binding(0) var src_hdr: texture_2d<f32>;
+@group(0) @binding(1) var dst_ldr: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(2) var<uniform> u: TonemapParams;
+
+fn aces_channel(v: f32) -> f32 {
+    let x = max(v, 0.0);
+    let num = x * (2.51 * x + 0.03);
+    let den = x * (2.43 * x + 0.59) + 0.14;
+    let r = clamp(num / den, 0.0, 1.0);
+    return pow(r, 1.0 / 2.2);
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= u.width || gid.y >= u.height) {
+        return;
+    }
+    let c = textureLoad(src_hdr, vec2<i32>(gid.xy), 0);
+    let e = max(u.exposure, 0.0);
+    let rgb = vec3<f32>(
+        aces_channel(c.r * e),
+        aces_channel(c.g * e),
+        aces_channel(c.b * e),
+    );
+    textureStore(dst_ldr, vec2<i32>(gid.xy), vec4<f32>(rgb, 1.0));
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct HdrTonemapUniform {
+        exposure: f32,
+        width: u32,
+        height: u32,
+        _pad: u32,
+    }
+
+    struct HdrTonemapPipeline {
+        pipeline: wgpu::ComputePipeline,
+        bgl: wgpu::BindGroupLayout,
+        uniform_buf: wgpu::Buffer,
+    }
+
+    impl HdrTonemapPipeline {
+        fn new(device: &wgpu::Device) -> Self {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(HDR_TONEMAP_WGSL)),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("dlss-rr-hdr-tonemap"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+            let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-uniform"),
+                size: std::mem::size_of::<HdrTonemapUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Self {
+                pipeline,
+                bgl,
+                uniform_buf,
+            }
+        }
+
+        fn create_bind_group(
+            &self,
+            device: &wgpu::Device,
+            src_hdr_view: &wgpu::TextureView,
+            dst_ldr_view: &wgpu::TextureView,
+        ) -> wgpu::BindGroup {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(src_hdr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(dst_ldr_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                ],
+            })
+        }
+
+        fn dispatch(
+            &self,
+            queue: &wgpu::Queue,
+            encoder: &mut wgpu::CommandEncoder,
+            bind_group: &wgpu::BindGroup,
+            width: u32,
+            height: u32,
+            exposure: f32,
+        ) {
+            let uniform = HdrTonemapUniform {
+                exposure,
+                width,
+                height,
+                _pad: 0,
+            };
+            queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dlss-rr-hdr-tonemap-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+    }
+
+    struct DlssRrSharedBuffers {
+        hdr_color: [SharedBuffer; 2],
+        diffuse_albedo: [SharedBuffer; 2],
+        spec_albedo: [SharedBuffer; 2],
+        normal_rough: [SharedBuffer; 2],
+    }
+
+    impl DlssRrSharedBuffers {
+        fn new(interop: &InteropContext, width: u32, height: u32) -> Result<Self, nv_wgpu::Error> {
+            let bytes = u64::from(width) * u64::from(height) * 8; // Rgba16Float
+            let make_pair = |prefix: &str| -> Result<[SharedBuffer; 2], nv_wgpu::Error> {
+                let b0 = interop.create_buffer(&SharedBufferDescriptor {
+                    label: Some(&format!("{prefix}-0")),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+                })?;
+                let b1 = interop.create_buffer(&SharedBufferDescriptor {
+                    label: Some(&format!("{prefix}-1")),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::STORAGE,
+                })?;
+                Ok([b0, b1])
+            };
+            Ok(Self {
+                hdr_color: make_pair("optix-rr-hdr")?,
+                diffuse_albedo: make_pair("optix-rr-diff")?,
+                spec_albedo: make_pair("optix-rr-spec")?,
+                normal_rough: make_pair("optix-rr-norm")?,
+            })
+        }
+
+        fn ptrs(&self) -> DlssRrBufferPtrs {
+            DlssRrBufferPtrs {
+                hdr_color: [
+                    self.hdr_color[0].cu_deviceptr(),
+                    self.hdr_color[1].cu_deviceptr(),
+                ],
+                diffuse_albedo: [
+                    self.diffuse_albedo[0].cu_deviceptr(),
+                    self.diffuse_albedo[1].cu_deviceptr(),
+                ],
+                spec_albedo: [
+                    self.spec_albedo[0].cu_deviceptr(),
+                    self.spec_albedo[1].cu_deviceptr(),
+                ],
+                normal_rough: [
+                    self.normal_rough[0].cu_deviceptr(),
+                    self.normal_rough[1].cu_deviceptr(),
+                ],
+            }
+        }
+
+        fn retire_into(self, gen_id: u64, retired: &mut Vec<(u64, [SharedBuffer; 2])>) {
+            retired.push((gen_id, self.hdr_color));
+            retired.push((gen_id, self.diffuse_albedo));
+            retired.push((gen_id, self.spec_albedo));
+            retired.push((gen_id, self.normal_rough));
+        }
+    }
+
+    struct DlssRrPass {
+        feature: ngx::FeatureHandle,
+        eval_params: ngx::Parameters,
+        color_in: SharedTexture,
+        color_view: wgpu::TextureView,
+        depth_in: SharedTexture,
+        depth_view: wgpu::TextureView,
+        motion_in: SharedTexture,
+        motion_view: wgpu::TextureView,
+        diffuse_in: SharedTexture,
+        diffuse_view: wgpu::TextureView,
+        specular_in: SharedTexture,
+        specular_view: wgpu::TextureView,
+        normals_in: SharedTexture,
+        normals_view: wgpu::TextureView,
+        output_hdr: SharedTexture,
+        output_hdr_view: wgpu::TextureView,
+        _display_ldr: wgpu::Texture,
+        display_view: wgpu::TextureView,
+        tonemap_bg: wgpu::BindGroup,
+        render_w: u32,
+        render_h: u32,
+        out_w: u32,
+        out_h: u32,
+        quality: u32,
+        reset_next: bool,
+    }
+
+    impl DlssRrPass {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "explicit render/output dimensions and shared resources for DLSS-RR pass setup"
+        )]
+        fn new(
+            interop: &InteropContext,
+            ngx: &ngx::NgxVulkan,
+            tonemap: &HdrTonemapPipeline,
+            render_w: u32,
+            render_h: u32,
+            out_w: u32,
+            out_h: u32,
+            quality: u32,
+        ) -> Result<Self, String> {
+            let make_tex = |w, h, fmt, usage, label| {
+                let mut desc = SharedTextureDescriptor::d2(w, h, fmt, usage, false);
+                desc.label = Some(label);
+                interop
+                    .create_texture(&desc)
+                    .map_err(|e| format!("{label}: {e}"))
+            };
+            let in_usage = wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING;
+            let color_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rgba16Float,
+                in_usage,
+                "dlss-rr-color-in",
+            )?;
+            let depth_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::R32Float,
+                in_usage,
+                "dlss-rr-depth-in",
+            )?;
+            let motion_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rg32Float,
+                in_usage,
+                "dlss-rr-motion-in",
+            )?;
+            let diffuse_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rgba16Float,
+                in_usage,
+                "dlss-rr-diffuse-in",
+            )?;
+            let specular_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rgba16Float,
+                in_usage,
+                "dlss-rr-specular-in",
+            )?;
+            let normals_in = make_tex(
+                render_w,
+                render_h,
+                wgpu::TextureFormat::Rgba16Float,
+                in_usage,
+                "dlss-rr-normals-in",
+            )?;
+            let output_hdr = make_tex(
+                out_w,
+                out_h,
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                "dlss-rr-output-hdr",
+            )?;
+
+            let display_ldr = interop.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("dlss-rr-display-ldr"),
+                size: wgpu::Extent3d {
+                    width: out_w,
+                    height: out_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+
+            let view_of = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+            let color_view = view_of(color_in.wgpu_texture());
+            let depth_view = view_of(depth_in.wgpu_texture());
+            let motion_view = view_of(motion_in.wgpu_texture());
+            let diffuse_view = view_of(diffuse_in.wgpu_texture());
+            let specular_view = view_of(specular_in.wgpu_texture());
+            let normals_view = view_of(normals_in.wgpu_texture());
+            let output_hdr_view = view_of(output_hdr.wgpu_texture());
+            let display_view = view_of(&display_ldr);
+            let tonemap_bg =
+                tonemap.create_bind_group(interop.device(), &output_hdr_view, &display_view);
+
+            let config = ngx::DlssRrCreateParams {
+                render_width: render_w,
+                render_height: render_h,
+                out_width: out_w,
+                out_height: out_h,
+                quality: dlss_quality_from_ui(quality),
+                flags: ngx::DlssFeatureFlags::IS_HDR | ngx::DlssFeatureFlags::MV_LOW_RES,
+                roughness_mode: ngx::DlssRoughnessMode::Packed,
+                depth_type: ngx::DlssDepthType::Linear,
+                preset: ngx::DlssRrPreset::Default,
+            };
+            let mut create_res: Option<Result<ngx::FeatureHandle, ngx::Error>> = None;
+            interop
+                .submit_vulkan_commands(|cmd| {
+                    // SAFETY: `cmd` is a valid recording `VkCommandBuffer` from `interop`.
+                    create_res = Some(unsafe { ngx.create_dlss_rr(cmd, &config) });
+                    Ok(())
+                })
+                .map_err(|e| format!("submit_vulkan_commands: {e}"))?;
+            let feature = create_res
+                .ok_or_else(|| "DLSS-RR feature creation did not run".to_string())?
+                .map_err(|e| format!("create_dlss_rr: {e}"))?;
+            let eval_params = ngx
+                .allocate_parameters()
+                .map_err(|e| format!("allocate_parameters: {e}"))?;
+
+            Ok(Self {
+                feature,
+                eval_params,
+                color_in,
+                color_view,
+                depth_in,
+                depth_view,
+                motion_in,
+                motion_view,
+                diffuse_in,
+                diffuse_view,
+                specular_in,
+                specular_view,
+                normals_in,
+                normals_view,
+                output_hdr,
+                output_hdr_view,
+                _display_ldr: display_ldr,
+                display_view,
+                tonemap_bg,
+                render_w,
+                render_h,
+                out_w,
+                out_h,
+                quality,
+                reset_next: true,
+            })
+        }
+
+        fn evaluate(
+            &mut self,
+            interop: &InteropContext,
+            jitter: [f32; 2],
+            world_to_view: [f32; 16],
+            view_to_clip: [f32; 16],
+        ) -> Result<(), String> {
+            let color = DlssPass::vk_info(
+                &self.color_in,
+                &self.color_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let depth = DlssPass::vk_info(
+                &self.depth_in,
+                &self.depth_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let motion = DlssPass::vk_info(
+                &self.motion_in,
+                &self.motion_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let diffuse = DlssPass::vk_info(
+                &self.diffuse_in,
+                &self.diffuse_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let specular = DlssPass::vk_info(
+                &self.specular_in,
+                &self.specular_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let normals = DlssPass::vk_info(
+                &self.normals_in,
+                &self.normals_view,
+                self.render_w,
+                self.render_h,
+                false,
+            )?;
+            let output = DlssPass::vk_info(
+                &self.output_hdr,
+                &self.output_hdr_view,
+                self.out_w,
+                self.out_h,
+                true,
+            )?;
+
+            let reset = self.reset_next;
+            self.reset_next = false;
+            let eval = ngx::DlssRrEvalParams {
+                color,
+                depth,
+                motion,
+                diffuse_albedo: diffuse,
+                specular_albedo: specular,
+                normals,
+                roughness: None,
+                output,
+                render_width: self.render_w,
+                render_height: self.render_h,
+                jitter_x: -jitter[0],
+                jitter_y: -jitter[1],
+                mv_scale_x: 1.0,
+                mv_scale_y: 1.0,
+                pre_exposure: 1.0,
+                exposure_scale: 1.0,
+                reset,
+                world_to_view: Some(world_to_view),
+                view_to_clip: Some(view_to_clip),
+            };
+            let mut eval_res: Option<Result<(), ngx::Error>> = None;
+            let in_images = [
+                color.image,
+                depth.image,
+                motion.image,
+                diffuse.image,
+                specular.image,
+                normals.image,
+            ];
+            interop
+                .submit_vulkan_commands(|cmd| {
+                    // SAFETY: `cmd` is a valid recording `VkCommandBuffer` and all 7
+                    // `SharedTexture`s stay alive through `submit_vulkan_commands` completion.
+                    unsafe {
+                        for img in in_images {
+                            interop.vk_image_barrier(
+                                cmd,
+                                img,
+                                VkImageTransition::TransferDstToShaderRead,
+                            )?;
+                        }
+                        interop.vk_image_barrier(
+                            cmd,
+                            output.image,
+                            VkImageTransition::UndefinedToGeneral,
+                        )?;
+                        let res = self.feature.evaluate_dlss_rr_with_params(
+                            cmd,
+                            &mut self.eval_params,
+                            &eval,
+                        );
+                        for img in in_images {
+                            interop.vk_image_barrier(
+                                cmd,
+                                img,
+                                VkImageTransition::ShaderReadToTransferDst,
+                            )?;
+                        }
+                        interop.vk_image_barrier(
+                            cmd,
+                            output.image,
+                            VkImageTransition::GeneralToShaderRead,
+                        )?;
+                        eval_res = Some(res);
+                    }
+                    Ok(())
+                })
+                .map_err(|e| format!("submit_vulkan_commands: {e}"))?;
+            eval_res
+                .ok_or_else(|| "DLSS-RR evaluate did not run".to_string())?
+                .map_err(|e| format!("evaluate_dlss_rr: {e}"))
+        }
+    }
+
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
         surface_config: wgpu::SurfaceConfiguration,
         dlss_pass: Option<DlssPass>,
-        cached_dlss_opt: Option<((u32, u32, u32), ngx::DlssOptimalSettings)>,
+        dlss_rr_pass: Option<DlssRrPass>,
+        dlss_rr_available: bool,
+        cached_dlss_opt: Option<((u32, u32, u32, bool), ngx::DlssOptimalSettings)>,
         ngx_vulkan: Option<ngx::NgxVulkan>,
         ngx_init_error: Option<String>,
         interop: InteropContext,
+        hdr_tonemap: HdrTonemapPipeline,
+        rr_last_exposure: f32,
         egui_ctx: egui::Context,
         egui_winit: egui_winit::State,
         egui_renderer: egui_wgpu::Renderer,
         shared_rgba: [SharedBuffer; 2],
         shared_depth: [SharedBuffer; 2],
         shared_motion: [SharedBuffer; 2],
+        rr_shared: Option<DlssRrSharedBuffers>,
         retired_buffers: Vec<(u64, [SharedBuffer; 2])>,
         buf_gen: u64,
         render_w: u32,
@@ -358,6 +912,7 @@ mod demo_app {
         fps: f32,
         is_recording: bool,
         record_frames: u64,
+        ser_supported: bool,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
@@ -481,6 +1036,12 @@ mod demo_app {
                 )
             };
 
+            let dlss_rr_available = ngx_vulkan
+                .as_ref()
+                .and_then(|v| v.is_dlss_rr_available().ok())
+                .unwrap_or(false);
+            let hdr_tonemap = HdrTonemapPipeline::new(interop.device());
+
             let mut surface_config = surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
                 .expect("surface default config");
@@ -579,7 +1140,14 @@ mod demo_app {
                 wgpu::FilterMode::Linear,
             );
 
-            let settings = persisted.settings;
+            let mut settings = persisted.settings;
+            if settings.dlss_rr_on && !dlss_rr_available {
+                settings.dlss_rr_on = false;
+            }
+            if settings.dlss_rr_on {
+                settings.dlss_on = false;
+                settings.denoiser_on = false;
+            }
             let initial_camera = pose_to_frame(cam_pose);
             let (cmd_tx, frame_rx, render_thread) = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
@@ -606,16 +1174,21 @@ mod demo_app {
                 surface,
                 surface_config,
                 dlss_pass: None,
+                dlss_rr_pass: None,
+                dlss_rr_available,
                 cached_dlss_opt: None,
                 ngx_vulkan,
                 ngx_init_error,
                 interop,
+                hdr_tonemap,
+                rr_last_exposure: f32::NAN,
                 egui_ctx,
                 egui_winit,
                 egui_renderer,
                 shared_rgba,
                 shared_depth,
                 shared_motion,
+                rr_shared: None,
                 retired_buffers: Vec::new(),
                 buf_gen: 0,
                 render_w: DEFAULT_W,
@@ -649,6 +1222,7 @@ mod demo_app {
                 fps: 60.0,
                 is_recording: false,
                 record_frames: 0,
+                ser_supported: false,
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
@@ -764,6 +1338,7 @@ mod demo_app {
                 self.tonemap_ms = msg.tonemap_ms;
                 self.is_recording = msg.is_recording;
                 self.record_frames = msg.record_frames;
+                self.ser_supported = msg.ser_supported;
                 if let Some(status) = msg.status_msg {
                     self.last_saved_msg = Some(status);
                 }
@@ -811,6 +1386,8 @@ mod demo_app {
                 fps: self.fps,
                 is_recording: self.is_recording,
                 record_frames: self.record_frames,
+                ser_supported: self.ser_supported,
+                dlss_rr_available: self.dlss_rr_available,
                 viewport_focused: &mut self.viewport_focused,
                 reset_accum_requested: &mut reset_accum_requested,
                 save_png_requested: &mut save_png_requested,
@@ -834,8 +1411,25 @@ mod demo_app {
                 self.dock_style = self.theme.apply(&self.egui_ctx);
             }
 
-            // 3. Dynamic viewport resolution resize & DLSS lifecycle.
-            if self.settings.dlss_on && self.ngx_vulkan.is_none() {
+            // 3. Dynamic viewport resolution resize & DLSS (SR / RR) lifecycle.
+            if self.settings.dlss_rr_on {
+                self.settings.dlss_on = false;
+                self.settings.denoiser_on = false;
+                if self.ngx_vulkan.is_none() {
+                    self.settings.dlss_rr_on = false;
+                    self.last_saved_msg = Some(
+                        self.ngx_init_error.clone().unwrap_or_else(|| {
+                            "DLSS-RR unavailable: NGX not initialized".to_string()
+                        }),
+                    );
+                } else if !self.dlss_rr_available {
+                    self.settings.dlss_rr_on = false;
+                    self.last_saved_msg = Some(
+                        "DLSS-RR unavailable: SuperSamplingDenoising not supported on this host/runtime"
+                            .to_string(),
+                    );
+                }
+            } else if self.settings.dlss_on && self.ngx_vulkan.is_none() {
                 self.settings.dlss_on = false;
                 self.last_saved_msg = Some(
                     self.ngx_init_error
@@ -844,19 +1438,22 @@ mod demo_app {
                 );
             }
 
+            let dlss_any = self.settings.dlss_on || self.settings.dlss_rr_on;
             let (out_w, out_h) =
                 align_render_size(self.desired_vp_size.0, self.desired_vp_size.1, 1.0);
-            let (target_w, target_h) = if self.settings.dlss_on {
+            let (target_w, target_h) = if dlss_any {
                 if let Some(ref ngx) = self.ngx_vulkan {
-                    let key = (out_w, out_h, self.settings.dlss_quality);
+                    let is_rr = self.settings.dlss_rr_on;
+                    let key = (out_w, out_h, self.settings.dlss_quality, is_rr);
                     let opt_res = match self.cached_dlss_opt {
                         Some((k, opt)) if k == key => Ok(opt),
                         _ => {
-                            let res = ngx.query_dlss_optimal_settings(
-                                out_w,
-                                out_h,
-                                dlss_quality_from_ui(self.settings.dlss_quality),
-                            );
+                            let q = dlss_quality_from_ui(self.settings.dlss_quality);
+                            let res = if is_rr {
+                                ngx.query_dlss_rr_optimal_settings(out_w, out_h, q)
+                            } else {
+                                ngx.query_dlss_optimal_settings(out_w, out_h, q)
+                            };
                             if let Ok(opt) = res {
                                 self.cached_dlss_opt = Some((key, opt));
                             }
@@ -877,8 +1474,13 @@ mod demo_app {
                             )
                         }
                         Err(e) => {
-                            self.settings.dlss_on = false;
-                            self.last_saved_msg = Some(format!("DLSS query failed: {e}"));
+                            if is_rr {
+                                self.settings.dlss_rr_on = false;
+                                self.last_saved_msg = Some(format!("DLSS-RR query failed: {e}"));
+                            } else {
+                                self.settings.dlss_on = false;
+                                self.last_saved_msg = Some(format!("DLSS query failed: {e}"));
+                            }
                             align_render_size(
                                 self.desired_vp_size.0,
                                 self.desired_vp_size.1,
@@ -902,23 +1504,44 @@ mod demo_app {
             };
 
             let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
+                || self.settings.dlss_rr_on != self.last_sent_settings.dlss_rr_on
                 || self.settings.dlss_quality != self.last_sent_settings.dlss_quality;
-            if (target_w != self.render_w || target_h != self.render_h)
-                && (self.last_resize_at.elapsed().as_millis() >= 120 || dlss_toggled)
+            let needs_rr_bufs = self.settings.dlss_rr_on && self.rr_shared.is_none();
+            let drop_rr_bufs = !self.settings.dlss_rr_on && self.rr_shared.is_some();
+            if (target_w != self.render_w
+                || target_h != self.render_h
+                || needs_rr_bufs
+                || drop_rr_bufs)
+                && (self.last_resize_at.elapsed().as_millis() >= 120
+                    || dlss_toggled
+                    || needs_rr_bufs
+                    || drop_rr_bufs)
             {
                 self.last_resize_at = Instant::now();
-                match allocate_render_targets(&self.interop, target_w, target_h) {
-                    Ok(RenderTargets {
-                        rgba: new_shared,
-                        depth: new_depth,
-                        motion: new_motion,
-                        display_texture: new_tex,
-                    }) => {
+                let rr_alloc = if self.settings.dlss_rr_on {
+                    DlssRrSharedBuffers::new(&self.interop, target_w, target_h).map(Some)
+                } else {
+                    Ok(None)
+                };
+                match (
+                    allocate_render_targets(&self.interop, target_w, target_h),
+                    rr_alloc,
+                ) {
+                    (
+                        Ok(RenderTargets {
+                            rgba: new_shared,
+                            depth: new_depth,
+                            motion: new_motion,
+                            display_texture: new_tex,
+                        }),
+                        Ok(new_rr_shared),
+                    ) => {
                         let new_ptrs = [new_shared[0].cu_deviceptr(), new_shared[1].cu_deviceptr()];
                         let new_depth_ptrs =
                             [new_depth[0].cu_deviceptr(), new_depth[1].cu_deviceptr()];
                         let new_motion_ptrs =
                             [new_motion[0].cu_deviceptr(), new_motion[1].cu_deviceptr()];
+                        let new_rr_ptrs = new_rr_shared.as_ref().map(DlssRrSharedBuffers::ptrs);
                         let new_view = new_tex.create_view(&wgpu::TextureViewDescriptor::default());
                         if !self.using_dlss_tex {
                             self.egui_renderer.update_egui_texture_from_wgpu_texture(
@@ -934,6 +1557,10 @@ mod demo_app {
                         self.retired_buffers.push((self.buf_gen, old_shared));
                         self.retired_buffers.push((self.buf_gen, old_depth));
                         self.retired_buffers.push((self.buf_gen, old_motion));
+                        if let Some(old_rr) = std::mem::replace(&mut self.rr_shared, new_rr_shared)
+                        {
+                            old_rr.retire_into(self.buf_gen, &mut self.retired_buffers);
+                        }
                         self.display_texture = new_tex;
                         self.display_view = new_view;
                         self.render_w = target_w;
@@ -950,16 +1577,96 @@ mod demo_app {
                             buf_ptrs: new_ptrs,
                             depth_ptrs: new_depth_ptrs,
                             motion_ptrs: new_motion_ptrs,
+                            rr_ptrs: new_rr_ptrs,
                             gen_id: self.buf_gen,
                         });
                     }
-                    Err(e) => {
+                    (Err(e), _) | (_, Err(e)) => {
+                        if self.settings.dlss_rr_on && self.rr_shared.is_none() {
+                            self.settings.dlss_rr_on = false;
+                        }
                         self.last_saved_msg = Some(format!("Resize failed: {e}"));
                     }
                 }
             }
 
-            if self.settings.dlss_on {
+            if self.settings.dlss_rr_on {
+                self.dlss_pass = None;
+                let needs_rebuild = self.dlss_rr_pass.as_ref().is_none_or(|p| {
+                    p.render_w != self.render_w
+                        || p.render_h != self.render_h
+                        || p.out_w != out_w
+                        || p.out_h != out_h
+                        || p.quality != self.settings.dlss_quality
+                });
+                if needs_rebuild {
+                    if self.using_dlss_tex {
+                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            self.interop.device(),
+                            &self.display_view,
+                            wgpu::FilterMode::Linear,
+                            self.display_tex_id,
+                        );
+                        self.using_dlss_tex = false;
+                    }
+                    self.dlss_rr_pass = None;
+                    if let Some(ref ngx) = self.ngx_vulkan {
+                        match DlssRrPass::new(
+                            &self.interop,
+                            ngx,
+                            &self.hdr_tonemap,
+                            self.render_w,
+                            self.render_h,
+                            out_w,
+                            out_h,
+                            self.settings.dlss_quality,
+                        ) {
+                            Ok(pass) => {
+                                if self.settings.aov_mode == 0 {
+                                    self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                        self.interop.device(),
+                                        &pass.display_view,
+                                        wgpu::FilterMode::Linear,
+                                        self.display_tex_id,
+                                    );
+                                    self.using_dlss_tex = true;
+                                }
+                                self.dlss_dirty = self.has_frame;
+                                self.rr_last_exposure = f32::NAN;
+                                self.dlss_rr_pass = Some(pass);
+                            }
+                            Err(e) => {
+                                self.settings.dlss_rr_on = false;
+                                self.last_saved_msg = Some(format!("DLSS-RR init failed: {e}"));
+                            }
+                        }
+                    }
+                }
+                if let Some(ref mut pass) = self.dlss_rr_pass {
+                    if self.settings.aov_mode == 0 {
+                        if !self.using_dlss_tex {
+                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                self.interop.device(),
+                                &pass.display_view,
+                                wgpu::FilterMode::Linear,
+                                self.display_tex_id,
+                            );
+                            self.using_dlss_tex = true;
+                            self.dlss_dirty = self.has_frame;
+                            pass.reset_next = true;
+                        }
+                    } else if self.using_dlss_tex {
+                        self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                            self.interop.device(),
+                            &self.display_view,
+                            wgpu::FilterMode::Linear,
+                            self.display_tex_id,
+                        );
+                        self.using_dlss_tex = false;
+                    }
+                }
+            } else if self.settings.dlss_on {
+                self.dlss_rr_pass = None;
                 let needs_rebuild = self.dlss_pass.as_ref().is_none_or(|p| {
                     p.render_w != self.render_w
                         || p.render_h != self.render_h
@@ -1017,6 +1724,16 @@ mod demo_app {
                     self.using_dlss_tex = false;
                 }
                 self.dlss_pass = None;
+                self.dlss_rr_pass = None;
+            }
+
+            if reset_accum_requested {
+                if let Some(ref mut p) = self.dlss_pass {
+                    p.reset_next = true;
+                }
+                if let Some(ref mut p) = self.dlss_rr_pass {
+                    p.reset_next = true;
+                }
             }
 
             if save_png_requested && self.has_frame {
@@ -1135,10 +1852,144 @@ mod demo_app {
                     });
 
             if self.has_frame {
-                if self.settings.dlss_on
+                if self.settings.dlss_rr_on
+                    && self.settings.aov_mode == 0
+                    && let Some(ref mut rr) = self.dlss_rr_pass
+                    && let Some(ref rr_bufs) = self.rr_shared
+                {
+                    let mut ran_rr = false;
+                    let mut rr_failed = false;
+                    if self.dlss_dirty {
+                        let _nvtx_rr =
+                            crate::nvtx::NvtxRange::new(c"DLSS-RR", crate::nvtx::COLOR_DLSS);
+                        self.dlss_dirty = false;
+                        let mut copy_enc = self.interop.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("dlss-rr-copy-inputs"),
+                            },
+                        );
+                        let extent = wgpu::Extent3d {
+                            width: self.render_w,
+                            height: self.render_h,
+                            depth_or_array_layers: 1,
+                        };
+                        let copy_buf = |enc: &mut wgpu::CommandEncoder,
+                                        buf: &wgpu::Buffer,
+                                        tex: &wgpu::Texture,
+                                        bpp: u32| {
+                            enc.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: buf,
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(self.render_w * bpp),
+                                        rows_per_image: Some(self.render_h),
+                                    },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                extent,
+                            );
+                        };
+                        let idx = self.front_buf_idx;
+                        copy_buf(
+                            &mut copy_enc,
+                            rr_bufs.hdr_color[idx].wgpu_buffer(),
+                            rr.color_in.wgpu_texture(),
+                            8,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            self.shared_depth[idx].wgpu_buffer(),
+                            rr.depth_in.wgpu_texture(),
+                            4,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            self.shared_motion[idx].wgpu_buffer(),
+                            rr.motion_in.wgpu_texture(),
+                            8,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            rr_bufs.diffuse_albedo[idx].wgpu_buffer(),
+                            rr.diffuse_in.wgpu_texture(),
+                            8,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            rr_bufs.spec_albedo[idx].wgpu_buffer(),
+                            rr.specular_in.wgpu_texture(),
+                            8,
+                        );
+                        copy_buf(
+                            &mut copy_enc,
+                            rr_bufs.normal_rough[idx].wgpu_buffer(),
+                            rr.normals_in.wgpu_texture(),
+                            8,
+                        );
+                        self.interop.queue().submit(Some(copy_enc.finish()));
+                        let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
+                        let world_to_view = glam::camera::rh::view::look_to_mat4(
+                            self.cam_pose.eye,
+                            self.cam_pose.forward(),
+                            self.cam_pose.up(),
+                        )
+                        .to_cols_array();
+                        let view_to_clip = glam::camera::rh::proj::directx::perspective(
+                            self.cam_pose.fov_y,
+                            aspect,
+                            self.cam_pose.znear.max(1e-3),
+                            self.cam_pose.zfar.max(10.0),
+                        )
+                        .to_cols_array();
+                        if let Err(e) = rr.evaluate(
+                            &self.interop,
+                            self.last_jitter,
+                            world_to_view,
+                            view_to_clip,
+                        ) {
+                            rr_failed = true;
+                            self.last_saved_msg = Some(format!("DLSS-RR evaluate failed: {e}"));
+                        } else {
+                            ran_rr = true;
+                        }
+                    }
+                    if rr_failed {
+                        self.settings.dlss_rr_on = false;
+                        if self.using_dlss_tex {
+                            self.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                self.interop.device(),
+                                &self.display_view,
+                                wgpu::FilterMode::Linear,
+                                self.display_tex_id,
+                            );
+                            self.using_dlss_tex = false;
+                        }
+                        self.dlss_rr_pass = None;
+                    } else if ran_rr
+                        || (self.settings.exposure - self.rr_last_exposure).abs() > 1e-5
+                    {
+                        self.hdr_tonemap.dispatch(
+                            self.interop.queue(),
+                            &mut encoder,
+                            &rr.tonemap_bg,
+                            rr.out_w,
+                            rr.out_h,
+                            self.settings.exposure,
+                        );
+                        self.rr_last_exposure = self.settings.exposure;
+                    }
+                } else if self.settings.dlss_on
                     && let Some(ref mut dlss) = self.dlss_pass
                 {
                     if self.dlss_dirty {
+                        let _nvtx_dlss =
+                            crate::nvtx::NvtxRange::new(c"DLSS", crate::nvtx::COLOR_DLSS);
                         self.dlss_dirty = false;
                         let mut copy_enc = self.interop.device().create_command_encoder(
                             &wgpu::CommandEncoderDescriptor {
@@ -1483,6 +2334,7 @@ impl ApplicationHandler for Runner {
 }
 
 fn main() {
+    nvtx::name_current_thread(c"nv-demo-main");
     let event_loop = EventLoop::new().expect("event loop");
     let mut runner = Runner::default();
     event_loop.run_app(&mut runner).expect("run app");

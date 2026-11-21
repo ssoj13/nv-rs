@@ -83,6 +83,44 @@ fn compile_ptx(
     Ok(())
 }
 
+fn find_cuda_nvtx_include() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+        if let Ok(root) = env::var(var) {
+            candidates.push(PathBuf::from(root).join("include"));
+        }
+    }
+    #[cfg(not(windows))]
+    candidates.push(PathBuf::from("/usr/local/cuda/include"));
+    candidates
+        .into_iter()
+        .find(|p| p.join("nvtx3").join("nvToolsExt.h").is_file())
+}
+
+fn build_nvtx_shim() {
+    println!("cargo::rustc-check-cfg=cfg(has_nvtx3)");
+    println!("cargo::rerun-if-changed=nvtx_shim.c");
+    println!("cargo::rerun-if-env-changed=CUDA_HOME");
+    println!("cargo::rerun-if-env-changed=CUDA_ROOT");
+
+    let Some(inc) = find_cuda_nvtx_include() else {
+        return;
+    };
+    let mut build = cc::Build::new();
+    build.file("nvtx_shim.c").include(&inc).warnings(false);
+    match build.try_compile("nv_demo_nvtx") {
+        Ok(()) => {
+            if cfg!(target_os = "linux") {
+                println!("cargo::rustc-link-lib=dl");
+            }
+            println!("cargo::rustc-cfg=has_nvtx3");
+        }
+        Err(err) => {
+            println!("cargo::warning=NVTX3 shim compile failed ({err}); using no-op markers");
+        }
+    }
+}
+
 fn stage_dlss_runtime(out_dir: &Path) {
     println!("cargo:rerun-if-env-changed=NGX_SDK_ROOT");
     let ngx_root = env::var_os("NGX_SDK_ROOT")
@@ -98,15 +136,18 @@ fn stage_dlss_runtime(out_dir: &Path) {
         return;
     };
     if cfg!(windows) {
-        let src = ngx_root.join("lib/Windows_x86_64/rel/nvngx_dlss.dll");
-        if src.is_file() {
-            let dst = target_dir.join("nvngx_dlss.dll");
-            let needs_copy = std::fs::metadata(&dst)
-                .and_then(|d| Ok((d.len(), std::fs::metadata(&src)?.len())))
-                .map(|(a, b)| a != b)
-                .unwrap_or(true);
-            if needs_copy {
-                let _ = std::fs::copy(&src, &dst);
+        let rel_dir = ngx_root.join("lib/Windows_x86_64/rel");
+        for dll in ["nvngx_dlss.dll", "nvngx_dlssd.dll"] {
+            let src = rel_dir.join(dll);
+            if src.is_file() {
+                let dst = target_dir.join(dll);
+                let needs_copy = std::fs::metadata(&dst)
+                    .and_then(|d| Ok((d.len(), std::fs::metadata(&src)?.len())))
+                    .map(|(a, b)| a != b)
+                    .unwrap_or(true);
+                if needs_copy {
+                    let _ = std::fs::copy(&src, &dst);
+                }
             }
         }
     } else if cfg!(target_os = "linux") {
@@ -114,7 +155,10 @@ fn stage_dlss_runtime(out_dir: &Path) {
         if let Ok(entries) = std::fs::read_dir(&rel_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with("libnvidia-ngx-dlss.so") {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("libnvidia-ngx-dlss.so")
+                    || name_str.starts_with("libnvidia-ngx-dlssd.so")
+                {
                     let dst = target_dir.join(&name);
                     if !dst.exists() {
                         let _ = std::fs::copy(entry.path(), &dst);
@@ -134,6 +178,7 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     stage_dlss_runtime(&out_dir);
+    build_nvtx_shim();
     let Some(nvcc) = find_nvcc() else {
         return;
     };

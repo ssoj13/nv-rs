@@ -28,7 +28,8 @@ struct Params {
     float floor_params[4];     // [roughness, scratch, scale, metallic]
     float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, sky_mode]
     unsigned int accum_count;
-    unsigned int _pad0[3];
+    unsigned int enable_ser;
+    unsigned int _pad0[2];
     unsigned long long out_motion_f32;
     unsigned long long out_depth_f32;
     float prev_cam_pos[4];
@@ -42,6 +43,8 @@ struct Params {
     float jitter_y;
     unsigned int _pad1;
     float env_params[8];
+    unsigned long long out_diffuse_albedo_f32;
+    unsigned long long out_spec_albedo_f32;
 };
 
 extern "C" {
@@ -113,24 +116,27 @@ static __forceinline__ __device__ float2 sdf_mandelbulb(float3 q) {
     float power = params.fractal_p0[0];
     float bailout = fmaxf(2.0f, params.fractal_p0[1]);
     bool julia = params.fractal_p0[2] > 0.5f;
-    int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
+    int max_iter = (int)fmaxf(2.0f, fminf(32.0f, params.fractal_p1[2]));
     float3 c_add = julia ? make_f3(params.fractal_p2) : q;
     float theta_mult = params.fractal_p3[0];
     float phi_mult = params.fractal_p3[1];
     float theta_phase = params.fractal_p3[2];
     float phi_phase = params.fractal_p3[3];
+    float ang_scale = fmaxf(1.0f, fmaxf(fabsf(theta_mult), fabsf(phi_mult)));
+    float dr_add = julia ? 0.0f : 1.0f;
 
     float3 z = q;
     float dr = 1.0f;
     float r = f3_len(z);
     float trap = 1e6f;
-    for (int i = 0; i < 28; ++i) {
-        if (i >= max_iter || r > bailout) break;
+    for (int i = 0; i < 32; ++i) {
+        if (i >= max_iter || r > bailout || dr > 1e20f) break;
         if (r < 1e-6f) return make_float2(0.0f, trap);
         float theta = acosf(fmaxf(-1.0f, fminf(1.0f, z.z / r))) * theta_mult + theta_phase;
         float phi = atan2f(z.y, z.x) * phi_mult + phi_phase;
-        dr = powf(r, power - 1.0f) * power * dr + 1.0f;
-        float zr = powf(r, power);
+        float rp = powf(r, power - 1.0f);
+        dr = rp * power * ang_scale * dr + dr_add;
+        float zr = rp * r;
         theta *= power;
         phi *= power;
         float sin_t = sinf(theta);
@@ -147,16 +153,17 @@ static __forceinline__ __device__ float2 sdf_mandelbox(float3 q) {
     float fold = fmaxf(0.1f, params.fractal_p0[2]);
     float min_r = fmaxf(0.05f, params.fractal_p0[3]);
     float fixed_r = fmaxf(min_r + 0.05f, params.fractal_p1[0]);
-    int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
+    int max_iter = (int)fmaxf(2.0f, fminf(32.0f, params.fractal_p1[2]));
     float fold_mult = params.fractal_p3[0];
     float iter_rot = params.fractal_p3[1];
     float min_r2 = min_r * min_r;
     float fixed_r2 = fixed_r * fixed_r;
+    float abs_scale = fabsf(scale);
 
     float3 z = q;
     float dr = 1.0f;
     float trap = 1e6f;
-    for (int i = 0; i < 28; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= max_iter) break;
         if (fabsf(iter_rot) > 1e-5f) {
             z = rot_y(z, iter_rot);
@@ -177,11 +184,15 @@ static __forceinline__ __device__ float2 sdf_mandelbox(float3 q) {
             dr *= k;
         }
         z = f3_add(f3_mul(z, scale), q);
-        dr = dr * fabsf(scale) + 1.0f;
+        dr = dr * abs_scale + 1.0f;
         trap = fminf(trap, r2);
-        if (f3_dot(z, z) > bailout2) break;
+        if (f3_dot(z, z) > bailout2 || dr > 1e20f) break;
     }
-    return make_float2((f3_len(z) - 1.0f) / fmaxf(fabsf(dr), 1e-6f), sqrtf(fmaxf(trap, 0.0f)));
+    // Exact Lowe/Knighty Mandelbox distance estimator: (|z| - |scale - 1|) / |dr| - |scale|^(1 - max_iter)
+    float c1 = fabsf(scale - 1.0f);
+    float c2 = (abs_scale > 1.05f) ? powf(abs_scale, (float)(1 - max_iter)) : 0.0f;
+    float de = (f3_len(z) - c1) / fmaxf(fabsf(dr), 1e-6f) - c2;
+    return make_float2(de, sqrtf(fmaxf(trap, 0.0f)));
 }
 
 static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
@@ -189,7 +200,7 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
     float bailout2 = params.fractal_p0[1] * params.fractal_p0[1];
     float a1 = params.fractal_p1[0];
     float a2 = params.fractal_p1[1];
-    int max_iter = (int)fmaxf(2.0f, fminf(28.0f, params.fractal_p1[2]));
+    int max_iter = (int)fmaxf(2.0f, fminf(32.0f, params.fractal_p1[2]));
     float3 off = make_f3(params.fractal_p2);
     float thickness = fmaxf(0.005f, params.fractal_p3[0]);
     float z_bias = params.fractal_p3[1];
@@ -197,7 +208,7 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
     float3 z = q;
     float s = 1.0f;
     float trap = 1e6f;
-    for (int i = 0; i < 28; ++i) {
+    for (int i = 0; i < 32; ++i) {
         if (i >= max_iter) break;
         z = rot_y(z, a1);
         z.x = fabsf(z.x);
@@ -216,9 +227,20 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
         s *= sc;
         float r2 = f3_dot(z, z);
         trap = fminf(trap, r2);
-        if (r2 > bailout2) break;
+        if (r2 > bailout2 || s > 1e18f) break;
     }
-    return make_float2((f3_len(z) - thickness) / s, sqrtf(fmaxf(trap, 0.0f)));
+    // Rounded box base primitive matching the [-off, +off] KIFS/Menger invariant domain
+    float ox = fmaxf(0.1f, fabsf(off.x));
+    float oy = fmaxf(0.1f, fabsf(off.y));
+    float oz = fmaxf(0.1f, fabsf(off.z));
+    float bevel = fminf(thickness, fminf(ox, fminf(oy, oz)) * 0.45f);
+    float bx = fabsf(z.x) - (ox - bevel);
+    float by = fabsf(z.y) - (oy - bevel);
+    float bz = fabsf(z.z) - (oz - bevel);
+    float d_box = fminf(fmaxf(bx, fmaxf(by, bz)), 0.0f)
+        + f3_len(make_float3(fmaxf(bx, 0.0f), fmaxf(by, 0.0f), fmaxf(bz, 0.0f)))
+        - bevel;
+    return make_float2(d_box / s, sqrtf(fmaxf(trap, 0.0f)));
 }
 
 static __forceinline__ __device__ float2 eval_fractal(float3 p) {
@@ -237,12 +259,43 @@ static __forceinline__ __device__ float2 eval_fractal(float3 p) {
     return make_float2(res.x * obj_scale, res.y);
 }
 
+static __forceinline__ __device__ float fractal_hit_eps(float path_dist) {
+    float detail_eps = fmaxf(0.00001f, params.fractal_r0[0]);
+    float pixel_angle = (2.0f * fmaxf(params.cam_up[3], 0.05f)) / fmaxf((float)params.height, 64.0f);
+    float cone = detail_eps * 400.0f * pixel_angle;
+    return fmaxf(2.0e-6f, path_dist * cone);
+}
+
 static __forceinline__ __device__ float3 fractal_normal(float3 p, float eps) {
-    float e = fmaxf(eps, 0.00002f);
-    float d0 = eval_fractal(make_float3(p.x + e, p.y, p.z)).x - eval_fractal(make_float3(p.x - e, p.y, p.z)).x;
-    float d1 = eval_fractal(make_float3(p.x, p.y + e, p.z)).x - eval_fractal(make_float3(p.x, p.y - e, p.z)).x;
-    float d2 = eval_fractal(make_float3(p.x, p.y, p.z + e)).x - eval_fractal(make_float3(p.x, p.y, p.z - e)).x;
-    return f3_norm(make_float3(d0, d1, d2));
+    // 4-tap tetrahedral gradient: 33% fewer SDF evaluations than 6-tap central differences,
+    // with an ULP-safe floor to prevent float32 cancellation on extreme close-ups.
+    float e = fmaxf(eps, 2.0e-6f * fmaxf(1.0f, f3_len(p)));
+    float d0 = eval_fractal(make_float3(p.x + e, p.y - e, p.z - e)).x;
+    float d1 = eval_fractal(make_float3(p.x - e, p.y - e, p.z + e)).x;
+    float d2 = eval_fractal(make_float3(p.x - e, p.y + e, p.z - e)).x;
+    float d3 = eval_fractal(make_float3(p.x + e, p.y + e, p.z + e)).x;
+    return f3_norm(make_float3(
+        d0 - d1 - d2 + d3,
+       -d0 - d1 + d2 + d3,
+       -d0 + d1 - d2 + d3
+    ));
+}
+
+static __forceinline__ __device__ float fractal_ao(float3 p, float3 n, float base_eps) {
+    // 3-tap multi-scale SDF cavity occlusion along surface normal (zoom-adaptive micro + macro).
+    // Bounded to [0.45, 1.0] so it accentuates micro-crevices and denoiser albedo guides
+    // without crushing physically-traced indirect shadows to black.
+    float h0 = fmaxf(base_eps * 5.0f, 0.00005f);
+    float h1 = h0 * 3.0f;
+    float h2 = fmaxf(h1 * 3.0f, 0.015f);
+    float occ = 0.0f;
+    float d0 = eval_fractal(f3_add(p, f3_mul(n, h0))).x;
+    occ += 0.45f * fmaxf(0.0f, fminf(1.0f, (h0 - d0) / h0));
+    float d1 = eval_fractal(f3_add(p, f3_mul(n, h1))).x;
+    occ += 0.35f * fmaxf(0.0f, fminf(1.0f, (h1 - d1) / h1));
+    float d2 = eval_fractal(f3_add(p, f3_mul(n, h2))).x;
+    occ += 0.20f * fmaxf(0.0f, fminf(1.0f, (h2 - d2) / h2));
+    return fmaxf(0.45f, fminf(1.0f, 1.0f - occ * 0.55f));
 }
 
 static __forceinline__ __device__ float3 trap_palette(float trap) {
@@ -947,18 +1000,36 @@ static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, b
 }
 
 static __forceinline__ __device__ void trace_primary(
-    float3 origin, float3 dir, unsigned int& p0, unsigned int& p1, unsigned int& p2, unsigned int& p3,
+    float3 origin, float3 dir, float tmin,
+    unsigned int& p0, unsigned int& p1, unsigned int& p2, unsigned int& p3,
     unsigned int& p4, unsigned int& p5, unsigned int& p6, unsigned int& p7
 ) {
-    optixTrace(
-        (OptixTraversableHandle)params.handle,
-        origin, dir,
-        0.001f, 1e16f, 0.0f,
-        OptixVisibilityMask(255),
-        OPTIX_RAY_FLAG_NONE,
-        0, 1, 0,
-        p0, p1, p2, p3, p4, p5, p6, p7
-    );
+    if (params.enable_ser != 0u) {
+        optixTraverse(
+            (OptixTraversableHandle)params.handle,
+            origin, dir,
+            tmin, 1e16f, 0.0f,
+            OptixVisibilityMask(255),
+            OPTIX_RAY_FLAG_NONE,
+            0, 1, 0,
+            p0, p1, p2, p3, p4, p5, p6, p7
+        );
+        unsigned int hint = optixHitObjectIsHit()
+            ? ((optixHitObjectGetInstanceId() & 0x7u) + 1u)
+            : 0u;
+        optixReorder(hint, 3u);
+        optixInvoke(p0, p1, p2, p3, p4, p5, p6, p7);
+    } else {
+        optixTrace(
+            (OptixTraversableHandle)params.handle,
+            origin, dir,
+            tmin, 1e16f, 0.0f,
+            OptixVisibilityMask(255),
+            OPTIX_RAY_FLAG_NONE,
+            0, 1, 0,
+            p0, p1, p2, p3, p4, p5, p6, p7
+        );
+    }
 }
 
 static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, float max_t) {
@@ -966,7 +1037,7 @@ static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, f
     optixTrace(
         (OptixTraversableHandle)params.handle,
         origin, dir,
-        0.002f, max_t, 0.0f,
+        1.0e-5f, max_t, 0.0f,
         OptixVisibilityMask(255),
         OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
         0, 1, 1,
@@ -992,7 +1063,10 @@ extern "C" __global__ void __raygen__render() {
 
     float3 accum_col = make_float3(0.0f, 0.0f, 0.0f);
     float3 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
+    float3 first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+    float3 first_specular = make_float3(0.0f, 0.0f, 0.0f);
     float3 first_normal = make_float3(0.0f, 0.0f, 1.0f);
+    float first_roughness = 1.0f;
     float first_depth = 1e6f;
     float2 first_motion = make_float2(0.0f, 0.0f);
 
@@ -1036,14 +1110,29 @@ extern "C" __global__ void __raygen__render() {
         for (int bounce = 0; bounce < 16; ++bounce) {
             if (bounce >= max_bounces) break;
             unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
-            trace_primary(origin, dir, p0, p1, p2, p3, p4, p5, p6, p7);
+            trace_primary(origin, dir, (bounce == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
 
             if (p0 == 0u) {
                 float3 sky = sky_color(dir, sun_dir, bounce == 0);
                 sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
                 if (bounce == 0 && s == 0) {
-                    first_albedo = sky;
-                    first_normal = make_float3(-dir.x, -dir.y, -dir.z);
+                    first_albedo = make_float3(
+                        fmaxf(0.0f, fminf(1.0f, sky.x)),
+                        fmaxf(0.0f, fminf(1.0f, sky.y)),
+                        fmaxf(0.0f, fminf(1.0f, sky.z))
+                    );
+                    if (params.out_diffuse_albedo_f32 != 0ull && params.aov_mode == 0u) {
+                        // DLSS-RR Integration Guide §§3.4.1/3.4.3/3.4.4 sky defaults
+                        first_diffuse = make_float3(0.5f, 0.5f, 0.5f);
+                        first_specular = make_float3(0.0f, 0.0f, 0.0f);
+                        first_normal = make_float3(0.0f, 0.0f, 0.0f);
+                        first_roughness = 0.0f;
+                    } else {
+                        first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                        first_specular = make_float3(0.0f, 0.0f, 0.0f);
+                        first_normal = make_float3(-dir.x, -dir.y, -dir.z);
+                        first_roughness = 1.0f;
+                    }
                     first_depth = 1e6f;
                     if (has_prev_cam) {
                         float pz = f3_dot(dir, prev_fwd);
@@ -1076,7 +1165,7 @@ extern "C" __global__ void __raygen__render() {
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
             if (bounce == 0 && s == 0) {
-                first_depth = hit_t;
+                first_depth = fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd));
                 if (has_prev_cam) {
                     float3 rel = f3_sub(hit_pos, prev_pos);
                     float pz = f3_dot(rel, prev_fwd);
@@ -1116,14 +1205,17 @@ extern "C" __global__ void __raygen__render() {
                         expf(-sigma.z * hit_t)
                     ));
                 }
+                float r0 = (1.0f - ior) / (1.0f + ior);
+                r0 = r0 * r0;
                 if (bounce == 0 && s == 0) {
                     first_albedo = make_float3(0.92f, 0.97f, 1.0f);
+                    first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                    first_specular = make_float3(r0, r0, r0);
                     first_normal = n;
+                    first_roughness = g_rough;
                 }
                 float eta = entering ? (1.0f / ior) : ior;
                 float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
-                float r0 = (1.0f - ior) / (1.0f + ior);
-                r0 = r0 * r0;
                 float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
                 float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
                 bool tir = sin2_t > 1.0f;
@@ -1162,7 +1254,10 @@ extern "C" __global__ void __raygen__render() {
                         fminf(1.0f, emission.y * 0.45f),
                         fminf(1.0f, emission.z * 0.45f)
                     );
+                    first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                    first_specular = make_float3(0.0f, 0.0f, 0.0f);
                     first_normal = n;
+                    first_roughness = 1.0f;
                 }
                 break;
             }
@@ -1200,6 +1295,16 @@ extern "C" __global__ void __raygen__render() {
 
                 rough = fmaxf(0.03f, fminf(0.88f, f_rough + 0.18f * (1.0f - patina) + 0.22f * groove));
                 metallic = fmaxf(0.0f, fminf(1.0f, f_metal * (1.0f - groove * 0.25f)));
+            } else if (inst_id == 4u) {
+                // Brushed satin-gold filigree halo (OptiX OMM / Any-Hit benchmark mesh)
+                float brush = fbm2(hit_pos.y * 28.0f, atan2f(hit_pos.z, hit_pos.x) * 14.0f);
+                base_col = make_float3(
+                    0.74f + 0.14f * brush,
+                    0.56f + 0.12f * brush,
+                    0.26f + 0.08f * brush
+                );
+                metallic = 0.88f;
+                rough = 0.16f + 0.10f * (1.0f - brush);
             } else {
                 // Fractal custom primitive uses orbit-trap base_col from p5
                 metallic = params.fractal_r1[0];
@@ -1212,17 +1317,35 @@ extern "C" __global__ void __raygen__render() {
             }
 
             if (bounce == 0 && s == 0) {
+                float inv_m = 1.0f - metallic;
                 first_albedo = base_col;
+                first_diffuse = f3_mul(base_col, inv_m);
+                first_specular = f3_add(
+                    make_float3(0.04f * inv_m, 0.04f * inv_m, 0.04f * inv_m),
+                    f3_mul(base_col, metallic)
+                );
                 first_normal = n;
+                first_roughness = fmaxf(0.0f, fminf(1.0f, rough));
             }
+
+            // Adaptive surface offset: scales down to micro-detail epsilon on fractals so
+            // fine buds cast crisp self-shadows and tight crevices self-occlude naturally.
+            float ray_bias;
+            if (inst_id == 1u) {
+                float hit_eps = fractal_hit_eps(f3_len(f3_sub(hit_pos, cam_pos)));
+                ray_bias = fmaxf(2.5e-5f, hit_eps * 5.0f);
+            } else {
+                ray_bias = fmaxf(0.0005f, hit_t * 0.0003f);
+            }
+            float3 biased_origin = f3_add(hit_pos, f3_mul(n, ray_bias));
 
             float ndotl = fmaxf(0.0f, f3_dot(n, sun_dir));
             if (ndotl > 0.0f) {
                 bool occluded = false;
                 if (params.enable_shadows != 0u) {
                     float3 jitter = make_float3(rand01(seed) - 0.5f, rand01(seed) - 0.5f, rand01(seed) - 0.5f);
-                    float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.045f)));
-                    occluded = trace_shadow(f3_add(hit_pos, f3_mul(n, 0.003f)), sdir, 1000.0f);
+                    float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.028f)));
+                    occluded = trace_shadow(biased_origin, sdir, 1000.0f);
                 }
                 if (!occluded) {
                     float sun_i = params.fractal_r1[3];
@@ -1254,7 +1377,7 @@ extern "C" __global__ void __raygen__render() {
             float3 spec_dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, rough)));
             bool do_spec = (rand01(seed) < (0.15f + 0.75f * metallic));
             dir = do_spec ? spec_dir : diff_dir;
-            origin = f3_add(hit_pos, f3_mul(n, 0.003f));
+            origin = biased_origin;
             throughput = f3_mul3(throughput, base_col);
         }
 
@@ -1286,13 +1409,21 @@ extern "C" __global__ void __raygen__render() {
     if (params.out_depth_f32 != 0ull) {
         ((float*)params.out_depth_f32)[out_idx] = first_depth;
     }
+    if (params.out_diffuse_albedo_f32 != 0ull) {
+        ((float4*)params.out_diffuse_albedo_f32)[out_idx] =
+            make_float4(first_diffuse.x, first_diffuse.y, first_diffuse.z, 1.0f);
+    }
+    if (params.out_spec_albedo_f32 != 0ull) {
+        ((float4*)params.out_spec_albedo_f32)[out_idx] =
+            make_float4(first_specular.x, first_specular.y, first_specular.z, 1.0f);
+    }
     float4* color_buf  = (float4*)params.out_color_f32;
     float4* albedo_buf = (float4*)params.out_albedo_f32;
     float4* normal_buf = (float4*)params.out_normal_f32;
     if (params.accum_count == 0u) {
         color_buf[out_idx]  = make_float4(final_col.x, final_col.y, final_col.z, 1.0f);
         albedo_buf[out_idx] = make_float4(first_albedo.x, first_albedo.y, first_albedo.z, 1.0f);
-        normal_buf[out_idx] = make_float4(first_normal.x, first_normal.y, first_normal.z, 1.0f);
+        normal_buf[out_idx] = make_float4(first_normal.x, first_normal.y, first_normal.z, first_roughness);
     } else {
         float w = 1.0f / (float)(params.accum_count + 1u);
         float4 pc = color_buf[out_idx];
@@ -1310,12 +1441,15 @@ extern "C" __global__ void __raygen__render() {
             pa.z + (first_albedo.z - pa.z) * w,
             1.0f
         );
-        normal_buf[out_idx] = make_float4(
+        float3 n_acc = make_float3(
             pn.x + (first_normal.x - pn.x) * w,
             pn.y + (first_normal.y - pn.y) * w,
-            pn.z + (first_normal.z - pn.z) * w,
-            1.0f
+            pn.z + (first_normal.z - pn.z) * w
         );
+        float n_len = f3_len(n_acc);
+        if (n_len > 1e-4f) n_acc = f3_mul(n_acc, 1.0f / n_len);
+        float r_acc = pn.w + (first_roughness - pn.w) * w;
+        normal_buf[out_idx] = make_float4(n_acc.x, n_acc.y, n_acc.z, r_acc);
     }
 }
 
@@ -1349,17 +1483,45 @@ extern "C" __global__ void __closesthit__hit() {
     optixSetPayload_7(prim_idx);
 }
 
+// Exact 1-Lipschitz 2D SDF for the perforated filigree halo band; matches `filigree_sdf` in renderer.rs.
+static __forceinline__ __device__ float filigree_sdf(float u, float v) {
+    float d_border = fminf(v, 1.0f - v) - 0.06f;
+    float s1 = u * 2.0f + v * 2.0f;
+    float f1 = s1 - floorf(s1);
+    float d_diag1 = (fabsf(f1 - 0.5f) - 0.075f) * 0.35355339f;
+    float s2 = u * 2.0f - v * 2.0f + 4.0f;
+    float f2 = s2 - floorf(s2);
+    float d_diag2 = (fabsf(f2 - 0.5f) - 0.075f) * 0.35355339f;
+    float dx = u - 0.5f;
+    float dy = v - 0.5f;
+    float d_ring = fabsf(sqrtf(dx * dx + dy * dy) - 0.30f) - 0.042f;
+    float cu = fminf(u, 1.0f - u);
+    float cv = fminf(v, 1.0f - v);
+    float d_corner = fabsf(sqrtf(cu * cu + cv * cv) - 0.22f) - 0.036f;
+    return fminf(d_border, fminf(fminf(d_diag1, d_diag2), fminf(d_ring, d_corner)));
+}
+
+extern "C" __global__ void __anyhit__omm() {
+    float2 bary = optixGetTriangleBarycentrics();
+    unsigned int odd = optixGetPrimitiveIndex() & 1u;
+    float u = odd ? bary.x : (bary.x + bary.y);
+    float v = odd ? (bary.x + bary.y) : bary.y;
+    if (filigree_sdf(u, v) > 0.0f) {
+        optixIgnoreIntersection();
+    }
+}
+
 extern "C" __global__ void __intersection__fractal() {
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = f3_norm(optixGetObjectRayDirection());
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
-    // Ray-AABB clip against [-1.5, 1.5]^3
+    // Ray-AABB clip against [-1.85, 1.85]^3 (matches fractal GAS AABB; accommodates rotated KIFS corners)
     float t0 = tmin;
     float t1 = tmax;
-    float bmin = -1.5f;
-    float bmax = 1.5f;
+    float bmin = -1.85f;
+    float bmax = 1.85f;
     float* o = &orig.x;
     float* d = &dir.x;
     for (int i = 0; i < 3; ++i) {
@@ -1372,27 +1534,66 @@ extern "C" __global__ void __intersection__fractal() {
         if (t0 > t1) return;
     }
 
-    float detail_eps = fmaxf(0.00002f, params.fractal_r0[0]);
     float fudge = fmaxf(0.2f, fminf(1.2f, params.fractal_r0[1]));
-    float norm_eps = fmaxf(0.00002f, params.fractal_r0[2]);
-    int max_steps = (int)fmaxf(16.0f, fminf(384.0f, params.fractal_r0[3]));
+    float formula_safety = (params.fractal_kind == 0u) ? 0.78f : ((params.fractal_kind == 1u) ? 0.85f : 0.90f);
+    float step_fudge = fudge * formula_safety;
+    float norm_eps = fmaxf(0.00001f, params.fractal_r0[2]);
+    int max_steps = (int)fmaxf(16.0f, fminf(512.0f, params.fractal_r0[3]));
+    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
+
+    // Distance from camera to ray origin keeps secondary/shadow ray epsilon matched to screen-space scale.
+    float base_cam_dist = f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
+    float pixel_angle = (2.0f * fmaxf(params.cam_up[3], 0.05f)) / fmaxf((float)params.height, 64.0f);
+    float eps_scale = is_shadow ? 1.5f : 1.0f;
 
     float t = t0;
-    for (int step = 0; step < 384; ++step) {
+    float t_prev = t0;
+    float trap_prev = 0.0f;
+    for (int step = 0; step < 512; ++step) {
         if (step >= max_steps || t > t1) return;
         float3 p = f3_add(orig, f3_mul(dir, t));
         float2 res = eval_fractal(p);
         float dist = res.x;
-        float eps = detail_eps * (1.0f + t * 0.25f);
+        float path_dist = base_cam_dist + t;
+        float eps = fractal_hit_eps(path_dist) * eps_scale;
         if (dist < eps) {
-            float3 obj_n = fractal_normal(p, fmaxf(norm_eps, eps));
-            float3 col = trap_palette(res.y);
+            if (is_shadow) {
+                optixReportIntersection(t, 0);
+                return;
+            }
+            // Refine overstepped interior hits back to the exterior surface boundary via 4-step bisection
+            float t_hit = t;
+            float trap_hit = res.y;
+            if (dist < 0.0f && step > 0) {
+                float lo = t_prev;
+                float hi = t;
+                trap_hit = trap_prev;
+                for (int b = 0; b < 4; ++b) {
+                    float mid = 0.5f * (lo + hi);
+                    float2 mres = eval_fractal(f3_add(orig, f3_mul(dir, mid)));
+                    if (mres.x < 0.0f) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                        trap_hit = mres.y;
+                    }
+                }
+                t_hit = lo;
+            }
+            float3 p_hit = f3_add(orig, f3_mul(dir, t_hit));
+            float hit_path_dist = base_cam_dist + t_hit;
+            float hit_eps = fractal_hit_eps(hit_path_dist);
+            float norm_cone = norm_eps * 250.0f * pixel_angle;
+            float n_eps = fmaxf(hit_eps * 0.75f, hit_path_dist * norm_cone);
+            float3 obj_n = fractal_normal(p_hit, n_eps);
+            float ao = fractal_ao(p_hit, obj_n, hit_eps);
+            float3 col = f3_mul(trap_palette(trap_hit), ao);
             unsigned int packed =
-                ((unsigned int)(col.x * 255.0f) & 0xFFu) |
-                (((unsigned int)(col.y * 255.0f) & 0xFFu) << 8u) |
-                (((unsigned int)(col.z * 255.0f) & 0xFFu) << 16u);
+                ((unsigned int)(fminf(1.0f, col.x) * 255.0f) & 0xFFu) |
+                (((unsigned int)(fminf(1.0f, col.y) * 255.0f) & 0xFFu) << 8u) |
+                (((unsigned int)(fminf(1.0f, col.z) * 255.0f) & 0xFFu) << 16u);
             optixReportIntersection(
-                t, 0,
+                t_hit, 0,
                 __float_as_uint(obj_n.x),
                 __float_as_uint(obj_n.y),
                 __float_as_uint(obj_n.z),
@@ -1400,7 +1601,9 @@ extern "C" __global__ void __intersection__fractal() {
             );
             return;
         }
-        t += fmaxf(dist * fudge, eps * 0.5f);
+        t_prev = t;
+        trap_prev = res.y;
+        t += fmaxf(dist * step_fudge, eps * 0.25f);
     }
 }
 

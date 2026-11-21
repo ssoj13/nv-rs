@@ -13,7 +13,10 @@
 
 use crate::error::{Error, Result};
 use crate::params::{Parameters, keys};
-use crate::types::{DlssFeatureFlags, DlssPerfQuality, Feature, ProjectId, RequiredExtensions};
+use crate::types::{
+    DlssDepthType, DlssFeatureFlags, DlssPerfQuality, DlssRoughnessMode, DlssRrPreset, Feature,
+    ProjectId, RequiredExtensions,
+};
 use std::ffi::c_void;
 use std::path::Path;
 
@@ -21,6 +24,8 @@ use std::path::Path;
 use crate::check_sys;
 #[cfg(has_ngx_sdk)]
 use crate::error::ResultCode;
+#[cfg(has_ngx_sdk)]
+use crate::types::DlssDenoiseMode;
 #[cfg(has_ngx_sdk)]
 use std::ffi::CStr;
 #[cfg(all(has_ngx_sdk, windows))]
@@ -68,6 +73,16 @@ impl VkImageResourceInfo {
                 "color" => "color VkImageResourceInfo must not have null image_view or image",
                 "depth" => "depth VkImageResourceInfo must not have null image_view or image",
                 "motion" => "motion VkImageResourceInfo must not have null image_view or image",
+                "diffuse_albedo" => {
+                    "diffuse_albedo VkImageResourceInfo must not have null image_view or image"
+                }
+                "specular_albedo" => {
+                    "specular_albedo VkImageResourceInfo must not have null image_view or image"
+                }
+                "normals" => "normals VkImageResourceInfo must not have null image_view or image",
+                "roughness" => {
+                    "roughness VkImageResourceInfo must not have null image_view or image"
+                }
                 _ => "output VkImageResourceInfo must not have null image_view or image",
             }));
         }
@@ -98,7 +113,21 @@ impl VkImageResourceInfo {
     }
 }
 
-/// Optimal render dimensions and sharpness returned by `NGX_DLSS_GET_OPTIMAL_SETTINGS`.
+/// Returns `VK_IMAGE_ASPECT_DEPTH_BIT` (`2`) for Vulkan depth/stencil formats (`124..=130`) and
+/// `VK_IMAGE_ASPECT_COLOR_BIT` (`1`) for linear color formats such as `R32_SFLOAT` (`100`).
+#[cfg(has_ngx_sdk)]
+fn depth_aspect_mask(format: u32) -> u32 {
+    const VK_FORMAT_D16_UNORM: u32 = 124;
+    const VK_FORMAT_D32_SFLOAT_S8_UINT: u32 = 130;
+    if (VK_FORMAT_D16_UNORM..=VK_FORMAT_D32_SFLOAT_S8_UINT).contains(&format) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Optimal render dimensions and sharpness returned by `NGX_DLSS_GET_OPTIMAL_SETTINGS` and
+/// `NGX_DLSSD_GET_OPTIMAL_SETTINGS`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DlssOptimalSettings {
     /// Recommended render width in pixels.
@@ -115,6 +144,73 @@ pub struct DlssOptimalSettings {
     pub max_height: u32,
     /// Recommended sharpening factor.
     pub sharpness: f32,
+}
+
+/// Creation configuration for [`NgxVulkan::create_dlss_rr`] (`NVSDK_NGX_DLSSD_Create_Params`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DlssRrCreateParams {
+    /// Input render width in pixels.
+    pub render_width: u32,
+    /// Input render height in pixels.
+    pub render_height: u32,
+    /// Upscaled output width in pixels.
+    pub out_width: u32,
+    /// Upscaled output height in pixels.
+    pub out_height: u32,
+    /// Performance/quality preset.
+    pub quality: DlssPerfQuality,
+    /// Feature creation flags (typically `IS_HDR | MV_LOW_RES`).
+    pub flags: DlssFeatureFlags,
+    /// Roughness input packing (`Unpacked` vs `Packed` in `normals.w`).
+    pub roughness_mode: DlssRoughnessMode,
+    /// Depth buffer encoding (`Linear` vs `Hw`).
+    pub depth_type: DlssDepthType,
+    /// Optional Ray Reconstruction render preset hint.
+    pub preset: DlssRrPreset,
+}
+
+/// Per-frame evaluation inputs for [`FeatureHandle::evaluate_dlss_rr_with_params`]
+/// (`NVSDK_NGX_VK_DLSSD_Eval_Params`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DlssRrEvalParams {
+    /// Noisy linear HDR input color resource (`Color`).
+    pub color: VkImageResourceInfo,
+    /// Depth resource (`Depth`, matching creation [`DlssDepthType`]).
+    pub depth: VkImageResourceInfo,
+    /// 2D motion vectors (`MotionVectors`).
+    pub motion: VkImageResourceInfo,
+    /// Diffuse albedo guide (`DLSS.Input.DiffuseAlbedo`).
+    pub diffuse_albedo: VkImageResourceInfo,
+    /// Specular albedo guide (`DLSS.Input.SpecularAlbedo`).
+    pub specular_albedo: VkImageResourceInfo,
+    /// Surface normals guide (`GBuffer.Normals`; `.w` holds roughness if [`DlssRoughnessMode::Packed`]).
+    pub normals: VkImageResourceInfo,
+    /// Optional separate roughness guide (`GBuffer.Roughness`; required for [`DlssRoughnessMode::Unpacked`]).
+    pub roughness: Option<VkImageResourceInfo>,
+    /// Output denoised and upscaled color resource (`Output`, requires `read_write = true`).
+    pub output: VkImageResourceInfo,
+    /// Active render subrect width in pixels.
+    pub render_width: u32,
+    /// Active render subrect height in pixels.
+    pub render_height: u32,
+    /// Camera jitter offset X in render pixel space.
+    pub jitter_x: f32,
+    /// Camera jitter offset Y in render pixel space.
+    pub jitter_y: f32,
+    /// Motion vector X scale (`0.0` defaults to `1.0`).
+    pub mv_scale_x: f32,
+    /// Motion vector Y scale (`0.0` defaults to `1.0`).
+    pub mv_scale_y: f32,
+    /// Pre-exposure scalar (`0.0` defaults to `1.0`).
+    pub pre_exposure: f32,
+    /// Exposure scale (`0.0` defaults to `1.0`).
+    pub exposure_scale: f32,
+    /// Reset temporal history (`Reset`).
+    pub reset: bool,
+    /// Optional 4x4 world-to-view matrix (`WorldToViewMatrix`).
+    pub world_to_view: Option<[f32; 16]>,
+    /// Optional 4x4 view-to-clip matrix (`ViewToClipMatrix`).
+    pub view_to_clip: Option<[f32; 16]>,
 }
 
 #[cfg(has_ngx_sdk)]
@@ -455,10 +551,30 @@ impl NgxVulkan {
         }
     }
 
-    /// Queries recommended render dimensions and sharpness for DLSS Super Resolution
-    /// (`NGX_DLSS_GET_OPTIMAL_SETTINGS`).
-    pub fn query_dlss_optimal_settings(
+    /// Queries whether DLSS Ray Reconstruction (`SuperSamplingDenoising.Available`) is available
+    /// on this device and runtime.
+    pub fn is_dlss_rr_available(&self) -> Result<bool> {
+        #[cfg(has_ngx_sdk)]
+        {
+            let params = self.capability_parameters()?;
+            match params.get_i32(keys::RAY_RECONSTRUCTION_AVAILABLE) {
+                Ok(avail) => Ok(avail != 0),
+                Err(Error::Ngx { .. }) => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(not(has_ngx_sdk))]
+        {
+            Err(Error::Unsupported(
+                "NGX SDK is not available for this target".into(),
+            ))
+        }
+    }
+
+    fn query_optimal_settings_with_key(
         &self,
+        callback_key: &'static str,
+        call_name: &'static str,
         out_width: u32,
         out_height: u32,
         quality: DlssPerfQuality,
@@ -466,11 +582,10 @@ impl NgxVulkan {
         #[cfg(has_ngx_sdk)]
         {
             let mut params = self.capability_parameters()?;
-            let cb_ptr = params.get_void_ptr(keys::DLSS_OPTIMAL_SETTINGS_CALLBACK)?;
+            let cb_ptr = params.get_void_ptr(callback_key)?;
             if cb_ptr.is_null() {
-                // Match `NGX_DLSS_GET_OPTIMAL_SETTINGS`: missing callback means DLSS is out of date.
                 return Err(Error::Ngx {
-                    call: "NGX_DLSS_GET_OPTIMAL_SETTINGS",
+                    call: call_name,
                     code: ResultCode::OUT_OF_DATE,
                 });
             }
@@ -480,14 +595,14 @@ impl NgxVulkan {
             params.set_perf_quality(quality)?;
             params.set_i32(keys::RTX_VALUE, 0)?;
 
-            // SAFETY: `cb_ptr` is non-null and returned by NGX under `DLSSOptimalSettingsCallback`
-            // with signature `PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback`.
+            // SAFETY: `cb_ptr` is non-null and returned by NGX under the optimal-settings callback
+            // key with signature `PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback`.
             let callback: unsafe extern "C" fn(
                 *mut ngx_sys::NVSDK_NGX_Parameter,
             ) -> ngx_sys::NVSDK_NGX_Result = unsafe { std::mem::transmute(cb_ptr) };
             // SAFETY: `params.as_mut_ptr()` is a valid capability `NVSDK_NGX_Parameter` bag.
             let rc = unsafe { callback(params.as_mut_ptr()) };
-            check_sys("NVSDK_NGX_DLSS_GetOptimalSettingsCallback", rc)?;
+            check_sys(call_name, rc)?;
 
             let render_width = params.get_u32(keys::OUT_WIDTH)?;
             let render_height = params.get_u32(keys::OUT_HEIGHT)?;
@@ -517,11 +632,45 @@ impl NgxVulkan {
         }
         #[cfg(not(has_ngx_sdk))]
         {
-            let _ = (out_width, out_height, quality);
+            let _ = (callback_key, call_name, out_width, out_height, quality);
             Err(Error::Unsupported(
                 "NGX SDK is not available for this target".into(),
             ))
         }
+    }
+
+    /// Queries recommended render dimensions and sharpness for DLSS Super Resolution
+    /// (`NGX_DLSS_GET_OPTIMAL_SETTINGS`).
+    pub fn query_dlss_optimal_settings(
+        &self,
+        out_width: u32,
+        out_height: u32,
+        quality: DlssPerfQuality,
+    ) -> Result<DlssOptimalSettings> {
+        self.query_optimal_settings_with_key(
+            keys::DLSS_OPTIMAL_SETTINGS_CALLBACK,
+            "NGX_DLSS_GET_OPTIMAL_SETTINGS",
+            out_width,
+            out_height,
+            quality,
+        )
+    }
+
+    /// Queries recommended render dimensions and sharpness for DLSS Ray Reconstruction
+    /// (`NGX_DLSSD_GET_OPTIMAL_SETTINGS`).
+    pub fn query_dlss_rr_optimal_settings(
+        &self,
+        out_width: u32,
+        out_height: u32,
+        quality: DlssPerfQuality,
+    ) -> Result<DlssOptimalSettings> {
+        self.query_optimal_settings_with_key(
+            keys::DLSSD_OPTIMAL_SETTINGS_CALLBACK,
+            "NGX_DLSSD_GET_OPTIMAL_SETTINGS",
+            out_width,
+            out_height,
+            quality,
+        )
     }
 
     /// Creates a DLSS Super Resolution feature handle on `cmd_buffer`
@@ -566,6 +715,46 @@ impl NgxVulkan {
                 quality,
                 flags,
             );
+            Err(Error::Unsupported(
+                "NGX SDK is not available for this target".into(),
+            ))
+        }
+    }
+
+    /// Creates a DLSS Ray Reconstruction feature handle on `cmd_buffer`
+    /// (`NGX_VULKAN_CREATE_DLSSD_EXT1`).
+    ///
+    /// # Safety
+    ///
+    /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` belonging to the `VkDevice` used
+    /// to initialize this [`NgxVulkan`] session.
+    pub unsafe fn create_dlss_rr(
+        &self,
+        cmd_buffer: *mut c_void,
+        config: &DlssRrCreateParams,
+    ) -> Result<FeatureHandle> {
+        #[cfg(has_ngx_sdk)]
+        {
+            let mut params = self.allocate_parameters()?;
+            params.set_u32(keys::CREATION_NODE_MASK, 1)?;
+            params.set_u32(keys::VISIBILITY_NODE_MASK, 1)?;
+            params.set_render_dimensions(config.render_width, config.render_height)?;
+            params.set_output_dimensions(config.out_width, config.out_height)?;
+            params.set_perf_quality(config.quality)?;
+            params.set_dlss_feature_flags(config.flags)?;
+            params.set_i32(keys::DLSS_ENABLE_OUTPUT_SUBRECTS, 0)?;
+            params.set_dlss_denoise_mode(DlssDenoiseMode::DlUnified)?;
+            params.set_dlss_roughness_mode(config.roughness_mode)?;
+            params.set_dlss_depth_type(config.depth_type)?;
+            if config.preset != DlssRrPreset::Default {
+                params.set_dlss_rr_preset(config.quality, config.preset)?;
+            }
+            // SAFETY: Caller guarantees `cmd_buffer` is a valid recording `VkCommandBuffer`.
+            unsafe { self.create_feature(cmd_buffer, Feature::RayReconstruction, &mut params) }
+        }
+        #[cfg(not(has_ngx_sdk))]
+        {
+            let _ = (cmd_buffer, config);
             Err(Error::Unsupported(
                 "NGX SDK is not available for this target".into(),
             ))
@@ -666,17 +855,7 @@ impl FeatureHandle {
             motion.validate("motion")?;
             output.validate("output")?;
 
-            // `VK_IMAGE_ASPECT_COLOR_BIT = 1`, `VK_IMAGE_ASPECT_DEPTH_BIT = 2`.
-            // Depth may be supplied either as a depth/stencil format (`124..=130`) or as a
-            // linear `R32_SFLOAT` (`100`) color texture; using `DEPTH_BIT` on `R32_SFLOAT` is invalid.
-            const VK_FORMAT_D16_UNORM: u32 = 124;
-            const VK_FORMAT_D32_SFLOAT_S8_UINT: u32 = 130;
-            let depth_aspect =
-                if (VK_FORMAT_D16_UNORM..=VK_FORMAT_D32_SFLOAT_S8_UINT).contains(&depth.format) {
-                    2
-                } else {
-                    1
-                };
+            let depth_aspect = depth_aspect_mask(depth.format);
             let mut color_res = color.into_ngx_resource(1);
             let mut depth_res = depth.into_ngx_resource(depth_aspect);
             let mut motion_res = motion.into_ngx_resource(1);
@@ -802,6 +981,122 @@ impl FeatureHandle {
                 sharpness,
                 reset,
             );
+            Err(Error::Unsupported(
+                "NGX SDK is not available for this target".into(),
+            ))
+        }
+    }
+
+    /// Evaluates a DLSS Ray Reconstruction feature on `cmd_buffer` using a caller-supplied
+    /// [`Parameters`] bag (`NGX_VULKAN_EVALUATE_DLSSD_EXT`) to avoid per-frame allocations.
+    ///
+    /// # Safety
+    ///
+    /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` and all `VkImage` / `VkImageView`
+    /// handles in `eval` must remain valid until GPU execution completes.
+    pub unsafe fn evaluate_dlss_rr_with_params(
+        &self,
+        cmd_buffer: *mut c_void,
+        params: &mut Parameters,
+        eval: &DlssRrEvalParams,
+    ) -> Result<()> {
+        #[cfg(has_ngx_sdk)]
+        {
+            if cmd_buffer.is_null() {
+                return Err(Error::InvalidArgument("cmd_buffer must not be null"));
+            }
+            eval.color.validate("color")?;
+            eval.depth.validate("depth")?;
+            eval.motion.validate("motion")?;
+            eval.diffuse_albedo.validate("diffuse_albedo")?;
+            eval.specular_albedo.validate("specular_albedo")?;
+            eval.normals.validate("normals")?;
+            if let Some(roughness) = eval.roughness {
+                roughness.validate("roughness")?;
+            }
+            eval.output.validate("output")?;
+
+            let mut color_res = eval.color.into_ngx_resource(1);
+            let mut depth_res = eval
+                .depth
+                .into_ngx_resource(depth_aspect_mask(eval.depth.format));
+            let mut motion_res = eval.motion.into_ngx_resource(1);
+            let mut diffuse_res = eval.diffuse_albedo.into_ngx_resource(1);
+            let mut specular_res = eval.specular_albedo.into_ngx_resource(1);
+            let mut normals_res = eval.normals.into_ngx_resource(1);
+            let mut roughness_res = eval.roughness.map(|r| r.into_ngx_resource(1));
+            let mut output_res = eval.output.into_ngx_resource(1);
+            let mut world_to_view = eval.world_to_view;
+            let mut view_to_clip = eval.view_to_clip;
+
+            let roughness_ptr = roughness_res
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |r| (&raw mut *r).cast());
+            let w2v_ptr = world_to_view
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
+            let v2c_ptr = view_to_clip
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
+
+            // SAFETY: Every stack resource and optional matrix outlives `self.evaluate(cmd_buffer, params)`.
+            unsafe {
+                params.set_void_ptr(keys::COLOR, (&raw mut color_res).cast())?;
+                params.set_void_ptr(keys::OUTPUT, (&raw mut output_res).cast())?;
+                params.set_void_ptr(keys::DEPTH, (&raw mut depth_res).cast())?;
+                params.set_void_ptr(keys::MOTION_VECTORS, (&raw mut motion_res).cast())?;
+                params.set_void_ptr(keys::DLSS_INPUT_DIFFUSE_ALBEDO, (&raw mut diffuse_res).cast())?;
+                params
+                    .set_void_ptr(keys::DLSS_INPUT_SPECULAR_ALBEDO, (&raw mut specular_res).cast())?;
+                params.set_void_ptr(keys::GBUFFER_NORMALS, (&raw mut normals_res).cast())?;
+                params.set_void_ptr(keys::GBUFFER_ROUGHNESS, roughness_ptr)?;
+                params.set_void_ptr(keys::WORLD_TO_VIEW_MATRIX, w2v_ptr)?;
+                params.set_void_ptr(keys::VIEW_TO_CLIP_MATRIX, v2c_ptr)?;
+            }
+            params.set_f32(keys::JITTER_OFFSET_X, eval.jitter_x)?;
+            params.set_f32(keys::JITTER_OFFSET_Y, eval.jitter_y)?;
+            params.set_i32(keys::RESET, i32::from(eval.reset))?;
+            params.set_f32(
+                keys::MV_SCALE_X,
+                if eval.mv_scale_x == 0.0 {
+                    1.0
+                } else {
+                    eval.mv_scale_x
+                },
+            )?;
+            params.set_f32(
+                keys::MV_SCALE_Y,
+                if eval.mv_scale_y == 0.0 {
+                    1.0
+                } else {
+                    eval.mv_scale_y
+                },
+            )?;
+            params.set_u32(keys::DLSS_RENDER_SUBRECT_WIDTH, eval.render_width)?;
+            params.set_u32(keys::DLSS_RENDER_SUBRECT_HEIGHT, eval.render_height)?;
+            params.set_f32(
+                keys::DLSS_PRE_EXPOSURE,
+                if eval.pre_exposure == 0.0 {
+                    1.0
+                } else {
+                    eval.pre_exposure
+                },
+            )?;
+            params.set_f32(
+                keys::DLSS_EXPOSURE_SCALE,
+                if eval.exposure_scale == 0.0 {
+                    1.0
+                } else {
+                    eval.exposure_scale
+                },
+            )?;
+
+            // SAFETY: Caller guarantees `cmd_buffer` and referenced GPU resources are valid.
+            unsafe { self.evaluate(cmd_buffer, params) }
+        }
+        #[cfg(not(has_ngx_sdk))]
+        {
+            let _ = (cmd_buffer, params, eval);
             Err(Error::Unsupported(
                 "NGX SDK is not available for this target".into(),
             ))

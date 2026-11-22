@@ -591,7 +591,7 @@ dependencies = [
 [[package]]
 name = "csg-citygen"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -606,7 +606,7 @@ dependencies = [
 [[package]]
 name = "csg-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "bytemuck",
  "serde",
@@ -615,7 +615,7 @@ dependencies = [
 [[package]]
 name = "csg-device"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -624,7 +624,7 @@ dependencies = [
 [[package]]
 name = "csg-kits"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-core",
  "csg-scene",
@@ -634,7 +634,7 @@ dependencies = [
 [[package]]
 name = "csg-scene"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-gundo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -655,7 +655,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-marina"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -668,7 +668,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-sf-house-of-ai"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -681,7 +681,7 @@ dependencies = [
 [[package]]
 name = "csg-scenes"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a9df31eddae9998321b70ad71a54a6723e5bc85d"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -3256,7 +3256,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3611,7 +3611,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.52.0",
@@ -4521,15 +4521,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -4684,7 +4675,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

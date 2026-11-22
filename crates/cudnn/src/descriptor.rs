@@ -106,6 +106,83 @@ impl ConvFwdAlgo {
     }
 }
 
+/// Backward-data convolution algorithm (`cudnnConvolutionBwdDataAlgo_t`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConvBwdDataAlgo {
+    /// Non-deterministic atomic sum (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_0`).
+    Algo0,
+    /// Deterministic implicit GEMM (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_1`).
+    Algo1,
+    /// FFT-based backward data (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT`).
+    Fft,
+    /// Tiled FFT backward data (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING`).
+    FftTiling,
+    /// Winograd backward data (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD`).
+    Winograd,
+    /// Non-fused Winograd backward data (`CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED`).
+    WinogradNonfused,
+}
+
+impl ConvBwdDataAlgo {
+    /// Converts to the underlying `cudnnConvolutionBwdDataAlgo_t`.
+    pub const fn to_sys(self) -> sys::cudnnConvolutionBwdDataAlgo_t {
+        match self {
+            Self::Algo0 => sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
+            Self::Algo1 => sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_1,
+            Self::Fft => sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT,
+            Self::FftTiling => {
+                sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING
+            }
+            Self::Winograd => {
+                sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD
+            }
+            Self::WinogradNonfused => {
+                sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED
+            }
+        }
+    }
+}
+
+/// Backward-filter convolution algorithm (`cudnnConvolutionBwdFilterAlgo_t`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConvBwdFilterAlgo {
+    /// Non-deterministic atomic sum (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0`).
+    Algo0,
+    /// Deterministic implicit GEMM (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1`).
+    Algo1,
+    /// FFT-based backward filter (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT`).
+    Fft,
+    /// Atomic sum with workspace (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3`).
+    Algo3,
+    /// Winograd backward filter (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD`).
+    Winograd,
+    /// Non-fused Winograd backward filter (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED`).
+    WinogradNonfused,
+    /// Tiled FFT backward filter (`CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING`).
+    FftTiling,
+}
+
+impl ConvBwdFilterAlgo {
+    /// Converts to the underlying `cudnnConvolutionBwdFilterAlgo_t`.
+    pub const fn to_sys(self) -> sys::cudnnConvolutionBwdFilterAlgo_t {
+        match self {
+            Self::Algo0 => sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
+            Self::Algo1 => sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1,
+            Self::Fft => sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT,
+            Self::Algo3 => sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3,
+            Self::Winograd => {
+                sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD
+            }
+            Self::WinogradNonfused => {
+                sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED
+            }
+            Self::FftTiling => {
+                sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING
+            }
+        }
+    }
+}
+
 /// Activation function kind (`cudnnActivationMode_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ActivationMode {

@@ -13,8 +13,8 @@ use cuda_core::{DeviceBuffer, Stream};
 use cudnn_sys as sys;
 
 use crate::descriptor::{
-    ActivationDescriptor, ConvFwdAlgo, ConvolutionDescriptor, FilterDescriptor, PoolingDescriptor,
-    TensorDescriptor,
+    ActivationDescriptor, ConvBwdDataAlgo, ConvBwdFilterAlgo, ConvFwdAlgo, ConvolutionDescriptor,
+    FilterDescriptor, PoolingDescriptor, TensorDescriptor,
 };
 use crate::handle::Handle;
 use crate::scratch::Scratch;
@@ -267,6 +267,440 @@ where
         )
     };
     check("cudnnConvolutionForward", status)
+}
+
+/// Executes forward convolution `y = alpha * conv(x, w) + beta * y` on `stream` using raw CUDA
+/// device pointers owned by an external GPU allocator (e.g. CubeCL pinned resources).
+///
+/// # Safety
+/// - `x_ptr`, `w_ptr`, and `y_ptr` must be valid device allocations in `handle.context()` spanning
+///   at least `x_bytes`, `w_bytes`, and `y_bytes` bytes respectively.
+/// - The allocations must remain alive and stationary until `stream` completes.
+/// - `y_ptr` must not alias `x_ptr` or `w_ptr`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct raw-pointer wrapper over cudnnConvolutionForward parameters"
+)]
+pub unsafe fn conv_forward_raw(
+    handle: &mut Handle,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    budget: Option<usize>,
+    alpha: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    x_bytes: usize,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    w_bytes: usize,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvFwdAlgo,
+    beta: f64,
+    y_desc: &TensorDescriptor,
+    y_ptr: cuda_bindings::CUdeviceptr,
+    y_bytes: usize,
+) -> Result<()> {
+    let ctx = handle.context().clone();
+    same_ctx(stream, &ctx)?;
+    if !Arc::ptr_eq(x_desc.context(), &ctx)
+        || !Arc::ptr_eq(w_desc.context(), &ctx)
+        || !Arc::ptr_eq(conv_desc.context(), &ctx)
+        || !Arc::ptr_eq(y_desc.context(), &ctx)
+    {
+        return Err(Error::Invalid("convolution descriptor context mismatch"));
+    }
+    if x_bytes < x_desc.size_in_bytes() {
+        return Err(Error::Invalid("input buffer smaller than descriptor size_in_bytes"));
+    }
+    if w_bytes < w_desc.size_in_bytes() {
+        return Err(Error::Invalid("filter buffer smaller than descriptor size_in_bytes"));
+    }
+    if y_bytes < y_desc.size_in_bytes() {
+        return Err(Error::Invalid("output buffer smaller than descriptor size_in_bytes"));
+    }
+
+    let needed = conv_forward_workspace_size(handle, x_desc, w_desc, conv_desc, y_desc, algo)?;
+    let (ws_ptr, ws_bytes) = scratch.reserve(stream, needed, budget)?;
+    handle.ensure_stream(stream)?;
+
+    let scale = ScalePair::new(y_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+
+    // SAFETY: caller upholds device pointer validity, non-aliasing, and stream lifetime; context,
+    // stream, byte spans, and workspace capacity are validated above.
+    let status = unsafe {
+        sys::cudnnConvolutionForward(
+            handle.as_raw(),
+            alpha_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            w_desc.as_raw(),
+            w_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            y_desc.as_raw(),
+            y_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionForward", status)
+}
+
+/// Queries the backward-data convolution workspace size in bytes for `algo`.
+pub fn conv_backward_data_workspace_size(
+    handle: &Handle,
+    w_desc: &FilterDescriptor,
+    dy_desc: &TensorDescriptor,
+    conv_desc: &ConvolutionDescriptor,
+    dx_desc: &TensorDescriptor,
+    algo: ConvBwdDataAlgo,
+) -> Result<usize> {
+    let ctx = handle.context();
+    if !Arc::ptr_eq(w_desc.context(), ctx)
+        || !Arc::ptr_eq(dy_desc.context(), ctx)
+        || !Arc::ptr_eq(conv_desc.context(), ctx)
+        || !Arc::ptr_eq(dx_desc.context(), ctx)
+    {
+        return Err(Error::Invalid("convolution descriptor context mismatch"));
+    }
+    ctx.bind_to_thread()?;
+    let mut size_in_bytes = 0usize;
+    // SAFETY: handle and descriptors are valid on `ctx` and `size_in_bytes` is a valid out-ptr.
+    let status = unsafe {
+        sys::cudnnGetConvolutionBackwardDataWorkspaceSize(
+            handle.as_raw(),
+            w_desc.as_raw(),
+            dy_desc.as_raw(),
+            conv_desc.as_raw(),
+            dx_desc.as_raw(),
+            algo.to_sys(),
+            &mut size_in_bytes,
+        )
+    };
+    check("cudnnGetConvolutionBackwardDataWorkspaceSize", status)?;
+    Ok(size_in_bytes)
+}
+
+/// Executes backward-data convolution `dx = alpha * conv_bwd_data(w, dy) + beta * dx` on `stream`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct typed wrapper over cudnnConvolutionBackwardData parameters"
+)]
+pub fn conv_backward_data<W, DY, DX>(
+    handle: &mut Handle,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    budget: Option<usize>,
+    alpha: f64,
+    w_desc: &FilterDescriptor,
+    w: &W,
+    dy_desc: &TensorDescriptor,
+    dy: &DY,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdDataAlgo,
+    beta: f64,
+    dx_desc: &TensorDescriptor,
+    dx: &mut DeviceBuffer<DX>,
+) -> Result<()>
+where
+    W: DeviceSpan + ?Sized,
+    DY: DeviceSpan + ?Sized,
+    DX: Sized,
+{
+    let ctx = handle.context().clone();
+    check_filter_buf(&ctx, w_desc, w)?;
+    check_tensor_buf(
+        &ctx,
+        dy_desc,
+        dy,
+        "dy buffer smaller than descriptor size_in_bytes",
+    )?;
+    check_mut_tensor_buf(&ctx, dx_desc, dx)?;
+    // SAFETY: `w`, `dy`, and `dx` are validated `DeviceSpan`/`DeviceBuffer` allocations on `ctx`,
+    // and `&mut DeviceBuffer<DX>` guarantees exclusivity against `w` and `dy`.
+    unsafe {
+        conv_backward_data_raw(
+            handle,
+            stream,
+            scratch,
+            budget,
+            alpha,
+            w_desc,
+            w.cu_deviceptr(),
+            w.num_bytes(),
+            dy_desc,
+            dy.cu_deviceptr(),
+            dy.num_bytes(),
+            conv_desc,
+            algo,
+            beta,
+            dx_desc,
+            dx.cu_deviceptr(),
+            dx.num_bytes(),
+        )
+    }
+}
+
+/// Executes backward-data convolution `dx = alpha * conv_bwd_data(w, dy) + beta * dx` on `stream`
+/// using raw CUDA device pointers owned by an external GPU allocator.
+///
+/// # Safety
+/// - `w_ptr`, `dy_ptr`, and `dx_ptr` must be valid device allocations in `handle.context()` spanning
+///   at least `w_bytes`, `dy_bytes`, and `dx_bytes` bytes respectively.
+/// - Allocations must remain alive and stationary until `stream` completes; `dx_ptr` must not alias
+///   `w_ptr` or `dy_ptr`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct raw-pointer wrapper over cudnnConvolutionBackwardData parameters"
+)]
+pub unsafe fn conv_backward_data_raw(
+    handle: &mut Handle,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    budget: Option<usize>,
+    alpha: f64,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    w_bytes: usize,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    dy_bytes: usize,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdDataAlgo,
+    beta: f64,
+    dx_desc: &TensorDescriptor,
+    dx_ptr: cuda_bindings::CUdeviceptr,
+    dx_bytes: usize,
+) -> Result<()> {
+    let ctx = handle.context().clone();
+    same_ctx(stream, &ctx)?;
+    if !Arc::ptr_eq(w_desc.context(), &ctx)
+        || !Arc::ptr_eq(dy_desc.context(), &ctx)
+        || !Arc::ptr_eq(conv_desc.context(), &ctx)
+        || !Arc::ptr_eq(dx_desc.context(), &ctx)
+    {
+        return Err(Error::Invalid("convolution descriptor context mismatch"));
+    }
+    if w_bytes < w_desc.size_in_bytes() {
+        return Err(Error::Invalid("filter buffer smaller than descriptor size_in_bytes"));
+    }
+    if dy_bytes < dy_desc.size_in_bytes() {
+        return Err(Error::Invalid("dy buffer smaller than descriptor size_in_bytes"));
+    }
+    if dx_bytes < dx_desc.size_in_bytes() {
+        return Err(Error::Invalid("dx buffer smaller than descriptor size_in_bytes"));
+    }
+
+    let needed =
+        conv_backward_data_workspace_size(handle, w_desc, dy_desc, conv_desc, dx_desc, algo)?;
+    let (ws_ptr, ws_bytes) = scratch.reserve(stream, needed, budget)?;
+    handle.ensure_stream(stream)?;
+
+    let scale = ScalePair::new(dx_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+
+    // SAFETY: caller upholds device pointer validity, non-aliasing, and stream lifetime; context,
+    // stream, byte spans, and workspace capacity are validated above.
+    let status = unsafe {
+        sys::cudnnConvolutionBackwardData(
+            handle.as_raw(),
+            alpha_ptr,
+            w_desc.as_raw(),
+            w_ptr as *const c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            dx_desc.as_raw(),
+            dx_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionBackwardData", status)
+}
+
+/// Queries the backward-filter convolution workspace size in bytes for `algo`.
+pub fn conv_backward_filter_workspace_size(
+    handle: &Handle,
+    x_desc: &TensorDescriptor,
+    dy_desc: &TensorDescriptor,
+    conv_desc: &ConvolutionDescriptor,
+    dw_desc: &FilterDescriptor,
+    algo: ConvBwdFilterAlgo,
+) -> Result<usize> {
+    let ctx = handle.context();
+    if !Arc::ptr_eq(x_desc.context(), ctx)
+        || !Arc::ptr_eq(dy_desc.context(), ctx)
+        || !Arc::ptr_eq(conv_desc.context(), ctx)
+        || !Arc::ptr_eq(dw_desc.context(), ctx)
+    {
+        return Err(Error::Invalid("convolution descriptor context mismatch"));
+    }
+    ctx.bind_to_thread()?;
+    let mut size_in_bytes = 0usize;
+    // SAFETY: handle and descriptors are valid on `ctx` and `size_in_bytes` is a valid out-ptr.
+    let status = unsafe {
+        sys::cudnnGetConvolutionBackwardFilterWorkspaceSize(
+            handle.as_raw(),
+            x_desc.as_raw(),
+            dy_desc.as_raw(),
+            conv_desc.as_raw(),
+            dw_desc.as_raw(),
+            algo.to_sys(),
+            &mut size_in_bytes,
+        )
+    };
+    check("cudnnGetConvolutionBackwardFilterWorkspaceSize", status)?;
+    Ok(size_in_bytes)
+}
+
+/// Executes backward-filter convolution `dw = alpha * conv_bwd_filter(x, dy) + beta * dw` on `stream`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct typed wrapper over cudnnConvolutionBackwardFilter parameters"
+)]
+pub fn conv_backward_filter<X, DY, DW>(
+    handle: &mut Handle,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    budget: Option<usize>,
+    alpha: f64,
+    x_desc: &TensorDescriptor,
+    x: &X,
+    dy_desc: &TensorDescriptor,
+    dy: &DY,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdFilterAlgo,
+    beta: f64,
+    dw_desc: &FilterDescriptor,
+    dw: &mut DeviceBuffer<DW>,
+) -> Result<()>
+where
+    X: DeviceSpan + ?Sized,
+    DY: DeviceSpan + ?Sized,
+    DW: Sized,
+{
+    let ctx = handle.context().clone();
+    check_tensor_buf(
+        &ctx,
+        x_desc,
+        x,
+        "input buffer smaller than descriptor size_in_bytes",
+    )?;
+    check_tensor_buf(
+        &ctx,
+        dy_desc,
+        dy,
+        "dy buffer smaller than descriptor size_in_bytes",
+    )?;
+    check_filter_buf(&ctx, dw_desc, dw)?;
+    // SAFETY: `x`, `dy`, and `dw` are validated `DeviceSpan`/`DeviceBuffer` allocations on `ctx`,
+    // and `&mut DeviceBuffer<DW>` guarantees exclusivity against `x` and `dy`.
+    unsafe {
+        conv_backward_filter_raw(
+            handle,
+            stream,
+            scratch,
+            budget,
+            alpha,
+            x_desc,
+            x.cu_deviceptr(),
+            x.num_bytes(),
+            dy_desc,
+            dy.cu_deviceptr(),
+            dy.num_bytes(),
+            conv_desc,
+            algo,
+            beta,
+            dw_desc,
+            dw.cu_deviceptr(),
+            dw.num_bytes(),
+        )
+    }
+}
+
+/// Executes backward-filter convolution `dw = alpha * conv_bwd_filter(x, dy) + beta * dw` on `stream`
+/// using raw CUDA device pointers owned by an external GPU allocator.
+///
+/// # Safety
+/// - `x_ptr`, `dy_ptr`, and `dw_ptr` must be valid device allocations in `handle.context()` spanning
+///   at least `x_bytes`, `dy_bytes`, and `dw_bytes` bytes respectively.
+/// - Allocations must remain alive and stationary until `stream` completes; `dw_ptr` must not alias
+///   `x_ptr` or `dy_ptr`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct raw-pointer wrapper over cudnnConvolutionBackwardFilter parameters"
+)]
+pub unsafe fn conv_backward_filter_raw(
+    handle: &mut Handle,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    budget: Option<usize>,
+    alpha: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    x_bytes: usize,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    dy_bytes: usize,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdFilterAlgo,
+    beta: f64,
+    dw_desc: &FilterDescriptor,
+    dw_ptr: cuda_bindings::CUdeviceptr,
+    dw_bytes: usize,
+) -> Result<()> {
+    let ctx = handle.context().clone();
+    same_ctx(stream, &ctx)?;
+    if !Arc::ptr_eq(x_desc.context(), &ctx)
+        || !Arc::ptr_eq(dy_desc.context(), &ctx)
+        || !Arc::ptr_eq(conv_desc.context(), &ctx)
+        || !Arc::ptr_eq(dw_desc.context(), &ctx)
+    {
+        return Err(Error::Invalid("convolution descriptor context mismatch"));
+    }
+    if x_bytes < x_desc.size_in_bytes() {
+        return Err(Error::Invalid("input buffer smaller than descriptor size_in_bytes"));
+    }
+    if dy_bytes < dy_desc.size_in_bytes() {
+        return Err(Error::Invalid("dy buffer smaller than descriptor size_in_bytes"));
+    }
+    if dw_bytes < dw_desc.size_in_bytes() {
+        return Err(Error::Invalid("dw buffer smaller than descriptor size_in_bytes"));
+    }
+
+    let needed =
+        conv_backward_filter_workspace_size(handle, x_desc, dy_desc, conv_desc, dw_desc, algo)?;
+    let (ws_ptr, ws_bytes) = scratch.reserve(stream, needed, budget)?;
+    handle.ensure_stream(stream)?;
+
+    let scale = ScalePair::new(dw_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+
+    // SAFETY: caller upholds device pointer validity, non-aliasing, and stream lifetime; context,
+    // stream, byte spans, and workspace capacity are validated above.
+    let status = unsafe {
+        sys::cudnnConvolutionBackwardFilter(
+            handle.as_raw(),
+            alpha_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            dw_desc.as_raw(),
+            dw_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionBackwardFilter", status)
 }
 
 /// Executes elementwise activation `y = alpha * act(x) + beta * y` on `stream`.
@@ -660,5 +1094,159 @@ mod tests {
         let sm = sm_out.to_host_vec(&stream).unwrap();
         assert!((sm[0] + sm[1] - 1.0).abs() < 1e-5);
         assert!(sm[1] > sm[0]);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and cuDNN runtime"]
+    fn t2_conv_backward_data_and_filter() {
+        let dev = cuda_core::Device::new(0).unwrap();
+        let ctx = dev.primary_context().unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut handle = Handle::new(&ctx).unwrap();
+        let mut scratch = Scratch::new(&stream);
+
+        let (n, c_in, c_out, h, w_in, k) = (2usize, 3, 4, 5, 5, 3);
+        let x_host: Vec<f32> = (0..n * c_in * h * w_in)
+            .map(|i| (((i * 29 + 7) % 97) as f32 / 97.0 - 0.5) * 1.5)
+            .collect();
+        let w_host: Vec<f32> = (0..c_out * c_in * k * k)
+            .map(|i| (((i * 41 + 13) % 89) as f32 / 89.0 - 0.5) * 1.2)
+            .collect();
+        let dy_host: Vec<f32> = (0..n * c_out * h * w_in)
+            .map(|i| (((i * 19 + 5) % 83) as f32 / 83.0 - 0.5) * 1.0)
+            .collect();
+
+        let x_desc = TensorDescriptor::new_4d(
+            &ctx,
+            crate::TensorFormat::Nchw,
+            DataType::F32,
+            [n, c_in, h, w_in],
+        )
+        .unwrap();
+        let w_desc = FilterDescriptor::new_4d(
+            &ctx,
+            crate::TensorFormat::Nchw,
+            DataType::F32,
+            [c_out, c_in, k, k],
+        )
+        .unwrap();
+        let conv_desc = ConvolutionDescriptor::new_2d(
+            &ctx,
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            crate::ConvMode::CrossCorrelation,
+            DataType::F32,
+        )
+        .unwrap();
+        let y_dims = conv_desc.output_dim_4d(&x_desc, &w_desc).unwrap();
+        assert_eq!(y_dims, [n, c_out, h, w_in]);
+        let y_desc = TensorDescriptor::new_4d(
+            &ctx,
+            crate::TensorFormat::Nchw,
+            DataType::F32,
+            y_dims,
+        )
+        .unwrap();
+
+        let x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
+        let w_dev = DeviceBuffer::from_host(&stream, &w_host).unwrap();
+        let dy_dev = DeviceBuffer::from_host(&stream, &dy_host).unwrap();
+        let mut dx_dev = DeviceBuffer::<f32>::zeroed(&stream, x_host.len()).unwrap();
+        let mut dw_dev = DeviceBuffer::<f32>::zeroed(&stream, w_host.len()).unwrap();
+
+        conv_backward_data(
+            &mut handle,
+            &stream,
+            &mut scratch,
+            None,
+            1.0,
+            &w_desc,
+            &w_dev,
+            &y_desc,
+            &dy_dev,
+            &conv_desc,
+            ConvBwdDataAlgo::Algo1,
+            0.0,
+            &x_desc,
+            &mut dx_dev,
+        )
+        .unwrap();
+        conv_backward_filter(
+            &mut handle,
+            &stream,
+            &mut scratch,
+            None,
+            1.0,
+            &x_desc,
+            &x_dev,
+            &y_desc,
+            &dy_dev,
+            &conv_desc,
+            ConvBwdFilterAlgo::Algo1,
+            0.0,
+            &w_desc,
+            &mut dw_dev,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let dx = dx_dev.to_host_vec(&stream).unwrap();
+        let dw = dw_dev.to_host_vec(&stream).unwrap();
+
+        // Central finite-difference check on sampled x and w entries.
+        let eps = 1e-3_f32;
+        let mut y_buf = DeviceBuffer::<f32>::zeroed(&stream, dy_host.len()).unwrap();
+        let mut eval_loss = |xv: &[f32], wv: &[f32]| -> f64 {
+            let xd = DeviceBuffer::from_host(&stream, xv).unwrap();
+            let wd = DeviceBuffer::from_host(&stream, wv).unwrap();
+            conv_forward(
+                &mut handle,
+                &stream,
+                &mut scratch,
+                None,
+                1.0,
+                &x_desc,
+                &xd,
+                &w_desc,
+                &wd,
+                &conv_desc,
+                ConvFwdAlgo::ImplicitPrecompGemm,
+                0.0,
+                &y_desc,
+                &mut y_buf,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let yv = y_buf.to_host_vec(&stream).unwrap();
+            yv.iter()
+                .zip(&dy_host)
+                .map(|(&y, &dy)| f64::from(y) * f64::from(dy))
+                .sum()
+        };
+
+        for idx in [0, 17, 63, x_host.len() - 1] {
+            let mut xp = x_host.clone();
+            let mut xm = x_host.clone();
+            xp[idx] += eps;
+            xm[idx] -= eps;
+            let num = (eval_loss(&xp, &w_host) - eval_loss(&xm, &w_host)) / (2.0 * f64::from(eps));
+            assert!(
+                (num - f64::from(dx[idx])).abs() < 5e-4,
+                "dx[{idx}] mismatch: cudnn={} num={num}",
+                dx[idx]
+            );
+        }
+        for idx in [0, 11, 55, w_host.len() - 1] {
+            let mut wp = w_host.clone();
+            let mut wm = w_host.clone();
+            wp[idx] += eps;
+            wm[idx] -= eps;
+            let num = (eval_loss(&x_host, &wp) - eval_loss(&x_host, &wm)) / (2.0 * f64::from(eps));
+            assert!(
+                (num - f64::from(dw[idx])).abs() < 5e-4,
+                "dw[{idx}] mismatch: cudnn={} num={num}",
+                dw[idx]
+            );
+        }
     }
 }

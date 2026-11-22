@@ -25,14 +25,17 @@ use cudnn_sys as sys;
 use thiserror::Error;
 
 pub use descriptor::{
-    ActivationDescriptor, ActivationMode, ConvFwdAlgo, ConvMode, ConvolutionDescriptor,
-    FilterDescriptor, MAX_DIMS, MathType, PoolingDescriptor, PoolingMode, TensorDescriptor,
+    ActivationDescriptor, ActivationMode, ConvBwdDataAlgo, ConvBwdFilterAlgo, ConvFwdAlgo,
+    ConvMode, ConvolutionDescriptor, FilterDescriptor, MAX_DIMS, MathType, PoolingDescriptor,
+    PoolingMode, TensorDescriptor,
 };
 pub use handle::Handle;
 pub use ops::{
     BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward, batch_norm_forward_inference,
-    conv_forward, conv_forward_workspace_size, derive_bn_tensor_desc, pooling_forward,
-    softmax_forward,
+    conv_backward_data, conv_backward_data_raw, conv_backward_data_workspace_size,
+    conv_backward_filter, conv_backward_filter_raw, conv_backward_filter_workspace_size,
+    conv_forward, conv_forward_raw, conv_forward_workspace_size, derive_bn_tensor_desc,
+    pooling_forward, softmax_forward,
 };
 pub use scratch::Scratch;
 

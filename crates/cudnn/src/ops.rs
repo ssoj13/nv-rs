@@ -1129,6 +1129,131 @@ where
     check("cudnnBatchNormalizationForwardInference", status)
 }
 
+/// Zero-overhead spatial/per-activation batch normalization training forward on the CUDA stream
+/// already bound to `handle` (via [`Handle::set_stream`] or [`Handle::set_raw_stream`]).
+///
+/// Computes `y = alpha * bn(x) + beta * y`, writes per-channel `save_mean` and `save_inv_var`
+/// (`1 / sqrt(var + eps)`), and optionally updates `running_mean` / `running_var` in place when
+/// both `running_mean_ptr` and `running_var_ptr` are `Some`.
+///
+/// # Safety
+/// - All non-null device pointers must be valid allocations in `handle.context()` spanning at
+///   least their descriptor byte sizes, and remain alive until the bound CUDA stream completes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct zero-overhead wrapper over cudnnBatchNormalizationForwardTraining"
+)]
+pub unsafe fn batch_norm_forward_training_on_bound_stream(
+    handle: &mut Handle,
+    mode: BatchNormMode,
+    alpha: f64,
+    beta: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    y_desc: &TensorDescriptor,
+    y_ptr: cuda_bindings::CUdeviceptr,
+    bn_param_desc: &TensorDescriptor,
+    scale_ptr: cuda_bindings::CUdeviceptr,
+    bias_ptr: cuda_bindings::CUdeviceptr,
+    exp_avg_factor: f64,
+    running_mean_ptr: Option<cuda_bindings::CUdeviceptr>,
+    running_var_ptr: Option<cuda_bindings::CUdeviceptr>,
+    epsilon: f64,
+    save_mean_ptr: cuda_bindings::CUdeviceptr,
+    save_inv_var_ptr: cuda_bindings::CUdeviceptr,
+) -> Result<()> {
+    let scale_pair = ScalePair::new(y_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale_pair.ptrs();
+    let rm_ptr = running_mean_ptr.map_or(std::ptr::null_mut(), |p| p as *mut c_void);
+    let rv_ptr = running_var_ptr.map_or(std::ptr::null_mut(), |p| p as *mut c_void);
+    // SAFETY: caller guarantees context/stream binding, buffer validity, and stream lifetime.
+    let status = unsafe {
+        sys::cudnnBatchNormalizationForwardTraining(
+            handle.as_raw(),
+            mode.to_sys(),
+            alpha_ptr,
+            beta_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            y_desc.as_raw(),
+            y_ptr as *mut c_void,
+            bn_param_desc.as_raw(),
+            scale_ptr as *const c_void,
+            bias_ptr as *const c_void,
+            exp_avg_factor,
+            rm_ptr,
+            rv_ptr,
+            epsilon,
+            save_mean_ptr as *mut c_void,
+            save_inv_var_ptr as *mut c_void,
+        )
+    };
+    check("cudnnBatchNormalizationForwardTraining", status)
+}
+
+/// Zero-overhead spatial/per-activation batch normalization backward on the CUDA stream already
+/// bound to `handle`, computing `dx`, `d_scale` (`d_gamma`), and `d_bias` (`d_beta`) in one
+/// fused cuDNN kernel using saved `(save_mean, save_inv_var)` from forward.
+///
+/// # Safety
+/// - All device pointers must be valid allocations in `handle.context()` spanning at least their
+///   descriptor byte sizes, and remain alive until the bound CUDA stream completes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct zero-overhead wrapper over cudnnBatchNormalizationBackward"
+)]
+pub unsafe fn batch_norm_backward_on_bound_stream(
+    handle: &mut Handle,
+    mode: BatchNormMode,
+    alpha_data: f64,
+    beta_data: f64,
+    alpha_param: f64,
+    beta_param: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    dx_desc: &TensorDescriptor,
+    dx_ptr: cuda_bindings::CUdeviceptr,
+    bn_param_desc: &TensorDescriptor,
+    scale_ptr: cuda_bindings::CUdeviceptr,
+    d_scale_ptr: cuda_bindings::CUdeviceptr,
+    d_bias_ptr: cuda_bindings::CUdeviceptr,
+    epsilon: f64,
+    saved_mean_ptr: cuda_bindings::CUdeviceptr,
+    saved_inv_var_ptr: cuda_bindings::CUdeviceptr,
+) -> Result<()> {
+    let data_scale = ScalePair::new(dx_desc.data_type(), alpha_data, beta_data);
+    let param_scale = ScalePair::new(bn_param_desc.data_type(), alpha_param, beta_param);
+    let (alpha_d_ptr, beta_d_ptr) = data_scale.ptrs();
+    let (alpha_p_ptr, beta_p_ptr) = param_scale.ptrs();
+    // SAFETY: caller guarantees context/stream binding, buffer validity, and stream lifetime.
+    let status = unsafe {
+        sys::cudnnBatchNormalizationBackward(
+            handle.as_raw(),
+            mode.to_sys(),
+            alpha_d_ptr,
+            beta_d_ptr,
+            alpha_p_ptr,
+            beta_p_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const c_void,
+            dx_desc.as_raw(),
+            dx_ptr as *mut c_void,
+            bn_param_desc.as_raw(),
+            scale_ptr as *const c_void,
+            d_scale_ptr as *mut c_void,
+            d_bias_ptr as *mut c_void,
+            epsilon,
+            saved_mean_ptr as *const c_void,
+            saved_inv_var_ptr as *const c_void,
+        )
+    };
+    check("cudnnBatchNormalizationBackward", status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

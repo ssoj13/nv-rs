@@ -31,12 +31,14 @@ pub use descriptor::{
 };
 pub use handle::Handle;
 pub use ops::{
-    BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward, batch_norm_forward_inference,
-    conv_backward_data, conv_backward_data_on_bound_stream, conv_backward_data_raw,
-    conv_backward_data_workspace_size, conv_backward_filter, conv_backward_filter_on_bound_stream,
-    conv_backward_filter_raw, conv_backward_filter_workspace_size, conv_forward,
-    conv_forward_on_bound_stream, conv_forward_raw, conv_forward_workspace_size,
-    derive_bn_tensor_desc, pooling_forward, softmax_forward,
+    BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward,
+    batch_norm_backward_on_bound_stream, batch_norm_forward_inference,
+    batch_norm_forward_training_on_bound_stream, conv_backward_data,
+    conv_backward_data_on_bound_stream, conv_backward_data_raw, conv_backward_data_workspace_size,
+    conv_backward_filter, conv_backward_filter_on_bound_stream, conv_backward_filter_raw,
+    conv_backward_filter_workspace_size, conv_forward, conv_forward_on_bound_stream,
+    conv_forward_raw, conv_forward_workspace_size, derive_bn_tensor_desc, pooling_forward,
+    softmax_forward,
 };
 pub use scratch::Scratch;
 

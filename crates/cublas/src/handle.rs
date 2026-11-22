@@ -267,6 +267,7 @@ pub struct Handle {
     raw: sys::cublasHandle_t,
     cuda: Arc<Context>,
     pointer_mode: Cell<PointerMode>,
+    last_raw_stream: Cell<*mut std::ffi::c_void>,
 }
 
 // SAFETY: `cublasHandle_t` has no thread-local state once created; moving ownership between threads
@@ -285,6 +286,7 @@ impl Handle {
             raw,
             cuda: cuda.clone(),
             pointer_mode: Cell::new(PointerMode::Host),
+            last_raw_stream: Cell::new(std::ptr::null_mut()),
         })
     }
 
@@ -307,11 +309,36 @@ impl Handle {
                 "stream belongs to a different CUDA context than the cuBLAS handle",
             ));
         }
+        let raw_s = stream.cu_stream();
+        if self.last_raw_stream.get() == raw_s.cast() {
+            return Ok(());
+        }
         self.cuda.bind_to_thread()?;
         // SAFETY: `self.raw` and `stream.cu_stream()` belong to the same live context.
         check("cublasSetStream_v2", unsafe {
-            sys::cublasSetStream_v2(self.raw, stream.cu_stream())
-        })
+            sys::cublasSetStream_v2(self.raw, raw_s)
+        })?;
+        self.last_raw_stream.set(raw_s.cast());
+        Ok(())
+    }
+
+    /// Binds an externally owned raw `CUstream` (e.g. from CubeCL) to this handle, caching the
+    /// last bound pointer to avoid redundant driver calls on repeated launches.
+    ///
+    /// # Safety
+    /// - `raw_stream` must be either null (default stream) or a live `CUstream` created in
+    ///   `self.cuda()` that remains valid for all subsequent cuBLAS calls until rebound.
+    pub unsafe fn set_raw_stream(&self, raw_stream: *mut std::ffi::c_void) -> Result<()> {
+        if self.last_raw_stream.get() == raw_stream {
+            return Ok(());
+        }
+        self.cuda.bind_to_thread()?;
+        // SAFETY: caller guarantees `raw_stream` belongs to `self.cuda` and stays alive.
+        check("cublasSetStream_v2", unsafe {
+            sys::cublasSetStream_v2(self.raw, raw_stream.cast())
+        })?;
+        self.last_raw_stream.set(raw_stream);
+        Ok(())
     }
 
     /// Sets whether scalar `alpha`/`beta` arguments live on host or device memory.

@@ -625,4 +625,63 @@ impl Handle {
             )
         })
     }
+
+    /// Zero-overhead mixed-precision `cublasGemmEx` on raw device pointers using the stream
+    /// already bound to `self` (via [`Self::set_stream`] or [`Self::set_raw_stream`]).
+    ///
+    /// # Safety
+    /// - `a_ptr`, `b_ptr`, and `c_ptr` must be valid device allocations in `self.cuda()` spanning
+    ///   at least the required column-major matrix extents for `(m, n, k, lda, ldb, ldc)` and their
+    ///   data types, and remain alive until the bound CUDA stream completes.
+    /// - `alpha` and `beta` must point to valid scalars matching `compute_type` and `pointer_mode`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cublasGemmEx C API parameter list"
+    )]
+    pub unsafe fn gemm_ex_on_bound_stream(
+        &self,
+        transa: Operation,
+        transb: Operation,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const c_void,
+        a_ptr: u64,
+        a_type: DataType,
+        lda: i32,
+        b_ptr: u64,
+        b_type: DataType,
+        ldb: i32,
+        beta: *const c_void,
+        c_ptr: u64,
+        c_type: DataType,
+        ldc: i32,
+        compute_type: ComputeType,
+        algo: GemmAlgo,
+    ) -> Result<()> {
+        // SAFETY: caller guarantees stream binding, scalar validity, and device buffer extents.
+        check("cublasGemmEx", unsafe {
+            sys::cublasGemmEx(
+                self.raw(),
+                transa.raw(),
+                transb.raw(),
+                m,
+                n,
+                k,
+                alpha,
+                a_ptr as usize as *const c_void,
+                a_type.raw(),
+                lda,
+                b_ptr as usize as *const c_void,
+                b_type.raw(),
+                ldb,
+                beta,
+                c_ptr as usize as *mut c_void,
+                c_type.raw(),
+                ldc,
+                compute_type.raw(),
+                algo.raw(),
+            )
+        })
+    }
 }

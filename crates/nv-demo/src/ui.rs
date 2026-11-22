@@ -1387,6 +1387,7 @@ impl UiContext<'_> {
                     } else if let Some(d) = descs.get(idx - 1) {
                         let short = match d.id {
                             "gundo" => "Gundo",
+                            "gundo_osm" => "Gundo OSM",
                             "marina" => "Marina",
                             "sf_house_of_ai" => "SF AI",
                             "inspector" => "Inspector",

@@ -876,7 +876,10 @@ mod tests {
     fn scene_registry_exposes_all_scenes_and_variants() {
         let descs = default_scene_descriptors();
         let ids: Vec<&str> = descs.iter().map(|d| d.id).collect();
-        assert_eq!(ids, vec!["gundo", "marina", "sf_house_of_ai", "inspector"]);
+        assert_eq!(
+            ids,
+            vec!["gundo", "gundo_osm", "marina", "sf_house_of_ai", "inspector"]
+        );
         let inspector = descs.iter().find(|d| d.id == "inspector").expect("inspector");
         assert!(inspector.variant_labels.len() >= 45);
     }
@@ -917,7 +920,7 @@ mod tests {
     #[test]
     fn all_city_scenes_pack_and_step_traffic_without_heap_churn() {
         let reg = csg_scenes::default_scene_registry();
-        for scene_id in ["gundo", "marina", "sf_house_of_ai"] {
+        for scene_id in ["gundo", "gundo_osm", "marina", "sf_house_of_ai"] {
             let module = reg.get(scene_id).expect("scene registered");
             let mut built = module.build(&SceneBuildConfig::default());
             assert!(

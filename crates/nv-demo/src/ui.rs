@@ -351,17 +351,26 @@ impl TabViewer for UiContext<'_> {
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
         match tab {
             DockTab::Viewport => self.ui_viewport(ui),
-            DockTab::Fractal => {
-                egui::ScrollArea::vertical().show(ui, |ui| self.ui_fractal(ui));
-            }
-            DockTab::RenderFloor => {
-                egui::ScrollArea::vertical().show(ui, |ui| self.ui_render_floor(ui));
-            }
-            DockTab::CameraStats => {
-                egui::ScrollArea::vertical().show(ui, |ui| self.ui_camera_stats(ui));
-            }
+            DockTab::Fractal => dock_scroll(ui, |ui| self.ui_fractal(ui)),
+            DockTab::RenderFloor => dock_scroll(ui, |ui| self.ui_render_floor(ui)),
+            DockTab::CameraStats => dock_scroll(ui, |ui| self.ui_camera_stats(ui)),
         }
     }
+}
+
+/// Vertical `ScrollArea` locked to the visible dock pane width so no wide button or combo
+/// box can expand `ui.available_width()` and clip sibling sections off the right edge.
+fn dock_scroll(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    let sc = ui.spacing().scroll;
+    let bar_reserve = sc.bar_outer_margin + sc.bar_width + sc.bar_inner_margin + 2.0;
+    let inner_w = (ui.available_width() - bar_reserve).max(120.0);
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_max_width(inner_w);
+            ui.set_width(inner_w);
+            add_contents(ui);
+        });
 }
 
 impl UiContext<'_> {
@@ -1545,10 +1554,11 @@ impl UiContext<'_> {
 
                 prop_row(ui, "Scene", |ui| {
                     let gap = 4.0;
-                    let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                    let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
                     ui.spacing_mut().item_spacing.x = gap;
                     egui::ComboBox::from_id_salt("csg_scene_combo")
                         .width(combo_w)
+                        .truncate()
                         .selected_text(active_name)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut s.csg_mode, 0u32, "Off (Classic)")
@@ -1622,7 +1632,7 @@ impl UiContext<'_> {
                         s.csg_asset_idx = s.csg_asset_idx.min(max_idx);
                         prop_row(ui, "Kit Asset", |ui| {
                             let gap = 4.0;
-                            let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                            let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
                             ui.spacing_mut().item_spacing.x = gap;
                             let cur_label = desc
                                 .variant_labels
@@ -1631,6 +1641,7 @@ impl UiContext<'_> {
                                 .unwrap_or("Asset");
                             egui::ComboBox::from_id_salt("csg_variant_combo")
                                 .width(combo_w)
+                                .truncate()
                                 .selected_text(cur_label)
                                 .show_ui(ui, |ui| {
                                     for (i, label) in desc.variant_labels.iter().enumerate() {
@@ -1704,8 +1715,10 @@ impl UiContext<'_> {
                                 && ui
                                     .add_sized(
                                         [w, ROW_H + 2.0],
-                                        egui::Button::new(format!("{}  {}", ic::CAMERA, vp.label)),
+                                        egui::Button::new(format!("{}  {}", ic::CAMERA, vp.label))
+                                            .truncate(),
                                     )
+                                    .on_hover_text(&vp.label)
                                     .clicked()
                             {
                                 pending_cam = Some((
@@ -1734,7 +1747,7 @@ impl UiContext<'_> {
         collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
             prop_row(ui, "Background", |ui| {
                 let gap = 4.0;
-                let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
                 ui.spacing_mut().item_spacing.x = gap;
                 let modes = [
                     "Daylight",
@@ -1750,6 +1763,7 @@ impl UiContext<'_> {
                 let idx = (s.sky_mode as usize).min(modes.len() - 1);
                 egui::ComboBox::from_id_salt("sky_mode_combo")
                     .width(combo_w)
+                    .truncate()
                     .selected_text(modes[idx])
                     .show_ui(ui, |ui| {
                         for (i, label) in modes.iter().enumerate() {
@@ -2685,7 +2699,8 @@ impl UiContext<'_> {
                         let mut picked_scene: Option<usize> = None;
                         let mut picked_custom = false;
                         egui::ComboBox::from_id_salt("cinema_cassette_combo")
-                            .width(ui.available_width().max(80.0))
+                            .width(ui.available_width().max(32.0))
+                            .truncate()
                             .selected_text(sel_text)
                             .show_ui(ui, |ui| {
                                 for (i, cr) in rail.scene_rails().iter().enumerate() {
@@ -2813,7 +2828,8 @@ impl UiContext<'_> {
                         });
                         prop_row(ui, "Probe", |ui| {
                             egui::ComboBox::from_id_salt("cinema_probe_backend")
-                                .width(ui.available_width().max(80.0))
+                                .width(ui.available_width().max(32.0))
+                                .truncate()
                                 .selected_text(s.probe_backend.label())
                                 .show_ui(ui, |ui| {
                                     for kind in [
@@ -3353,6 +3369,30 @@ fn cycle_toggle_btn(
     step
 }
 
+/// Computes adaptive `(label_w, rem_w)` column widths for a property row so labels shrink
+/// gracefully on narrow dock panes without clipping control columns.
+fn prop_row_widths(total_w: f32) -> (f32, f32) {
+    let row_gap = 6.0;
+    let safe_w = if total_w.is_finite() {
+        total_w.max(130.0)
+    } else {
+        240.0
+    };
+    let label_w = LABEL_W.min((safe_w * 0.34).max(46.0));
+    let rem_w = (safe_w - label_w - row_gap).max(76.0);
+    (label_w, rem_w)
+}
+
+/// Computes adaptive `(track_w, val_w)` widths inside a property row's control column so
+/// numeric `DragValue` boxes and the animation toggle stay visible with zero horizontal overflow.
+fn slider_control_widths(rem_w: f32) -> (f32, f32) {
+    let ctrl_gap = 4.0;
+    let avail = (rem_w - ANIM_BTN_W - ctrl_gap * 2.0).max(52.0);
+    let val_w = VAL_W.min((avail - 16.0).max(36.0));
+    let track_w = (avail - val_w).max(16.0);
+    (track_w, val_w)
+}
+
 fn equal_grid(
     ui: &mut Ui,
     cols: usize,
@@ -3360,15 +3400,24 @@ fn equal_grid(
     mut item_ui: impl FnMut(&mut Ui, usize, f32),
 ) {
     let gap = 4.0;
-    let total_w = ui.available_width();
+    let total_w = ui.available_width().max(48.0);
     let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(24.0);
     let mut idx = 0;
     while idx < count {
         ui.horizontal(|ui| {
+            ui.set_max_width(total_w);
             ui.spacing_mut().item_spacing.x = gap;
             for _ in 0..cols {
                 if idx < count {
-                    item_ui(ui, idx, cell_w);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(cell_w, ROW_H + 2.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_max_width(cell_w);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            item_ui(ui, idx, cell_w);
+                        },
+                    );
                     idx += 1;
                 }
             }
@@ -3377,27 +3426,43 @@ fn equal_grid(
 }
 
 fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
-    let total_w = ui.available_width().max(LABEL_W + 80.0);
+    let total_w = ui.available_width().max(130.0);
     let gap = 6.0;
+    let (label_w, rem_w) = prop_row_widths(total_w);
     ui.allocate_ui_with_layout(
         egui::vec2(total_w, ROW_H),
         Layout::left_to_right(Align::Center),
         |ui| {
+            ui.set_max_width(total_w);
             ui.spacing_mut().item_spacing.x = gap;
-            let (label_rect, _) =
-                ui.allocate_exact_size(egui::vec2(LABEL_W, ROW_H), Sense::hover());
-            ui.painter().text(
-                egui::pos2(label_rect.left(), label_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                label,
+            let (label_rect, label_resp) =
+                ui.allocate_exact_size(egui::vec2(label_w, ROW_H), Sense::hover());
+            let galley = ui.painter().layout_no_wrap(
+                label.to_owned(),
                 egui::FontId::proportional(11.5),
                 ui.visuals().weak_text_color(),
             );
-            let rem_w = (total_w - LABEL_W - gap).max(60.0);
+            let clipped = galley.size().x > label_w + 1.0;
+            ui.painter()
+                .with_clip_rect(label_rect.intersect(ui.clip_rect()))
+                .galley(
+                    egui::pos2(
+                        label_rect.left(),
+                        label_rect.center().y - galley.size().y * 0.5,
+                    ),
+                    galley,
+                    Color32::WHITE,
+                );
+            if clipped && label_resp.hovered() {
+                label_resp.on_hover_text(label);
+            }
             ui.allocate_ui_with_layout(
                 egui::vec2(rem_w, ROW_H),
                 Layout::left_to_right(Align::Center),
-                add_contents,
+                |ui| {
+                    ui.set_max_width(rem_w);
+                    add_contents(ui);
+                },
             );
         },
     );
@@ -3469,7 +3534,7 @@ fn anim_slider_f32(
 ) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
+        let (track_w, val_w) = slider_control_widths(ui.available_width());
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
@@ -3479,7 +3544,7 @@ fn anim_slider_f32(
         let prev_style = ui.style().override_text_style.clone();
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         ui.add_sized(
-            [VAL_W, ROW_H],
+            [val_w, ROW_H],
             egui::DragValue::new(val)
                 .range(range)
                 .fixed_decimals(decimals)
@@ -3500,7 +3565,7 @@ fn prop_slider_f32(
 ) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
+        let (track_w, val_w) = slider_control_widths(ui.available_width());
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone()).show_value(false);
@@ -3514,7 +3579,7 @@ fn prop_slider_f32(
         if !suffix.is_empty() {
             drag = drag.suffix(suffix);
         }
-        ui.add_sized([VAL_W, ROW_H], drag);
+        ui.add_sized([val_w, ROW_H], drag);
         ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn_disabled(ui);
     });
@@ -3523,7 +3588,7 @@ fn prop_slider_f32(
 fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
+        let (track_w, val_w) = slider_control_widths(ui.available_width());
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
         let slider = egui::Slider::new(val, range.clone())
@@ -3533,7 +3598,7 @@ fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusiv
         let prev_style = ui.style().override_text_style.clone();
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         ui.add_sized(
-            [VAL_W, ROW_H],
+            [val_w, ROW_H],
             egui::DragValue::new(val).range(range).speed(1.0),
         );
         ui.style_mut().override_text_style = prev_style;
@@ -3552,7 +3617,7 @@ fn anim_vec3(
 ) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(28.0);
+        let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(18.0);
         ui.spacing_mut().item_spacing.x = gap;
         let prev_style = ui.style().override_text_style.clone();
         ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
@@ -3573,12 +3638,14 @@ fn anim_vec3(
 fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
-        let check_w = (ui.available_width() - ANIM_BTN_W - gap).max(40.0);
+        let check_w = (ui.available_width() - ANIM_BTN_W - gap).max(24.0);
         ui.spacing_mut().item_spacing.x = gap;
         ui.allocate_ui_with_layout(
             egui::vec2(check_w, ROW_H),
             Layout::left_to_right(Align::Center),
             |ui| {
+                ui.set_max_width(check_w);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.checkbox(val, text);
             },
         );
@@ -3691,5 +3758,25 @@ mod tests {
         assert!((lat_nan - lat0).abs() < 1e-12);
         assert!((lon_nan - lon0).abs() < 1e-12);
         assert_eq!(alt_nan, 0.0);
+    }
+
+    #[test]
+    fn slider_row_widths_never_overflow_narrow_or_wide_panels() {
+        for total_w in [130.0_f32, 160.0, 190.0, 220.0, 260.0, 320.0, 480.0] {
+            let (label_w, rem_w) = prop_row_widths(total_w);
+            let (track_w, val_w) = slider_control_widths(rem_w);
+            let used = label_w + 6.0 + track_w + 4.0 + val_w + 4.0 + ANIM_BTN_W;
+            assert!(
+                used <= total_w + 1e-3,
+                "row overflow at total_w={total_w}: used={used} (label={label_w}, track={track_w}, val={val_w})"
+            );
+            assert!(track_w >= 16.0 && val_w >= 36.0 && label_w >= 46.0);
+        }
+        // Wide panels preserve canonical column widths.
+        let (label_w, rem_w) = prop_row_widths(320.0);
+        let (track_w, val_w) = slider_control_widths(rem_w);
+        assert_eq!(label_w, LABEL_W);
+        assert_eq!(val_w, VAL_W);
+        assert!((track_w - 150.0).abs() < 1e-4);
     }
 }

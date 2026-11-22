@@ -126,7 +126,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
  "x11rb",
 ]
 
@@ -599,7 +599,7 @@ dependencies = [
 [[package]]
 name = "csg-citygen"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -616,7 +616,7 @@ dependencies = [
 [[package]]
 name = "csg-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "bytemuck",
  "serde",
@@ -625,7 +625,7 @@ dependencies = [
 [[package]]
 name = "csg-device"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -634,7 +634,7 @@ dependencies = [
 [[package]]
 name = "csg-kits"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-scene",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "csg-roads"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -656,7 +656,7 @@ dependencies = [
 [[package]]
 name = "csg-scene"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -667,7 +667,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-gundo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -679,7 +679,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-gundo-osm"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -692,7 +692,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-marina"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -705,7 +705,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-sf-house-of-ai"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -718,7 +718,7 @@ dependencies = [
 [[package]]
 name = "csg-scenes"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -732,7 +732,7 @@ dependencies = [
 [[package]]
 name = "csg-terrain"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#a0babd2db9b7daf98773ffbb09cf5d27cef13cd8"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#0d955bf398ec0deace87cf4f66a88a7b241e532b"
 dependencies = [
  "csg-core",
  "csg-kits",
@@ -1195,7 +1195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3318,7 +3318,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3663,7 +3663,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4455,7 +4455,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -20,10 +20,16 @@ use optix::{
     micro_to_base_bary,
 };
 
-use crate::app_events::{AppBus, RenderControl, RenderEvent, fast_preview_budget};
+use crate::app_events::{
+    AppBus, PossessInfo, RenderControl, RenderEvent, SmartViewResult, fast_preview_budget,
+};
 use crate::csg_scene_host::{CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
+use csg_scene::{
+    CpuViewProber, PackedGpuScene, ProbeBackendKind, ProbeSample, SmartViewSelector,
+    ViewCandidate, ViewProbeBackend, ViewScore, WgpuViewProber, WorldScene, score_probe_grid,
+};
 
 #[cfg(has_embedded_ptx)]
 const EMBEDDED_RAYTRACER_PTX: &str = concat!(
@@ -112,10 +118,126 @@ struct LaunchParams {
     csg_flags: u32,
     csg_wetness: f32,
     csg_traffic_time: f32,
-    _pad2: [u32; 2],
+    camera_projection: u32,
+    probe_grid_wh: u32,
+    probe_candidates: u64,
+    probe_samples: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 576);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 592);
+
+/// Optical sensor projection model for primary ray generation and `Ctrl+Click` Pick-to-Possess.
+#[repr(u32)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum CameraProjection {
+    /// Standard rectilinear pinhole perspective camera.
+    #[default]
+    Pinhole = 0,
+    /// 180-degree equidistant automotive fisheye inscribed in the viewport.
+    Fisheye180 = 1,
+    /// 360 x 180 equirectangular panoramic camera (ideal for Robotaxi Roof LiDAR).
+    Equirect360 = 2,
+    /// 360-degree cylindrical slit-scan / pushbroom panorama (vertical lines remain straight).
+    SlitCam = 3,
+}
+
+impl CameraProjection {
+    /// All supported optical sensor projections in UI order.
+    pub const ALL: [Self; 4] = [
+        Self::Pinhole,
+        Self::Fisheye180,
+        Self::Equirect360,
+        Self::SlitCam,
+    ];
+
+    /// Short UI label for toolbar and HUD badges.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pinhole => "Pinhole",
+            Self::Fisheye180 => "Fisheye 180°",
+            Self::Equirect360 => "360° Equirect",
+            Self::SlitCam => "360° Slit",
+        }
+    }
+
+    /// Returns `true` when this projection can observe geometry outside a narrow forward frustum.
+    #[inline]
+    pub const fn is_omnidirectional(self) -> bool {
+        !matches!(self, Self::Pinhole)
+    }
+}
+
+/// Generates an exact world-space primary ray `(origin, unit_dir)` matching `__raygen__render`
+/// for all 4 optical sensor projections (`norm_x`, `norm_y` in `[0, 1]`, top-left origin).
+///
+/// Returns `None` if `(norm_x, norm_y)` falls outside the circular mask of `Fisheye180`.
+pub fn camera_projection_ray(
+    cam: &CameraFrame,
+    proj: CameraProjection,
+    norm_x: f32,
+    norm_y: f32,
+    aspect: f32,
+) -> Option<([f32; 3], [f32; 3])> {
+    let fwd = glam::Vec3::from_array(cam.fwd);
+    let rgt = glam::Vec3::from_array(cam.right);
+    let up = glam::Vec3::from_array(cam.up);
+    let safe_aspect = aspect.clamp(0.1, 10.0);
+    let u01 = norm_x.clamp(0.0, 1.0);
+    let v01 = norm_y.clamp(0.0, 1.0);
+
+    let dir = match proj {
+        CameraProjection::Pinhole => {
+            let u = u01 * 2.0 - 1.0;
+            let v = 1.0 - v01 * 2.0;
+            (fwd + rgt * (u * safe_aspect * cam.tan_half_fov) + up * (v * cam.tan_half_fov))
+                .normalize_or_zero()
+        }
+        CameraProjection::Fisheye180 => {
+            let sx = safe_aspect.max(1.0);
+            let sy = (1.0 / safe_aspect).max(1.0);
+            let dx = (u01 - 0.5) * 2.0 * sx;
+            let dy = (0.5 - v01) * 2.0 * sy;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r > 1.0 {
+                return None;
+            }
+            let theta = r * std::f32::consts::FRAC_PI_2;
+            let phi = dy.atan2(dx);
+            let radial = rgt * phi.cos() + up * phi.sin();
+            (fwd * theta.cos() + radial * theta.sin()).normalize_or_zero()
+        }
+        CameraProjection::Equirect360 => {
+            let yaw = (u01 - 0.5) * std::f32::consts::TAU;
+            let pitch = (0.5 - v01) * std::f32::consts::PI;
+            let hdir = fwd * yaw.cos() + rgt * yaw.sin();
+            (hdir * pitch.cos() + up * pitch.sin()).normalize_or_zero()
+        }
+        CameraProjection::SlitCam => {
+            let yaw = (u01 - 0.5) * std::f32::consts::TAU;
+            let hdir = fwd * yaw.cos() + rgt * yaw.sin();
+            let v_off = (0.5 - v01) * 2.0 * cam.tan_half_fov;
+            (hdir + up * v_off).normalize_or_zero()
+        }
+    };
+    if dir.length_squared() < 1e-8 {
+        return None;
+    }
+    Some((cam.eye, dir.to_array()))
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct GpuProbeCandidate {
+    eye: [f32; 4],
+    forward: [f32; 4],
+    right: [f32; 4],
+    up: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<GpuProbeCandidate>() == 64);
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -410,6 +532,10 @@ pub struct DemoSettings {
     pub csg_show_fractal: bool,
     /// Distance/SSE LOD detail multiplier (`0.25..=4.0`).
     pub csg_lod_bias: f32,
+    /// Active optical sensor projection (`Pinhole`, `Fisheye180`, `Equirect360`, `SlitCam`).
+    pub camera_projection: CameraProjection,
+    /// Active primary-ray view scoring backend (`Auto`, `Optix`, `Wgpu`, `Cpu`).
+    pub probe_backend: ProbeBackendKind,
 }
 
 impl Default for DemoSettings {
@@ -530,6 +656,8 @@ impl Default for DemoSettings {
             csg_traffic_speed: 1.0,
             csg_show_fractal: false,
             csg_lod_bias: 1.0,
+            camera_projection: CameraProjection::Pinhole,
+            probe_backend: ProbeBackendKind::Auto,
         }
     }
 }
@@ -566,6 +694,8 @@ pub struct FrameReady {
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
     pub fast_preview: bool,
+    /// Resolved world camera basis when actively possessing a body (synced back to UI for picking & Eject).
+    pub possess_camera: Option<CameraFrame>,
 }
 
 struct TonemapKernel {
@@ -599,6 +729,7 @@ struct OptixRig {
     ias: Arc<Accel>,
     pipeline: Pipeline,
     sbt: ShaderBindingTable,
+    probe_sbt: ShaderBindingTable,
     ser_supported: bool,
     denoiser: Denoiser,
     denoiser_is_temporal: bool,
@@ -617,6 +748,12 @@ struct OptixRig {
     bloom: Option<FftBloomPass>,
     csg_host: CsgGpuHost,
     ias_instances_scratch: Vec<Instance>,
+    probe_candidates_buf: Option<DeviceBuffer<u8>>,
+    probe_samples_buf: Option<DeviceBuffer<u8>>,
+    probe_candidates_host: Vec<GpuProbeCandidate>,
+    probe_samples_host: Vec<ProbeSample>,
+    cpu_prober: CpuViewProber,
+    wgpu_prober: Option<WgpuViewProber>,
 }
 
 fn find_optix_include() -> Option<String> {
@@ -690,7 +827,7 @@ fn build_optix_pipeline(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Stream,
     rt_ptx: &[u8],
-) -> Result<(Pipeline, ShaderBindingTable), String> {
+) -> Result<(Pipeline, ShaderBindingTable, ShaderBindingTable), String> {
     let mut opts = PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8)
         .map_err(|e| format!("PipelineOptions: {e}"))?;
     opts.attribute_values = 5;
@@ -701,6 +838,8 @@ fn build_optix_pipeline(
 
     let raygen =
         ProgramGroup::raygen(&module, "__raygen__render").map_err(|e| format!("raygen: {e}"))?;
+    let raygen_probe = ProgramGroup::raygen(&module, "__raygen__score_views")
+        .map_err(|e| format!("raygen_probe: {e}"))?;
     let miss = ProgramGroup::miss(&module, "__miss__miss").map_err(|e| format!("miss: {e}"))?;
     let miss_shadow =
         ProgramGroup::miss(&module, "__miss__shadow").map_err(|e| format!("miss_shadow: {e}"))?;
@@ -764,6 +903,7 @@ fn build_optix_pipeline(
         LinkOptions::default(),
         &[
             raygen.clone(),
+            raygen_probe.clone(),
             miss.clone(),
             miss_shadow.clone(),
             hit_floor.clone(),
@@ -776,25 +916,34 @@ fn build_optix_pipeline(
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
 
+    let miss_recs = [
+        SbtRecord::new(&miss, 0u32).map_err(|e| format!("sbt miss0: {e}"))?,
+        SbtRecord::new(&miss_shadow, 0u32).map_err(|e| format!("sbt miss1: {e}"))?,
+    ];
+    let hit_recs = [
+        SbtRecord::new(&hit_floor, 0u32).map_err(|e| format!("sbt hit0: {e}"))?,
+        SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
+        SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
+        SbtRecord::new(&hit_omm, 0u32).map_err(|e| format!("sbt hit3: {e}"))?,
+        SbtRecord::new(&hit_csg, 0u32).map_err(|e| format!("sbt hit4: {e}"))?,
+        SbtRecord::new(&hit_csg_prim, 0u32).map_err(|e| format!("sbt hit5: {e}"))?,
+    ];
     let sbt = ShaderBindingTable::new(
         stream,
         &SbtRecord::new(&raygen, 0u32).map_err(|e| format!("sbt raygen: {e}"))?,
-        &[
-            SbtRecord::new(&miss, 0u32).map_err(|e| format!("sbt miss0: {e}"))?,
-            SbtRecord::new(&miss_shadow, 0u32).map_err(|e| format!("sbt miss1: {e}"))?,
-        ],
-        &[
-            SbtRecord::new(&hit_floor, 0u32).map_err(|e| format!("sbt hit0: {e}"))?,
-            SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
-            SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
-            SbtRecord::new(&hit_omm, 0u32).map_err(|e| format!("sbt hit3: {e}"))?,
-            SbtRecord::new(&hit_csg, 0u32).map_err(|e| format!("sbt hit4: {e}"))?,
-            SbtRecord::new(&hit_csg_prim, 0u32).map_err(|e| format!("sbt hit5: {e}"))?,
-        ],
+        &miss_recs,
+        &hit_recs,
     )
     .map_err(|e| format!("SBT::new: {e}"))?;
+    let probe_sbt = ShaderBindingTable::new(
+        stream,
+        &SbtRecord::new(&raygen_probe, 0u32).map_err(|e| format!("sbt probe raygen: {e}"))?,
+        &miss_recs,
+        &hit_recs,
+    )
+    .map_err(|e| format!("probe SBT::new: {e}"))?;
 
-    Ok((pipeline, sbt))
+    Ok((pipeline, sbt, probe_sbt))
 }
 
 fn create_denoiser(
@@ -1299,7 +1448,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         pack_rr_func,
     };
 
-    let (pipeline, sbt) =
+    let (pipeline, sbt, probe_sbt) =
         build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
@@ -1414,6 +1563,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             viewport_h: DEFAULT_H,
             vfov_rad: std::f32::consts::FRAC_PI_3,
             lod_bias: initial_settings.csg_lod_bias,
+            omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
         0.0,
     ) {
@@ -1509,6 +1659,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         ias,
         pipeline,
         sbt,
+        probe_sbt,
         ser_supported,
         denoiser,
         denoiser_is_temporal,
@@ -1527,7 +1678,352 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         bloom,
         csg_host,
         ias_instances_scratch,
+        probe_candidates_buf: None,
+        probe_samples_buf: None,
+        probe_candidates_host: Vec::with_capacity(128),
+        probe_samples_host: Vec::with_capacity(128 * 192),
+        cpu_prober: CpuViewProber::new(),
+        wgpu_prober: None,
     }
+}
+
+/// Hardware OptiX 9 primary-ray [`ViewProbeBackend`] launching `__raygen__score_views`
+/// across our existing split-SBT `hit_csg` / `hit_csg_prim` IAS with zero steady-state reallocations.
+struct OptixViewProber<'a> {
+    pipeline: &'a Pipeline,
+    probe_sbt: &'a ShaderBindingTable,
+    stream: &'a Arc<Stream>,
+    params_buf: &'a mut DeviceBuffer<u8>,
+    ias_handle: u64,
+    csg_ptrs: crate::csg_scene_host::CsgDevicePointers,
+    candidates_buf: &'a mut Option<DeviceBuffer<u8>>,
+    samples_buf: &'a mut Option<DeviceBuffer<u8>>,
+    host_candidates: &'a mut Vec<GpuProbeCandidate>,
+    host_samples: &'a mut Vec<ProbeSample>,
+}
+
+impl ViewProbeBackend for OptixViewProber<'_> {
+    fn kind(&self) -> ProbeBackendKind {
+        ProbeBackendKind::Optix
+    }
+
+    fn probe_views(
+        &mut self,
+        _world: &WorldScene,
+        _packed: &PackedGpuScene,
+        candidates: &[ViewCandidate],
+        grid_w: u32,
+        grid_h: u32,
+    ) -> Result<Vec<ViewScore>, String> {
+        if grid_w == 0 || grid_h == 0 {
+            return Err("OptiX probe grid dimensions must be non-zero".to_string());
+        }
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rays_per_view = (grid_w as usize)
+            .checked_mul(grid_h as usize)
+            .ok_or_else(|| "OptiX probe ray count overflow".to_string())?;
+        let total_rays = rays_per_view
+            .checked_mul(candidates.len())
+            .ok_or_else(|| "OptiX probe total ray count overflow".to_string())?;
+        let aspect = grid_w as f32 / grid_h as f32;
+
+        self.host_candidates.clear();
+        self.host_candidates.reserve(candidates.len());
+        for c in candidates {
+            let fwd = if c.forward.len_sq() > 1e-10 {
+                c.forward.norm()
+            } else {
+                csg_core::Vec3::Z
+            };
+            let up_ref = if c.up.len_sq() > 1e-10 {
+                c.up.norm()
+            } else {
+                csg_core::Vec3::Y
+            };
+            let right_raw = fwd.cross(up_ref);
+            let right = if right_raw.len_sq() > 1e-10 {
+                right_raw.norm()
+            } else {
+                let alt = fwd.cross(csg_core::Vec3::X);
+                if alt.len_sq() > 1e-10 {
+                    alt.norm()
+                } else {
+                    fwd.cross(csg_core::Vec3::Z).norm()
+                }
+            };
+            let up = right.cross(fwd).norm();
+            let vfov_rad = if c.vfov_deg.is_finite() {
+                c.vfov_deg.clamp(20.0, 110.0).to_radians()
+            } else {
+                55.0f32.to_radians()
+            };
+            let tan_half_fov = (0.5 * vfov_rad).tan();
+            self.host_candidates.push(GpuProbeCandidate {
+                eye: [c.eye.x, c.eye.y, c.eye.z, 0.0],
+                forward: [fwd.x, fwd.y, fwd.z, aspect],
+                right: [right.x, right.y, right.z, 0.0],
+                up: [up.x, up.y, up.z, tan_half_fov],
+            });
+        }
+
+        let cand_bytes_len = self.host_candidates.len() * std::mem::size_of::<GpuProbeCandidate>();
+        if self
+            .candidates_buf
+            .as_ref()
+            .is_none_or(|b| b.num_bytes() < cand_bytes_len)
+        {
+            let cap_bytes = cand_bytes_len
+                .next_power_of_two()
+                .max(64 * std::mem::size_of::<GpuProbeCandidate>());
+            *self.candidates_buf = Some(
+                DeviceBuffer::zeroed(self.stream, cap_bytes)
+                    .map_err(|e| format!("OptiX probe candidates alloc failed: {e}"))?,
+            );
+        }
+        let samp_bytes_len = total_rays * std::mem::size_of::<ProbeSample>();
+        if self
+            .samples_buf
+            .as_ref()
+            .is_none_or(|b| b.num_bytes() < samp_bytes_len)
+        {
+            let cap_bytes = samp_bytes_len
+                .next_power_of_two()
+                .max(4096 * std::mem::size_of::<ProbeSample>());
+            *self.samples_buf = Some(
+                DeviceBuffer::zeroed(self.stream, cap_bytes)
+                    .map_err(|e| format!("OptiX probe samples alloc failed: {e}"))?,
+            );
+        }
+        let cand_buf = self
+            .candidates_buf
+            .as_mut()
+            .ok_or_else(|| "probe candidates buffer missing".to_string())?;
+        let samp_buf = self
+            .samples_buf
+            .as_ref()
+            .ok_or_else(|| "probe samples buffer missing".to_string())?;
+
+        // Upload only the active candidates slice into the reusable device buffer.
+        let cand_bytes: &[u8] = bytemuck::cast_slice(self.host_candidates.as_slice());
+        // SAFETY: `cand_buf` holds `>= host_candidates.len()` `GpuProbeCandidate` elements on `self.stream`,
+        // and `host_candidates` remains live through `self.stream.synchronize()`.
+        let h2d = unsafe {
+            cu::cuMemcpyHtoDAsync_v2(
+                cand_buf.cu_deviceptr(),
+                cand_bytes.as_ptr().cast(),
+                cand_bytes.len(),
+                self.stream.cu_stream(),
+            )
+        };
+        if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("OptiX probe candidate upload failed ({h2d:?})"));
+        }
+
+        let lp = LaunchParams {
+            handle: self.ias_handle,
+            csg_compounds: self.csg_ptrs.compounds,
+            csg_ops: self.csg_ptrs.ops,
+            csg_prims: self.csg_ptrs.prims,
+            csg_aux_planes: self.csg_ptrs.aux_planes,
+            csg_guard_aabbs: self.csg_ptrs.guard_aabbs,
+            csg_repeats: self.csg_ptrs.repeats,
+            csg_materials: self.csg_ptrs.materials,
+            csg_instances: self.csg_ptrs.instances,
+            csg_instance_count: self.csg_ptrs.instance_count,
+            csg_material_count: self.csg_ptrs.material_count,
+            csg_compound_count: self.csg_ptrs.compound_count,
+            csg_flags: csg_flags::ENABLED,
+            probe_grid_wh: (grid_h << 16) | (grid_w & 0xFFFF),
+            probe_candidates: cand_buf.cu_deviceptr(),
+            probe_samples: samp_buf.cu_deviceptr(),
+            ..LaunchParams::zeroed()
+        };
+        self.params_buf
+            .copy_from_host(self.stream, bytemuck::bytes_of(&lp))
+            .map_err(|e| format!("OptiX probe LaunchParams upload failed: {e}"))?;
+
+        // SAFETY: `params_buf` matches `Params` layout; `cand_buf` and `samp_buf` are sized for
+        // `candidates.len() * grid_w * grid_h` and stay alive through `stream.synchronize()`.
+        unsafe {
+            self.pipeline.launch(
+                self.stream,
+                self.params_buf,
+                self.probe_sbt,
+                [grid_w, grid_h, candidates.len() as u32],
+            )
+        }
+        .map_err(|e| format!("OptiX __raygen__score_views launch failed: {e}"))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("OptiX probe sync failed: {e}"))?;
+
+        self.host_samples.resize(total_rays, ProbeSample::MISS);
+        let samp_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut self.host_samples[..total_rays]);
+        // SAFETY: `samp_buf` holds `>= total_rays` `ProbeSample` elements and GPU execution has synced.
+        let d2h = unsafe {
+            cu::cuMemcpyDtoH_v2(
+                samp_bytes.as_mut_ptr().cast(),
+                samp_buf.cu_deviceptr(),
+                samp_bytes.len(),
+            )
+        };
+        if d2h != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("OptiX probe readback failed ({d2h:?})"));
+        }
+
+        let mut scores = Vec::with_capacity(candidates.len());
+        for (i, cand) in candidates.iter().enumerate() {
+            let start = i * rays_per_view;
+            let slice = &self.host_samples[start..start + rays_per_view];
+            scores.push(score_probe_grid(
+                slice,
+                grid_w,
+                grid_h,
+                cand.target_sem,
+                ProbeBackendKind::Optix,
+            ));
+        }
+        Ok(scores)
+    }
+}
+
+/// Evaluates `candidates` on the exact requested `ProbeBackendKind` (`Auto` selects `Optix`;
+/// explicit `Optix`, `Wgpu`, and `Cpu` never silently downgrade).
+fn score_views_on_rig(
+    rig: &mut OptixRig,
+    backend: ProbeBackendKind,
+    candidates: &[ViewCandidate],
+    grid_w: u32,
+    grid_h: u32,
+) -> Result<Vec<ViewScore>, String> {
+    rig.csg_host.prepare_full_scene_for_probe(&rig.stream)?;
+    match backend {
+        ProbeBackendKind::Auto | ProbeBackendKind::Optix => {
+            // Build an omnidirectional CSG-only IAS for accurate city-wide OptiX probing.
+            rig.ias_instances_scratch.clear();
+            rig.csg_host
+                .append_optix_instances(&mut rig.ias_instances_scratch);
+            if rig.ias_instances_scratch.is_empty() {
+                return Err("Active CSG scene has zero instances to probe".to_string());
+            }
+            let probe_ias = Accel::instances(
+                &rig._optix_ctx,
+                &rig.stream,
+                &mut rig._scratch,
+                &rig.ias_instances_scratch,
+                BuildOptions::default(),
+            )
+            .map_err(|e| format!("OptiX probe IAS build failed: {e}"))?;
+            let csg_ptrs = rig.csg_host.device_pointers();
+            let (world, _) = rig
+                .csg_host
+                .world_and_hints()
+                .ok_or_else(|| "No active CSG scene".to_string())?;
+            let packed = rig.csg_host.packed();
+            let mut prober = OptixViewProber {
+                pipeline: &rig.pipeline,
+                probe_sbt: &rig.probe_sbt,
+                stream: &rig.stream,
+                params_buf: &mut rig.params_buf,
+                ias_handle: probe_ias.handle(),
+                csg_ptrs,
+                candidates_buf: &mut rig.probe_candidates_buf,
+                samples_buf: &mut rig.probe_samples_buf,
+                host_candidates: &mut rig.probe_candidates_host,
+                host_samples: &mut rig.probe_samples_host,
+            };
+            prober.probe_views(world, packed, candidates, grid_w, grid_h)
+        }
+        ProbeBackendKind::Wgpu => {
+            if rig.wgpu_prober.is_none() {
+                rig.wgpu_prober = Some(WgpuViewProber::try_headless()?);
+            }
+            let prober = rig
+                .wgpu_prober
+                .as_mut()
+                .ok_or_else(|| "WGPU ViewProber unavailable".to_string())?;
+            let (world, _) = rig
+                .csg_host
+                .world_and_hints()
+                .ok_or_else(|| "No active CSG scene".to_string())?;
+            let packed = rig.csg_host.packed();
+            prober.probe_views(world, packed, candidates, grid_w, grid_h)
+        }
+        ProbeBackendKind::Cpu => {
+            let (world, _) = rig
+                .csg_host
+                .world_and_hints()
+                .ok_or_else(|| "No active CSG scene".to_string())?;
+            let packed = rig.csg_host.packed();
+            rig.cpu_prober
+                .probe_views(world, packed, candidates, grid_w, grid_h)
+        }
+    }
+}
+
+fn csg_pose_to_camera_frame(pose: csg_scene::CameraPose) -> CameraFrame {
+    let fwd = glam::Vec3::new(pose.forward.x, pose.forward.y, pose.forward.z).normalize_or_zero();
+    let fwd = if fwd.length_squared() > 1e-8 {
+        fwd
+    } else {
+        glam::Vec3::Z
+    };
+    let up_ref = glam::Vec3::new(pose.up.x, pose.up.y, pose.up.z).normalize_or_zero();
+    let up_ref = if up_ref.length_squared() > 1e-8 {
+        up_ref
+    } else {
+        glam::Vec3::Y
+    };
+    let right_raw = fwd.cross(up_ref);
+    let right = if right_raw.length_squared() > 1e-8 {
+        right_raw.normalize()
+    } else {
+        fwd.cross(glam::Vec3::X).normalize_or_zero()
+    };
+    let up = right.cross(fwd).normalize();
+    let tan_half_fov = (0.5 * pose.vfov_deg.clamp(15.0, 115.0).to_radians()).tan();
+    CameraFrame {
+        eye: [pose.eye.x, pose.eye.y, pose.eye.z],
+        fwd: fwd.to_array(),
+        right: right.to_array(),
+        up: up.to_array(),
+        tan_half_fov,
+    }
+}
+
+fn camera_frame_to_core_pose(cam: CameraFrame) -> crate::camera_core::CameraPose {
+    let fov_y = (2.0 * cam.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
+    crate::camera_core::CameraPose::from_eye_forward_up(
+        glam::Vec3::from_array(cam.eye),
+        glam::Vec3::from_array(cam.fwd),
+        glam::Vec3::from_array(cam.up),
+        fov_y,
+        0.05,
+        2000.0,
+    )
+}
+
+fn core_pose_to_camera_frame(pose: crate::camera_core::CameraPose) -> CameraFrame {
+    CameraFrame {
+        eye: pose.eye.to_array(),
+        fwd: pose.forward().to_array(),
+        right: pose.right().to_array(),
+        up: pose.up().to_array(),
+        tan_half_fov: (0.5 * pose.fov_y).tan(),
+    }
+}
+
+fn emit_possess_status(bus: &AppBus, info: &PossessInfo) {
+    let mount_lbl = info
+        .mounts
+        .get(info.mount_idx)
+        .map_or("Mount", |m| m.label.as_str());
+    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+        "Possessing {} — {}",
+        info.assembly_name, mount_lbl
+    )));
 }
 
 fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
@@ -1583,6 +2079,14 @@ pub fn spawn_render_thread(
             let mut settings = init_snap.settings;
             let mut camera = init_snap.camera;
             let mut prev_camera = camera;
+            let mut possess_free_yaw = init_snap.possess_free_yaw;
+            let mut possess_free_pitch = init_snap.possess_free_pitch;
+            let mut possess_auto_level = init_snap.possess_auto_level;
+            let mut possess_damper = crate::camera_rail::CameraDamper::default();
+            possess_damper.snap(camera_frame_to_core_pose(camera));
+            let mut possess_blend_rem: f32 = 0.0;
+            let mut last_rendered_camera = camera;
+            let mut was_possessing = false;
             let mut rig = init_optix(&cuda, &settings);
             if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                 bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
@@ -1728,6 +2232,195 @@ pub fn spawn_render_thread(
                                 }
                             }
                         }
+                        RenderControl::PickPossess { origin, dir } => {
+                            match rig.csg_host.pick_possess(*origin, *dir) {
+                                Ok(info) => {
+                                    possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
+                                    possess_blend_rem = 0.9;
+                                    accum_count = 0;
+                                    emit_possess_status(&bus, &info);
+                                    bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
+                                }
+                            }
+                        }
+                        RenderControl::PossessNextVehicle => {
+                            match rig.csg_host.possess_next_vehicle() {
+                                Ok(info) => {
+                                    possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
+                                    possess_blend_rem = 0.9;
+                                    accum_count = 0;
+                                    emit_possess_status(&bus, &info);
+                                    bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
+                                }
+                            }
+                        }
+                        RenderControl::SetPossessMount { mount_idx } => {
+                            if let Some(info) = rig.csg_host.set_possess_mount(*mount_idx) {
+                                possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
+                                possess_blend_rem = 0.6;
+                                accum_count = 0;
+                                emit_possess_status(&bus, &info);
+                                bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
+                            }
+                        }
+                        RenderControl::EjectPossess => {
+                            if rig.csg_host.eject_possess() {
+                                possess_blend_rem = 0.0;
+                                accum_count = 0;
+                                bus.emit_render_event(RenderEvent::PossessChanged(None));
+                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                    "Ejected to free camera".to_string(),
+                                ));
+                            }
+                        }
+                        RenderControl::RunSmartView { seed, backend } => {
+                            let t0 = Instant::now();
+                            let candidates_opt = rig
+                                .csg_host
+                                .world_and_hints()
+                                .map(|(_, hints)| SmartViewSelector::generate_candidates(hints, *seed, 64));
+                            match candidates_opt {
+                                None => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(
+                                        "Load a CSG scene before running Smart View".to_string(),
+                                    ));
+                                }
+                                Some(candidates) if candidates.is_empty() => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(
+                                        "Smart View generated zero candidates".to_string(),
+                                    ));
+                                }
+                                Some(candidates) => {
+                                    match score_views_on_rig(&mut rig, *backend, &candidates, 16, 12) {
+                                        Ok(scores) => {
+                                            if let Some((best_idx, best_score)) = scores
+                                                .iter()
+                                                .enumerate()
+                                                .max_by(|(_, a), (_, b)| {
+                                                    a.composite.total_cmp(&b.composite)
+                                                })
+                                            {
+                                                let winner = candidates[best_idx];
+                                                let elapsed_ms =
+                                                    t0.elapsed().as_secs_f32() * 1000.0;
+                                                if rig.csg_host.eject_possess() {
+                                                    bus.emit_render_event(
+                                                        RenderEvent::PossessChanged(None),
+                                                    );
+                                                }
+                                                let res = SmartViewResult {
+                                                    eye: [winner.eye.x, winner.eye.y, winner.eye.z],
+                                                    forward: [
+                                                        winner.forward.x,
+                                                        winner.forward.y,
+                                                        winner.forward.z,
+                                                    ],
+                                                    up: [winner.up.x, winner.up.y, winner.up.z],
+                                                    vfov_deg: winner.vfov_deg,
+                                                    score: *best_score,
+                                                    elapsed_ms,
+                                                    candidates_evaluated: candidates.len(),
+                                                };
+                                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                                    format!(
+                                                        "Smart View ({}): {:.2} score ({} views in {:.1} ms)",
+                                                        best_score.backend.label(),
+                                                        best_score.composite,
+                                                        candidates.len(),
+                                                        elapsed_ms
+                                                    ),
+                                                ));
+                                                bus.emit_render_event(RenderEvent::SmartViewReady(
+                                                    res,
+                                                ));
+                                                accum_count = 0;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("Smart View failed: {e}"),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        RenderControl::RunSmartRail { seed, backend } => {
+                            let t0 = Instant::now();
+                            let mut rails = Vec::with_capacity(4);
+                            for k in 0..4u64 {
+                                if let Ok(r) = rig.csg_host.generate_random_rail(seed.wrapping_add(k * 7919)) {
+                                    rails.push(r);
+                                }
+                            }
+                            if rails.is_empty() {
+                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                    "Load a CSG scene before running Smart Rail".to_string(),
+                                ));
+                            } else {
+                                let mut cands = Vec::with_capacity(rails.len() * 4);
+                                for rail in &rails {
+                                    let compiled = rail.compile();
+                                    for s_idx in 0..4u32 {
+                                        let u = (s_idx as f32 + 0.5) * 0.25;
+                                        let sample = compiled.eval_at_fraction(u);
+                                        cands.push(ViewCandidate {
+                                            eye: sample.eye,
+                                            forward: sample.forward,
+                                            up: sample.up,
+                                            vfov_deg: sample.vfov_deg,
+                                            target_sem: None,
+                                        });
+                                    }
+                                }
+                                match score_views_on_rig(&mut rig, *backend, &cands, 16, 12) {
+                                    Ok(scores) => {
+                                        let mut best_rail_idx = 0usize;
+                                        let mut best_avg = -1.0f32;
+                                        let mut used_backend = ProbeBackendKind::Cpu;
+                                        for (ri, chunk) in scores.chunks(4).enumerate() {
+                                            if ri >= rails.len() || chunk.is_empty() {
+                                                break;
+                                            }
+                                            used_backend = chunk[0].backend;
+                                            let avg = chunk.iter().map(|s| s.composite).sum::<f32>()
+                                                / chunk.len() as f32;
+                                            if avg > best_avg {
+                                                best_avg = avg;
+                                                best_rail_idx = ri;
+                                            }
+                                        }
+                                        if rig.csg_host.eject_possess() {
+                                            bus.emit_render_event(RenderEvent::PossessChanged(None));
+                                        }
+                                        let mut winner = rails.swap_remove(best_rail_idx);
+                                        winner.label =
+                                            format!("{} ({:.2})", winner.label, best_avg.max(0.0));
+                                        let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                            "Smart Rail ({}): avg {:.2} across {} rails in {:.1} ms",
+                                            used_backend.label(),
+                                            best_avg.max(0.0),
+                                            scores.len() / 4,
+                                            elapsed_ms
+                                        )));
+                                        bus.emit_render_event(RenderEvent::RailGenerated(winner));
+                                        accum_count = 0;
+                                    }
+                                    Err(e) => {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                            "Smart Rail scoring failed: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                        }
                         RenderControl::ReloadShader => {
                             let disk_path = PathBuf::from("crates/nv-demo/shaders/raytracer.cu");
                             let res = std::fs::read_to_string(&disk_path)
@@ -1737,10 +2430,11 @@ pub fn spawn_render_thread(
                                     build_optix_pipeline(&rig._optix_ctx, &rig.stream, &ptx)
                                 });
                             match res {
-                                Ok((pipeline, sbt)) => {
+                                Ok((pipeline, sbt, probe_sbt)) => {
                                     let _ = rig.stream.synchronize();
                                     rig.pipeline = pipeline;
                                     rig.sbt = sbt;
+                                    rig.probe_sbt = probe_sbt;
                                     accum_count = 0;
                                     fast_preview_reduced = false;
                                     bus.emit_render_event(RenderEvent::StatusMessage(
@@ -1791,16 +2485,27 @@ pub fn spawn_render_thread(
                     tmp.cam_smooth_tau = settings.cam_smooth_tau;
                     tmp.time_scale = settings.time_scale;
                     tmp.record_shutter_subframes = settings.record_shutter_subframes;
+                    tmp.probe_backend = settings.probe_backend;
                     if s.aov_mode < 3 && settings.aov_mode < 3 {
                         tmp.aov_mode = settings.aov_mode;
                     }
                     let only_non_accum = tmp == settings && c == camera;
-                    if reset_accum || (!only_non_accum && (s != settings || c != camera)) {
+                    let possess_look_changed = rig.csg_host.is_possessing()
+                        && (snap.possess_free_yaw.to_bits() != possess_free_yaw.to_bits()
+                            || snap.possess_free_pitch.to_bits() != possess_free_pitch.to_bits()
+                            || snap.possess_auto_level != possess_auto_level);
+                    if reset_accum
+                        || possess_look_changed
+                        || (!only_non_accum && (s != settings || c != camera))
+                    {
                         accum_count = 0;
                         interacting_until = snap.interacting_until;
                     }
                     settings = s;
                     camera = c;
+                    possess_free_yaw = snap.possess_free_yaw;
+                    possess_free_pitch = snap.possess_free_pitch;
+                    possess_auto_level = snap.possess_auto_level;
                 }
 
                 let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
@@ -1828,6 +2533,7 @@ pub fn spawn_render_thread(
                     && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
                     && !csg_traffic_moving
+                    && possess_blend_rem <= 0.0
                     && !rec_active
                     && pending_jpeg.is_none()
                     && !rig.csg_host.has_pending_metadata()
@@ -1896,17 +2602,49 @@ pub fn spawn_render_thread(
                 }
                 if csg_traffic_moving {
                     traffic_time += dt * settings.csg_traffic_speed;
+                    rig.csg_host.step_traffic(traffic_time);
                     if !preserve_shutter_accum {
                         accum_count = 0;
                     }
                 }
+
+                // Resolve live possessed camera mount AFTER dynamic traffic advances so the
+                // camera stays mathematically locked to moving vehicles with zero 1-frame lag.
+                let mut possess_cam_out: Option<CameraFrame> = None;
+                let active_camera = if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                    possess_free_yaw,
+                    possess_free_pitch,
+                    possess_auto_level,
+                ) {
+                    let target_frame = csg_pose_to_camera_frame(csg_pose);
+                    let final_frame = if possess_blend_rem > 0.0 {
+                        let frac = (possess_blend_rem / 0.9).clamp(0.0, 1.0);
+                        possess_blend_rem = (possess_blend_rem - dt.max(1.0 / 120.0)).max(0.0);
+                        let tau = 0.24 * frac;
+                        let target_core = camera_frame_to_core_pose(target_frame);
+                        let blended = possess_damper.step(target_core, dt.max(1.0 / 120.0), tau);
+                        if !preserve_shutter_accum {
+                            accum_count = 0;
+                        }
+                        core_pose_to_camera_frame(blended)
+                    } else {
+                        possess_damper.snap(camera_frame_to_core_pose(target_frame));
+                        target_frame
+                    };
+                    possess_cam_out = Some(final_frame);
+                    final_frame
+                } else {
+                    possess_blend_rem = 0.0;
+                    camera
+                };
+                last_rendered_camera = active_camera;
 
                 let csg_key = CsgSceneKey {
                     scene_idx: settings.csg_mode,
                     variant_idx: settings.csg_asset_idx,
                     seed: settings.csg_seed,
                 };
-                let vfov_rad = 2.0 * camera.tan_half_fov.max(0.05).atan();
+                let vfov_rad = 2.0 * active_camera.tan_half_fov.max(0.05).atan();
                 let csg_ias_dirty = match rig.csg_host.sync(
                     &rig._optix_ctx,
                     &rig.stream,
@@ -1915,13 +2653,14 @@ pub fn spawn_render_thread(
                     settings.csg_wetness,
                     settings.csg_time_of_day,
                     CsgCameraParams {
-                        eye: camera.eye,
-                        fwd: camera.fwd,
-                        up: camera.up,
+                        eye: active_camera.eye,
+                        fwd: active_camera.fwd,
+                        up: active_camera.up,
                         viewport_w: cur_w,
                         viewport_h: cur_h,
                         vfov_rad,
                         lod_bias: settings.csg_lod_bias,
+                        omnidirectional: settings.camera_projection.is_omnidirectional(),
                     },
                     traffic_time,
                 ) {
@@ -1933,6 +2672,11 @@ pub fn spawn_render_thread(
                         false
                     }
                 };
+                let is_possessing_now = rig.csg_host.is_possessing();
+                if was_possessing && !is_possessing_now {
+                    bus.emit_render_event(RenderEvent::PossessChanged(None));
+                }
+                was_possessing = is_possessing_now;
                 if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                     bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
                 }
@@ -2141,23 +2885,28 @@ pub fn spawn_render_thread(
                     frame_index,
                     spp: launch_spp,
                     cam_pos: [
-                        camera.eye[0],
-                        camera.eye[1],
-                        camera.eye[2],
+                        active_camera.eye[0],
+                        active_camera.eye[1],
+                        active_camera.eye[2],
                         settings.aperture,
                     ],
-                    cam_forward: [camera.fwd[0], camera.fwd[1], camera.fwd[2], 0.0],
+                    cam_forward: [
+                        active_camera.fwd[0],
+                        active_camera.fwd[1],
+                        active_camera.fwd[2],
+                        0.0,
+                    ],
                     cam_right: [
-                        camera.right[0],
-                        camera.right[1],
-                        camera.right[2],
+                        active_camera.right[0],
+                        active_camera.right[1],
+                        active_camera.right[2],
                         settings.focus_dist,
                     ],
                     cam_up: [
-                        camera.up[0],
-                        camera.up[1],
-                        camera.up[2],
-                        camera.tan_half_fov,
+                        active_camera.up[0],
+                        active_camera.up[1],
+                        active_camera.up[2],
+                        active_camera.tan_half_fov,
                     ],
                     sun_dir: [sun_x, sun_y, sun_z, settings.roughness],
                     fractal_p0,
@@ -2263,10 +3012,13 @@ pub fn spawn_render_thread(
                     csg_flags: csg_flag_bits,
                     csg_wetness: settings.csg_wetness.clamp(0.0, 1.0),
                     csg_traffic_time: traffic_time,
-                    _pad2: [0; 2],
+                    camera_projection: settings.camera_projection as u32,
+                    probe_grid_wh: 0,
+                    probe_candidates: 0,
+                    probe_samples: 0,
                 };
                 if publish_frame {
-                    prev_camera = camera;
+                    prev_camera = active_camera;
                 }
                 rig.params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
@@ -2617,6 +3369,7 @@ pub fn spawn_render_thread(
                     ser_supported: rig.ser_supported,
                     csg_stats: rig.csg_host.stats(),
                     fast_preview: frame_is_fast_preview,
+                    possess_camera: possess_cam_out,
                 }));
             }
         })
@@ -2661,12 +3414,79 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 576);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 592);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instance_count), 544);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_flags), 556);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_wetness), 560);
+        assert_eq!(std::mem::offset_of!(LaunchParams, camera_projection), 568);
+        assert_eq!(std::mem::offset_of!(LaunchParams, probe_grid_wh), 572);
+        assert_eq!(std::mem::offset_of!(LaunchParams, probe_candidates), 576);
+        assert_eq!(std::mem::offset_of!(LaunchParams, probe_samples), 584);
+        assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);
+    }
+
+    #[test]
+    fn camera_projection_rays_match_cardinal_axes_and_fisheye_mask() {
+        let cam = CameraFrame {
+            eye: [1.0, 2.0, 3.0],
+            fwd: [0.0, 0.0, 1.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            tan_half_fov: 0.5,
+        };
+        for proj in CameraProjection::ALL {
+            let (orig, dir) =
+                camera_projection_ray(&cam, proj, 0.5, 0.5, 16.0 / 9.0).expect("center ray");
+            assert_eq!(orig, cam.eye);
+            assert!(
+                (dir[2] - 1.0).abs() < 1e-5 && dir[0].abs() < 1e-5 && dir[1].abs() < 1e-5,
+                "{proj:?} center must point straight along +fwd: {dir:?}"
+            );
+        }
+        // Corner of 16:9 viewport lies outside the inscribed 180-degree fisheye circle -> masked None.
+        assert!(camera_projection_ray(&cam, CameraProjection::Fisheye180, 0.0, 0.0, 16.0 / 9.0).is_none());
+        // Equirect360 & SlitCam edges (norm_x = 0.0 / 1.0) wrap 180 degrees to -fwd.
+        for proj in [CameraProjection::Equirect360, CameraProjection::SlitCam] {
+            let (_, back) = camera_projection_ray(&cam, proj, 0.0, 0.5, 16.0 / 9.0).expect("edge");
+            assert!(
+                (back[2] + 1.0).abs() < 1e-5,
+                "{proj:?} left seam must look behind (-fwd): {back:?}"
+            );
+        }
+        // Equirect360 poles look straight up / down.
+        let (_, zenith) =
+            camera_projection_ray(&cam, CameraProjection::Equirect360, 0.5, 0.0, 2.0).expect("top");
+        assert!((zenith[1] - 1.0).abs() < 1e-5, "equirect top = +up: {zenith:?}");
+    }
+
+    #[test]
+    fn cryptomatte_murmur3_produces_valid_non_nan_f32_ids() {
+        fn murmur3_32_3u(k0: u32, k1: u32, k2: u32) -> u32 {
+            let (c1, c2) = (0xcc9e_2d51u32, 0x1b87_3593u32);
+            let mut h = 0u32;
+            for mut k in [k0, k1, k2] {
+                k = k.wrapping_mul(c1).rotate_left(15).wrapping_mul(c2);
+                h ^= k;
+                h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+            }
+            h ^= 12;
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85eb_ca6b);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xc2b2_ae35);
+            h ^ (h >> 16)
+        }
+        for i in 0..2048u32 {
+            let h = murmur3_32_3u(i, i.wrapping_mul(7), i & 31);
+            let mut exp = (h >> 23) & 0xFF;
+            if exp == 0 || exp == 255 {
+                exp ^= 1;
+            }
+            let id_f32 = f32::from_bits((exp << 23) | (h & 0x007F_FFFF));
+            assert!(id_f32.is_normal(), "Cryptomatte ID must never be NaN/Inf/denormal/zero");
+        }
     }
 }

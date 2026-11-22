@@ -6,15 +6,43 @@ use egui::{Align, Color32, FontDefinitions, Layout, RichText, Sense, Ui};
 use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
-use crate::app_events::{AppBus, StillFormat, UiCommand};
+use crate::app_events::{AppBus, PossessInfo, SmartViewResult, StillFormat, UiCommand};
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::DemoAnimator;
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
-use crate::renderer::{CaptureSource, DemoSettings};
-use csg_scene::{SceneDescriptor, SceneViewpoint, TimeOfDay};
+use crate::renderer::{CameraProjection, CaptureSource, DemoSettings};
+use csg_scene::{ProbeBackendKind, SceneDescriptor, SceneViewpoint, TimeOfDay};
+
+const AOV_LABELS: [&str; 11] = [
+    "Beauty",
+    "Albedo",
+    "Normal",
+    "Depth",
+    "Motion",
+    "Semantic",
+    "Instance",
+    "WorldPos",
+    "Range (LiDAR)",
+    "Material",
+    "Cryptomatte",
+];
+
+const AOV_HUD_TAGS: [&str; 11] = [
+    "BEAUTY",
+    "ALBEDO",
+    "NORMAL",
+    "DEPTH",
+    "MOTION",
+    "SEMANTIC",
+    "INSTANCE",
+    "WORLDPOS",
+    "RANGE",
+    "MATERIAL",
+    "CRYPTO",
+];
 
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
@@ -250,6 +278,13 @@ pub struct UiContext<'a> {
     pub dlss_rr_available: bool,
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
+    pub possess_info: Option<&'a PossessInfo>,
+    pub possess_free_yaw: &'a mut f32,
+    pub possess_free_pitch: &'a mut f32,
+    pub possess_auto_level: &'a mut bool,
+    pub pick_possess_mode: &'a mut bool,
+    pub smart_view_seed: &'a mut u64,
+    pub last_smart_view: Option<SmartViewResult>,
     pub last_saved_msg: Option<&'a str>,
 }
 
@@ -389,6 +424,52 @@ impl UiContext<'_> {
                 .clicked()
             {
                 self.bus.emit_ui(UiCommand::ResetAccum);
+            }
+
+            ui.separator();
+
+            ui.label(RichText::new("AOV").small().weak());
+            let cur_aov = (self.settings.aov_mode as usize).min(AOV_LABELS.len() - 1);
+            egui::ComboBox::from_id_salt("toolbar_aov_mode")
+                .width(102.0)
+                .selected_text(AOV_LABELS[cur_aov])
+                .show_ui(ui, |ui| {
+                    for (idx, lbl) in AOV_LABELS.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.aov_mode, idx as u32, *lbl);
+                    }
+                });
+
+            ui.label(RichText::new("Lens").small().weak());
+            egui::ComboBox::from_id_salt("toolbar_lens_proj")
+                .width(96.0)
+                .selected_text(self.settings.camera_projection.label())
+                .show_ui(ui, |ui| {
+                    for proj in CameraProjection::ALL {
+                        ui.selectable_value(
+                            &mut self.settings.camera_projection,
+                            proj,
+                            proj.label(),
+                        );
+                    }
+                });
+
+            let pick_on = *self.pick_possess_mode;
+            let pick_btn = if pick_on {
+                egui::Button::new(
+                    RichText::new(format!("{} Pick", ic::CROSSHAIR_SIMPLE)).color(Color32::WHITE),
+                )
+                .fill(Color32::from_rgb(38, 108, 168))
+            } else {
+                egui::Button::new(format!("{} Pick", ic::CROSSHAIR_SIMPLE))
+            };
+            if ui
+                .add_enabled(self.settings.csg_mode != 0, pick_btn)
+                .on_hover_text(
+                    "Click any vehicle, lamp, yacht, or building in the viewport to possess its camera mount (shortcut: Ctrl + Left Click).",
+                )
+                .clicked()
+            {
+                *self.pick_possess_mode = !*self.pick_possess_mode;
             }
 
             ui.separator();
@@ -544,7 +625,52 @@ impl UiContext<'_> {
 
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
-        if !split_dragging {
+        if *self.pick_possess_mode && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let ctrl_down = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let pick_clicked = !split_dragging
+            && self.settings.csg_mode != 0
+            && resp.clicked_by(egui::PointerButton::Primary)
+            && (ctrl_down || *self.pick_possess_mode);
+        if pick_clicked
+            && let Some(pos) = resp.interact_pointer_pos()
+            && img_rect.width() > 2.0
+            && img_rect.height() > 2.0
+            && img_rect.contains(pos)
+        {
+            let norm_x = ((pos.x - img_rect.left()) / img_rect.width()).clamp(0.0, 1.0);
+            let norm_y = ((pos.y - img_rect.top()) / img_rect.height()).clamp(0.0, 1.0);
+            self.bus
+                .emit_ui(UiCommand::PickPossess { norm_x, norm_y });
+            *self.pick_possess_mode = false;
+        }
+
+        let kb_free = !ui.ctx().egui_wants_keyboard_input();
+        if let Some(pinfo) = self.possess_info {
+            if kb_free {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.bus.emit_ui(UiCommand::EjectPossess);
+                } else if ui.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+                    self.bus.emit_ui(UiCommand::CyclePossessMount { delta: -1 });
+                } else if ui.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+                    self.bus.emit_ui(UiCommand::CyclePossessMount { delta: 1 });
+                }
+            }
+            let allow_look = pinfo
+                .mounts
+                .get(pinfo.mount_idx)
+                .is_none_or(|m| m.allow_free_look);
+            if !split_dragging && allow_look && resp.dragged() {
+                let d = resp.drag_delta();
+                if d.x.abs() > 0.0 || d.y.abs() > 0.0 {
+                    *self.possess_free_yaw =
+                        (*self.possess_free_yaw + d.x * 0.0045).rem_euclid(std::f32::consts::TAU);
+                    *self.possess_free_pitch = (*self.possess_free_pitch - d.y * 0.0045)
+                        .clamp(-1.35, 1.35);
+                }
+            }
+        } else if !split_dragging && !pick_clicked {
             if resp.dragged() && self.camera_rail.playing {
                 self.camera_rail.playing = false;
             }
@@ -554,7 +680,6 @@ impl UiContext<'_> {
                 }
                 None => crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0),
             };
-            let kb_free = !ui.ctx().egui_wants_keyboard_input();
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
             let f_pressed =
                 kb_free && *self.viewport_focused && ui.input(|i| i.key_pressed(egui::Key::F));
@@ -608,16 +733,71 @@ impl UiContext<'_> {
             }
         }
 
+        // Top-left floating Possess Body HUD overlay with mount pills and Eject button
+        if let Some(pinfo) = self.possess_info {
+            let overlay_rect = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(10.0, 10.0),
+                egui::vec2((rect.width() - 20.0).max(160.0), 56.0),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 210))
+                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let tag = if pinfo.is_dynamic { "RIDING" } else { "POSSESS" };
+                            ui.label(
+                                RichText::new(format!("{} {tag}: {}", ic::CAR, pinfo.assembly_name))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(174, 236, 194)),
+                            );
+                            for (idx, mount) in pinfo.mounts.iter().enumerate() {
+                                let selected = idx == pinfo.mount_idx;
+                                if ui
+                                    .add(egui::Button::selectable(selected, &mount.label).small())
+                                    .clicked()
+                                {
+                                    self.bus.emit_ui(UiCommand::SelectPossessMount { mount_idx: idx });
+                                }
+                            }
+                            ui.checkbox(self.possess_auto_level, "Level")
+                                .on_hover_text("Keep horizon level while riding vehicles.");
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Eject (Esc)").color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(168, 46, 54))
+                                    .small(),
+                                )
+                                .clicked()
+                            {
+                                self.bus.emit_ui(UiCommand::EjectPossess);
+                            }
+                        });
+                    });
+            });
+        }
+
         // Compact bottom-left status badge inside viewport
         let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
-        let aov_tag = match self.settings.aov_mode {
-            1 => "ALBEDO",
-            2 => "NORMAL",
-            3 => "DEPTH",
-            4 => "MOTION",
-            5 => "SEMANTIC",
-            6 => "INSTANCE",
-            _ => "BEAUTY",
+        let aov_tag = AOV_HUD_TAGS
+            .get(self.settings.aov_mode as usize)
+            .copied()
+            .unwrap_or("BEAUTY");
+        let lens_tag = if self.settings.camera_projection != CameraProjection::Pinhole {
+            format!("  |  {}", self.settings.camera_projection.label())
+        } else {
+            String::new()
+        };
+        let possess_tag = if self.possess_info.is_some() {
+            "  |  POSSESS"
+        } else {
+            ""
         };
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
@@ -647,12 +827,14 @@ impl UiContext<'_> {
             }
             let anim_tag = tags.join("+");
             format!(
-                "{} {}  |  {}x{}  |  {}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+                "{} {}  |  {}x{}  |  {}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::ARROWS_CLOCKWISE,
                 anim_tag,
                 self.render_w,
                 self.render_h,
                 aov_tag,
+                lens_tag,
+                possess_tag,
                 preview_tag,
                 self.ui_fps.round() as u32,
                 self.rt_fps,
@@ -660,13 +842,15 @@ impl UiContext<'_> {
             )
         } else {
             format!(
-                "{} {}/{} spp  |  {}x{}  |  {}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+                "{} {}/{} spp  |  {}x{}  |  {}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::STACK,
                 self.total_samples,
                 self.settings.max_accum.saturating_mul(self.settings.spp),
                 self.render_w,
                 self.render_h,
                 aov_tag,
+                lens_tag,
+                possess_tag,
                 preview_tag,
                 self.ui_fps.round() as u32,
                 self.rt_fps,
@@ -1868,29 +2052,20 @@ impl UiContext<'_> {
                     }
                 }
                 1 => {
-                    const AOVS: [&str; 7] = [
-                        "Beauty",
-                        "Albedo",
-                        "Normal",
-                        "Depth",
-                        "Motion",
-                        "Semantic",
-                        "Instance",
-                    ];
-                    let cur = (s.aov_mode as usize).min(AOVS.len() - 1);
+                    let cur = (s.aov_mode as usize).min(AOV_LABELS.len() - 1);
                     let tint = (cur != 0).then(|| active_accent_tint(ui));
                     let step = cycle_toggle_btn(
                         ui,
                         w,
                         "AOV",
-                        AOVS[cur],
-                        "Inspect what the renderer sees: Beauty, Albedo, Normal, Depth, Motion, SemanticId (digital twin class), or InstanceId.",
+                        AOV_LABELS[cur],
+                        "Inspect all 11 SDG/VFX passes: Beauty, Albedo, Normal, Depth, Motion, SemanticId, InstanceId, WorldPos, Range (LiDAR), Material (PBR), and Cryptomatte.",
                         true,
                         tint,
                     );
                     if step != 0 {
                         s.aov_mode =
-                            ((cur as i32 + step).rem_euclid(AOVS.len() as i32)) as u32;
+                            ((cur as i32 + step).rem_euclid(AOV_LABELS.len() as i32)) as u32;
                     }
                 }
                 _ => {
@@ -2364,30 +2539,129 @@ impl UiContext<'_> {
                             }
                         }
                     });
-                    // 3. On-demand exact-CSG Random Rail Generator for any active city scene.
+                    // 3. On-demand exact-CSG Random Rail, Possess Body & GPU Smart View controls.
                     {
                         let gen_enabled = s.csg_mode != 0;
-                        let gen_lbl = format!(
-                            "{}  Random Rail (#{:04x})",
-                            ic::SHUFFLE,
-                            *self.rail_random_seed & 0xffff
-                        );
-                        if ui
-                            .add_enabled(
-                                gen_enabled,
-                                egui::Button::new(gen_lbl)
-                                    .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0)),
-                            )
-                            .on_hover_text(
-                                "Synthesize a fresh, exact-CSG collision-verified random cinema rail for the active city scene.",
-                            )
-                            .clicked()
-                        {
-                            *self.rail_random_seed = self
-                                .rail_random_seed
-                                .wrapping_add(1)
-                                .max(1);
-                            request_gen_rail = true;
+                        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                            0 => {
+                                let gen_lbl = format!(
+                                    "{}  Random Rail",
+                                    ic::SHUFFLE,
+                                );
+                                if ui
+                                    .add_enabled(
+                                        gen_enabled,
+                                        egui::Button::new(gen_lbl)
+                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                    )
+                                    .on_hover_text(
+                                        "Synthesize a fresh, exact-CSG collision-verified random cinema rail for the active city scene.",
+                                    )
+                                    .clicked()
+                                {
+                                    *self.rail_random_seed = self
+                                        .rail_random_seed
+                                        .wrapping_add(1)
+                                        .max(1);
+                                    request_gen_rail = true;
+                                }
+                            }
+                            _ => {
+                                if ui
+                                    .add_enabled(
+                                        gen_enabled,
+                                        egui::Button::new(format!("{}  Smart Rail", ic::SPARKLE))
+                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                    )
+                                    .on_hover_text(
+                                        "Generate 4 candidate cinema rails, score their vistas on the selected GPU/CPU backend, and fly the winner.",
+                                    )
+                                    .clicked()
+                                {
+                                    *self.rail_random_seed = self
+                                        .rail_random_seed
+                                        .wrapping_add(1)
+                                        .max(1);
+                                    self.bus.emit_ui(UiCommand::RunSmartRail {
+                                        seed: *self.rail_random_seed,
+                                        backend: s.probe_backend,
+                                    });
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                            0 => {
+                                if ui
+                                    .add_enabled(
+                                        gen_enabled,
+                                        egui::Button::new(format!("{}  Possess Car", ic::CAR))
+                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                    )
+                                    .on_hover_text(
+                                        "Jump directly into a driving Robotaxi / vehicle or mounted landmark (cycles targets on each click; Ctrl+Click viewport to pick any object).",
+                                    )
+                                    .clicked()
+                                {
+                                    self.bus.emit_ui(UiCommand::PossessNextVehicle);
+                                }
+                            }
+                            _ => {
+                                if ui
+                                    .add_enabled(
+                                        gen_enabled,
+                                        egui::Button::new(format!("{}  Smart View", ic::EYE))
+                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                    )
+                                    .on_hover_text(
+                                        "Score 64 city viewpoints on OptiX 9 / WGPU / CPU and smoothly glide to the best composition.",
+                                    )
+                                    .clicked()
+                                {
+                                    *self.smart_view_seed = self
+                                        .smart_view_seed
+                                        .wrapping_add(1)
+                                        .max(1);
+                                    self.bus.emit_ui(UiCommand::RunSmartView {
+                                        seed: *self.smart_view_seed,
+                                        backend: s.probe_backend,
+                                    });
+                                }
+                            }
+                        });
+                        prop_row(ui, "Probe", |ui| {
+                            egui::ComboBox::from_id_salt("cinema_probe_backend")
+                                .width(ui.available_width().max(80.0))
+                                .selected_text(s.probe_backend.label())
+                                .show_ui(ui, |ui| {
+                                    for kind in [
+                                        ProbeBackendKind::Auto,
+                                        ProbeBackendKind::Optix,
+                                        ProbeBackendKind::Wgpu,
+                                        ProbeBackendKind::Cpu,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut s.probe_backend,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        if let Some(sv) = self.last_smart_view {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}: {:.2} ({}v, ent {:.2}, depth {:.2}, {:.1} ms)",
+                                    sv.score.backend.label(),
+                                    sv.score.composite,
+                                    sv.candidates_evaluated,
+                                    sv.score.semantic_entropy,
+                                    sv.score.depth_stratification,
+                                    sv.elapsed_ms
+                                ))
+                                .size(10.5)
+                                .weak(),
+                            );
                         }
                     }
                     prop_slider_f32(

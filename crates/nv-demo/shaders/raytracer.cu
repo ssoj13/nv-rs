@@ -61,10 +61,30 @@ struct Params {
     unsigned int csg_flags;      // bit0=enabled, bit1=night, bit2=wet_asphalt, bit3=sunset
     float csg_wetness;           // 0..1 smooth asphalt wetness
     float csg_traffic_time;      // simulation clock for water waves / aviation beacons
-    unsigned int _pad2[2];
+    unsigned int camera_projection; // 0=Pinhole, 1=Fisheye180, 2=Equirect360, 3=SlitCam
+    unsigned int probe_grid_wh;     // (grid_h << 16) | grid_w for __raygen__score_views
+    unsigned long long probe_candidates; // device ptr to GpuProbeCandidate[num_candidates]
+    unsigned long long probe_samples;    // device ptr to GpuProbeSample[num_candidates * grid_w * grid_h]
 };
 
-static_assert(sizeof(Params) == 576, "Params size must match LaunchParams (576 B)");
+static_assert(sizeof(Params) == 592, "Params size must match LaunchParams (592 B)");
+
+struct GpuProbeCandidate {
+    float eye[4];     // xyz = origin, w = unused
+    float forward[4]; // xyz = unit forward, w = aspect
+    float right[4];   // xyz = unit right, w = unused
+    float up[4];      // xyz = unit up, w = tan_half_fov
+};
+static_assert(sizeof(GpuProbeCandidate) == 64, "GpuProbeCandidate must be 64 B");
+
+struct GpuProbeSample {
+    float t;                // <= 0.0f on sky miss
+    unsigned short sem_id;  // SemanticId::0
+    unsigned short _pad0;
+    unsigned int inst_id;   // 0xFFFFFFFFu on miss
+    unsigned int _pad1;
+};
+static_assert(sizeof(GpuProbeSample) == 16, "GpuProbeSample must match csg_scene::ProbeSample (16 B)");
 
 extern "C" {
 __constant__ Params params;
@@ -1429,6 +1449,87 @@ static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, f
     return hit != 0u;
 }
 
+static __forceinline__ __device__ float3 turbo_colormap(float t) {
+    // Google AI Turbo polynomial approximation (perceptually smooth LiDAR range visualization).
+    float x = fmaxf(0.0f, fminf(1.0f, t));
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float x4 = x2 * x2;
+    float x5 = x4 * x;
+    float r = 0.13572138f + 4.61539260f * x - 42.66032258f * x2 + 132.13108234f * x3
+        - 152.94239396f * x4 + 59.28637943f * x5;
+    float g = 0.09140261f + 2.19418839f * x + 4.84296658f * x2 - 14.18503333f * x3
+        + 4.27729857f * x4 + 2.82956604f * x5;
+    float b = 0.10667330f + 12.64194608f * x - 60.58204836f * x2 + 110.36276771f * x3
+        - 89.90310912f * x4 + 27.34824973f * x5;
+    return make_float3(fmaxf(0.0f, fminf(1.0f, r)), fmaxf(0.0f, fminf(1.0f, g)), fmaxf(0.0f, fminf(1.0f, b)));
+}
+
+static __forceinline__ __device__ float3 range_lidar_aov_color(float range_m) {
+    if (range_m > 1e5f) return make_float3(0.0f, 0.0f, 0.0f);
+    // Log-compressed Euclidean LiDAR range across 0..250 m (near = warm bright, far = deep indigo).
+    float norm = log2f(1.0f + fmaxf(0.0f, range_m) * 0.15f) / log2f(1.0f + 250.0f * 0.15f);
+    return turbo_colormap(1.0f - fminf(1.0f, norm));
+}
+
+static __forceinline__ __device__ unsigned int murmur3_rotl32(unsigned int x, unsigned int r) {
+    return (x << r) | (x >> (32u - r));
+}
+
+static __forceinline__ __device__ unsigned int murmur3_32_3u(
+    unsigned int k0,
+    unsigned int k1,
+    unsigned int k2
+) {
+    // Canonical MurmurHash3-32 over 12 bytes (inst_id, part_id, sem_id), seed = 0.
+    const unsigned int c1 = 0xcc9e2d51u;
+    const unsigned int c2 = 0x1b873593u;
+    unsigned int h = 0u;
+    unsigned int ks[3] = { k0, k1, k2 };
+    for (int i = 0; i < 3; ++i) {
+        unsigned int k = ks[i];
+        k *= c1;
+        k = murmur3_rotl32(k, 15u);
+        k *= c2;
+        h ^= k;
+        h = murmur3_rotl32(h, 13u);
+        h = h * 5u + 0xe6546b64u;
+    }
+    h ^= 12u;
+    h ^= h >> 16u;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13u;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16u;
+    return h;
+}
+
+static __forceinline__ __device__ unsigned int cryptomatte_hash_to_f32_bits(unsigned int m3hash) {
+    // Psyop / Academy Cryptomatte specification `hash_to_float`:
+    // mantissa = low 23 bits, exponent = bits 23..30 (remapped away from 0/255 so zero NaN/Inf/denormals).
+    unsigned int exp = (m3hash >> 23u) & 0xFFu;
+    if (exp == 0u || exp == 255u) {
+        exp ^= 1u;
+    }
+    return (exp << 23u) | (m3hash & 0x007FFFFFu);
+}
+
+static __forceinline__ __device__ float3 cryptomatte_aov_color(
+    unsigned int inst_id,
+    unsigned int part_id,
+    unsigned int sem_id,
+    bool has_hit
+) {
+    if (!has_hit) return make_float3(0.0f, 0.0f, 0.0f);
+    unsigned int m3hash = murmur3_32_3u(inst_id, part_id, sem_id);
+    unsigned int id_bits = cryptomatte_hash_to_f32_bits(m3hash);
+    // Official Psyop / Nuke / Blender / Houdini Cryptomatte false-color preview mapping from float32 ID bits.
+    float r = 0.25f * ((float)(id_bits << 8u) * (1.0f / 4294967296.0f));
+    float g = (float)(id_bits << 16u) * (1.0f / 4294967296.0f);
+    float b = (float)(id_bits << 24u) * (1.0f / 4294967296.0f);
+    return make_float3(r, g, b);
+}
+
 extern "C" __global__ void __raygen__render() {
     const uint3 idx = optixGetLaunchIndex();
     if (idx.x >= params.width || idx.y >= params.height) return;
@@ -1443,6 +1544,7 @@ extern "C" __global__ void __raygen__render() {
     float aspect = (float)params.width / (float)params.height;
     float tan_fov = params.cam_up[3];
     unsigned int spp = (params.spp > 0u) ? params.spp : 1u;
+    unsigned int proj = params.camera_projection;
 
     float3 accum_col = make_float3(0.0f, 0.0f, 0.0f);
     float3 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
@@ -1451,32 +1553,91 @@ extern "C" __global__ void __raygen__render() {
     float3 first_normal = make_float3(0.0f, 0.0f, 1.0f);
     float first_roughness = 1.0f;
     float first_depth = 1e6f;
+    float first_range = 1e6f;
+    float3 first_world_pos = make_float3(0.0f, 0.0f, 0.0f);
+    float3 first_mat_pbr = make_float3(0.0f, 0.0f, 0.0f);
+    bool first_has_hit = false;
     float2 first_motion = make_float2(0.0f, 0.0f);
     unsigned int first_sem_id = 0u;
     unsigned int first_inst_id = 0u;
+    unsigned int first_part_id = 0u;
 
     float3 prev_pos = make_f3(params.prev_cam_pos);
     float3 prev_fwd = make_f3(params.prev_cam_forward);
     float3 prev_rgt = make_f3(params.prev_cam_right);
     float3 prev_up  = make_f3(params.prev_cam_up);
     float prev_tan_fov = params.prev_cam_up[3];
-    bool has_prev_cam = (prev_tan_fov > 1e-5f);
+    bool has_prev_cam = (prev_tan_fov > 1e-5f) && (proj == 0u);
 
     for (unsigned int s = 0; s < spp; ++s) {
         bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
         float jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
         float jy = use_dlss_jitter ? params.jitter_y : (rand01(seed) - 0.5f + params.jitter_y);
-        float u = ((float)idx.x + 0.5f + jx) / (float)params.width * 2.0f - 1.0f;
-        float v = 1.0f - ((float)idx.y + 0.5f + jy) / (float)params.height * 2.0f;
+        float px = (float)idx.x + 0.5f + jx;
+        float py = (float)idx.y + 0.5f + jy;
+        float u01 = px / (float)params.width;
+        float v01 = py / (float)params.height;
 
-        float3 dir = f3_norm(f3_add(
-            cam_fwd,
-            f3_add(f3_mul(cam_rgt, u * aspect * tan_fov), f3_mul(cam_up, v * tan_fov))
-        ));
+        float3 dir;
+        bool masked = false;
+        if (proj == 1u) {
+            // 180-degree equidistant automotive fisheye inscribed in centered viewport circle.
+            float half_min = 0.5f * fminf((float)params.width, (float)params.height);
+            float dx = (px - 0.5f * (float)params.width) / fmaxf(1.0f, half_min);
+            float dy = (0.5f * (float)params.height - py) / fmaxf(1.0f, half_min);
+            float r = sqrtf(dx * dx + dy * dy);
+            if (r > 1.0f) {
+                masked = true;
+                dir = cam_fwd;
+            } else {
+                float theta = r * 1.5707963268f;
+                float phi = atan2f(dy, dx);
+                float st = sinf(theta);
+                float ct = cosf(theta);
+                float3 radial = f3_add(f3_mul(cam_rgt, cosf(phi)), f3_mul(cam_up, sinf(phi)));
+                dir = f3_norm(f3_add(f3_mul(cam_fwd, ct), f3_mul(radial, st)));
+            }
+        } else if (proj == 2u) {
+            // 360 x 180 equirectangular panorama (ideal for Robotaxi 360 Roof LiDAR).
+            float yaw = (u01 - 0.5f) * 6.28318530718f;
+            float pitch = (0.5f - v01) * 3.14159265359f;
+            float cp = cosf(pitch);
+            float sp = sinf(pitch);
+            float3 hdir = f3_add(f3_mul(cam_fwd, cosf(yaw)), f3_mul(cam_rgt, sinf(yaw)));
+            dir = f3_norm(f3_add(f3_mul(hdir, cp), f3_mul(cam_up, sp)));
+        } else if (proj == 3u) {
+            // 360-degree cylindrical slit-scan / pushbroom panorama (vertical lines remain straight).
+            float yaw = (u01 - 0.5f) * 6.28318530718f;
+            float3 hdir = f3_add(f3_mul(cam_fwd, cosf(yaw)), f3_mul(cam_rgt, sinf(yaw)));
+            float v_off = (0.5f - v01) * 2.0f * tan_fov;
+            dir = f3_norm(f3_add(hdir, f3_mul(cam_up, v_off)));
+        } else {
+            // Standard rectilinear pinhole camera.
+            float u = u01 * 2.0f - 1.0f;
+            float v = 1.0f - v01 * 2.0f;
+            dir = f3_norm(f3_add(
+                cam_fwd,
+                f3_add(f3_mul(cam_rgt, u * aspect * tan_fov), f3_mul(cam_up, v * tan_fov))
+            ));
+        }
+
+        if (masked) {
+            if (s == 0u) {
+                first_albedo = make_float3(0.0f, 0.0f, 0.0f);
+                first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                first_specular = make_float3(0.0f, 0.0f, 0.0f);
+                first_normal = make_float3(0.0f, 0.0f, 0.0f);
+                first_roughness = 0.0f;
+                first_depth = 1e6f;
+                first_range = 1e6f;
+                first_has_hit = false;
+            }
+            continue;
+        }
         float3 origin = cam_pos;
         float aperture = params.cam_pos[3];
         float focus_dist = params.cam_right[3];
-        if (aperture > 1e-5f && focus_dist > 0.05f) {
+        if (proj == 0u && aperture > 1e-5f && focus_dist > 0.05f) {
             float r = sqrtf(rand01(seed)) * aperture;
             float phi = 6.28318530718f * rand01(seed);
             float3 lens_off = f3_add(
@@ -1559,9 +1720,13 @@ extern "C" __global__ void __raygen__render() {
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
             if (bounce == 0 && s == 0) {
+                first_has_hit = true;
+                first_world_pos = hit_pos;
+                first_range = f3_len(f3_sub(hit_pos, cam_pos));
                 first_depth = fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd));
                 if (is_csg) {
                     first_sem_id = (p5 >> 16u) & 0xFFFFu;
+                    first_part_id = p7;
                     unsigned int uid = p6 + 1u;
                     if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
                         unsigned int u = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
@@ -1571,6 +1736,7 @@ extern "C" __global__ void __raygen__render() {
                 } else {
                     first_sem_id = (inst_id == 0u) ? 16u : (inst_id + 1u);
                     first_inst_id = p6 + 1u;
+                    first_part_id = 0u;
                 }
                 if (has_prev_cam) {
                     float3 rel = f3_sub(hit_pos, prev_pos);
@@ -1614,6 +1780,7 @@ extern "C" __global__ void __raygen__render() {
                             first_specular = make_float3(0.0f, 0.0f, 0.0f);
                             first_normal = n;
                             first_roughness = 1.0f;
+                            first_mat_pbr = make_float3(1.0f, 0.0f, 1.0f);
                         }
                         break;
                     }
@@ -1638,6 +1805,7 @@ extern "C" __global__ void __raygen__render() {
                         first_specular = make_float3(r0, r0, r0);
                         first_normal = n;
                         first_roughness = g_rough;
+                        first_mat_pbr = make_float3(g_rough, 0.0f, 1.0f);
                     }
                     float eta = entering ? (1.0f / ior) : ior;
                     float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
@@ -1679,6 +1847,11 @@ extern "C" __global__ void __raygen__render() {
                     );
                     first_normal = n;
                     first_roughness = (clearcoat > 0.5f) ? fminf(rough, cc_rough + 0.08f) : rough;
+                    first_mat_pbr = make_float3(
+                        fmaxf(0.0f, fminf(1.0f, rough)),
+                        fmaxf(0.0f, fminf(1.0f, metallic)),
+                        (max_em > 0.05f) ? fminf(1.0f, max_em) : 0.0f
+                    );
                 }
 
                 float ray_bias = fmaxf(0.001f, hit_t * 0.0004f);
@@ -1776,6 +1949,7 @@ extern "C" __global__ void __raygen__render() {
                     first_specular = make_float3(r0, r0, r0);
                     first_normal = n;
                     first_roughness = g_rough;
+                    first_mat_pbr = make_float3(g_rough, 0.0f, 1.0f);
                 }
                 float eta = entering ? (1.0f / ior) : ior;
                 float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
@@ -1821,6 +1995,7 @@ extern "C" __global__ void __raygen__render() {
                     first_specular = make_float3(0.0f, 0.0f, 0.0f);
                     first_normal = n;
                     first_roughness = 1.0f;
+                    first_mat_pbr = make_float3(1.0f, 0.0f, 1.0f);
                 }
                 break;
             }
@@ -1889,6 +2064,7 @@ extern "C" __global__ void __raygen__render() {
                 );
                 first_normal = n;
                 first_roughness = fmaxf(0.0f, fminf(1.0f, rough));
+                first_mat_pbr = make_float3(first_roughness, fmaxf(0.0f, fminf(1.0f, metallic)), 0.0f);
             }
 
             // Adaptive surface offset: scales down to micro-detail epsilon on fractals so
@@ -1949,6 +2125,7 @@ extern "C" __global__ void __raygen__render() {
 
     float inv_spp = 1.0f / (float)spp;
     float3 final_col = f3_mul(accum_col, inv_spp);
+    float final_w = 1.0f;
     if (params.aov_mode == 1u) {
         final_col = first_albedo;
     } else if (params.aov_mode == 2u) {
@@ -1967,6 +2144,15 @@ extern "C" __global__ void __raygen__render() {
         final_col = semantic_aov_color(first_sem_id);
     } else if (params.aov_mode == 6u) {
         final_col = instance_aov_color(first_inst_id);
+    } else if (params.aov_mode == 7u) {
+        final_col = first_has_hit ? first_world_pos : make_float3(0.0f, 0.0f, 0.0f);
+        final_w = first_has_hit ? 1.0f : 0.0f;
+    } else if (params.aov_mode == 8u) {
+        final_col = range_lidar_aov_color(first_range);
+    } else if (params.aov_mode == 9u) {
+        final_col = first_has_hit ? first_mat_pbr : make_float3(0.0f, 0.0f, 0.0f);
+    } else if (params.aov_mode == 10u) {
+        final_col = cryptomatte_aov_color(first_inst_id, first_part_id, first_sem_id, first_has_hit);
     }
 
     unsigned int out_idx = idx.y * params.width + idx.x;
@@ -1988,7 +2174,7 @@ extern "C" __global__ void __raygen__render() {
     float4* albedo_buf = (float4*)params.out_albedo_f32;
     float4* normal_buf = (float4*)params.out_normal_f32;
     if (params.accum_count == 0u) {
-        color_buf[out_idx]  = make_float4(final_col.x, final_col.y, final_col.z, 1.0f);
+        color_buf[out_idx]  = make_float4(final_col.x, final_col.y, final_col.z, final_w);
         albedo_buf[out_idx] = make_float4(first_albedo.x, first_albedo.y, first_albedo.z, 1.0f);
         normal_buf[out_idx] = make_float4(first_normal.x, first_normal.y, first_normal.z, first_roughness);
     } else {
@@ -2000,7 +2186,7 @@ extern "C" __global__ void __raygen__render() {
             pc.x + (final_col.x - pc.x) * w,
             pc.y + (final_col.y - pc.y) * w,
             pc.z + (final_col.z - pc.z) * w,
-            1.0f
+            pc.w + (final_w - pc.w) * w
         );
         albedo_buf[out_idx] = make_float4(
             pa.x + (first_albedo.x - pa.x) * w,
@@ -2018,6 +2204,71 @@ extern "C" __global__ void __raygen__render() {
         float r_acc = pn.w + (first_roughness - pn.w) * w;
         normal_buf[out_idx] = make_float4(n_acc.x, n_acc.y, n_acc.z, r_acc);
     }
+}
+
+extern "C" __global__ void __raygen__score_views() {
+    if (params.probe_candidates == 0ull || params.probe_samples == 0ull) return;
+    unsigned int grid_w = params.probe_grid_wh & 0xFFFFu;
+    unsigned int grid_h = (params.probe_grid_wh >> 16u) & 0xFFFFu;
+    if (grid_w == 0u || grid_h == 0u) return;
+
+    const uint3 idx = optixGetLaunchIndex();
+    if (idx.x >= grid_w || idx.y >= grid_h) return;
+
+    const GpuProbeCandidate cand = ((const GpuProbeCandidate*)params.probe_candidates)[idx.z];
+    float3 eye   = make_f3(cand.eye);
+    float3 fwd   = make_f3(cand.forward);
+    float3 right = make_f3(cand.right);
+    float3 up    = make_f3(cand.up);
+    float aspect = cand.forward[3];
+    float tan_half_fov = cand.up[3];
+
+    float ndc_x = 2.0f * (((float)idx.x + 0.5f) / (float)grid_w) - 1.0f;
+    float ndc_y = 1.0f - 2.0f * (((float)idx.y + 0.5f) / (float)grid_h);
+    float3 dir = f3_norm(f3_add(
+        fwd,
+        f3_add(f3_mul(right, ndc_x * aspect * tan_half_fov), f3_mul(up, ndc_y * tan_half_fov))
+    ));
+
+    unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
+    optixTrace(
+        (OptixTraversableHandle)params.handle,
+        eye, dir,
+        0.05f, 600.0f, 0.0f,
+        OptixVisibilityMask(255),
+        OPTIX_RAY_FLAG_NONE,
+        0, 1, 0,
+        p0, p1, p2, p3, p4, p5, p6, p7
+    );
+
+    GpuProbeSample out_s;
+    if (p0 == 2u) {
+        out_s.t = __uint_as_float(p1);
+        out_s.sem_id = (unsigned short)((p5 >> 16u) & 0xFFFFu);
+        out_s._pad0 = 0u;
+        unsigned int uid = p6;
+        if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
+            uid = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
+        }
+        out_s.inst_id = uid;
+        out_s._pad1 = 0u;
+    } else if (p0 != 0u) {
+        out_s.t = __uint_as_float(p1);
+        unsigned int inst_id = p6 & 0xFFu;
+        out_s.sem_id = (unsigned short)((inst_id == 0u) ? 16u : (inst_id + 1u));
+        out_s._pad0 = 0u;
+        out_s.inst_id = p6;
+        out_s._pad1 = 0u;
+    } else {
+        out_s.t = -1.0f;
+        out_s.sem_id = 0u;
+        out_s._pad0 = 0u;
+        out_s.inst_id = 0xFFFFFFFFu;
+        out_s._pad1 = 0u;
+    }
+
+    unsigned int out_idx = (idx.z * grid_h + idx.y) * grid_w + idx.x;
+    ((GpuProbeSample*)params.probe_samples)[out_idx] = out_s;
 }
 
 extern "C" __global__ void __miss__miss() {

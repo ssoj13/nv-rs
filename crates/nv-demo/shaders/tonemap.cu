@@ -1,4 +1,19 @@
 
+static __forceinline__ __device__ float3 world_pos_to_vis_rgb(float4 c) {
+    // `c.w < 0.5f` marks sky miss -> crisp black; hits carry exact metric world coordinates in `c.xyz`.
+    if (c.w < 0.5f) {
+        return make_float3(0.0f, 0.0f, 0.0f);
+    }
+    auto map_axis = [](float v) -> float {
+        // Signed-log macro position tint + subtle 20 m repeating spatial contour for 3D continuity.
+        float macro = 0.5f + 0.5f * (v / (1.0f + fabsf(v) * 0.018f));
+        float cell = v * 0.05f - floorf(v * 0.05f);
+        float grid = 0.78f + 0.22f * cell;
+        return fmaxf(0.0f, fminf(1.0f, macro * grid));
+    };
+    return make_float3(map_axis(c.x), map_axis(c.y), map_axis(c.z));
+}
+
 static __forceinline__ __device__ uchar4 eval_tonemap_pixel(float4 c, float exposure, unsigned int mode) {
     if (mode == 2u) {
         // Normal AOV: map [-1, 1] -> [0, 255]
@@ -16,8 +31,18 @@ static __forceinline__ __device__ uchar4 eval_tonemap_pixel(float4 c, float expo
         };
         return make_uchar4(to_srgb(c.x), to_srgb(c.y), to_srgb(c.z), 255);
     }
-    if (mode == 3u || mode == 4u || mode == 5u || mode == 6u) {
-        // Depth / Motion / SemanticId / InstanceId AOV: already normalized [0, 1]
+    if (mode == 7u) {
+        // WorldPos AOV: raw metric 3D position -> readable signed-log + 20 m grid visualization
+        float3 v = world_pos_to_vis_rgb(c);
+        return make_uchar4(
+            (unsigned char)(v.x * 255.0f + 0.5f),
+            (unsigned char)(v.y * 255.0f + 0.5f),
+            (unsigned char)(v.z * 255.0f + 0.5f),
+            255
+        );
+    }
+    if (mode >= 3u && mode <= 10u) {
+        // Depth / Motion / SemanticId / InstanceId / Range / Material / Cryptomatte: normalized [0, 1]
         auto to_u8 = [](float v) -> unsigned char {
             float s = fmaxf(0.0f, fminf(1.0f, v));
             return (unsigned char)(s * 255.0f + 0.5f);
@@ -160,7 +185,16 @@ static __forceinline__ __device__ ushort4 eval_scrgb_pixel(float4 c, float expos
             1.0f
         );
     }
-    if (mode == 3u || mode == 4u || mode == 5u || mode == 6u) {
+    if (mode == 7u) {
+        float3 v = world_pos_to_vis_rgb(c);
+        return pack_f16_4(
+            powf(v.x, 2.2f) * paper_white_scrgb,
+            powf(v.y, 2.2f) * paper_white_scrgb,
+            powf(v.z, 2.2f) * paper_white_scrgb,
+            1.0f
+        );
+    }
+    if (mode >= 3u && mode <= 10u) {
         float r = sanitize_range(c.x, 0.0f, 1.0f);
         float g = sanitize_range(c.y, 0.0f, 1.0f);
         float b = sanitize_range(c.z, 0.0f, 1.0f);

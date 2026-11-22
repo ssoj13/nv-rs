@@ -18,14 +18,18 @@ use cuda_bindings as cu;
 use cuda_core::{DeviceBuffer, Stream};
 use optix::{Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, Instance, Scratch};
 
-use csg_core::GpuCompound;
 use csg_core::abi::compound_flags;
 use csg_core::math::Vec3;
+use csg_core::{GpuCompound, Ray};
 use csg_scene::{
-    CameraView, GpuInstance, GpuMaterial, PackedGpuScene, RailGenConfig, RailSpec,
-    SceneBuildConfig, SceneDescriptor, SceneHints, SceneRegistry, SceneTraffic, SceneViewpoint,
-    TimeOfDay, WorldScene, generate_random_rail,
+    CameraPose as CsgCameraPose, CameraView, GpuInstance, GpuMaterial, PackedGpuScene,
+    RailGenConfig, RailSpec, SceneBuildConfig, SceneDescriptor, SceneHints, SceneRegistry,
+    SceneTraffic, SceneViewpoint, TimeOfDay, WorldScene, generate_random_rail, is_dynamic_inst_id,
+    list_possess_targets, lookup_instance_and_assembly, pick_possessable_instance,
+    resolve_possess_pose,
 };
+
+use crate::app_events::PossessInfo;
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`).
 pub const CSG_SBT_OFFSET: u32 = 4;
@@ -60,6 +64,8 @@ pub struct CsgCameraParams {
     pub vfov_rad: f32,
     /// User LOD detail multiplier (`0.25..=4.0`).
     pub lod_bias: f32,
+    /// Use 360-degree omnidirectional packing (for `Fisheye180`, `Equirect360`, and `SlitCam`).
+    pub omnidirectional: bool,
 }
 
 /// Bitflags packed into `LaunchParams::csg_flags`.
@@ -283,9 +289,12 @@ pub struct CsgGpuHost {
     last_pack_cam: [f32; 3],
     last_pack_fwd: [f32; 3],
     last_pack_lod_bits: u32,
+    last_pack_omni: bool,
     last_traffic_bits: u32,
     ias_dirty: bool,
     stats: CsgStats,
+    active_possess: Option<PossessInfo>,
+    next_vehicle_cursor: usize,
 }
 
 impl Default for CsgGpuHost {
@@ -321,9 +330,12 @@ impl CsgGpuHost {
             last_pack_cam: [f32::NAN; 3],
             last_pack_fwd: [f32::NAN; 3],
             last_pack_lod_bits: 0,
+            last_pack_omni: false,
             last_traffic_bits: u32::MAX,
             ias_dirty: false,
             stats: CsgStats::default(),
+            active_possess: None,
+            next_vehicle_cursor: 0,
         }
     }
 
@@ -367,6 +379,137 @@ impl CsgGpuHost {
             .map_err(|e| format!("Random rail gen failed: {e}"))
     }
 
+    /// Returns references to the active `WorldScene` and `SceneHints`, if a CSG scene is loaded.
+    pub fn world_and_hints(&self) -> Option<(&WorldScene, &SceneHints)> {
+        match (&self.world, &self.hints) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }
+    }
+
+    /// Returns the currently packed GPU instance staging buffer.
+    pub fn packed(&self) -> &PackedGpuScene {
+        &self.packed
+    }
+
+    /// Packs the full scene omnidirectionally into `self.packed` and uploads `self.instances_buf`
+    /// for city-wide view scoring, marking `ias_dirty` so the next render frame restores frustum culling.
+    pub fn prepare_full_scene_for_probe(&mut self, stream: &Arc<Stream>) -> Result<(), String> {
+        let Some(ref mut world) = self.world else {
+            return Err("Load a CSG scene before running Smart View".to_string());
+        };
+        let cam_pos = if self.last_pack_cam.iter().all(|v| v.is_finite()) {
+            Vec3::new(
+                self.last_pack_cam[0],
+                self.last_pack_cam[1],
+                self.last_pack_cam[2],
+            )
+        } else {
+            Vec3::ZERO
+        };
+        world.pack_all(cam_pos, &mut self.packed);
+        self.instances_buf
+            .upload(stream, self.packed.instances_slice())?;
+        self.ias_dirty = true;
+        Ok(())
+    }
+
+    /// Casts an exact CSG ray against live dynamic + static instances and enters `Possess` mode.
+    pub fn pick_possess(&mut self, origin: [f32; 3], dir: [f32; 3]) -> Result<PossessInfo, String> {
+        let Some(ref world) = self.world else {
+            return Err("Load a CSG scene before picking an object to possess".to_string());
+        };
+        let d = Vec3::new(dir[0], dir[1], dir[2]).norm();
+        let ray = Ray::new(Vec3::new(origin[0], origin[1], origin[2]), d, 0.05, 1500.0);
+        let Some((inst_id, _t, mounts)) = pick_possessable_instance(world, ray) else {
+            return Err("No possessable object hit under cursor".to_string());
+        };
+        let assembly_name = lookup_instance_and_assembly(world, inst_id)
+            .map(|(_, asm)| asm.name.clone())
+            .unwrap_or_else(|| format!("Object #{inst_id}"));
+        let info = PossessInfo {
+            inst_id,
+            assembly_name,
+            mounts,
+            mount_idx: 0,
+            is_dynamic: is_dynamic_inst_id(inst_id),
+        };
+        self.active_possess = Some(info.clone());
+        Ok(info)
+    }
+
+    /// Possesses the next dynamic vehicle (prioritizing `Robotaxi`) or mounted scene landmark.
+    pub fn possess_next_vehicle(&mut self) -> Result<PossessInfo, String> {
+        let Some(ref world) = self.world else {
+            return Err("Load a CSG scene before possessing a vehicle".to_string());
+        };
+        let mut targets = list_possess_targets(world);
+        if targets.is_empty() {
+            return Err("Active scene has no mounted vehicles or landmarks".to_string());
+        }
+        // Sort: dynamic Robotaxis first, then other dynamic actors, then static mounted landmarks.
+        targets.sort_by_key(|t| {
+            let dyn_rank = if is_dynamic_inst_id(t.inst_id) { 0u8 } else { 1u8 };
+            let robo_rank = if t.assembly_name.to_ascii_lowercase().contains("robotaxi") {
+                0u8
+            } else {
+                1u8
+            };
+            (dyn_rank, robo_rank, t.inst_id)
+        });
+        let idx = self.next_vehicle_cursor % targets.len();
+        self.next_vehicle_cursor = self.next_vehicle_cursor.wrapping_add(1);
+        let chosen = targets.swap_remove(idx);
+        let info = PossessInfo {
+            inst_id: chosen.inst_id,
+            assembly_name: chosen.assembly_name,
+            mounts: chosen.mounts,
+            mount_idx: 0,
+            is_dynamic: is_dynamic_inst_id(chosen.inst_id),
+        };
+        self.active_possess = Some(info.clone());
+        Ok(info)
+    }
+
+    /// Switches the active mount index on the currently possessed body.
+    pub fn set_possess_mount(&mut self, mount_idx: usize) -> Option<PossessInfo> {
+        let info = self.active_possess.as_mut()?;
+        if info.mounts.is_empty() {
+            return None;
+        }
+        info.mount_idx = mount_idx % info.mounts.len();
+        Some(info.clone())
+    }
+
+    /// Detaches from any currently possessed body back to free camera.
+    pub fn eject_possess(&mut self) -> bool {
+        self.active_possess.take().is_some()
+    }
+
+    /// Returns `true` while actively possessing an object or moving vehicle.
+    pub fn is_possessing(&self) -> bool {
+        self.active_possess.is_some()
+    }
+
+    /// Resolves the live world-space camera pose of the possessed body (tracking moving traffic).
+    pub fn resolve_active_possess(
+        &self,
+        free_yaw: f32,
+        free_pitch: f32,
+        auto_level: bool,
+    ) -> Option<CsgCameraPose> {
+        let world = self.world.as_ref()?;
+        let info = self.active_possess.as_ref()?;
+        resolve_possess_pose(
+            world,
+            info.inst_id,
+            info.mount_idx,
+            free_yaw,
+            free_pitch,
+            Some(auto_level),
+        )
+    }
+
     /// Returns the flat device pointers for `LaunchParams`.
     pub fn device_pointers(&self) -> CsgDevicePointers {
         if !self.is_active() {
@@ -394,6 +537,24 @@ impl CsgGpuHost {
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
         }
+    }
+
+    /// Advances dynamic 3D Frenet traffic in-place to `traffic_time_s` before resolving possessed
+    /// vehicle camera mounts so the camera is locked to the exact current-frame vehicle transform.
+    pub fn step_traffic(&mut self, traffic_time_s: f32) -> bool {
+        let traffic_bits = traffic_time_s.to_bits();
+        let moved = self.has_traffic() && traffic_bits != self.last_traffic_bits;
+        if moved
+            && let (Some(reg_idx), Some(world), Some(traffic)) =
+                (self.active_reg_idx, self.world.as_mut(), self.traffic.as_ref())
+            && let Some(module) = self.registry.get_by_index(reg_idx)
+        {
+            module.step_dynamic(world, traffic, traffic_time_s);
+            self.last_traffic_bits = traffic_bits;
+            self.ias_dirty = true;
+            return true;
+        }
+        false
     }
 
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
@@ -465,26 +626,36 @@ impl CsgGpuHost {
             || self.ias_dirty
             || traffic_moved
             || lod_bits != self.last_pack_lod_bits
+            || cam.omnidirectional != self.last_pack_omni
             || !cam_dist_sq.is_finite()
             || cam_dist_sq > 4.0
-            || !fwd_dot.is_finite()
-            || fwd_dot < 0.99;
+            || (!cam.omnidirectional && (!fwd_dot.is_finite() || fwd_dot < 0.99));
 
         if need_pack && let Some(ref mut world) = self.world {
-            let aspect = (cam.viewport_w.max(1) as f32 / cam.viewport_h.max(1) as f32).clamp(0.25, 4.0);
-            // Pad frustum FOV by 28% so fast turns (~8 deg threshold) and edge reflections never pop,
-            // while culling off-screen behind-camera micro-instances (shadow_guard_radius = 120 m
-            // retains large behind-camera buildings for accurate shadows).
-            let padded_vfov = (cam.vfov_rad * 1.28).clamp(0.15, 2.7);
-            let mut cam_view = CameraView::perspective(
-                Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]),
-                Vec3::new(cam.fwd[0], cam.fwd[1], cam.fwd[2]),
-                Vec3::new(cam.up[0], cam.up[1], cam.up[2]),
-                padded_vfov,
-                aspect,
-                [0.05, 1500.0],
-                (cam.viewport_h.max(144)) as f32,
-            );
+            let mut cam_view = if cam.omnidirectional {
+                CameraView::omnidirectional(
+                    Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]),
+                    1500.0,
+                    cam.vfov_rad.clamp(0.15, 2.7),
+                    (cam.viewport_h.max(144)) as f32,
+                )
+            } else {
+                let aspect = (cam.viewport_w.max(1) as f32 / cam.viewport_h.max(1) as f32)
+                    .clamp(0.25, 4.0);
+                // Pad frustum FOV by 28% so fast turns (~8 deg threshold) and edge reflections never pop,
+                // while culling off-screen behind-camera micro-instances (shadow_guard_radius = 120 m
+                // retains large behind-camera buildings for accurate shadows).
+                let padded_vfov = (cam.vfov_rad * 1.28).clamp(0.15, 2.7);
+                CameraView::perspective(
+                    Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]),
+                    Vec3::new(cam.fwd[0], cam.fwd[1], cam.fwd[2]),
+                    Vec3::new(cam.up[0], cam.up[1], cam.up[2]),
+                    padded_vfov,
+                    aspect,
+                    [0.05, 1500.0],
+                    (cam.viewport_h.max(144)) as f32,
+                )
+            };
             cam_view.lod_bias = cam.lod_bias.clamp(0.25, 4.0);
             world.pack_visible(&cam_view, &mut self.packed);
             self.instances_buf
@@ -503,6 +674,7 @@ impl CsgGpuHost {
             self.last_pack_cam = cam.eye;
             self.last_pack_fwd = cam.fwd;
             self.last_pack_lod_bits = lod_bits;
+            self.last_pack_omni = cam.omnidirectional;
             self.ias_dirty = false;
             return Ok(true);
         }
@@ -576,6 +748,9 @@ impl CsgGpuHost {
         self.last_mat_state = (u32::MAX, u32::MAX);
         self.last_pack_cam = [f32::NAN; 3];
         self.last_pack_fwd = [f32::NAN; 3];
+        self.last_pack_omni = false;
+        self.active_possess = None;
+        self.next_vehicle_cursor = 0;
         self.last_pack_cam = [f32::NAN; 3];
         self.last_traffic_bits = u32::MAX;
         self.ias_dirty = true;

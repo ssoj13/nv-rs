@@ -33,8 +33,8 @@ use winit::window::{Window, WindowId};
 mod demo_app {
     use super::*;
     use crate::app_events::{
-        AppBus, INTERACTION_SETTLE_WINDOW, RenderControl, RenderEvent, RenderStateSnapshot,
-        StillFormat, UiCommand,
+        AppBus, INTERACTION_SETTLE_WINDOW, PossessInfo, RenderControl, RenderEvent,
+        RenderStateSnapshot, SmartViewResult, StillFormat, UiCommand,
     };
     use crate::camera_core::input::NavScheme;
     use crate::camera_core::{
@@ -43,7 +43,7 @@ mod demo_app {
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
         CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs,
-        align_render_size, spawn_render_thread,
+        align_render_size, camera_projection_ray, spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
     use appbus::downcast_event;
@@ -1145,6 +1145,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
         pending_scene_auto_frame: Option<(u32, u32)>,
         rail_random_seed: u64,
+        smart_view_seed: u64,
+        possess_info: Option<PossessInfo>,
+        possess_free_yaw: f32,
+        possess_free_pitch: f32,
+        possess_auto_level: bool,
+        last_sent_possess_look: (u32, u32, bool),
+        last_possess_camera: Option<CameraFrame>,
+        pick_possess_mode: bool,
+        last_smart_view: Option<SmartViewResult>,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
@@ -1424,6 +1433,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 camera: initial_camera,
                 interacting_until: None,
                 reset_seq: 0,
+                possess_free_yaw: 0.0,
+                possess_free_pitch: 0.0,
+                possess_auto_level: true,
             });
             let render_thread = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
@@ -1522,6 +1534,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 scene_viewpoints: Vec::new(),
                 pending_scene_auto_frame: None,
                 rail_random_seed: 2026,
+                smart_view_seed: 42,
+                possess_info: None,
+                possess_free_yaw: 0.0,
+                possess_free_pitch: 0.0,
+                possess_auto_level: true,
+                last_sent_possess_look: (0.0f32.to_bits(), 0.0f32.to_bits(), true),
+                last_possess_camera: None,
+                pick_possess_mode: false,
+                last_smart_view: None,
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
@@ -1675,6 +1696,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
                         self.fast_preview = msg.fast_preview;
+                        self.last_possess_camera = msg.possess_camera;
                         let total_gpu_ms =
                             (msg.rt_ms + msg.denoise_ms + msg.bloom_ms + msg.tonemap_ms).max(0.1);
                         let inst_rt_fps = 1000.0 / total_gpu_ms;
@@ -1728,6 +1750,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     RenderEvent::RailGenerated(rail_spec) => {
                         self.camera_rail.push_generated_rail(rail_spec.clone());
                         self.rail_blend_remaining = 1.6;
+                    }
+                    RenderEvent::PossessChanged(info) => {
+                        if let Some(pinfo) = info {
+                            self.camera_rail.set_playing(false);
+                            self.possess_free_yaw = 0.0;
+                            self.possess_free_pitch = 0.0;
+                            if let Some(m) = pinfo.mounts.get(pinfo.mount_idx) {
+                                self.possess_auto_level = m.auto_level;
+                            }
+                            self.possess_info = Some(pinfo.clone());
+                        } else {
+                            if self.possess_info.is_some()
+                                && let Some(pc) = self.last_possess_camera.take()
+                            {
+                                let fov_y = (2.0 * pc.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
+                                let pose = CameraPose::from_eye_forward_up(
+                                    Vec3::from_array(pc.eye),
+                                    Vec3::from_array(pc.fwd),
+                                    Vec3::from_array(pc.up),
+                                    fov_y,
+                                    self.cam_pose.znear,
+                                    self.cam_pose.zfar.max(2000.0),
+                                );
+                                self.cam_driver.controller_mut().set_pose(pose);
+                                self.cam_pose = self.cam_driver.controller().pose();
+                                self.rail_blend_remaining = 0.0;
+                                self.cam_damper.snap(self.cam_pose);
+                            }
+                            self.possess_info = None;
+                        }
+                    }
+                    RenderEvent::SmartViewReady(sv) => {
+                        self.last_smart_view = Some(*sv);
+                        self.camera_rail.set_playing(false);
+                        let pose = CameraPose::from_eye_forward_up(
+                            Vec3::from_array(sv.eye),
+                            Vec3::from_array(sv.forward),
+                            Vec3::from_array(sv.up),
+                            sv.vfov_deg.clamp(15.0, 110.0).to_radians(),
+                            self.cam_pose.znear,
+                            self.cam_pose.zfar.max(2000.0),
+                        );
+                        self.cam_driver.controller_mut().set_pose(pose);
+                        self.cam_driver.controller_mut().set_orbit_distance(16.0);
+                        self.cam_pose = self.cam_driver.controller().pose();
+                        self.rail_blend_remaining = 1.0;
                     }
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
@@ -1788,6 +1856,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 dlss_rr_available: self.dlss_rr_available,
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
+                possess_info: self.possess_info.as_ref(),
+                possess_free_yaw: &mut self.possess_free_yaw,
+                possess_free_pitch: &mut self.possess_free_pitch,
+                possess_auto_level: &mut self.possess_auto_level,
+                pick_possess_mode: &mut self.pick_possess_mode,
+                smart_view_seed: &mut self.smart_view_seed,
+                last_smart_view: self.last_smart_view,
                 last_saved_msg: self.last_saved_msg.as_deref(),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
@@ -1811,6 +1886,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut save_jpeg_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
+            let mut pick_possess_uv: Option<(f32, f32)> = None;
+            let mut possess_next_vehicle_requested = false;
+            let mut select_possess_mount: Option<usize> = None;
+            let mut cycle_possess_mount_delta: i32 = 0;
+            let mut eject_possess_requested = false;
+            let mut run_smart_view: Option<(u64, csg_scene::ProbeBackendKind)> = None;
+            let mut run_smart_rail: Option<(u64, csg_scene::ProbeBackendKind)> = None;
             self.bus.poll_ui_commands(&mut self.ui_cmd_scratch);
             for boxed in &self.ui_cmd_scratch {
                 let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
@@ -1833,6 +1915,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     UiCommand::SnapCamera => cam_snap_requested = true,
                     UiCommand::BlendRail => rail_blend_requested = true,
+                    UiCommand::PickPossess { norm_x, norm_y } => {
+                        pick_possess_uv = Some((norm_x, norm_y));
+                    }
+                    UiCommand::PossessNextVehicle => possess_next_vehicle_requested = true,
+                    UiCommand::SelectPossessMount { mount_idx } => {
+                        select_possess_mount = Some(mount_idx);
+                    }
+                    UiCommand::CyclePossessMount { delta } => {
+                        cycle_possess_mount_delta += delta;
+                    }
+                    UiCommand::EjectPossess => eject_possess_requested = true,
+                    UiCommand::RunSmartView { seed, backend } => {
+                        run_smart_view = Some((seed, backend));
+                    }
+                    UiCommand::RunSmartRail { seed, backend } => {
+                        run_smart_rail = Some((seed, backend));
+                    }
                 }
             }
             if self.theme != prev_theme {
@@ -2493,9 +2592,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if let Some((scene_idx, variant_idx)) = select_scene_target {
                 self.pending_scene_auto_frame = Some((scene_idx, variant_idx));
                 self.camera_rail.set_playing(false);
+                if self.possess_info.is_some() {
+                    self.bus.send_render(RenderControl::EjectPossess);
+                }
             }
             if let Some(seed) = generate_random_rail_seed {
+                if self.possess_info.is_some() {
+                    self.bus.send_render(RenderControl::EjectPossess);
+                }
                 self.bus.send_render(RenderControl::GenerateRandomRail { seed });
+            }
+            if let Some((norm_x, norm_y)) = pick_possess_uv {
+                let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
+                let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
+                if let Some((origin, dir)) = camera_projection_ray(
+                    &active_cam,
+                    self.settings.camera_projection,
+                    norm_x,
+                    norm_y,
+                    aspect,
+                ) {
+                    self.bus.send_render(RenderControl::PickPossess { origin, dir });
+                } else {
+                    self.last_saved_msg = Some("Click inside the fisheye sensor circle to pick".to_string());
+                }
+            }
+            if possess_next_vehicle_requested {
+                self.bus.send_render(RenderControl::PossessNextVehicle);
+            }
+            if let Some(mount_idx) = select_possess_mount {
+                self.bus.send_render(RenderControl::SetPossessMount { mount_idx });
+            } else if cycle_possess_mount_delta != 0
+                && let Some(ref info) = self.possess_info
+                && !info.mounts.is_empty()
+            {
+                let next_idx = (info.mount_idx as i32 + cycle_possess_mount_delta)
+                    .rem_euclid(info.mounts.len() as i32) as usize;
+                self.bus
+                    .send_render(RenderControl::SetPossessMount { mount_idx: next_idx });
+            }
+            if eject_possess_requested {
+                self.bus.send_render(RenderControl::EjectPossess);
+            }
+            if let Some((seed, backend)) = run_smart_view {
+                self.bus
+                    .send_render(RenderControl::RunSmartView { seed, backend });
+            }
+            if let Some((seed, backend)) = run_smart_rail {
+                self.bus
+                    .send_render(RenderControl::RunSmartRail { seed, backend });
             }
             if reload_shader_requested {
                 self.bus.send_render(RenderControl::ReloadShader);
@@ -2511,6 +2656,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 1
             };
             if rail_blend_requested {
+                if self.possess_info.is_some() {
+                    self.bus.send_render(RenderControl::EjectPossess);
+                }
                 self.rail_blend_remaining = 1.6;
             }
             if cam_snap_requested {
@@ -2608,9 +2756,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     effective_settings.sat_orbit = false;
                 }
                 let cam_frame = pose_to_frame(render_pose);
+                let possess_look = (
+                    self.possess_free_yaw.to_bits(),
+                    self.possess_free_pitch.to_bits(),
+                    self.possess_auto_level,
+                );
                 if reset_accum_requested
                     || effective_settings != self.last_sent_settings
                     || cam_frame != self.last_sent_camera
+                    || possess_look != self.last_sent_possess_look
                 {
                     if reset_accum_requested {
                         self.reset_seq = self.reset_seq.wrapping_add(1);
@@ -2625,11 +2779,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     };
                     self.last_sent_settings = effective_settings;
                     self.last_sent_camera = cam_frame;
+                    self.last_sent_possess_look = possess_look;
                     self.bus.publish_render_state(RenderStateSnapshot {
                         settings: effective_settings,
                         camera: cam_frame,
                         interacting_until: self.interacting_until,
                         reset_seq: self.reset_seq,
+                        possess_free_yaw: self.possess_free_yaw,
+                        possess_free_pitch: self.possess_free_pitch,
+                        possess_auto_level: self.possess_auto_level,
                     });
                 }
             }

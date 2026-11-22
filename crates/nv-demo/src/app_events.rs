@@ -15,13 +15,47 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use appbus::{BoxedEvent, EventBus, StateSlot};
-use csg_scene::RailSpec;
+use csg_scene::{CameraMount, ProbeBackendKind, RailSpec, ViewScore};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady};
 
 /// Duration after the last camera or setting change during which interactive fast-preview stays active.
 pub const INTERACTION_SETTLE_WINDOW: Duration = Duration::from_millis(150);
+
+/// Active possessed object metadata synced from the render worker to the UI thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PossessInfo {
+    /// Encoded static or dynamic instance ID (`DYNAMIC_INST_BIT` marks moving actors).
+    pub inst_id: u32,
+    /// Human-readable assembly label (e.g. `robotaxi`, `sf_house_of_ai_40_boardman`).
+    pub assembly_name: String,
+    /// Available camera mounts attached to the possessed object.
+    pub mounts: Vec<CameraMount>,
+    /// Currently active index inside `mounts`.
+    pub mount_idx: usize,
+    /// `true` when riding a moving dynamic traffic/marine actor.
+    pub is_dynamic: bool,
+}
+
+/// Result of a GPU/CPU multi-candidate `Smart View` scoring pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SmartViewResult {
+    /// Winning camera origin.
+    pub eye: [f32; 3],
+    /// Winning unit forward direction.
+    pub forward: [f32; 3],
+    /// Winning unit up vector.
+    pub up: [f32; 3],
+    /// Winning vertical FOV in degrees.
+    pub vfov_deg: f32,
+    /// SSOT composition quality breakdown and concrete backend that executed.
+    pub score: ViewScore,
+    /// Wall-clock scoring time in milliseconds.
+    pub elapsed_ms: f32,
+    /// Number of candidate viewpoints evaluated.
+    pub candidates_evaluated: usize,
+}
 
 /// Still image capture format requested from the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +67,7 @@ pub enum StillFormat {
 }
 
 /// Typed UI commands emitted by `ui.rs` and consumed cleanly by the main application loop.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
     /// Clear progressive path-tracing and DLSS temporal accumulation.
     ResetAccum,
@@ -51,6 +85,20 @@ pub enum UiCommand {
     SnapCamera,
     /// Smoothly glide `CameraDamper` into a newly started or switched camera rail cassette.
     BlendRail,
+    /// Pick and possess the object under normalized viewport coordinates `(norm_x, norm_y)` (`[0, 1]`).
+    PickPossess { norm_x: f32, norm_y: f32 },
+    /// Jump straight into the next moving vehicle (prioritizing `Robotaxi`) with 1 click.
+    PossessNextVehicle,
+    /// Switch the active possessed object to a specific `CameraMount` index.
+    SelectPossessMount { mount_idx: usize },
+    /// Cycle the active possessed object's `CameraMount` by `delta` (`-1` for `[`, `+1` for `]`).
+    CyclePossessMount { delta: i32 },
+    /// Detach cleanly from the possessed object back to free camera control.
+    EjectPossess,
+    /// Score 64 city viewpoints on the selected `ProbeBackendKind` and glide to the highest-scoring view.
+    RunSmartView { seed: u64, backend: ProbeBackendKind },
+    /// Generate multiple candidate rails, score their key vistas on `backend`, and activate the best rail.
+    RunSmartRail { seed: u64, backend: ProbeBackendKind },
 }
 
 /// Discrete non-coalescable control commands dispatched from the UI thread to the OptiX worker.
@@ -87,6 +135,18 @@ pub enum RenderControl {
     },
     /// Synthesize a deterministic exact-CSG random rail for the active scene on the worker thread.
     GenerateRandomRail { seed: u64 },
+    /// Cast an exact world-space CSG pick ray and possess the hit object.
+    PickPossess { origin: [f32; 3], dir: [f32; 3] },
+    /// Possess the next dynamic vehicle (prioritizing `Robotaxi`) or mounted scene object.
+    PossessNextVehicle,
+    /// Switch active camera mount index on the currently possessed object.
+    SetPossessMount { mount_idx: usize },
+    /// Eject from the currently possessed object back to free camera.
+    EjectPossess,
+    /// Evaluate 64 scenic viewpoints using the requested probe backend and return the winner.
+    RunSmartView { seed: u64, backend: ProbeBackendKind },
+    /// Score multiple candidate random rails using the requested probe backend and activate the winner.
+    RunSmartRail { seed: u64, backend: ProbeBackendKind },
     /// Hot-reload `raytracer.cu` from disk via NVRTC.
     ReloadShader,
     /// Gracefully terminate the render worker thread.
@@ -102,6 +162,10 @@ pub enum RenderEvent {
     SceneMetaUpdated(SceneLoadedMetadata),
     /// An on-demand exact-CSG random rail finished generating.
     RailGenerated(RailSpec),
+    /// Active possessed body or mount changed (`None` = ejected to free camera).
+    PossessChanged(Option<PossessInfo>),
+    /// A `Smart View` scoring run selected a top viewpoint.
+    SmartViewReady(SmartViewResult),
     /// Human-readable status or diagnostic message for the UI status bar.
     StatusMessage(String),
 }
@@ -121,6 +185,12 @@ pub struct RenderStateSnapshot {
     pub interacting_until: Option<Instant>,
     /// Monotonically incremented whenever an explicit `ResetAccum` is requested.
     pub reset_seq: u64,
+    /// User free-look yaw offset (radians) while possessing a body with `allow_free_look`.
+    pub possess_free_yaw: f32,
+    /// User free-look pitch offset (radians) while possessing a body with `allow_free_look`.
+    pub possess_free_pitch: f32,
+    /// Keep possessed camera horizon level (`true`) or follow full body roll/pitch (`false`).
+    pub possess_auto_level: bool,
 }
 
 /// Lost-wakeup-immune condvar waking the OptiX worker whenever a command or state snapshot arrives.
@@ -278,6 +348,9 @@ mod tests {
             camera: sample_camera(0.0),
             interacting_until: None,
             reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
         };
         let bus = AppBus::new(initial);
 
@@ -291,6 +364,9 @@ mod tests {
                 camera: sample_camera(i as f32),
                 interacting_until: Some(Instant::now() + INTERACTION_SETTLE_WINDOW),
                 reset_seq: u64::from(i),
+                possess_free_yaw: 0.0,
+                possess_free_pitch: 0.0,
+                possess_auto_level: true,
             });
         }
 
@@ -309,6 +385,9 @@ mod tests {
             camera: sample_camera(0.0),
             interacting_until: None,
             reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
         };
         let bus = AppBus::new(initial);
         let mut scratch = Vec::with_capacity(16);

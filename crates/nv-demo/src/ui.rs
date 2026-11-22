@@ -1018,6 +1018,19 @@ impl UiContext<'_> {
     fn ui_fractal(&mut self, ui: &mut Ui) {
         let s = &mut *self.settings;
         let anim = &mut *self.demo_anim;
+        // Master Hero Fractal visibility toggle at top of Fractal panel (aligned with section columns).
+        ui.add_space(2.0);
+        ui.indent(ui.id().with("fractal_master_toggle"), |ui| {
+            if s.csg_mode == 0 {
+                let mut always_on = true;
+                ui.add_enabled_ui(false, |ui| {
+                    prop_toggle(ui, "Fractal", &mut always_on, "Enabled (Classic)");
+                });
+            } else {
+                prop_toggle(ui, "Fractal", &mut s.csg_show_fractal, "Enabled");
+            }
+        });
+        ui.add_space(2.0);
         collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", true, |ui| {
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
@@ -1672,7 +1685,6 @@ impl UiContext<'_> {
                             );
                         }
                     }
-                    prop_toggle(ui, "Hero Fractal", &mut s.csg_show_fractal, "Overlay Fractal");
                     prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
                     anim_slider_f32(
                         ui,

@@ -21,7 +21,7 @@ use optix::{
 };
 
 use crate::app_events::{AppBus, RenderControl, RenderEvent, fast_preview_budget};
-use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
+use crate::csg_scene_host::{CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 
@@ -748,6 +748,15 @@ fn build_optix_pipeline(
         },
     )
     .map_err(|e| format!("hit_csg: {e}"))?;
+    let hit_csg_prim = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__csg")),
+            intersection: Some((&module, "__intersection__csg_prim")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_csg_prim: {e}"))?;
 
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
@@ -762,6 +771,7 @@ fn build_optix_pipeline(
             hit_sphere.clone(),
             hit_omm.clone(),
             hit_csg.clone(),
+            hit_csg_prim.clone(),
         ],
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
@@ -779,6 +789,7 @@ fn build_optix_pipeline(
             SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
             SbtRecord::new(&hit_omm, 0u32).map_err(|e| format!("sbt hit3: {e}"))?,
             SbtRecord::new(&hit_csg, 0u32).map_err(|e| format!("sbt hit4: {e}"))?,
+            SbtRecord::new(&hit_csg_prim, 0u32).map_err(|e| format!("sbt hit5: {e}"))?,
         ],
     )
     .map_err(|e| format!("SBT::new: {e}"))?;
@@ -1395,10 +1406,15 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         initial_csg_key,
         initial_settings.csg_wetness,
         initial_settings.csg_time_of_day,
-        [0.0, 2.0, -5.0],
-        DEFAULT_H,
-        std::f32::consts::FRAC_PI_3,
-        initial_settings.csg_lod_bias,
+        CsgCameraParams {
+            eye: [0.0, 2.0, -5.0],
+            fwd: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: DEFAULT_W,
+            viewport_h: DEFAULT_H,
+            vfov_rad: std::f32::consts::FRAC_PI_3,
+            lod_bias: initial_settings.csg_lod_bias,
+        },
         0.0,
     ) {
         eprintln!("nv-demo: initial CSG scene sync failed: {err}");
@@ -1898,10 +1914,15 @@ pub fn spawn_render_thread(
                     csg_key,
                     settings.csg_wetness,
                     settings.csg_time_of_day,
-                    camera.eye,
-                    cur_h,
-                    vfov_rad,
-                    settings.csg_lod_bias,
+                    CsgCameraParams {
+                        eye: camera.eye,
+                        fwd: camera.fwd,
+                        up: camera.up,
+                        viewport_w: cur_w,
+                        viewport_h: cur_h,
+                        vfov_rad,
+                        lod_bias: settings.csg_lod_bias,
+                    },
                     traffic_time,
                 ) {
                     Ok(dirty) => dirty,

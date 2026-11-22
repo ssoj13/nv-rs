@@ -1494,6 +1494,14 @@ extern "C" __global__ void __raygen__render() {
         int max_bounces = (int)params.bounces;
         for (int bounce = 0; bounce < 16; ++bounce) {
             if (bounce >= max_bounces) break;
+            if (bounce >= 2) {
+                float p_survive = fmaxf(
+                    0.05f,
+                    fminf(0.95f, fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)))
+                );
+                if (rand01(seed) > p_survive) break;
+                throughput = f3_mul(throughput, 1.0f / p_survive);
+            }
             unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
             trace_primary(origin, dir, (bounce == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
 
@@ -2243,6 +2251,48 @@ extern "C" __global__ void __intersection__csg() {
 
     CsgHit hit;
     if (csg_trace_compound(view, inst.compound_id, orig, dir, tmin, tmax, &hit)) {
+        unsigned int mat_id = (inst.mat_override != CSG_MAT_OVERRIDE_NONE)
+            ? (inst.mat_override & 0xFFFFu)
+            : (hit.mat_id & 0xFFFFu);
+        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
+        optixReportIntersection(
+            hit.t,
+            0u,
+            __float_as_uint(hit.normal.x),
+            __float_as_uint(hit.normal.y),
+            __float_as_uint(hit.normal.z),
+            mat_sem,
+            hit.part_id
+        );
+    }
+}
+
+extern "C" __global__ void __intersection__csg_prim() {
+    if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[inst_idx];
+    if ((inst.flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
+    if (inst.compound_id >= params.csg_compound_count) return;
+
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+    CsgSceneView view = make_csg_view();
+
+    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
+    if (is_shadow) {
+        if ((inst.flags & CSG_INST_FLAG_CAST_SHADOW) == 0u) return;
+        if (csg_trace_single_prim_shadow(view, inst.compound_id, orig, dir, tmin, tmax)) {
+            optixReportIntersection(tmin, 0u);
+        }
+        return;
+    }
+
+    CsgHit hit;
+    if (csg_trace_single_prim(view, inst.compound_id, orig, dir, tmin, tmax, &hit)) {
         unsigned int mat_id = (inst.mat_override != CSG_MAT_OVERRIDE_NONE)
             ? (inst.mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);

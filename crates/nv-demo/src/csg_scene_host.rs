@@ -19,6 +19,7 @@ use cuda_core::{DeviceBuffer, Stream};
 use optix::{Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, Instance, Scratch};
 
 use csg_core::GpuCompound;
+use csg_core::abi::compound_flags;
 use csg_core::math::Vec3;
 use csg_scene::{
     CameraView, GpuInstance, GpuMaterial, PackedGpuScene, RailGenConfig, RailSpec,
@@ -26,8 +27,40 @@ use csg_scene::{
     TimeOfDay, WorldScene, generate_random_rail,
 };
 
-/// SBT hit-group offset for `hit_csg` (`__intersection__csg` + `__closesthit__csg`).
+/// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`).
 pub const CSG_SBT_OFFSET: u32 = 4;
+
+/// SBT hit-group offset for ultra-lean single-primitive CSG (`__intersection__csg_prim` + `__closesthit__csg`).
+pub const CSG_SBT_PRIM_OFFSET: u32 = 5;
+
+/// Routes single-primitive compounds to the register-lean SBT 5 hit group and general RPN compounds to SBT 4.
+#[inline]
+pub const fn sbt_offset_for_compound(flags: u32) -> u32 {
+    if (flags & compound_flags::SINGLE_PRIM) != 0 {
+        CSG_SBT_PRIM_OFFSET
+    } else {
+        CSG_SBT_OFFSET
+    }
+}
+
+/// Camera basis and viewport parameters driving live CSG frustum + small-detail culling.
+#[derive(Clone, Copy, Debug)]
+pub struct CsgCameraParams {
+    /// World-space camera origin.
+    pub eye: [f32; 3],
+    /// Unit camera forward vector.
+    pub fwd: [f32; 3],
+    /// Unit camera up vector.
+    pub up: [f32; 3],
+    /// Render target width in pixels.
+    pub viewport_w: u32,
+    /// Render target height in pixels.
+    pub viewport_h: u32,
+    /// Vertical field of view in radians.
+    pub vfov_rad: f32,
+    /// User LOD detail multiplier (`0.25..=4.0`).
+    pub lod_bias: f32,
+}
 
 /// Bitflags packed into `LaunchParams::csg_flags`.
 pub mod csg_flags {
@@ -235,6 +268,8 @@ pub struct CsgGpuHost {
     packed: PackedGpuScene,
     /// Per-compound cached OptiX custom-primitive GASes (indexed by `compound_id`).
     compound_gases: Vec<Arc<Accel>>,
+    /// Per-compound SBT hit-group offset (`CSG_SBT_PRIM_OFFSET` for single-prim, `CSG_SBT_OFFSET` for RPN).
+    compound_sbt_offsets: Vec<u32>,
     compounds_buf: Option<DeviceBuffer<u8>>,
     ops_buf: Option<DeviceBuffer<u8>>,
     prims_buf: Option<DeviceBuffer<u8>>,
@@ -246,6 +281,7 @@ pub struct CsgGpuHost {
     static_gpu_bytes: usize,
     last_mat_state: (u32, u32),
     last_pack_cam: [f32; 3],
+    last_pack_fwd: [f32; 3],
     last_pack_lod_bits: u32,
     last_traffic_bits: u32,
     ias_dirty: bool,
@@ -271,6 +307,7 @@ impl CsgGpuHost {
             pending_metadata: None,
             packed: PackedGpuScene::new(),
             compound_gases: Vec::new(),
+            compound_sbt_offsets: Vec::new(),
             compounds_buf: None,
             ops_buf: None,
             prims_buf: None,
@@ -282,6 +319,7 @@ impl CsgGpuHost {
             static_gpu_bytes: 0,
             last_mat_state: (u32::MAX, u32::MAX),
             last_pack_cam: [f32::NAN; 3],
+            last_pack_fwd: [f32::NAN; 3],
             last_pack_lod_bits: 0,
             last_traffic_bits: u32::MAX,
             ias_dirty: false,
@@ -360,12 +398,13 @@ impl CsgGpuHost {
 
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
     /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes,
-    /// steps 3D Frenet dynamic traffic, and repacks visible instances when needed.
+    /// steps 3D Frenet dynamic traffic, and repacks visible instances with live frustum +
+    /// small-detail culling whenever the camera moves, rotates, or scene state changes.
     ///
     /// Returns `Ok(true)` if the OptiX IAS must be rebuilt this frame.
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates scene key, material params, camera state, and OptiX resources cleanly"
+        reason = "coordinates scene key, material params, camera frustum, and OptiX resources cleanly"
     )]
     pub fn sync(
         &mut self,
@@ -375,10 +414,7 @@ impl CsgGpuHost {
         key: CsgSceneKey,
         wetness: f32,
         time_of_day: u32,
-        cam_eye: [f32; 3],
-        viewport_h: u32,
-        vfov_rad: f32,
-        lod_bias: f32,
+        cam: CsgCameraParams,
         traffic_time_s: f32,
     ) -> Result<bool, String> {
         let mut rebuilt_scene = false;
@@ -417,26 +453,39 @@ impl CsgGpuHost {
             self.last_traffic_bits = traffic_bits;
         }
 
-        // Repack visible instances & upload grow-only instance buffer when scene/traffic/LOD moved.
-        let cam_dist_sq = (cam_eye[0] - self.last_pack_cam[0]).powi(2)
-            + (cam_eye[1] - self.last_pack_cam[1]).powi(2)
-            + (cam_eye[2] - self.last_pack_cam[2]).powi(2);
-        let lod_bits = lod_bias.clamp(0.25, 4.0).to_bits();
+        // Repack visible instances & upload grow-only instance buffer when scene/traffic/camera moved.
+        let cam_dist_sq = (cam.eye[0] - self.last_pack_cam[0]).powi(2)
+            + (cam.eye[1] - self.last_pack_cam[1]).powi(2)
+            + (cam.eye[2] - self.last_pack_cam[2]).powi(2);
+        let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
+            + cam.fwd[1] * self.last_pack_fwd[1]
+            + cam.fwd[2] * self.last_pack_fwd[2];
+        let lod_bits = cam.lod_bias.clamp(0.25, 4.0).to_bits();
         let need_pack = rebuilt_scene
             || self.ias_dirty
             || traffic_moved
             || lod_bits != self.last_pack_lod_bits
             || !cam_dist_sq.is_finite()
-            || cam_dist_sq > 4.0;
+            || cam_dist_sq > 4.0
+            || !fwd_dot.is_finite()
+            || fwd_dot < 0.99;
 
         if need_pack && let Some(ref mut world) = self.world {
-            let mut cam_view = CameraView::omnidirectional(
-                Vec3::new(cam_eye[0], cam_eye[1], cam_eye[2]),
-                1500.0,
-                vfov_rad.clamp(0.1, 2.5),
-                (viewport_h.max(144)) as f32,
+            let aspect = (cam.viewport_w.max(1) as f32 / cam.viewport_h.max(1) as f32).clamp(0.25, 4.0);
+            // Pad frustum FOV by 28% so fast turns (~8 deg threshold) and edge reflections never pop,
+            // while culling off-screen behind-camera micro-instances (shadow_guard_radius = 120 m
+            // retains large behind-camera buildings for accurate shadows).
+            let padded_vfov = (cam.vfov_rad * 1.28).clamp(0.15, 2.7);
+            let mut cam_view = CameraView::perspective(
+                Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]),
+                Vec3::new(cam.fwd[0], cam.fwd[1], cam.fwd[2]),
+                Vec3::new(cam.up[0], cam.up[1], cam.up[2]),
+                padded_vfov,
+                aspect,
+                [0.05, 1500.0],
+                (cam.viewport_h.max(144)) as f32,
             );
-            cam_view.lod_bias = lod_bias.clamp(0.25, 4.0);
+            cam_view.lod_bias = cam.lod_bias.clamp(0.25, 4.0);
             world.pack_visible(&cam_view, &mut self.packed);
             self.instances_buf
                 .upload(stream, self.packed.instances_slice())?;
@@ -451,7 +500,8 @@ impl CsgGpuHost {
                 primitives: world.library.prims.len() as u32,
                 gpu_bytes: gpu_bytes as u64,
             };
-            self.last_pack_cam = cam_eye;
+            self.last_pack_cam = cam.eye;
+            self.last_pack_fwd = cam.fwd;
             self.last_pack_lod_bits = lod_bits;
             self.ias_dirty = false;
             return Ok(true);
@@ -463,7 +513,8 @@ impl CsgGpuHost {
     /// Appends all visible CSG instances into `out_instances` using cached per-compound GASes.
     ///
     /// Each OptiX instance receives `id = csg_instance_index` (matching `params.csg_instances[id]`)
-    /// and `sbt_offset = CSG_SBT_OFFSET` (`4`).
+    /// and routes single-primitive compounds to `CSG_SBT_PRIM_OFFSET` (`5`) and general RPN
+    /// compounds to `CSG_SBT_OFFSET` (`4`).
     pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>) {
         if !self.is_active() {
             return;
@@ -481,7 +532,11 @@ impl CsgGpuHost {
             }
             let mut inst = Instance::new(&self.compound_gases[cid]);
             inst.id = idx as u32;
-            inst.sbt_offset = CSG_SBT_OFFSET;
+            inst.sbt_offset = self
+                .compound_sbt_offsets
+                .get(cid)
+                .copied()
+                .unwrap_or(CSG_SBT_OFFSET);
             inst.transform = gpu_inst.xform;
             out_instances.push(inst);
         }
@@ -507,6 +562,7 @@ impl CsgGpuHost {
         self.traffic = None;
         self.hints = None;
         self.compound_gases.clear();
+        self.compound_sbt_offsets.clear();
         self.compounds_buf = None;
         self.ops_buf = None;
         self.prims_buf = None;
@@ -518,6 +574,8 @@ impl CsgGpuHost {
         self.static_gpu_bytes = 0;
         self.stats = CsgStats::default();
         self.last_mat_state = (u32::MAX, u32::MAX);
+        self.last_pack_cam = [f32::NAN; 3];
+        self.last_pack_fwd = [f32::NAN; 3];
         self.last_pack_cam = [f32::NAN; 3];
         self.last_traffic_bits = u32::MAX;
         self.ias_dirty = true;
@@ -614,6 +672,11 @@ impl CsgGpuHost {
         }
 
         self.compound_gases = gases;
+        self.compound_sbt_offsets = lib
+            .compounds
+            .iter()
+            .map(|c| sbt_offset_for_compound(c.flags))
+            .collect();
         self.packed
             .reserve_instances(built.world.total_instance_count().max(256));
         self.active_reg_idx = Some(reg_idx);
@@ -714,5 +777,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sbt_routing_splits_single_prim_and_rpn_compounds() {
+        assert_eq!(sbt_offset_for_compound(0), CSG_SBT_OFFSET);
+        assert_eq!(
+            sbt_offset_for_compound(compound_flags::UNBOUNDED),
+            CSG_SBT_OFFSET
+        );
+        assert_eq!(
+            sbt_offset_for_compound(compound_flags::SINGLE_PRIM),
+            CSG_SBT_PRIM_OFFSET
+        );
+        assert_eq!(
+            sbt_offset_for_compound(compound_flags::SINGLE_PRIM | compound_flags::BOX_ONLY),
+            CSG_SBT_PRIM_OFFSET
+        );
+    }
+
+    #[test]
+    fn perspective_frustum_culling_prunes_offscreen_city_micro_instances() {
+        let reg = csg_scenes::default_scene_registry();
+        let module = reg.get("sf_house_of_ai").expect("sf_house_of_ai");
+        let mut built = module.build(&SceneBuildConfig::default());
+        let vp = &built.viewpoints[0];
+        let fwd = (vp.target - vp.eye).norm();
+        let cam_persp = CameraView::perspective(
+            vp.eye,
+            fwd,
+            Vec3::Y,
+            (vp.vfov_deg.to_radians() * 1.28).clamp(0.15, 2.7),
+            16.0 / 9.0,
+            [0.05, 1500.0],
+            720.0,
+        );
+        let mut packed = PackedGpuScene::with_capacity(
+            built.world.total_instance_count() * 2,
+            built.world.library.compounds.len(),
+        );
+        built.world.pack_visible(&cam_persp, &mut packed);
+        assert!(!packed.is_empty(), "visible frustum must contain geometry");
+        assert!(
+            packed.stats.culled_instances > 0,
+            "perspective frustum + small-detail culling must prune off-screen/far micro-instances"
+        );
+        assert!(
+            packed.stats.single_prim_instances > 0,
+            "city scenes must route single-prim instances to the lean SBT 5 hit group"
+        );
     }
 }

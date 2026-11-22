@@ -139,7 +139,8 @@ fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
         "kifs_z_bias" => anim_f32(&mut s.kifs_z_bias, amp, phase, 0.0, 1.5),
         "kifs_bailout" => anim_f32(&mut s.kifs_bailout, amp, phase, 4.0, 32.0),
         // Transform
-        "obj_scale" => anim_f32(&mut s.obj_scale, amp, phase, 0.25, 2.5),
+        "fractal_translate" => anim_vec3(&mut s.fractal_translate, amp, phase, -500.0, 500.0),
+        "obj_scale" => anim_f32(&mut s.obj_scale, amp, phase, 0.05, 50.0),
         "rot_x" => anim_f32(&mut s.rot_x, amp, phase, -180.0, 180.0),
         "rot_y" => anim_f32(&mut s.rot_y, amp, phase, -180.0, 180.0),
         "rot_z" => anim_f32(&mut s.rot_z, amp, phase, -180.0, 180.0),

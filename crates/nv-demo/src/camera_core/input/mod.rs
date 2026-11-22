@@ -89,6 +89,7 @@ mod navigator;
 mod raw;
 
 pub use bindings::{Bindings, DragBinding, DragRole, FlyKeys, NavScheme, OrbitStepKeys, ViewKeys};
+pub use fly::{altitude_speed_multiplier, shift_fly_ramp};
 pub use navigator::{
     CursorRequest, DOLLY_ZOOM_RAD_PER_UNIT, FACTOR_MAX, NavFrame, NavRequests, NavTuning,
     Navigator, ORBIT_STEP_RAD,

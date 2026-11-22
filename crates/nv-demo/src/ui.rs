@@ -7,7 +7,7 @@ use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
 use crate::app_events::{AppBus, PossessInfo, SmartViewResult, StillFormat, UiCommand};
-use crate::camera_core::input::NavScheme;
+use crate::camera_core::input::{NavScheme, altitude_speed_multiplier};
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
@@ -404,11 +404,12 @@ impl UiContext<'_> {
                 .clicked()
             {
                 self.camera_rail.playing = false;
-                let ext = 1.35 * self.settings.obj_scale.max(0.25);
+                let center = glam::Vec3::from_array(self.settings.fractal_translate);
+                let ext = 1.35 * self.settings.obj_scale.clamp(0.05, 50.0);
                 self.cam_driver.controller_mut().apply_intent(
                     CameraIntent::FrameBounds {
-                        min: glam::Vec3::splat(-ext),
-                        max: glam::Vec3::splat(ext),
+                        min: center - glam::Vec3::splat(ext),
+                        max: center + glam::Vec3::splat(ext),
                         margin: 1.2,
                     },
                     1.0 / 60.0,
@@ -674,11 +675,16 @@ impl UiContext<'_> {
             if resp.dragged() && self.camera_rail.playing {
                 self.camera_rail.playing = false;
             }
+            let fly_scene_radius = 2.0 * altitude_speed_multiplier(self.cam_pose.eye.y);
             let df = match self.cam_fixed_dt {
-                Some(fixed_dt) => {
-                    crate::camera_egui::drive_with_dt(ui, &resp, self.cam_driver, 2.0, fixed_dt)
-                }
-                None => crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0),
+                Some(fixed_dt) => crate::camera_egui::drive_with_dt(
+                    ui,
+                    &resp,
+                    self.cam_driver,
+                    fly_scene_radius,
+                    fixed_dt,
+                ),
+                None => crate::camera_egui::drive(ui, &resp, self.cam_driver, fly_scene_radius),
             };
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
             let f_pressed =
@@ -711,11 +717,12 @@ impl UiContext<'_> {
                 self.bus.emit_ui(UiCommand::SnapCamera);
             } else if a_pressed {
                 self.camera_rail.playing = false;
-                let ext = 1.35 * self.settings.obj_scale.max(0.25);
+                let center = glam::Vec3::from_array(self.settings.fractal_translate);
+                let ext = 1.35 * self.settings.obj_scale.clamp(0.05, 50.0);
                 self.cam_driver.controller_mut().apply_intent(
                     CameraIntent::FrameBounds {
-                        min: glam::Vec3::splat(-ext),
-                        max: glam::Vec3::splat(ext),
+                        min: center - glam::Vec3::splat(ext),
+                        max: center + glam::Vec3::splat(ext),
                         margin: 1.2,
                     },
                     1.0 / 60.0,
@@ -811,6 +818,21 @@ impl UiContext<'_> {
             && self.settings.csg_traffic_on
             && self.settings.csg_traffic_speed > 0.001;
         let preview_tag = if self.fast_preview { "  |  PREVIEW" } else { "" };
+        let nav = self.cam_driver.navigator();
+        let fly_mult = nav.fly_speed();
+        let shift_ramp = nav.shift_fly_ramp();
+        let alt_mult = altitude_speed_multiplier(self.cam_pose.eye.y);
+        let in_fly_hud = self.cam_driver.is_hold_flying() || self.cam_driver.controller().is_fly();
+        let fly_tag = if in_fly_hud || (fly_mult - 1.0).abs() > 0.01 || shift_ramp > 1.05 {
+            let eff = fly_mult * alt_mult * shift_ramp;
+            if shift_ramp > 1.05 {
+                format!("  |  FLY {eff:.1}x (SHIFT {shift_ramp:.1}x)")
+            } else {
+                format!("  |  FLY {eff:.1}x")
+            }
+        } else {
+            String::new()
+        };
         let status = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
             let mut tags = Vec::with_capacity(4);
             if demo_running {
@@ -827,7 +849,7 @@ impl UiContext<'_> {
             }
             let anim_tag = tags.join("+");
             format!(
-                "{} {}  |  {}x{}  |  {}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+                "{} {}  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::ARROWS_CLOCKWISE,
                 anim_tag,
                 self.render_w,
@@ -835,6 +857,7 @@ impl UiContext<'_> {
                 aov_tag,
                 lens_tag,
                 possess_tag,
+                fly_tag,
                 preview_tag,
                 self.ui_fps.round() as u32,
                 self.rt_fps,
@@ -842,7 +865,7 @@ impl UiContext<'_> {
             )
         } else {
             format!(
-                "{} {}/{} spp  |  {}x{}  |  {}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+                "{} {}/{} spp  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::STACK,
                 self.total_samples,
                 self.settings.max_accum.saturating_mul(self.settings.spp),
@@ -851,6 +874,7 @@ impl UiContext<'_> {
                 aov_tag,
                 lens_tag,
                 possess_tag,
+                fly_tag,
                 preview_tag,
                 self.ui_fps.round() as u32,
                 self.rt_fps,
@@ -1193,15 +1217,14 @@ impl UiContext<'_> {
             "Transform",
             true,
             |ui| {
-                anim_slider_f32(
+                anim_vec3(
                     ui,
                     anim,
-                    "obj_scale",
-                    "Obj Scale",
-                    &mut s.obj_scale,
-                    0.25..=2.5,
-                    2,
-                    false,
+                    "fractal_translate",
+                    "Translate",
+                    &mut s.fractal_translate,
+                    -500.0..=500.0,
+                    0.05,
                 );
                 anim_slider_f32(
                     ui,
@@ -1233,6 +1256,32 @@ impl UiContext<'_> {
                     1,
                     false,
                 );
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "obj_scale",
+                    "Scale",
+                    &mut s.obj_scale,
+                    0.05..=50.0,
+                    2,
+                    true,
+                );
+                ui.add_space(2.0);
+                let btn_w = ui.available_width();
+                if ui
+                    .add_sized(
+                        [btn_w, ROW_H + 4.0],
+                        egui::Button::new(format!("{} Reset Transform", ic::ARROW_COUNTER_CLOCKWISE)),
+                    )
+                    .on_hover_text("Reset Hero Fractal Translate, Rotate, and Scale to identity.")
+                    .clicked()
+                {
+                    s.fractal_translate = [0.0, 0.0, 0.0];
+                    s.rot_x = 0.0;
+                    s.rot_y = 0.0;
+                    s.rot_z = 0.0;
+                    s.obj_scale = 1.0;
+                }
             },
         );
 

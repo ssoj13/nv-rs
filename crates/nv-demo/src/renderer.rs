@@ -391,9 +391,15 @@ pub enum CaptureSource {
 pub struct DemoSettings {
     pub fractal_kind: u32,
     // Fractal Transform
+    /// World-space translation `[x, y, z]` of the Hero Fractal in meters.
+    pub fractal_translate: [f32; 3],
+    /// Uniform Hero Fractal scale factor (`0.05..=50.0`, default `1.0`).
     pub obj_scale: f32,
+    /// Hero Fractal X-axis rotation in degrees (`-180.0..=180.0`).
     pub rot_x: f32,
+    /// Hero Fractal Y-axis rotation in degrees (`-180.0..=180.0`).
     pub rot_y: f32,
+    /// Hero Fractal Z-axis rotation in degrees (`-180.0..=180.0`).
     pub rot_z: f32,
     // Mandelbulb
     pub bulb_power: f32,
@@ -542,6 +548,7 @@ impl Default for DemoSettings {
     fn default() -> Self {
         Self {
             fractal_kind: 0,
+            fractal_translate: [0.0, 0.0, 0.0],
             obj_scale: 1.0,
             rot_x: 0.0,
             rot_y: 0.0,
@@ -1230,6 +1237,61 @@ struct SceneGas<'a> {
     omm_anyhit: &'a Arc<Accel>,
 }
 
+/// Builds the row-major 3x4 OptiX TLAS instance transform `T * R_z * R_y * R_x * S`
+/// for the Hero Fractal.
+///
+/// - `translate`: world-space position `[tx, ty, tz]` in meters (non-finite components default to `0.0`).
+/// - `rotate_deg`: Euler angles `[rx, ry, rz]` in degrees applied in `R_z * R_y * R_x` order
+///   (non-finite components default to `0.0`).
+/// - `scale`: uniform object-to-world scale clamped to `0.05..=50.0` (non-finite defaults to `1.0`).
+pub fn fractal_instance_transform(
+    translate: [f32; 3],
+    rotate_deg: [f32; 3],
+    scale: f32,
+) -> [f32; 12] {
+    let tx = if translate[0].is_finite() { translate[0] } else { 0.0 };
+    let ty = if translate[1].is_finite() { translate[1] } else { 0.0 };
+    let tz = if translate[2].is_finite() { translate[2] } else { 0.0 };
+    let rx = if rotate_deg[0].is_finite() {
+        rotate_deg[0].to_radians()
+    } else {
+        0.0
+    };
+    let ry = if rotate_deg[1].is_finite() {
+        rotate_deg[1].to_radians()
+    } else {
+        0.0
+    };
+    let rz = if rotate_deg[2].is_finite() {
+        rotate_deg[2].to_radians()
+    } else {
+        0.0
+    };
+    let s = if scale.is_finite() {
+        scale.clamp(0.05, 50.0)
+    } else {
+        1.0
+    };
+    let lin = glam::Mat3::from_rotation_z(rz)
+        * glam::Mat3::from_rotation_y(ry)
+        * glam::Mat3::from_rotation_x(rx)
+        * s;
+    [
+        lin.x_axis.x,
+        lin.y_axis.x,
+        lin.z_axis.x,
+        tx,
+        lin.x_axis.y,
+        lin.y_axis.y,
+        lin.z_axis.y,
+        ty,
+        lin.x_axis.z,
+        lin.y_axis.z,
+        lin.z_axis.z,
+        tz,
+    ]
+}
+
 struct SceneState {
     sat_angle: f32,
     sat_count: u32,
@@ -1246,6 +1308,7 @@ struct SceneState {
     neon_on: bool,
     omm_mode: u32,
     show_classic: bool,
+    fractal_transform: [f32; 12],
 }
 
 fn splitmix32(mut x: u32) -> f32 {
@@ -1276,6 +1339,7 @@ fn build_ias(
         let mut i1 = Instance::new(gas.fractal);
         i1.id = 1;
         i1.sbt_offset = 1;
+        i1.transform = state.fractal_transform;
         instances.push(i1);
 
         if state.sat_on && count > 0 {
@@ -1618,6 +1682,15 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             neon_on: initial_settings.neon_on,
             omm_mode: initial_settings.omm_mode,
             show_classic,
+            fractal_transform: fractal_instance_transform(
+                initial_settings.fractal_translate,
+                [
+                    initial_settings.rot_x,
+                    initial_settings.rot_y,
+                    initial_settings.rot_z,
+                ],
+                initial_settings.obj_scale,
+            ),
         },
     );
 
@@ -2132,6 +2205,11 @@ pub fn spawn_render_thread(
                     settings.sat_hue_spread,
                     0.0,
                 ],
+                fractal_instance_transform(
+                    settings.fractal_translate,
+                    [settings.rot_x, settings.rot_y, settings.rot_z],
+                    settings.obj_scale,
+                ),
             );
             let mut last_tick = Instant::now();
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
@@ -2694,6 +2772,15 @@ pub fn spawn_render_thread(
                     rig.glass_mesh_segs = (settings.sat_u_segs, settings.sat_v_segs);
                 }
                 let show_classic = settings.csg_mode == 0 || settings.csg_show_fractal;
+                let fractal_transform = fractal_instance_transform(
+                    settings.fractal_translate,
+                    [
+                        settings.rot_x,
+                        settings.rot_y + spin_angle.to_degrees(),
+                        settings.rot_z,
+                    ],
+                    settings.obj_scale,
+                );
                 let ias_state = (
                     settings.sat_on,
                     settings.glass_analytic,
@@ -2720,6 +2807,7 @@ pub fn spawn_render_thread(
                         settings.sat_hue_spread,
                         sat_angle,
                     ],
+                    fractal_transform,
                 );
                 if csg_ias_dirty || ias_state != last_ias_state {
                     rig.ias = build_ias(
@@ -2756,6 +2844,7 @@ pub fn spawn_render_thread(
                             neon_on: settings.neon_on,
                             omm_mode: settings.omm_mode,
                             show_classic,
+                            fractal_transform,
                         },
                     );
                     last_ias_state = ias_state;
@@ -2913,12 +3002,8 @@ pub fn spawn_render_thread(
                     fractal_p1,
                     fractal_p2,
                     fractal_p3,
-                    fractal_xform: [
-                        settings.obj_scale,
-                        settings.rot_x.to_radians(),
-                        settings.rot_y.to_radians() + spin_angle,
-                        settings.rot_z.to_radians(),
-                    ],
+                    // Fractal TRS is applied in the OptiX TLAS instance transform; keep ABI slot identity.
+                    fractal_xform: [1.0, 0.0, 0.0, 0.0],
                     fractal_r0: [
                         settings.detail_eps,
                         settings.fudge,
@@ -3488,5 +3573,52 @@ mod tests {
             let id_f32 = f32::from_bits((exp << 23) | (h & 0x007F_FFFF));
             assert!(id_f32.is_normal(), "Cryptomatte ID must never be NaN/Inf/denormal/zero");
         }
+    }
+
+    #[test]
+    fn fractal_instance_transform_builds_exact_trs_matrix() {
+        // Default identity TRS
+        let id = fractal_instance_transform([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 1.0);
+        assert_eq!(id, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+
+        // Pure translation
+        let tr = fractal_instance_transform([12.5, -3.25, 44.0], [0.0, 0.0, 0.0], 1.0);
+        assert_eq!([tr[3], tr[7], tr[11]], [12.5, -3.25, 44.0]);
+
+        // Uniform scale clamps to [0.05, 50.0] and determinant equals scale^3
+        for (raw_s, expect_s) in [(0.001_f32, 0.05_f32), (0.05, 0.05), (3.5, 3.5), (50.0, 50.0), (200.0, 50.0)] {
+            let m = fractal_instance_transform([1.0, 2.0, 3.0], [25.0, -40.0, 65.0], raw_s);
+            let mat3 = glam::Mat3::from_cols(
+                glam::Vec3::new(m[0], m[4], m[8]),
+                glam::Vec3::new(m[1], m[5], m[9]),
+                glam::Vec3::new(m[2], m[6], m[10]),
+            );
+            let det = mat3.determinant();
+            let expect_det = expect_s * expect_s * expect_s;
+            assert!(
+                (det - expect_det).abs() <= expect_det * 1e-4 + 1e-5,
+                "det={det}, expected={expect_det} for scale={raw_s}"
+            );
+        }
+
+        // Combined T * R_z * R_y * R_x * S exact point mapping
+        let t = [10.0_f32, -4.0, 22.5];
+        let r = [30.0_f32, 45.0, -60.0];
+        let s = 2.5_f32;
+        let m = fractal_instance_transform(t, r, s);
+        let p_obj = glam::Vec3::new(0.7, -1.1, 0.4);
+        let got = glam::Vec3::new(
+            m[0] * p_obj.x + m[1] * p_obj.y + m[2] * p_obj.z + m[3],
+            m[4] * p_obj.x + m[5] * p_obj.y + m[6] * p_obj.z + m[7],
+            m[8] * p_obj.x + m[9] * p_obj.y + m[10] * p_obj.z + m[11],
+        );
+        let expected = glam::Vec3::from_array(t)
+            + glam::Mat3::from_rotation_z(r[2].to_radians())
+                * (glam::Mat3::from_rotation_y(r[1].to_radians())
+                    * (glam::Mat3::from_rotation_x(r[0].to_radians()) * (p_obj * s)));
+        assert!(
+            (got - expected).length() < 1e-4,
+            "got={got:?}, expected={expected:?}"
+        );
     }
 }

@@ -34,12 +34,37 @@ use crate::camera_core::settings::MouseSteer;
 const DEADZONE_MAX: f32 = 0.95;
 /// Smallest half-viewport extent (viewport units) the deflection is normalised against.
 const HALF_VIEWPORT_MIN: f32 = 1.0;
-/// Flight-speed factor per wheel notch while flying (nodes-editor parity).
-const FLY_WHEEL_STEP: f32 = 1.2;
+/// Flight-speed factor per wheel notch while flying (`RMB + Mouse Wheel`, UE5/Blender standard).
+const FLY_WHEEL_STEP: f32 = 1.25;
 /// Lower bound of the wheel flight-speed multiplier.
-const FLY_SPEED_MIN: f32 = 1.0 / 64.0;
+const FLY_SPEED_MIN: f32 = 0.1;
 /// Upper bound of the wheel flight-speed multiplier.
 const FLY_SPEED_MAX: f32 = 64.0;
+
+/// Progressive Shift-flight acceleration ramp for navigating large city scenes.
+///
+/// Stays at flat `1.0x` base Shift speed for the first `2.0 s`, then smoothly doubles every
+/// `5.0 s` (`2^((t - 2.0) / 5.0)`), clamped to `[1.0, 64.0]`.
+#[inline]
+pub fn shift_fly_ramp(shift_fly_secs: f32) -> f32 {
+    if !shift_fly_secs.is_finite() || shift_fly_secs <= 2.0 {
+        1.0
+    } else {
+        2.0_f32.powf((shift_fly_secs - 2.0) / 5.0).clamp(1.0, 64.0)
+    }
+}
+
+/// Cesium/UE5-style altitude-aware flight speed multiplier.
+///
+/// Keeps close-up ground/bolt inspection (`altitude <= 8 m`) at exact `1.0x`, scaling smoothly
+/// up to `25.0x` at high aerial altitude (`>= 200 m`) so orbital/map sweeps feel effortless.
+#[inline]
+pub fn altitude_speed_multiplier(altitude_m: f32) -> f32 {
+    if !altitude_m.is_finite() {
+        return 1.0;
+    }
+    (altitude_m.max(2.0) / 8.0).clamp(1.0, 25.0)
+}
 /// Still steering time (seconds) after which the persistent mode's mouse look counts as
 /// stopped and coasts. Longer than a slow mouse's polling gap (125 Hz = 8 ms) seen from a fast
 /// display, shorter than the release window so the measured rate is still the sweep's.
@@ -71,6 +96,8 @@ pub(super) struct FlyState {
     pub pinned: bool,
     /// Wheel flight-speed multiplier, folded into `CameraIntent::SpeedScale`.
     pub speed: f32,
+    /// Continuous seconds spent flying with Shift held AND an active WASD/QE flight key.
+    pub shift_fly_secs: f32,
     /// The speed scale of the previous engaged frame: a change is real input (repaint), the
     /// intent itself is sent every frame.
     pub last_scale: Option<f32>,
@@ -98,6 +125,7 @@ impl Default for FlyState {
             anchor: Vec2::ZERO,
             pinned: false,
             speed: 1.0,
+            shift_fly_secs: 0.0,
             last_scale: None,
             suspended: false,
             look: ReleaseVelocity::new(),
@@ -238,13 +266,30 @@ impl FlyState {
 
         let keys_held = if live { raw.keys_down } else { KeySet::EMPTY };
         let (forward, right, up, roll) = axes(keys_held, keys);
-        moved |= forward != 0.0 || right != 0.0 || up != 0.0 || roll != 0.0;
+        let thrust_moving = forward != 0.0 || right != 0.0 || up != 0.0 || roll != 0.0;
+        moved |= thrust_moving;
         out.push(CameraIntent::Thrust { forward, right, up });
         out.push(CameraIntent::Roll { d: roll });
-        // Every frame, like Thrust: Shift fast / Alt slow (camera-navigation exception) times the
-        // wheel speed.
+        // Progressive Shift-flight ramp: flat 1x for <= 2s, then doubles every 5s up to 64x;
+        // resets immediately when Shift is released or movement stops.
         let m = raw.mods;
-        let scale = tuning.speed_scale(live && m.shift, live && m.alt) * self.speed;
+        let shift_held = live && m.shift;
+        if shift_held && thrust_moving {
+            let step_dt = if raw.dt.is_finite() && raw.dt > 0.0 {
+                raw.dt
+            } else {
+                0.0
+            };
+            self.shift_fly_secs = (self.shift_fly_secs + step_dt).min(60.0);
+        } else {
+            self.shift_fly_secs = 0.0;
+        }
+        let ramp = if shift_held {
+            shift_fly_ramp(self.shift_fly_secs)
+        } else {
+            1.0
+        };
+        let scale = tuning.speed_scale(shift_held, live && m.alt) * ramp * self.speed;
         moved |= self.last_scale != Some(scale);
         self.last_scale = Some(scale);
         out.push(CameraIntent::SpeedScale(scale));
@@ -383,5 +428,93 @@ mod tests {
         let mut mode = FlyState::default();
         mode.anchor_at(&raw, &tuning);
         assert_eq!(mode.anchor, Vec2::new(400.0, 300.0));
+    }
+
+    #[test]
+    fn shift_fly_ramp_doubles_every_5s_after_2s_and_resets_on_release() {
+        assert!((shift_fly_ramp(0.0) - 1.0).abs() < 1e-6);
+        assert!((shift_fly_ramp(1.5) - 1.0).abs() < 1e-6);
+        assert!((shift_fly_ramp(2.0) - 1.0).abs() < 1e-6);
+        assert!((shift_fly_ramp(7.0) - 2.0).abs() < 1e-5);
+        assert!((shift_fly_ramp(12.0) - 4.0).abs() < 1e-5);
+        assert!((shift_fly_ramp(32.0) - 64.0).abs() < 1e-4);
+        assert_eq!(shift_fly_ramp(100.0), 64.0);
+        assert_eq!(shift_fly_ramp(f32::NAN), 1.0);
+
+        // Stateful hold -> ramp -> release reset check through FlyState::push_frame.
+        let tuning = NavTuning::default();
+        let keys = FlyKeys::WASD;
+        let mut st = FlyState::default();
+        let mut out = Vec::new();
+        let moving_shift = RawInput {
+            dt: 1.0,
+            keys_allowed: true,
+            keys_down: KeySet::EMPTY.with(Key::W),
+            mods: crate::camera_core::input::Mods::SHIFT,
+            viewport: Vec2::new(800.0, 600.0),
+            ..RawInput::default()
+        };
+        for _ in 0..7 {
+            out.clear();
+            st.push_frame(&moving_shift, &keys, &tuning, true, &mut out);
+        }
+        assert!((st.shift_fly_secs - 7.0).abs() < 1e-5);
+        let expected_7s = tuning.speed_scale(true, false) * 2.0;
+        let last_7s = out.iter().rev().find_map(|i| match *i {
+            CameraIntent::SpeedScale(s) => Some(s),
+            _ => None,
+        });
+        assert!((last_7s.expect("speed scale") - expected_7s).abs() < 1e-4);
+
+        // Releasing Shift resets `shift_fly_secs` immediately to 0.
+        let released_shift = RawInput {
+            mods: crate::camera_core::input::Mods::NONE,
+            ..moving_shift
+        };
+        out.clear();
+        st.push_frame(&released_shift, &keys, &tuning, true, &mut out);
+        assert_eq!(st.shift_fly_secs, 0.0);
+
+        // Stopping movement while Shift is still held also resets `shift_fly_secs` to 0.
+        st.shift_fly_secs = 9.0;
+        let stopped_move = RawInput {
+            keys_down: KeySet::EMPTY,
+            ..moving_shift
+        };
+        out.clear();
+        st.push_frame(&stopped_move, &keys, &tuning, true, &mut out);
+        assert_eq!(st.shift_fly_secs, 0.0);
+    }
+
+    #[test]
+    fn altitude_speed_multiplier_scales_smoothly_from_ground_to_aerial() {
+        assert_eq!(altitude_speed_multiplier(0.0), 1.0);
+        assert_eq!(altitude_speed_multiplier(2.0), 1.0);
+        assert_eq!(altitude_speed_multiplier(8.0), 1.0);
+        assert!((altitude_speed_multiplier(16.0) - 2.0).abs() < 1e-5);
+        assert!((altitude_speed_multiplier(80.0) - 10.0).abs() < 1e-5);
+        assert_eq!(altitude_speed_multiplier(200.0), 25.0);
+        assert_eq!(altitude_speed_multiplier(500.0), 25.0);
+        assert_eq!(altitude_speed_multiplier(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn rmb_wheel_scales_fly_speed_by_1_25_clamped_to_0_1_through_64() {
+        let wheel = |lines: f32| RawInput {
+            wheel: Wheel {
+                lines: Vec2::new(0.0, lines),
+                points: Vec2::ZERO,
+            },
+            ..RawInput::default()
+        };
+        let mut st = FlyState::default();
+        st.wheel_speed(&wheel(1.0));
+        assert!((st.speed - 1.25).abs() < 1e-6);
+        st.wheel_speed(&wheel(1.0));
+        assert!((st.speed - 1.5625).abs() < 1e-5);
+        st.wheel_speed(&wheel(-100.0));
+        assert!((st.speed - 0.1).abs() < 1e-6);
+        st.wheel_speed(&wheel(100.0));
+        assert!((st.speed - 64.0).abs() < 1e-6);
     }
 }

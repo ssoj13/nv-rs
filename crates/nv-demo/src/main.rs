@@ -3759,7 +3759,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     pub(crate) fn enable_rmb_fly(driver: &mut CameraDriver) {
         use crate::camera_core::input::{Button, DragBinding, DragRole, Mods};
-        let drags = &mut driver.bindings_mut().drags;
+        let bindings = driver.bindings_mut();
+        bindings.fly_wheel_speed = true;
+        let drags = &mut bindings.drags;
         drags.retain(|b| !(b.button == Button::Secondary && b.mods == Mods::NONE));
         drags.push(DragBinding::new(
             Button::Secondary,

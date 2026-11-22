@@ -297,6 +297,11 @@ impl Navigator {
         self.fly.speed
     }
 
+    /// Current progressive Shift-flight acceleration multiplier (`1.0..=64.0`).
+    pub fn shift_fly_ramp(&self) -> f32 {
+        super::fly::shift_fly_ramp(self.fly.shift_fly_secs)
+    }
+
     /// Translate one frame of input. See the `input` module docs for the scheme table.
     pub fn update(
         &mut self,
@@ -411,6 +416,7 @@ impl Navigator {
                     self.intents.push(CameraIntent::Stop);
                 }
                 self.fly.last_scale = None;
+                self.fly.shift_fly_secs = 0.0;
             }
             self.fly.suspended = false;
             if bindings.wheel_zoom {
@@ -465,6 +471,7 @@ impl Navigator {
         self.fly.clear_look();
         self.fly.active = false;
         self.fly.last_scale = None;
+        self.fly.shift_fly_secs = 0.0;
         self.fly.suspended = true;
         self.hovered_last = false;
         NavFrame {

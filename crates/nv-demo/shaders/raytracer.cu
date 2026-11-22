@@ -145,11 +145,6 @@ static __forceinline__ __device__ float3 rot_x(float3 p, float a) {
     float s = sinf(a);
     return make_float3(p.x, c * p.y - s * p.z, s * p.y + c * p.z);
 }
-static __forceinline__ __device__ float3 rot_z(float3 p, float a) {
-    float c = cosf(a);
-    float s = sinf(a);
-    return make_float3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
-}
 
 static __forceinline__ __device__ float2 sdf_mandelbulb(float3 q) {
     float power = params.fractal_p0[0];
@@ -282,20 +277,17 @@ static __forceinline__ __device__ float2 sdf_kifs_octahedron(float3 q) {
     return make_float2(d_box / s, sqrtf(fmaxf(trap, 0.0f)));
 }
 
-static __forceinline__ __device__ float2 eval_fractal(float3 p) {
-    float obj_scale = fmaxf(0.15f, params.fractal_xform[0]);
-    float3 q = rot_z(rot_y(rot_x(p, params.fractal_xform[1]), params.fractal_xform[2]), params.fractal_xform[3]);
-    q = f3_mul(q, 1.0f / obj_scale);
-    float2 res;
+static __forceinline__ __device__ float2 eval_fractal(float3 q) {
+    // Object-to-world TRS (Translate * Rz * Ry * Rx * Scale) lives in the OptiX TLAS
+    // OptixInstance::transform; eval_fractal evaluates the canonical unscaled SDF directly.
     if (params.fractal_kind == 1u) {
         float2 r = sdf_mandelbox(f3_mul(q, 2.2f));
-        res = make_float2(r.x * (1.0f / 2.2f), r.y);
+        return make_float2(r.x * (1.0f / 2.2f), r.y);
     } else if (params.fractal_kind == 2u) {
-        res = sdf_kifs_octahedron(q);
+        return sdf_kifs_octahedron(q);
     } else {
-        res = sdf_mandelbulb(q);
+        return sdf_mandelbulb(q);
     }
-    return make_float2(res.x * obj_scale, res.y);
 }
 
 static __forceinline__ __device__ float fractal_hit_eps(float path_dist) {
@@ -2467,14 +2459,18 @@ extern "C" __global__ void __anyhit__omm() {
 }
 
 extern "C" __global__ void __intersection__fractal() {
-    float3 orig = optixGetObjectRayOrigin();
-    float3 dir  = f3_norm(optixGetObjectRayDirection());
-    float tmin  = optixGetRayTmin();
-    float tmax  = optixGetRayTmax();
+    float3 orig    = optixGetObjectRayOrigin();
+    float3 raw_dir = optixGetObjectRayDirection();
+    float dir_len  = f3_len(raw_dir);
+    if (dir_len <= 1e-8f) return;
+    float inv_dir_len = 1.0f / dir_len;
+    float3 dir        = f3_mul(raw_dir, inv_dir_len);
+    // March in unit object-space arc length s = t_world * dir_len so SDF/DE Lipschitz bounds
+    // remain exact under arbitrary uniform TLAS scale (0.05..=50.0), then report s * inv_dir_len.
+    float t0 = optixGetRayTmin() * dir_len;
+    float t1 = optixGetRayTmax() * dir_len;
 
     // Ray-AABB clip against [-1.85, 1.85]^3 (matches fractal GAS AABB; accommodates rotated KIFS corners)
-    float t0 = tmin;
-    float t1 = tmax;
     float bmin = -1.85f;
     float bmax = 1.85f;
     float* o = &orig.x;
@@ -2509,11 +2505,11 @@ extern "C" __global__ void __intersection__fractal() {
         float3 p = f3_add(orig, f3_mul(dir, t));
         float2 res = eval_fractal(p);
         float dist = res.x;
-        float path_dist = base_cam_dist + t;
-        float eps = fractal_hit_eps(path_dist) * eps_scale;
+        float path_dist = base_cam_dist + t * inv_dir_len;
+        float eps = fractal_hit_eps(path_dist) * dir_len * eps_scale;
         if (dist < eps) {
             if (is_shadow) {
-                optixReportIntersection(t, 0);
+                optixReportIntersection(t * inv_dir_len, 0);
                 return;
             }
             // Refine overstepped interior hits back to the exterior surface boundary via 4-step bisection
@@ -2536,10 +2532,10 @@ extern "C" __global__ void __intersection__fractal() {
                 t_hit = lo;
             }
             float3 p_hit = f3_add(orig, f3_mul(dir, t_hit));
-            float hit_path_dist = base_cam_dist + t_hit;
-            float hit_eps = fractal_hit_eps(hit_path_dist);
+            float hit_path_dist = base_cam_dist + t_hit * inv_dir_len;
+            float hit_eps = fractal_hit_eps(hit_path_dist) * dir_len;
             float norm_cone = norm_eps * 250.0f * pixel_angle;
-            float n_eps = fmaxf(hit_eps * 0.75f, hit_path_dist * norm_cone);
+            float n_eps = fmaxf(hit_eps * 0.75f, hit_path_dist * norm_cone * dir_len);
             float3 obj_n = fractal_normal(p_hit, n_eps);
             float ao = fractal_ao(p_hit, obj_n, hit_eps);
             float3 col = f3_mul(trap_palette(trap_hit), ao);
@@ -2548,7 +2544,7 @@ extern "C" __global__ void __intersection__fractal() {
                 (((unsigned int)(fminf(1.0f, col.y) * 255.0f) & 0xFFu) << 8u) |
                 (((unsigned int)(fminf(1.0f, col.z) * 255.0f) & 0xFFu) << 16u);
             optixReportIntersection(
-                t_hit, 0,
+                t_hit * inv_dir_len, 0,
                 __float_as_uint(obj_n.x),
                 __float_as_uint(obj_n.y),
                 __float_as_uint(obj_n.z),

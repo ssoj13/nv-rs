@@ -49,6 +49,51 @@ const VAL_W: f32 = 56.0;
 const ANIM_BTN_W: f32 = 16.0;
 const ROW_H: f32 = 14.0;
 
+/// WGS84 semi-major equatorial radius in meters.
+const WGS84_A: f64 = 6_378_137.0;
+/// WGS84 flattening factor (`1 / 298.257223563`).
+const WGS84_F: f64 = 1.0 / 298.257_223_563;
+/// WGS84 first eccentricity squared (`f * (2 - f)`).
+const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
+
+/// Returns the WGS84 geodetic origin `(lat_deg, lon_deg)` for real-world OSM scenes.
+///
+/// Matches the verified `osm_rs` origins (`GUNDO_EL_SEGUNDO_ORIGIN`, `MARINA_CITY_DR_ORIGIN`,
+/// `SF_HOUSE_OF_AI_ORIGIN`). Returns `None` for non-georeferenced scenes (`classic`, procedural
+/// `gundo`, `inspector`).
+pub fn scene_wgs84_origin(scene_id: &str) -> Option<(f64, f64)> {
+    match scene_id {
+        "gundo_osm" => Some((33.9138, -118.4190)),
+        "marina" => Some((33.9846, -118.4534)),
+        "sf_house_of_ai" => Some((37.7750, -122.4032)),
+        _ => None,
+    }
+}
+
+/// Converts a right-handed world position `[x, y, z]` (`+X = East`, `+Y = Up` orthometric
+/// height in meters above sea level, `-Z = North`) into Apple Maps–compatible WGS84 geodetic
+/// coordinates `(lat_deg, lon_deg, alt_m)` relative to `(origin_lat, origin_lon)`.
+///
+/// Uses the exact WGS84 meridional (`R_M`) and prime-vertical (`R_N`) radii of curvature at
+/// `origin_lat`. Non-finite coordinates are sanitized to `0.0`.
+pub fn world_to_wgs84(origin_lat: f64, origin_lon: f64, pos: [f32; 3]) -> (f64, f64, f32) {
+    let east_m = if pos[0].is_finite() { pos[0] as f64 } else { 0.0 };
+    let alt_m = if pos[1].is_finite() { pos[1] } else { 0.0 };
+    let north_m = if pos[2].is_finite() { -(pos[2] as f64) } else { 0.0 };
+
+    let lat0_rad = origin_lat.clamp(-89.9999, 89.9999).to_radians();
+    let sin_lat = lat0_rad.sin();
+    let cos_lat = lat0_rad.cos().max(1e-6);
+    let w2 = 1.0 - WGS84_E2 * sin_lat * sin_lat;
+    let w = w2.sqrt();
+    let r_n = WGS84_A / w;
+    let r_m = WGS84_A * (1.0 - WGS84_E2) / (w2 * w);
+
+    let lat_deg = origin_lat + (north_m / r_m).to_degrees();
+    let lon_deg = origin_lon + (east_m / (r_n * cos_lat)).to_degrees();
+    (lat_deg, lon_deg, alt_m)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DockTab {
     Viewport,
@@ -893,6 +938,81 @@ impl UiContext<'_> {
         ui.painter()
             .rect_filled(bg, 4.0, Color32::from_rgba_unmultiplied(12, 14, 18, 190));
         ui.painter().galley(hud_pos, galley, Color32::WHITE);
+
+        // Clickable Apple Maps / WGS84 coordinate readout in bottom Viewport status bar
+        let active_scene_id = self
+            .settings
+            .csg_mode
+            .checked_sub(1)
+            .and_then(|idx| self.scene_descriptors.get(idx as usize))
+            .map(|d| d.id);
+        if let Some((origin_lat, origin_lon)) = active_scene_id.and_then(scene_wgs84_origin) {
+            let (lat, lon, alt_m) =
+                world_to_wgs84(origin_lat, origin_lon, self.cam_pose.eye.to_array());
+            let copy_id = ui.id().with("wgs84-hud-copied-at");
+            let now_s = ui.input(|i| i.time);
+            let copied_recently = ui
+                .ctx()
+                .data(|d| d.get_temp::<f64>(copy_id))
+                .is_some_and(|t| (now_s - t) < 1.5);
+            let pill_text = if copied_recently {
+                format!("{} Copied {lat:.5}, {lon:.5}", ic::CHECK)
+            } else {
+                format!("{} {lat:.5}, {lon:.5} | {alt_m:.1} m", ic::MAP_PIN)
+            };
+            let text_col = if copied_recently {
+                Color32::from_rgb(138, 232, 168)
+            } else {
+                Color32::from_rgb(212, 228, 245)
+            };
+            let wgs_galley = ui.painter().layout_no_wrap(
+                pill_text,
+                egui::FontId::monospace(11.0),
+                text_col,
+            );
+            let pill_size = wgs_galley.size() + egui::vec2(12.0, 6.0);
+            let pref_left = rect.right() - pill_size.x - 10.0;
+            let pill_min = if pref_left >= bg.right() + 8.0 {
+                egui::pos2(pref_left, bg.top())
+            } else {
+                egui::pos2(bg.left(), bg.top() - pill_size.y - 4.0)
+            };
+            let pill_rect = egui::Rect::from_min_size(pill_min, pill_size);
+            let pill_resp = ui
+                .interact(pill_rect, ui.id().with("wgs84-hud-copy"), Sense::click())
+                .on_hover_text("Click to copy Apple Maps coordinates (lat, lon)");
+            if pill_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if pill_resp.clicked() {
+                ui.ctx().copy_text(format!("{lat:.5}, {lon:.5}"));
+                ui.ctx().data_mut(|d| d.insert_temp(copy_id, now_s));
+            }
+            let pill_fill = if pill_resp.hovered() {
+                Color32::from_rgba_unmultiplied(24, 34, 48, 225)
+            } else {
+                Color32::from_rgba_unmultiplied(12, 14, 18, 190)
+            };
+            ui.painter().rect_filled(pill_rect, 4.0, pill_fill);
+            if pill_resp.hovered() || copied_recently {
+                let stroke_col = if copied_recently {
+                    Color32::from_rgb(76, 178, 112)
+                } else {
+                    Color32::from_rgb(78, 128, 184)
+                };
+                ui.painter().rect_stroke(
+                    pill_rect,
+                    4.0,
+                    egui::Stroke::new(1.0, stroke_col),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            ui.painter().galley(
+                pill_rect.min + egui::vec2(6.0, 3.0),
+                wgs_galley,
+                Color32::WHITE,
+            );
+        }
     }
 
     fn ui_fractal(&mut self, ui: &mut Ui) {
@@ -3511,4 +3631,53 @@ fn sparkline_row(
             ui.add(egui::Label::new(RichText::new(txt).size(11.5).color(color)).truncate());
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scene_wgs84_origin_maps_osm_scenes_and_skips_non_geo() {
+        assert_eq!(scene_wgs84_origin("gundo_osm"), Some((33.9138, -118.4190)));
+        assert_eq!(scene_wgs84_origin("marina"), Some((33.9846, -118.4534)));
+        assert_eq!(
+            scene_wgs84_origin("sf_house_of_ai"),
+            Some((37.7750, -122.4032))
+        );
+        assert_eq!(scene_wgs84_origin("gundo"), None);
+        assert_eq!(scene_wgs84_origin("inspector"), None);
+    }
+
+    #[test]
+    fn world_to_wgs84_exact_at_origin_and_1km_east_north() {
+        let (lat0, lon0) = (33.9138, -118.4190);
+        // Origin `(0, 41.1, 0)` reproduces exact anchor lat/lon and orthometric altitude.
+        let (lat, lon, alt) = world_to_wgs84(lat0, lon0, [0.0, 41.1, 0.0]);
+        assert!((lat - lat0).abs() < 1e-12, "origin lat={lat}");
+        assert!((lon - lon0).abs() < 1e-12, "origin lon={lon}");
+        assert!((alt - 41.1).abs() < 1e-5, "origin alt={alt}");
+
+        // `+1000 m East (+X)` and `+1000 m North (-Z)` match WGS84 curvature radii.
+        let (lat_ne, lon_ne, alt_ne) = world_to_wgs84(lat0, lon0, [1000.0, 125.5, -1000.0]);
+        let dlat = lat_ne - lat0;
+        let dlon = lon_ne - lon0;
+        // At 33.9138° N: 1 km North ~= +0.0090148°, 1 km East ~= +0.0108144°.
+        assert!(
+            (dlat - 0.009_014_8).abs() < 2e-6,
+            "1 km North dlat={dlat:.7} deg"
+        );
+        assert!(
+            (dlon - 0.010_814_4).abs() < 2e-6,
+            "1 km East dlon={dlon:.7} deg"
+        );
+        assert!((alt_ne - 125.5).abs() < 1e-4, "alt_ne={alt_ne}");
+
+        // Non-finite inputs sanitize safely without NaN.
+        let (lat_nan, lon_nan, alt_nan) =
+            world_to_wgs84(lat0, lon0, [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        assert!((lat_nan - lat0).abs() < 1e-12);
+        assert!((lon_nan - lon0).abs() < 1e-12);
+        assert_eq!(alt_nan, 0.0);
+    }
 }

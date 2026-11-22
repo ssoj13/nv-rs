@@ -1,5 +1,6 @@
 [package]
 name = "nv-demo"
+description = "Interactive OptiX 9 path tracer, pure-CSG world viewer, DLSS SR/RR, and MP4/still studio demo."
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

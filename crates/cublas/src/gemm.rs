@@ -684,4 +684,88 @@ impl Handle {
             )
         })
     }
+
+    /// Zero-overhead grouped-batched mixed-precision `cublasGemmGroupedBatchedEx` on the stream
+    /// already bound to `self` (via [`Self::set_stream`] or [`Self::set_raw_stream`]).
+    ///
+    /// Executes `sum(group_size)` independent GEMMs grouped by `(transa, transb, m, n, k, lda, ldb, ldc)`
+    /// in a single cuBLAS launch. `a_ptrs_dev`, `b_ptrs_dev`, and `c_ptrs_dev` are device pointers
+    /// to contiguous arrays of `u64` device pointers (`total_batches` entries each). All other arrays
+    /// are host slices of length `group_count`.
+    ///
+    /// # Safety
+    /// - All `group_count`-length host slices must be valid and have length `>= group_count`.
+    /// - `a_ptrs_dev`, `b_ptrs_dev`, `c_ptrs_dev` must point to valid device arrays of `total_batches`
+    ///   device pointers on `self.cuda()`, each pointing to valid matrix storage for the duration of
+    ///   the bound CUDA stream.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cublasGemmGroupedBatchedEx C API parameter list"
+    )]
+    pub unsafe fn gemm_grouped_batched_ex_on_bound_stream(
+        &self,
+        transa: &[sys::cublasOperation_t],
+        transb: &[sys::cublasOperation_t],
+        m: &[i32],
+        n: &[i32],
+        k: &[i32],
+        alpha_f32: &[f32],
+        a_ptrs_dev: u64,
+        a_type: DataType,
+        lda: &[i32],
+        b_ptrs_dev: u64,
+        b_type: DataType,
+        ldb: &[i32],
+        beta_f32: &[f32],
+        c_ptrs_dev: u64,
+        c_type: DataType,
+        ldc: &[i32],
+        group_size: &[i32],
+        compute_type: ComputeType,
+    ) -> Result<()> {
+        let group_count = group_size.len();
+        if group_count == 0 {
+            return Ok(());
+        }
+        if transa.len() != group_count
+            || transb.len() != group_count
+            || m.len() != group_count
+            || n.len() != group_count
+            || k.len() != group_count
+            || alpha_f32.len() != group_count
+            || lda.len() != group_count
+            || ldb.len() != group_count
+            || beta_f32.len() != group_count
+            || ldc.len() != group_count
+        {
+            return Err(Error::Invalid(
+                "gemm_grouped_batched_ex_on_bound_stream: slice lengths must match group_size.len()",
+            ));
+        }
+        // SAFETY: caller guarantees stream binding, valid device pointer arrays, and matrix extents.
+        check("cublasGemmGroupedBatchedEx", unsafe {
+            sys::cublasGemmGroupedBatchedEx(
+                self.raw(),
+                transa.as_ptr(),
+                transb.as_ptr(),
+                m.as_ptr(),
+                n.as_ptr(),
+                k.as_ptr(),
+                alpha_f32.as_ptr().cast::<c_void>(),
+                a_ptrs_dev as usize as *const *const c_void,
+                a_type.raw(),
+                lda.as_ptr(),
+                b_ptrs_dev as usize as *const *const c_void,
+                b_type.raw(),
+                ldb.as_ptr(),
+                beta_f32.as_ptr().cast::<c_void>(),
+                c_ptrs_dev as usize as *const *mut c_void,
+                c_type.raw(),
+                ldc.as_ptr(),
+                group_count as i32,
+                group_size.as_ptr(),
+                compute_type.raw(),
+            )
+        })
+    }
 }

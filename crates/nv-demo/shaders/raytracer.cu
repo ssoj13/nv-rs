@@ -1211,6 +1211,26 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_BRICK: {
+            if (n.y > 0.7f) {
+                // Horizontal roof faces of brick buildings shade as a weathered tar/gravel/EPDM
+                // flat roof membrane instead of world-axis-aligned brick stripes.
+                float gravel = value_noise2(hit_pos.x * 26.0f, hit_pos.z * 26.0f);
+                float patch_n = fbm2(hit_pos.x * 0.24f + 2.3f, hit_pos.z * 0.24f - 1.7f);
+                float seam_x = fabsf(fmodf(fabsf(hit_pos.x + hit_pos.z * 0.25f), 2.4f) - 1.2f);
+                float seam_z = fabsf(fmodf(fabsf(hit_pos.z - hit_pos.x * 0.25f), 4.8f) - 2.4f);
+                float tar_seam = (seam_x > 1.17f || seam_z > 2.37f) ? 0.72f : 1.0f;
+                float tone = (0.78f + 0.30f * patch_n) * (0.90f + 0.20f * gravel) * tar_seam;
+                base_col = make_float3(0.11f * tone, 0.115f * tone, 0.125f * tone);
+                rough = fmaxf(0.76f, fminf(0.92f, 0.84f + (0.5f - gravel) * 0.12f));
+                if (wet > 0.05f) {
+                    float wmask = sky_smoothstep(0.45f, 0.75f, patch_n) * wet;
+                    base_col = f3_mul(base_col, 1.0f - 0.32f * wmask);
+                    rough = fmaxf(0.18f, rough * (1.0f - 0.52f * wmask));
+                    clearcoat = fmaxf(clearcoat, 0.55f * wmask);
+                    cc_rough = fminf(cc_rough, 0.08f);
+                }
+                break;
+            }
             // Exact horizontal wall-tangent projection preserves undistorted brick proportions
             // on arbitrary-angle OSM streets (e.g. 45-degree SF SoMa Boardman Pl & curved arcs).
             float horiz = sqrtf(n.x * n.x + n.z * n.z);

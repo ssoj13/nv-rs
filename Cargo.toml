@@ -16,6 +16,7 @@ publish = false
 [workspace.dependencies]
 nv-loader = { path = "crates/nv-loader" }
 nv-bindgen = { path = "crates/nv-bindgen" }
+appbus = { package = "appbus-rs", git = "ssh://git@github.com/ssoj13/appbus-rs.git", branch = "main", default-features = false, features = ["bus"] }
 csg-core = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
 csg-scene = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
 csg-device = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }

@@ -3,6 +3,7 @@
 //! Run with:
 //! `cargo run -p nv-demo --release`
 
+mod app_events;
 #[allow(unexpected_cfgs, dead_code, unused_imports, clippy::all)]
 mod camera_core;
 #[allow(unexpected_cfgs, dead_code, unused_imports, deprecated, clippy::all)]
@@ -20,7 +21,6 @@ mod renderer;
 mod ui;
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -32,6 +32,10 @@ use winit::window::{Window, WindowId};
 
 mod demo_app {
     use super::*;
+    use crate::app_events::{
+        AppBus, INTERACTION_SETTLE_WINDOW, RenderControl, RenderEvent, RenderStateSnapshot,
+        StillFormat, UiCommand,
+    };
     use crate::camera_core::input::NavScheme;
     use crate::camera_core::{
         CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, NavPrefs, ViewportSize,
@@ -39,9 +43,10 @@ mod demo_app {
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
         CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs,
-        FrameReady, RenderCmd, align_render_size, spawn_render_thread,
+        align_render_size, spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
+    use appbus::downcast_event;
     use bytemuck::{Pod, Zeroable};
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
@@ -1098,6 +1103,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         last_resize_at: Instant,
         front_buf_idx: usize,
         has_frame: bool,
+        viewport_tex_dirty: bool,
         dlss_dirty: bool,
         display_texture: wgpu::Texture,
         display_view: wgpu::TextureView,
@@ -1108,8 +1114,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         bound_hdr_tex: bool,
         last_jitter: [f32; 2],
         last_saved_msg: Option<String>,
-        cmd_tx: Sender<RenderCmd>,
-        frame_rx: Receiver<FrameReady>,
+        bus: AppBus,
+        ui_cmd_scratch: Vec<appbus::BoxedEvent>,
+        render_ev_scratch: Vec<appbus::BoxedEvent>,
         render_thread: Option<JoinHandle<()>>,
         nvml_dev: Option<nvml::Device>,
         _nvml: Option<&'static nvml::Nvml>,
@@ -1123,7 +1130,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         denoise_ms: f32,
         bloom_ms: f32,
         tonemap_ms: f32,
-        fps: f32,
+        ui_fps: f32,
+        rt_fps: f32,
+        fast_preview: bool,
+        reset_seq: u64,
+        interacting_until: Option<Instant>,
         is_recording: bool,
         record_frames: u64,
         video_recorder: Option<ActiveRecorder>,
@@ -1132,7 +1143,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         csg_stats: crate::csg_scene_host::CsgStats,
         scene_descriptors: Vec<csg_scene::SceneDescriptor>,
         scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
-        pending_scene_auto_frame: bool,
+        pending_scene_auto_frame: Option<(u32, u32)>,
         rail_random_seed: u64,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
@@ -1163,7 +1174,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let _ = active.recorder.finish();
             }
             self.save_persisted();
-            let _ = self.cmd_tx.send(RenderCmd::Shutdown);
+            self.bus.send_render(RenderControl::Shutdown);
             if let Some(handle) = self.render_thread.take() {
                 let _ = handle.join();
             }
@@ -1408,13 +1419,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 settings.denoiser_on = false;
             }
             let initial_camera = pose_to_frame(cam_pose);
-            let (cmd_tx, frame_rx, render_thread) = spawn_render_thread(
+            let bus = AppBus::new(RenderStateSnapshot {
+                settings,
+                camera: initial_camera,
+                interacting_until: None,
+                reset_seq: 0,
+            });
+            let render_thread = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
                 buf_ptrs,
                 depth_ptrs,
                 motion_ptrs,
-                settings,
-                initial_camera,
+                bus.clone(),
             );
 
             let nvml_lib = nvml::Nvml::init()
@@ -1464,6 +1480,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 last_resize_at: Instant::now(),
                 front_buf_idx: 0,
                 has_frame: false,
+                viewport_tex_dirty: false,
                 dlss_dirty: false,
                 display_texture,
                 display_view,
@@ -1474,8 +1491,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 bound_hdr_tex: false,
                 last_jitter: [0.0, 0.0],
                 last_saved_msg: None,
-                cmd_tx,
-                frame_rx,
+                bus,
+                ui_cmd_scratch: Vec::with_capacity(16),
+                render_ev_scratch: Vec::with_capacity(32),
                 render_thread: Some(render_thread),
                 nvml_dev,
                 _nvml: nvml_lib,
@@ -1489,7 +1507,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 denoise_ms: 0.0,
                 bloom_ms: 0.0,
                 tonemap_ms: 0.0,
-                fps: 60.0,
+                ui_fps: 60.0,
+                rt_fps: 0.0,
+                fast_preview: false,
+                reset_seq: 0,
+                interacting_until: None,
                 is_recording: false,
                 record_frames: 0,
                 video_recorder: None,
@@ -1498,7 +1520,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 csg_stats: crate::csg_scene_host::CsgStats::default(),
                 scene_descriptors: crate::csg_scene_host::default_scene_descriptors(),
                 scene_viewpoints: Vec::new(),
-                pending_scene_auto_frame: false,
+                pending_scene_auto_frame: None,
                 rail_random_seed: 2026,
                 settings,
                 last_sent_settings: settings,
@@ -1540,7 +1562,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 1
             };
-            let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+            self.bus.send_render(RenderControl::SetRecording {
                 active,
                 fixed_fps,
                 shutter_subframes,
@@ -1611,7 +1633,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let now = Instant::now();
             let dt = (now - self.last_frame_at).as_secs_f32().clamp(1e-4, 0.1);
             self.last_frame_at = now;
-            self.fps = self.fps * 0.9 + (1.0 / dt) * 0.1;
+            self.ui_fps = self.ui_fps * 0.9 + (1.0 / dt) * 0.1;
 
             if self.last_telemetry_at.elapsed().as_secs_f32() > 0.35 {
                 self.profiler
@@ -1619,95 +1641,102 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.last_telemetry_at = now;
             }
 
-            // 1. Drain completed frames from the async OptiX render thread.
+            // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
-            while let Ok(msg) = self.frame_rx.try_recv() {
-                if msg.gen_id != self.buf_gen {
+            self.bus.poll_render_events(&mut self.render_ev_scratch);
+            for boxed in &self.render_ev_scratch {
+                let Some(ev) = downcast_event::<RenderEvent>(boxed) else {
                     continue;
-                }
-                frames_received += 1;
-                self.shutter_in_flight = false;
-                if self.has_frame && self.front_buf_idx != msg.buf_idx {
-                    let _ = self.cmd_tx.send(RenderCmd::ReturnBuffer {
-                        buf_idx: self.front_buf_idx,
-                        gen_id: self.buf_gen,
-                    });
-                }
-                self.front_buf_idx = msg.buf_idx;
-                self.has_frame = true;
-                self.dlss_dirty = true;
-                self.accum_count = msg.accum_count;
-                self.total_samples = msg.total_samples;
-                self.last_jitter = msg.jitter;
-                self.rt_ms = msg.rt_ms;
-                self.denoise_ms = msg.denoise_ms;
-                self.bloom_ms = msg.bloom_ms;
-                self.tonemap_ms = msg.tonemap_ms;
-                self.ser_supported = msg.ser_supported;
-                self.csg_stats = msg.csg_stats;
-                if let Some(meta) = msg.scene_meta {
-                    self.scene_viewpoints = meta.viewpoints;
-                    self.camera_rail.set_scene_rails(meta.rails);
-                    if self.camera_rail.is_active() {
-                        self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
+                };
+                match ev {
+                    RenderEvent::FrameReady(msg) => {
+                        if msg.gen_id != self.buf_gen {
+                            continue;
+                        }
+                        frames_received += 1;
+                        self.shutter_in_flight = false;
+                        if self.has_frame && self.front_buf_idx != msg.buf_idx {
+                            self.bus.send_render(RenderControl::ReturnBuffer {
+                                buf_idx: self.front_buf_idx,
+                                gen_id: self.buf_gen,
+                            });
+                        }
+                        self.front_buf_idx = msg.buf_idx;
+                        self.has_frame = true;
+                        self.viewport_tex_dirty = true;
+                        self.dlss_dirty = true;
+                        self.accum_count = msg.accum_count;
+                        self.total_samples = msg.total_samples;
+                        self.last_jitter = msg.jitter;
+                        self.rt_ms = msg.rt_ms;
+                        self.denoise_ms = msg.denoise_ms;
+                        self.bloom_ms = msg.bloom_ms;
+                        self.tonemap_ms = msg.tonemap_ms;
+                        self.ser_supported = msg.ser_supported;
+                        self.csg_stats = msg.csg_stats;
+                        self.fast_preview = msg.fast_preview;
+                        let total_gpu_ms =
+                            (msg.rt_ms + msg.denoise_ms + msg.bloom_ms + msg.tonemap_ms).max(0.1);
+                        let inst_rt_fps = 1000.0 / total_gpu_ms;
+                        self.rt_fps = if self.rt_fps <= 0.01 {
+                            inst_rt_fps
+                        } else {
+                            self.rt_fps * 0.85 + inst_rt_fps * 0.15
+                        };
+                        self.profiler.record_frame(
+                            msg.rt_ms,
+                            msg.denoise_ms,
+                            msg.bloom_ms,
+                            msg.tonemap_ms,
+                            self.rt_fps,
+                        );
+                        self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
                     }
-                    if self.pending_scene_auto_frame
-                        && meta.scene_idx == self.settings.csg_mode
-                        && meta.variant_idx == self.settings.csg_asset_idx
-                    {
-                        self.pending_scene_auto_frame = false;
-                        if !self.camera_rail.is_active()
-                            && let Some(vp) = self.scene_viewpoints.first()
+                    RenderEvent::SceneMetaUpdated(meta) => {
+                        self.scene_viewpoints = meta.viewpoints.clone();
+                        self.camera_rail.set_scene_rails(meta.rails.clone());
+                        if self.camera_rail.is_active() {
+                            self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
+                        }
+                        if self.pending_scene_auto_frame == Some((meta.scene_idx, meta.variant_idx))
                         {
-                            let eye_v = glam::Vec3::new(vp.eye.x, vp.eye.y, vp.eye.z);
-                            let tgt_v = glam::Vec3::new(vp.target.x, vp.target.y, vp.target.z);
-                            let delta = tgt_v - eye_v;
-                            let dist = delta.length().max(0.25);
-                            let fwd = delta / dist;
-                            let pose = CameraPose::from_eye_forward_up(
-                                eye_v,
-                                fwd,
-                                glam::Vec3::Y,
-                                vp.vfov_deg.clamp(15.0, 110.0).to_radians(),
-                                self.cam_pose.znear,
-                                self.cam_pose.zfar.max(2000.0),
-                            );
-                            self.cam_driver.controller_mut().set_pose(pose);
-                            self.cam_driver.controller_mut().set_orbit_distance(dist);
-                            self.cam_pose = self.cam_driver.controller().pose();
-                            self.rail_blend_remaining = 0.0;
-                            self.cam_damper.snap(self.cam_pose);
+                            self.pending_scene_auto_frame = None;
+                            if !self.camera_rail.is_active()
+                                && let Some(vp) = self.scene_viewpoints.first()
+                            {
+                                let eye_v = glam::Vec3::new(vp.eye.x, vp.eye.y, vp.eye.z);
+                                let tgt_v = glam::Vec3::new(vp.target.x, vp.target.y, vp.target.z);
+                                let delta = tgt_v - eye_v;
+                                let dist = delta.length().max(0.25);
+                                let fwd = delta / dist;
+                                let pose = CameraPose::from_eye_forward_up(
+                                    eye_v,
+                                    fwd,
+                                    glam::Vec3::Y,
+                                    vp.vfov_deg.clamp(15.0, 110.0).to_radians(),
+                                    self.cam_pose.znear,
+                                    self.cam_pose.zfar.max(2000.0),
+                                );
+                                self.cam_driver.controller_mut().set_pose(pose);
+                                self.cam_driver.controller_mut().set_orbit_distance(dist);
+                                self.cam_pose = self.cam_driver.controller().pose();
+                                self.rail_blend_remaining = 0.0;
+                                self.cam_damper.snap(self.cam_pose);
+                            }
                         }
                     }
+                    RenderEvent::RailGenerated(rail_spec) => {
+                        self.camera_rail.push_generated_rail(rail_spec.clone());
+                        self.rail_blend_remaining = 1.6;
+                    }
+                    RenderEvent::StatusMessage(status) => {
+                        self.last_saved_msg = Some(status.clone());
+                    }
                 }
-                if let Some(rail_spec) = msg.generated_rail {
-                    self.camera_rail.push_generated_rail(rail_spec);
-                    self.rail_blend_remaining = 1.6;
-                }
-                if let Some(status) = msg.status_msg {
-                    self.last_saved_msg = Some(status);
-                }
-                self.profiler.record_frame(
-                    msg.rt_ms,
-                    msg.denoise_ms,
-                    msg.bloom_ms,
-                    msg.tonemap_ms,
-                    self.fps,
-                );
-                self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
             }
 
-            // 2. Docked egui pass (60 FPS, zero blocking; camera_egui::drive steps the camera).
+            // 2. Docked egui pass (60+ FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
-            let mut reset_accum_requested = false;
-            let mut cam_snap_requested = false;
-            let mut rail_blend_requested = false;
-            let mut scene_auto_frame_requested = false;
-            let mut generate_random_rail_requested = false;
-            let mut save_png_requested = false;
-            let mut save_jpeg_requested = false;
-            let mut toggle_record_requested = false;
-            let mut reload_shader_requested = false;
             let prev_theme = self.theme;
             let cam_fixed_dt = if self.is_recording && self.settings.record_fixed_fps {
                 let shutter_n = self.settings.record_shutter_subframes.clamp(1, 4);
@@ -1721,6 +1750,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 None
             };
             let mut ui_ctx = UiContext {
+                bus: &self.bus,
                 settings: &mut self.settings,
                 demo_anim: &mut self.demo_anim,
                 display_tex_id: self.display_tex_id,
@@ -1731,8 +1761,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 cam_home: self.cam_home,
                 cam_pose: &mut self.cam_pose,
                 camera_rail: &mut self.camera_rail,
-                cam_snap_requested: &mut cam_snap_requested,
-                rail_blend_requested: &mut rail_blend_requested,
                 cam_fixed_dt,
                 cam_mode: &mut self.cam_mode,
                 cam_fly_mode: &mut self.cam_fly_mode,
@@ -1747,24 +1775,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 denoise_ms: self.denoise_ms,
                 bloom_ms: self.bloom_ms,
                 tonemap_ms: self.tonemap_ms,
-                fps: self.fps,
+                ui_fps: self.ui_fps,
+                rt_fps: self.rt_fps,
+                fast_preview: self.fast_preview,
                 is_recording: self.is_recording,
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
                 csg_stats: self.csg_stats,
                 scene_descriptors: &self.scene_descriptors,
                 scene_viewpoints: &self.scene_viewpoints,
-                scene_auto_frame_requested: &mut scene_auto_frame_requested,
-                generate_random_rail_requested: &mut generate_random_rail_requested,
                 rail_random_seed: &mut self.rail_random_seed,
                 dlss_rr_available: self.dlss_rr_available,
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
-                reset_accum_requested: &mut reset_accum_requested,
-                save_png_requested: &mut save_png_requested,
-                save_jpeg_requested: &mut save_jpeg_requested,
-                toggle_record_requested: &mut toggle_record_requested,
-                reload_shader_requested: &mut reload_shader_requested,
                 last_saved_msg: self.last_saved_msg.as_deref(),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
@@ -1778,6 +1801,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .show_leaf_collapse_buttons(false)
                     .show_inside(ui, &mut ui_ctx);
             });
+
+            let mut reset_accum_requested = false;
+            let mut cam_snap_requested = false;
+            let mut rail_blend_requested = false;
+            let mut select_scene_target: Option<(u32, u32)> = None;
+            let mut generate_random_rail_seed: Option<u64> = None;
+            let mut save_png_requested = false;
+            let mut save_jpeg_requested = false;
+            let mut toggle_record_requested = false;
+            let mut reload_shader_requested = false;
+            self.bus.poll_ui_commands(&mut self.ui_cmd_scratch);
+            for boxed in &self.ui_cmd_scratch {
+                let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
+                    continue;
+                };
+                match *cmd {
+                    UiCommand::ResetAccum => reset_accum_requested = true,
+                    UiCommand::SaveStill(StillFormat::Png) => save_png_requested = true,
+                    UiCommand::SaveStill(StillFormat::Jpeg) => save_jpeg_requested = true,
+                    UiCommand::ToggleRecord => toggle_record_requested = true,
+                    UiCommand::ReloadShader => reload_shader_requested = true,
+                    UiCommand::SelectScene {
+                        scene_idx,
+                        variant_idx,
+                    } => {
+                        select_scene_target = Some((scene_idx, variant_idx));
+                    }
+                    UiCommand::GenerateRandomRail { seed } => {
+                        generate_random_rail_seed = Some(seed);
+                    }
+                    UiCommand::SnapCamera => cam_snap_requested = true,
+                    UiCommand::BlendRail => rail_blend_requested = true,
+                }
+            }
             if self.theme != prev_theme {
                 self.dock_style = self.theme.apply(&self.egui_ctx);
             }
@@ -1992,11 +2049,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.buf_gen = self.buf_gen.wrapping_add(1);
                         self.shutter_in_flight = false;
                         self.has_frame = false;
+                        self.viewport_tex_dirty = false;
                         self.dlss_dirty = false;
                         self.front_buf_idx = 0;
                         self.accum_count = 0;
                         self.total_samples = 0;
-                        let _ = self.cmd_tx.send(RenderCmd::Resize {
+                        self.bus.send_render(RenderControl::Resize {
                             width: target_w,
                             height: target_h,
                             buf_ptrs: new_ptrs,
@@ -2124,6 +2182,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         );
                         self.using_dlss_tex = false;
                         self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
+                        self.viewport_tex_dirty = self.has_frame;
                     }
                 }
             } else if self.settings.dlss_on {
@@ -2200,6 +2259,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     self.using_dlss_tex = false;
                     self.bound_hdr_tex = want_hdr_view;
+                    self.viewport_tex_dirty = self.has_frame;
                 }
                 self.dlss_pass = None;
                 self.dlss_rr_pass = None;
@@ -2239,7 +2299,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     let path = dir.join(format!("nv-demo-{ts}.jpg"));
-                    let _ = self.cmd_tx.send(RenderCmd::SaveJpeg { path, quality: 92 });
+                    self.bus.send_render(RenderControl::SaveJpeg { path, quality: 92 });
                 }
             }
             if toggle_record_requested {
@@ -2430,17 +2490,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
-            if scene_auto_frame_requested {
-                self.pending_scene_auto_frame = true;
+            if let Some((scene_idx, variant_idx)) = select_scene_target {
+                self.pending_scene_auto_frame = Some((scene_idx, variant_idx));
                 self.camera_rail.set_playing(false);
             }
-            if generate_random_rail_requested {
-                let _ = self.cmd_tx.send(RenderCmd::GenerateRandomRail {
-                    seed: self.rail_random_seed,
-                });
+            if let Some(seed) = generate_random_rail_seed {
+                self.bus.send_render(RenderControl::GenerateRandomRail { seed });
             }
             if reload_shader_requested {
-                let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
+                self.bus.send_render(RenderControl::ReloadShader);
             }
 
             // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.
@@ -2505,7 +2563,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let cam_frame = pose_to_frame(smoothed);
                         self.last_sent_settings = effective_settings;
                         self.last_sent_camera = cam_frame;
-                        let _ = self.cmd_tx.send(RenderCmd::RenderShutterSubframe {
+                        self.bus.send_render(RenderControl::RenderShutterSubframe {
                             settings: Box::new(effective_settings),
                             camera: cam_frame,
                             sim_dt: sub_dt,
@@ -2554,12 +2612,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     || effective_settings != self.last_sent_settings
                     || cam_frame != self.last_sent_camera
                 {
+                    if reset_accum_requested {
+                        self.reset_seq = self.reset_seq.wrapping_add(1);
+                    }
+                    let automated_motion = self.is_recording
+                        || self.demo_anim.is_running()
+                        || self.camera_rail.is_active();
+                    self.interacting_until = if automated_motion {
+                        None
+                    } else {
+                        Some(Instant::now() + INTERACTION_SETTLE_WINDOW)
+                    };
                     self.last_sent_settings = effective_settings;
                     self.last_sent_camera = cam_frame;
-                    let _ = self.cmd_tx.send(RenderCmd::Update {
-                        settings: Box::new(effective_settings),
+                    self.bus.publish_render_state(RenderStateSnapshot {
+                        settings: effective_settings,
                         camera: cam_frame,
-                        reset_accum: reset_accum_requested,
+                        interacting_until: self.interacting_until,
+                        reset_seq: self.reset_seq,
                     });
                 }
             }
@@ -2751,6 +2821,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             );
                             self.using_dlss_tex = false;
                             self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
+                            self.viewport_tex_dirty = self.has_frame;
                         }
                         self.dlss_rr_pass = None;
                     } else if ran_rr
@@ -2863,58 +2934,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 );
                                 self.using_dlss_tex = false;
                                 self.bound_hdr_tex = hdr_active && self.display_view_hdr.is_some();
+                                self.viewport_tex_dirty = self.has_frame;
                             }
                             self.dlss_pass = None;
                             self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
                         }
                     }
-                } else if hdr_active
-                    && let (Some(hdr_bufs), Some(hdr_tex)) =
-                        (&self.shared_hdr, &self.display_texture_hdr)
-                {
-                    encoder.copy_buffer_to_texture(
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: hdr_bufs[self.front_buf_idx].wgpu_buffer(),
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(self.render_w * 8),
-                                rows_per_image: Some(self.render_h),
+                } else if self.viewport_tex_dirty {
+                    self.viewport_tex_dirty = false;
+                    if hdr_active
+                        && let (Some(hdr_bufs), Some(hdr_tex)) =
+                            (&self.shared_hdr, &self.display_texture_hdr)
+                    {
+                        encoder.copy_buffer_to_texture(
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: hdr_bufs[self.front_buf_idx].wgpu_buffer(),
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(self.render_w * 8),
+                                    rows_per_image: Some(self.render_h),
+                                },
                             },
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: hdr_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: self.render_w,
-                            height: self.render_h,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                } else {
-                    encoder.copy_buffer_to_texture(
-                        wgpu::TexelCopyBufferInfo {
-                            buffer: self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
-                            layout: wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(self.render_w * 4),
-                                rows_per_image: Some(self.render_h),
+                            wgpu::TexelCopyTextureInfo {
+                                texture: hdr_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
                             },
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &self.display_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: self.render_w,
-                            height: self.render_h,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                            wgpu::Extent3d {
+                                width: self.render_w,
+                                height: self.render_h,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    } else {
+                        encoder.copy_buffer_to_texture(
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: self.shared_rgba[self.front_buf_idx].wgpu_buffer(),
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(self.render_w * 4),
+                                    rows_per_image: Some(self.render_h),
+                                },
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &self.display_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: self.render_w,
+                                height: self.render_h,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
                 }
             }
 

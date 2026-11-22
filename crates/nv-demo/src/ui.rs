@@ -6,6 +6,7 @@ use egui::{Align, Color32, FontDefinitions, Layout, RichText, Sense, Ui};
 use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
+use crate::app_events::{AppBus, StillFormat, UiCommand};
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use crate::camera_rail::CameraRail;
@@ -211,6 +212,7 @@ impl UiTheme {
 }
 
 pub struct UiContext<'a> {
+    pub bus: &'a AppBus,
     pub settings: &'a mut DemoSettings,
     pub demo_anim: &'a mut DemoAnimator,
     pub display_tex_id: egui::TextureId,
@@ -221,8 +223,6 @@ pub struct UiContext<'a> {
     pub cam_home: CameraPose,
     pub cam_pose: &'a mut CameraPose,
     pub camera_rail: &'a mut CameraRail,
-    pub cam_snap_requested: &'a mut bool,
-    pub rail_blend_requested: &'a mut bool,
     pub cam_fixed_dt: Option<f32>,
     pub cam_mode: &'a mut NavMode,
     pub cam_fly_mode: &'a mut NavMode,
@@ -237,24 +237,19 @@ pub struct UiContext<'a> {
     pub denoise_ms: f32,
     pub bloom_ms: f32,
     pub tonemap_ms: f32,
-    pub fps: f32,
+    pub ui_fps: f32,
+    pub rt_fps: f32,
+    pub fast_preview: bool,
     pub is_recording: bool,
     pub record_frames: u64,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
     pub scene_descriptors: &'a [SceneDescriptor],
     pub scene_viewpoints: &'a [SceneViewpoint],
-    pub scene_auto_frame_requested: &'a mut bool,
-    pub generate_random_rail_requested: &'a mut bool,
     pub rail_random_seed: &'a mut u64,
     pub dlss_rr_available: bool,
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
-    pub reset_accum_requested: &'a mut bool,
-    pub save_png_requested: &'a mut bool,
-    pub save_jpeg_requested: &'a mut bool,
-    pub toggle_record_requested: &'a mut bool,
-    pub reload_shader_requested: &'a mut bool,
     pub last_saved_msg: Option<&'a str>,
 }
 
@@ -366,7 +361,7 @@ impl UiContext<'_> {
                 self.camera_rail.playing = false;
                 self.cam_driver.controller_mut().set_pose(self.cam_home);
                 *self.cam_pose = self.cam_home;
-                *self.cam_snap_requested = true;
+                self.bus.emit_ui(UiCommand::SnapCamera);
             }
             if ui
                 .button(format!("{} Frame", ic::CROSSHAIR))
@@ -385,7 +380,7 @@ impl UiContext<'_> {
                     ViewportSize::new(self.render_w, self.render_h),
                 );
                 *self.cam_pose = self.cam_driver.controller().pose();
-                *self.cam_snap_requested = true;
+                self.bus.emit_ui(UiCommand::SnapCamera);
             }
 
             if ui
@@ -393,7 +388,7 @@ impl UiContext<'_> {
                 .on_hover_text("Clear accumulated samples and restart path-tracing from frame 1.")
                 .clicked()
             {
-                *self.reset_accum_requested = true;
+                self.bus.emit_ui(UiCommand::ResetAccum);
             }
 
             ui.separator();
@@ -588,7 +583,7 @@ impl UiContext<'_> {
                 self.cam_driver.controller_mut().set_pose(aimed);
                 self.cam_driver.controller_mut().set_orbit_distance(dist);
                 *self.cam_pose = self.cam_driver.controller().pose();
-                *self.cam_snap_requested = true;
+                self.bus.emit_ui(UiCommand::SnapCamera);
             } else if a_pressed {
                 self.camera_rail.playing = false;
                 let ext = 1.35 * self.settings.obj_scale.max(0.25);
@@ -602,12 +597,12 @@ impl UiContext<'_> {
                     ViewportSize::new(self.render_w, self.render_h),
                 );
                 *self.cam_pose = self.cam_driver.controller().pose();
-                *self.cam_snap_requested = true;
+                self.bus.emit_ui(UiCommand::SnapCamera);
             } else if df.requests.home {
                 self.camera_rail.playing = false;
                 self.cam_driver.controller_mut().set_pose(self.cam_home);
                 *self.cam_pose = self.cam_home;
-                *self.cam_snap_requested = true;
+                self.bus.emit_ui(UiCommand::SnapCamera);
             } else if !self.camera_rail.is_active() {
                 *self.cam_pose = df.pose;
             }
@@ -627,9 +622,15 @@ impl UiContext<'_> {
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let demo_running = self.demo_anim.is_running();
-        let traffic_moving = self.settings.csg_mode == 2
+        let active_supports_traffic = self.settings.csg_mode > 0
+            && self
+                .scene_descriptors
+                .get((self.settings.csg_mode as usize).saturating_sub(1))
+                .is_some_and(|d| d.supports_traffic);
+        let traffic_moving = active_supports_traffic
             && self.settings.csg_traffic_on
             && self.settings.csg_traffic_speed > 0.001;
+        let preview_tag = if self.fast_preview { "  |  PREVIEW" } else { "" };
         let status = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
             let mut tags = Vec::with_capacity(4);
             if demo_running {
@@ -646,25 +647,29 @@ impl UiContext<'_> {
             }
             let anim_tag = tags.join("+");
             format!(
-                "{} {}  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
+                "{} {}  |  {}x{}  |  {}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::ARROWS_CLOCKWISE,
                 anim_tag,
                 self.render_w,
                 self.render_h,
                 aov_tag,
-                self.fps.round() as u32,
+                preview_tag,
+                self.ui_fps.round() as u32,
+                self.rt_fps,
                 self.rt_ms
             )
         } else {
             format!(
-                "{} {}/{} spp  |  {}x{}  |  {}  |  {} FPS  |  {:.1} ms RT",
+                "{} {}/{} spp  |  {}x{}  |  {}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
                 ic::STACK,
                 self.total_samples,
                 self.settings.max_accum.saturating_mul(self.settings.spp),
                 self.render_w,
                 self.render_h,
                 aov_tag,
-                self.fps.round() as u32,
+                preview_tag,
+                self.ui_fps.round() as u32,
+                self.rt_fps,
                 self.rt_ms
             )
         };
@@ -1149,7 +1154,7 @@ impl UiContext<'_> {
         self.cam_driver.controller_mut().set_pose(pose);
         self.cam_driver.controller_mut().set_orbit_distance(dist);
         *self.cam_pose = self.cam_driver.controller().pose();
-        *self.cam_snap_requested = true;
+        self.bus.emit_ui(UiCommand::SnapCamera);
     }
 
     fn ui_render_floor(&mut self, ui: &mut Ui) {
@@ -1348,7 +1353,10 @@ impl UiContext<'_> {
             });
         }
         if request_auto_frame {
-            *self.scene_auto_frame_requested = true;
+            self.bus.emit_ui(UiCommand::SelectScene {
+                scene_idx: self.settings.csg_mode,
+                variant_idx: self.settings.csg_asset_idx,
+            });
         }
         if let Some((eye, tgt)) = pending_cam {
             self.aim_camera(eye, tgt);
@@ -1992,7 +2000,7 @@ impl UiContext<'_> {
                         .on_hover_text("Clear accumulated samples and restart rendering cleanly from frame 1.")
                         .clicked()
                     {
-                        *self.reset_accum_requested = true;
+                        self.bus.emit_ui(UiCommand::ResetAccum);
                     }
                 }
                 1 => {
@@ -2009,7 +2017,7 @@ impl UiContext<'_> {
                         .on_hover_text(tip)
                         .clicked()
                     {
-                        *self.save_png_requested = true;
+                        self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
                     }
                 }
                 2 => {
@@ -2026,7 +2034,7 @@ impl UiContext<'_> {
                         .on_hover_text(tip)
                         .clicked()
                     {
-                        *self.save_jpeg_requested = true;
+                        self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Jpeg));
                     }
                 }
                 _ => {
@@ -2089,7 +2097,7 @@ impl UiContext<'_> {
                         .on_hover_text(rec_tip)
                         .clicked()
                     {
-                        *self.toggle_record_requested = true;
+                        self.bus.emit_ui(UiCommand::ToggleRecord);
                     }
                 }
             });
@@ -2217,7 +2225,7 @@ impl UiContext<'_> {
                 .on_hover_text("Recompile raytracer.cu from disk on the fly without restarting the app.")
                 .clicked()
             {
-                *self.reload_shader_requested = true;
+                self.bus.emit_ui(UiCommand::ReloadShader);
             }
             if let Some(msg) = self.last_saved_msg {
                 ui.label(
@@ -2493,15 +2501,17 @@ impl UiContext<'_> {
             );
         }
         if request_blend {
-            *self.rail_blend_requested = true;
+            self.bus.emit_ui(UiCommand::BlendRail);
         }
         if request_gen_rail {
-            *self.generate_random_rail_requested = true;
+            self.bus.emit_ui(UiCommand::GenerateRandomRail {
+                seed: *self.rail_random_seed,
+            });
         }
         if let Some(pose) = snap_pose {
             self.cam_driver.controller_mut().set_pose(pose);
             *self.cam_pose = pose;
-            *self.cam_snap_requested = true;
+            self.bus.emit_ui(UiCommand::SnapCamera);
         }
 
         collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", true, |ui| {
@@ -2511,10 +2521,16 @@ impl UiContext<'_> {
                 "Resolution",
                 &format!("{} x {}", self.render_w, self.render_h),
             );
+            stat_row(ui, "UI FPS", &format!("{:.0} FPS", self.ui_fps));
             stat_row(
                 ui,
-                "GUI / RT",
-                &format!("{:.0} FPS / {:.1} ms", self.fps, self.rt_ms),
+                "RT FPS",
+                &format!(
+                    "{:.1} FPS ({:.1} ms{})",
+                    self.rt_fps,
+                    self.rt_ms,
+                    if self.fast_preview { " fast" } else { "" }
+                ),
             );
             stat_row(
                 ui,

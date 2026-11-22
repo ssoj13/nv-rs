@@ -1,13 +1,13 @@
-//! Asynchronous OptiX path-tracing worker thread communicating with the 60 FPS GUI via channels.
+//! Asynchronous OptiX path-tracing worker thread communicating with the 60+ FPS GUI via `appbus`.
 
 use std::collections::VecDeque;
 use std::ffi::{CString, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use appbus::downcast_event;
 use bytemuck::{Pod, Zeroable};
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
@@ -20,7 +20,8 @@ use optix::{
     micro_to_base_bary,
 };
 
-use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, SceneLoadedMetadata, csg_flags};
+use crate::app_events::{AppBus, RenderControl, RenderEvent, fast_preview_budget};
+use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 
@@ -533,7 +534,7 @@ impl Default for DemoSettings {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CameraFrame {
     pub eye: [f32; 3],
     pub fwd: [f32; 3],
@@ -551,49 +552,7 @@ pub struct DlssRrBufferPtrs {
     pub normal_rough: [u64; 2],
 }
 
-pub enum RenderCmd {
-    Update {
-        settings: Box<DemoSettings>,
-        camera: CameraFrame,
-        reset_accum: bool,
-    },
-    Resize {
-        width: u32,
-        height: u32,
-        buf_ptrs: [u64; 2],
-        depth_ptrs: [u64; 2],
-        motion_ptrs: [u64; 2],
-        hdr_ptrs: Option<[u64; 2]>,
-        rr_ptrs: Option<DlssRrBufferPtrs>,
-        gen_id: u64,
-    },
-    ReturnBuffer {
-        buf_idx: usize,
-        gen_id: u64,
-    },
-    SaveJpeg {
-        path: PathBuf,
-        quality: u8,
-    },
-    SetRecording {
-        active: bool,
-        fixed_fps: u32,
-        shutter_subframes: u32,
-    },
-    RenderShutterSubframe {
-        settings: Box<DemoSettings>,
-        camera: CameraFrame,
-        sim_dt: f32,
-        sub_idx: u32,
-        sub_count: u32,
-    },
-    GenerateRandomRail {
-        seed: u64,
-    },
-    ReloadShader,
-    Shutdown,
-}
-
+#[derive(Clone, Debug)]
 pub struct FrameReady {
     pub buf_idx: usize,
     pub gen_id: u64,
@@ -606,9 +565,7 @@ pub struct FrameReady {
     pub tonemap_ms: f32,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
-    pub scene_meta: Option<SceneLoadedMetadata>,
-    pub generated_rail: Option<csg_scene::RailSpec>,
-    pub status_msg: Option<String>,
+    pub fast_preview: bool,
 }
 
 struct TonemapKernel {
@@ -1595,19 +1552,25 @@ pub fn spawn_render_thread(
     initial_buf_ptrs: [u64; 2],
     initial_depth_ptrs: [u64; 2],
     initial_motion_ptrs: [u64; 2],
-    initial_settings: DemoSettings,
-    initial_camera: CameraFrame,
-) -> (Sender<RenderCmd>, Receiver<FrameReady>, JoinHandle<()>) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<RenderCmd>();
-    let (frame_tx, frame_rx) = mpsc::channel::<FrameReady>();
-
-    let handle = thread::Builder::new()
+    bus: AppBus,
+) -> JoinHandle<()> {
+    thread::Builder::new()
         .name("optix-render".to_string())
         .spawn(move || {
             crate::nvtx::name_current_thread(c"optix-render");
             cuda.bind_to_thread()
                 .expect("cuda bind_to_thread on render thread");
-            let mut rig = init_optix(&cuda, &initial_settings);
+            let init_snap = bus.state.load();
+            let mut last_state_rev = bus.state.revision();
+            let mut last_reset_seq = init_snap.reset_seq;
+            let mut interacting_until = init_snap.interacting_until;
+            let mut settings = init_snap.settings;
+            let mut camera = init_snap.camera;
+            let mut prev_camera = camera;
+            let mut rig = init_optix(&cuda, &settings);
+            if let Some(meta) = rig.csg_host.take_loaded_metadata() {
+                bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
+            }
             let mut cur_w = DEFAULT_W;
             let mut cur_h = DEFAULT_H;
             let mut cur_gen: u64 = 0;
@@ -1617,14 +1580,12 @@ pub fn spawn_render_thread(
             let mut hdr_ptrs: Option<[u64; 2]> = None;
             let mut rr_ptrs: Option<DlssRrBufferPtrs> = None;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
-            let mut settings = initial_settings;
-            let mut camera = initial_camera;
-            let mut prev_camera = initial_camera;
             let mut accum_count: u32 = 0;
             let mut frame_index: u32 = 0;
             let mut spin_angle: f32 = 0.0;
             let mut sat_angle: f32 = 0.0;
             let mut traffic_time: f32 = 0.0;
+            let mut fast_preview_reduced = false;
             let mut last_ias_state = (
                 settings.sat_on,
                 settings.glass_analytic,
@@ -1659,75 +1620,17 @@ pub fn spawn_render_thread(
             let mut rec_shutter_subframes: u32 = 1;
             let mut shutter_queue: VecDeque<(Box<DemoSettings>, CameraFrame, f32, u32, u32)> =
                 VecDeque::with_capacity(8);
-            let mut pending_generated_rail: Option<csg_scene::RailSpec> = None;
-            let mut pending_status: Option<String> = None;
+            let mut cmd_scratch: Vec<appbus::BoxedEvent> = Vec::with_capacity(32);
 
             loop {
                 let mut should_exit = false;
-                let apply_cmd = |cmd: RenderCmd,
-                                 rig: &mut OptixRig,
-                                 cur_w: &mut u32,
-                                 cur_h: &mut u32,
-                                 cur_gen: &mut u64,
-                                 buf_ptrs: &mut [u64; 2],
-                                 depth_ptrs: &mut [u64; 2],
-                                 motion_ptrs: &mut [u64; 2],
-                                 hdr_ptrs: &mut Option<[u64; 2]>,
-                                 rr_ptrs: &mut Option<DlssRrBufferPtrs>,
-                                 free_bufs: &mut VecDeque<usize>,
-                                 settings: &mut DemoSettings,
-                                 camera: &mut CameraFrame,
-                                 accum_count: &mut u32,
-                                 pending_jpeg: &mut Option<(PathBuf, u8)>,
-                                 rec_active: &mut bool,
-                                 rec_fixed_fps: &mut u32,
-                                 rec_shutter_subframes: &mut u32,
-                                 shutter_queue: &mut VecDeque<(
-                                     Box<DemoSettings>,
-                                     CameraFrame,
-                                     f32,
-                                     u32,
-                                     u32,
-                                 )>,
-                                 pending_generated_rail: &mut Option<csg_scene::RailSpec>,
-                                 pending_status: &mut Option<String>|
-                 -> bool {
+                bus.poll_render_controls(&mut cmd_scratch);
+                for boxed in &cmd_scratch {
+                    let Some(cmd) = downcast_event::<RenderControl>(boxed) else {
+                        continue;
+                    };
                     match cmd {
-                        RenderCmd::Update {
-                            settings: s,
-                            camera: c,
-                            reset_accum,
-                        } => {
-                            let mut tmp = *s;
-                            tmp.exposure = settings.exposure;
-                            tmp.split_on = settings.split_on;
-                            tmp.split_x = settings.split_x;
-                            tmp.right_is_aov = settings.right_is_aov;
-                            tmp.bloom_on = settings.bloom_on;
-                            tmp.bloom_threshold = settings.bloom_threshold;
-                            tmp.bloom_intensity = settings.bloom_intensity;
-                            tmp.bloom_blades = settings.bloom_blades;
-                            tmp.dlss_sharpness = settings.dlss_sharpness;
-                            tmp.hdr_display = settings.hdr_display;
-                            tmp.record_video_mode = settings.record_video_mode;
-                            tmp.record_fixed_fps = settings.record_fixed_fps;
-                            tmp.capture_source = settings.capture_source;
-                            tmp.cam_smooth_tau = settings.cam_smooth_tau;
-                            tmp.time_scale = settings.time_scale;
-                            tmp.record_shutter_subframes = settings.record_shutter_subframes;
-                            if s.aov_mode < 3 && settings.aov_mode < 3 {
-                                tmp.aov_mode = settings.aov_mode;
-                            }
-                            let only_non_accum = tmp == *settings && c == *camera;
-                            if reset_accum || (!only_non_accum && (*s != *settings || c != *camera))
-                            {
-                                *accum_count = 0;
-                            }
-                            *settings = *s;
-                            *camera = c;
-                            false
-                        }
-                        RenderCmd::Resize {
+                        RenderControl::Resize {
                             width,
                             height,
                             buf_ptrs: new_ptrs,
@@ -1737,75 +1640,79 @@ pub fn spawn_render_thread(
                             rr_ptrs: new_rr_ptrs,
                             gen_id,
                         } => {
-                            if width != *cur_w || height != *cur_h {
-                                resize_rig(rig, width, height, settings.temporal_denoise);
-                                *cur_w = width;
-                                *cur_h = height;
+                            if *width != cur_w || *height != cur_h {
+                                resize_rig(&mut rig, *width, *height, settings.temporal_denoise);
+                                cur_w = *width;
+                                cur_h = *height;
                             }
-                            *buf_ptrs = new_ptrs;
-                            *depth_ptrs = new_depth_ptrs;
-                            *motion_ptrs = new_motion_ptrs;
-                            *hdr_ptrs = new_hdr_ptrs;
-                            *rr_ptrs = new_rr_ptrs;
-                            *cur_gen = gen_id;
+                            buf_ptrs = *new_ptrs;
+                            depth_ptrs = *new_depth_ptrs;
+                            motion_ptrs = *new_motion_ptrs;
+                            hdr_ptrs = *new_hdr_ptrs;
+                            rr_ptrs = *new_rr_ptrs;
+                            cur_gen = *gen_id;
                             free_bufs.clear();
                             free_bufs.push_back(0);
                             free_bufs.push_back(1);
                             shutter_queue.clear();
-                            *accum_count = 0;
-                            false
+                            accum_count = 0;
+                            fast_preview_reduced = false;
                         }
-                        RenderCmd::ReturnBuffer { buf_idx, gen_id } => {
-                            if gen_id == *cur_gen && !free_bufs.contains(&buf_idx) {
-                                free_bufs.push_back(buf_idx);
+                        RenderControl::ReturnBuffer { buf_idx, gen_id } => {
+                            if *gen_id == cur_gen && !free_bufs.contains(buf_idx) {
+                                free_bufs.push_back(*buf_idx);
                             }
-                            false
                         }
-                        RenderCmd::SaveJpeg { path, quality } => {
-                            *pending_jpeg = Some((path, quality));
-                            *accum_count = (*accum_count).min(settings.max_accum.saturating_sub(1));
-                            false
+                        RenderControl::SaveJpeg { path, quality } => {
+                            pending_jpeg = Some((path.clone(), *quality));
+                            accum_count = accum_count.min(settings.max_accum.saturating_sub(1));
                         }
-                        RenderCmd::SetRecording {
+                        RenderControl::SetRecording {
                             active,
                             fixed_fps,
                             shutter_subframes,
                         } => {
-                            *rec_active = active;
-                            *rec_fixed_fps = fixed_fps;
-                            *rec_shutter_subframes = if active && fixed_fps > 0 {
-                                shutter_subframes.max(1)
+                            rec_active = *active;
+                            rec_fixed_fps = *fixed_fps;
+                            rec_shutter_subframes = if *active && *fixed_fps > 0 {
+                                (*shutter_subframes).max(1)
                             } else {
                                 1
                             };
-                            if !active || *rec_shutter_subframes <= 1 {
+                            if !*active || rec_shutter_subframes <= 1 {
                                 shutter_queue.clear();
                             }
-                            false
                         }
-                        RenderCmd::RenderShutterSubframe {
+                        RenderControl::RenderShutterSubframe {
                             settings: s,
                             camera: c,
                             sim_dt,
                             sub_idx,
                             sub_count,
                         } => {
-                            shutter_queue.push_back((s, c, sim_dt, sub_idx, sub_count.max(1)));
-                            false
+                            shutter_queue.push_back((
+                                s.clone(),
+                                *c,
+                                *sim_dt,
+                                *sub_idx,
+                                (*sub_count).max(1),
+                            ));
                         }
-                        RenderCmd::GenerateRandomRail { seed } => {
-                            match rig.csg_host.generate_random_rail(seed) {
+                        RenderControl::GenerateRandomRail { seed } => {
+                            match rig.csg_host.generate_random_rail(*seed) {
                                 Ok(rail) => {
-                                    *pending_status = Some(format!("Generated rail: {}", rail.label));
-                                    *pending_generated_rail = Some(rail);
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Generated rail: {}",
+                                        rail.label
+                                    )));
+                                    bus.emit_render_event(RenderEvent::RailGenerated(rail));
                                 }
                                 Err(e) => {
-                                    *pending_status = Some(e);
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
                                 }
                             }
-                            false
                         }
-                        RenderCmd::ReloadShader => {
+                        RenderControl::ReloadShader => {
                             let disk_path = PathBuf::from("crates/nv-demo/shaders/raytracer.cu");
                             let res = std::fs::read_to_string(&disk_path)
                                 .map_err(|e| format!("Read {}: {e}", disk_path.display()))
@@ -1818,52 +1725,79 @@ pub fn spawn_render_thread(
                                     let _ = rig.stream.synchronize();
                                     rig.pipeline = pipeline;
                                     rig.sbt = sbt;
-                                    *accum_count = 0;
-                                    *pending_status = Some("Shader hot-reloaded".to_string());
+                                    accum_count = 0;
+                                    fast_preview_reduced = false;
+                                    bus.emit_render_event(RenderEvent::StatusMessage(
+                                        "Shader hot-reloaded".to_string(),
+                                    ));
                                 }
                                 Err(e) => {
-                                    *pending_status = Some(format!("Hot-reload failed: {e}"));
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Hot-reload failed: {e}"
+                                    )));
                                 }
                             }
-                            false
                         }
-                        RenderCmd::Shutdown => true,
-                    }
-                };
-
-                while let Ok(cmd) = cmd_rx.try_recv() {
-                    if apply_cmd(
-                        cmd,
-                        &mut rig,
-                        &mut cur_w,
-                        &mut cur_h,
-                        &mut cur_gen,
-                        &mut buf_ptrs,
-                        &mut depth_ptrs,
-                        &mut motion_ptrs,
-                        &mut hdr_ptrs,
-                        &mut rr_ptrs,
-                        &mut free_bufs,
-                        &mut settings,
-                        &mut camera,
-                        &mut accum_count,
-                        &mut pending_jpeg,
-                        &mut rec_active,
-                        &mut rec_fixed_fps,
-                        &mut rec_shutter_subframes,
-                        &mut shutter_queue,
-                        &mut pending_generated_rail,
-                        &mut pending_status,
-                    ) {
-                        should_exit = true;
-                        break;
+                        RenderControl::Shutdown => {
+                            should_exit = true;
+                            break;
+                        }
                     }
                 }
                 if should_exit {
                     break;
                 }
 
+                // Consume latest coalesced UI state snapshot (zero stale-frame queue buildup).
+                let cur_state_rev = bus.state.revision();
+                if cur_state_rev != last_state_rev {
+                    let snap = bus.state.load();
+                    last_state_rev = cur_state_rev;
+                    let s = snap.settings;
+                    let c = snap.camera;
+                    let reset_accum = snap.reset_seq != last_reset_seq;
+                    last_reset_seq = snap.reset_seq;
+
+                    let mut tmp = s;
+                    tmp.exposure = settings.exposure;
+                    tmp.split_on = settings.split_on;
+                    tmp.split_x = settings.split_x;
+                    tmp.right_is_aov = settings.right_is_aov;
+                    tmp.bloom_on = settings.bloom_on;
+                    tmp.bloom_threshold = settings.bloom_threshold;
+                    tmp.bloom_intensity = settings.bloom_intensity;
+                    tmp.bloom_blades = settings.bloom_blades;
+                    tmp.dlss_sharpness = settings.dlss_sharpness;
+                    tmp.hdr_display = settings.hdr_display;
+                    tmp.record_video_mode = settings.record_video_mode;
+                    tmp.record_fixed_fps = settings.record_fixed_fps;
+                    tmp.capture_source = settings.capture_source;
+                    tmp.cam_smooth_tau = settings.cam_smooth_tau;
+                    tmp.time_scale = settings.time_scale;
+                    tmp.record_shutter_subframes = settings.record_shutter_subframes;
+                    if s.aov_mode < 3 && settings.aov_mode < 3 {
+                        tmp.aov_mode = settings.aov_mode;
+                    }
+                    let only_non_accum = tmp == settings && c == camera;
+                    if reset_accum || (!only_non_accum && (s != settings || c != camera)) {
+                        accum_count = 0;
+                        interacting_until = snap.interacting_until;
+                    }
+                    settings = s;
+                    camera = c;
+                }
+
                 let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
+                let now_preview = Instant::now();
+                let fast_preview = !rec_active
+                    && !in_shutter_mode
+                    && interacting_until.is_some_and(|until| now_preview < until);
+                if !fast_preview && fast_preview_reduced {
+                    // Interaction settle window expired — restart clean full-quality accumulation.
+                    accum_count = 0;
+                    fast_preview_reduced = false;
+                }
+
                 let shutter_waiting = in_shutter_mode
                     && (shutter_queue.is_empty()
                         || (shutter_queue
@@ -1871,50 +1805,28 @@ pub fn spawn_render_thread(
                             .is_some_and(|&(_, _, _, idx, cnt)| idx + 1 >= cnt)
                             && free_bufs.is_empty()));
 
-                let csg_traffic_moving =
-                    rig.csg_host.has_traffic() && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
+                let csg_traffic_moving = rig.csg_host.has_traffic()
+                    && settings.csg_traffic_on
+                    && settings.csg_traffic_speed > 0.001;
                 let converged = !in_shutter_mode
                     && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
                     && !csg_traffic_moving
                     && !rec_active
                     && pending_jpeg.is_none()
-                    && pending_generated_rail.is_none()
                     && !rig.csg_host.has_pending_metadata()
-                    && pending_status.is_none()
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
 
                 if shutter_waiting || converged || (!in_shutter_mode && free_bufs.is_empty()) {
-                    match cmd_rx.recv() {
-                        Ok(cmd) => {
-                            if apply_cmd(
-                                cmd,
-                                &mut rig,
-                                &mut cur_w,
-                                &mut cur_h,
-                                &mut cur_gen,
-                                &mut buf_ptrs,
-                                &mut depth_ptrs,
-                                &mut motion_ptrs,
-                                &mut hdr_ptrs,
-                                &mut rr_ptrs,
-                                &mut free_bufs,
-                                &mut settings,
-                                &mut camera,
-                                &mut accum_count,
-                                &mut pending_jpeg,
-                                &mut rec_active,
-                                &mut rec_fixed_fps,
-                                &mut rec_shutter_subframes,
-                                &mut shutter_queue,
-                                &mut pending_generated_rail,
-                                &mut pending_status,
-                            ) {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                    if let Some(until) = interacting_until.filter(|_| fast_preview && !shutter_waiting)
+                    {
+                        let rem = until
+                            .saturating_duration_since(now_preview)
+                            .max(Duration::from_millis(1));
+                        bus.render_wake.wait_timeout(rem);
+                    } else {
+                        bus.render_wake.wait();
                     }
                     continue;
                 }
@@ -1994,10 +1906,15 @@ pub fn spawn_render_thread(
                 ) {
                     Ok(dirty) => dirty,
                     Err(e) => {
-                        pending_status = Some(format!("CSG sync error: {e}"));
+                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                            "CSG sync error: {e}"
+                        )));
                         false
                     }
                 };
+                if let Some(meta) = rig.csg_host.take_loaded_metadata() {
+                    bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
+                }
 
                 if !settings.glass_analytic
                     && (settings.sat_u_segs, settings.sat_v_segs) != rig.glass_mesh_segs
@@ -2184,6 +2101,15 @@ pub fn spawn_render_thread(
                     }
                 }
 
+                let (launch_spp, launch_bounces) =
+                    fast_preview_budget(settings.spp, settings.bounces, fast_preview);
+                let frame_is_fast_preview = fast_preview
+                    && (launch_spp < settings.spp.max(1)
+                        || launch_bounces < settings.bounces.clamp(1, 16));
+                if frame_is_fast_preview {
+                    fast_preview_reduced = true;
+                }
+
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
@@ -2192,7 +2118,7 @@ pub fn spawn_render_thread(
                     width: cur_w,
                     height: cur_h,
                     frame_index,
-                    spp: settings.spp,
+                    spp: launch_spp,
                     cam_pos: [
                         camera.eye[0],
                         camera.eye[1],
@@ -2238,7 +2164,7 @@ pub fn spawn_render_thread(
                     time: spin_angle,
                     enable_shadows: u32::from(settings.shadows_on),
                     fractal_kind: settings.fractal_kind,
-                    bounces: settings.bounces,
+                    bounces: launch_bounces,
                     floor_params: [
                         settings.floor_roughness,
                         settings.floor_scratch,
@@ -2582,9 +2508,9 @@ pub fn spawn_render_thread(
                         if depth_res != cu::cudaError_enum_CUDA_SUCCESS
                             || motion_res != cu::cudaError_enum_CUDA_SUCCESS
                         {
-                            pending_status = Some(format!(
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
                                 "DLSS guide copy failed (depth={depth_res:?}, motion={motion_res:?})"
-                            ));
+                            )));
                         }
                     }
                     if rr_export
@@ -2629,8 +2555,9 @@ pub fn spawn_render_thread(
                             )
                         };
                         if pack_res != cu::cudaError_enum_CUDA_SUCCESS {
-                            pending_status =
-                                Some(format!("DLSS-RR AOV pack kernel failed ({pack_res:?})"));
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "DLSS-RR AOV pack kernel failed ({pack_res:?})"
+                            )));
                         }
                     }
                     rig.stream.synchronize().expect("tonemap sync");
@@ -2638,51 +2565,41 @@ pub fn spawn_render_thread(
                 };
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
-                    pending_status = Some(
-                        match save_jpeg_from_rgba8(
-                            &cuda,
-                            &rig.stream,
-                            buf_ptrs[buf_idx],
-                            cur_w,
-                            cur_h,
-                            &jpeg_path,
-                            quality,
-                        ) {
-                            Ok(()) => format!("Saved {}", jpeg_path.display()),
-                            Err(e) => format!("JPEG failed: {e}"),
-                        },
-                    );
+                    let msg = match save_jpeg_from_rgba8(
+                        &cuda,
+                        &rig.stream,
+                        buf_ptrs[buf_idx],
+                        cur_w,
+                        cur_h,
+                        &jpeg_path,
+                        quality,
+                    ) {
+                        Ok(()) => format!("Saved {}", jpeg_path.display()),
+                        Err(e) => format!("JPEG failed: {e}"),
+                    };
+                    bus.emit_render_event(RenderEvent::StatusMessage(msg));
                 }
 
                 accum_count = accum_count.saturating_add(1);
                 frame_index = frame_index.wrapping_add(1);
 
-                if frame_tx
-                    .send(FrameReady {
-                        buf_idx,
-                        gen_id: cur_gen,
-                        accum_count,
-                        total_samples: accum_count.saturating_mul(settings.spp),
-                        jitter,
-                        rt_ms,
-                        denoise_ms,
-                        bloom_ms,
-                        tonemap_ms,
-                        ser_supported: rig.ser_supported,
-                        csg_stats: rig.csg_host.stats(),
-                        scene_meta: rig.csg_host.take_loaded_metadata(),
-                        generated_rail: pending_generated_rail.take(),
-                        status_msg: pending_status.take(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                bus.emit_render_event(RenderEvent::FrameReady(FrameReady {
+                    buf_idx,
+                    gen_id: cur_gen,
+                    accum_count,
+                    total_samples: accum_count.saturating_mul(launch_spp),
+                    jitter,
+                    rt_ms,
+                    denoise_ms,
+                    bloom_ms,
+                    tonemap_ms,
+                    ser_supported: rig.ser_supported,
+                    csg_stats: rig.csg_host.stats(),
+                    fast_preview: frame_is_fast_preview,
+                }));
             }
         })
-        .expect("spawn optix-render thread");
-
-    (cmd_tx, frame_rx, handle)
+        .expect("spawn optix-render thread")
 }
 
 #[cfg(test)]

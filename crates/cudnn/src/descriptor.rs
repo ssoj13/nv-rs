@@ -104,6 +104,31 @@ impl ConvFwdAlgo {
             }
         }
     }
+
+    /// Converts from the underlying `cudnnConvolutionFwdAlgo_t`.
+    pub const fn from_sys(raw: sys::cudnnConvolutionFwdAlgo_t) -> Option<Self> {
+        match raw {
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM => {
+                Some(Self::ImplicitGemm)
+            }
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM => {
+                Some(Self::ImplicitPrecompGemm)
+            }
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_GEMM => Some(Self::Gemm),
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_DIRECT => Some(Self::Direct),
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_FFT => Some(Self::Fft),
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING => {
+                Some(Self::FftTiling)
+            }
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD => {
+                Some(Self::Winograd)
+            }
+            sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED => {
+                Some(Self::WinogradNonfused)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Backward-data convolution algorithm (`cudnnConvolutionBwdDataAlgo_t`).
@@ -139,6 +164,25 @@ impl ConvBwdDataAlgo {
             Self::WinogradNonfused => {
                 sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED
             }
+        }
+    }
+
+    /// Converts from the underlying `cudnnConvolutionBwdDataAlgo_t`.
+    pub const fn from_sys(raw: sys::cudnnConvolutionBwdDataAlgo_t) -> Option<Self> {
+        match raw {
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_0 => Some(Self::Algo0),
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 => Some(Self::Algo1),
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT => Some(Self::Fft),
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING => {
+                Some(Self::FftTiling)
+            }
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD => {
+                Some(Self::Winograd)
+            }
+            sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED => {
+                Some(Self::WinogradNonfused)
+            }
+            _ => None,
         }
     }
 }
@@ -179,6 +223,34 @@ impl ConvBwdFilterAlgo {
             Self::FftTiling => {
                 sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING
             }
+        }
+    }
+
+    /// Converts from the underlying `cudnnConvolutionBwdFilterAlgo_t`.
+    pub const fn from_sys(raw: sys::cudnnConvolutionBwdFilterAlgo_t) -> Option<Self> {
+        match raw {
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0 => {
+                Some(Self::Algo0)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1 => {
+                Some(Self::Algo1)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT => {
+                Some(Self::Fft)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3 => {
+                Some(Self::Algo3)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD => {
+                Some(Self::Winograd)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED => {
+                Some(Self::WinogradNonfused)
+            }
+            sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING => {
+                Some(Self::FftTiling)
+            }
+            _ => None,
         }
     }
 }

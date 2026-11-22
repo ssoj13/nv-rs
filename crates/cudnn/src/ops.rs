@@ -707,6 +707,207 @@ pub unsafe fn conv_backward_filter_raw(
 /// [`Handle::set_stream`] or [`Handle::set_raw_stream`]), using pre-queried workspace memory
 /// `(ws_ptr, ws_bytes)`. Performs zero descriptor creation, zero workspace queries, and zero host
 /// synchronization.
+/// Benchmarks all supported cuDNN forward convolution algorithms on the handle's currently bound
+/// raw stream (`cudnnFindConvolutionForwardAlgorithmEx`) and returns the fastest `(algo, ws_bytes)`
+/// fitting within `ws_bytes`. Note: `y_ptr` is overwritten during benchmarking.
+///
+/// # Safety
+/// `x_ptr`, `w_ptr`, `y_ptr`, and `ws_ptr` (when `ws_bytes > 0`) must be valid device pointers
+/// belonging to `handle.context()`, spanning at least their descriptor byte sizes, and the caller
+/// must have bound the active stream via [`Handle::set_raw_stream`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct wrapper over cudnnFindConvolutionForwardAlgorithmEx on a bound stream"
+)]
+pub unsafe fn find_conv_forward_algo_ex_on_bound_stream(
+    handle: &Handle,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    y_desc: &TensorDescriptor,
+    y_ptr: cuda_bindings::CUdeviceptr,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    deterministic: bool,
+) -> Result<Option<(ConvFwdAlgo, usize)>> {
+    const MAX_ALGOS: usize = 8;
+    // SAFETY: `cudnnConvolutionFwdAlgoPerf_t` is a plain C struct of POD scalars/enums.
+    let mut results: [sys::cudnnConvolutionFwdAlgoPerf_t; MAX_ALGOS] =
+        unsafe { std::mem::zeroed() };
+    let mut returned: std::os::raw::c_int = 0;
+    // SAFETY: caller upholds device pointer validity and bound-stream contract.
+    let status = unsafe {
+        sys::cudnnFindConvolutionForwardAlgorithmEx(
+            handle.as_raw(),
+            x_desc.as_raw(),
+            x_ptr as *const std::ffi::c_void,
+            w_desc.as_raw(),
+            w_ptr as *const std::ffi::c_void,
+            conv_desc.as_raw(),
+            y_desc.as_raw(),
+            y_ptr as *mut std::ffi::c_void,
+            MAX_ALGOS as std::os::raw::c_int,
+            &mut returned,
+            results.as_mut_ptr(),
+            ws_ptr as *mut std::ffi::c_void,
+            ws_bytes,
+        )
+    };
+    check("cudnnFindConvolutionForwardAlgorithmEx", status)?;
+    let n = (returned.max(0) as usize).min(MAX_ALGOS);
+    let mut best: Option<(ConvFwdAlgo, usize, f32)> = None;
+    for r in &results[..n] {
+        if r.status != sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS || r.memory > ws_bytes {
+            continue;
+        }
+        if deterministic && r.determinism != sys::cudnnDeterminism_t_CUDNN_DETERMINISTIC {
+            continue;
+        }
+        let Some(algo) = ConvFwdAlgo::from_sys(r.algo) else {
+            continue;
+        };
+        if r.time >= 0.0 && best.is_none_or(|(_, _, bt)| r.time < bt) {
+            best = Some((algo, r.memory, r.time));
+        }
+    }
+    Ok(best.map(|(a, m, _)| (a, m)))
+}
+
+/// Benchmarks all supported cuDNN backward-data convolution algorithms on the handle's currently
+/// bound raw stream (`cudnnFindConvolutionBackwardDataAlgorithmEx`) and returns the fastest
+/// `(algo, ws_bytes)` fitting within `ws_bytes`. Note: `dx_ptr` is overwritten during benchmarking.
+///
+/// # Safety
+/// Same device pointer and bound-stream requirements as [`find_conv_forward_algo_ex_on_bound_stream`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct wrapper over cudnnFindConvolutionBackwardDataAlgorithmEx on a bound stream"
+)]
+pub unsafe fn find_conv_backward_data_algo_ex_on_bound_stream(
+    handle: &Handle,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    dx_desc: &TensorDescriptor,
+    dx_ptr: cuda_bindings::CUdeviceptr,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    deterministic: bool,
+) -> Result<Option<(ConvBwdDataAlgo, usize)>> {
+    const MAX_ALGOS: usize = 6;
+    // SAFETY: `cudnnConvolutionBwdDataAlgoPerf_t` is a plain C struct of POD scalars/enums.
+    let mut results: [sys::cudnnConvolutionBwdDataAlgoPerf_t; MAX_ALGOS] =
+        unsafe { std::mem::zeroed() };
+    let mut returned: std::os::raw::c_int = 0;
+    // SAFETY: caller upholds device pointer validity and bound-stream contract.
+    let status = unsafe {
+        sys::cudnnFindConvolutionBackwardDataAlgorithmEx(
+            handle.as_raw(),
+            w_desc.as_raw(),
+            w_ptr as *const std::ffi::c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const std::ffi::c_void,
+            conv_desc.as_raw(),
+            dx_desc.as_raw(),
+            dx_ptr as *mut std::ffi::c_void,
+            MAX_ALGOS as std::os::raw::c_int,
+            &mut returned,
+            results.as_mut_ptr(),
+            ws_ptr as *mut std::ffi::c_void,
+            ws_bytes,
+        )
+    };
+    check("cudnnFindConvolutionBackwardDataAlgorithmEx", status)?;
+    let n = (returned.max(0) as usize).min(MAX_ALGOS);
+    let mut best: Option<(ConvBwdDataAlgo, usize, f32)> = None;
+    for r in &results[..n] {
+        if r.status != sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS || r.memory > ws_bytes {
+            continue;
+        }
+        if deterministic && r.determinism != sys::cudnnDeterminism_t_CUDNN_DETERMINISTIC {
+            continue;
+        }
+        let Some(algo) = ConvBwdDataAlgo::from_sys(r.algo) else {
+            continue;
+        };
+        if r.time >= 0.0 && best.is_none_or(|(_, _, bt)| r.time < bt) {
+            best = Some((algo, r.memory, r.time));
+        }
+    }
+    Ok(best.map(|(a, m, _)| (a, m)))
+}
+
+/// Benchmarks all supported cuDNN backward-filter convolution algorithms on the handle's currently
+/// bound raw stream (`cudnnFindConvolutionBackwardFilterAlgorithmEx`) and returns the fastest
+/// `(algo, ws_bytes)` fitting within `ws_bytes`. Note: `dw_ptr` is overwritten during benchmarking.
+///
+/// # Safety
+/// Same device pointer and bound-stream requirements as [`find_conv_forward_algo_ex_on_bound_stream`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct wrapper over cudnnFindConvolutionBackwardFilterAlgorithmEx on a bound stream"
+)]
+pub unsafe fn find_conv_backward_filter_algo_ex_on_bound_stream(
+    handle: &Handle,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    dw_desc: &FilterDescriptor,
+    dw_ptr: cuda_bindings::CUdeviceptr,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    deterministic: bool,
+) -> Result<Option<(ConvBwdFilterAlgo, usize)>> {
+    const MAX_ALGOS: usize = 7;
+    // SAFETY: `cudnnConvolutionBwdFilterAlgoPerf_t` is a plain C struct of POD scalars/enums.
+    let mut results: [sys::cudnnConvolutionBwdFilterAlgoPerf_t; MAX_ALGOS] =
+        unsafe { std::mem::zeroed() };
+    let mut returned: std::os::raw::c_int = 0;
+    // SAFETY: caller upholds device pointer validity and bound-stream contract.
+    let status = unsafe {
+        sys::cudnnFindConvolutionBackwardFilterAlgorithmEx(
+            handle.as_raw(),
+            x_desc.as_raw(),
+            x_ptr as *const std::ffi::c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const std::ffi::c_void,
+            conv_desc.as_raw(),
+            dw_desc.as_raw(),
+            dw_ptr as *mut std::ffi::c_void,
+            MAX_ALGOS as std::os::raw::c_int,
+            &mut returned,
+            results.as_mut_ptr(),
+            ws_ptr as *mut std::ffi::c_void,
+            ws_bytes,
+        )
+    };
+    check("cudnnFindConvolutionBackwardFilterAlgorithmEx", status)?;
+    let n = (returned.max(0) as usize).min(MAX_ALGOS);
+    let mut best: Option<(ConvBwdFilterAlgo, usize, f32)> = None;
+    for r in &results[..n] {
+        if r.status != sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS || r.memory > ws_bytes {
+            continue;
+        }
+        if deterministic && r.determinism != sys::cudnnDeterminism_t_CUDNN_DETERMINISTIC {
+            continue;
+        }
+        let Some(algo) = ConvBwdFilterAlgo::from_sys(r.algo) else {
+            continue;
+        };
+        if r.time >= 0.0 && best.is_none_or(|(_, _, bt)| r.time < bt) {
+            best = Some((algo, r.memory, r.time));
+        }
+    }
+    Ok(best.map(|(a, m, _)| (a, m)))
+}
+
+/// Launches `cudnnConvolutionForward` on the handle's currently bound raw stream.
 ///
 /// # Safety
 /// - `x_ptr`, `w_ptr`, `y_ptr`, and (when `ws_bytes > 0`) `ws_ptr` must be valid device allocations

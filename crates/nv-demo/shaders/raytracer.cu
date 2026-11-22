@@ -1142,6 +1142,8 @@ static __forceinline__ __device__ CsgGpuMaterial load_csg_material(unsigned int 
 
 static __forceinline__ __device__ void eval_csg_procedural(
     const CsgGpuMaterial& mat,
+    unsigned int mat_id,
+    unsigned int sem_id,
     float3 hit_pos,
     float3& n,
     float3& base_col,
@@ -1166,25 +1168,32 @@ static __forceinline__ __device__ void eval_csg_procedural(
     switch (mat.procedural_kind) {
         case CSG_PROC_ASPHALT: {
             float grain = value_noise2(hit_pos.x * 22.0f, hit_pos.z * 22.0f);
+            float fine_chip = value_noise2(hit_pos.x * 68.0f + 5.7f, hit_pos.z * 68.0f - 2.3f);
             float coarse = fbm2(hit_pos.x * 0.45f, hit_pos.z * 0.45f);
-            // Subtle longitudinal tire wear polish along highway Z lanes
-            float lane_wear = 0.5f + 0.5f * cosf(hit_pos.x * 1.75f);
+            // Dual-wheel tire-track wear darkening & slight rubber polish along lanes.
+            float wheel_pair = 0.5f + 0.5f * cosf(hit_pos.x * 3.4f);
+            float lane_band = 0.5f + 0.5f * cosf(hit_pos.x * 1.70f);
+            float tire_wear = lane_band * (0.45f + 0.55f * wheel_pair);
             float tar_crack = sky_smoothstep(0.76f, 0.84f, fbm2(hit_pos.x * 0.25f + 7.1f, hit_pos.z * 0.25f - 3.4f));
-            float shade = (0.82f + 0.28f * grain) * (0.88f + 0.22f * coarse) * (1.0f - 0.18f * lane_wear);
-            base_col = f3_mul(base_col, shade * (1.0f - 0.35f * tar_crack));
-            rough = fmaxf(0.04f, fminf(0.95f, rough + (grain - 0.5f) * 0.16f - 0.08f * lane_wear));
+            float agg = 0.78f + 0.22f * grain + 0.14f * fine_chip;
+            float shade = agg * (0.86f + 0.24f * coarse) * (1.0f - 0.20f * tire_wear);
+            base_col = f3_mul(base_col, shade * (1.0f - 0.38f * tar_crack));
+            rough = fmaxf(0.04f, fminf(0.95f, rough + (grain - 0.5f) * 0.16f + (fine_chip - 0.5f) * 0.08f - 0.10f * tire_wear));
+            float puddle = 0.0f;
             if (wet > 0.01f) {
                 float p_noise = fbm2(hit_pos.x * 0.14f + 2.3f, hit_pos.z * 0.14f - 5.1f);
-                float puddle = sky_smoothstep(0.68f - 0.52f * wet, 0.84f - 0.44f * wet, p_noise) * wet;
+                puddle = sky_smoothstep(0.68f - 0.52f * wet, 0.84f - 0.44f * wet, p_noise) * wet;
                 float damp = wet * (0.45f + 0.55f * puddle);
                 base_col = f3_mul(base_col, 1.0f - 0.52f * damp);
                 rough = rough * (1.0f - 0.85f * puddle) + 0.035f * puddle;
                 clearcoat = fmaxf(clearcoat, 0.25f * wet + 0.70f * puddle);
                 cc_rough = 0.03f + 0.08f * (1.0f - puddle);
-                // Micro aggregate bump suppressed inside flat mirror puddles
-                float bump_k = 0.035f * (1.0f - puddle);
-                float gx = value_noise2((hit_pos.x + 0.02f) * 18.0f, hit_pos.z * 18.0f) - grain;
-                float gz = value_noise2(hit_pos.x * 18.0f, (hit_pos.z + 0.02f) * 18.0f) - grain;
+            }
+            // Tactile asphalt aggregate micro-normal relief (suppressed inside flat mirror puddles).
+            float bump_k = 0.034f * (1.0f - puddle);
+            if (bump_k > 0.002f) {
+                float gx = value_noise2((hit_pos.x + 0.018f) * 24.0f, hit_pos.z * 24.0f) - grain;
+                float gz = value_noise2(hit_pos.x * 24.0f, (hit_pos.z + 0.018f) * 24.0f) - grain;
                 n = f3_norm(make_float3(n.x - gx * bump_k, n.y, n.z - gz * bump_k));
             }
             break;
@@ -1206,22 +1215,79 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_CONCRETE: {
+            float lum = base_col.x * 0.3f + base_col.y * 0.59f + base_col.z * 0.11f;
+            // Crushed gravel / rail ballast / tank dike aggregate (`COASTAL_ROCK = 38` or dark berms).
+            if (mat_id == 38u || (sem_id == 17u && lum < 0.32f)) {
+                float u = (fabsf(n.y) > 0.45f) ? hit_pos.x : (hit_pos.x + hit_pos.z);
+                float v = (fabsf(n.y) > 0.45f) ? hit_pos.z : hit_pos.y;
+                float clump = fbm2(u * 1.1f + 3.1f, v * 1.1f - 2.4f);
+                float stone_m = value_noise2(u * 16.0f, v * 16.0f);
+                float stone_f = value_noise2(u * 44.0f + 11.3f, v * 44.0f - 7.9f);
+                float speck = value_noise2(u * 96.0f - 4.2f, v * 96.0f + 8.6f);
+                // Multi-octave angular stone contrast (basalt darks + crushed granite flecks).
+                float rock_tone = (0.68f + 0.34f * clump) * (0.76f + 0.34f * stone_m) * (0.86f + 0.26f * stone_f);
+                float granite_fleck = sky_smoothstep(0.74f, 0.90f, speck);
+                float3 stone_col = f3_mul(base_col, rock_tone);
+                base_col = f3_add(stone_col, make_float3(0.10f * granite_fleck, 0.095f * granite_fleck, 0.09f * granite_fleck));
+                rough = fmaxf(0.80f, fminf(0.96f, 0.88f + (0.5f - stone_m) * 0.14f));
+                // Micro-normal perturbation for faceted gravel / ballast relief.
+                float eps_g = 0.022f;
+                float gx = value_noise2((u + eps_g) * 28.0f, v * 28.0f) - value_noise2((u - eps_g) * 28.0f, v * 28.0f);
+                float gz = value_noise2(u * 28.0f, (v + eps_g) * 28.0f) - value_noise2(u * 28.0f, (v - eps_g) * 28.0f);
+                if (fabsf(n.y) > 0.45f) {
+                    n = f3_norm(make_float3(n.x - gx * 0.22f, n.y, n.z - gz * 0.22f));
+                } else {
+                    float horiz = sqrtf(n.x * n.x + n.z * n.z);
+                    float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
+                    float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
+                    n = f3_norm(make_float3(n.x - tx * gx * 0.18f, n.y - gz * 0.18f, n.z - tz * gx * 0.18f));
+                }
+                if (wet > 0.05f) {
+                    base_col = f3_mul(base_col, 1.0f - 0.28f * wet);
+                    rough = fmaxf(0.42f, rough - 0.24f * wet);
+                }
+                break;
+            }
+
             float horiz = sqrtf(n.x * n.x + n.z * n.z);
             float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
             float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
-            float sx = (fabsf(n.y) > 0.5f) ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz);
-            float sy = (fabsf(n.y) > 0.5f) ? hit_pos.z : hit_pos.y;
+            bool is_horiz = fabsf(n.y) > 0.5f;
+            float sx = is_horiz ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz);
+            float sy = is_horiz ? hit_pos.z : hit_pos.y;
             float grime = fbm2(sx * 0.35f + 4.1f, sy * 0.25f - 1.9f);
-            float micro = value_noise2(sx * 11.0f, sy * 11.0f);
+            float micro = value_noise2(sx * 14.0f, sy * 14.0f);
+            float fine = value_noise2(sx * 46.0f + 2.1f, sy * 46.0f - 3.7f);
             float vein = fbm2(sx * 1.4f + sy * 0.4f, sy * 2.8f - sx * 0.3f);
-            float jx = fabsf(fmodf(fabsf(sx), 3.0f) - 1.5f);
-            float jy = fabsf(fmodf(fabsf(sy), 3.0f) - 1.5f);
-            float seam = (jx > 1.47f || jy > 1.47f) ? 0.80f : 1.0f;
+            // Expansion-joint slab grid: 2.5 m horizontal pavement slabs / 3.0x2.4 m architectural formwork.
+            float pitch_x = is_horiz ? 2.5f : 3.0f;
+            float pitch_y = is_horiz ? 2.5f : 2.4f;
+            float cell_x = floorf(sx / pitch_x);
+            float cell_y = floorf(sy / pitch_y);
+            float fx = (sx / pitch_x) - cell_x;
+            float fy = (sy / pitch_y) - cell_y;
+            float slab_hash = hash21(cell_x, cell_y);
+            bool in_joint = (fx < 0.014f || fx > 0.986f || fy < 0.014f || fy > 0.986f);
+            float seam = in_joint ? 0.68f : (0.95f + 0.10f * slab_hash);
             // Light travertine/Marina stucco keeps crisp veining; dark concrete gains weathering.
-            float lum = base_col.x * 0.3f + base_col.y * 0.59f + base_col.z * 0.11f;
             float grime_amp = (lum > 0.55f) ? 0.14f : 0.28f;
-            base_col = f3_mul(base_col, ((1.0f - 0.5f * grime_amp) + grime_amp * grime) * (0.91f + 0.15f * micro) * (0.95f + 0.10f * vein) * seam);
-            if (wet > 0.05f && fabsf(n.y) > 0.5f) {
+            base_col = f3_mul(
+                base_col,
+                ((1.0f - 0.5f * grime_amp) + grime_amp * grime)
+                    * (0.90f + 0.12f * micro + 0.06f * fine)
+                    * (0.95f + 0.10f * vein)
+                    * seam
+            );
+            rough = fmaxf(0.18f, fminf(0.96f, rough + (0.5f - micro) * 0.10f + (in_joint ? 0.12f : 0.0f)));
+            // Subtle expansion-joint bevel normal on horizontal concrete slabs.
+            if (is_horiz && !in_joint) {
+                float bx = (fx < 0.032f) ? -1.0f : ((fx > 0.968f) ? 1.0f : 0.0f);
+                float bz = (fy < 0.032f) ? -1.0f : ((fy > 0.968f) ? 1.0f : 0.0f);
+                if (bx != 0.0f || bz != 0.0f) {
+                    n = f3_norm(make_float3(n.x + bx * 0.05f, n.y, n.z + bz * 0.05f));
+                }
+            }
+            if (wet > 0.05f && is_horiz) {
                 float wmask = sky_smoothstep(0.42f, 0.72f, grime) * wet;
                 base_col = f3_mul(base_col, 1.0f - 0.30f * wmask);
                 rough = fmaxf(0.12f, rough * (1.0f - 0.55f * wmask));
@@ -1322,11 +1388,58 @@ static __forceinline__ __device__ void eval_csg_procedural(
         }
         case CSG_PROC_METAL: {
             float horiz = sqrtf(n.x * n.x + n.z * n.z);
-            float u = (horiz > 1e-4f) ? ((-hit_pos.x * n.z + hit_pos.z * n.x) / horiz) : hit_pos.x;
+            float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
+            float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
+            float u = (horiz > 1e-4f) ? (hit_pos.x * tx + hit_pos.z * tz) : hit_pos.x;
             float patina = fbm2(u * 0.65f, hit_pos.y * 0.45f + hit_pos.z * 0.15f);
             float brush = value_noise2(hit_pos.y * 16.0f, u * 3.0f);
-            base_col = f3_mul(base_col, 0.85f + 0.24f * patina);
-            rough = fmaxf(0.06f, fminf(0.88f, rough + (0.5f - brush) * 0.14f));
+
+            if (sem_id == 14u) {
+                // Storage tank welded steel plate courses (2.4 m height x 6.0 m staggered plates) + vertical weathering.
+                if (fabsf(n.y) < 0.65f) {
+                    float course = hit_pos.y * (1.0f / 2.4f);
+                    float row_idx = floorf(course);
+                    float fy = course - row_idx;
+                    float stagger = 0.5f * fmodf(fabsf(row_idx), 2.0f);
+                    float col_u = u * (1.0f / 6.0f) + stagger;
+                    float col_idx = floorf(col_u);
+                    float fx = col_u - col_idx;
+                    bool h_weld = (fy < 0.022f || fy > 0.978f);
+                    bool v_weld = (fx < 0.010f || fx > 0.990f);
+                    float plate_var = 0.94f + 0.11f * hash21(col_idx, row_idx);
+                    float streak = fbm2(u * 0.72f + 1.9f, hit_pos.y * 0.09f);
+                    float lower_dust = 0.90f + 0.10f * sky_smoothstep(0.0f, 4.5f, hit_pos.y);
+                    float weld_k = (h_weld || v_weld) ? 0.76f : 1.0f;
+                    base_col = f3_mul(base_col, plate_var * (0.89f + 0.20f * streak) * lower_dust * weld_k);
+                    rough = fmaxf(0.12f, fminf(0.92f, rough + (0.5f - streak) * 0.14f + (h_weld ? 0.12f : 0.0f)));
+                    if (h_weld) {
+                        float wy = (fy < 0.022f) ? -0.09f : 0.09f;
+                        n = f3_norm(make_float3(n.x, n.y + wy, n.z));
+                    }
+                } else {
+                    float rx = fabsf(fmodf(fabsf(hit_pos.x), 3.0f) - 1.5f);
+                    float rz = fabsf(fmodf(fabsf(hit_pos.z), 6.0f) - 3.0f);
+                    float roof_seam = (rx > 1.46f || rz > 2.95f) ? 0.80f : 1.0f;
+                    base_col = f3_mul(base_col, (0.86f + 0.22f * patina) * roof_seam);
+                    rough = fmaxf(0.22f, fminf(0.90f, rough + (0.5f - brush) * 0.12f));
+                }
+            } else if ((sem_id == 4u || sem_id == 12u) && fabsf(n.y) < 0.45f) {
+                // Corrugated industrial steel cladding (vertical ribs + metallic specular variation).
+                float phase = u * 25.132741f; // 4 ribs/m
+                float rib = sinf(phase);
+                float rib_d = cosf(phase);
+                float panel_u = fabsf(fmodf(fabsf(u), 1.2f) - 0.6f);
+                float panel_seam = (panel_u > 0.585f) ? 0.76f : 1.0f;
+                float girt_y = fabsf(fmodf(fabsf(hit_pos.y), 3.2f) - 1.6f);
+                float girt_seam = (girt_y > 1.56f) ? 0.86f : 1.0f;
+                float rib_shade = 0.88f + 0.16f * rib;
+                base_col = f3_mul(base_col, (0.86f + 0.22f * patina) * rib_shade * panel_seam * girt_seam);
+                rough = fmaxf(0.10f, fminf(0.88f, rough + (0.5f - rib * 0.5f) * 0.10f + (0.5f - brush) * 0.08f));
+                n = f3_norm(make_float3(n.x + tx * rib_d * 0.14f, n.y, n.z + tz * rib_d * 0.14f));
+            } else {
+                base_col = f3_mul(base_col, 0.85f + 0.24f * patina);
+                rough = fmaxf(0.06f, fminf(0.88f, rough + (0.5f - brush) * 0.14f));
+            }
             break;
         }
         case CSG_PROC_GLASS: {
@@ -1365,9 +1478,32 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_SAND: {
-            float ripple = sinf(hit_pos.x * 3.5f + fbm2(hit_pos.x * 0.4f, hit_pos.z * 0.4f) * 2.5f);
-            float grit = value_noise2(hit_pos.x * 32.0f, hit_pos.z * 32.0f);
-            base_col = f3_mul(base_col, (0.90f + 0.10f * ripple) * (0.92f + 0.16f * grit));
+            // Wind-aligned coastal dune sand micro-ripples + warm beach/dune albedo variation.
+            const float wx_dir = 0.88f;
+            const float wz_dir = 0.475f;
+            float wind_u = hit_pos.x * wx_dir + hit_pos.z * wz_dir;
+            float wind_v = -hit_pos.x * wz_dir + hit_pos.z * wx_dir;
+            float warp = fbm2(wind_u * 0.35f + 1.4f, wind_v * 0.22f - 2.1f);
+            float phase = wind_u * 5.2f + warp * 3.2f;
+            float ripple = sinf(phase);
+            float ripple_d = cosf(phase);
+            float macro_dune = fbm2(hit_pos.x * 0.045f - 3.2f, hit_pos.z * 0.045f + 5.7f);
+            float grit = value_noise2(hit_pos.x * 36.0f, hit_pos.z * 36.0f);
+            float sparkle = sky_smoothstep(0.86f, 0.96f, value_noise2(hit_pos.x * 78.0f + 4.1f, hit_pos.z * 78.0f - 1.7f));
+            // Subtle darker damp foreshore near sea level (`y < 0.8 m`) vs warm dry upper dunes.
+            float foreshore = 1.0f - sky_smoothstep(0.0f, 0.85f, hit_pos.y);
+            float3 dune_tint = make_float3(
+                0.96f + 0.09f * macro_dune,
+                0.94f + 0.07f * macro_dune,
+                0.90f + 0.04f * macro_dune
+            );
+            float shade = (0.91f + 0.09f * ripple) * (0.92f + 0.14f * grit) * (1.0f - 0.28f * foreshore);
+            base_col = f3_mul(f3_mul3(base_col, dune_tint), shade);
+            rough = fmaxf(0.32f, fminf(0.95f, rough - 0.22f * foreshore - 0.16f * sparkle));
+            if (fabsf(n.y) > 0.35f) {
+                float slope = ripple_d * 0.11f * (1.0f - 0.5f * foreshore);
+                n = f3_norm(make_float3(n.x - wx_dir * slope, n.y, n.z - wz_dir * slope));
+            }
             break;
         }
         default:
@@ -1757,13 +1893,14 @@ extern "C" __global__ void __raygen__render() {
 
             if (is_csg) {
                 unsigned int mat_id = p5 & 0xFFFFu;
+                unsigned int sem_id = (p5 >> 16u) & 0xFFFFu;
                 CsgGpuMaterial cmat = load_csg_material(mat_id);
                 float rough = 0.5f;
                 float metallic = 0.0f;
                 float clearcoat = 0.0f;
                 float cc_rough = 0.08f;
                 float3 emission = make_float3(0.0f, 0.0f, 0.0f);
-                eval_csg_procedural(cmat, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
+                eval_csg_procedural(cmat, mat_id, sem_id, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
 
                 // Emissive contribution (streetlights, vehicle headlights/taillights, signals, aviation beacons, lit windows)
                 float max_em = fmaxf(emission.x, fmaxf(emission.y, emission.z));

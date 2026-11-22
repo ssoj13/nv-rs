@@ -17,6 +17,7 @@ pub struct Handle {
     raw: sys::cudnnHandle_t,
     ctx: Arc<Context>,
     stream: Option<Arc<Stream>>,
+    raw_stream: *mut std::ffi::c_void,
 }
 
 // SAFETY: `Handle` exposes mutation only via `&mut self` (and is `!Sync`), guaranteeing exclusive
@@ -37,6 +38,7 @@ impl Handle {
             raw,
             ctx: ctx.clone(),
             stream: None,
+            raw_stream: ptr::null_mut(),
         })
     }
 
@@ -63,6 +65,28 @@ impl Handle {
         let status = unsafe { sys::cudnnSetStream(self.raw, stream.cu_stream()) };
         check("cudnnSetStream", status)?;
         self.stream = Some(stream.clone());
+        self.raw_stream = stream.cu_stream().cast();
+        Ok(())
+    }
+
+    /// Binds an external raw `CUstream` (e.g. owned by CubeCL) to this cuDNN handle, skipping the
+    /// `cudnnSetStream` FFI call when the exact same stream pointer is already bound.
+    ///
+    /// # Safety
+    /// `raw_stream` must be a valid `CUstream` belonging to `self.context()` and must outlive all
+    /// cuDNN work enqueued on this handle until another stream is bound.
+    pub unsafe fn set_raw_stream(&mut self, raw_stream: cuda_bindings::CUstream) -> Result<()> {
+        self.ctx.bind_to_thread()?;
+        let raw_void = raw_stream.cast::<std::ffi::c_void>();
+        if self.raw_stream == raw_void && !raw_void.is_null() {
+            return Ok(());
+        }
+        // SAFETY: `self.raw` is a live cuDNN handle and caller guarantees `raw_stream` is valid on
+        // `self.ctx`.
+        let status = unsafe { sys::cudnnSetStream(self.raw, raw_stream) };
+        check("cudnnSetStream", status)?;
+        self.stream = None;
+        self.raw_stream = raw_void;
         Ok(())
     }
 

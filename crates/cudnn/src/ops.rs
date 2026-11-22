@@ -703,6 +703,155 @@ pub unsafe fn conv_backward_filter_raw(
     check("cudnnConvolutionBackwardFilter", status)
 }
 
+/// Zero-overhead forward convolution on the stream already bound to `handle` (via
+/// [`Handle::set_stream`] or [`Handle::set_raw_stream`]), using pre-queried workspace memory
+/// `(ws_ptr, ws_bytes)`. Performs zero descriptor creation, zero workspace queries, and zero host
+/// synchronization.
+///
+/// # Safety
+/// - `x_ptr`, `w_ptr`, `y_ptr`, and (when `ws_bytes > 0`) `ws_ptr` must be valid device allocations
+///   in `handle.context()` spanning at least their descriptor/workspace byte sizes.
+/// - All buffers must remain alive until the bound CUDA stream completes; `y_ptr` must not alias
+///   `x_ptr`, `w_ptr`, or `ws_ptr`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct zero-overhead wrapper over cudnnConvolutionForward on a bound stream"
+)]
+pub unsafe fn conv_forward_on_bound_stream(
+    handle: &mut Handle,
+    alpha: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvFwdAlgo,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    beta: f64,
+    y_desc: &TensorDescriptor,
+    y_ptr: cuda_bindings::CUdeviceptr,
+) -> Result<()> {
+    let scale = ScalePair::new(y_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
+    // workspace capacity.
+    let status = unsafe {
+        sys::cudnnConvolutionForward(
+            handle.as_raw(),
+            alpha_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            w_desc.as_raw(),
+            w_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            y_desc.as_raw(),
+            y_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionForward", status)
+}
+
+/// Zero-overhead backward-data convolution on the stream already bound to `handle`.
+///
+/// # Safety
+/// Same pointer validity, non-aliasing, workspace, and stream-lifetime obligations as
+/// [`conv_forward_on_bound_stream`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct zero-overhead wrapper over cudnnConvolutionBackwardData on a bound stream"
+)]
+pub unsafe fn conv_backward_data_on_bound_stream(
+    handle: &mut Handle,
+    alpha: f64,
+    w_desc: &FilterDescriptor,
+    w_ptr: cuda_bindings::CUdeviceptr,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdDataAlgo,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    beta: f64,
+    dx_desc: &TensorDescriptor,
+    dx_ptr: cuda_bindings::CUdeviceptr,
+) -> Result<()> {
+    let scale = ScalePair::new(dx_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
+    // workspace capacity.
+    let status = unsafe {
+        sys::cudnnConvolutionBackwardData(
+            handle.as_raw(),
+            alpha_ptr,
+            w_desc.as_raw(),
+            w_ptr as *const c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            dx_desc.as_raw(),
+            dx_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionBackwardData", status)
+}
+
+/// Zero-overhead backward-filter convolution on the stream already bound to `handle`.
+///
+/// # Safety
+/// Same pointer validity, non-aliasing, workspace, and stream-lifetime obligations as
+/// [`conv_forward_on_bound_stream`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct zero-overhead wrapper over cudnnConvolutionBackwardFilter on a bound stream"
+)]
+pub unsafe fn conv_backward_filter_on_bound_stream(
+    handle: &mut Handle,
+    alpha: f64,
+    x_desc: &TensorDescriptor,
+    x_ptr: cuda_bindings::CUdeviceptr,
+    dy_desc: &TensorDescriptor,
+    dy_ptr: cuda_bindings::CUdeviceptr,
+    conv_desc: &ConvolutionDescriptor,
+    algo: ConvBwdFilterAlgo,
+    ws_ptr: cuda_bindings::CUdeviceptr,
+    ws_bytes: usize,
+    beta: f64,
+    dw_desc: &FilterDescriptor,
+    dw_ptr: cuda_bindings::CUdeviceptr,
+) -> Result<()> {
+    let scale = ScalePair::new(dw_desc.data_type(), alpha, beta);
+    let (alpha_ptr, beta_ptr) = scale.ptrs();
+    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
+    // workspace capacity.
+    let status = unsafe {
+        sys::cudnnConvolutionBackwardFilter(
+            handle.as_raw(),
+            alpha_ptr,
+            x_desc.as_raw(),
+            x_ptr as *const c_void,
+            dy_desc.as_raw(),
+            dy_ptr as *const c_void,
+            conv_desc.as_raw(),
+            algo.to_sys(),
+            ws_ptr as *mut c_void,
+            ws_bytes,
+            beta_ptr,
+            dw_desc.as_raw(),
+            dw_ptr as *mut c_void,
+        )
+    };
+    check("cudnnConvolutionBackwardFilter", status)
+}
+
 /// Executes elementwise activation `y = alpha * act(x) + beta * y` on `stream`.
 #[expect(
     clippy::too_many_arguments,

@@ -530,6 +530,18 @@ pub fn drive(
     scene_radius: f32,
 ) -> DriverFrame {
     let dt = ui.input(|i| i.stable_dt);
+    drive_with_dt(ui, response, driver, scene_radius, dt)
+}
+
+/// Same as [`drive`], but advances `driver` using an explicit `dt` (for deterministic fixed-step
+/// video recording & global time-scale pacing).
+pub fn drive_with_dt(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    driver: &mut CameraDriver,
+    scene_radius: f32,
+    dt: f32,
+) -> DriverFrame {
     let raw = read_input(ui, response, dt);
     if raw.hovered {
         consume_wheel(ui.ctx());

@@ -20,6 +20,7 @@ use optix::{
     micro_to_base_bary,
 };
 
+use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 
@@ -96,9 +97,24 @@ struct LaunchParams {
     env_params: [f32; 8],
     out_diffuse_albedo_f32: u64,
     out_spec_albedo_f32: u64,
+    csg_compounds: u64,
+    csg_ops: u64,
+    csg_prims: u64,
+    csg_aux_planes: u64,
+    csg_guard_aabbs: u64,
+    csg_repeats: u64,
+    csg_materials: u64,
+    csg_instances: u64,
+    csg_instance_count: u32,
+    csg_material_count: u32,
+    csg_compound_count: u32,
+    csg_flags: u32,
+    csg_wetness: f32,
+    csg_traffic_time: f32,
+    _pad2: [u32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 480);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 576);
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -234,6 +250,19 @@ impl EnvSettings {
     }
 }
 
+/// Selects whether still captures (PNG/JPEG) and MP4 recordings capture only the 3D viewport
+/// or the entire application window (3D viewport + docked egui UI).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum CaptureSource {
+    /// Capture only the 3D rendered viewport (zero-copy CUDA/DLSS fast path).
+    #[default]
+    Viewport,
+    /// Capture the entire application window including docked egui UI panels and toolbar.
+    FullWindow,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DemoSettings {
@@ -351,8 +380,35 @@ pub struct DemoSettings {
     /// `0 = Match View`, `1 = SDR H.264`, `2 = PQ10 HDR10 HEVC`.
     pub record_video_mode: u32,
     pub record_fixed_fps: bool,
+    /// Capture target for PNG/JPEG stills and MP4 video recording.
+    pub capture_source: CaptureSource,
+    /// Cinematic gimbal camera smoothing time constant in seconds (`0.0` = instant/off).
+    pub cam_smooth_tau: f32,
+    /// Global simulation & animation time scale (`0.05..=2.0`, `1.0` = real-time).
+    pub time_scale: f32,
+    /// 180-degree shutter motion-blur subframe count in Smooth 60 recording (`1` = Off, `2`, `4`).
+    pub record_shutter_subframes: u32,
     // Per-environment procedural parameters (persisted in PersistedState)
     pub env: EnvSettings,
+    // Render-time analytical CSG backdrop (`csg-rs`)
+    /// `0 = Off (Classic)`, `1 = Asset Inspector`, `2 = Gundo (El Segundo Coastal Refinery & Highway)`.
+    pub csg_mode: u32,
+    /// Selected asset index into `csg_urban::InspectorAssetKind::ALL` (`csg_mode == 1`).
+    pub csg_asset_idx: u32,
+    /// Deterministic procedural seed for CSG scenes.
+    pub csg_seed: u32,
+    /// `0 = Day`, `1 = Sunset`, `2 = Night`.
+    pub csg_time_of_day: u32,
+    /// Coastal road & concrete wetness (`0.0..=1.0`).
+    pub csg_wetness: f32,
+    /// Animate highway traffic & spinning wheels in `Gundo`.
+    pub csg_traffic_on: bool,
+    /// Traffic simulation speed multiplier (`0.0..=3.0`).
+    pub csg_traffic_speed: f32,
+    /// Keep the classic foreground fractal & stage floor visible inside CSG modes.
+    pub csg_show_fractal: bool,
+    /// Distance/SSE LOD detail multiplier (`0.25..=4.0`).
+    pub csg_lod_bias: f32,
 }
 
 impl Default for DemoSettings {
@@ -459,7 +515,20 @@ impl Default for DemoSettings {
             hdr_display: false,
             record_video_mode: 0,
             record_fixed_fps: false,
+            capture_source: CaptureSource::Viewport,
+            cam_smooth_tau: 0.0,
+            time_scale: 1.0,
+            record_shutter_subframes: 1,
             env: EnvSettings::default(),
+            csg_mode: 0,
+            csg_asset_idx: 13,
+            csg_seed: 1337,
+            csg_time_of_day: 1,
+            csg_wetness: 0.38,
+            csg_traffic_on: true,
+            csg_traffic_speed: 1.0,
+            csg_show_fractal: false,
+            csg_lod_bias: 1.0,
         }
     }
 }
@@ -509,6 +578,14 @@ pub enum RenderCmd {
     SetRecording {
         active: bool,
         fixed_fps: u32,
+        shutter_subframes: u32,
+    },
+    RenderShutterSubframe {
+        settings: Box<DemoSettings>,
+        camera: CameraFrame,
+        sim_dt: f32,
+        sub_idx: u32,
+        sub_count: u32,
     },
     ReloadShader,
     Shutdown,
@@ -525,6 +602,7 @@ pub struct FrameReady {
     pub bloom_ms: f32,
     pub tonemap_ms: f32,
     pub ser_supported: bool,
+    pub csg_stats: CsgStats,
     pub status_msg: Option<String>,
 }
 
@@ -575,6 +653,8 @@ struct OptixRig {
     params_buf: DeviceBuffer<u8>,
     tonemap: TonemapKernel,
     bloom: Option<FftBloomPass>,
+    csg_host: CsgGpuHost,
+    ias_instances_scratch: Vec<Instance>,
 }
 
 fn find_optix_include() -> Option<String> {
@@ -628,6 +708,7 @@ fn try_compile_ptx(src: &str, name: &str, include_optix: bool) -> Result<Vec<u8>
         if let Some(p) = find_cuda_include() {
             opts = opts.include_dir(&p);
         }
+        opts = opts.include_dir(csg_device::csg_eval_cuh_dir());
     }
 
     let mut prog = nvrtc::Program::new(src, Some(name), &[])
@@ -650,7 +731,7 @@ fn build_optix_pipeline(
 ) -> Result<(Pipeline, ShaderBindingTable), String> {
     let mut opts = PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8)
         .map_err(|e| format!("PipelineOptions: {e}"))?;
-    opts.attribute_values = 4;
+    opts.attribute_values = 5;
     opts.primitive_types = 0; // custom AABB + triangles
     opts.opacity_micromaps = true;
     let (module, _) = Module::new(optix_ctx, &ModuleOptions::default(), &opts, rt_ptx)
@@ -696,6 +777,15 @@ fn build_optix_pipeline(
         },
     )
     .map_err(|e| format!("hit_omm: {e}"))?;
+    let hit_csg = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__csg")),
+            intersection: Some((&module, "__intersection__csg")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_csg: {e}"))?;
 
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
@@ -709,6 +799,7 @@ fn build_optix_pipeline(
             hit_fractal.clone(),
             hit_sphere.clone(),
             hit_omm.clone(),
+            hit_csg.clone(),
         ],
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
@@ -725,6 +816,7 @@ fn build_optix_pipeline(
             SbtRecord::new(&hit_fractal, 0u32).map_err(|e| format!("sbt hit1: {e}"))?,
             SbtRecord::new(&hit_sphere, 0u32).map_err(|e| format!("sbt hit2: {e}"))?,
             SbtRecord::new(&hit_omm, 0u32).map_err(|e| format!("sbt hit3: {e}"))?,
+            SbtRecord::new(&hit_csg, 0u32).map_err(|e| format!("sbt hit4: {e}"))?,
         ],
     )
     .map_err(|e| format!("SBT::new: {e}"))?;
@@ -1031,6 +1123,7 @@ struct SceneState {
     glass_analytic: bool,
     neon_on: bool,
     omm_mode: u32,
+    show_classic: bool,
 }
 
 fn splitmix32(mut x: u32) -> f32 {
@@ -1046,111 +1139,123 @@ fn build_ias(
     stream: &Arc<Stream>,
     scratch: &mut Scratch,
     gas: SceneGas<'_>,
+    csg_host: &CsgGpuHost,
+    instances: &mut Vec<Instance>,
     state: SceneState,
 ) -> Arc<Accel> {
-    let count = state.sat_count.min(24) as usize;
-    let mut instances = Vec::with_capacity(3 + count);
-    let mut i0 = Instance::new(gas.floor);
-    i0.id = 0;
-    i0.sbt_offset = 0;
-    instances.push(i0);
+    instances.clear();
+    if state.show_classic {
+        let count = state.sat_count.min(24) as usize;
+        let mut i0 = Instance::new(gas.floor);
+        i0.id = 0;
+        i0.sbt_offset = 0;
+        instances.push(i0);
 
-    let mut i1 = Instance::new(gas.fractal);
-    i1.id = 1;
-    i1.sbt_offset = 1;
-    instances.push(i1);
+        let mut i1 = Instance::new(gas.fractal);
+        i1.id = 1;
+        i1.sbt_offset = 1;
+        instances.push(i1);
 
-    if state.sat_on && count > 0 {
-        let (glass_gas, sbt_off) = if state.glass_analytic {
-            (gas.glass_analytic, 2)
-        } else {
-            (gas.glass_mesh, 0)
-        };
-        let s_min = state.sat_size_range[0]
-            .min(state.sat_size_range[1])
-            .max(0.001);
-        let s_max = state.sat_size_range[0]
-            .max(state.sat_size_range[1])
-            .max(0.001);
-        let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
-        let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
-        let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
-        let h_max = state.sat_height_range[0].max(state.sat_height_range[1]);
-        let v_min = state.sat_speed_range[0].min(state.sat_speed_range[1]);
-        let v_max = state.sat_speed_range[0].max(state.sat_speed_range[1]);
-        let a_min = state.sat_bob_amp_range[0].min(state.sat_bob_amp_range[1]);
-        let a_max = state.sat_bob_amp_range[0].max(state.sat_bob_amp_range[1]);
-        let f_min = state.sat_bob_freq_range[0].min(state.sat_bob_freq_range[1]);
-        let f_max = state.sat_bob_freq_range[0].max(state.sat_bob_freq_range[1]);
-        let hue_spread = state.sat_hue_spread.clamp(0.0, 1.0);
+        if state.sat_on && count > 0 {
+            let (glass_gas, sbt_off) = if state.glass_analytic {
+                (gas.glass_analytic, 2)
+            } else {
+                (gas.glass_mesh, 0)
+            };
+            let s_min = state.sat_size_range[0]
+                .min(state.sat_size_range[1])
+                .max(0.001);
+            let s_max = state.sat_size_range[0]
+                .max(state.sat_size_range[1])
+                .max(0.001);
+            let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
+            let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
+            let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
+            let h_max = state.sat_height_range[0].max(state.sat_height_range[1]);
+            let v_min = state.sat_speed_range[0].min(state.sat_speed_range[1]);
+            let v_max = state.sat_speed_range[0].max(state.sat_speed_range[1]);
+            let a_min = state.sat_bob_amp_range[0].min(state.sat_bob_amp_range[1]);
+            let a_max = state.sat_bob_amp_range[0].max(state.sat_bob_amp_range[1]);
+            let f_min = state.sat_bob_freq_range[0].min(state.sat_bob_freq_range[1]);
+            let f_max = state.sat_bob_freq_range[0].max(state.sat_bob_freq_range[1]);
+            let hue_spread = state.sat_hue_spread.clamp(0.0, 1.0);
 
-        for idx in 0..count {
-            let base = state
-                .sat_seed
-                .wrapping_mul(747_796_405)
-                .wrapping_add((idx as u32).wrapping_mul(2_891_336_453));
-            let u0 = splitmix32(base ^ 0x1111_1111);
-            let u1 = splitmix32(base ^ 0x2222_2222);
-            let u2 = splitmix32(base ^ 0x3333_3333);
-            let u3 = splitmix32(base ^ 0x4444_4444);
-            let u4 = splitmix32(base ^ 0x5555_5555);
-            let u5 = splitmix32(base ^ 0x6666_6666);
-            let u6 = splitmix32(base ^ 0x7777_7777);
-            let u7 = splitmix32(base ^ 0x8888_8888);
-            let u8 = splitmix32(base ^ 0x9999_9999);
+            for idx in 0..count {
+                let base = state
+                    .sat_seed
+                    .wrapping_mul(747_796_405)
+                    .wrapping_add((idx as u32).wrapping_mul(2_891_336_453));
+                let u0 = splitmix32(base ^ 0x1111_1111);
+                let u1 = splitmix32(base ^ 0x2222_2222);
+                let u2 = splitmix32(base ^ 0x3333_3333);
+                let u3 = splitmix32(base ^ 0x4444_4444);
+                let u4 = splitmix32(base ^ 0x5555_5555);
+                let u5 = splitmix32(base ^ 0x6666_6666);
+                let u6 = splitmix32(base ^ 0x7777_7777);
+                let u7 = splitmix32(base ^ 0x8888_8888);
+                let u8 = splitmix32(base ^ 0x9999_9999);
 
-            let r = s_min + (s_max - s_min) * u0;
-            // Stratify orbital radii across the band with seeded jitter so spheres stay spaced.
-            let t_orbit = (idx as f32 + 0.15 + 0.70 * u1) / (count as f32);
-            let orbit_r = o_min + (o_max - o_min) * t_orbit;
-            let height = h_min + (h_max - h_min) * u2;
-            let phase0 = u3 * std::f32::consts::TAU;
-            let speed = v_min + (v_max - v_min) * u4;
-            let angle = phase0 + state.sat_angle * speed;
-            let bob_amp = a_min + (a_max - a_min) * u5;
-            let bob_freq = f_min + (f_max - f_min) * u6;
-            let bob_phase = u7 * std::f32::consts::TAU;
-            let bob = (state.sat_angle * bob_freq + bob_phase).sin() * 0.7
-                + (state.sat_angle * bob_freq * 0.63 + bob_phase * 1.7).cos() * 0.3;
-            let px = orbit_r * angle.cos();
-            let py = height + bob_amp * bob;
-            let pz = orbit_r * angle.sin();
-            let hue = (0.48 + (u8 - 0.5) * hue_spread).rem_euclid(1.0);
-            let hue_byte = (hue * 255.0).round().clamp(0.0, 255.0) as u32;
+                let r = s_min + (s_max - s_min) * u0;
+                // Stratify orbital radii across the band with seeded jitter so spheres stay spaced.
+                let t_orbit = (idx as f32 + 0.15 + 0.70 * u1) / (count as f32);
+                let orbit_r = o_min + (o_max - o_min) * t_orbit;
+                let height = h_min + (h_max - h_min) * u2;
+                let phase0 = u3 * std::f32::consts::TAU;
+                let speed = v_min + (v_max - v_min) * u4;
+                let angle = phase0 + state.sat_angle * speed;
+                let bob_amp = a_min + (a_max - a_min) * u5;
+                let bob_freq = f_min + (f_max - f_min) * u6;
+                let bob_phase = u7 * std::f32::consts::TAU;
+                let bob = (state.sat_angle * bob_freq + bob_phase).sin() * 0.7
+                    + (state.sat_angle * bob_freq * 0.63 + bob_phase * 1.7).cos() * 0.3;
+                let px = orbit_r * angle.cos();
+                let py = height + bob_amp * bob;
+                let pz = orbit_r * angle.sin();
+                let hue = (0.48 + (u8 - 0.5) * hue_spread).rem_euclid(1.0);
+                let hue_byte = (hue * 255.0).round().clamp(0.0, 255.0) as u32;
 
-            let mut inst = Instance::new(glass_gas);
-            inst.id = 2 | (hue_byte << 8);
-            inst.sbt_offset = sbt_off;
-            inst.transform = [r, 0.0, 0.0, px, 0.0, r, 0.0, py, 0.0, 0.0, r, pz];
-            instances.push(inst);
+                let mut inst = Instance::new(glass_gas);
+                inst.id = 2 | (hue_byte << 8);
+                inst.sbt_offset = sbt_off;
+                inst.transform = [r, 0.0, 0.0, px, 0.0, r, 0.0, py, 0.0, 0.0, r, pz];
+                instances.push(inst);
+            }
+        }
+
+        if state.neon_on {
+            let mut i3 = Instance::new(gas.neon);
+            i3.id = 3;
+            i3.sbt_offset = 0;
+            i3.transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.24, 0.0, 0.0, 1.0, 0.0];
+            instances.push(i3);
+        }
+
+        if state.omm_mode == 1 || state.omm_mode == 2 {
+            let omm_accel = if state.omm_mode == 1 {
+                gas.omm
+            } else {
+                gas.omm_anyhit
+            };
+            let mut i4 = Instance::new(omm_accel);
+            i4.id = 4;
+            i4.sbt_offset = 3;
+            instances.push(i4);
         }
     }
 
-    if state.neon_on {
-        let mut i3 = Instance::new(gas.neon);
-        i3.id = 3;
-        i3.sbt_offset = 0;
-        i3.transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.24, 0.0, 0.0, 1.0, 0.0];
-        instances.push(i3);
-    }
+    csg_host.append_optix_instances(instances);
 
-    if state.omm_mode == 1 || state.omm_mode == 2 {
-        let omm_accel = if state.omm_mode == 1 {
-            gas.omm
-        } else {
-            gas.omm_anyhit
-        };
-        let mut i4 = Instance::new(omm_accel);
-        i4.id = 4;
-        i4.sbt_offset = 3;
-        instances.push(i4);
+    if instances.is_empty() {
+        let mut dummy = Instance::new(gas.floor);
+        dummy.mask = 0;
+        instances.push(dummy);
     }
 
     Accel::instances(
         optix_ctx,
         stream,
         scratch,
-        &instances,
+        instances,
         BuildOptions::default(),
     )
     .expect("IAS")
@@ -1315,6 +1420,30 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     // Perforated filigree halo GAS pair (hardware OMM vs pure Any-Hit benchmark)
     let (omm_gas, omm_anyhit_gas) = build_omm_gases(&optix_ctx, &stream, &mut scratch);
 
+    let mut csg_host = CsgGpuHost::new();
+    let initial_csg_key = CsgSceneKey {
+        mode: initial_settings.csg_mode,
+        asset_idx: initial_settings.csg_asset_idx,
+        seed: initial_settings.csg_seed,
+    };
+    if let Err(err) = csg_host.sync(
+        &optix_ctx,
+        &stream,
+        &mut scratch,
+        initial_csg_key,
+        initial_settings.csg_wetness,
+        initial_settings.csg_time_of_day,
+        [0.0, 2.0, -5.0],
+        DEFAULT_H,
+        std::f32::consts::FRAC_PI_3,
+        initial_settings.csg_lod_bias,
+        0.0,
+    ) {
+        eprintln!("nv-demo: initial CSG scene sync failed: {err}");
+    }
+    let mut ias_instances_scratch = Vec::with_capacity(4096);
+    let show_classic = initial_settings.csg_mode == 0 || initial_settings.csg_show_fractal;
+
     let ias = build_ias(
         &optix_ctx,
         &stream,
@@ -1328,6 +1457,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             omm: &omm_gas,
             omm_anyhit: &omm_anyhit_gas,
         },
+        &csg_host,
+        &mut ias_instances_scratch,
         SceneState {
             sat_angle: 0.0,
             sat_count: initial_settings.sat_count,
@@ -1358,6 +1489,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             glass_analytic: initial_settings.glass_analytic,
             neon_on: initial_settings.neon_on,
             omm_mode: initial_settings.omm_mode,
+            show_classic,
         },
     );
 
@@ -1415,6 +1547,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         params_buf,
         tonemap,
         bloom,
+        csg_host,
+        ias_instances_scratch,
     }
 }
 
@@ -1485,6 +1619,7 @@ pub fn spawn_render_thread(
             let mut frame_index: u32 = 0;
             let mut spin_angle: f32 = 0.0;
             let mut sat_angle: f32 = 0.0;
+            let mut traffic_time: f32 = 0.0;
             let mut last_ias_state = (
                 settings.sat_on,
                 settings.glass_analytic,
@@ -1494,6 +1629,7 @@ pub fn spawn_render_thread(
                 settings.sat_seed,
                 settings.neon_on,
                 settings.omm_mode,
+                settings.csg_mode == 0 || settings.csg_show_fractal,
                 [
                     settings.sat_size_min,
                     settings.sat_size_max,
@@ -1515,6 +1651,9 @@ pub fn spawn_render_thread(
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
             let mut rec_active = false;
             let mut rec_fixed_fps: u32 = 0;
+            let mut rec_shutter_subframes: u32 = 1;
+            let mut shutter_queue: VecDeque<(Box<DemoSettings>, CameraFrame, f32, u32, u32)> =
+                VecDeque::with_capacity(8);
             let mut pending_status: Option<String> = None;
 
             loop {
@@ -1536,6 +1675,14 @@ pub fn spawn_render_thread(
                                  pending_jpeg: &mut Option<(PathBuf, u8)>,
                                  rec_active: &mut bool,
                                  rec_fixed_fps: &mut u32,
+                                 rec_shutter_subframes: &mut u32,
+                                 shutter_queue: &mut VecDeque<(
+                                     Box<DemoSettings>,
+                                     CameraFrame,
+                                     f32,
+                                     u32,
+                                     u32,
+                                 )>,
                                  pending_status: &mut Option<String>|
                  -> bool {
                     match cmd {
@@ -1557,6 +1704,10 @@ pub fn spawn_render_thread(
                             tmp.hdr_display = settings.hdr_display;
                             tmp.record_video_mode = settings.record_video_mode;
                             tmp.record_fixed_fps = settings.record_fixed_fps;
+                            tmp.capture_source = settings.capture_source;
+                            tmp.cam_smooth_tau = settings.cam_smooth_tau;
+                            tmp.time_scale = settings.time_scale;
+                            tmp.record_shutter_subframes = settings.record_shutter_subframes;
                             if s.aov_mode < 3 && settings.aov_mode < 3 {
                                 tmp.aov_mode = settings.aov_mode;
                             }
@@ -1593,6 +1744,7 @@ pub fn spawn_render_thread(
                             free_bufs.clear();
                             free_bufs.push_back(0);
                             free_bufs.push_back(1);
+                            shutter_queue.clear();
                             *accum_count = 0;
                             false
                         }
@@ -1607,9 +1759,31 @@ pub fn spawn_render_thread(
                             *accum_count = (*accum_count).min(settings.max_accum.saturating_sub(1));
                             false
                         }
-                        RenderCmd::SetRecording { active, fixed_fps } => {
+                        RenderCmd::SetRecording {
+                            active,
+                            fixed_fps,
+                            shutter_subframes,
+                        } => {
                             *rec_active = active;
                             *rec_fixed_fps = fixed_fps;
+                            *rec_shutter_subframes = if active && fixed_fps > 0 {
+                                shutter_subframes.max(1)
+                            } else {
+                                1
+                            };
+                            if !active || *rec_shutter_subframes <= 1 {
+                                shutter_queue.clear();
+                            }
+                            false
+                        }
+                        RenderCmd::RenderShutterSubframe {
+                            settings: s,
+                            camera: c,
+                            sim_dt,
+                            sub_idx,
+                            sub_count,
+                        } => {
+                            shutter_queue.push_back((s, c, sim_dt, sub_idx, sub_count.max(1)));
                             false
                         }
                         RenderCmd::ReloadShader => {
@@ -1657,6 +1831,8 @@ pub fn spawn_render_thread(
                         &mut pending_jpeg,
                         &mut rec_active,
                         &mut rec_fixed_fps,
+                        &mut rec_shutter_subframes,
+                        &mut shutter_queue,
                         &mut pending_status,
                     ) {
                         should_exit = true;
@@ -1667,15 +1843,27 @@ pub fn spawn_render_thread(
                     break;
                 }
 
-                let converged = !settings.auto_rotate
+                let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
+                let shutter_waiting = in_shutter_mode
+                    && (shutter_queue.is_empty()
+                        || (shutter_queue
+                            .front()
+                            .is_some_and(|&(_, _, _, idx, cnt)| idx + 1 >= cnt)
+                            && free_bufs.is_empty()));
+
+                let csg_traffic_moving =
+                    settings.csg_mode == 2 && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
+                let converged = !in_shutter_mode
+                    && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
+                    && !csg_traffic_moving
                     && !rec_active
                     && pending_jpeg.is_none()
                     && pending_status.is_none()
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
 
-                if converged || free_bufs.is_empty() {
+                if shutter_waiting || converged || (!in_shutter_mode && free_bufs.is_empty()) {
                     match cmd_rx.recv() {
                         Ok(cmd) => {
                             if apply_cmd(
@@ -1696,6 +1884,8 @@ pub fn spawn_render_thread(
                                 &mut pending_jpeg,
                                 &mut rec_active,
                                 &mut rec_fixed_fps,
+                                &mut rec_shutter_subframes,
+                                &mut shutter_queue,
                                 &mut pending_status,
                             ) {
                                 break;
@@ -1706,25 +1896,85 @@ pub fn spawn_render_thread(
                     continue;
                 }
 
-                let Some(buf_idx) = free_bufs.pop_front() else {
-                    continue;
+                let (shutter_sub_idx, publish_frame, dt) = if in_shutter_mode {
+                    let Some((s, c, sim_dt, sub_idx, sub_count)) = shutter_queue.pop_front() else {
+                        continue;
+                    };
+                    settings = *s;
+                    camera = c;
+                    if sub_idx == 0 {
+                        accum_count = 0;
+                    }
+                    last_tick = Instant::now();
+                    (Some(sub_idx), sub_idx + 1 >= sub_count, sim_dt.max(0.0))
+                } else {
+                    let now = Instant::now();
+                    let base_dt = if rec_active && rec_fixed_fps > 0 {
+                        1.0 / rec_fixed_fps as f32
+                    } else {
+                        now.duration_since(last_tick).as_secs_f32().min(0.1)
+                    };
+                    last_tick = now;
+                    let scale = settings.time_scale.clamp(0.05, 2.0);
+                    (None, true, base_dt * scale)
                 };
 
-                let now = Instant::now();
-                let dt = if rec_active && rec_fixed_fps > 0 {
-                    1.0 / rec_fixed_fps as f32
+                let buf_idx = if publish_frame {
+                    let Some(idx) = free_bufs.pop_front() else {
+                        continue;
+                    };
+                    idx
                 } else {
-                    now.duration_since(last_tick).as_secs_f32().min(0.1)
+                    0
                 };
-                last_tick = now;
+
+                let preserve_shutter_accum = shutter_sub_idx.is_some_and(|idx| idx > 0);
+                let csg_traffic_moving =
+                    settings.csg_mode == 2 && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
                 if settings.auto_rotate {
                     spin_angle += dt * settings.spin_speed;
-                    accum_count = 0;
+                    if !preserve_shutter_accum {
+                        accum_count = 0;
+                    }
                 }
                 if settings.sat_on && settings.sat_orbit && settings.sat_count > 0 {
                     sat_angle += dt * settings.spin_speed;
-                    accum_count = 0;
+                    if !preserve_shutter_accum {
+                        accum_count = 0;
+                    }
                 }
+                if csg_traffic_moving {
+                    traffic_time += dt * settings.csg_traffic_speed;
+                    if !preserve_shutter_accum {
+                        accum_count = 0;
+                    }
+                }
+
+                let csg_key = CsgSceneKey {
+                    mode: settings.csg_mode,
+                    asset_idx: settings.csg_asset_idx,
+                    seed: settings.csg_seed,
+                };
+                let vfov_rad = 2.0 * camera.tan_half_fov.max(0.05).atan();
+                let csg_ias_dirty = match rig.csg_host.sync(
+                    &rig._optix_ctx,
+                    &rig.stream,
+                    &mut rig._scratch,
+                    csg_key,
+                    settings.csg_wetness,
+                    settings.csg_time_of_day,
+                    camera.eye,
+                    cur_h,
+                    vfov_rad,
+                    settings.csg_lod_bias,
+                    traffic_time,
+                ) {
+                    Ok(dirty) => dirty,
+                    Err(e) => {
+                        pending_status = Some(format!("CSG sync error: {e}"));
+                        false
+                    }
+                };
 
                 if !settings.glass_analytic
                     && (settings.sat_u_segs, settings.sat_v_segs) != rig.glass_mesh_segs
@@ -1738,6 +1988,7 @@ pub fn spawn_render_thread(
                     );
                     rig.glass_mesh_segs = (settings.sat_u_segs, settings.sat_v_segs);
                 }
+                let show_classic = settings.csg_mode == 0 || settings.csg_show_fractal;
                 let ias_state = (
                     settings.sat_on,
                     settings.glass_analytic,
@@ -1747,6 +1998,7 @@ pub fn spawn_render_thread(
                     settings.sat_seed,
                     settings.neon_on,
                     settings.omm_mode,
+                    show_classic,
                     [
                         settings.sat_size_min,
                         settings.sat_size_max,
@@ -1764,7 +2016,7 @@ pub fn spawn_render_thread(
                         sat_angle,
                     ],
                 );
-                if ias_state != last_ias_state {
+                if csg_ias_dirty || ias_state != last_ias_state {
                     rig.ias = build_ias(
                         &rig._optix_ctx,
                         &rig.stream,
@@ -1778,6 +2030,8 @@ pub fn spawn_render_thread(
                             omm: &rig.omm_gas,
                             omm_anyhit: &rig.omm_anyhit_gas,
                         },
+                        &rig.csg_host,
+                        &mut rig.ias_instances_scratch,
                         SceneState {
                             sat_angle,
                             sat_count: settings.sat_count,
@@ -1796,6 +2050,7 @@ pub fn spawn_render_thread(
                             glass_analytic: settings.glass_analytic,
                             neon_on: settings.neon_on,
                             omm_mode: settings.omm_mode,
+                            show_classic,
                         },
                     );
                     last_ias_state = ias_state;
@@ -1879,15 +2134,32 @@ pub fn spawn_render_thread(
                 let rr_export = settings.dlss_rr_on || rr_ptrs.is_some();
                 let dlss_any = settings.dlss_on || rr_export;
                 let jitter = if dlss_any {
-                    accum_count = 0;
+                    if !preserve_shutter_accum {
+                        accum_count = 0;
+                    }
                     let period = if rr_export { 64 } else { 16 };
+                    let jitter_idx = frame_index.saturating_sub(shutter_sub_idx.unwrap_or(0));
                     [
-                        halton((frame_index % period) + 1, 2) - 0.5,
-                        halton((frame_index % period) + 1, 3) - 0.5,
+                        halton((jitter_idx % period) + 1, 2) - 0.5,
+                        halton((jitter_idx % period) + 1, 3) - 0.5,
                     ]
                 } else {
                     [0.0, 0.0]
                 };
+
+                let csg_ptrs = rig.csg_host.device_pointers();
+                let mut csg_flag_bits = 0u32;
+                if rig.csg_host.is_active() {
+                    csg_flag_bits |= csg_flags::ENABLED;
+                    if settings.csg_time_of_day == 2 {
+                        csg_flag_bits |= csg_flags::NIGHT;
+                    } else if settings.csg_time_of_day == 1 {
+                        csg_flag_bits |= csg_flags::SUNSET;
+                    }
+                    if settings.csg_wetness > 0.05 {
+                        csg_flag_bits |= csg_flags::WET_ASPHALT;
+                    }
+                }
 
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
@@ -2007,8 +2279,25 @@ pub fn spawn_render_thread(
                     } else {
                         0
                     },
+                    csg_compounds: csg_ptrs.compounds,
+                    csg_ops: csg_ptrs.ops,
+                    csg_prims: csg_ptrs.prims,
+                    csg_aux_planes: csg_ptrs.aux_planes,
+                    csg_guard_aabbs: csg_ptrs.guard_aabbs,
+                    csg_repeats: csg_ptrs.repeats,
+                    csg_materials: csg_ptrs.materials,
+                    csg_instances: csg_ptrs.instances,
+                    csg_instance_count: csg_ptrs.instance_count,
+                    csg_material_count: csg_ptrs.material_count,
+                    csg_compound_count: csg_ptrs.compound_count,
+                    csg_flags: csg_flag_bits,
+                    csg_wetness: settings.csg_wetness.clamp(0.0, 1.0),
+                    csg_traffic_time: traffic_time,
+                    _pad2: [0; 2],
                 };
-                prev_camera = camera;
+                if publish_frame {
+                    prev_camera = camera;
+                }
                 rig.params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
                     .expect("params upload");
@@ -2029,6 +2318,12 @@ pub fn spawn_render_thread(
                     rig.stream.synchronize().expect("rt sync");
                     t_rt.elapsed().as_secs_f32() * 1000.0
                 };
+
+                if !publish_frame {
+                    accum_count = accum_count.saturating_add(1);
+                    frame_index = frame_index.wrapping_add(1);
+                    continue;
+                }
 
                 let (mut final_f32_ptr, denoise_ms) = if settings.denoiser_on
                     && !dlss_any
@@ -2351,6 +2646,7 @@ pub fn spawn_render_thread(
                         bloom_ms,
                         tonemap_ms,
                         ser_supported: rig.ser_supported,
+                        csg_stats: rig.csg_host.stats(),
                         status_msg: pending_status.take(),
                     })
                     .is_err()
@@ -2398,5 +2694,16 @@ mod tests {
         assert!(filigree_sdf(0.5, 0.02) < 0.0);
         assert!(filigree_sdf(0.5, 0.98) < 0.0);
         assert!(filigree_sdf(0.5, 0.5) > 0.0);
+    }
+
+    #[test]
+    fn launch_params_abi_size_and_offsets_match_cuda() {
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 576);
+        assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_instance_count), 544);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_flags), 556);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_wetness), 560);
     }
 }

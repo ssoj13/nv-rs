@@ -16,8 +16,8 @@ static __forceinline__ __device__ uchar4 eval_tonemap_pixel(float4 c, float expo
         };
         return make_uchar4(to_srgb(c.x), to_srgb(c.y), to_srgb(c.z), 255);
     }
-    if (mode == 3u || mode == 4u) {
-        // Depth / Motion AOV: already normalized [0, 1]
+    if (mode == 3u || mode == 4u || mode == 5u || mode == 6u) {
+        // Depth / Motion / SemanticId / InstanceId AOV: already normalized [0, 1]
         auto to_u8 = [](float v) -> unsigned char {
             float s = fmaxf(0.0f, fminf(1.0f, v));
             return (unsigned char)(s * 255.0f + 0.5f);
@@ -160,7 +160,7 @@ static __forceinline__ __device__ ushort4 eval_scrgb_pixel(float4 c, float expos
             1.0f
         );
     }
-    if (mode == 3u || mode == 4u) {
+    if (mode == 3u || mode == 4u || mode == 5u || mode == 6u) {
         float r = sanitize_range(c.x, 0.0f, 1.0f);
         float g = sanitize_range(c.y, 0.0f, 1.0f);
         float b = sanitize_range(c.z, 0.0f, 1.0f);

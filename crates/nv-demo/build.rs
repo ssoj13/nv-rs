@@ -43,14 +43,14 @@ fn compile_ptx(
     nvcc: &Path,
     src: &Path,
     out: &Path,
-    optix_inc: Option<&Path>,
+    extra_incs: &[&Path],
 ) -> Result<(), String> {
     let mut cmd = Command::new(nvcc);
     cmd.arg("--ptx")
         .arg("-arch=compute_75")
         .arg("-std=c++17")
         .arg("--use_fast_math");
-    if let Some(inc) = optix_inc {
+    for inc in extra_incs {
         cmd.arg("-I").arg(inc);
     }
     if cfg!(windows)
@@ -176,6 +176,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPTIX_ROOT");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
+    let csg_inc = PathBuf::from(csg_device::csg_eval_cuh_dir());
+    println!(
+        "cargo:rerun-if-changed={}",
+        csg_inc.join("csg_eval.cuh").display()
+    );
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     stage_dlss_runtime(&out_dir);
     build_nvtx_shim();
@@ -192,12 +198,12 @@ fn main() {
         &nvcc,
         Path::new("shaders/raytracer.cu"),
         &rt_out,
-        Some(&optix_inc),
+        &[optix_inc.as_path(), csg_inc.as_path()],
     ) {
         println!("cargo:warning={err}");
         return;
     }
-    if let Err(err) = compile_ptx(&nvcc, Path::new("shaders/tonemap.cu"), &tm_out, None) {
+    if let Err(err) = compile_ptx(&nvcc, Path::new("shaders/tonemap.cu"), &tm_out, &[]) {
         println!("cargo:warning={err}");
         return;
     }

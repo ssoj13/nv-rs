@@ -208,6 +208,10 @@ fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
         "split_x" => anim_f32(&mut s.split_x, amp, phase, 0.02, 0.98),
         "spin_speed" => anim_f32(&mut s.spin_speed, amp, phase, 0.0, 2.0),
         "dlss_sharpness" => anim_f32(&mut s.dlss_sharpness, amp, phase, 0.0, 1.0),
+        // CSG World
+        "csg_wetness" => anim_f32(&mut s.csg_wetness, amp, phase, 0.0, 1.0),
+        "csg_traffic_speed" => anim_f32(&mut s.csg_traffic_speed, amp, phase, 0.0, 3.0),
+        "csg_lod_bias" => anim_f32(&mut s.csg_lod_bias, amp, phase, 0.25, 4.0),
         _ => {}
     }
 }

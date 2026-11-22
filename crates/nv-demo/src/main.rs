@@ -7,6 +7,8 @@
 mod camera_core;
 #[allow(unexpected_cfgs, dead_code, unused_imports, deprecated, clippy::all)]
 mod camera_egui;
+mod camera_rail;
+mod csg_scene_host;
 mod demo_anim;
 mod fft_bloom;
 mod gpu_export;
@@ -36,8 +38,8 @@ mod demo_app {
     };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
-        CameraFrame, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs, FrameReady, RenderCmd,
-        align_render_size, spawn_render_thread,
+        CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs,
+        FrameReady, RenderCmd, align_render_size, spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiTheme, default_dock_state, install_fonts};
     use bytemuck::{Pod, Zeroable};
@@ -980,9 +982,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    struct FullWindowCapture {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        copy_buf: SharedBuffer,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        pixel_format: crate::gpu_export::SourcePixelFormat,
+        copy_bpr: u32,
+        copy_pitch_px: u32,
+    }
+
+    impl FullWindowCapture {
+        fn new(
+            interop: &InteropContext,
+            width: u32,
+            height: u32,
+            format: wgpu::TextureFormat,
+        ) -> Result<Self, String> {
+            let pixel_format = crate::gpu_export::SourcePixelFormat::from_wgpu(format)
+                .ok_or_else(|| format!("unsupported window capture format {format:?}"))?;
+            let (copy_bpr, copy_pitch_px) =
+                crate::gpu_export::copy_pitch_for_width(width, pixel_format.bytes_per_pixel())
+                    .ok_or_else(|| format!("invalid window capture dimensions ({width}x{height})"))?;
+            let texture = interop.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("full-window-capture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let copy_bytes = u64::from(copy_bpr)
+                .checked_mul(u64::from(height))
+                .ok_or_else(|| "window capture buffer size overflow".to_string())?;
+            let copy_buf = interop
+                .create_buffer(&SharedBufferDescriptor {
+                    label: Some("full-window-capture-copy"),
+                    size: copy_bytes,
+                    usage: wgpu::BufferUsages::COPY_DST,
+                })
+                .map_err(|e| format!("window capture buffer: {e}"))?;
+            Ok(Self {
+                texture,
+                view,
+                copy_buf,
+                width,
+                height,
+                format,
+                pixel_format,
+                copy_bpr,
+                copy_pitch_px,
+            })
+        }
+
+        fn matches(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> bool {
+            self.width == width && self.height == height && self.format == format
+        }
+    }
+
     struct ActiveRecorder {
         recorder: crate::gpu_export::VideoRecorder,
         profile: crate::gpu_export::VideoProfile,
+        source: CaptureSource,
+        pixel_format: crate::gpu_export::SourcePixelFormat,
         width: u32,
         height: u32,
         fps: u32,
@@ -995,8 +1066,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
         surface_config: wgpu::SurfaceConfiguration,
+        surface_supports_copy_dst: bool,
         sdr_surface_format: wgpu::TextureFormat,
         hdr_surface_supported: bool,
+        window_capture: Option<FullWindowCapture>,
+        png_readback_scratch: Vec<u8>,
+        png_rgba_scratch: Vec<u8>,
         dlss_pass: Option<DlssPass>,
         dlss_rr_pass: Option<DlssRrPass>,
         dlss_rr_available: bool,
@@ -1052,10 +1127,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         is_recording: bool,
         record_frames: u64,
         video_recorder: Option<ActiveRecorder>,
+        shutter_in_flight: bool,
         ser_supported: bool,
+        csg_stats: crate::csg_scene_host::CsgStats,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
+        camera_rail: crate::camera_rail::CameraRail,
+        cam_damper: crate::camera_rail::CameraDamper,
+        rail_blend_remaining: f32,
         cam_driver: CameraDriver,
         cam_home: CameraPose,
         cam_pose: CameraPose,
@@ -1190,6 +1270,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .expect("surface default config");
             surface_config.present_mode = wgpu::PresentMode::AutoVsync;
             let caps = surface.get_capabilities(&adapter);
+            let surface_supports_copy_dst = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
+            if surface_supports_copy_dst {
+                surface_config.usage |= wgpu::TextureUsages::COPY_DST;
+            }
             let sdr_surface_format = caps
                 .formats
                 .iter()
@@ -1344,8 +1428,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 window,
                 surface,
                 surface_config,
+                surface_supports_copy_dst,
                 sdr_surface_format,
                 hdr_surface_supported,
+                window_capture: None,
+                png_readback_scratch: Vec::new(),
+                png_rgba_scratch: Vec::new(),
                 dlss_pass: None,
                 dlss_rr_pass: None,
                 dlss_rr_available,
@@ -1401,10 +1489,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is_recording: false,
                 record_frames: 0,
                 video_recorder: None,
+                shutter_in_flight: false,
                 ser_supported: false,
+                csg_stats: crate::csg_scene_host::CsgStats::default(),
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
+                camera_rail: persisted.camera_rail.clone(),
+                cam_damper: {
+                    let mut d = crate::camera_rail::CameraDamper::default();
+                    d.snap(cam_pose);
+                    d
+                },
+                rail_blend_remaining: 0.0,
                 cam_driver,
                 cam_home,
                 cam_pose,
@@ -1423,6 +1520,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
+        fn notify_recording(&mut self, active: bool) {
+            self.shutter_in_flight = false;
+            let fixed_fps = if active && self.settings.record_fixed_fps {
+                60
+            } else {
+                0
+            };
+            let shutter_subframes = if fixed_fps > 0 {
+                self.settings.record_shutter_subframes.clamp(1, 4)
+            } else {
+                1
+            };
+            let _ = self.cmd_tx.send(RenderCmd::SetRecording {
+                active,
+                fixed_fps,
+                shutter_subframes,
+            });
+        }
+
         fn current_persisted_state(&self) -> crate::persist::PersistedState {
             crate::persist::PersistedState {
                 window: self.win_state,
@@ -1436,6 +1552,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.cam_feel,
                     self.cam_pose,
                 ),
+                camera_rail: self.camera_rail.clone(),
             }
         }
 
@@ -1501,6 +1618,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     continue;
                 }
                 frames_received += 1;
+                self.shutter_in_flight = false;
                 if self.has_frame && self.front_buf_idx != msg.buf_idx {
                     let _ = self.cmd_tx.send(RenderCmd::ReturnBuffer {
                         buf_idx: self.front_buf_idx,
@@ -1518,6 +1636,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.bloom_ms = msg.bloom_ms;
                 self.tonemap_ms = msg.tonemap_ms;
                 self.ser_supported = msg.ser_supported;
+                self.csg_stats = msg.csg_stats;
                 if let Some(status) = msg.status_msg {
                     self.last_saved_msg = Some(status);
                 }
@@ -1534,11 +1653,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // 2. Docked egui pass (60 FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let mut reset_accum_requested = false;
+            let mut cam_snap_requested = false;
+            let mut rail_blend_requested = false;
             let mut save_png_requested = false;
             let mut save_jpeg_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
             let prev_theme = self.theme;
+            let cam_fixed_dt = if self.is_recording && self.settings.record_fixed_fps {
+                let shutter_n = self.settings.record_shutter_subframes.clamp(1, 4);
+                let ts = self.settings.time_scale.clamp(0.05, 2.0);
+                if shutter_n > 1 {
+                    Some(0.0)
+                } else {
+                    Some((frames_received as f32 / 60.0) * ts)
+                }
+            } else {
+                None
+            };
             let mut ui_ctx = UiContext {
                 settings: &mut self.settings,
                 demo_anim: &mut self.demo_anim,
@@ -1549,6 +1681,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 cam_driver: &mut self.cam_driver,
                 cam_home: self.cam_home,
                 cam_pose: &mut self.cam_pose,
+                camera_rail: &mut self.camera_rail,
+                cam_snap_requested: &mut cam_snap_requested,
+                rail_blend_requested: &mut rail_blend_requested,
+                cam_fixed_dt,
                 cam_mode: &mut self.cam_mode,
                 cam_fly_mode: &mut self.cam_fly_mode,
                 cam_scheme: &mut self.cam_scheme,
@@ -1566,6 +1702,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 is_recording: self.is_recording,
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
+                csg_stats: self.csg_stats,
                 dlss_rr_available: self.dlss_rr_available,
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
@@ -1696,11 +1833,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.rr_last_exposure = f32::NAN;
             }
 
-            let recording_pq10 = self
-                .video_recorder
-                .as_ref()
-                .is_some_and(|r| r.profile == crate::gpu_export::VideoProfile::Hdr10Pq);
-            let need_hdr_buf = hdr_active || (recording_pq10 && !self.settings.dlss_rr_on);
+            let recording_vp_pq10 = self.video_recorder.as_ref().is_some_and(|r| {
+                r.source == CaptureSource::Viewport
+                    && r.profile == crate::gpu_export::VideoProfile::Hdr10Pq
+            });
+            let need_hdr_buf = hdr_active || (recording_vp_pq10 && !self.settings.dlss_rr_on);
             let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
                 || self.settings.dlss_rr_on != self.last_sent_settings.dlss_rr_on
                 || self.settings.dlss_quality != self.last_sent_settings.dlss_quality;
@@ -1799,6 +1936,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.render_w = target_w;
                         self.render_h = target_h;
                         self.buf_gen = self.buf_gen.wrapping_add(1);
+                        self.shutter_in_flight = false;
                         self.has_frame = false;
                         self.dlss_dirty = false;
                         self.front_buf_idx = 0;
@@ -2022,23 +2160,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            if save_png_requested && self.has_frame {
-                self.last_saved_msg = Some(save_front_png(
-                    &self.interop,
-                    self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
-                    self.render_w,
-                    self.render_h,
-                ));
+            let mut capture_window_png = false;
+            let mut capture_window_jpeg = false;
+            if save_png_requested {
+                if self.settings.capture_source == CaptureSource::FullWindow {
+                    capture_window_png = true;
+                } else if self.has_frame {
+                    self.last_saved_msg = Some(save_front_png(
+                        &self.interop,
+                        self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
+                        self.render_w,
+                        self.render_h,
+                    ));
+                }
             }
-            if save_jpeg_requested && self.has_frame {
-                let dir = std::path::Path::new("renders");
-                let _ = std::fs::create_dir_all(dir);
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let path = dir.join(format!("nv-demo-{ts}.jpg"));
-                let _ = self.cmd_tx.send(RenderCmd::SaveJpeg { path, quality: 92 });
+            if save_jpeg_requested {
+                if self.settings.capture_source == CaptureSource::FullWindow {
+                    capture_window_jpeg = true;
+                } else if self.has_frame {
+                    let dir = std::path::Path::new("renders");
+                    let _ = std::fs::create_dir_all(dir);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let path = dir.join(format!("nv-demo-{ts}.jpg"));
+                    let _ = self.cmd_tx.send(RenderCmd::SaveJpeg { path, quality: 92 });
+                }
             }
             if toggle_record_requested {
                 if let Some(active) = self.video_recorder.take() {
@@ -2049,17 +2197,109 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     });
                     self.is_recording = false;
                     self.record_frames = 0;
-                    let _ = self.cmd_tx.send(RenderCmd::SetRecording {
-                        active: false,
-                        fixed_fps: 0,
-                    });
+                    self.notify_recording(false);
                 } else {
                     let use_pq10 = match self.settings.record_video_mode {
                         1 => false,
                         2 => true,
                         _ => hdr_active,
                     };
-                    if use_pq10 && self.settings.dlss_on && !self.settings.dlss_rr_on {
+                    let profile = if use_pq10 {
+                        crate::gpu_export::VideoProfile::Hdr10Pq
+                    } else {
+                        crate::gpu_export::VideoProfile::SdrH264
+                    };
+                    let tag = if use_pq10 { "pq10" } else { "sdr" };
+                    let dir = std::path::Path::new("renders");
+                    let _ = std::fs::create_dir_all(dir);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    if self.settings.capture_source == CaptureSource::FullWindow {
+                        let win_w = self.surface_config.width;
+                        let win_h = self.surface_config.height;
+                        let win_tex_fmt = self.surface_config.format;
+                        let win_fmt =
+                            crate::gpu_export::SourcePixelFormat::from_wgpu(win_tex_fmt);
+                        let even_dims = crate::gpu_export::align_even_dims(win_w, win_h);
+                        let path = dir.join(format!("nv-demo-{ts}-win-{tag}.mp4"));
+
+                        if let (Some(src_fmt), Some((rec_w, rec_h))) = (win_fmt, even_dims) {
+                            if use_pq10
+                                && src_fmt != crate::gpu_export::SourcePixelFormat::ScrgbF16
+                            {
+                                self.last_saved_msg = Some(
+                                    "Full Window PQ10 requires HDR View (switch View to HDR or Video to SDR/Auto)"
+                                        .to_string(),
+                                );
+                            } else {
+                                let cap_ok = match self.window_capture.as_ref() {
+                                    Some(cap) if cap.matches(win_w, win_h, win_tex_fmt) => {
+                                        Ok(cap.copy_pitch_px)
+                                    }
+                                    _ => {
+                                        match FullWindowCapture::new(
+                                            &self.interop,
+                                            win_w,
+                                            win_h,
+                                            win_tex_fmt,
+                                        ) {
+                                            Ok(cap) => {
+                                                let pitch = cap.copy_pitch_px;
+                                                self.window_capture = Some(cap);
+                                                Ok(pitch)
+                                            }
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                };
+                                match cap_ok.and_then(|copy_pitch_px| {
+                                    crate::gpu_export::VideoRecorder::start_with_format(
+                                        self.interop.cuda_context(),
+                                        rec_w,
+                                        rec_h,
+                                        60,
+                                        profile,
+                                        src_fmt,
+                                        &path,
+                                    )
+                                    .map(|recorder| (recorder, copy_pitch_px))
+                                }) {
+                                    Ok((recorder, copy_pitch_px)) => {
+                                        self.video_recorder = Some(ActiveRecorder {
+                                            recorder,
+                                            profile,
+                                            source: CaptureSource::FullWindow,
+                                            pixel_format: src_fmt,
+                                            width: rec_w,
+                                            height: rec_h,
+                                            fps: 60,
+                                            copy_buf: None,
+                                            copy_pitch_px,
+                                            last_frame_at: None,
+                                        });
+                                        self.is_recording = true;
+                                        self.record_frames = 0;
+                                        self.notify_recording(true);
+                                        self.last_saved_msg = Some(format!(
+                                            "Recording window to {}",
+                                            path.display()
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.last_saved_msg =
+                                            Some(format!("Record start failed: {e}"));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.last_saved_msg = Some(format!(
+                                "Full Window record unsupported ({win_w}x{win_h}, {win_tex_fmt:?})"
+                            ));
+                        }
+                    } else if use_pq10 && self.settings.dlss_on && !self.settings.dlss_rr_on {
                         self.last_saved_msg = Some(
                             "PQ10 requires DLSS RR or OptiX/Raw (DLSS SR is 8-bit SDR)".to_string(),
                         );
@@ -2077,18 +2317,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             } else {
                                 (self.render_w & !1, self.render_h & !1, false)
                             };
-                        let profile = if use_pq10 {
-                            crate::gpu_export::VideoProfile::Hdr10Pq
-                        } else {
-                            crate::gpu_export::VideoProfile::SdrH264
-                        };
-                        let tag = if use_pq10 { "pq10" } else { "sdr" };
-                        let dir = std::path::Path::new("renders");
-                        let _ = std::fs::create_dir_all(dir);
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
                         let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
 
                         let bpp: u32 = if use_pq10 { 8 } else { 4 };
@@ -2121,6 +2349,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 self.video_recorder = Some(ActiveRecorder {
                                     recorder,
                                     profile,
+                                    source: CaptureSource::Viewport,
+                                    pixel_format: if use_pq10 {
+                                        crate::gpu_export::SourcePixelFormat::ScrgbF16
+                                    } else {
+                                        crate::gpu_export::SourcePixelFormat::Rgba8
+                                    },
                                     width: src_w,
                                     height: src_h,
                                     fps: 60,
@@ -2131,10 +2365,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 self.is_recording = true;
                                 self.record_frames = 0;
                                 self.rr_last_exposure = f32::NAN;
-                                let _ = self.cmd_tx.send(RenderCmd::SetRecording {
-                                    active: true,
-                                    fixed_fps: if self.settings.record_fixed_fps { 60 } else { 0 },
-                                });
+                                self.notify_recording(true);
                                 self.last_saved_msg =
                                     Some(format!("Recording to {}", path.display()));
                             }
@@ -2149,32 +2380,125 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let _ = self.cmd_tx.send(RenderCmd::ReloadShader);
             }
 
-            // 4. Advance demo animator & push camera/settings updates when changed.
-            // In Smooth 60 FPS recording mode, step animation by an exact 1/60s per rendered frame
-            // so slow close-up fractal frames produce silky 60 FPS playback instead of cartoon speedup.
-            let anim_dt = if self.is_recording && self.settings.record_fixed_fps {
-                frames_received as f32 / 60.0
+            // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.
+            // In Smooth 60 FPS recording mode, step everything by exact `(1/60s) * time_scale` per
+            // encoded frame (and across N 180-degree shutter subframes when enabled).
+            let time_scale = self.settings.time_scale.clamp(0.05, 2.0);
+            let shutter_n = if self.is_recording && self.settings.record_fixed_fps {
+                self.settings.record_shutter_subframes.clamp(1, 4)
             } else {
-                dt
+                1
             };
-            self.demo_anim.tick(anim_dt);
-            let mut effective_settings = self.demo_anim.apply(&self.settings);
-            if !self.demo_anim.playing {
-                effective_settings.auto_rotate = false;
-                effective_settings.sat_orbit = false;
+            if rail_blend_requested {
+                self.rail_blend_remaining = 1.6;
             }
-            let cam_frame = pose_to_frame(self.cam_pose);
-            if reset_accum_requested
-                || effective_settings != self.last_sent_settings
-                || cam_frame != self.last_sent_camera
-            {
-                self.last_sent_settings = effective_settings;
-                self.last_sent_camera = cam_frame;
-                let _ = self.cmd_tx.send(RenderCmd::Update {
-                    settings: Box::new(effective_settings),
-                    camera: cam_frame,
-                    reset_accum: reset_accum_requested,
-                });
+            if cam_snap_requested {
+                self.rail_blend_remaining = 0.0;
+                self.cam_damper.snap(self.cam_pose);
+            }
+
+            if shutter_n > 1 {
+                if !self.shutter_in_flight {
+                    let frame_dt = (1.0 / 60.0) * time_scale;
+                    for sub_idx in 0..shutter_n {
+                        let sub_dt =
+                            crate::camera_rail::shutter_subframe_dt(frame_dt, sub_idx, shutter_n);
+                        self.demo_anim.tick(sub_dt);
+                        if self.camera_rail.is_active() {
+                            self.camera_rail.tick(sub_dt);
+                            if let Some(rp) = self
+                                .camera_rail
+                                .evaluate_current(self.cam_pose.znear, self.cam_pose.zfar.max(2000.0))
+                            {
+                                self.cam_pose = rp;
+                                self.cam_driver.controller_mut().set_pose(rp);
+                            }
+                        } else {
+                            let raw = crate::camera_core::input::RawInput {
+                                dt: sub_dt,
+                                viewport: glam::Vec2::new(self.render_w as f32, self.render_h as f32),
+                                ..Default::default()
+                            };
+                            let df = self.cam_driver.update(&raw, 2.0);
+                            self.cam_pose = df.pose;
+                        }
+                        let effective_tau = if self.rail_blend_remaining > 0.0 {
+                            let frac = (self.rail_blend_remaining / 1.6).clamp(0.0, 1.0);
+                            self.rail_blend_remaining = (self.rail_blend_remaining - sub_dt).max(0.0);
+                            self.settings.cam_smooth_tau.max(0.32 * frac)
+                        } else {
+                            self.settings.cam_smooth_tau
+                        };
+                        let smoothed = self.cam_damper.step(
+                            self.cam_pose,
+                            sub_dt,
+                            effective_tau,
+                        );
+                        let mut effective_settings = self.demo_anim.apply(&self.settings);
+                        if !self.demo_anim.playing {
+                            effective_settings.auto_rotate = false;
+                            effective_settings.sat_orbit = false;
+                        }
+                        let cam_frame = pose_to_frame(smoothed);
+                        self.last_sent_settings = effective_settings;
+                        self.last_sent_camera = cam_frame;
+                        let _ = self.cmd_tx.send(RenderCmd::RenderShutterSubframe {
+                            settings: Box::new(effective_settings),
+                            camera: cam_frame,
+                            sim_dt: sub_dt,
+                            sub_idx,
+                            sub_count: shutter_n,
+                        });
+                    }
+                    self.shutter_in_flight = true;
+                }
+            } else {
+                let fixed_recording = self.is_recording && self.settings.record_fixed_fps;
+                let step_dt = if fixed_recording {
+                    (frames_received as f32 / 60.0) * time_scale
+                } else {
+                    dt * time_scale
+                };
+                self.demo_anim.tick(step_dt);
+                if self.camera_rail.is_active() {
+                    self.camera_rail.tick(step_dt);
+                    if let Some(rp) = self
+                        .camera_rail
+                        .evaluate_current(self.cam_pose.znear, self.cam_pose.zfar.max(2000.0))
+                    {
+                        self.cam_pose = rp;
+                        self.cam_driver.controller_mut().set_pose(rp);
+                    }
+                }
+                let damper_dt = if fixed_recording { step_dt } else { dt };
+                let effective_tau = if self.rail_blend_remaining > 0.0 {
+                    let frac = (self.rail_blend_remaining / 1.6).clamp(0.0, 1.0);
+                    self.rail_blend_remaining = (self.rail_blend_remaining - damper_dt).max(0.0);
+                    self.settings.cam_smooth_tau.max(0.32 * frac)
+                } else {
+                    self.settings.cam_smooth_tau
+                };
+                let render_pose =
+                    self.cam_damper
+                        .step(self.cam_pose, damper_dt, effective_tau);
+                let mut effective_settings = self.demo_anim.apply(&self.settings);
+                if !self.demo_anim.playing {
+                    effective_settings.auto_rotate = false;
+                    effective_settings.sat_orbit = false;
+                }
+                let cam_frame = pose_to_frame(render_pose);
+                if reset_accum_requested
+                    || effective_settings != self.last_sent_settings
+                    || cam_frame != self.last_sent_camera
+                {
+                    self.last_sent_settings = effective_settings;
+                    self.last_sent_camera = cam_frame;
+                    let _ = self.cmd_tx.send(RenderCmd::Update {
+                        settings: Box::new(effective_settings),
+                        camera: cam_frame,
+                        reset_accum: reset_accum_requested,
+                    });
+                }
             }
 
             // 5. wgpu present (copy latest SharedBuffer -> display_texture + render egui).
@@ -2549,6 +2873,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
+            let recording_full_win = self
+                .video_recorder
+                .as_ref()
+                .is_some_and(|r| r.source == CaptureSource::FullWindow);
+            let need_win_capture =
+                recording_full_win || capture_window_png || capture_window_jpeg;
+            if need_win_capture {
+                let win_w = self.surface_config.width;
+                let win_h = self.surface_config.height;
+                let win_fmt = self.surface_config.format;
+                let needs_alloc = self
+                    .window_capture
+                    .as_ref()
+                    .is_none_or(|c| !c.matches(win_w, win_h, win_fmt));
+                if needs_alloc {
+                    match FullWindowCapture::new(&self.interop, win_w, win_h, win_fmt) {
+                        Ok(cap) => self.window_capture = Some(cap),
+                        Err(e) => {
+                            self.last_saved_msg = Some(format!("Window capture alloc failed: {e}"));
+                            capture_window_png = false;
+                            capture_window_jpeg = false;
+                            if recording_full_win && let Some(active) = self.video_recorder.take() {
+                                let _ = active.recorder.finish();
+                                self.is_recording = false;
+                                self.record_frames = 0;
+                                self.notify_recording(false);
+                            }
+                        }
+                    }
+                }
+            } else if self.settings.capture_source == CaptureSource::Viewport {
+                self.window_capture = None;
+            }
+
             let active_egui = if hdr_active {
                 self.egui_renderer_hdr
                     .as_mut()
@@ -2563,7 +2921,96 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 &tris,
                 &screen_desc,
             );
+
+            let mut win_gpu_copied = false;
+            if need_win_capture
+                && let Some(ref cap) = self.window_capture
+                && cap.matches(
+                    self.surface_config.width,
+                    self.surface_config.height,
+                    self.surface_config.format,
+                )
             {
+                {
+                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui-full-window-capture-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &cap.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    let mut pass = pass.forget_lifetime();
+                    active_egui.render(&mut pass, &tris, &screen_desc);
+                }
+                let extent = wgpu::Extent3d {
+                    width: cap.width,
+                    height: cap.height,
+                    depth_or_array_layers: 1,
+                };
+                if self.surface_supports_copy_dst {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &cap.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &frame.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        extent,
+                    );
+                } else {
+                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    let mut pass = pass.forget_lifetime();
+                    active_egui.render(&mut pass, &tris, &screen_desc);
+                }
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &cap.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: cap.copy_buf.wgpu_buffer(),
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(cap.copy_bpr),
+                            rows_per_image: Some(cap.height),
+                        },
+                    },
+                    extent,
+                );
+                win_gpu_copied = true;
+            } else {
                 let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2590,11 +3037,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            // Capture the final post-DLSS-RR / post-DLSS-SR / post-OptiX frame into MP4 when a new frame arrived.
+            // Capture the final post-DLSS-RR / post-DLSS-SR / post-OptiX viewport into MP4 when recording Viewport.
             let mut rec_gpu_copied = false;
             if frames_received > 0
                 && self.has_frame
                 && let Some(ref mut active) = self.video_recorder
+                && active.source == CaptureSource::Viewport
             {
                 let is_pq = active.profile == crate::gpu_export::VideoProfile::Hdr10Pq;
                 let src_tex: Option<(&wgpu::Texture, u32, u32, u32)> =
@@ -2652,7 +3100,126 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             self.interop.queue().submit(Some(encoder.finish()));
 
-            if frames_received > 0
+            if win_gpu_copied && let Some(ref cap) = self.window_capture {
+                let _ = self
+                    .interop
+                    .device()
+                    .poll(wgpu::PollType::wait_indefinitely());
+                let ptr = cap.copy_buf.cu_deviceptr();
+                let cap_w = cap.width;
+                let cap_h = cap.height;
+                let cap_pitch_px = cap.copy_pitch_px;
+                let cap_fmt = cap.pixel_format;
+
+                if capture_window_png {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let path = std::path::Path::new("renders")
+                        .join(format!("nv-demo-{ts}-win.png"));
+                    self.last_saved_msg = Some(
+                        match crate::gpu_export::save_png_from_pitched(
+                            self.interop.cuda_context(),
+                            ptr,
+                            cap_w,
+                            cap_h,
+                            cap_pitch_px,
+                            cap_fmt,
+                            &path,
+                            &mut self.png_readback_scratch,
+                            &mut self.png_rgba_scratch,
+                        ) {
+                            Ok(()) => format!("Saved {}", path.display()),
+                            Err(e) => format!("Window PNG failed: {e}"),
+                        },
+                    );
+                }
+
+                if capture_window_jpeg {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let path = std::path::Path::new("renders")
+                        .join(format!("nv-demo-{ts}-win.jpg"));
+                    let jpeg_res = self
+                        .interop
+                        .cuda_context()
+                        .bind_to_thread()
+                        .map_err(|e| format!("CUDA bind failed: {e}"))
+                        .and_then(|()| {
+                            self.interop
+                                .cuda_context()
+                                .new_stream()
+                                .map_err(|e| format!("CUDA stream failed: {e}"))
+                        })
+                        .and_then(|stream| {
+                            crate::gpu_export::save_jpeg_from_pitched(
+                                self.interop.cuda_context(),
+                                &stream,
+                                ptr,
+                                cap_w,
+                                cap_h,
+                                cap_pitch_px,
+                                cap_fmt,
+                                &path,
+                                92,
+                            )
+                        });
+                    self.last_saved_msg = Some(match jpeg_res {
+                        Ok(()) => format!("Saved {}", path.display()),
+                        Err(e) => format!("Window JPEG failed: {e}"),
+                    });
+                }
+
+                if recording_full_win
+                    && (!self.settings.record_fixed_fps || frames_received > 0)
+                    && let Some(mut active) = self.video_recorder.take()
+                {
+                    let dims_ok = crate::gpu_export::align_even_dims(cap_w, cap_h)
+                        == Some((active.width, active.height))
+                        && cap_fmt == active.pixel_format
+                        && ptr != 0;
+                    if !dims_ok {
+                        let _ = active.recorder.finish();
+                        self.is_recording = false;
+                        self.record_frames = 0;
+                        self.notify_recording(false);
+                        self.last_saved_msg = Some(
+                            "Recording stopped (window size or format changed)".to_string(),
+                        );
+                    } else {
+                        let rec_now = Instant::now();
+                        let frame_dur = if self.settings.record_fixed_fps {
+                            1.0 / f64::from(active.fps.max(1))
+                        } else {
+                            let d = active.last_frame_at.map_or(
+                                1.0 / f64::from(active.fps.max(1)),
+                                |prev| rec_now.duration_since(prev).as_secs_f64(),
+                            );
+                            d.clamp(1.0 / 240.0, 2.0)
+                        };
+                        active.last_frame_at = Some(rec_now);
+                        match active.recorder.push_frame(ptr, cap_pitch_px, frame_dur) {
+                            Ok(()) => {
+                                self.record_frames = active.recorder.frame_count();
+                                self.video_recorder = Some(active);
+                            }
+                            Err(e) => {
+                                let _ = active.recorder.finish();
+                                self.is_recording = false;
+                                self.record_frames = 0;
+                                self.notify_recording(false);
+                                self.last_saved_msg = Some(format!("Video encode error: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !recording_full_win
+                && frames_received > 0
                 && self.has_frame
                 && let Some(mut active) = self.video_recorder.take()
             {
@@ -2696,10 +3263,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let _ = active.recorder.finish();
                     self.is_recording = false;
                     self.record_frames = 0;
-                    let _ = self.cmd_tx.send(RenderCmd::SetRecording {
-                        active: false,
-                        fixed_fps: 0,
-                    });
+                    self.notify_recording(false);
                     self.last_saved_msg =
                         Some("Recording stopped (resolution or upscale mode changed)".to_string());
                 } else {
@@ -2723,10 +3287,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             let _ = active.recorder.finish();
                             self.is_recording = false;
                             self.record_frames = 0;
-                            let _ = self.cmd_tx.send(RenderCmd::SetRecording {
-                                active: false,
-                                fixed_fps: 0,
-                            });
+                            self.notify_recording(false);
                             self.last_saved_msg = Some(format!("Video encode error: {e}"));
                         }
                     }

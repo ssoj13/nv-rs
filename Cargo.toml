@@ -16,6 +16,10 @@ publish = false
 [workspace.dependencies]
 nv-loader = { path = "crates/nv-loader" }
 nv-bindgen = { path = "crates/nv-bindgen" }
+csg-core = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
+csg-scene = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
+csg-device = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
+csg-urban = { git = "ssh://git@github.com/ssoj13/csg-rs.git", branch = "main" }
 vcv-rs = { version = "0.1.2", default-features = false, features = ["cuda", "optix", "nvsdk"] }
 bindgen = "0.72"
 syn = { version = "2", features = ["full"] }

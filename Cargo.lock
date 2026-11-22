@@ -501,6 +501,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "csg-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+dependencies = [
+ "bytemuck",
+ "serde",
+]
+
+[[package]]
+name = "csg-device"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+dependencies = [
+ "bytemuck",
+ "csg-core",
+]
+
+[[package]]
+name = "csg-scene"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+dependencies = [
+ "bytemuck",
+ "csg-core",
+ "serde",
+]
+
+[[package]]
+name = "csg-urban"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+dependencies = [
+ "csg-core",
+ "csg-scene",
+ "serde",
+]
+
+[[package]]
 name = "cublas"
 version = "0.1.0"
 dependencies = [
@@ -1945,6 +1983,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cc",
+ "csg-core",
+ "csg-device",
+ "csg-scene",
+ "csg-urban",
  "cuda-bindings",
  "cuda-core",
  "cuda-core-ext",

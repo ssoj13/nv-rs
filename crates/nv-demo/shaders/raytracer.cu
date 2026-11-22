@@ -1,4 +1,5 @@
 #include <optix.h>
+#include "csg_eval.cuh"
 
 struct Params {
     unsigned long long out_color_f32;
@@ -38,14 +39,32 @@ struct Params {
     float prev_cam_up[4];
     float sat_pos[4];      // [x, y, z, radius/enable]
     float glass_params[4]; // [ior, absorption, roughness, enable]
-    unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion
+    unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId
     float jitter_x;
     float jitter_y;
     unsigned int _pad1;
     float env_params[8];
     unsigned long long out_diffuse_albedo_f32;
     unsigned long long out_spec_albedo_f32;
+    // Render-time analytical CSG scene device pointers & controls
+    unsigned long long csg_compounds;
+    unsigned long long csg_ops;
+    unsigned long long csg_prims;
+    unsigned long long csg_aux_planes;
+    unsigned long long csg_guard_aabbs;
+    unsigned long long csg_repeats;
+    unsigned long long csg_materials;
+    unsigned long long csg_instances;
+    unsigned int csg_instance_count;
+    unsigned int csg_material_count;
+    unsigned int csg_compound_count;
+    unsigned int csg_flags;      // bit0=enabled, bit1=night, bit2=wet_asphalt, bit3=sunset
+    float csg_wetness;           // 0..1 smooth asphalt wetness
+    float csg_traffic_time;      // simulation clock for water waves / aviation beacons
+    unsigned int _pad2[2];
 };
+
+static_assert(sizeof(Params) == 576, "Params size must match LaunchParams (576 B)");
 
 extern "C" {
 __constant__ Params params;
@@ -838,6 +857,31 @@ static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, b
     float y = fmaxf(0.0f, dir.y);
     float horizon_band = expf(-fabsf(dir.y) * (6.0f / haze_k));
 
+    if (mode == 8) {
+        // Coastal Night: deep Pacific navy-indigo twilight + warm sodium-vapor city horizon + stars
+        float3 zenith  = make_float3(0.004f, 0.008f, 0.024f);
+        float3 horizon = make_float3(0.032f, 0.042f, 0.075f);
+        float t = powf(y, 0.50f);
+        float3 col = f3_add(f3_mul(horizon, 1.0f - t), f3_mul(zenith, t));
+        // Subtle warm coastal urban sodium glow along the inland horizon
+        float inland = 0.55f + 0.45f * fmaxf(0.0f, dir.x);
+        col = f3_add(col, f3_mul(make_float3(0.16f, 0.095f, 0.045f), horizon_band * 0.48f * inland));
+        if (dir.y < 0.0f) {
+            float g = fminf(1.0f, -dir.y * 5.0f);
+            col = f3_add(f3_mul(col, 1.0f - g), f3_mul(make_float3(0.006f, 0.009f, 0.015f), g));
+        }
+        float moon_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
+        float moon_halo = powf(moon_dot, 24.0f) * 0.14f;
+        float moon_t = fmaxf(0.0f, fminf(1.0f, (moon_dot - 0.9992f) / 0.0005f));
+        float moon_disc = moon_t * moon_t * (3.0f - 2.0f * moon_t) * (is_camera_ray ? 1.8f : 0.45f);
+        col = f3_add(col, f3_mul(make_float3(0.76f, 0.84f, 1.0f), moon_halo + moon_disc));
+        if (is_camera_ray && dir.y > 0.01f) {
+            float star_fade = sky_smoothstep(0.02f, 0.22f, dir.y);
+            col = f3_add(col, f3_mul(sky_starfield(dir, 1.15f, 1.25f, 0.0f), star_fade));
+        }
+        return f3_mul(col, sky_i);
+    }
+
     if (mode == 1) {
         // Golden Sunset: deep indigo zenith -> warm coral/amber horizon + layered sunset clouds
         float3 zenith  = make_float3(0.05f, 0.07f, 0.22f);
@@ -999,6 +1043,247 @@ static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, b
     return f3_mul(col, sky_i);
 }
 
+// --- Render-Time Analytical CSG Helpers & Procedural Urban Shading ---
+
+static __forceinline__ __device__ CsgSceneView make_csg_view() {
+    return csg_make_scene_view(
+        params.csg_compounds,
+        params.csg_ops,
+        params.csg_prims,
+        params.csg_aux_planes,
+        params.csg_guard_aabbs,
+        params.csg_repeats,
+        params.csg_materials,
+        params.csg_instances,
+        params.csg_compound_count,
+        params.csg_material_count,
+        params.csg_instance_count
+    );
+}
+
+// Perceptually distinct Cityscapes-inspired palette matching `csg_core::ast::semantic` (0..17).
+static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id) {
+    switch (sem_id) {
+        case 1u:  return make_float3(0.50f, 0.25f, 0.50f); // ROAD
+        case 2u:  return make_float3(0.96f, 0.14f, 0.91f); // SIDEWALK
+        case 3u:  return make_float3(0.76f, 0.60f, 0.76f); // CURB
+        case 4u:  return make_float3(0.28f, 0.28f, 0.34f); // BUILDING
+        case 5u:  return make_float3(0.32f, 0.76f, 0.96f); // WINDOW
+        case 6u:  return make_float3(0.60f, 0.60f, 0.60f); // POLE
+        case 7u:  return make_float3(0.98f, 0.67f, 0.12f); // TRAFFIC_LIGHT
+        case 8u:  return make_float3(0.86f, 0.86f, 0.00f); // TRAFFIC_SIGN
+        case 9u:  return make_float3(0.42f, 0.56f, 0.14f); // FURNITURE
+        case 10u: return make_float3(0.00f, 0.32f, 0.88f); // VEHICLE
+        case 11u: return make_float3(0.12f, 0.16f, 0.45f); // WHEEL
+        case 12u: return make_float3(0.90f, 0.42f, 0.14f); // INDUSTRIAL
+        case 13u: return make_float3(0.95f, 0.58f, 0.22f); // PIPE
+        case 14u: return make_float3(0.86f, 0.24f, 0.28f); // TANK
+        case 15u: return make_float3(0.06f, 0.46f, 0.78f); // WATER
+        case 16u: return make_float3(0.78f, 0.68f, 0.46f); // GROUND / SAND
+        case 17u: return make_float3(0.64f, 0.48f, 0.40f); // BARRIER
+        default:  return make_float3(0.08f, 0.08f, 0.10f); // UNKNOWN / SKY
+    }
+}
+
+static __forceinline__ __device__ float3 instance_aov_color(unsigned int inst_id) {
+    if (inst_id == 0u) return make_float3(0.02f, 0.02f, 0.04f);
+    unsigned int h = pcg_hash(inst_id * 2654435761u ^ 0x9E3779B9u);
+    float hue = (float)(h & 0xFFFFu) * (1.0f / 65536.0f);
+    float sat = 0.68f + 0.28f * ((float)((h >> 16u) & 0xFFu) * (1.0f / 255.0f));
+    float val = 0.65f + 0.32f * ((float)((h >> 24u) & 0xFFu) * (1.0f / 255.0f));
+    float h6 = fmodf(hue * 6.0f, 6.0f);
+    float r = fminf(1.0f, fmaxf(0.0f, fabsf(h6 - 3.0f) - 1.0f));
+    float g = fminf(1.0f, fmaxf(0.0f, 2.0f - fabsf(h6 - 2.0f)));
+    float b = fminf(1.0f, fmaxf(0.0f, 2.0f - fabsf(h6 - 4.0f)));
+    return make_float3(
+        val * (1.0f - sat + sat * r),
+        val * (1.0f - sat + sat * g),
+        val * (1.0f - sat + sat * b)
+    );
+}
+
+static __forceinline__ __device__ CsgGpuMaterial load_csg_material(unsigned int mat_id) {
+    if (params.csg_materials != 0ull && mat_id < params.csg_material_count) {
+        return ((const CsgGpuMaterial*)params.csg_materials)[mat_id];
+    }
+    CsgGpuMaterial def;
+    def.albedo[0] = 0.45f; def.albedo[1] = 0.45f; def.albedo[2] = 0.45f;
+    def.roughness = 0.55f;
+    def.emission[0] = 0.0f; def.emission[1] = 0.0f; def.emission[2] = 0.0f;
+    def.metallic = 0.0f;
+    def.absorption[0] = 0.0f; def.absorption[1] = 0.0f; def.absorption[2] = 0.0f;
+    def.ior = 1.5f;
+    def.clearcoat = 0.0f;
+    def.clearcoat_roughness = 0.08f;
+    def.procedural_kind = CSG_PROC_NONE;
+    def.flags = 0u;
+    return def;
+}
+
+static __forceinline__ __device__ void eval_csg_procedural(
+    const CsgGpuMaterial& mat,
+    float3 hit_pos,
+    float3& n,
+    float3& base_col,
+    float& rough,
+    float& metallic,
+    float& clearcoat,
+    float& cc_rough,
+    float3& emission
+) {
+    base_col = make_float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
+    rough = fmaxf(0.02f, fminf(0.98f, mat.roughness));
+    metallic = fmaxf(0.0f, fminf(1.0f, mat.metallic));
+    clearcoat = fmaxf(0.0f, fminf(1.0f, mat.clearcoat));
+    cc_rough = fmaxf(0.02f, fminf(0.60f, mat.clearcoat_roughness));
+    emission = make_float3(mat.emission[0], mat.emission[1], mat.emission[2]);
+
+    float wet = fmaxf(0.0f, fminf(1.0f, params.csg_wetness));
+    if ((mat.flags & CSG_MAT_FLAG_WET) != 0u) {
+        wet = fmaxf(wet, 0.35f);
+    }
+
+    switch (mat.procedural_kind) {
+        case CSG_PROC_ASPHALT: {
+            float grain = value_noise2(hit_pos.x * 22.0f, hit_pos.z * 22.0f);
+            float coarse = fbm2(hit_pos.x * 0.45f, hit_pos.z * 0.45f);
+            // Subtle longitudinal tire wear polish along highway Z lanes
+            float lane_wear = 0.5f + 0.5f * cosf(hit_pos.x * 1.75f);
+            float tar_crack = sky_smoothstep(0.76f, 0.84f, fbm2(hit_pos.x * 0.25f + 7.1f, hit_pos.z * 0.25f - 3.4f));
+            float shade = (0.82f + 0.28f * grain) * (0.88f + 0.22f * coarse) * (1.0f - 0.18f * lane_wear);
+            base_col = f3_mul(base_col, shade * (1.0f - 0.35f * tar_crack));
+            rough = fmaxf(0.04f, fminf(0.95f, rough + (grain - 0.5f) * 0.16f - 0.08f * lane_wear));
+            if (wet > 0.01f) {
+                float p_noise = fbm2(hit_pos.x * 0.14f + 2.3f, hit_pos.z * 0.14f - 5.1f);
+                float puddle = sky_smoothstep(0.68f - 0.52f * wet, 0.84f - 0.44f * wet, p_noise) * wet;
+                float damp = wet * (0.45f + 0.55f * puddle);
+                base_col = f3_mul(base_col, 1.0f - 0.52f * damp);
+                rough = rough * (1.0f - 0.85f * puddle) + 0.035f * puddle;
+                clearcoat = fmaxf(clearcoat, 0.25f * wet + 0.70f * puddle);
+                cc_rough = 0.03f + 0.08f * (1.0f - puddle);
+                // Micro aggregate bump suppressed inside flat mirror puddles
+                float bump_k = 0.035f * (1.0f - puddle);
+                float gx = value_noise2((hit_pos.x + 0.02f) * 18.0f, hit_pos.z * 18.0f) - grain;
+                float gz = value_noise2(hit_pos.x * 18.0f, (hit_pos.z + 0.02f) * 18.0f) - grain;
+                n = f3_norm(make_float3(n.x - gx * bump_k, n.y, n.z - gz * bump_k));
+            }
+            break;
+        }
+        case CSG_PROC_LANE_PAINT: {
+            if ((mat.flags & CSG_MAT_FLAG_LANE_DASHED) != 0u) {
+                float dash = fmodf(fabsf(hit_pos.z), 9.0f);
+                if (dash > 3.2f) {
+                    base_col = make_float3(0.07f, 0.072f, 0.078f);
+                    rough = fmaxf(0.06f, 0.55f - 0.35f * wet);
+                    break;
+                }
+            }
+            float wear = value_noise2(hit_pos.x * 16.0f, hit_pos.z * 16.0f);
+            float chip = sky_smoothstep(0.18f, 0.32f, wear);
+            float3 asphalt_under = make_float3(0.07f, 0.072f, 0.078f);
+            base_col = f3_add(f3_mul(asphalt_under, 1.0f - chip), f3_mul(base_col, chip));
+            rough = fmaxf(0.10f, rough - 0.14f * wet);
+            break;
+        }
+        case CSG_PROC_CONCRETE: {
+            float sx = (fabsf(n.y) > 0.5f) ? hit_pos.x : (hit_pos.x + hit_pos.z);
+            float sy = (fabsf(n.y) > 0.5f) ? hit_pos.z : hit_pos.y;
+            float grime = fbm2(sx * 0.35f + 4.1f, sy * 0.25f - 1.9f);
+            float micro = value_noise2(sx * 9.0f, sy * 9.0f);
+            float jx = fabsf(fmodf(fabsf(sx), 3.0f) - 1.5f);
+            float jy = fabsf(fmodf(fabsf(sy), 3.0f) - 1.5f);
+            float seam = (jx > 1.47f || jy > 1.47f) ? 0.80f : 1.0f;
+            base_col = f3_mul(base_col, (0.80f + 0.30f * grime) * (0.92f + 0.14f * micro) * seam);
+            if (wet > 0.05f && fabsf(n.y) > 0.5f) {
+                float wmask = sky_smoothstep(0.42f, 0.72f, grime) * wet;
+                base_col = f3_mul(base_col, 1.0f - 0.30f * wmask);
+                rough = fmaxf(0.12f, rough * (1.0f - 0.55f * wmask));
+            }
+            break;
+        }
+        case CSG_PROC_BRICK: {
+            float u = (fabsf(n.x) > 0.5f) ? hit_pos.z : hit_pos.x;
+            float v = hit_pos.y;
+            float row = floorf(v * 11.0f);
+            float col_u = u * 4.5f + 0.5f * fmodf(fabsf(row), 2.0f);
+            float fx = col_u - floorf(col_u);
+            float fy = (v * 11.0f) - row;
+            bool mortar = (fx < 0.06f || fy < 0.10f);
+            if (mortar) {
+                base_col = make_float3(0.48f, 0.46f, 0.43f);
+                rough = 0.90f;
+            } else {
+                float b_hash = hash21(floorf(col_u), row);
+                base_col = f3_mul(base_col, 0.82f + 0.34f * b_hash);
+                rough = fmaxf(0.45f, rough + (b_hash - 0.5f) * 0.14f);
+            }
+            break;
+        }
+        case CSG_PROC_WATER: {
+            float wt = params.csg_traffic_time;
+            float wx = hit_pos.x * 0.35f;
+            float wz = hit_pos.z * 0.35f;
+            float eps = 0.08f;
+            float h0 = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
+                     + cosf(wz * 1.9f - wt * 1.1f) * 0.25f
+                     + fbm2(wx * 1.6f + wt * 0.25f, wz * 1.6f - wt * 0.18f) * 0.45f;
+            float hx = sinf((wx + eps) * 2.4f + wt * 1.4f) * 0.35f
+                     + cosf(wz * 1.9f - wt * 1.1f) * 0.25f
+                     + fbm2((wx + eps) * 1.6f + wt * 0.25f, wz * 1.6f - wt * 0.18f) * 0.45f;
+            float hz = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
+                     + cosf((wz + eps) * 1.9f - wt * 1.1f) * 0.25f
+                     + fbm2(wx * 1.6f + wt * 0.25f, (wz + eps) * 1.6f - wt * 0.18f) * 0.45f;
+            float strength = 0.10f;
+            n = f3_norm(make_float3(n.x - (hx - h0) / eps * strength, n.y, n.z - (hz - h0) / eps * strength));
+            rough = 0.035f;
+            clearcoat = 0.95f;
+            cc_rough = 0.025f;
+            break;
+        }
+        case CSG_PROC_METAL: {
+            float patina = fbm2(hit_pos.x * 0.65f + hit_pos.z * 0.65f, hit_pos.y * 0.45f);
+            float brush = value_noise2(hit_pos.y * 14.0f, (hit_pos.x + hit_pos.z) * 2.5f);
+            base_col = f3_mul(base_col, 0.86f + 0.22f * patina);
+            rough = fmaxf(0.06f, fminf(0.85f, rough + (0.5f - brush) * 0.12f));
+            break;
+        }
+        case CSG_PROC_CAR_PAINT: {
+            if ((mat.flags & CSG_MAT_FLAG_CAR_PAINT_FLAKE) != 0u) {
+                float flake = value_noise2(hit_pos.x * 95.0f + hit_pos.y * 41.0f, hit_pos.z * 95.0f);
+                base_col = f3_mul(base_col, 0.92f + 0.18f * flake);
+                rough = fmaxf(0.08f, rough - 0.05f * flake);
+            }
+            clearcoat = fmaxf(clearcoat, 0.85f);
+            cc_rough = fminf(cc_rough, 0.05f);
+            break;
+        }
+        case CSG_PROC_WOOD: {
+            float ring = sinf((hit_pos.x * 18.0f + hit_pos.z * 3.0f) + fbm2(hit_pos.x * 4.0f, hit_pos.z * 4.0f) * 4.0f);
+            base_col = f3_mul(base_col, 0.86f + 0.18f * ring);
+            break;
+        }
+        case CSG_PROC_SAND: {
+            float ripple = sinf(hit_pos.x * 3.5f + fbm2(hit_pos.x * 0.4f, hit_pos.z * 0.4f) * 2.5f);
+            float grit = value_noise2(hit_pos.x * 32.0f, hit_pos.z * 32.0f);
+            base_col = f3_mul(base_col, (0.90f + 0.10f * ripple) * (0.92f + 0.16f * grit));
+            break;
+        }
+        default:
+            break;
+    }
+
+    // Pulse red aviation warning beacons atop tall refinery flare stacks & distillation towers.
+    if ((mat.flags & CSG_MAT_FLAG_EMISSIVE) != 0u
+        && hit_pos.y > 16.0f
+        && emission.x > 2.0f * fmaxf(emission.y, 0.05f)
+        && emission.x > 2.0f * fmaxf(emission.z, 0.05f))
+    {
+        float ph = 0.5f + 0.5f * sinf(params.csg_traffic_time * 3.2f + hit_pos.x * 0.13f + hit_pos.z * 0.07f);
+        float pulse = 0.20f + 0.80f * ph * ph * ph;
+        emission = f3_mul(emission, pulse);
+    }
+}
+
 static __forceinline__ __device__ void trace_primary(
     float3 origin, float3 dir, float tmin,
     unsigned int& p0, unsigned int& p1, unsigned int& p2, unsigned int& p3,
@@ -1069,6 +1354,8 @@ extern "C" __global__ void __raygen__render() {
     float first_roughness = 1.0f;
     float first_depth = 1e6f;
     float2 first_motion = make_float2(0.0f, 0.0f);
+    unsigned int first_sem_id = 0u;
+    unsigned int first_inst_id = 0u;
 
     float3 prev_pos = make_f3(params.prev_cam_pos);
     float3 prev_fwd = make_f3(params.prev_cam_forward);
@@ -1156,16 +1443,29 @@ extern "C" __global__ void __raygen__render() {
             float3 geom_n = make_float3(__uint_as_float(p2), __uint_as_float(p3), __uint_as_float(p4));
             bool entering = f3_dot(geom_n, dir) < 0.0f;
             float3 n = entering ? geom_n : f3_mul(geom_n, -1.0f);
+            bool is_csg = (p0 == 2u);
             float3 base_col = make_float3(
                 (float)(p5 & 0xFFu) / 255.0f,
                 (float)((p5 >> 8u) & 0xFFu) / 255.0f,
                 (float)((p5 >> 16u) & 0xFFu) / 255.0f
             );
-            unsigned int inst_id = p6 & 0xFFu;
+            unsigned int inst_id = is_csg ? 0xFFFFu : (p6 & 0xFFu);
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
             if (bounce == 0 && s == 0) {
                 first_depth = fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd));
+                if (is_csg) {
+                    first_sem_id = (p5 >> 16u) & 0xFFFFu;
+                    unsigned int uid = p6 + 1u;
+                    if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
+                        unsigned int u = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
+                        if (u != 0u) uid = u;
+                    }
+                    first_inst_id = uid;
+                } else {
+                    first_sem_id = (inst_id == 0u) ? 16u : (inst_id + 1u);
+                    first_inst_id = p6 + 1u;
+                }
                 if (has_prev_cam) {
                     float3 rel = f3_sub(hit_pos, prev_pos);
                     float pz = f3_dot(rel, prev_fwd);
@@ -1181,6 +1481,163 @@ extern "C" __global__ void __raygen__render() {
                         );
                     }
                 }
+            }
+
+            if (is_csg) {
+                unsigned int mat_id = p5 & 0xFFFFu;
+                CsgGpuMaterial cmat = load_csg_material(mat_id);
+                float rough = 0.5f;
+                float metallic = 0.0f;
+                float clearcoat = 0.0f;
+                float cc_rough = 0.08f;
+                float3 emission = make_float3(0.0f, 0.0f, 0.0f);
+                eval_csg_procedural(cmat, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
+
+                // Emissive contribution (streetlights, vehicle headlights/taillights, signals, aviation beacons, lit windows)
+                float max_em = fmaxf(emission.x, fmaxf(emission.y, emission.z));
+                if (max_em > 1e-4f) {
+                    sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
+                    if (max_em > 1.5f) {
+                        if (bounce == 0 && s == 0) {
+                            first_albedo = make_float3(
+                                fminf(1.0f, emission.x * 0.35f),
+                                fminf(1.0f, emission.y * 0.35f),
+                                fminf(1.0f, emission.z * 0.35f)
+                            );
+                            first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                            first_specular = make_float3(0.0f, 0.0f, 0.0f);
+                            first_normal = n;
+                            first_roughness = 1.0f;
+                        }
+                        break;
+                    }
+                }
+
+                // Dielectric transmissive CSG glass (windshields, architectural glazing, bus shelters)
+                if ((cmat.flags & CSG_MAT_FLAG_TRANSMISSIVE) != 0u && cmat.procedural_kind == CSG_PROC_GLASS) {
+                    float ior = fmaxf(1.05f, cmat.ior);
+                    float g_rough = fmaxf(0.0f, fminf(0.45f, rough));
+                    if (!entering) {
+                        throughput = f3_mul3(throughput, make_float3(
+                            expf(-fmaxf(0.0f, cmat.absorption[0]) * hit_t),
+                            expf(-fmaxf(0.0f, cmat.absorption[1]) * hit_t),
+                            expf(-fmaxf(0.0f, cmat.absorption[2]) * hit_t)
+                        ));
+                    }
+                    float r0 = (1.0f - ior) / (1.0f + ior);
+                    r0 = r0 * r0;
+                    if (bounce == 0 && s == 0) {
+                        first_albedo = base_col;
+                        first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                        first_specular = make_float3(r0, r0, r0);
+                        first_normal = n;
+                        first_roughness = g_rough;
+                    }
+                    float eta = entering ? (1.0f / ior) : ior;
+                    float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
+                    float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
+                    float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
+                    bool tir = sin2_t > 1.0f;
+                    float g_bias = fmaxf(0.001f, hit_t * 0.0004f);
+                    if (tir || rand01(seed) < fresnel) {
+                        float3 refl = f3_reflect(dir, n);
+                        if (g_rough > 1e-4f) {
+                            refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), g_rough)));
+                        }
+                        dir = refl;
+                        origin = f3_add(hit_pos, f3_mul(n, g_bias));
+                    } else {
+                        float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
+                        float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
+                        if (g_rough > 1e-4f) {
+                            refr = f3_norm(f3_add(refr, f3_mul(sample_cosine_hemisphere(refr, seed), g_rough)));
+                        }
+                        dir = refr;
+                        origin = f3_sub(hit_pos, f3_mul(n, g_bias));
+                        throughput = f3_mul3(throughput, make_float3(
+                            0.65f + 0.35f * base_col.x,
+                            0.65f + 0.35f * base_col.y,
+                            0.65f + 0.35f * base_col.z
+                        ));
+                    }
+                    continue;
+                }
+
+                if (bounce == 0 && s == 0) {
+                    float inv_m = 1.0f - metallic;
+                    first_albedo = base_col;
+                    first_diffuse = f3_mul(base_col, inv_m);
+                    first_specular = f3_add(
+                        make_float3(0.04f * inv_m + 0.04f * clearcoat, 0.04f * inv_m + 0.04f * clearcoat, 0.04f * inv_m + 0.04f * clearcoat),
+                        f3_mul(base_col, metallic)
+                    );
+                    first_normal = n;
+                    first_roughness = (clearcoat > 0.5f) ? fminf(rough, cc_rough + 0.08f) : rough;
+                }
+
+                float ray_bias = fmaxf(0.001f, hit_t * 0.0004f);
+                float3 biased_origin = f3_add(hit_pos, f3_mul(n, ray_bias));
+                float ndotl = fmaxf(0.0f, f3_dot(n, sun_dir));
+                if (ndotl > 0.0f) {
+                    bool occluded = false;
+                    if (params.enable_shadows != 0u) {
+                        float3 jitter = make_float3(rand01(seed) - 0.5f, rand01(seed) - 0.5f, rand01(seed) - 0.5f);
+                        float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.024f)));
+                        occluded = trace_shadow(biased_origin, sdir, 1500.0f);
+                    }
+                    if (!occluded) {
+                        float sun_i = params.fractal_r1[3];
+                        float3 sun_rad = ((params.csg_flags & 2u) != 0u)
+                            ? make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f)
+                            : (((params.csg_flags & 8u) != 0u)
+                                ? make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f)
+                                : make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f));
+                        float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.85f));
+                        float3 half_v = f3_norm(f3_sub(sun_dir, dir));
+                        float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
+                        float spec_exp = fmaxf(4.0f, 2.0f / (rough * rough + 0.002f) - 2.0f);
+                        float spec_norm = (spec_exp + 2.0f) * 0.125f * 0.318309886f;
+                        float spec_val = powf(ndoth, fminf(spec_exp, 512.0f)) * fminf(spec_norm, 6.0f);
+                        float3 spec_tint = f3_add(make_float3(0.04f, 0.04f, 0.04f), f3_mul(base_col, metallic));
+                        float3 direct = f3_add(diff_term, f3_mul(f3_mul3(spec_tint, sun_rad), spec_val * ndotl));
+                        if (clearcoat > 0.01f) {
+                            float cc_exp = fmaxf(12.0f, 2.0f / (cc_rough * cc_rough + 0.001f) - 2.0f);
+                            float cc_norm = (cc_exp + 2.0f) * 0.125f * 0.318309886f;
+                            float cc_val = powf(ndoth, fminf(cc_exp, 1024.0f)) * fminf(cc_norm, 10.0f);
+                            direct = f3_add(direct, f3_mul(sun_rad, 0.08f * clearcoat * cc_val * ndotl));
+                        }
+                        sample_col = f3_add(sample_col, f3_mul3(throughput, direct));
+                    }
+                }
+
+                float cos_v = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
+                float schlick = 0.04f + 0.96f * powf(1.0f - cos_v, 5.0f);
+                float p_coat = clearcoat * (0.12f + 0.78f * schlick);
+                float p_spec = (1.0f - p_coat) * (0.12f + 0.78f * metallic + (1.0f - rough) * 0.25f * schlick);
+                float u_lobe = rand01(seed);
+                float3 diff_dir = sample_cosine_hemisphere(n, seed);
+                float3 refl_dir = f3_reflect(dir, n);
+                if (u_lobe < p_coat) {
+                    dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, cc_rough)));
+                    origin = biased_origin;
+                    // Clearcoat is neutral white Fresnel reflection (preserves crisp sky/lamp reflections)
+                    throughput = f3_mul(throughput, 0.88f);
+                } else if (u_lobe < p_coat + p_spec) {
+                    dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, rough)));
+                    origin = biased_origin;
+                    float3 spec_col = f3_add(
+                        make_float3(0.04f + 0.92f * (1.0f - metallic) * schlick,
+                                    0.04f + 0.92f * (1.0f - metallic) * schlick,
+                                    0.04f + 0.92f * (1.0f - metallic) * schlick),
+                        f3_mul(base_col, metallic)
+                    );
+                    throughput = f3_mul3(throughput, spec_col);
+                } else {
+                    dir = diff_dir;
+                    origin = biased_origin;
+                    throughput = f3_mul3(throughput, base_col);
+                }
+                continue;
             }
 
             if (inst_id == 2u) {
@@ -1400,6 +1857,10 @@ extern "C" __global__ void __raygen__render() {
             fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.y * 0.05f)),
             fminf(1.0f, mag * 0.05f)
         );
+    } else if (params.aov_mode == 5u) {
+        final_col = semantic_aov_color(first_sem_id);
+    } else if (params.aov_mode == 6u) {
+        final_col = instance_aov_color(first_inst_id);
     }
 
     unsigned int out_idx = idx.y * params.width + idx.x;
@@ -1656,5 +2117,67 @@ extern "C" __global__ void __intersection__sphere() {
         __float_as_uint(obj_n.z),
         0xFFE0E0E0u
     );
+}
+
+extern "C" __global__ void __intersection__csg() {
+    if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[inst_idx];
+    if ((inst.flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
+    if (inst.compound_id >= params.csg_compound_count) return;
+
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+    CsgSceneView view = make_csg_view();
+
+    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
+    if (is_shadow) {
+        if ((inst.flags & CSG_INST_FLAG_CAST_SHADOW) == 0u) return;
+        if (csg_trace_shadow(view, inst.compound_id, orig, dir, tmin, tmax)) {
+            optixReportIntersection(tmin, 0u);
+        }
+        return;
+    }
+
+    CsgHit hit;
+    if (csg_trace_compound(view, inst.compound_id, orig, dir, tmin, tmax, &hit)) {
+        unsigned int mat_id = (inst.mat_override != CSG_MAT_OVERRIDE_NONE)
+            ? (inst.mat_override & 0xFFFFu)
+            : (hit.mat_id & 0xFFFFu);
+        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
+        optixReportIntersection(
+            hit.t,
+            0u,
+            __float_as_uint(hit.normal.x),
+            __float_as_uint(hit.normal.y),
+            __float_as_uint(hit.normal.z),
+            mat_sem,
+            hit.part_id
+        );
+    }
+}
+
+extern "C" __global__ void __closesthit__csg() {
+    float3 obj_n = make_float3(
+        __uint_as_float(optixGetAttribute_0()),
+        __uint_as_float(optixGetAttribute_1()),
+        __uint_as_float(optixGetAttribute_2())
+    );
+    float3 world_n = f3_norm(optixTransformNormalFromObjectToWorldSpace(obj_n));
+    unsigned int mat_sem = optixGetAttribute_3();
+    unsigned int part_id = optixGetAttribute_4();
+
+    optixSetPayload_0(2u);
+    optixSetPayload_1(__float_as_uint(optixGetRayTmax()));
+    optixSetPayload_2(__float_as_uint(world_n.x));
+    optixSetPayload_3(__float_as_uint(world_n.y));
+    optixSetPayload_4(__float_as_uint(world_n.z));
+    optixSetPayload_5(mat_sem);
+    optixSetPayload_6(optixGetInstanceId());
+    optixSetPayload_7(part_id);
 }
 

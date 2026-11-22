@@ -8,9 +8,14 @@ use egui_phosphor::regular as ic;
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
+use crate::camera_rail::{CameraRail, RailCassette};
+use crate::csg_scene_host::{
+    CsgStats, GUNDO_CAMERA_PRESETS, inspector_asset_by_index, inspector_asset_camera,
+};
 use crate::demo_anim::DemoAnimator;
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
-use crate::renderer::DemoSettings;
+use crate::renderer::{CaptureSource, DemoSettings};
+use csg_urban::InspectorAssetKind;
 
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
@@ -217,6 +222,10 @@ pub struct UiContext<'a> {
     pub cam_driver: &'a mut CameraDriver,
     pub cam_home: CameraPose,
     pub cam_pose: &'a mut CameraPose,
+    pub camera_rail: &'a mut CameraRail,
+    pub cam_snap_requested: &'a mut bool,
+    pub rail_blend_requested: &'a mut bool,
+    pub cam_fixed_dt: Option<f32>,
     pub cam_mode: &'a mut NavMode,
     pub cam_fly_mode: &'a mut NavMode,
     pub cam_scheme: &'a mut NavScheme,
@@ -234,6 +243,7 @@ pub struct UiContext<'a> {
     pub is_recording: bool,
     pub record_frames: u64,
     pub ser_supported: bool,
+    pub csg_stats: CsgStats,
     pub dlss_rr_available: bool,
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
@@ -350,14 +360,17 @@ impl UiContext<'_> {
                 .on_hover_text("Reset the camera back to its starting viewpoint.")
                 .clicked()
             {
+                self.camera_rail.playing = false;
                 self.cam_driver.controller_mut().set_pose(self.cam_home);
                 *self.cam_pose = self.cam_home;
+                *self.cam_snap_requested = true;
             }
             if ui
                 .button(format!("{} Frame", ic::CROSSHAIR))
                 .on_hover_text("Automatically zoom and center the camera on the fractal (shortcut: A).")
                 .clicked()
             {
+                self.camera_rail.playing = false;
                 let ext = 1.35 * self.settings.obj_scale.max(0.25);
                 self.cam_driver.controller_mut().apply_intent(
                     CameraIntent::FrameBounds {
@@ -369,6 +382,7 @@ impl UiContext<'_> {
                     ViewportSize::new(self.render_w, self.render_h),
                 );
                 *self.cam_pose = self.cam_driver.controller().pose();
+                *self.cam_snap_requested = true;
             }
 
             if ui
@@ -533,7 +547,15 @@ impl UiContext<'_> {
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
         if !split_dragging {
-            let df = crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0);
+            if resp.dragged() && self.camera_rail.playing {
+                self.camera_rail.playing = false;
+            }
+            let df = match self.cam_fixed_dt {
+                Some(fixed_dt) => {
+                    crate::camera_egui::drive_with_dt(ui, &resp, self.cam_driver, 2.0, fixed_dt)
+                }
+                None => crate::camera_egui::drive(ui, &resp, self.cam_driver, 2.0),
+            };
             let kb_free = !ui.ctx().egui_wants_keyboard_input();
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
             let f_pressed =
@@ -544,6 +566,7 @@ impl UiContext<'_> {
                 && ui.input(|i| i.key_pressed(egui::Key::A));
 
             if df.requests.frame_selected || f_pressed {
+                self.camera_rail.playing = false;
                 let cur = self.cam_driver.controller().pose();
                 let dist = cur.eye.length().max(0.25);
                 let fwd = if cur.eye.length_squared() > 1e-6 {
@@ -562,7 +585,9 @@ impl UiContext<'_> {
                 self.cam_driver.controller_mut().set_pose(aimed);
                 self.cam_driver.controller_mut().set_orbit_distance(dist);
                 *self.cam_pose = self.cam_driver.controller().pose();
+                *self.cam_snap_requested = true;
             } else if a_pressed {
+                self.camera_rail.playing = false;
                 let ext = 1.35 * self.settings.obj_scale.max(0.25);
                 self.cam_driver.controller_mut().apply_intent(
                     CameraIntent::FrameBounds {
@@ -574,10 +599,13 @@ impl UiContext<'_> {
                     ViewportSize::new(self.render_w, self.render_h),
                 );
                 *self.cam_pose = self.cam_driver.controller().pose();
+                *self.cam_snap_requested = true;
             } else if df.requests.home {
+                self.camera_rail.playing = false;
                 self.cam_driver.controller_mut().set_pose(self.cam_home);
                 *self.cam_pose = self.cam_home;
-            } else {
+                *self.cam_snap_requested = true;
+            } else if !self.camera_rail.is_active() {
                 *self.cam_pose = df.pose;
             }
         }
@@ -589,13 +617,18 @@ impl UiContext<'_> {
             2 => "NORMAL",
             3 => "DEPTH",
             4 => "MOTION",
+            5 => "SEMANTIC",
+            6 => "INSTANCE",
             _ => "BEAUTY",
         };
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let demo_running = self.demo_anim.is_running();
-        let status = if self.settings.auto_rotate || sat_orbiting || demo_running {
-            let mut tags = Vec::with_capacity(3);
+        let traffic_moving = self.settings.csg_mode == 2
+            && self.settings.csg_traffic_on
+            && self.settings.csg_traffic_speed > 0.001;
+        let status = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
+            let mut tags = Vec::with_capacity(4);
             if demo_running {
                 tags.push("DEMO");
             }
@@ -604,6 +637,9 @@ impl UiContext<'_> {
             }
             if sat_orbiting {
                 tags.push("ORBIT");
+            }
+            if traffic_moving {
+                tags.push("TRAFFIC");
             }
             let anim_tag = tags.join("+");
             format!(
@@ -1091,7 +1127,197 @@ impl UiContext<'_> {
         );
     }
 
+    fn aim_camera(&mut self, eye: [f32; 3], target: [f32; 3]) {
+        self.camera_rail.playing = false;
+        let eye_v = glam::Vec3::from_array(eye);
+        let tgt_v = glam::Vec3::from_array(target);
+        let delta = tgt_v - eye_v;
+        let dist = delta.length().max(0.25);
+        let fwd = delta / dist;
+        let cur = self.cam_driver.controller().pose();
+        let pose = CameraPose::from_eye_forward_up(
+            eye_v,
+            fwd,
+            glam::Vec3::Y,
+            cur.fov_y,
+            cur.znear,
+            cur.zfar.max(2000.0),
+        );
+        self.cam_driver.controller_mut().set_pose(pose);
+        self.cam_driver.controller_mut().set_orbit_distance(dist);
+        *self.cam_pose = self.cam_driver.controller().pose();
+        *self.cam_snap_requested = true;
+    }
+
     fn ui_render_floor(&mut self, ui: &mut Ui) {
+        let mut pending_cam: Option<([f32; 3], [f32; 3])> = None;
+        {
+            let s = &mut *self.settings;
+            let anim = &mut *self.demo_anim;
+
+            collapsing_section(ui, "sec_csg", ic::BUILDINGS, "CSG World", true, |ui| {
+                let prev_mode = s.csg_mode;
+                equal_grid(ui, 3, 3, |ui, idx, w| {
+                    let (mode, label, tip) = match idx {
+                        0 => (0u32, "Off (Classic)", "Classic fractal + metal stage floor"),
+                        1 => (1u32, "Inspector", "Inspect any individual csg-urban kit asset"),
+                        _ => (2u32, "Gundo", "El Segundo Coastal Refinery & Highway digital twin"),
+                    };
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::selectable(s.csg_mode == mode, label),
+                        )
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        s.csg_mode = mode;
+                    }
+                });
+                if s.csg_mode != prev_mode {
+                    if s.csg_mode == 1 {
+                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
+                    } else if s.csg_mode == 2 {
+                        apply_csg_time_of_day_preset(s, s.csg_time_of_day);
+                        pending_cam = Some((GUNDO_CAMERA_PRESETS[0].1, GUNDO_CAMERA_PRESETS[0].2));
+                    }
+                }
+
+                if s.csg_mode == 1 {
+                    ui.add_space(2.0);
+                    let prev_asset = s.csg_asset_idx;
+                    prop_row(ui, "Kit Asset", |ui| {
+                        let gap = 4.0;
+                        let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                        ui.spacing_mut().item_spacing.x = gap;
+                        let cur_asset = inspector_asset_by_index(s.csg_asset_idx);
+                        egui::ComboBox::from_id_salt("csg_asset_combo")
+                            .width(combo_w)
+                            .selected_text(cur_asset.label())
+                            .show_ui(ui, |ui| {
+                                for (i, asset) in InspectorAssetKind::ALL.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut s.csg_asset_idx,
+                                        i as u32,
+                                        asset.label(),
+                                    );
+                                }
+                            });
+                        anim_toggle_btn_disabled(ui);
+                    });
+                    if s.csg_asset_idx != prev_asset {
+                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
+                    }
+                    prop_slider_u32(ui, "Asset Seed", &mut s.csg_seed, 1..=9999, false);
+                    equal_grid(ui, 3, 3, |ui, idx, w| {
+                        let (tod, label) = match idx {
+                            0 => (0u32, "Day"),
+                            1 => (1u32, "Sunset"),
+                            _ => (2u32, "Night"),
+                        };
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::selectable(s.csg_time_of_day == tod, label),
+                            )
+                            .clicked()
+                        {
+                            apply_csg_time_of_day_preset(s, tod);
+                        }
+                    });
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "csg_wetness",
+                        "Wet Asphalt",
+                        &mut s.csg_wetness,
+                        0.0..=1.0,
+                        2,
+                        false,
+                    );
+                    prop_toggle(ui, "Hero Fractal", &mut s.csg_show_fractal, "Overlay Fractal");
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Frame Asset", ic::CROSSHAIR)),
+                        )
+                        .clicked()
+                    {
+                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
+                    }
+                } else if s.csg_mode == 2 {
+                    ui.add_space(2.0);
+                    equal_grid(ui, 3, 3, |ui, idx, w| {
+                        let (tod, label) = match idx {
+                            0 => (0u32, "Day"),
+                            1 => (1u32, "Sunset"),
+                            _ => (2u32, "Night"),
+                        };
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::selectable(s.csg_time_of_day == tod, label),
+                            )
+                            .clicked()
+                        {
+                            apply_csg_time_of_day_preset(s, tod);
+                        }
+                    });
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "csg_wetness",
+                        "Wet Asphalt",
+                        &mut s.csg_wetness,
+                        0.0..=1.0,
+                        2,
+                        false,
+                    );
+                    prop_toggle(ui, "Traffic", &mut s.csg_traffic_on, "Highway Traffic Motion");
+                    if s.csg_traffic_on {
+                        anim_slider_f32(
+                            ui,
+                            anim,
+                            "csg_traffic_speed",
+                            "Traffic Spd",
+                            &mut s.csg_traffic_speed,
+                            0.0..=3.0,
+                            2,
+                            false,
+                        );
+                    }
+                    prop_toggle(ui, "Hero Fractal", &mut s.csg_show_fractal, "Overlay Fractal");
+                    prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
+                    anim_slider_f32(
+                        ui,
+                        anim,
+                        "csg_lod_bias",
+                        "LOD Bias",
+                        &mut s.csg_lod_bias,
+                        0.25..=4.0,
+                        2,
+                        false,
+                    );
+                    ui.add_space(2.0);
+                    equal_grid(ui, 2, GUNDO_CAMERA_PRESETS.len(), |ui, idx, w| {
+                        let (label, eye, tgt) = GUNDO_CAMERA_PRESETS[idx];
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::new(format!("{}  {label}", ic::CAMERA)),
+                            )
+                            .clicked()
+                        {
+                            pending_cam = Some((eye, tgt));
+                        }
+                    });
+                }
+            });
+        }
+        if let Some((eye, tgt)) = pending_cam {
+            self.aim_camera(eye, tgt);
+        }
+
         let s = &mut *self.settings;
         let anim = &mut *self.demo_anim;
 
@@ -1109,6 +1335,7 @@ impl UiContext<'_> {
                     "Elevated (4k)",
                     "Unprogress (4k)",
                     "Offscreen Colonies",
+                    "Coastal Night",
                 ];
                 let idx = (s.sky_mode as usize).min(modes.len() - 1);
                 egui::ComboBox::from_id_salt("sky_mode_combo")
@@ -1597,7 +1824,15 @@ impl UiContext<'_> {
                     }
                 }
                 1 => {
-                    const AOVS: [&str; 5] = ["Beauty", "Albedo", "Normal", "Depth", "Motion"];
+                    const AOVS: [&str; 7] = [
+                        "Beauty",
+                        "Albedo",
+                        "Normal",
+                        "Depth",
+                        "Motion",
+                        "Semantic",
+                        "Instance",
+                    ];
                     let cur = (s.aov_mode as usize).min(AOVS.len() - 1);
                     let tint = (cur != 0).then(|| active_accent_tint(ui));
                     let step = cycle_toggle_btn(
@@ -1605,7 +1840,7 @@ impl UiContext<'_> {
                         w,
                         "AOV",
                         AOVS[cur],
-                        "Inspect what the renderer sees: final Beauty image, base color (Albedo), surface direction (Normal), distance (Depth), or pixel motion.",
+                        "Inspect what the renderer sees: Beauty, Albedo, Normal, Depth, Motion, SemanticId (digital twin class), or InstanceId.",
                         true,
                         tint,
                     );
@@ -1710,6 +1945,7 @@ impl UiContext<'_> {
                 }
             }
             ui.add_space(1.0);
+            let is_full_win = s.capture_source == CaptureSource::FullWindow;
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
                     if ui
@@ -1724,24 +1960,34 @@ impl UiContext<'_> {
                     }
                 }
                 1 => {
+                    let tip = if is_full_win {
+                        "Save a lossless PNG screenshot of the full window (viewport + UI) into renders/."
+                    } else {
+                        "Save a lossless PNG screenshot of the 3D viewport into renders/."
+                    };
                     if ui
                         .add_sized(
                             [w, ROW_H + 2.0],
                             egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
                         )
-                        .on_hover_text("Save a lossless PNG screenshot into the renders/ folder.")
+                        .on_hover_text(tip)
                         .clicked()
                     {
                         *self.save_png_requested = true;
                     }
                 }
                 2 => {
+                    let tip = if is_full_win {
+                        "Encode a GPU-accelerated JPEG snapshot (nvJPEG) of the full window (viewport + UI) into renders/."
+                    } else {
+                        "Encode a fast GPU-accelerated JPEG snapshot (nvJPEG) of the 3D viewport into renders/."
+                    };
                     if ui
                         .add_sized(
                             [w, ROW_H + 2.0],
                             egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
                         )
-                        .on_hover_text("Encode a fast GPU-accelerated JPEG snapshot (nvJPEG) into renders/.")
+                        .on_hover_text(tip)
                         .clicked()
                     {
                         *self.save_jpeg_requested = true;
@@ -1761,12 +2007,21 @@ impl UiContext<'_> {
                     } else {
                         format!("{}  Record MP4", ic::VIDEO_CAMERA)
                     };
-                    let rec_tip = if self.is_recording {
-                        "Stop recording and finalize the MP4 video file (Red = Recording)."
-                    } else if use_pq10 {
-                        "Start recording a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
+                    let target_desc = if is_full_win {
+                        "full window (viewport + UI)"
                     } else {
-                        "Start recording an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
+                        "3D viewport"
+                    };
+                    let rec_tip = if self.is_recording {
+                        "Stop recording and finalize the MP4 video file (Red = Recording).".to_string()
+                    } else if use_pq10 {
+                        format!(
+                            "Start recording the {target_desc} as a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
+                        )
+                    } else {
+                        format!(
+                            "Start recording the {target_desc} as an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
+                        )
                     };
                     let dark = ui.visuals().dark_mode;
                     let rec_btn = if self.is_recording {
@@ -1803,8 +2058,31 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
-            equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
+                    let val = match s.capture_source {
+                        CaptureSource::Viewport => "Viewport",
+                        CaptureSource::FullWindow => "Full Window",
+                    };
+                    let tint = (s.capture_source == CaptureSource::FullWindow)
+                        .then(|| active_accent_tint(ui));
+                    if cycle_toggle_btn(
+                        ui,
+                        w,
+                        "Capture",
+                        val,
+                        "Choose capture source for MP4 video and PNG/JPEG stills: 3D Viewport only or Full Window (viewport + docked egui UI).",
+                        !self.is_recording,
+                        tint,
+                    ) != 0
+                    {
+                        s.capture_source = match s.capture_source {
+                            CaptureSource::Viewport => CaptureSource::FullWindow,
+                            CaptureSource::FullWindow => CaptureSource::Viewport,
+                        };
+                    }
+                }
+                1 => {
                     let hdr_active = s.hdr_display && self.hdr_surface_supported;
                     let val = if hdr_active { "HDR" } else { "SDR" };
                     let tip = if self.hdr_surface_supported {
@@ -1819,7 +2097,7 @@ impl UiContext<'_> {
                         s.hdr_display = !s.hdr_display;
                     }
                 }
-                1 => {
+                2 => {
                     let val = match s.record_video_mode {
                         1 => "SDR",
                         2 => "PQ10",
@@ -1866,6 +2144,35 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
+            {
+                const SHUTTER_MODES: [(u32, &str); 3] = [(1, "Off (1x)"), (2, "180° 2x"), (4, "180° 4x")];
+                let cur = SHUTTER_MODES
+                    .iter()
+                    .position(|&(n, _)| n == s.record_shutter_subframes)
+                    .unwrap_or(0);
+                let enabled = s.record_fixed_fps && !self.is_recording;
+                let tint = (s.record_fixed_fps && s.record_shutter_subframes > 1)
+                    .then(|| active_accent_tint(ui));
+                let tip = if s.record_fixed_fps {
+                    "180-degree shutter motion blur during Smooth 60 recording: averages 2 or 4 subframes across half a frame interval in linear HDR."
+                } else {
+                    "Enable Smooth 60 Timing to unlock 180-degree subframe shutter motion blur."
+                };
+                let step = cycle_toggle_btn(
+                    ui,
+                    ui.available_width(),
+                    "Shutter",
+                    SHUTTER_MODES[cur].1,
+                    tip,
+                    enabled,
+                    tint,
+                );
+                if step != 0 {
+                    let next = (cur as i32 + step).rem_euclid(SHUTTER_MODES.len() as i32) as usize;
+                    s.record_shutter_subframes = SHUTTER_MODES[next].0;
+                }
+            }
+            ui.add_space(2.0);
             if ui
                 .add_sized(
                     [ui.available_width(), ROW_H + 2.0],
@@ -1887,6 +2194,231 @@ impl UiContext<'_> {
     }
 
     fn ui_camera_stats(&mut self, ui: &mut Ui) {
+        let mut snap_pose: Option<CameraPose> = None;
+        let mut request_blend = false;
+        {
+            let s = &mut *self.settings;
+            let rail = &mut *self.camera_rail;
+            let cur_pose = *self.cam_pose;
+            collapsing_section(
+                ui,
+                "sec_cinema",
+                ic::VIDEO_CAMERA,
+                "Cinema & Camera Rail",
+                true,
+                |ui| {
+                    // 1. Toggleable Auto-Drive ON/OFF button (never erases custom keyframes).
+                    {
+                        let active = rail.is_active();
+                        let can_play = rail.can_play();
+                        let dark = ui.visuals().dark_mode;
+                        let lbl = if active {
+                            format!("{}  Auto-Drive: ON (Stop)", ic::PAUSE)
+                        } else {
+                            format!("{}  Auto-Drive: OFF (Start)", ic::PLAY)
+                        };
+                        let mut btn = egui::Button::new(if active {
+                            RichText::new(lbl).color(if dark {
+                                Color32::from_rgb(220, 248, 228)
+                            } else {
+                                Color32::from_rgb(22, 86, 46)
+                            })
+                        } else {
+                            RichText::new(lbl)
+                        });
+                        if active {
+                            btn = btn
+                                .fill(if dark {
+                                    Color32::from_rgb(32, 86, 56)
+                                } else {
+                                    Color32::from_rgb(204, 238, 216)
+                                })
+                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)));
+                        }
+                        let tip = if active {
+                            "Turn Auto-Drive OFF to immediately regain manual camera control without wiping your custom keyframes."
+                        } else if can_play {
+                            "Turn Auto-Drive ON to fly the selected cassette smoothly (built-in cassettes auto-enable Gundo)."
+                        } else {
+                            "Add at least 2 Custom keyframes (+ KF) or select a built-in Gundo cassette to enable Auto-Drive."
+                        };
+                        if ui
+                            .add_enabled(
+                                active || can_play,
+                                btn.min_size(egui::vec2(ui.available_width(), ROW_H + 4.0)),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            if active {
+                                rail.set_playing(false);
+                            } else {
+                                if rail.cassette.is_builtin() && s.csg_mode != 2 {
+                                    s.csg_mode = 2;
+                                    apply_csg_time_of_day_preset(s, s.csg_time_of_day);
+                                }
+                                if rail.set_playing(true) {
+                                    request_blend = true;
+                                }
+                            }
+                        }
+                    }
+                    ui.add_space(2.0);
+                    // 2. Multi-Cassette Deck selector.
+                    prop_row(ui, "Cassette", |ui| {
+                        let prev = rail.cassette;
+                        let sel_text = if prev == RailCassette::Custom {
+                            format!("Custom ({} KF)", rail.keyframes.len())
+                        } else {
+                            prev.label().to_string()
+                        };
+                        egui::ComboBox::from_id_salt("cinema_cassette_combo")
+                            .width(ui.available_width().max(80.0))
+                            .selected_text(sel_text)
+                            .show_ui(ui, |ui| {
+                                for &c in RailCassette::ALL {
+                                    let text = if c == RailCassette::Custom {
+                                        format!("Custom ({} KF)", rail.keyframes.len())
+                                    } else {
+                                        c.label().to_string()
+                                    };
+                                    let resp = ui.selectable_value(&mut rail.cassette, c, text);
+                                    resp.on_hover_text(c.description());
+                                }
+                            });
+                        if rail.cassette != prev {
+                            let chosen = rail.cassette;
+                            // Restore `prev` so `select_cassette` applies duration/loop/LUT defaults cleanly.
+                            rail.cassette = prev;
+                            rail.select_cassette(chosen);
+                            if rail.is_active() {
+                                if chosen.is_builtin() && s.csg_mode != 2 {
+                                    s.csg_mode = 2;
+                                    apply_csg_time_of_day_preset(s, s.csg_time_of_day);
+                                }
+                                request_blend = true;
+                            }
+                        }
+                    });
+                    prop_slider_f32(
+                        ui,
+                        "Cam Smooth",
+                        &mut s.cam_smooth_tau,
+                        0.0..=1.0,
+                        2,
+                        "s",
+                    );
+                    prop_slider_f32(
+                        ui,
+                        "Time Scale",
+                        &mut s.time_scale,
+                        0.05..=2.0,
+                        2,
+                        "x",
+                    );
+                    ui.add_space(2.0);
+                    equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                        0 => {
+                            let tint = rail.looping.then(|| active_accent_tint(ui));
+                            if cycle_toggle_btn(
+                                ui,
+                                w,
+                                "Loop",
+                                if rail.looping { "On" } else { "Off" },
+                                "Continuously wrap the camera rail with C1 periodic continuity.",
+                                true,
+                                tint,
+                            ) != 0
+                            {
+                                rail.looping = !rail.looping;
+                                rail.sync_lut();
+                            }
+                        }
+                        _ => {
+                            let tint = rail.ease_io.then(|| active_accent_tint(ui));
+                            if cycle_toggle_btn(
+                                ui,
+                                w,
+                                "Ease",
+                                if rail.ease_io { "I/O" } else { "Lin" },
+                                "Smoothstep ease-in / ease-out vs constant arc-length speed along the rail.",
+                                true,
+                                tint,
+                            ) != 0
+                            {
+                                rail.ease_io = !rail.ease_io;
+                            }
+                        }
+                    });
+                    prop_slider_f32(
+                        ui,
+                        "Duration",
+                        &mut rail.duration_s,
+                        2.0..=120.0,
+                        1,
+                        "s",
+                    );
+                    if rail.can_play() {
+                        let dur = rail.duration_s.max(0.5);
+                        let prev_t = rail.time_s;
+                        prop_slider_f32(ui, "Rail Time", &mut rail.time_s, 0.0..=dur, 2, "s");
+                        if (rail.time_s - prev_t).abs() > 1e-5
+                            && let Some(p) =
+                                rail.evaluate_current(cur_pose.znear, cur_pose.zfar.max(2000.0))
+                        {
+                            snap_pose = Some(p);
+                        }
+                    }
+                    ui.add_space(2.0);
+                    // 3. Independent Custom Keyframe controls (preserved across cassette switches).
+                    equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+                        0 => {
+                            let lbl = format!("+ KF ({})", rail.keyframes.len());
+                            if ui
+                                .add_sized([w, ROW_H + 2.0], egui::Button::new(lbl))
+                                .on_hover_text("Append the current camera pose to your Custom keyframe deck.")
+                                .clicked()
+                            {
+                                rail.push_pose(cur_pose);
+                            }
+                        }
+                        1 => {
+                            if ui
+                                .add_enabled(
+                                    !rail.keyframes.is_empty(),
+                                    egui::Button::new("Pop KF").min_size(egui::vec2(w, ROW_H + 2.0)),
+                                )
+                                .on_hover_text("Remove the last Custom keyframe.")
+                                .clicked()
+                            {
+                                rail.pop_keyframe();
+                            }
+                        }
+                        _ => {
+                            if ui
+                                .add_enabled(
+                                    !rail.keyframes.is_empty(),
+                                    egui::Button::new("Clear").min_size(egui::vec2(w, ROW_H + 2.0)),
+                                )
+                                .on_hover_text("Clear all Custom keyframes without affecting built-in cassettes.")
+                                .clicked()
+                            {
+                                rail.clear();
+                            }
+                        }
+                    });
+                },
+            );
+        }
+        if request_blend {
+            *self.rail_blend_requested = true;
+        }
+        if let Some(pose) = snap_pose {
+            self.cam_driver.controller_mut().set_pose(pose);
+            *self.cam_pose = pose;
+            *self.cam_snap_requested = true;
+        }
+
         collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", true, |ui| {
             stat_row(ui, "GPU", &self.telemetry.gpu_name);
             stat_row(
@@ -1958,6 +2490,29 @@ impl UiContext<'_> {
                     (false, _) => "Unavailable",
                 },
             );
+            if self.settings.csg_mode != 0 {
+                stat_row(
+                    ui,
+                    "CSG Inst",
+                    &format!(
+                        "{} / {}",
+                        self.csg_stats.visible_instances, self.csg_stats.total_instances
+                    ),
+                );
+                stat_row(
+                    ui,
+                    "CSG DAG",
+                    &format!(
+                        "{} cmp / {} prm",
+                        self.csg_stats.compounds, self.csg_stats.primitives
+                    ),
+                );
+                stat_row(
+                    ui,
+                    "CSG VRAM",
+                    &format!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
+                );
+            }
         });
 
         collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {
@@ -1993,8 +2548,39 @@ impl UiContext<'_> {
     }
 }
 
+fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
+    s.csg_time_of_day = tod.min(2);
+    match s.csg_time_of_day {
+        0 => {
+            s.sky_mode = 0; // Daylight
+            s.sun_azimuth = -52.0;
+            s.sun_elevation = 46.0;
+            s.sun_intensity = 2.20;
+            s.sky_intensity = 0.95;
+            s.exposure = 0.90;
+        }
+        2 => {
+            s.sky_mode = 8; // Coastal Night
+            s.sun_azimuth = -110.0;
+            s.sun_elevation = 24.0;
+            s.sun_intensity = 0.16;
+            s.sky_intensity = 0.65;
+            s.exposure = 1.05;
+        }
+        _ => {
+            s.sky_mode = 1; // Golden Sunset
+            s.sun_azimuth = -98.0;
+            s.sun_elevation = 11.0;
+            s.sun_intensity = 1.75;
+            s.sky_intensity = 0.85;
+            s.exposure = 0.95;
+        }
+    }
+}
+
 fn section_accent(id_salt: &str) -> Color32 {
     match id_salt {
+        "sec_csg" => Color32::from_rgb(92, 184, 224),
         "sec_sky" => Color32::from_rgb(232, 178, 84),
         "sec_env" => Color32::from_rgb(98, 162, 208),
         "sec_dof" => Color32::from_rgb(198, 118, 162),
@@ -2007,6 +2593,7 @@ fn section_accent(id_salt: &str) -> Color32 {
         "sec_formula" => Color32::from_rgb(92, 188, 168),
         "sec_transform" => Color32::from_rgb(138, 164, 212),
         "sec_detail" => Color32::from_rgb(166, 209, 137),
+        "sec_cinema" => Color32::from_rgb(232, 148, 112),
         "sec_telemetry" => Color32::from_rgb(112, 172, 216),
         "sec_perf" => Color32::from_rgb(112, 184, 156),
         _ => Color32::from_rgb(142, 149, 163),
@@ -2018,6 +2605,7 @@ const SECTION_GROUPS: &[&[&str]] = &[
     &["sec_presets", "sec_formula", "sec_transform", "sec_detail"],
     // Render & Floor panel
     &[
+        "sec_csg",
         "sec_sky",
         "sec_dof",
         "sec_floor",
@@ -2027,7 +2615,7 @@ const SECTION_GROUPS: &[&[&str]] = &[
         "sec_pt",
     ],
     // Camera & Stats panel
-    &["sec_telemetry", "sec_perf"],
+    &["sec_cinema", "sec_telemetry", "sec_perf"],
 ];
 
 fn section_group_for(id_salt: &str) -> &'static [&'static str] {
@@ -2041,10 +2629,12 @@ fn section_group_for(id_salt: &str) -> &'static [&'static str] {
 fn section_default_open(id_salt: &str) -> bool {
     matches!(
         id_salt,
-        "sec_telemetry"
+        "sec_cinema"
+            | "sec_telemetry"
             | "sec_perf"
             | "sec_presets"
             | "sec_formula"
+            | "sec_csg"
             | "sec_sky"
             | "sec_pt"
     )
@@ -2340,6 +2930,36 @@ fn anim_slider_f32(
         );
         ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn(ui, anim, key);
+    });
+}
+
+fn prop_slider_f32(
+    ui: &mut Ui,
+    label: &str,
+    val: &mut f32,
+    range: RangeInclusive<f32>,
+    decimals: usize,
+    suffix: &str,
+) {
+    prop_row(ui, label, |ui| {
+        let gap = 4.0;
+        let track_w = (ui.available_width() - VAL_W - ANIM_BTN_W - gap * 2.0).max(32.0);
+        ui.spacing_mut().item_spacing.x = gap;
+        ui.spacing_mut().slider_width = track_w;
+        let slider = egui::Slider::new(val, range.clone()).show_value(false);
+        ui.add_sized([track_w, ROW_H], slider);
+        let prev_style = ui.style().override_text_style.clone();
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+        let mut drag = egui::DragValue::new(val)
+            .range(range)
+            .fixed_decimals(decimals)
+            .speed(0.01);
+        if !suffix.is_empty() {
+            drag = drag.suffix(suffix);
+        }
+        ui.add_sized([VAL_W, ROW_H], drag);
+        ui.style_mut().override_text_style = prev_style;
+        anim_toggle_btn_disabled(ui);
     });
 }
 

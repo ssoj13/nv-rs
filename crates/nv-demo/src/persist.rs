@@ -161,6 +161,7 @@ pub struct PersistedState {
     pub settings: DemoSettings,
     pub demo_anim: DemoAnimator,
     pub camera: CameraState,
+    pub camera_rail: crate::camera_rail::CameraRail,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -290,6 +291,35 @@ mod tests {
         state.settings.sat_count = 6;
         state.settings.sat_seed = 777;
         state.settings.glass_absorb = 5.5;
+        state.settings.csg_mode = 2;
+        state.settings.csg_asset_idx = 5;
+        state.settings.csg_time_of_day = 2;
+        state.settings.csg_wetness = 0.72;
+        state.settings.csg_traffic_on = true;
+        state.settings.csg_traffic_speed = 1.4;
+        state.settings.capture_source = crate::renderer::CaptureSource::FullWindow;
+        state.settings.cam_smooth_tau = 0.25;
+        state.settings.time_scale = 0.5;
+        state.settings.record_shutter_subframes = 4;
+        state.camera_rail = crate::camera_rail::CameraRail::gundo_auto_drive();
+        state.camera_rail.keyframes = vec![
+            crate::camera_rail::CameraKeyframe::from_look_at(
+                [-12.0, 4.0, -30.0],
+                [10.0, 5.0, 0.0],
+                50.0,
+            ),
+            crate::camera_rail::CameraKeyframe::from_look_at(
+                [18.0, 8.0, 40.0],
+                [40.0, 12.0, 90.0],
+                54.0,
+            ),
+        ];
+        state
+            .camera_rail
+            .select_cassette(crate::camera_rail::RailCassette::RefinerySlalom);
+        // Runtime-only fields (`playing`, `time_s`) are not persisted.
+        state.camera_rail.playing = false;
+        state.camera_rail.time_s = 0.0;
         state.camera = CameraState::from_runtime(
             NavMode::Trackball,
             NavMode::QuatFlightLocked,
@@ -312,6 +342,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(loaded, state);
+        assert_eq!(
+            loaded.camera_rail.cassette,
+            crate::camera_rail::RailCassette::RefinerySlalom
+        );
+        assert_eq!(loaded.camera_rail.keyframes.len(), 2);
         assert_eq!(loaded.camera.nav_mode(), NavMode::Trackball);
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::QuatFlightLocked);
         assert_eq!(loaded.camera.nav_scheme(), NavScheme::Blender);
@@ -337,6 +372,18 @@ mod tests {
         assert_eq!(loaded.window.height, 720);
         assert_eq!(loaded.settings.sat_count, 9);
         assert_eq!(loaded.settings.sat_seed, 42);
+        assert_eq!(
+            loaded.settings.capture_source,
+            crate::renderer::CaptureSource::Viewport
+        );
+        assert_eq!(loaded.settings.cam_smooth_tau, 0.0);
+        assert_eq!(loaded.settings.time_scale, 1.0);
+        assert_eq!(loaded.settings.record_shutter_subframes, 1);
+        assert_eq!(
+            loaded.camera_rail.cassette,
+            crate::camera_rail::RailCassette::CoastalCruise
+        );
+        assert!(loaded.camera_rail.keyframes.is_empty());
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::FpsFly);
     }
 }

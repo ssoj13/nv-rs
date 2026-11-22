@@ -21,6 +21,10 @@ ngx = { path = "../ngx" }
 cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "main" }
 cuda-core-ext = { path = "../cuda-core-ext" }
+csg-core = { workspace = true }
+csg-scene = { workspace = true }
+csg-device = { workspace = true }
+csg-urban = { workspace = true }
 
 wgpu = "30"
 egui = { version = "0.36", features = ["default_fonts"] }
@@ -37,6 +41,7 @@ serde_json = { workspace = true }
 
 [build-dependencies]
 cc = "1"
+csg-device = { workspace = true }
 
 [lints]
 workspace = true

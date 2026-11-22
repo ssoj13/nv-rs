@@ -1,11 +1,13 @@
-//! Host-side `csg-rs` scene lifecycle, per-compound OptiX GAS cache, and zero-churn GPU uploads.
+//! 100% scene-agnostic `csg-rs` host lifecycle, batched per-compound OptiX GAS cache, and
+//! zero-churn GPU uploads.
 //!
-//! What: builds `csg-urban` scenes (`Gundo` coastal refinery & highway or any of the 28
-//! `InspectorAssetKind` assets), caches one OptiX custom-primitive GAS per compiled `GpuCompound`,
-//! uploads flat `CsgSceneView` device buffers once per scene rebuild, and updates dynamic traffic
-//! and materials in-place with zero steady-state GPU buffer reallocations.
-//! Why: keeps `renderer.rs` focused on the OptiX frame loop while preserving zero-churn
-//! performance for 10k-100k+ CSG instances.
+//! What: loads any registered [`csg_scene::SceneModule`] from [`csg_scenes::default_scene_registry`]
+//! (`Gundo`, `Marina del Rey`, `SF House of AI`, `Studio Asset Inspector`, or future scenes),
+//! batches all compound `OptixAabb`s in a single H2D upload while caching one custom-primitive GAS
+//! per unique `GpuCompound`, refreshes material palettes and 3D Frenet traffic in-place with zero
+//! steady-state GPU buffer reallocations, and synthesizes exact-CSG random rails on demand.
+//! Why: keeps `nv-demo` completely decoupled from scene-specific coordinates, presets, or rails
+//! while delivering smooth frame times across 10k-100k+ CSG instances.
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
 use std::marker::PhantomData;
@@ -18,10 +20,10 @@ use optix::{Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, Instance
 
 use csg_core::GpuCompound;
 use csg_core::math::Vec3;
-use csg_scene::{CameraView, GpuInstance, GpuMaterial, PackedGpuScene, WorldScene};
-use csg_urban::{
-    GundoParams, GundoTimeOfDay, GundoTraffic, InspectorAssetKind, MaterialPalette,
-    build_gundo_scene_with_traffic, build_inspector_scene, step_gundo_traffic,
+use csg_scene::{
+    CameraView, GpuInstance, GpuMaterial, PackedGpuScene, RailGenConfig, RailSpec,
+    SceneBuildConfig, SceneDescriptor, SceneHints, SceneRegistry, SceneTraffic, SceneViewpoint,
+    TimeOfDay, WorldScene, generate_random_rail,
 };
 
 /// SBT hit-group offset for `hit_csg` (`__intersection__csg` + `__closesthit__csg`).
@@ -33,7 +35,7 @@ pub mod csg_flags {
     pub const ENABLED: u32 = 1 << 0;
     /// Night lighting mode (boosts emissive streetlights, headlights, beacons).
     pub const NIGHT: u32 = 1 << 1;
-    /// Wet coastal asphalt puddles enabled.
+    /// Wet asphalt puddles enabled.
     pub const WET_ASPHALT: u32 = 1 << 2;
     /// Golden sunset lighting mode.
     pub const SUNSET: u32 = 1 << 3;
@@ -54,6 +56,19 @@ pub struct CsgStats {
     pub gpu_bytes: u64,
 }
 
+/// Scene metadata delivered once to the UI thread whenever a new CSG scene finishes building.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneLoadedMetadata {
+    /// Active `csg_mode` (`0 = Off`, `1..=N` = registry index + 1).
+    pub scene_idx: u32,
+    /// Active variant index (e.g. `Inspector` asset index).
+    pub variant_idx: u32,
+    /// Curated static camera viewpoints exported by the scene module.
+    pub viewpoints: Vec<SceneViewpoint>,
+    /// Collision-verified cinematic camera rails exported by the scene module.
+    pub rails: Vec<RailSpec>,
+}
+
 /// Device pointer bundle copied into `LaunchParams` each frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CsgDevicePointers {
@@ -70,59 +85,28 @@ pub struct CsgDevicePointers {
     pub compound_count: u32,
 }
 
-/// Scene structural configuration key that requires a full `WorldScene` + GAS rebuild.
+/// Structural configuration key that triggers a full `WorldScene` + GAS rebuild.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CsgSceneKey {
-    /// `0 = Off (Classic)`, `1 = Asset Inspector`, `2 = Gundo`.
-    pub mode: u32,
-    /// Asset index into `InspectorAssetKind::ALL` (used when `mode == 1`).
-    pub asset_idx: u32,
+    /// `0 = Off (Classic)`, `1..=registry.len()` maps to `registry.get_by_index(scene_idx - 1)`.
+    pub scene_idx: u32,
+    /// Scene-specific variant index (e.g. asset index for `Inspector`).
+    pub variant_idx: u32,
     /// Deterministic world / asset seed.
     pub seed: u32,
 }
 
-/// Curated camera preset `(label, eye, look_target)` for `Gundo` coastal scenes.
-pub const GUNDO_CAMERA_PRESETS: &[(&str, [f32; 3], [f32; 3])] = &[
-    (
-        "Highway",
-        [-14.0, 5.2, -52.0],
-        [10.0, 3.8, 22.0],
-    ),
-    (
-        "Refinery",
-        [-24.0, 18.0, -78.0],
-        [56.0, 14.0, 4.0],
-    ),
-    (
-        "Seawall",
-        [-28.0, 4.4, -36.0],
-        [4.0, 3.2, 24.0],
-    ),
-    (
-        "Aerial",
-        [-72.0, 46.0, -110.0],
-        [36.0, 6.0, 12.0],
-    ),
-];
-
-/// Returns the `InspectorAssetKind` for a UI index, clamping safely to the catalog length.
-pub fn inspector_asset_by_index(idx: u32) -> InspectorAssetKind {
-    let all = InspectorAssetKind::ALL;
-    all[(idx as usize).min(all.len().saturating_sub(1))]
+/// Returns descriptors for all registered pure-CSG scene modules in deterministic order.
+pub fn default_scene_descriptors() -> Vec<SceneDescriptor> {
+    csg_scenes::default_scene_registry().descriptors()
 }
 
-/// Returns `(eye, target)` recommended camera coordinates for an inspector asset index.
-pub fn inspector_asset_camera(idx: u32) -> ([f32; 3], [f32; 3]) {
-    let (eye, tgt) = inspector_asset_by_index(idx).recommended_camera();
-    ([eye.x, eye.y, eye.z], [tgt.x, tgt.y, tgt.z])
-}
-
-/// Maps UI `csg_time_of_day` (`0 = Day`, `1 = Sunset`, `2 = Night`) to `GundoTimeOfDay`.
-pub const fn time_of_day_from_u32(v: u32) -> GundoTimeOfDay {
+/// Maps UI `csg_time_of_day` (`0 = Day`, `1 = Sunset`, `2 = Night`) to [`TimeOfDay`].
+pub const fn time_of_day_from_u32(v: u32) -> TimeOfDay {
     match v {
-        0 => GundoTimeOfDay::Day,
-        2 => GundoTimeOfDay::Night,
-        _ => GundoTimeOfDay::Sunset,
+        0 => TimeOfDay::Day,
+        2 => TimeOfDay::Night,
+        _ => TimeOfDay::Sunset,
     }
 }
 
@@ -238,11 +222,16 @@ impl<T: Pod> GrowDeviceBuffer<T> {
     }
 }
 
-/// Owns the active `csg-rs` CPU world, per-compound OptiX GAS cache, and flat GPU buffers.
+/// Owns the active `SceneRegistry`, compiled `WorldScene`, batched per-compound OptiX GAS cache,
+/// dynamic traffic controller, and flat GPU buffers.
 pub struct CsgGpuHost {
+    registry: SceneRegistry,
     scene_key: CsgSceneKey,
+    active_reg_idx: Option<usize>,
     world: Option<WorldScene>,
-    traffic: Option<GundoTraffic>,
+    traffic: Option<SceneTraffic>,
+    hints: Option<SceneHints>,
+    pending_metadata: Option<SceneLoadedMetadata>,
     packed: PackedGpuScene,
     /// Per-compound cached OptiX custom-primitive GASes (indexed by `compound_id`).
     compound_gases: Vec<Arc<Accel>>,
@@ -270,12 +259,16 @@ impl Default for CsgGpuHost {
 }
 
 impl CsgGpuHost {
-    /// Creates an empty host in `Off (Classic)` mode with zero GPU allocations.
+    /// Creates an empty host in `Off (Classic)` mode backed by [`csg_scenes::default_scene_registry`].
     pub fn new() -> Self {
         Self {
+            registry: csg_scenes::default_scene_registry(),
             scene_key: CsgSceneKey::default(),
+            active_reg_idx: None,
             world: None,
             traffic: None,
+            hints: None,
+            pending_metadata: None,
             packed: PackedGpuScene::new(),
             compound_gases: Vec::new(),
             compounds_buf: None,
@@ -296,14 +289,44 @@ impl CsgGpuHost {
         }
     }
 
-    /// Returns `true` when a CSG scene (`Asset Inspector` or `Gundo`) is loaded and active.
+    /// Returns `true` when any registered CSG scene is loaded and active.
     pub fn is_active(&self) -> bool {
-        self.scene_key.mode != 0 && self.world.is_some()
+        self.scene_key.scene_idx != 0 && self.world.is_some()
+    }
+
+    /// Returns `true` when the active scene has dynamic moving traffic actors.
+    pub fn has_traffic(&self) -> bool {
+        self.traffic
+            .as_ref()
+            .is_some_and(|t| !t.actors.is_empty())
     }
 
     /// Returns the latest CSG telemetry for the UI.
     pub fn stats(&self) -> CsgStats {
         self.stats
+    }
+
+    /// Returns `true` if freshly built scene metadata is waiting to be sent to the UI thread.
+    pub fn has_pending_metadata(&self) -> bool {
+        self.pending_metadata.is_some()
+    }
+
+    /// Takes freshly built scene metadata (viewpoints + collision-verified rails) once per rebuild.
+    pub fn take_loaded_metadata(&mut self) -> Option<SceneLoadedMetadata> {
+        self.pending_metadata.take()
+    }
+
+    /// Synthesizes a fresh deterministic, exact-CSG collision-verified random rail for the active scene.
+    pub fn generate_random_rail(&self, seed: u64) -> Result<RailSpec, String> {
+        let (Some(world), Some(hints)) = (&self.world, &self.hints) else {
+            return Err("Load a CSG scene before generating a random rail".to_string());
+        };
+        let cfg = RailGenConfig {
+            seed,
+            ..RailGenConfig::default()
+        };
+        generate_random_rail(world, hints, seed, &cfg)
+            .map_err(|e| format!("Random rail gen failed: {e}"))
     }
 
     /// Returns the flat device pointers for `LaunchParams`.
@@ -337,7 +360,7 @@ impl CsgGpuHost {
 
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
     /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes,
-    /// steps highway traffic, and repacks visible instances when needed.
+    /// steps 3D Frenet dynamic traffic, and repacks visible instances when needed.
     ///
     /// Returns `Ok(true)` if the OptiX IAS must be rebuilt this frame.
     #[expect(
@@ -364,31 +387,33 @@ impl CsgGpuHost {
             rebuilt_scene = true;
         }
 
-        if key.mode == 0 {
+        if key.scene_idx == 0 {
             let dirty = self.ias_dirty || rebuilt_scene;
             self.ias_dirty = false;
             return Ok(dirty);
         }
 
-        // Fast in-place material palette refresh (zero GAS/scene rebuild!) on wetness/time change.
+        // Fast in-place material palette refresh (zero GAS/scene rebuild!) via SceneModule.
         let mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
         if mat_state != self.last_mat_state
-            && let Some(ref mut world) = self.world
+            && let (Some(reg_idx), Some(world)) = (self.active_reg_idx, self.world.as_mut())
+            && let Some(module) = self.registry.get_by_index(reg_idx)
         {
             let tod = time_of_day_from_u32(time_of_day);
-            let palette = MaterialPalette::gundo(wetness.clamp(0.0, 1.0), tod.night_factor());
-            world.materials = palette.to_material_table();
+            module.refresh_materials(world, wetness.clamp(0.0, 1.0), tod);
             self.materials_buf.upload(stream, world.materials.as_slice())?;
             self.last_mat_state = mat_state;
         }
 
-        // Step animated highway traffic in-place (zero heap allocations).
+        // Step animated 3D Frenet traffic in-place (zero heap allocations).
         let traffic_bits = traffic_time_s.to_bits();
-        let traffic_moved = self.traffic.is_some() && traffic_bits != self.last_traffic_bits;
+        let traffic_moved = self.has_traffic() && traffic_bits != self.last_traffic_bits;
         if traffic_moved
-            && let (Some(world), Some(traffic)) = (&mut self.world, &self.traffic)
+            && let (Some(reg_idx), Some(world), Some(traffic)) =
+                (self.active_reg_idx, self.world.as_mut(), self.traffic.as_ref())
+            && let Some(module) = self.registry.get_by_index(reg_idx)
         {
-            step_gundo_traffic(world, traffic, traffic_time_s);
+            module.step_dynamic(world, traffic, traffic_time_s);
             self.last_traffic_bits = traffic_bits;
         }
 
@@ -477,8 +502,10 @@ impl CsgGpuHost {
             .map_err(|e| format!("CSG pre-rebuild sync failed: {e}"))?;
 
         self.scene_key = key;
+        self.active_reg_idx = None;
         self.world = None;
         self.traffic = None;
+        self.hints = None;
         self.compound_gases.clear();
         self.compounds_buf = None;
         self.ops_buf = None;
@@ -495,43 +522,48 @@ impl CsgGpuHost {
         self.last_traffic_bits = u32::MAX;
         self.ias_dirty = true;
 
-        if key.mode == 0 {
+        if key.scene_idx == 0 {
+            self.pending_metadata = Some(SceneLoadedMetadata {
+                scene_idx: 0,
+                variant_idx: 0,
+                viewpoints: Vec::new(),
+                rails: Vec::new(),
+            });
             return Ok(());
         }
 
-        let tod = time_of_day_from_u32(time_of_day);
-        let (mut world, traffic) = match key.mode {
-            1 => {
-                let kind = inspector_asset_by_index(key.asset_idx);
-                let w = build_inspector_scene(kind, u64::from(key.seed));
-                (w, None)
-            }
-            _ => {
-                let params = GundoParams {
-                    seed: u64::from(key.seed).max(1),
-                    wetness: wetness.clamp(0.0, 1.0),
-                    time_of_day: tod,
-                    ..GundoParams::default()
-                };
-                let (w, tr) = build_gundo_scene_with_traffic(&params);
-                (w, Some(tr))
-            }
-        };
+        let reg_count = self.registry.len();
+        if reg_count == 0 {
+            return Err("CSG SceneRegistry is empty".to_string());
+        }
+        let reg_idx = ((key.scene_idx as usize).saturating_sub(1)).min(reg_count - 1);
+        let module = self
+            .registry
+            .get_by_index(reg_idx)
+            .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
 
-        // Ensure inspector scenes also reflect current wetness & time-of-day palette.
-        let palette = MaterialPalette::gundo(wetness.clamp(0.0, 1.0), tod.night_factor());
-        world.materials = palette.to_material_table();
+        let tod = time_of_day_from_u32(time_of_day);
+        let build_cfg = SceneBuildConfig {
+            seed: u64::from(key.seed).max(1),
+            wetness: wetness.clamp(0.0, 1.0),
+            time_of_day: tod,
+            variant_idx: key.variant_idx,
+            ..SceneBuildConfig::default()
+        };
+        let mut built = module.build(&build_cfg);
+        module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
         // Upload static compiled library buffers once per scene rebuild.
-        let lib = &world.library;
+        let lib = &built.world.library;
         self.compounds_buf = upload_optional_slice(stream, &lib.compounds)?;
         self.ops_buf = upload_optional_slice(stream, &lib.ops)?;
         self.prims_buf = upload_optional_slice(stream, &lib.prims)?;
         self.aux_planes_buf = upload_optional_slice(stream, &lib.aux_planes)?;
         self.guard_aabbs_buf = upload_optional_slice(stream, &lib.guard_aabbs)?;
         self.repeats_buf = upload_optional_slice(stream, &lib.repeats)?;
-        self.materials_buf.upload(stream, world.materials.as_slice())?;
+        self.materials_buf
+            .upload(stream, built.world.materials.as_slice())?;
 
         self.static_gpu_bytes = std::mem::size_of_val(lib.compounds.as_slice())
             + std::mem::size_of_val(lib.ops.as_slice())
@@ -540,38 +572,60 @@ impl CsgGpuHost {
             + std::mem::size_of_val(lib.guard_aabbs.as_slice())
             + std::mem::size_of_val(lib.repeats.as_slice());
 
-        // Build & cache one custom-primitive GAS per unique compound so IAS updates never rebuild GASes.
+        // Upload ALL compound AABBs in ONE batched H2D `DeviceBuffer<Aabb>`, then build one cached
+        // custom-primitive GAS per compound via fast GPU D2D copy into a 1-box staging slot.
         let build_opts = BuildOptions {
             prefer_fast_trace: true,
             ..Default::default()
         };
         let aabb_host: Vec<Aabb> = lib.compounds.iter().map(sanitized_compound_aabb).collect();
         let mut gases = Vec::with_capacity(aabb_host.len());
-        let mut aabb_staging = DeviceBuffer::zeroed(stream, 1)
-            .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
-        for aabb in &aabb_host {
-            aabb_staging
-                .copy_from_host(stream, std::slice::from_ref(aabb))
-                .map_err(|e| format!("CSG AABB upload failed: {e}"))?;
-            let gas = Accel::custom(
-                optix_ctx,
-                stream,
-                scratch,
-                &[CustomPrimitives::new(&aabb_staging)],
-                build_opts,
-            )
-            .map_err(|e| format!("CSG compound GAS build failed: {e}"))?;
-            gases.push(gas);
+        if !aabb_host.is_empty() {
+            let batched_aabbs = DeviceBuffer::from_host(stream, &aabb_host)
+                .map_err(|e| format!("CSG batched AABB upload failed: {e}"))?;
+            let aabb_staging: DeviceBuffer<Aabb> = DeviceBuffer::zeroed(stream, 1)
+                .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
+            let box_bytes = std::mem::size_of::<Aabb>();
+            let base_ptr = batched_aabbs.cu_deviceptr();
+            let dst_ptr = aabb_staging.cu_deviceptr();
+            for i in 0..aabb_host.len() {
+                let src_ptr = base_ptr + (i * box_bytes) as u64;
+                // SAFETY: `batched_aabbs` owns `aabb_host.len()` contiguous `Aabb`s on `stream`
+                // and `aabb_staging` owns 1 `Aabb`; both remain alive through `stream.synchronize()`.
+                let cp = unsafe {
+                    cu::cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, box_bytes, stream.cu_stream())
+                };
+                if cp != cu::cudaError_enum_CUDA_SUCCESS {
+                    return Err(format!("CSG AABB D2D copy failed ({cp:?})"));
+                }
+                let gas = Accel::custom(
+                    optix_ctx,
+                    stream,
+                    scratch,
+                    &[CustomPrimitives::new(&aabb_staging)],
+                    build_opts,
+                )
+                .map_err(|e| format!("CSG compound GAS build failed: {e}"))?;
+                gases.push(gas);
+            }
+            stream
+                .synchronize()
+                .map_err(|e| format!("CSG GAS sync failed: {e}"))?;
         }
-        stream
-            .synchronize()
-            .map_err(|e| format!("CSG GAS sync failed: {e}"))?;
 
         self.compound_gases = gases;
         self.packed
-            .reserve_instances(world.total_instance_count().max(256));
-        self.world = Some(world);
-        self.traffic = traffic;
+            .reserve_instances(built.world.total_instance_count().max(256));
+        self.active_reg_idx = Some(reg_idx);
+        self.pending_metadata = Some(SceneLoadedMetadata {
+            scene_idx: key.scene_idx,
+            variant_idx: key.variant_idx,
+            viewpoints: built.viewpoints,
+            rails: built.rails,
+        });
+        self.world = Some(built.world);
+        self.traffic = Some(built.traffic);
+        self.hints = Some(built.hints);
         Ok(())
     }
 }
@@ -581,20 +635,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inspector_catalog_and_camera_helpers_are_valid() {
-        assert!(!InspectorAssetKind::ALL.is_empty());
-        for i in 0..InspectorAssetKind::ALL.len() {
-            let (eye, tgt) = inspector_asset_camera(i as u32);
-            assert!(eye.iter().all(|v| v.is_finite()));
-            assert!(tgt.iter().all(|v| v.is_finite()));
-            let dx = eye[0] - tgt[0];
-            let dy = eye[1] - tgt[1];
-            let dz = eye[2] - tgt[2];
-            assert!(dx * dx + dy * dy + dz * dz > 0.1);
-        }
-        // Out-of-range index clamps cleanly without panicking.
-        let clamped = inspector_asset_by_index(999_999);
-        assert_eq!(clamped, *InspectorAssetKind::ALL.last().unwrap());
+    fn scene_registry_exposes_all_scenes_and_variants() {
+        let descs = default_scene_descriptors();
+        let ids: Vec<&str> = descs.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec!["gundo", "marina", "sf_house_of_ai", "inspector"]);
+        let inspector = descs.iter().find(|d| d.id == "inspector").expect("inspector");
+        assert!(inspector.variant_labels.len() >= 45);
     }
 
     #[test]
@@ -631,25 +677,42 @@ mod tests {
     }
 
     #[test]
-    fn gundo_scene_and_traffic_step_pack_without_heap_churn() {
-        let params = GundoParams::default();
-        let (mut world, traffic) = build_gundo_scene_with_traffic(&params);
-        assert!(world.total_instance_count() >= 2000);
-        assert!(!traffic.actors.is_empty());
+    fn all_city_scenes_pack_and_step_traffic_without_heap_churn() {
+        let reg = csg_scenes::default_scene_registry();
+        for scene_id in ["gundo", "marina", "sf_house_of_ai"] {
+            let module = reg.get(scene_id).expect("scene registered");
+            let mut built = module.build(&SceneBuildConfig::default());
+            assert!(
+                built.world.total_instance_count() >= 100,
+                "{scene_id}: expected rich instance count"
+            );
+            assert!(
+                built.world.library.compounds.len() <= 256,
+                "{scene_id}: exceeded 256 GPU GAS budget ({})",
+                built.world.library.compounds.len()
+            );
+            assert!(!built.viewpoints.is_empty(), "{scene_id}: missing viewpoints");
+            assert!(!built.rails.is_empty(), "{scene_id}: missing rails");
 
-        let mut packed = PackedGpuScene::with_capacity(
-            world.total_instance_count() * 2,
-            world.library.compounds.len(),
-        );
-        let cam = CameraView::omnidirectional(Vec3::new(-14.0, 5.2, -52.0), 1500.0, 1.0, 720.0);
-        world.pack_visible(&cam, &mut packed);
-        let cap_before = packed.instances.capacity();
-        assert!(!packed.is_empty());
+            let mut packed = PackedGpuScene::with_capacity(
+                built.world.total_instance_count() * 2,
+                built.world.library.compounds.len(),
+            );
+            let vp = &built.viewpoints[0];
+            let cam = CameraView::omnidirectional(vp.eye, 1500.0, 1.0, 720.0);
+            built.world.pack_visible(&cam, &mut packed);
+            let cap_before = packed.instances.capacity();
+            assert!(!packed.is_empty(), "{scene_id}: packed empty");
 
-        for step in 1..=5 {
-            step_gundo_traffic(&mut world, &traffic, step as f32 * 0.1);
-            world.pack_visible(&cam, &mut packed);
-            assert_eq!(packed.instances.capacity(), cap_before);
+            for step in 1..=5 {
+                module.step_dynamic(&mut built.world, &built.traffic, step as f32 * 0.1);
+                built.world.pack_visible(&cam, &mut packed);
+                assert_eq!(
+                    packed.instances.capacity(),
+                    cap_before,
+                    "{scene_id}: steady-state heap realloc"
+                );
+            }
         }
     }
 }

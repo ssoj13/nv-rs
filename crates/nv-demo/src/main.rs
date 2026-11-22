@@ -1130,6 +1130,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         shutter_in_flight: bool,
         ser_supported: bool,
         csg_stats: crate::csg_scene_host::CsgStats,
+        scene_descriptors: Vec<csg_scene::SceneDescriptor>,
+        scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
+        pending_scene_auto_frame: bool,
+        rail_random_seed: u64,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
@@ -1492,6 +1496,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 shutter_in_flight: false,
                 ser_supported: false,
                 csg_stats: crate::csg_scene_host::CsgStats::default(),
+                scene_descriptors: crate::csg_scene_host::default_scene_descriptors(),
+                scene_viewpoints: Vec::new(),
+                pending_scene_auto_frame: false,
+                rail_random_seed: 2026,
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
@@ -1637,6 +1645,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.tonemap_ms = msg.tonemap_ms;
                 self.ser_supported = msg.ser_supported;
                 self.csg_stats = msg.csg_stats;
+                if let Some(meta) = msg.scene_meta {
+                    self.scene_viewpoints = meta.viewpoints;
+                    self.camera_rail.set_scene_rails(meta.rails);
+                    if self.camera_rail.is_active() {
+                        self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
+                    }
+                    if self.pending_scene_auto_frame
+                        && meta.scene_idx == self.settings.csg_mode
+                        && meta.variant_idx == self.settings.csg_asset_idx
+                    {
+                        self.pending_scene_auto_frame = false;
+                        if !self.camera_rail.is_active()
+                            && let Some(vp) = self.scene_viewpoints.first()
+                        {
+                            let eye_v = glam::Vec3::new(vp.eye.x, vp.eye.y, vp.eye.z);
+                            let tgt_v = glam::Vec3::new(vp.target.x, vp.target.y, vp.target.z);
+                            let delta = tgt_v - eye_v;
+                            let dist = delta.length().max(0.25);
+                            let fwd = delta / dist;
+                            let pose = CameraPose::from_eye_forward_up(
+                                eye_v,
+                                fwd,
+                                glam::Vec3::Y,
+                                vp.vfov_deg.clamp(15.0, 110.0).to_radians(),
+                                self.cam_pose.znear,
+                                self.cam_pose.zfar.max(2000.0),
+                            );
+                            self.cam_driver.controller_mut().set_pose(pose);
+                            self.cam_driver.controller_mut().set_orbit_distance(dist);
+                            self.cam_pose = self.cam_driver.controller().pose();
+                            self.rail_blend_remaining = 0.0;
+                            self.cam_damper.snap(self.cam_pose);
+                        }
+                    }
+                }
+                if let Some(rail_spec) = msg.generated_rail {
+                    self.camera_rail.push_generated_rail(rail_spec);
+                    self.rail_blend_remaining = 1.6;
+                }
                 if let Some(status) = msg.status_msg {
                     self.last_saved_msg = Some(status);
                 }
@@ -1655,6 +1702,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut reset_accum_requested = false;
             let mut cam_snap_requested = false;
             let mut rail_blend_requested = false;
+            let mut scene_auto_frame_requested = false;
+            let mut generate_random_rail_requested = false;
             let mut save_png_requested = false;
             let mut save_jpeg_requested = false;
             let mut toggle_record_requested = false;
@@ -1703,6 +1752,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
                 csg_stats: self.csg_stats,
+                scene_descriptors: &self.scene_descriptors,
+                scene_viewpoints: &self.scene_viewpoints,
+                scene_auto_frame_requested: &mut scene_auto_frame_requested,
+                generate_random_rail_requested: &mut generate_random_rail_requested,
+                rail_random_seed: &mut self.rail_random_seed,
                 dlss_rr_available: self.dlss_rr_available,
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
@@ -2375,6 +2429,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                     }
                 }
+            }
+            if scene_auto_frame_requested {
+                self.pending_scene_auto_frame = true;
+                self.camera_rail.set_playing(false);
+            }
+            if generate_random_rail_requested {
+                let _ = self.cmd_tx.send(RenderCmd::GenerateRandomRail {
+                    seed: self.rail_random_seed,
+                });
             }
             if reload_shader_requested {
                 let _ = self.cmd_tx.send(RenderCmd::ReloadShader);

@@ -8,14 +8,12 @@ use egui_phosphor::regular as ic;
 
 use crate::camera_core::input::NavScheme;
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
-use crate::camera_rail::{CameraRail, RailCassette};
-use crate::csg_scene_host::{
-    CsgStats, GUNDO_CAMERA_PRESETS, inspector_asset_by_index, inspector_asset_camera,
-};
+use crate::camera_rail::CameraRail;
+use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::DemoAnimator;
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::{CaptureSource, DemoSettings};
-use csg_urban::InspectorAssetKind;
+use csg_scene::{SceneDescriptor, SceneViewpoint, TimeOfDay};
 
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
@@ -244,6 +242,11 @@ pub struct UiContext<'a> {
     pub record_frames: u64,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
+    pub scene_descriptors: &'a [SceneDescriptor],
+    pub scene_viewpoints: &'a [SceneViewpoint],
+    pub scene_auto_frame_requested: &'a mut bool,
+    pub generate_random_rail_requested: &'a mut bool,
+    pub rail_random_seed: &'a mut u64,
     pub dlss_rr_available: bool,
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
@@ -1151,17 +1154,58 @@ impl UiContext<'_> {
 
     fn ui_render_floor(&mut self, ui: &mut Ui) {
         let mut pending_cam: Option<([f32; 3], [f32; 3])> = None;
+        let mut request_auto_frame = false;
         {
             let s = &mut *self.settings;
             let anim = &mut *self.demo_anim;
+            let descs = self.scene_descriptors;
+            let viewpoints = self.scene_viewpoints;
 
             collapsing_section(ui, "sec_csg", ic::BUILDINGS, "CSG World", true, |ui| {
                 let prev_mode = s.csg_mode;
-                equal_grid(ui, 3, 3, |ui, idx, w| {
-                    let (mode, label, tip) = match idx {
-                        0 => (0u32, "Off (Classic)", "Classic fractal + metal stage floor"),
-                        1 => (1u32, "Inspector", "Inspect any individual csg-urban kit asset"),
-                        _ => (2u32, "Gundo", "El Segundo Coastal Refinery & Highway digital twin"),
+                let total_choices = descs.len() + 1;
+                let active_name = if s.csg_mode == 0 {
+                    "Off (Classic)"
+                } else {
+                    descs
+                        .get((s.csg_mode as usize).saturating_sub(1))
+                        .map_or("Off (Classic)", |d| d.name)
+                };
+
+                prop_row(ui, "Scene", |ui| {
+                    let gap = 4.0;
+                    let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    egui::ComboBox::from_id_salt("csg_scene_combo")
+                        .width(combo_w)
+                        .selected_text(active_name)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.csg_mode, 0u32, "Off (Classic)")
+                                .on_hover_text("Classic SDF fractal + scratched metal stage floor");
+                            for (i, d) in descs.iter().enumerate() {
+                                ui.selectable_value(&mut s.csg_mode, (i + 1) as u32, d.name)
+                                    .on_hover_text(d.description);
+                            }
+                        });
+                    anim_toggle_btn_disabled(ui);
+                });
+
+                // Quick-pick scene buttons driven strictly by `SceneRegistry::descriptors()`.
+                let cols = total_choices.clamp(1, 3);
+                equal_grid(ui, cols, total_choices, |ui, idx, w| {
+                    let (mode, label, tip) = if idx == 0 {
+                        (0u32, "Off", "Classic SDF fractal + stage floor")
+                    } else if let Some(d) = descs.get(idx - 1) {
+                        let short = match d.id {
+                            "gundo" => "Gundo",
+                            "marina" => "Marina",
+                            "sf_house_of_ai" => "SF AI",
+                            "inspector" => "Inspector",
+                            _ => d.name,
+                        };
+                        (idx as u32, short, d.description)
+                    } else {
+                        (0u32, "Off", "")
                     };
                     if ui
                         .add_sized(
@@ -1174,41 +1218,60 @@ impl UiContext<'_> {
                         s.csg_mode = mode;
                     }
                 });
-                if s.csg_mode != prev_mode {
-                    if s.csg_mode == 1 {
-                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
-                    } else if s.csg_mode == 2 {
-                        apply_csg_time_of_day_preset(s, s.csg_time_of_day);
-                        pending_cam = Some((GUNDO_CAMERA_PRESETS[0].1, GUNDO_CAMERA_PRESETS[0].2));
+
+                let active_desc = if s.csg_mode == 0 {
+                    None
+                } else {
+                    descs.get((s.csg_mode as usize).saturating_sub(1))
+                };
+
+                if s.csg_mode != prev_mode
+                    && let Some(desc) = active_desc
+                {
+                    let tod_u32 = match desc.default_tod {
+                        TimeOfDay::Day => 0,
+                        TimeOfDay::Sunset => 1,
+                        TimeOfDay::Night => 2,
+                    };
+                    s.csg_wetness = desc.default_wetness.clamp(0.0, 1.0);
+                    apply_csg_time_of_day_preset(s, tod_u32);
+                    if !desc.variant_labels.is_empty() {
+                        s.csg_asset_idx =
+                            s.csg_asset_idx.min((desc.variant_labels.len() - 1) as u32);
                     }
+                    request_auto_frame = true;
                 }
 
-                if s.csg_mode == 1 {
+                if let Some(desc) = active_desc {
                     ui.add_space(2.0);
-                    let prev_asset = s.csg_asset_idx;
-                    prop_row(ui, "Kit Asset", |ui| {
-                        let gap = 4.0;
-                        let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
-                        ui.spacing_mut().item_spacing.x = gap;
-                        let cur_asset = inspector_asset_by_index(s.csg_asset_idx);
-                        egui::ComboBox::from_id_salt("csg_asset_combo")
-                            .width(combo_w)
-                            .selected_text(cur_asset.label())
-                            .show_ui(ui, |ui| {
-                                for (i, asset) in InspectorAssetKind::ALL.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut s.csg_asset_idx,
-                                        i as u32,
-                                        asset.label(),
-                                    );
-                                }
-                            });
-                        anim_toggle_btn_disabled(ui);
-                    });
-                    if s.csg_asset_idx != prev_asset {
-                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
+                    if !desc.variant_labels.is_empty() {
+                        let prev_var = s.csg_asset_idx;
+                        let max_idx = (desc.variant_labels.len() - 1) as u32;
+                        s.csg_asset_idx = s.csg_asset_idx.min(max_idx);
+                        prop_row(ui, "Kit Asset", |ui| {
+                            let gap = 4.0;
+                            let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
+                            ui.spacing_mut().item_spacing.x = gap;
+                            let cur_label = desc
+                                .variant_labels
+                                .get(s.csg_asset_idx as usize)
+                                .copied()
+                                .unwrap_or("Asset");
+                            egui::ComboBox::from_id_salt("csg_variant_combo")
+                                .width(combo_w)
+                                .selected_text(cur_label)
+                                .show_ui(ui, |ui| {
+                                    for (i, label) in desc.variant_labels.iter().enumerate() {
+                                        ui.selectable_value(&mut s.csg_asset_idx, i as u32, *label);
+                                    }
+                                });
+                            anim_toggle_btn_disabled(ui);
+                        });
+                        if s.csg_asset_idx != prev_var {
+                            request_auto_frame = true;
+                        }
                     }
-                    prop_slider_u32(ui, "Asset Seed", &mut s.csg_seed, 1..=9999, false);
+
                     equal_grid(ui, 3, 3, |ui, idx, w| {
                         let (tod, label) = match idx {
                             0 => (0u32, "Day"),
@@ -1229,62 +1292,26 @@ impl UiContext<'_> {
                         ui,
                         anim,
                         "csg_wetness",
-                        "Wet Asphalt",
+                        "Wetness",
                         &mut s.csg_wetness,
                         0.0..=1.0,
                         2,
                         false,
                     );
-                    prop_toggle(ui, "Hero Fractal", &mut s.csg_show_fractal, "Overlay Fractal");
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), ROW_H + 2.0],
-                            egui::Button::new(format!("{}  Frame Asset", ic::CROSSHAIR)),
-                        )
-                        .clicked()
-                    {
-                        pending_cam = Some(inspector_asset_camera(s.csg_asset_idx));
-                    }
-                } else if s.csg_mode == 2 {
-                    ui.add_space(2.0);
-                    equal_grid(ui, 3, 3, |ui, idx, w| {
-                        let (tod, label) = match idx {
-                            0 => (0u32, "Day"),
-                            1 => (1u32, "Sunset"),
-                            _ => (2u32, "Night"),
-                        };
-                        if ui
-                            .add_sized(
-                                [w, ROW_H + 2.0],
-                                egui::Button::selectable(s.csg_time_of_day == tod, label),
-                            )
-                            .clicked()
-                        {
-                            apply_csg_time_of_day_preset(s, tod);
+                    if desc.supports_traffic {
+                        prop_toggle(ui, "Traffic", &mut s.csg_traffic_on, "Animated 3D Traffic");
+                        if s.csg_traffic_on {
+                            anim_slider_f32(
+                                ui,
+                                anim,
+                                "csg_traffic_speed",
+                                "Traffic Spd",
+                                &mut s.csg_traffic_speed,
+                                0.0..=3.0,
+                                2,
+                                false,
+                            );
                         }
-                    });
-                    anim_slider_f32(
-                        ui,
-                        anim,
-                        "csg_wetness",
-                        "Wet Asphalt",
-                        &mut s.csg_wetness,
-                        0.0..=1.0,
-                        2,
-                        false,
-                    );
-                    prop_toggle(ui, "Traffic", &mut s.csg_traffic_on, "Highway Traffic Motion");
-                    if s.csg_traffic_on {
-                        anim_slider_f32(
-                            ui,
-                            anim,
-                            "csg_traffic_speed",
-                            "Traffic Spd",
-                            &mut s.csg_traffic_speed,
-                            0.0..=3.0,
-                            2,
-                            false,
-                        );
                     }
                     prop_toggle(ui, "Hero Fractal", &mut s.csg_show_fractal, "Overlay Fractal");
                     prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
@@ -1298,21 +1325,30 @@ impl UiContext<'_> {
                         2,
                         false,
                     );
-                    ui.add_space(2.0);
-                    equal_grid(ui, 2, GUNDO_CAMERA_PRESETS.len(), |ui, idx, w| {
-                        let (label, eye, tgt) = GUNDO_CAMERA_PRESETS[idx];
-                        if ui
-                            .add_sized(
-                                [w, ROW_H + 2.0],
-                                egui::Button::new(format!("{}  {label}", ic::CAMERA)),
-                            )
-                            .clicked()
-                        {
-                            pending_cam = Some((eye, tgt));
-                        }
-                    });
+                    if !viewpoints.is_empty() {
+                        ui.add_space(2.0);
+                        let vp_cols = if viewpoints.len() == 1 { 1 } else { 2 };
+                        equal_grid(ui, vp_cols, viewpoints.len(), |ui, idx, w| {
+                            if let Some(vp) = viewpoints.get(idx)
+                                && ui
+                                    .add_sized(
+                                        [w, ROW_H + 2.0],
+                                        egui::Button::new(format!("{}  {}", ic::CAMERA, vp.label)),
+                                    )
+                                    .clicked()
+                            {
+                                pending_cam = Some((
+                                    [vp.eye.x, vp.eye.y, vp.eye.z],
+                                    [vp.target.x, vp.target.y, vp.target.z],
+                                ));
+                            }
+                        });
+                    }
                 }
             });
+        }
+        if request_auto_frame {
+            *self.scene_auto_frame_requested = true;
         }
         if let Some((eye, tgt)) = pending_cam {
             self.aim_camera(eye, tgt);
@@ -2196,10 +2232,12 @@ impl UiContext<'_> {
     fn ui_camera_stats(&mut self, ui: &mut Ui) {
         let mut snap_pose: Option<CameraPose> = None;
         let mut request_blend = false;
+        let mut request_gen_rail = false;
         {
             let s = &mut *self.settings;
             let rail = &mut *self.camera_rail;
             let cur_pose = *self.cam_pose;
+            let has_scenes = !self.scene_descriptors.is_empty();
             collapsing_section(
                 ui,
                 "sec_cinema",
@@ -2210,7 +2248,7 @@ impl UiContext<'_> {
                     // 1. Toggleable Auto-Drive ON/OFF button (never erases custom keyframes).
                     {
                         let active = rail.is_active();
-                        let can_play = rail.can_play();
+                        let can_play = rail.can_play() || (s.csg_mode == 0 && has_scenes);
                         let dark = ui.visuals().dark_mode;
                         let lbl = if active {
                             format!("{}  Auto-Drive: ON (Stop)", ic::PAUSE)
@@ -2237,10 +2275,12 @@ impl UiContext<'_> {
                         }
                         let tip = if active {
                             "Turn Auto-Drive OFF to immediately regain manual camera control without wiping your custom keyframes."
-                        } else if can_play {
-                            "Turn Auto-Drive ON to fly the selected cassette smoothly (built-in cassettes auto-enable Gundo)."
+                        } else if rail.can_play() {
+                            "Turn Auto-Drive ON to fly the selected cassette smoothly along the active CSG scene."
+                        } else if s.csg_mode == 0 && has_scenes {
+                            "Activate the default CSG world and start Auto-Drive."
                         } else {
-                            "Add at least 2 Custom keyframes (+ KF) or select a built-in Gundo cassette to enable Auto-Drive."
+                            "Load a CSG scene or add at least 2 Custom keyframes (+ KF) to enable Auto-Drive."
                         };
                         if ui
                             .add_enabled(
@@ -2252,54 +2292,96 @@ impl UiContext<'_> {
                         {
                             if active {
                                 rail.set_playing(false);
-                            } else {
-                                if rail.cassette.is_builtin() && s.csg_mode != 2 {
-                                    s.csg_mode = 2;
-                                    apply_csg_time_of_day_preset(s, s.csg_time_of_day);
-                                }
+                            } else if rail.can_play() {
                                 if rail.set_playing(true) {
                                     request_blend = true;
                                 }
+                            } else if s.csg_mode == 0 && has_scenes {
+                                s.csg_mode = 1;
+                                if let Some(d) = self.scene_descriptors.first() {
+                                    let tod_u32 = match d.default_tod {
+                                        TimeOfDay::Day => 0,
+                                        TimeOfDay::Sunset => 1,
+                                        TimeOfDay::Night => 2,
+                                    };
+                                    s.csg_wetness = d.default_wetness.clamp(0.0, 1.0);
+                                    apply_csg_time_of_day_preset(s, tod_u32);
+                                }
+                                rail.playing = true;
+                                request_blend = true;
                             }
                         }
                     }
                     ui.add_space(2.0);
-                    // 2. Multi-Cassette Deck selector.
+                    // 2. Dynamic Scene Cassette Deck + Independent Custom Deck.
                     prop_row(ui, "Cassette", |ui| {
-                        let prev = rail.cassette;
-                        let sel_text = if prev == RailCassette::Custom {
-                            format!("Custom ({} KF)", rail.keyframes.len())
-                        } else {
-                            prev.label().to_string()
-                        };
+                        let sel_text = rail.active_label();
+                        let active_scene_idx = rail.active_scene_rail_index();
+                        let mut picked_scene: Option<usize> = None;
+                        let mut picked_custom = false;
                         egui::ComboBox::from_id_salt("cinema_cassette_combo")
                             .width(ui.available_width().max(80.0))
                             .selected_text(sel_text)
                             .show_ui(ui, |ui| {
-                                for &c in RailCassette::ALL {
-                                    let text = if c == RailCassette::Custom {
-                                        format!("Custom ({} KF)", rail.keyframes.len())
-                                    } else {
-                                        c.label().to_string()
-                                    };
-                                    let resp = ui.selectable_value(&mut rail.cassette, c, text);
-                                    resp.on_hover_text(c.description());
+                                for (i, cr) in rail.scene_rails().iter().enumerate() {
+                                    let selected = active_scene_idx == Some(i);
+                                    if ui
+                                        .selectable_label(selected, &cr.spec.label)
+                                        .on_hover_text(&cr.spec.description)
+                                        .clicked()
+                                    {
+                                        picked_scene = Some(i);
+                                    }
+                                }
+                                let custom_lbl = format!("Custom ({} KF)", rail.keyframes.len());
+                                if ui
+                                    .selectable_label(rail.is_custom_selected(), custom_lbl)
+                                    .on_hover_text("Play your own Custom keyframes (+ KF / Pop KF / Clear) independently of scene cassettes.")
+                                    .clicked()
+                                {
+                                    picked_custom = true;
                                 }
                             });
-                        if rail.cassette != prev {
-                            let chosen = rail.cassette;
-                            // Restore `prev` so `select_cassette` applies duration/loop/LUT defaults cleanly.
-                            rail.cassette = prev;
-                            rail.select_cassette(chosen);
-                            if rail.is_active() {
-                                if chosen.is_builtin() && s.csg_mode != 2 {
-                                    s.csg_mode = 2;
-                                    apply_csg_time_of_day_preset(s, s.csg_time_of_day);
-                                }
+                        if let Some(idx) = picked_scene {
+                            let changed = active_scene_idx != Some(idx);
+                            rail.select_scene_rail(idx);
+                            if changed && rail.is_active() {
+                                request_blend = true;
+                            }
+                        } else if picked_custom {
+                            let changed = !rail.is_custom_selected();
+                            rail.select_custom();
+                            if changed && rail.is_active() {
                                 request_blend = true;
                             }
                         }
                     });
+                    // 3. On-demand exact-CSG Random Rail Generator for any active city scene.
+                    {
+                        let gen_enabled = s.csg_mode != 0;
+                        let gen_lbl = format!(
+                            "{}  Random Rail (#{:04x})",
+                            ic::SHUFFLE,
+                            *self.rail_random_seed & 0xffff
+                        );
+                        if ui
+                            .add_enabled(
+                                gen_enabled,
+                                egui::Button::new(gen_lbl)
+                                    .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0)),
+                            )
+                            .on_hover_text(
+                                "Synthesize a fresh, exact-CSG collision-verified random cinema rail for the active city scene.",
+                            )
+                            .clicked()
+                        {
+                            *self.rail_random_seed = self
+                                .rail_random_seed
+                                .wrapping_add(1)
+                                .max(1);
+                            request_gen_rail = true;
+                        }
+                    }
                     prop_slider_f32(
                         ui,
                         "Cam Smooth",
@@ -2370,7 +2452,7 @@ impl UiContext<'_> {
                         }
                     }
                     ui.add_space(2.0);
-                    // 3. Independent Custom Keyframe controls (preserved across cassette switches).
+                    // 4. Independent Custom Keyframe controls (preserved across scene & cassette switches).
                     equal_grid(ui, 3, 3, |ui, idx, w| match idx {
                         0 => {
                             let lbl = format!("+ KF ({})", rail.keyframes.len());
@@ -2400,7 +2482,7 @@ impl UiContext<'_> {
                                     !rail.keyframes.is_empty(),
                                     egui::Button::new("Clear").min_size(egui::vec2(w, ROW_H + 2.0)),
                                 )
-                                .on_hover_text("Clear all Custom keyframes without affecting built-in cassettes.")
+                                .on_hover_text("Clear all Custom keyframes without affecting scene cassettes.")
                                 .clicked()
                             {
                                 rail.clear();
@@ -2412,6 +2494,9 @@ impl UiContext<'_> {
         }
         if request_blend {
             *self.rail_blend_requested = true;
+        }
+        if request_gen_rail {
+            *self.generate_random_rail_requested = true;
         }
         if let Some(pose) = snap_pose {
             self.cam_driver.controller_mut().set_pose(pose);

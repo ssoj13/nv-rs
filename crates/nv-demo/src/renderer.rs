@@ -20,7 +20,7 @@ use optix::{
     micro_to_base_bary,
 };
 
-use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
+use crate::csg_scene_host::{CsgGpuHost, CsgSceneKey, CsgStats, SceneLoadedMetadata, csg_flags};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 
@@ -390,10 +390,10 @@ pub struct DemoSettings {
     pub record_shutter_subframes: u32,
     // Per-environment procedural parameters (persisted in PersistedState)
     pub env: EnvSettings,
-    // Render-time analytical CSG backdrop (`csg-rs`)
-    /// `0 = Off (Classic)`, `1 = Asset Inspector`, `2 = Gundo (El Segundo Coastal Refinery & Highway)`.
+    // Render-time analytical CSG world (`csg-scenes` SceneRegistry)
+    /// `0 = Off (Classic)`, `1..=N` selects registered scene index `csg_mode - 1` (`Gundo`, `Marina del Rey`, `SF House of AI`, `Inspector`).
     pub csg_mode: u32,
-    /// Selected asset index into `csg_urban::InspectorAssetKind::ALL` (`csg_mode == 1`).
+    /// Selected variant index within the active scene (e.g. `Inspector` asset index).
     pub csg_asset_idx: u32,
     /// Deterministic procedural seed for CSG scenes.
     pub csg_seed: u32,
@@ -587,6 +587,9 @@ pub enum RenderCmd {
         sub_idx: u32,
         sub_count: u32,
     },
+    GenerateRandomRail {
+        seed: u64,
+    },
     ReloadShader,
     Shutdown,
 }
@@ -603,6 +606,8 @@ pub struct FrameReady {
     pub tonemap_ms: f32,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
+    pub scene_meta: Option<SceneLoadedMetadata>,
+    pub generated_rail: Option<csg_scene::RailSpec>,
     pub status_msg: Option<String>,
 }
 
@@ -1422,8 +1427,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
 
     let mut csg_host = CsgGpuHost::new();
     let initial_csg_key = CsgSceneKey {
-        mode: initial_settings.csg_mode,
-        asset_idx: initial_settings.csg_asset_idx,
+        scene_idx: initial_settings.csg_mode,
+        variant_idx: initial_settings.csg_asset_idx,
         seed: initial_settings.csg_seed,
     };
     if let Err(err) = csg_host.sync(
@@ -1654,6 +1659,7 @@ pub fn spawn_render_thread(
             let mut rec_shutter_subframes: u32 = 1;
             let mut shutter_queue: VecDeque<(Box<DemoSettings>, CameraFrame, f32, u32, u32)> =
                 VecDeque::with_capacity(8);
+            let mut pending_generated_rail: Option<csg_scene::RailSpec> = None;
             let mut pending_status: Option<String> = None;
 
             loop {
@@ -1683,6 +1689,7 @@ pub fn spawn_render_thread(
                                      u32,
                                      u32,
                                  )>,
+                                 pending_generated_rail: &mut Option<csg_scene::RailSpec>,
                                  pending_status: &mut Option<String>|
                  -> bool {
                     match cmd {
@@ -1786,6 +1793,18 @@ pub fn spawn_render_thread(
                             shutter_queue.push_back((s, c, sim_dt, sub_idx, sub_count.max(1)));
                             false
                         }
+                        RenderCmd::GenerateRandomRail { seed } => {
+                            match rig.csg_host.generate_random_rail(seed) {
+                                Ok(rail) => {
+                                    *pending_status = Some(format!("Generated rail: {}", rail.label));
+                                    *pending_generated_rail = Some(rail);
+                                }
+                                Err(e) => {
+                                    *pending_status = Some(e);
+                                }
+                            }
+                            false
+                        }
                         RenderCmd::ReloadShader => {
                             let disk_path = PathBuf::from("crates/nv-demo/shaders/raytracer.cu");
                             let res = std::fs::read_to_string(&disk_path)
@@ -1833,6 +1852,7 @@ pub fn spawn_render_thread(
                         &mut rec_fixed_fps,
                         &mut rec_shutter_subframes,
                         &mut shutter_queue,
+                        &mut pending_generated_rail,
                         &mut pending_status,
                     ) {
                         should_exit = true;
@@ -1852,13 +1872,15 @@ pub fn spawn_render_thread(
                             && free_bufs.is_empty()));
 
                 let csg_traffic_moving =
-                    settings.csg_mode == 2 && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
+                    rig.csg_host.has_traffic() && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
                 let converged = !in_shutter_mode
                     && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
                     && !csg_traffic_moving
                     && !rec_active
                     && pending_jpeg.is_none()
+                    && pending_generated_rail.is_none()
+                    && !rig.csg_host.has_pending_metadata()
                     && pending_status.is_none()
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
@@ -1886,6 +1908,7 @@ pub fn spawn_render_thread(
                                 &mut rec_fixed_fps,
                                 &mut rec_shutter_subframes,
                                 &mut shutter_queue,
+                                &mut pending_generated_rail,
                                 &mut pending_status,
                             ) {
                                 break;
@@ -1930,7 +1953,7 @@ pub fn spawn_render_thread(
 
                 let preserve_shutter_accum = shutter_sub_idx.is_some_and(|idx| idx > 0);
                 let csg_traffic_moving =
-                    settings.csg_mode == 2 && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
+                    rig.csg_host.has_traffic() && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
                 if settings.auto_rotate {
                     spin_angle += dt * settings.spin_speed;
                     if !preserve_shutter_accum {
@@ -1951,8 +1974,8 @@ pub fn spawn_render_thread(
                 }
 
                 let csg_key = CsgSceneKey {
-                    mode: settings.csg_mode,
-                    asset_idx: settings.csg_asset_idx,
+                    scene_idx: settings.csg_mode,
+                    variant_idx: settings.csg_asset_idx,
                     seed: settings.csg_seed,
                 };
                 let vfov_rad = 2.0 * camera.tan_half_fov.max(0.05).atan();
@@ -2647,6 +2670,8 @@ pub fn spawn_render_thread(
                         tonemap_ms,
                         ser_supported: rig.ser_supported,
                         csg_stats: rig.csg_host.stats(),
+                        scene_meta: rig.csg_host.take_loaded_metadata(),
+                        generated_rail: pending_generated_rail.take(),
                         status_msg: pending_status.take(),
                     })
                     .is_err()

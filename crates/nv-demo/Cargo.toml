@@ -24,7 +24,7 @@ cuda-core-ext = { path = "../cuda-core-ext" }
 csg-core = { workspace = true }
 csg-scene = { workspace = true }
 csg-device = { workspace = true }
-csg-urban = { workspace = true }
+csg-scenes = { workspace = true }
 
 wgpu = "30"
 egui = { version = "0.36", features = ["default_fonts"] }

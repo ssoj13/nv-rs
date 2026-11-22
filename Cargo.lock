@@ -40,6 +40,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "const-random",
  "getrandom 0.3.4",
  "once_cell",
  "version_check",
@@ -214,6 +215,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -238,6 +252,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2 0.6.5",
+]
+
+[[package]]
+name = "box-rs"
+version = "0.4.0"
+source = "git+ssh://git@github.com/ssoj13/box-rs.git?branch=main#dcd2af00a99c341f598686a9f3f9b607b4508651"
+dependencies = [
+ "serde",
+ "serde_json",
+ "smallvec",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -329,6 +354,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -402,6 +436,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,6 +452,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "compact_str"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fcda08c33bb58b97008b2cdada6622500e949e060f5913361763121abd2416"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "static_assertions",
+ "zmij",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -419,6 +472,32 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "const-random"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
+dependencies = [
+ "const-random-macro",
+]
+
+[[package]]
+name = "const-random-macro"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d839f2a20b0aee515dc581a6172f2321f96cab76c1a38a4c584a194955390e"
+dependencies = [
+ "getrandom 0.2.17",
+ "once_cell",
+ "tiny-keccak",
+]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -470,6 +549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -501,9 +589,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "csg-citygen"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+dependencies = [
+ "csg-core",
+ "csg-kits",
+ "csg-scene",
+ "nodes-core",
+ "osm-rs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "csg-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
 dependencies = [
  "bytemuck",
  "serde",
@@ -512,16 +615,26 @@ dependencies = [
 [[package]]
 name = "csg-device"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
 dependencies = [
  "bytemuck",
  "csg-core",
 ]
 
 [[package]]
+name = "csg-kits"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+dependencies = [
+ "csg-core",
+ "csg-scene",
+ "serde",
+]
+
+[[package]]
 name = "csg-scene"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -529,12 +642,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "csg-urban"
+name = "csg-scene-gundo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#5f123d487630947d7193d3ff94706b49e89ec3a0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
 dependencies = [
  "csg-core",
+ "csg-kits",
  "csg-scene",
+ "serde",
+]
+
+[[package]]
+name = "csg-scene-marina"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+dependencies = [
+ "csg-citygen",
+ "csg-core",
+ "csg-kits",
+ "csg-scene",
+ "osm-rs",
+ "serde",
+]
+
+[[package]]
+name = "csg-scene-sf-house-of-ai"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+dependencies = [
+ "csg-citygen",
+ "csg-core",
+ "csg-kits",
+ "csg-scene",
+ "osm-rs",
+ "serde",
+]
+
+[[package]]
+name = "csg-scenes"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#653abaac8361529bfd682f0757255025d5885d95"
+dependencies = [
+ "csg-core",
+ "csg-kits",
+ "csg-scene",
+ "csg-scene-gundo",
+ "csg-scene-marina",
+ "csg-scene-sf-house-of-ai",
  "serde",
 ]
 
@@ -1012,6 +1166,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1047,6 +1207,14 @@ dependencies = [
  "crc32fast",
  "miniz_oxide 0.9.1",
  "zlib-rs",
+]
+
+[[package]]
+name = "flex-geom"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/wgpu-widgets-rs.git?branch=main#6a7b1d860d0b248e51f85b553c6cbbb7ac4ecd12"
+dependencies = [
+ "glam",
 ]
 
 [[package]]
@@ -1107,6 +1275,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsio-rs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/fsio-rs.git?branch=main#460c8d88301f94ede20f75ec54e7414bcdab2fd1"
+dependencies = [
+ "memmap2",
+ "tempfile",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1152,14 +1329,29 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "libc",
+ "wasi",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1169,8 +1361,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
 ]
 
 [[package]]
@@ -1291,6 +1495,11 @@ dependencies = [
  "wgpu",
  "windows",
 ]
+
+[[package]]
+name = "graph-layout"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/graph-layout-rs.git?branch=main#0d0cea79681830f1dc29de1981f7bce4b964bc97"
 
 [[package]]
 name = "guillotiere"
@@ -1481,10 +1690,25 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -1885,6 +2109,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodes-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/nodes-rs.git?branch=main#aa4ca0882143e3b5da8ff11797d69a87990a9986"
+dependencies = [
+ "blake3",
+ "box-rs",
+ "flex-geom",
+ "fsio-rs",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "graph-layout",
+ "image",
+ "log",
+ "rhai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ui-theme",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1986,7 +2234,7 @@ dependencies = [
  "csg-core",
  "csg-device",
  "csg-scene",
- "csg-urban",
+ "csg-scenes",
  "cuda-bindings",
  "cuda-core",
  "cuda-core-ext",
@@ -2528,6 +2776,9 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+dependencies = [
+ "portable-atomic",
+]
 
 [[package]]
 name = "optix"
@@ -2565,6 +2816,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "osm-rs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/osm-rs.git?branch=main#ec923299efc28c28954f454e7c2eff55a1bb0613"
+dependencies = [
+ "fsio-rs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2935,6 +3197,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "rhai"
+version = "1.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3925b784c0bee6542637e425ed7511a63257bf11b7ecf51ffd845e2d24d9163"
+dependencies = [
+ "ahash",
+ "bitflags 2.13.2",
+ "compact_str",
+ "num-traits",
+ "once_cell",
+ "rhai_codegen",
+ "smallvec",
+ "smartstring",
+ "thin-vec",
+ "web-time",
+]
+
+[[package]]
+name = "rhai_codegen"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d9661edb4a4b8145b017582d634c5eb88ff1a5284a5aa701f83a28f0657a826"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3086,13 +3377,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest",
 ]
 
@@ -3162,6 +3459,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smartstring"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
+dependencies = [
+ "autocfg",
+ "static_assertions",
+ "version_check",
 ]
 
 [[package]]
@@ -3297,6 +3605,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.3.4",
+ "once_cell",
+ "rustix 1.1.6",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3304,6 +3625,12 @@ checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "thin-vec"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6a4b9ba8738cb4a4f399d37e266becfd475e75eb73425b87a05a2f2039ba63e"
 
 [[package]]
 name = "thiserror"
@@ -3357,6 +3684,15 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]
@@ -3502,6 +3838,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "ui-theme"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/wgpu-widgets-rs.git?branch=main#6a7b1d860d0b248e51f85b553c6cbbb7ac4ecd12"
+dependencies = [
+ "flex-geom",
+ "glam",
+ "serde",
+]
+
+[[package]]
 name = "unicode-general-category"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3557,6 +3903,13 @@ name = "uuid"
 version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde_core",
+ "sha1_smol",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "vcv-rs"
@@ -3613,6 +3966,12 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"

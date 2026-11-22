@@ -301,7 +301,7 @@ mod tests {
         state.settings.cam_smooth_tau = 0.25;
         state.settings.time_scale = 0.5;
         state.settings.record_shutter_subframes = 4;
-        state.camera_rail = crate::camera_rail::CameraRail::gundo_auto_drive();
+        state.camera_rail.selected_rail_id = "landmark_slalom".to_string();
         state.camera_rail.keyframes = vec![
             crate::camera_rail::CameraKeyframe::from_look_at(
                 [-12.0, 4.0, -30.0],
@@ -314,12 +314,9 @@ mod tests {
                 54.0,
             ),
         ];
-        state
-            .camera_rail
-            .select_cassette(crate::camera_rail::RailCassette::RefinerySlalom);
-        // Runtime-only fields (`playing`, `time_s`) are not persisted.
-        state.camera_rail.playing = false;
-        state.camera_rail.time_s = 0.0;
+        state.camera_rail.duration_s = 22.0;
+        state.camera_rail.looping = true;
+        state.camera_rail.ease_io = false;
         state.camera = CameraState::from_runtime(
             NavMode::Trackball,
             NavMode::QuatFlightLocked,
@@ -342,10 +339,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(loaded, state);
-        assert_eq!(
-            loaded.camera_rail.cassette,
-            crate::camera_rail::RailCassette::RefinerySlalom
-        );
+        assert_eq!(loaded.camera_rail.selected_rail_id, "landmark_slalom");
         assert_eq!(loaded.camera_rail.keyframes.len(), 2);
         assert_eq!(loaded.camera.nav_mode(), NavMode::Trackball);
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::QuatFlightLocked);
@@ -379,10 +373,7 @@ mod tests {
         assert_eq!(loaded.settings.cam_smooth_tau, 0.0);
         assert_eq!(loaded.settings.time_scale, 1.0);
         assert_eq!(loaded.settings.record_shutter_subframes, 1);
-        assert_eq!(
-            loaded.camera_rail.cassette,
-            crate::camera_rail::RailCassette::CoastalCruise
-        );
+        assert!(loaded.camera_rail.selected_rail_id.is_empty());
         assert!(loaded.camera_rail.keyframes.is_empty());
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::FpsFly);
     }

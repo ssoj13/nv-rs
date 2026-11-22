@@ -1186,43 +1186,79 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_CONCRETE: {
-            float sx = (fabsf(n.y) > 0.5f) ? hit_pos.x : (hit_pos.x + hit_pos.z);
+            float horiz = sqrtf(n.x * n.x + n.z * n.z);
+            float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
+            float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
+            float sx = (fabsf(n.y) > 0.5f) ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz);
             float sy = (fabsf(n.y) > 0.5f) ? hit_pos.z : hit_pos.y;
             float grime = fbm2(sx * 0.35f + 4.1f, sy * 0.25f - 1.9f);
-            float micro = value_noise2(sx * 9.0f, sy * 9.0f);
+            float micro = value_noise2(sx * 11.0f, sy * 11.0f);
+            float vein = fbm2(sx * 1.4f + sy * 0.4f, sy * 2.8f - sx * 0.3f);
             float jx = fabsf(fmodf(fabsf(sx), 3.0f) - 1.5f);
             float jy = fabsf(fmodf(fabsf(sy), 3.0f) - 1.5f);
             float seam = (jx > 1.47f || jy > 1.47f) ? 0.80f : 1.0f;
-            base_col = f3_mul(base_col, (0.80f + 0.30f * grime) * (0.92f + 0.14f * micro) * seam);
+            // Light travertine/Marina stucco keeps crisp veining; dark concrete gains weathering.
+            float lum = base_col.x * 0.3f + base_col.y * 0.59f + base_col.z * 0.11f;
+            float grime_amp = (lum > 0.55f) ? 0.14f : 0.28f;
+            base_col = f3_mul(base_col, ((1.0f - 0.5f * grime_amp) + grime_amp * grime) * (0.91f + 0.15f * micro) * (0.95f + 0.10f * vein) * seam);
             if (wet > 0.05f && fabsf(n.y) > 0.5f) {
                 float wmask = sky_smoothstep(0.42f, 0.72f, grime) * wet;
                 base_col = f3_mul(base_col, 1.0f - 0.30f * wmask);
                 rough = fmaxf(0.12f, rough * (1.0f - 0.55f * wmask));
+                clearcoat = fmaxf(clearcoat, 0.65f * wmask);
+                cc_rough = fminf(cc_rough, 0.06f);
             }
             break;
         }
         case CSG_PROC_BRICK: {
-            float u = (fabsf(n.x) > 0.5f) ? hit_pos.z : hit_pos.x;
+            // Exact horizontal wall-tangent projection preserves undistorted brick proportions
+            // on arbitrary-angle OSM streets (e.g. 45-degree SF SoMa Boardman Pl & curved arcs).
+            float horiz = sqrtf(n.x * n.x + n.z * n.z);
+            float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
+            float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
+            float u = hit_pos.x * tx + hit_pos.z * tz;
             float v = hit_pos.y;
-            float row = floorf(v * 11.0f);
-            float col_u = u * 4.5f + 0.5f * fmodf(fabsf(row), 2.0f);
+            float row = floorf(v * 11.5f);
+            float col_u = u * 4.4f + 0.5f * fmodf(fabsf(row), 2.0f);
             float fx = col_u - floorf(col_u);
-            float fy = (v * 11.0f) - row;
-            bool mortar = (fx < 0.06f || fy < 0.10f);
+            float fy = (v * 11.5f) - row;
+            bool mortar = (fx < 0.065f || fy < 0.11f);
+            float weather = fbm2(u * 0.28f + 1.7f, v * 0.22f);
+            float street_soot = 0.84f + 0.16f * sky_smoothstep(0.0f, 3.5f, v);
             if (mortar) {
-                base_col = make_float3(0.48f, 0.46f, 0.43f);
-                rough = 0.90f;
+                base_col = f3_mul(make_float3(0.44f, 0.42f, 0.39f), (0.85f + 0.24f * weather) * street_soot);
+                rough = 0.92f;
             } else {
                 float b_hash = hash21(floorf(col_u), row);
-                base_col = f3_mul(base_col, 0.82f + 0.34f * b_hash);
-                rough = fmaxf(0.45f, rough + (b_hash - 0.5f) * 0.14f);
+                float warm_shift = hash21(floorf(col_u) + 37.0f, row + 19.0f);
+                float grain = value_noise2(u * 28.0f, v * 28.0f);
+                float3 b_tint = make_float3(
+                    0.82f + 0.30f * b_hash + 0.08f * warm_shift,
+                    0.79f + 0.28f * b_hash,
+                    0.76f + 0.24f * b_hash - 0.04f * warm_shift
+                );
+                base_col = f3_mul(f3_mul3(base_col, b_tint), (0.88f + 0.20f * weather) * (0.93f + 0.14f * grain) * street_soot);
+                rough = fmaxf(0.42f, fminf(0.95f, rough + (b_hash - 0.5f) * 0.16f));
+                // Subtle mortar-edge normal bevel for grazing sunlight across SoMa brick facades.
+                float edge_u = (fx < 0.12f) ? -1.0f : ((fx > 0.94f) ? 1.0f : 0.0f);
+                float edge_v = (fy < 0.17f) ? -1.0f : ((fy > 0.93f) ? 1.0f : 0.0f);
+                if (edge_u != 0.0f || edge_v != 0.0f) {
+                    n = f3_norm(make_float3(
+                        n.x + tx * edge_u * 0.06f,
+                        n.y + edge_v * 0.06f,
+                        n.z + tz * edge_u * 0.06f
+                    ));
+                }
             }
             break;
         }
         case CSG_PROC_WATER: {
             float wt = params.csg_traffic_time;
-            float wx = hit_pos.x * 0.35f;
-            float wz = hit_pos.z * 0.35f;
+            // Distinguish bright turquoise swimming pools from deep Pacific ocean / marina basins.
+            bool is_pool = (base_col.y > 0.25f && base_col.z > 0.30f);
+            float scale = is_pool ? 1.15f : 0.35f;
+            float wx = hit_pos.x * scale;
+            float wz = hit_pos.z * scale;
             float eps = 0.08f;
             float h0 = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
                      + cosf(wz * 1.9f - wt * 1.1f) * 0.25f
@@ -1233,18 +1269,32 @@ static __forceinline__ __device__ void eval_csg_procedural(
             float hz = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
                      + cosf((wz + eps) * 1.9f - wt * 1.1f) * 0.25f
                      + fbm2(wx * 1.6f + wt * 0.25f, (wz + eps) * 1.6f - wt * 0.18f) * 0.45f;
-            float strength = 0.10f;
+            float strength = is_pool ? 0.06f : 0.10f;
             n = f3_norm(make_float3(n.x - (hx - h0) / eps * strength, n.y, n.z - (hz - h0) / eps * strength));
-            rough = 0.035f;
+            if (is_pool) {
+                float caustic = fmaxf(0.0f, sinf(wx * 4.5f + wt * 1.8f) * cosf(wz * 4.2f - wt * 1.5f));
+                base_col = f3_mul(base_col, 0.90f + 0.28f * caustic * caustic);
+            }
+            rough = is_pool ? 0.02f : 0.035f;
             clearcoat = 0.95f;
             cc_rough = 0.025f;
             break;
         }
         case CSG_PROC_METAL: {
-            float patina = fbm2(hit_pos.x * 0.65f + hit_pos.z * 0.65f, hit_pos.y * 0.45f);
-            float brush = value_noise2(hit_pos.y * 14.0f, (hit_pos.x + hit_pos.z) * 2.5f);
-            base_col = f3_mul(base_col, 0.86f + 0.22f * patina);
-            rough = fmaxf(0.06f, fminf(0.85f, rough + (0.5f - brush) * 0.12f));
+            float horiz = sqrtf(n.x * n.x + n.z * n.z);
+            float u = (horiz > 1e-4f) ? ((-hit_pos.x * n.z + hit_pos.z * n.x) / horiz) : hit_pos.x;
+            float patina = fbm2(u * 0.65f, hit_pos.y * 0.45f + hit_pos.z * 0.15f);
+            float brush = value_noise2(hit_pos.y * 16.0f, u * 3.0f);
+            base_col = f3_mul(base_col, 0.85f + 0.24f * patina);
+            rough = fmaxf(0.06f, fminf(0.88f, rough + (0.5f - brush) * 0.14f));
+            break;
+        }
+        case CSG_PROC_GLASS: {
+            // Subtle architectural glass flatness micro-warp for realistic sky/building reflections.
+            float pane_u = floorf((hit_pos.x + hit_pos.z) * 0.55f);
+            float pane_v = floorf(hit_pos.y * 0.35f);
+            float h = hash21(pane_u, pane_v) - 0.5f;
+            n = f3_norm(make_float3(n.x + h * 0.008f, n.y + h * 0.004f, n.z - h * 0.008f));
             break;
         }
         case CSG_PROC_CAR_PAINT: {
@@ -1258,8 +1308,20 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_WOOD: {
-            float ring = sinf((hit_pos.x * 18.0f + hit_pos.z * 3.0f) + fbm2(hit_pos.x * 4.0f, hit_pos.z * 4.0f) * 4.0f);
-            base_col = f3_mul(base_col, 0.86f + 0.18f * ring);
+            float horiz = sqrtf(n.x * n.x + n.z * n.z);
+            float u = (fabsf(n.y) > 0.5f) ? hit_pos.x : ((horiz > 1e-4f) ? ((-hit_pos.x * n.z + hit_pos.z * n.x) / horiz) : hit_pos.x);
+            float v = (fabsf(n.y) > 0.5f) ? hit_pos.z : hit_pos.y;
+            float plank_idx = floorf(u * 6.5f);
+            float plank_f = (u * 6.5f) - plank_idx;
+            float seam = (plank_f < 0.045f || plank_f > 0.955f) ? 0.68f : 1.0f;
+            float p_hash = hash21(plank_idx, floorf(v * 0.4f));
+            float ring = sinf((u * 22.0f + v * 2.5f + p_hash * 5.0f) + fbm2(u * 4.5f, v * 2.2f) * 3.8f);
+            base_col = f3_mul(base_col, (0.82f + 0.18f * ring) * (0.90f + 0.20f * p_hash) * seam);
+            rough = fmaxf(0.18f, fminf(0.85f, rough + (0.5f - p_hash) * 0.10f));
+            if (rough < 0.42f) {
+                clearcoat = fmaxf(clearcoat, 0.35f);
+                cc_rough = 0.16f;
+            }
             break;
         }
         case CSG_PROC_SAND: {
@@ -1270,6 +1332,22 @@ static __forceinline__ __device__ void eval_csg_procedural(
         }
         default:
             break;
+    }
+
+    // Room-to-room warmth variation on illuminated architectural interiors (Marina towers & SoMa offices).
+    if ((mat.flags & CSG_MAT_FLAG_EMISSIVE) != 0u
+        && (mat.procedural_kind == CSG_PROC_NONE || mat.procedural_kind == CSG_PROC_GLASS)
+        && emission.x > 0.15f
+        && emission.x < 4.0f) {
+        float cell_u = floorf((hit_pos.x + hit_pos.z) * 0.28f);
+        float cell_v = floorf(hit_pos.y * 0.30f);
+        float room = hash21(cell_u, cell_v);
+        float dim = 0.55f + 0.70f * room;
+        emission = make_float3(
+            emission.x * dim,
+            emission.y * dim * (0.92f + 0.14f * room),
+            emission.z * dim * (0.85f + 0.26f * room)
+        );
     }
 
     // Pulse red aviation warning beacons atop tall refinery flare stacks & distillation towers.

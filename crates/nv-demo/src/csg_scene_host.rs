@@ -32,16 +32,17 @@ use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
 use csg_scene::{
-    CROWD_USER_ID_BASE, CameraPose as CsgCameraPose, CameraView, GpuInstance, GpuMaterial,
-    MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec, SHADOW_GUARD_MIN_DIAMETER,
-    SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints, SceneRegistry, SceneViewpoint,
-    TimeOfDay, WorldScene, find_crowd_actor_for_inst, generate_random_rail, inst_flags,
-    is_dynamic_inst_id, list_possess_targets_with_crowd, lookup_instance_and_assembly,
-    pick_possessable_instance_with_crowd, resolve_possess_pose_with_crowd,
+    CROWD_USER_ID_BASE, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
+    GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec,
+    SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
+    SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
+    generate_random_rail, inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
+    lookup_instance_and_assembly, pick_possessable_instance_with_crowd,
+    resolve_possess_pose_with_crowd,
 };
 
 use crate::app_events::PossessInfo;
-use crate::cuda_crowd::scale_crowd_lod_dists;
+use crate::cuda_crowd::CrowdLodParams;
 use crate::renderer::{CameraFrame, CameraProjection};
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
@@ -206,7 +207,90 @@ fn sanitized_prim_aabb(prim: &GpuPrim) -> Aabb {
     }
 }
 
-/// Camera basis and viewport parameters driving live CSG frustum + small-detail culling.
+/// Sanitized, NaN-free equality key for [`LodConfig`] so any change to any distance, tier,
+/// screen-pixel, force-LOD, hysteresis, or enabled setting triggers an immediate `FullRepack`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LodConfigKey {
+    enabled: bool,
+    force_lod: Option<u8>,
+    lod_bias_bits: u32,
+    lod1_dist_bits: u32,
+    lod2_dist_bits: u32,
+    meso_dist_bits: u32,
+    micro_dist_bits: u32,
+    min_screen_px_bits: u32,
+    hysteresis_bits: u32,
+}
+
+#[inline]
+fn sanitize_lod_config(cfg: LodConfig) -> LodConfig {
+    let lod_bias = if cfg.lod_bias.is_finite() {
+        cfg.lod_bias.clamp(0.25, 4.0)
+    } else {
+        1.0
+    };
+    let lod1_dist_m = if cfg.lod1_dist_m.is_finite() {
+        cfg.lod1_dist_m.clamp(1.0, 5000.0)
+    } else {
+        80.0
+    };
+    let lod2_dist_m = if cfg.lod2_dist_m.is_finite() {
+        cfg.lod2_dist_m.clamp(lod1_dist_m, 10_000.0)
+    } else {
+        220.0_f32.max(lod1_dist_m)
+    };
+    let meso_dist_m = if cfg.meso_dist_m.is_finite() {
+        cfg.meso_dist_m.clamp(1.0, 10_000.0)
+    } else {
+        300.0
+    };
+    let micro_dist_m = if cfg.micro_dist_m.is_finite() {
+        cfg.micro_dist_m.clamp(1.0, meso_dist_m)
+    } else {
+        35.0_f32.min(meso_dist_m)
+    };
+    let min_screen_px = if cfg.min_screen_px.is_finite() {
+        cfg.min_screen_px.clamp(0.0, 64.0)
+    } else {
+        1.5
+    };
+    let hysteresis = if cfg.hysteresis.is_finite() {
+        cfg.hysteresis.clamp(0.0, 0.45)
+    } else {
+        0.15
+    };
+    LodConfig {
+        enabled: cfg.enabled,
+        lod_bias,
+        force_lod: cfg.force_lod.map(|v| v.min(2)),
+        lod1_dist_m,
+        lod2_dist_m,
+        meso_dist_m,
+        micro_dist_m,
+        min_screen_px,
+        hysteresis,
+    }
+}
+
+impl LodConfigKey {
+    #[inline]
+    fn from_config(cfg: LodConfig) -> Self {
+        let s = sanitize_lod_config(cfg);
+        Self {
+            enabled: s.enabled,
+            force_lod: s.force_lod,
+            lod_bias_bits: s.lod_bias.to_bits(),
+            lod1_dist_bits: s.lod1_dist_m.to_bits(),
+            lod2_dist_bits: s.lod2_dist_m.to_bits(),
+            meso_dist_bits: s.meso_dist_m.to_bits(),
+            micro_dist_bits: s.micro_dist_m.to_bits(),
+            min_screen_px_bits: s.min_screen_px.to_bits(),
+            hysteresis_bits: s.hysteresis.to_bits(),
+        }
+    }
+}
+
+/// Camera basis and viewport parameters driving live CSG frustum + distance/screen-space LOD culling.
 #[derive(Clone, Copy, Debug)]
 pub struct CsgCameraParams {
     /// World-space camera origin.
@@ -221,8 +305,8 @@ pub struct CsgCameraParams {
     pub viewport_h: u32,
     /// Vertical field of view in radians.
     pub vfov_rad: f32,
-    /// User LOD detail multiplier (`0.25..=4.0`).
-    pub lod_bias: f32,
+    /// Full distance, screen-space, detail-tier, and force-LOD configuration.
+    pub lod_config: LodConfig,
     /// Use 360-degree omnidirectional packing (for `Fisheye180`, `Equirect360`, and `SlitCam`).
     pub omnidirectional: bool,
 }
@@ -254,6 +338,14 @@ pub struct CsgStats {
     pub gpu_bytes: u64,
     /// Active GPU memory footprint of the `aux_planes` buffer (DEM / road tiles / convex planes) in bytes.
     pub aux_planes_bytes: u64,
+    /// Visible parts emitted at LOD 0 (full detail).
+    pub lod0_count: u32,
+    /// Visible parts emitted at LOD 1 (mid detail).
+    pub lod1_count: u32,
+    /// Visible parts emitted at LOD 2+ (coarse / auto-proxy silhouette).
+    pub lod2_count: u32,
+    /// Total instances/parts culled this frame (frustum + detail tier + screen-px + budget).
+    pub culled_count: u32,
 }
 
 /// Scene metadata delivered once to the UI thread whenever a new CSG scene finishes building.
@@ -614,9 +706,10 @@ fn xform_max_scale(m: Mat3x4) -> f32 {
 /// Packs ONLY `world.dynamic_instances()` against `view` into `out_insts` & `out_prev` with zero
 /// iteration over static spatial chunks and zero static-tail topology hashing.
 ///
-/// Mirrors `WorldScene::pack_visible` dynamic pass verbatim (using `view.effective_detail_cull_factor()`
-/// and `view.effective_lod_distance(dist)`) so `TrafficOnly` ticks run in O(`dynamic_instances.len()`)
-/// — or O(`traffic_vehicles`) when `skip_crowd_bones` is enabled for GPU-direct CUDA crowds.
+/// Mirrors `WorldScene::pack_visible` dynamic pass verbatim (honoring `LodConfig`, `min_screen_px`,
+/// `DetailTier`, `select_lod_with_config`, and `AssemblyPart::active_proxy`) so `TrafficOnly` ticks
+/// run in O(`dynamic_instances.len()`) — or O(`traffic_vehicles`) when `skip_crowd_bones` is
+/// enabled for GPU-direct CUDA crowds.
 fn pack_dynamic_prefix_only(
     world: &WorldScene,
     view: &CameraView,
@@ -634,7 +727,7 @@ fn pack_dynamic_prefix_only(
 
     let fixed_bytes = world.fixed_gpu_bytes();
     let max_emit = world.budget.instance_budget(fixed_bytes);
-    let eff_detail_cull = view.effective_detail_cull_factor();
+    let lod_cfg = view.effective_lod_config();
     let max_radius = if view.max_radius.is_nan() {
         0.0
     } else {
@@ -688,17 +781,29 @@ fn pack_dynamic_prefix_only(
             inst.xform.xform_pt(assembly.local_aabb.center())
         };
         let dist = (center - view.position).len();
-        let part_end = assembly.visible_part_end(dist, eff_detail_cull);
+        let part_end = if is_crowd_bone {
+            assembly.parts.len()
+        } else {
+            assembly.visible_part_end_with_config(dist, view.small_detail_cull_factor, &lod_cfg)
+        };
         if part_end == 0 {
             continue;
         }
 
         let scale_max = xform_max_scale(inst.xform);
-        let eff_lod_dist = view.effective_lod_distance(dist);
         let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
             None
         } else {
             Some(*prev_lod_slot as usize)
+        };
+        let min_px = if !is_crowd_bone
+            && lod_cfg.enabled
+            && view.small_detail_cull_factor.is_finite()
+            && view.small_detail_cull_factor > 0.0
+        {
+            lod_cfg.sanitized_min_screen_px()
+        } else {
+            0.0
         };
         let mut recorded_lod: Option<usize> = None;
         let visible_parts = assembly.parts.get(..part_end).unwrap_or(&assembly.parts);
@@ -709,12 +814,44 @@ fn pack_dynamic_prefix_only(
                 assembly.local_aabb.diameter() * scale_max
             };
             let proj_px = view.project_diameter_px(part_diam, dist);
-            let lod = part.lods.select_lod(eff_lod_dist, proj_px, prev_lod);
-            if recorded_lod.is_none() && part.lods.num_levels() > 1 {
+            if min_px > 0.0 && part.tier != DetailTier::Macro && proj_px < min_px {
+                continue;
+            }
+            let lod = part
+                .lods
+                .select_lod_with_config(dist, proj_px, prev_lod, &lod_cfg);
+            if recorded_lod.is_none()
+                && part.lods.num_levels() > 1
+                && lod_cfg.enabled
+                && lod_cfg.force_lod.is_none()
+            {
                 recorded_lod = Some(lod);
             }
+            let active_proxy = part.active_proxy(lod);
             let compounds = part.lods.compounds_for_lod(lod);
-            if compounds.is_empty() {
+            if active_proxy.is_none() && compounds.is_empty() {
+                continue;
+            }
+            if let Some(proxy) = active_proxy {
+                let part_world = inst.xform * proxy.box_local_xform;
+                let part_prev = inst
+                    .prev_xform
+                    .map_or(part_world, |prev| prev * proxy.box_local_xform);
+                let mat_ov = inst
+                    .mat_override
+                    .or(part.mat_override)
+                    .or(proxy.dominant_mat)
+                    .map_or(MAT_OVERRIDE_NONE, |m| m.0 as u32);
+                if out_insts.len() < max_emit {
+                    out_insts.push(GpuInstance {
+                        xform: part_world.0,
+                        compound_id: proxy.compound_id.0,
+                        user_id: inst.user_id,
+                        mat_override: mat_ov,
+                        flags: inst.flags,
+                    });
+                    out_prev.push(part_prev.0);
+                }
                 continue;
             }
             let part_world = inst.xform * part.local_xform;
@@ -888,7 +1025,7 @@ pub struct CsgGpuHost {
     last_pack_cam: [f32; 3],
     last_pack_fwd: [f32; 3],
     last_pack_cam_params: Option<CsgCameraParams>,
-    last_pack_lod_bits: u32,
+    last_pack_lod_key: Option<LodConfigKey>,
     last_pack_omni: bool,
     last_traffic_bits: u32,
     ias_dirty: bool,
@@ -944,7 +1081,7 @@ impl CsgGpuHost {
             last_pack_cam: [f32::NAN; 3],
             last_pack_fwd: [f32::NAN; 3],
             last_pack_cam_params: None,
-            last_pack_lod_bits: 0,
+            last_pack_lod_key: None,
             last_pack_omni: false,
             last_traffic_bits: u32::MAX,
             ias_dirty: false,
@@ -1135,18 +1272,14 @@ impl CsgGpuHost {
         let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
             + cam.fwd[1] * self.last_pack_fwd[1]
             + cam.fwd[2] * self.last_pack_fwd[2];
-        let lod_bits = if cam.lod_bias.is_finite() {
-            cam.lod_bias.clamp(0.25, 4.0).to_bits()
-        } else {
-            1.0f32.to_bits()
-        };
+        let lod_key = LodConfigKey::from_config(cam.lod_config);
         let viewport_or_fov_changed = self.last_pack_cam_params.is_none_or(|prev| {
             prev.viewport_w != cam.viewport_w
                 || prev.viewport_h != cam.viewport_h
                 || prev.vfov_rad.to_bits() != cam.vfov_rad.to_bits()
         });
         viewport_or_fov_changed
-            || lod_bits != self.last_pack_lod_bits
+            || self.last_pack_lod_key != Some(lod_key)
             || cam.omnidirectional != self.last_pack_omni
             || !cam_dist_sq.is_finite()
             || cam_dist_sq > 1.0
@@ -1507,8 +1640,8 @@ impl CsgGpuHost {
     /// Advances dynamic 3D Frenet traffic and articulated crowd actors in-place before resolving
     /// possessed vehicle mounts so cameras lock to exact current-frame transforms.
     ///
-    /// Scales `CrowdSim` LOD thresholds (`lod1_dist_m`, `lod2_dist_m`, `cull_dist_m`) by `lod_bias`
-    /// (`0.25..=4.0`) for the step while keeping the scene's nominal `1.0x` thresholds unmodified.
+    /// Applies [`CrowdLodParams`] (`enabled`, `force_lod`, `lod_bias`, `lod1/lod2/cull`) for the
+    /// step while keeping the scene's nominal `1.0x` thresholds unmodified.
     /// Respects `freeze_pose` (pausing both traffic and crowd stepping so progressive path tracing
     /// can accumulate cleanly for Synthetic Data Generation captures).
     pub fn step_dynamic(
@@ -1516,7 +1649,7 @@ impl CsgGpuHost {
         dt: f32,
         time_s: f32,
         cam_eye: [f32; 3],
-        lod_bias: f32,
+        crowd_lod: CrowdLodParams,
         freeze_pose: bool,
         step_traffic: bool,
     ) -> bool {
@@ -1558,7 +1691,7 @@ impl CsgGpuHost {
                 scene.crowd.lod2_dist_m,
                 scene.crowd.cull_dist_m,
             );
-            let (l1, l2, cull) = scale_crowd_lod_dists(orig.0, orig.1, orig.2, lod_bias);
+            let (l1, l2, cull) = crowd_lod.resolve_dists();
             scene.crowd.lod1_dist_m = l1;
             scene.crowd.lod2_dist_m = l2;
             scene.crowd.cull_dist_m = cull;
@@ -1573,13 +1706,13 @@ impl CsgGpuHost {
         moved
     }
 
-    /// Re-evaluates CPU crowd LOD visibility against `lod_bias` with zero actor motion (used when
-    /// dragging the LOD bias slider while crowd simulation is paused or frozen).
+    /// Re-evaluates CPU crowd LOD visibility against [`CrowdLodParams`] with zero actor motion
+    /// (used when adjusting LOD settings while crowd simulation is paused or frozen).
     pub fn refresh_crowd_lod_cpu(
         &mut self,
         time_s: f32,
         cam_eye: [f32; 3],
-        lod_bias: f32,
+        crowd_lod: CrowdLodParams,
     ) -> bool {
         let Some(ref mut scene) = self.scene else {
             return false;
@@ -1596,7 +1729,7 @@ impl CsgGpuHost {
             scene.crowd.lod2_dist_m,
             scene.crowd.cull_dist_m,
         );
-        let (l1, l2, cull) = scale_crowd_lod_dists(orig.0, orig.1, orig.2, lod_bias);
+        let (l1, l2, cull) = crowd_lod.resolve_dists();
         scene.crowd.lod1_dist_m = l1;
         scene.crowd.lod2_dist_m = l2;
         scene.crowd.cull_dist_m = cull;
@@ -1783,11 +1916,7 @@ impl CsgGpuHost {
         let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
             + cam.fwd[1] * self.last_pack_fwd[1]
             + cam.fwd[2] * self.last_pack_fwd[2];
-        let lod_bits = if cam.lod_bias.is_finite() {
-            cam.lod_bias.clamp(0.25, 4.0).to_bits()
-        } else {
-            1.0f32.to_bits()
-        };
+        let lod_key = LodConfigKey::from_config(cam.lod_config);
         let viewport_or_fov_changed = self.last_pack_cam_params.is_none_or(|prev| {
             prev.viewport_w != cam.viewport_w
                 || prev.viewport_h != cam.viewport_h
@@ -1796,7 +1925,7 @@ impl CsgGpuHost {
         let camera_repack_needed = rebuilt_scene
             || self.ias_dirty
             || viewport_or_fov_changed
-            || lod_bits != self.last_pack_lod_bits
+            || self.last_pack_lod_key != Some(lod_key)
             || cam.omnidirectional != self.last_pack_omni
             || !cam_dist_sq.is_finite()
             || cam_dist_sq > 1.0
@@ -1814,7 +1943,8 @@ impl CsgGpuHost {
             } else {
                 self.last_pack_cam_params.unwrap_or(cam)
             };
-            let mut cam_view = if pack_cam.omnidirectional {
+            let safe_lod_cfg = sanitize_lod_config(pack_cam.lod_config);
+            let cam_view = if pack_cam.omnidirectional {
                 CameraView::omnidirectional(
                     Vec3::new(pack_cam.eye[0], pack_cam.eye[1], pack_cam.eye[2]),
                     1500.0,
@@ -1837,12 +1967,8 @@ impl CsgGpuHost {
                     [0.05, 1500.0],
                     (pack_cam.viewport_h.max(144)) as f32,
                 )
-            };
-            cam_view.lod_bias = if pack_cam.lod_bias.is_finite() {
-                pack_cam.lod_bias.clamp(0.25, 4.0)
-            } else {
-                1.0
-            };
+            }
+            .with_lod_config(safe_lod_cfg);
 
             // W3.1: Static-tail vs dynamic-prefix split!
             // On `!camera_repack_needed` dynamic ticks, pack ONLY `world.dynamic_instances()`
@@ -1947,6 +2073,10 @@ impl CsgGpuHost {
                 + self.materials_buf.active_bytes()
                 + self.instances_buf.active_bytes()
                 + self.prev_xforms_buf.active_bytes();
+            let lod_stats = self.packed.lod_stats;
+            let culled_count = lod_stats
+                .total_culled()
+                .saturating_add(u32::try_from(self.packed.stats.instances_culled_budget).unwrap_or(u32::MAX));
             self.stats = CsgStats {
                 visible_instances: self.packed.len() as u32,
                 total_instances: scene.world.total_instance_count() as u32,
@@ -1954,12 +2084,16 @@ impl CsgGpuHost {
                 primitives: scene.world.library.prims.len() as u32,
                 gpu_bytes: gpu_bytes as u64,
                 aux_planes_bytes: self.aux_planes_buf.active_bytes() as u64,
+                lod0_count: lod_stats.lod0,
+                lod1_count: lod_stats.lod1,
+                lod2_count: lod_stats.lod2,
+                culled_count,
             };
             if camera_repack_needed {
                 self.last_pack_cam = cam.eye;
                 self.last_pack_fwd = cam.fwd;
                 self.last_pack_cam_params = Some(cam);
-                self.last_pack_lod_bits = lod_bits;
+                self.last_pack_lod_key = Some(lod_key);
                 self.last_pack_omni = cam.omnidirectional;
             }
             self.ias_dirty = false;
@@ -2115,7 +2249,7 @@ impl CsgGpuHost {
         self.last_pack_cam = [f32::NAN; 3];
         self.last_pack_fwd = [f32::NAN; 3];
         self.last_pack_cam_params = None;
-        self.last_pack_lod_bits = 0;
+        self.last_pack_lod_key = None;
         self.last_pack_omni = false;
         self.active_possess = None;
         self.next_vehicle_cursor = 0;
@@ -2445,13 +2579,34 @@ mod tests {
 
         assert!(host.has_crowd());
         // Freeze Pose must prevent crowd stepping and set FREEZE_POSE flag.
-        assert!(!host.step_dynamic(0.05, 0.05, cam_eye, 1.0, true, true));
+        assert!(!host.step_dynamic(
+            0.05,
+            0.05,
+            cam_eye,
+            CrowdLodParams::default(),
+            true,
+            true
+        ));
         assert!(host.crowd_frozen);
 
         // Unfreezing steps the crowd and populates motion_prev_xforms.
-        assert!(host.step_dynamic(0.05, 0.10, cam_eye, 1.0, false, true));
+        assert!(host.step_dynamic(
+            0.05,
+            0.10,
+            cam_eye,
+            CrowdLodParams::default(),
+            false,
+            true
+        ));
         assert!(!host.crowd_frozen);
-        assert!(host.step_dynamic(0.05, 0.15, cam_eye, 1.0, false, true));
+        assert!(host.step_dynamic(
+            0.05,
+            0.15,
+            cam_eye,
+            CrowdLodParams::default(),
+            false,
+            true
+        ));
 
         let fwd = (vp.target - vp.eye).norm();
         let right = fwd.cross(Vec3::Y).norm();
@@ -2512,7 +2667,14 @@ mod tests {
         // Transitioning freeze_pose false -> true must snap prev_xform = xform for all dynamic
         // instances and mark traffic_dirty so Motion AOV emits zero stale object optical flow.
         host.traffic_dirty = false;
-        assert!(!host.step_dynamic(0.05, 0.20, cam_eye, 1.0, true, true));
+        assert!(!host.step_dynamic(
+            0.05,
+            0.20,
+            cam_eye,
+            CrowdLodParams::default(),
+            true,
+            true
+        ));
         assert!(host.crowd_frozen);
         assert!(
             host.traffic_dirty,
@@ -2582,7 +2744,7 @@ mod tests {
             .map(|i| i.xform.0)
             .collect();
         assert!(
-            host.step_dynamic(0.0, 1.5, cam_eye, 1.0, false, true),
+            host.step_dynamic(0.0, 1.5, cam_eye, CrowdLodParams::default(), false, true),
             "step_dynamic must advance SoA city traffic"
         );
         let moved_any = host
@@ -2629,7 +2791,7 @@ mod tests {
             0.05,
             1.5,
             [vp.eye.x, vp.eye.y, vp.eye.z],
-            1.0,
+            CrowdLodParams::default(),
             false,
             true
         ));
@@ -2733,7 +2895,14 @@ mod tests {
         host.scene = Some(built);
 
         // Step crowd once and verify bone_slot_map matches every visible bone exactly.
-        assert!(host.step_dynamic(1.0 / 60.0, 0.1, [0.0, 2.0, -8.0], 1.0, false, false));
+        assert!(host.step_dynamic(
+            1.0 / 60.0,
+            0.1,
+            [0.0, 2.0, -8.0],
+            CrowdLodParams::default(),
+            false,
+            false
+        ));
         {
             let scene = host.scene.as_mut().expect("scene");
             scene.world.pack_all(Vec3::new(0.0, 2.0, -8.0), &mut host.packed);
@@ -2979,7 +3148,10 @@ mod tests {
             viewport_w: 1280,
             viewport_h: 720,
             vfov_rad: vp.vfov_deg.to_radians(),
-            lod_bias: 0.25,
+            lod_config: LodConfig {
+                lod_bias: 0.25,
+                ..LodConfig::default()
+            },
             omnidirectional: false,
         };
 
@@ -2987,16 +3159,19 @@ mod tests {
         host.last_pack_cam = base_cam.eye;
         host.last_pack_fwd = base_cam.fwd;
         host.last_pack_cam_params = Some(base_cam);
-        host.last_pack_lod_bits = base_cam.lod_bias.clamp(0.25, 4.0).to_bits();
+        host.last_pack_lod_key = Some(LodConfigKey::from_config(base_cam.lod_config));
         host.last_pack_omni = false;
         host.ias_dirty = false;
 
         assert!(
             !host.will_camera_repack(key, base_cam),
-            "unchanged camera and lod_bias must not spuriously force FullRepack"
+            "unchanged camera and lod_config must not spuriously force FullRepack"
         );
         let high_cam = CsgCameraParams {
-            lod_bias: 4.0,
+            lod_config: LodConfig {
+                lod_bias: 4.0,
+                ..LodConfig::default()
+            },
             ..base_cam
         };
         assert!(
@@ -3005,7 +3180,10 @@ mod tests {
         );
         // Non-finite lod_bias must safely normalize to 1.0 and trigger repack from 0.25.
         let nan_cam = CsgCameraParams {
-            lod_bias: f32::NAN,
+            lod_config: LodConfig {
+                lod_bias: f32::NAN,
+                ..LodConfig::default()
+            },
             ..base_cam
         };
         assert!(host.will_camera_repack(key, nan_cam));
@@ -3084,7 +3262,14 @@ mod tests {
         host.scene = Some(built);
 
         // Simulate low lod_bias culling all actors far from camera, then reviving for GPU scatter.
-        assert!(host.refresh_crowd_lod_cpu(0.0, [0.0, 2.0, 500.0], 0.25));
+        assert!(host.refresh_crowd_lod_cpu(
+            0.0,
+            [0.0, 2.0, 500.0],
+            CrowdLodParams {
+                lod_bias: 0.25,
+                ..CrowdLodParams::default()
+            }
+        ));
         {
             let scene = host.scene.as_mut().expect("scene");
             mark_crowd_bones_visible(scene);
@@ -3141,5 +3326,166 @@ mod tests {
                 rail.waypoints.len()
             );
         }
+    }
+
+    #[test]
+    fn lod_config_force_lod_disable_and_distance_sliders_trigger_repack_and_update_stats() {
+        let mut host = CsgGpuHost::new();
+        let gundo_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo")
+            .expect("gundo registered");
+        let module = host
+            .registry
+            .get_by_index(gundo_idx)
+            .expect("gundo module");
+        let built = module.build(&SceneBuildConfig::default());
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+
+        let key = CsgSceneKey {
+            scene_idx: (gundo_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+        host.scene_key = key;
+        host.active_reg_idx = Some(gundo_idx);
+        host.scene = Some(built);
+
+        let default_cfg = LodConfig::default();
+        let base_cam = CsgCameraParams {
+            eye: [vp.eye.x, vp.eye.y, vp.eye.z],
+            fwd: [fwd.x, fwd.y, fwd.z],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: vp.vfov_deg.to_radians(),
+            lod_config: default_cfg,
+            omnidirectional: false,
+        };
+
+        host.last_pack_cam = base_cam.eye;
+        host.last_pack_fwd = base_cam.fwd;
+        host.last_pack_cam_params = Some(base_cam);
+        host.last_pack_lod_key = Some(LodConfigKey::from_config(default_cfg));
+        host.last_pack_omni = false;
+        host.ias_dirty = false;
+        assert!(!host.will_camera_repack(key, base_cam));
+
+        // Every individual LodConfig slider/toggle must trigger immediate FullRepack.
+        let variants = [
+            LodConfig { enabled: false, ..default_cfg },
+            LodConfig { force_lod: Some(0), ..default_cfg },
+            LodConfig { force_lod: Some(2), ..default_cfg },
+            LodConfig { lod1_dist_m: 35.0, ..default_cfg },
+            LodConfig { lod2_dist_m: 90.0, ..default_cfg },
+            LodConfig { meso_dist_m: 80.0, ..default_cfg },
+            LodConfig { micro_dist_m: 10.0, ..default_cfg },
+            LodConfig { min_screen_px: 8.0, ..default_cfg },
+            LodConfig { hysteresis: 0.30, ..default_cfg },
+        ];
+        for (idx, cfg) in variants.into_iter().enumerate() {
+            let cam = CsgCameraParams {
+                lod_config: cfg,
+                ..base_cam
+            };
+            assert!(
+                host.will_camera_repack(key, cam),
+                "LodConfig variant #{idx} ({cfg:?}) must trigger immediate FullRepack"
+            );
+        }
+
+        // Pack Gundo under Force LOD0, Force LOD2, LOD Disabled, and strict distance/tier cull
+        // and verify `CsgStats` (`lod0_count`, `lod1_count`, `lod2_count`, `culled_count`).
+        let pack_stats_for = |world: &mut WorldScene, cfg: LodConfig| -> CsgStats {
+            let view = CameraView::perspective(
+                vp.eye,
+                fwd,
+                Vec3::Y,
+                (vp.vfov_deg.to_radians() * 1.35).clamp(0.15, 2.7),
+                16.0 / 9.0,
+                [0.05, 1500.0],
+                720.0,
+            )
+            .with_lod_config(sanitize_lod_config(cfg));
+            let mut packed = PackedGpuScene::new();
+            world.pack_visible(&view, &mut packed);
+            let ls = packed.lod_stats;
+            CsgStats {
+                visible_instances: packed.len() as u32,
+                total_instances: world.total_instance_count() as u32,
+                compounds: world.library.compounds.len() as u32,
+                primitives: world.library.prims.len() as u32,
+                gpu_bytes: 0,
+                aux_planes_bytes: 0,
+                lod0_count: ls.lod0,
+                lod1_count: ls.lod1,
+                lod2_count: ls.lod2,
+                culled_count: ls
+                    .total_culled()
+                    .saturating_add(u32::try_from(packed.stats.instances_culled_budget).unwrap_or(u32::MAX)),
+            }
+        };
+
+        let world = &mut host.scene.as_mut().expect("gundo").world;
+        let stats_force_lod0 = pack_stats_for(
+            world,
+            LodConfig {
+                force_lod: Some(0),
+                ..default_cfg
+            },
+        );
+        let stats_force_lod2 = pack_stats_for(
+            world,
+            LodConfig {
+                force_lod: Some(2),
+                ..default_cfg
+            },
+        );
+        let stats_disabled = pack_stats_for(
+            world,
+            LodConfig {
+                enabled: false,
+                meso_dist_m: 15.0,
+                micro_dist_m: 5.0,
+                min_screen_px: 12.0,
+                ..default_cfg
+            },
+        );
+        let stats_tight_cull = pack_stats_for(
+            world,
+            LodConfig {
+                enabled: true,
+                lod1_dist_m: 20.0,
+                lod2_dist_m: 45.0,
+                meso_dist_m: 40.0,
+                micro_dist_m: 8.0,
+                min_screen_px: 10.0,
+                ..default_cfg
+            },
+        );
+
+        assert!(
+            stats_force_lod0.lod0_count > 0 && stats_force_lod0.lod2_count == 0,
+            "Force LOD0 must emit only LOD0 parts, got {stats_force_lod0:?}"
+        );
+        assert!(
+            stats_force_lod2.lod2_count > 0 && stats_force_lod2.lod0_count < stats_force_lod0.lod0_count,
+            "Force LOD2 must push multi-LOD/auto-proxy parts into lod2_count: lod0={stats_force_lod0:?}, lod2={stats_force_lod2:?}"
+        );
+        assert!(
+            stats_disabled.lod1_count == 0
+                && stats_disabled.lod2_count == 0
+                && stats_disabled.visible_instances > stats_tight_cull.visible_instances,
+            "LOD disabled must bypass LOD reduction and tier/screen-px culling: disabled={stats_disabled:?}, tight={stats_tight_cull:?}"
+        );
+        assert!(
+            stats_tight_cull.culled_count > stats_disabled.culled_count
+                && (stats_tight_cull.lod1_count + stats_tight_cull.lod2_count) > 0,
+            "tight distance/tier/screen-px sliders must increase culled_count and activate LOD1/LOD2: tight={stats_tight_cull:?}, disabled={stats_disabled:?}"
+        );
     }
 }

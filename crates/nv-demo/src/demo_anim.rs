@@ -284,4 +284,33 @@ mod tests {
         anim.toggle_play(&mut settings);
         assert!(!anim.playing);
     }
+
+    #[test]
+    fn csg_lod_bias_oscillates_and_clamps_within_bounds() {
+        let base = DemoSettings {
+            csg_lod_bias: 1.0,
+            ..Default::default()
+        };
+        let mut anim = DemoAnimator {
+            playing: true,
+            enabled: true,
+            period_s: 4.0,
+            amp: 1.0,
+            active: ["csg_lod_bias".to_string()].into_iter().collect(),
+            time_s: 1.0, // sin(+pi/2) = +1.0 -> +0.10 * (4.0 - 0.25) = +0.375
+        };
+        let hi = anim.apply(&base);
+        assert!((hi.csg_lod_bias - 1.375).abs() < 1e-5);
+
+        anim.time_s = 3.0; // sin(3pi/2) = -1.0 -> -0.375
+        let lo = anim.apply(&base);
+        assert!((lo.csg_lod_bias - 0.625).abs() < 1e-5);
+
+        // Extreme base clamps cleanly inside `0.25..=4.0`.
+        let edge_base = DemoSettings {
+            csg_lod_bias: 0.30,
+            ..Default::default()
+        };
+        assert!((anim.apply(&edge_base).csg_lod_bias - 0.25).abs() < 1e-5);
+    }
 }

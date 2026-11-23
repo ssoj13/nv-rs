@@ -49,6 +49,8 @@ const AOV_HUD_TAGS: [&str; 11] = [
     "CRYPTO",
 ];
 
+const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
+
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
 const ANIM_BTN_W: f32 = 16.0;
@@ -974,7 +976,8 @@ impl UiContext<'_> {
                     ui.separator();
                     ui.label(RichText::new("LOD").small().weak());
                     ui.spacing_mut().slider_width = 68.0;
-                    ui.add(
+                    ui.add_enabled(
+                        self.settings.csg_lod_enabled,
                         egui::Slider::new(&mut self.settings.csg_lod_bias, 0.25..=4.0)
                             .logarithmic(true)
                             .fixed_decimals(2)
@@ -2241,16 +2244,6 @@ impl UiContext<'_> {
                         "m/s",
                     );
                     prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
-                    anim_slider_f32(
-                        ui,
-                        anim,
-                        "csg_lod_bias",
-                        "LOD Bias",
-                        &mut s.csg_lod_bias,
-                        0.25..=4.0,
-                        2,
-                        false,
-                    );
                     if !viewpoints.is_empty() {
                         ui.add_space(2.0);
                         let vp_cols = if viewpoints.len() == 1 { 1 } else { 2 };
@@ -2287,6 +2280,81 @@ impl UiContext<'_> {
 
         let s = &mut *self.settings;
         let anim = &mut *self.demo_anim;
+        let csg_stats = self.csg_stats;
+        let label_buf = &mut self.scratch.label_buf;
+
+        collapsing_section(ui, "sec_lod", ic::STACK, "LOD & Culling", true, |ui| {
+            lod_telemetry_strip(ui, label_buf, csg_stats, s.csg_mode != 0);
+            ui.add_space(2.0);
+            prop_toggle(ui, "LOD Enabled", &mut s.csg_lod_enabled, "Distance & SSE LOD");
+            ui.add_enabled_ui(s.csg_lod_enabled, |ui| {
+                prop_row(ui, "Force LOD", |ui| {
+                    let gap = 4.0;
+                    let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let cur = (s.csg_force_lod as usize).min(FORCE_LOD_LABELS.len() - 1);
+                    egui::ComboBox::from_id_salt("csg_force_lod_combo")
+                        .width(combo_w)
+                        .truncate()
+                        .selected_text(FORCE_LOD_LABELS[cur])
+                        .show_ui(ui, |ui| {
+                            const TIPS: [&str; 4] = [
+                                "Select LOD0 / LOD1 / LOD2 dynamically by camera distance and screen-space size.",
+                                "Force full-detail LOD0 on all CSG assemblies and crowd actors.",
+                                "Force mid-detail LOD1 on all CSG assemblies and crowd actors.",
+                                "Force coarse proxy LOD2 on all CSG assemblies and crowd actors.",
+                            ];
+                            for (idx, lbl) in FORCE_LOD_LABELS.iter().enumerate() {
+                                ui.selectable_value(&mut s.csg_force_lod, idx as u32, *lbl)
+                                    .on_hover_text(TIPS[idx]);
+                            }
+                        });
+                    anim_toggle_btn_disabled(ui);
+                });
+                anim_slider_f32(
+                    ui,
+                    anim,
+                    "csg_lod_bias",
+                    "LOD Bias",
+                    &mut s.csg_lod_bias,
+                    0.25..=4.0,
+                    2,
+                    true,
+                );
+                let prev_lod = *s;
+                ui.add_space(2.0);
+                ui.label(RichText::new("Scene Distances & SSE").small().weak());
+                prop_slider_f32(ui, "LOD1 Dist", &mut s.csg_lod1_dist_m, 10.0..=500.0, 0, "m");
+                prop_slider_f32(ui, "LOD2 Dist", &mut s.csg_lod2_dist_m, 30.0..=1200.0, 0, "m");
+                prop_slider_f32(ui, "Meso Cull", &mut s.csg_meso_dist_m, 30.0..=1200.0, 0, "m");
+                prop_slider_f32(ui, "Micro Cull", &mut s.csg_micro_dist_m, 5.0..=200.0, 0, "m");
+                prop_slider_f32(ui, "Min Screen Px", &mut s.csg_min_screen_px, 0.0..=16.0, 1, "px");
+                prop_slider_f32(ui, "Hysteresis", &mut s.csg_lod_hysteresis, 0.0..=0.45, 2, "");
+                ui.add_space(2.0);
+                ui.label(RichText::new("Crowd LOD").small().weak());
+                prop_slider_f32(ui, "Crowd LOD1", &mut s.csg_crowd_lod1_m, 5.0..=120.0, 0, "m");
+                prop_slider_f32(ui, "Crowd LOD2", &mut s.csg_crowd_lod2_m, 20.0..=300.0, 0, "m");
+                prop_slider_f32(ui, "Crowd Cull", &mut s.csg_crowd_cull_m, 40.0..=600.0, 0, "m");
+                sync_lod_distance_order(s, &prev_lod);
+            });
+            ui.add_space(2.0);
+            let reset_lbl = fmt_into(
+                label_buf,
+                format_args!("{}  Reset LOD Defaults", ic::ARROW_COUNTER_CLOCKWISE),
+            );
+            if ui
+                .add_sized(
+                    [ui.available_width(), ROW_H + 4.0],
+                    egui::Button::new(reset_lbl).truncate(),
+                )
+                .on_hover_text(
+                    "Restore all CSG distance, screen-space, and crowd LOD settings to defaults.",
+                )
+                .clicked()
+            {
+                reset_csg_lod_defaults(s);
+            }
+        });
 
         collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
             prop_row(ui, "Background", |ui| {
@@ -3730,6 +3798,20 @@ impl UiContext<'_> {
                 );
                 stat_row(
                     ui,
+                    "CSG LOD",
+                    fmt_into(
+                        buf,
+                        format_args!(
+                            "L0:{} L1:{} L2:{} C:{}",
+                            self.csg_stats.lod0_count,
+                            self.csg_stats.lod1_count,
+                            self.csg_stats.lod2_count,
+                            self.csg_stats.culled_count
+                        ),
+                    ),
+                );
+                stat_row(
+                    ui,
                     "CSG DAG",
                     fmt_into(
                         buf,
@@ -3857,9 +3939,166 @@ pub fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
     }
 }
 
+/// Restores all CSG distance, screen-space, and crowd LOD/culling settings to
+/// [`DemoSettings::default`] without modifying unrelated render or scene fields.
+pub fn reset_csg_lod_defaults(s: &mut DemoSettings) {
+    let d = DemoSettings::default();
+    s.csg_lod_enabled = d.csg_lod_enabled;
+    s.csg_force_lod = d.csg_force_lod;
+    s.csg_lod_bias = d.csg_lod_bias;
+    s.csg_lod1_dist_m = d.csg_lod1_dist_m;
+    s.csg_lod2_dist_m = d.csg_lod2_dist_m;
+    s.csg_meso_dist_m = d.csg_meso_dist_m;
+    s.csg_micro_dist_m = d.csg_micro_dist_m;
+    s.csg_min_screen_px = d.csg_min_screen_px;
+    s.csg_lod_hysteresis = d.csg_lod_hysteresis;
+    s.csg_crowd_lod1_m = d.csg_crowd_lod1_m;
+    s.csg_crowd_lod2_m = d.csg_crowd_lod2_m;
+    s.csg_crowd_cull_m = d.csg_crowd_cull_m;
+}
+
+/// Keeps ordered LOD and culling distance thresholds monotonic (`lod1 <= lod2`,
+/// `micro <= meso`, `crowd_lod1 <= crowd_lod2 <= crowd_cull`) based on which slider moved.
+fn sync_lod_distance_order(s: &mut DemoSettings, prev: &DemoSettings) {
+    if (s.csg_lod1_dist_m - prev.csg_lod1_dist_m).abs() > 1e-4 {
+        s.csg_lod2_dist_m = s.csg_lod2_dist_m.max(s.csg_lod1_dist_m).clamp(30.0, 1200.0);
+    } else if (s.csg_lod2_dist_m - prev.csg_lod2_dist_m).abs() > 1e-4 {
+        s.csg_lod1_dist_m = s.csg_lod1_dist_m.min(s.csg_lod2_dist_m).clamp(10.0, 500.0);
+    }
+
+    if (s.csg_micro_dist_m - prev.csg_micro_dist_m).abs() > 1e-4 {
+        s.csg_meso_dist_m = s.csg_meso_dist_m.max(s.csg_micro_dist_m).clamp(30.0, 1200.0);
+    } else if (s.csg_meso_dist_m - prev.csg_meso_dist_m).abs() > 1e-4 {
+        s.csg_micro_dist_m = s.csg_micro_dist_m.min(s.csg_meso_dist_m).clamp(5.0, 200.0);
+    }
+
+    if (s.csg_crowd_lod1_m - prev.csg_crowd_lod1_m).abs() > 1e-4 {
+        s.csg_crowd_lod2_m = s.csg_crowd_lod2_m.max(s.csg_crowd_lod1_m).clamp(20.0, 300.0);
+        s.csg_crowd_cull_m = s.csg_crowd_cull_m.max(s.csg_crowd_lod2_m).clamp(40.0, 600.0);
+    } else if (s.csg_crowd_lod2_m - prev.csg_crowd_lod2_m).abs() > 1e-4 {
+        s.csg_crowd_lod1_m = s.csg_crowd_lod1_m.min(s.csg_crowd_lod2_m).clamp(5.0, 120.0);
+        s.csg_crowd_cull_m = s.csg_crowd_cull_m.max(s.csg_crowd_lod2_m).clamp(40.0, 600.0);
+    } else if (s.csg_crowd_cull_m - prev.csg_crowd_cull_m).abs() > 1e-4 {
+        s.csg_crowd_lod2_m = s.csg_crowd_lod2_m.min(s.csg_crowd_cull_m).clamp(20.0, 300.0);
+        s.csg_crowd_lod1_m = s.csg_crowd_lod1_m.min(s.csg_crowd_lod2_m).clamp(5.0, 120.0);
+    }
+}
+
+/// Computes `(inner_w, cell_w)` for the 4-column LOD telemetry strip so columns never overflow
+/// narrow dock panes (`total_w >= 120.0`).
+fn lod_strip_widths(total_w: f32) -> (f32, f32) {
+    let safe_w = if total_w.is_finite() {
+        total_w.max(120.0)
+    } else {
+        220.0
+    };
+    let inner_w = (safe_w - 8.0).max(112.0);
+    let gap = 4.0;
+    let cell_w = ((inner_w - gap * 3.0) / 4.0).max(24.0);
+    (inner_w, cell_w)
+}
+
+/// Renders a compact, zero-churn 4-column tabular telemetry strip (`LOD0 / LOD1 / LOD2 / Culled`)
+/// using reusable scratch buffer `buf`.
+fn lod_telemetry_strip(ui: &mut Ui, buf: &mut String, stats: CsgStats, active: bool) {
+    let (inner_w, cell_w) = lod_strip_widths(ui.available_width());
+    let dark = ui.visuals().dark_mode;
+    let colors = if !active {
+        let muted = ui.visuals().weak_text_color();
+        [muted, muted, muted, muted]
+    } else if dark {
+        [
+            Color32::from_rgb(142, 214, 158),
+            Color32::from_rgb(138, 178, 244),
+            Color32::from_rgb(236, 198, 126),
+            Color32::from_rgb(168, 174, 186),
+        ]
+    } else {
+        [
+            Color32::from_rgb(30, 122, 62),
+            Color32::from_rgb(38, 96, 192),
+            Color32::from_rgb(164, 108, 24),
+            Color32::from_rgb(96, 102, 114),
+        ]
+    };
+    let items: [(&str, u32, Color32); 4] = [
+        ("LOD0", stats.lod0_count, colors[0]),
+        ("LOD1", stats.lod1_count, colors[1]),
+        ("LOD2", stats.lod2_count, colors[2]),
+        ("Culled", stats.culled_count, colors[3]),
+    ];
+
+    egui::Frame::NONE
+        .fill(ui.visuals().extreme_bg_color)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(4, 3))
+        .show(ui, |ui| {
+            ui.set_width(inner_w);
+            let gap = 4.0;
+            let resp = ui
+                .horizontal(|ui| {
+                    ui.set_max_width(inner_w);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for (lbl, count, col) in items {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(cell_w, 26.0),
+                            Layout::top_down(Align::Center),
+                            |ui| {
+                                ui.set_max_width(cell_w);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(lbl)
+                                            .size(9.5)
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .truncate(),
+                                );
+                                let val_str = if active {
+                                    fmt_into(buf, format_args!("{count}"))
+                                } else {
+                                    "-"
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(val_str).monospace().size(11.0).color(col),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                    }
+                })
+                .response;
+            let hover_resp = ui.interact(
+                resp.rect,
+                ui.id().with("lod_strip_hover"),
+                Sense::hover(),
+            );
+            if hover_resp.hovered() {
+                let tip = if active {
+                    fmt_into(
+                        buf,
+                        format_args!(
+                            "LOD0: {}  |  LOD1: {}  |  LOD2: {}  |  Culled: {}",
+                            stats.lod0_count,
+                            stats.lod1_count,
+                            stats.lod2_count,
+                            stats.culled_count
+                        ),
+                    )
+                } else {
+                    "Switch to a CSG World scene to inspect live LOD & culling counts."
+                };
+                hover_resp.on_hover_text(tip);
+            }
+        });
+}
+
 fn section_accent(id_salt: &str) -> Color32 {
     match id_salt {
         "sec_csg" => Color32::from_rgb(92, 184, 224),
+        "sec_lod" => Color32::from_rgb(104, 192, 186),
         "sec_sky" => Color32::from_rgb(232, 178, 84),
         "sec_env" => Color32::from_rgb(98, 162, 208),
         "sec_dof" => Color32::from_rgb(198, 118, 162),
@@ -3885,6 +4124,7 @@ const SECTION_GROUPS: &[&[&str]] = &[
     // Render & Floor panel
     &[
         "sec_csg",
+        "sec_lod",
         "sec_sky",
         "sec_dof",
         "sec_floor",
@@ -3914,6 +4154,7 @@ fn section_default_open(id_salt: &str) -> bool {
             | "sec_presets"
             | "sec_formula"
             | "sec_csg"
+            | "sec_lod"
             | "sec_sky"
             | "sec_pt"
     )
@@ -4275,6 +4516,12 @@ fn prop_slider_f32(
         let (track_w, val_w) = slider_control_widths(ui.available_width());
         ui.spacing_mut().item_spacing.x = gap;
         ui.spacing_mut().slider_width = track_w;
+        let span = (*range.end() - *range.start()).abs();
+        let drag_speed = if span.is_finite() && span > 0.0 {
+            (span / 250.0).clamp(0.005, 2.0)
+        } else {
+            0.01
+        };
         let slider = egui::Slider::new(val, range.clone()).show_value(false);
         ui.add_sized([track_w, ROW_H], slider);
         let prev_style = ui.style().override_text_style.clone();
@@ -4282,7 +4529,7 @@ fn prop_slider_f32(
         let mut drag = egui::DragValue::new(val)
             .range(range)
             .fixed_decimals(decimals)
-            .speed(0.01);
+            .speed(drag_speed);
         if !suffix.is_empty() {
             drag = drag.suffix(suffix);
         }
@@ -4587,5 +4834,108 @@ mod tests {
         assert!(df.pose.eye.is_finite());
         assert_eq!(driver.prefs().mode, NavMode::Trackball);
         assert_eq!(driver.controller().mode(), Some(NavMode::Trackball));
+    }
+
+    #[test]
+    fn reset_csg_lod_defaults_restores_all_lod_fields_and_preserves_other_settings() {
+        let def = DemoSettings::default();
+        let mut s = DemoSettings {
+            csg_mode: 3,
+            csg_wetness: 0.72,
+            exposure: 1.65,
+            csg_lod_enabled: false,
+            csg_force_lod: 3,
+            csg_lod_bias: 2.75,
+            csg_lod1_dist_m: 210.0,
+            csg_lod2_dist_m: 640.0,
+            csg_meso_dist_m: 720.0,
+            csg_micro_dist_m: 95.0,
+            csg_min_screen_px: 8.5,
+            csg_lod_hysteresis: 0.35,
+            csg_crowd_lod1_m: 60.0,
+            csg_crowd_lod2_m: 150.0,
+            csg_crowd_cull_m: 410.0,
+            ..def
+        };
+
+        reset_csg_lod_defaults(&mut s);
+
+        assert_eq!(s.csg_lod_enabled, def.csg_lod_enabled);
+        assert_eq!(s.csg_force_lod, def.csg_force_lod);
+        assert_eq!(s.csg_lod_bias, def.csg_lod_bias);
+        assert_eq!(s.csg_lod1_dist_m, def.csg_lod1_dist_m);
+        assert_eq!(s.csg_lod2_dist_m, def.csg_lod2_dist_m);
+        assert_eq!(s.csg_meso_dist_m, def.csg_meso_dist_m);
+        assert_eq!(s.csg_micro_dist_m, def.csg_micro_dist_m);
+        assert_eq!(s.csg_min_screen_px, def.csg_min_screen_px);
+        assert_eq!(s.csg_lod_hysteresis, def.csg_lod_hysteresis);
+        assert_eq!(s.csg_crowd_lod1_m, def.csg_crowd_lod1_m);
+        assert_eq!(s.csg_crowd_lod2_m, def.csg_crowd_lod2_m);
+        assert_eq!(s.csg_crowd_cull_m, def.csg_crowd_cull_m);
+
+        // Unrelated settings stay untouched.
+        assert_eq!(s.csg_mode, 3);
+        assert!((s.csg_wetness - 0.72).abs() < 1e-6);
+        assert!((s.exposure - 1.65).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_lod_distance_order_keeps_tiers_monotonic_in_both_directions() {
+        let mut s = DemoSettings::default();
+
+        // Pushing LOD1 above LOD2 lifts LOD2.
+        let prev = s;
+        s.csg_lod1_dist_m = 340.0;
+        sync_lod_distance_order(&mut s, &prev);
+        assert!(s.csg_lod2_dist_m >= s.csg_lod1_dist_m);
+
+        // Pulling LOD2 below LOD1 lowers LOD1.
+        let prev = s;
+        s.csg_lod2_dist_m = 60.0;
+        sync_lod_distance_order(&mut s, &prev);
+        assert!(s.csg_lod1_dist_m <= s.csg_lod2_dist_m);
+
+        // Pushing Micro Cull above Meso Cull lifts Meso Cull.
+        s.csg_meso_dist_m = 100.0;
+        s.csg_micro_dist_m = 100.0;
+        let prev_m = s;
+        s.csg_micro_dist_m = 180.0;
+        sync_lod_distance_order(&mut s, &prev_m);
+        assert!(s.csg_meso_dist_m >= s.csg_micro_dist_m);
+
+        // Pulling Meso Cull below Micro Cull lowers Micro Cull.
+        let prev_m2 = s;
+        s.csg_meso_dist_m = 60.0;
+        sync_lod_distance_order(&mut s, &prev_m2);
+        assert!(s.csg_micro_dist_m <= s.csg_meso_dist_m);
+
+        // Pulling Crowd Cull down pulls Crowd LOD2 and Crowd LOD1 down cleanly.
+        let prev = s;
+        s.csg_crowd_lod1_m = 110.0;
+        sync_lod_distance_order(&mut s, &prev);
+        assert!(s.csg_crowd_lod1_m <= s.csg_crowd_lod2_m);
+        assert!(s.csg_crowd_lod2_m <= s.csg_crowd_cull_m);
+
+        let prev = s;
+        s.csg_crowd_cull_m = 45.0;
+        sync_lod_distance_order(&mut s, &prev);
+        assert!(s.csg_crowd_lod2_m <= s.csg_crowd_cull_m);
+        assert!(s.csg_crowd_lod1_m <= s.csg_crowd_lod2_m);
+    }
+
+    #[test]
+    fn lod_strip_widths_never_overflow_narrow_or_wide_panels() {
+        for total_w in [120.0_f32, 140.0, 180.0, 220.0, 320.0, 480.0] {
+            let (inner_w, cell_w) = lod_strip_widths(total_w);
+            assert!(inner_w + 8.0 <= total_w + 1e-3);
+            let used = 4.0 * cell_w + 3.0 * 4.0;
+            assert!(
+                used <= inner_w + 1e-3,
+                "LOD strip overflow at total_w={total_w}: used={used} > inner_w={inner_w}"
+            );
+            assert!(cell_w >= 24.0);
+        }
+        let (nan_inner, nan_cell) = lod_strip_widths(f32::NAN);
+        assert!(nan_inner.is_finite() && nan_cell.is_finite() && nan_cell >= 24.0);
     }
 }

@@ -27,7 +27,7 @@ use crate::app_events::{
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
 };
-use crate::cuda_crowd::{CudaCrowdBackend, GpuScatterTarget};
+use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 use crate::profiler::GpuPassProfiler;
@@ -431,6 +431,50 @@ fn default_tod_transition_secs() -> f32 {
     2.0
 }
 
+fn default_csg_lod_enabled() -> bool {
+    true
+}
+
+fn default_csg_force_lod() -> u32 {
+    0
+}
+
+fn default_csg_lod1_dist_m() -> f32 {
+    80.0
+}
+
+fn default_csg_lod2_dist_m() -> f32 {
+    220.0
+}
+
+fn default_csg_meso_dist_m() -> f32 {
+    300.0
+}
+
+fn default_csg_micro_dist_m() -> f32 {
+    35.0
+}
+
+fn default_csg_min_screen_px() -> f32 {
+    1.5
+}
+
+fn default_csg_lod_hysteresis() -> f32 {
+    0.15
+}
+
+fn default_csg_crowd_lod1_m() -> f32 {
+    22.0
+}
+
+fn default_csg_crowd_lod2_m() -> f32 {
+    75.0
+}
+
+fn default_csg_crowd_cull_m() -> f32 {
+    180.0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DemoSettings {
@@ -595,8 +639,41 @@ pub struct DemoSettings {
     pub csg_freeze_pose: bool,
     /// Keep the classic foreground fractal & stage floor visible inside CSG modes.
     pub csg_show_fractal: bool,
+    /// Master distance & screen-space LOD / culling toggle (`false` renders full LOD0 everywhere).
+    #[serde(default = "default_csg_lod_enabled")]
+    pub csg_lod_enabled: bool,
+    /// Optional forced LOD tier (`0 = Auto`, `1 = LOD0`, `2 = LOD1`, `3 = LOD2`).
+    #[serde(default = "default_csg_force_lod")]
+    pub csg_force_lod: u32,
     /// Distance/SSE LOD detail multiplier (`0.25..=4.0`).
     pub csg_lod_bias: f32,
+    /// Base LOD0 -> LOD1 transition distance in meters (`10..=500`, default `80.0`).
+    #[serde(default = "default_csg_lod1_dist_m")]
+    pub csg_lod1_dist_m: f32,
+    /// Base LOD1 -> LOD2 / proxy transition distance in meters (`30..=1200`, default `220.0`).
+    #[serde(default = "default_csg_lod2_dist_m")]
+    pub csg_lod2_dist_m: f32,
+    /// Base `DetailTier::Meso` cull distance in meters (`30..=1200`, default `300.0`).
+    #[serde(default = "default_csg_meso_dist_m")]
+    pub csg_meso_dist_m: f32,
+    /// Base `DetailTier::Micro` cull distance in meters (`5..=200`, default `35.0`).
+    #[serde(default = "default_csg_micro_dist_m")]
+    pub csg_micro_dist_m: f32,
+    /// Minimum projected screen-space pixel diameter before culling (`0.0..=16.0`, default `1.5`).
+    #[serde(default = "default_csg_min_screen_px")]
+    pub csg_min_screen_px: f32,
+    /// Fractional hysteresis deadband around LOD switching boundaries (`0.0..=0.45`, default `0.15`).
+    #[serde(default = "default_csg_lod_hysteresis")]
+    pub csg_lod_hysteresis: f32,
+    /// Base crowd LOD0 -> LOD1 transition distance in meters (`5..=120`, default `22.0`).
+    #[serde(default = "default_csg_crowd_lod1_m")]
+    pub csg_crowd_lod1_m: f32,
+    /// Base crowd LOD1 -> LOD2 transition distance in meters (`20..=300`, default `75.0`).
+    #[serde(default = "default_csg_crowd_lod2_m")]
+    pub csg_crowd_lod2_m: f32,
+    /// Base crowd visibility cull distance in meters (`40..=600`, default `180.0`).
+    #[serde(default = "default_csg_crowd_cull_m")]
+    pub csg_crowd_cull_m: f32,
     /// Road geometry representation (`0 = Watertight 3D`, `1 = C1 Tangent`, `2 = Hybrid C1+SDF`, `3 = F-Rep Tile`).
     #[serde(default = "default_csg_road_mode")]
     pub csg_road_mode: u8,
@@ -737,7 +814,18 @@ impl Default for DemoSettings {
             csg_traffic_speed: 1.0,
             csg_freeze_pose: false,
             csg_show_fractal: false,
+            csg_lod_enabled: default_csg_lod_enabled(),
+            csg_force_lod: default_csg_force_lod(),
             csg_lod_bias: 1.0,
+            csg_lod1_dist_m: default_csg_lod1_dist_m(),
+            csg_lod2_dist_m: default_csg_lod2_dist_m(),
+            csg_meso_dist_m: default_csg_meso_dist_m(),
+            csg_micro_dist_m: default_csg_micro_dist_m(),
+            csg_min_screen_px: default_csg_min_screen_px(),
+            csg_lod_hysteresis: default_csg_lod_hysteresis(),
+            csg_crowd_lod1_m: default_csg_crowd_lod1_m(),
+            csg_crowd_lod2_m: default_csg_crowd_lod2_m(),
+            csg_crowd_cull_m: default_csg_crowd_cull_m(),
             csg_road_mode: default_csg_road_mode(),
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
@@ -745,6 +833,37 @@ impl Default for DemoSettings {
             sdg_occluder_backend: SdgOccluderBackend::Auto,
             poke_impulse: 1.8,
             sdg_burst_frames: 16,
+        }
+    }
+}
+
+impl DemoSettings {
+    /// Builds the unified [`csg_scene::LodConfig`] driving static/dynamic CSG LODs and culling.
+    #[inline]
+    pub fn csg_lod_config(&self) -> csg_scene::LodConfig {
+        csg_scene::LodConfig {
+            enabled: self.csg_lod_enabled,
+            lod_bias: self.csg_lod_bias,
+            force_lod: CrowdLodParams::decode_force_lod(self.csg_force_lod),
+            lod1_dist_m: self.csg_lod1_dist_m,
+            lod2_dist_m: self.csg_lod2_dist_m,
+            meso_dist_m: self.csg_meso_dist_m,
+            micro_dist_m: self.csg_micro_dist_m,
+            min_screen_px: self.csg_min_screen_px,
+            hysteresis: self.csg_lod_hysteresis,
+        }
+    }
+
+    /// Builds the unified [`CrowdLodParams`] driving both CPU (`CrowdSim`) and CUDA crowd LODs.
+    #[inline]
+    pub fn crowd_lod_params(&self) -> CrowdLodParams {
+        CrowdLodParams {
+            enabled: self.csg_lod_enabled,
+            force_lod: CrowdLodParams::decode_force_lod(self.csg_force_lod),
+            lod_bias: self.csg_lod_bias,
+            lod1_dist_m: self.csg_crowd_lod1_m,
+            lod2_dist_m: self.csg_crowd_lod2_m,
+            cull_dist_m: self.csg_crowd_cull_m,
         }
     }
 }
@@ -2103,7 +2222,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             viewport_w: DEFAULT_W,
             viewport_h: DEFAULT_H,
             vfov_rad: std::f32::consts::FRAC_PI_3,
-            lod_bias: initial_settings.csg_lod_bias,
+            lod_config: initial_settings.csg_lod_config(),
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
         0.0,
@@ -3109,11 +3228,7 @@ pub fn spawn_render_thread(
             let mut last_crowd_step_ms: f32 = 0.0;
             let mut last_crowd_backend = ActiveCrowdBackend::None;
             let mut last_cuda_crowd_err: Option<String> = None;
-            let mut last_crowd_lod_bits: u32 = if settings.csg_lod_bias.is_finite() {
-                settings.csg_lod_bias.clamp(0.25, 4.0).to_bits()
-            } else {
-                1.0f32.to_bits()
-            };
+            let mut last_crowd_lod_sig = settings.crowd_lod_params().signature_key();
             let mut rec_active = false;
             let mut rec_fixed_fps: u32 = 0;
             let mut rec_shutter_subframes: u32 = 1;
@@ -3813,13 +3928,10 @@ pub fn spawn_render_thread(
                     cc.mark_intents_dirty();
                 }
 
-                let cur_lod_bits = if settings.csg_lod_bias.is_finite() {
-                    settings.csg_lod_bias.clamp(0.25, 4.0).to_bits()
-                } else {
-                    1.0f32.to_bits()
-                };
-                let crowd_lod_changed = cur_lod_bits != last_crowd_lod_bits;
-                last_crowd_lod_bits = cur_lod_bits;
+                let crowd_lod = settings.crowd_lod_params();
+                let cur_crowd_lod_sig = crowd_lod.signature_key();
+                let crowd_lod_changed = cur_crowd_lod_sig != last_crowd_lod_sig;
+                last_crowd_lod_sig = cur_crowd_lod_sig;
 
                 let mut run_cuda_crowd_after_sync = false;
                 if rig.csg_host.has_crowd() && crowd_step_dt > 0.0 {
@@ -3835,7 +3947,7 @@ pub fn spawn_render_thread(
                                 crowd_step_dt,
                                 traffic_time,
                                 last_rendered_camera.eye,
-                                settings.csg_lod_bias,
+                                crowd_lod,
                                 false,
                                 step_traffic_now,
                             );
@@ -3851,7 +3963,7 @@ pub fn spawn_render_thread(
                                 0.0,
                                 traffic_time,
                                 last_rendered_camera.eye,
-                                settings.csg_lod_bias,
+                                crowd_lod,
                                 false,
                                 step_traffic_now,
                             );
@@ -3885,7 +3997,7 @@ pub fn spawn_render_thread(
                                             crowd_step_dt,
                                             traffic_time,
                                             last_rendered_camera.eye,
-                                            settings.csg_lod_bias,
+                                            crowd_lod,
                                             false,
                                             false,
                                         );
@@ -3905,7 +4017,7 @@ pub fn spawn_render_thread(
                         0.0,
                         traffic_time,
                         last_rendered_camera.eye,
-                        settings.csg_lod_bias,
+                        crowd_lod,
                         freeze_now,
                         step_traffic_now,
                     );
@@ -3951,7 +4063,7 @@ pub fn spawn_render_thread(
                                     if rig.csg_host.refresh_crowd_lod_cpu(
                                         traffic_time,
                                         last_rendered_camera.eye,
-                                        settings.csg_lod_bias,
+                                        crowd_lod,
                                     ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
                                     {
                                         cc.mark_scene_dirty();
@@ -3967,7 +4079,7 @@ pub fn spawn_render_thread(
                                 if rig.csg_host.refresh_crowd_lod_cpu(
                                     traffic_time,
                                     last_rendered_camera.eye,
-                                    settings.csg_lod_bias,
+                                    crowd_lod,
                                 ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
                                 {
                                     cc.mark_scene_dirty();
@@ -4039,7 +4151,7 @@ pub fn spawn_render_thread(
                     viewport_w: cur_w,
                     viewport_h: cur_h,
                     vfov_rad,
-                    lod_bias: settings.csg_lod_bias,
+                    lod_config: settings.csg_lod_config(),
                     omnidirectional: settings.camera_projection.is_omnidirectional(),
                 };
                 let freeze_for_sync = settings.csg_freeze_pose || active_burst.is_some();
@@ -4262,7 +4374,7 @@ pub fn spawn_render_thread(
                             crowd_step_dt,
                             traffic_time,
                             active_camera.eye,
-                            settings.csg_lod_bias,
+                            crowd_lod,
                             Some(scatter),
                             possessing_crowd,
                         ),

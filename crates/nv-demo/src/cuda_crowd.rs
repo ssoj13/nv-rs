@@ -44,6 +44,39 @@ const _: () = assert!(CSG_SBT_PRIM_OFFSET == 10);
 /// an incremental `OPTIX_BUILD_OPERATION_UPDATE` refit (preserves tight BVH traversal quality).
 pub const CUDA_IAS_REBUILD_DISP_M: f32 = 8.0;
 
+/// Single source of truth scaling crowd LOD thresholds `(lod1_dist_m, lod2_dist_m, cull_dist_m)`
+/// by `lod_bias` (`0.25..=4.0`), guarding against non-finite or non-positive inputs identically
+/// across CPU (`CrowdSim`) and CUDA (`step_and_emit_actors_cuda`).
+#[inline]
+pub fn scale_crowd_lod_dists(
+    lod1_dist_m: f32,
+    lod2_dist_m: f32,
+    cull_dist_m: f32,
+    lod_bias: f32,
+) -> (f32, f32, f32) {
+    let bias = if lod_bias.is_finite() {
+        lod_bias.clamp(0.25, 4.0)
+    } else {
+        1.0
+    };
+    let base_lod1 = if lod1_dist_m.is_finite() && lod1_dist_m > 0.0 {
+        lod1_dist_m
+    } else {
+        22.0
+    };
+    let base_lod2 = if lod2_dist_m.is_finite() && lod2_dist_m > 0.0 {
+        lod2_dist_m
+    } else {
+        75.0
+    };
+    let base_cull = if cull_dist_m.is_finite() && cull_dist_m > 0.0 {
+        cull_dist_m
+    } else {
+        180.0
+    };
+    (base_lod1 * bias, base_lod2 * bias, base_cull * bias)
+}
+
 /// GPU DEM elevation header (`32 B`, 16-byte aligned) matching `ActorDemUniformsPod` in CUDA.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -307,10 +340,10 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
     float ox[4];
     float oz[4];
     if (desc.archetype_id == quadruped_arch_id) {
-        ox[0] = -0.11f * cy + 0.32f * hs * sy; oz[0] =  0.11f * sy + 0.32f * hs * cy;
-        ox[1] =  0.11f * cy + 0.32f * hs * sy; oz[1] = -0.11f * sy + 0.32f * hs * cy;
-        ox[2] = -0.11f * cy - 0.26f * hs * sy; oz[2] =  0.11f * sy - 0.26f * hs * cy;
-        ox[3] =  0.11f * cy - 0.26f * hs * sy; oz[3] = -0.11f * sy - 0.26f * hs * cy;
+        ox[0] = -0.11f * cy + 0.64f * hs * sy; oz[0] =  0.11f * sy + 0.64f * hs * cy;
+        ox[1] =  0.11f * cy + 0.64f * hs * sy; oz[1] = -0.11f * sy + 0.64f * hs * cy;
+        ox[2] = -0.11f * cy - 0.02f * hs * sy; oz[2] =  0.11f * sy - 0.02f * hs * cy;
+        ox[3] =  0.11f * cy - 0.02f * hs * sy; oz[3] = -0.11f * sy - 0.02f * hs * cy;
     } else {
         ox[0] = -0.22f * cy; oz[0] =  0.22f * sy;
         ox[1] =  0.22f * cy; oz[1] = -0.22f * sy;
@@ -790,7 +823,7 @@ impl CudaCrowdBackend {
     /// displacement flag) with **zero mid-frame host synchronization** in steady state.
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates CUDA stream, scene state, timestep, camera eye, scatter targets, and readback policy cleanly"
+        reason = "coordinates CUDA stream, scene state, timestep, camera eye, LOD bias, scatter targets, and readback policy cleanly"
     )]
     pub fn step_gpu_direct(
         &mut self,
@@ -799,6 +832,7 @@ impl CudaCrowdBackend {
         dt: f32,
         time_s: f32,
         cam_eye: [f32; 3],
+        lod_bias: f32,
         scatter: Option<GpuScatterTarget>,
         sync_world_joints: bool,
     ) -> Result<CudaCrowdStepReport, String> {
@@ -1004,9 +1038,12 @@ impl CudaCrowdBackend {
         let mut p_gas_null: u64 = 0;
         let mut p_sbt_null: u64 = 0;
         let mut optix_off_zero: u32 = 0;
-        let mut lod1 = scene.crowd.lod1_dist_m;
-        let mut lod2 = scene.crowd.lod2_dist_m;
-        let mut cull = scene.crowd.cull_dist_m;
+        let (mut lod1, mut lod2, mut cull) = scale_crowd_lod_dists(
+            scene.crowd.lod1_dist_m,
+            scene.crowd.lod2_dist_m,
+            scene.crowd.cull_dist_m,
+            lod_bias,
+        );
 
         let mut step_args: [*mut c_void; 18] = [
             (&raw mut p_u_sim).cast(),
@@ -1196,7 +1233,7 @@ impl CudaCrowdBackend {
     #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "test helper mirrors GPU step parameters directly for parity and stress benchmarks"
+        reason = "test helper mirrors GPU step parameters directly for parity, LOD, and stress benchmarks"
     )]
     pub fn step_crowd_raw_for_test(
         &mut self,
@@ -1206,6 +1243,7 @@ impl CudaCrowdBackend {
         dt: f32,
         time_s: f32,
         cam_eye: [f32; 3],
+        lod_bias: f32,
         readback_all: bool,
     ) -> Result<f32, String> {
         let n_actors = crowd.actor_count();
@@ -1268,9 +1306,12 @@ impl CudaCrowdBackend {
         let mut p_world_joints = self.d_world_joints.device_ptr();
         let mut p_null: u64 = 0;
         let mut off_zero: u32 = 0;
-        let mut lod1 = crowd.lod1_dist_m;
-        let mut lod2 = crowd.lod2_dist_m;
-        let mut cull = crowd.cull_dist_m;
+        let (mut lod1, mut lod2, mut cull) = scale_crowd_lod_dists(
+            crowd.lod1_dist_m,
+            crowd.lod2_dist_m,
+            crowd.cull_dist_m,
+            lod_bias,
+        );
         let mut step_args: [*mut c_void; 18] = [
             (&raw mut p_u_sim).cast(),
             (&raw mut p_arch).cast(),
@@ -1423,10 +1464,10 @@ fn sample_scene_grounds(scene: &SceneBuilt, offset_m: f32, out: &mut Vec<GroundS
         let is_quad = desc.archetype_id == ArchetypeKind::Quadruped as u32;
         let foot_offsets: [(f32, f32); 4] = if is_quad {
             [
-                (-0.11 * cy + 0.32 * hs * sy, 0.11 * sy + 0.32 * hs * cy),
-                (0.11 * cy + 0.32 * hs * sy, -0.11 * sy + 0.32 * hs * cy),
-                (-0.11 * cy - 0.26 * hs * sy, 0.11 * sy - 0.26 * hs * cy),
-                (0.11 * cy - 0.26 * hs * sy, -0.11 * sy - 0.26 * hs * cy),
+                (-0.11 * cy + 0.64 * hs * sy, 0.11 * sy + 0.64 * hs * cy),
+                (0.11 * cy + 0.64 * hs * sy, -0.11 * sy + 0.64 * hs * cy),
+                (-0.11 * cy - 0.02 * hs * sy, 0.11 * sy - 0.02 * hs * cy),
+                (0.11 * cy - 0.02 * hs * sy, -0.11 * sy - 0.02 * hs * cy),
             ]
         } else {
             [
@@ -1504,7 +1545,7 @@ mod tests {
             let t = step as f32 * dt;
             cpu.step_analytical(&ground, cam_vec, dt, t);
             backend
-                .step_crowd_raw_for_test(&stream, &mut gpu, &grounds, dt, t, cam_eye, true)
+                .step_crowd_raw_for_test(&stream, &mut gpu, &grounds, dt, t, cam_eye, 1.0, true)
                 .expect("GPU step");
         }
 
@@ -1589,7 +1630,7 @@ mod tests {
 
         // Warmup upload + first step.
         backend
-            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 0.0, cam_eye, false)
+            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 0.0, cam_eye, 1.0, false)
             .expect("warmup GPU step");
 
         // Timed steady-state GPU steps (no full bone readback).
@@ -1603,6 +1644,7 @@ mod tests {
                     dt,
                     step as f32 * dt,
                     cam_eye,
+                    1.0,
                     false,
                 )
                 .expect("steady GPU step");
@@ -1610,7 +1652,7 @@ mod tests {
         }
         // Final readback sanity check: every actor state & bone xform must be finite.
         backend
-            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 11.0 * dt, cam_eye, true)
+            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 11.0 * dt, cam_eye, 1.0, true)
             .expect("readback GPU step");
 
         for st in &crowd.states {
@@ -1660,7 +1702,7 @@ mod tests {
         for step in 0..4 {
             let t = step as f32 * dt;
             let _rep = backend
-                .step_gpu_direct(&stream, &mut gpu_scene, dt, t, cam_eye, None, false)
+                .step_gpu_direct(&stream, &mut gpu_scene, dt, t, cam_eye, 1.0, None, false)
                 .expect("GPU direct step");
             // Simulate single end-of-frame fence.
             stream.synchronize().expect("end of frame fence");
@@ -1674,5 +1716,77 @@ mod tests {
         for b in &gpu_scene.crowd.bone_outs {
             assert!(b.xform.iter().all(|v| v.is_finite()));
         }
+    }
+
+    #[test]
+    fn scale_crowd_lod_dists_clamps_and_handles_non_finite() {
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 0.25), (5.5, 18.75, 45.0));
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 1.0), (22.0, 75.0, 180.0));
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 4.0), (88.0, 300.0, 720.0));
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 0.01), (5.5, 18.75, 45.0));
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 99.0), (88.0, 300.0, 720.0));
+        assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, f32::NAN), (22.0, 75.0, 180.0));
+        assert_eq!(scale_crowd_lod_dists(0.0, -1.0, f32::NAN, 2.0), (44.0, 150.0, 360.0));
+    }
+
+    #[test]
+    fn cuda_crowd_lod_bias_scales_gpu_lod_and_cull_distances() {
+        let ctx = CudaContext::new(0).expect("CUDA context on device 0");
+        ctx.bind_to_thread().expect("bind CUDA context");
+        let stream = ctx.default_stream();
+        let mut backend = CudaCrowdBackend::new(&ctx).expect("NVRTC compile actor_sim.cuh");
+
+        // Place a HumanHero actor (has distinct LOD0/LOD1/LOD2 bone masks) at 50 m from camera.
+        let mut crowd = CrowdSim::with_default_topologies();
+        let params = ActorSpawnParams::new(
+            ArchetypeKind::HumanHero,
+            ActorVec3::new(0.0, 0.0, 50.0),
+            0.0,
+            600_001,
+        );
+        let aidx = crowd.spawn_actor(params, |j| (j.role as u32 % 11, u32::MAX));
+        crowd.intents[aidx].flags |= intent_flags::FREEZE_POSE;
+        let grounds = vec![GroundSamplePod {
+            height_normal: [0.0, 0.0, 1.0, 0.0],
+            foot_heights: [0.0; 4],
+        }];
+        let cam_eye = [0.0f32, 1.5, 0.0];
+        let dt = 1.0 / 60.0;
+
+        // lod_bias = 0.25 -> cull = 45.0 m < 50.0 m -> 0 visible bones.
+        backend
+            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 0.0, cam_eye, 0.25, true)
+            .expect("GPU step lod 0.25");
+        let vis_025 = crowd
+            .bone_outs
+            .iter()
+            .filter(|b| (b.flags & csg_actors::BONE_OUT_VISIBLE) != 0)
+            .count();
+
+        // lod_bias = 1.0 -> lod1 = 22 m < 50 m <= lod2 = 75 m -> LOD1 visible subset.
+        backend
+            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 0.0, cam_eye, 1.0, true)
+            .expect("GPU step lod 1.0");
+        let vis_100 = crowd
+            .bone_outs
+            .iter()
+            .filter(|b| (b.flags & csg_actors::BONE_OUT_VISIBLE) != 0)
+            .count();
+
+        // lod_bias = 4.0 -> lod1 = 88 m >= 50 m -> full LOD0 bones.
+        backend
+            .step_crowd_raw_for_test(&stream, &mut crowd, &grounds, dt, 0.0, cam_eye, 4.0, true)
+            .expect("GPU step lod 4.0");
+        let vis_400 = crowd
+            .bone_outs
+            .iter()
+            .filter(|b| (b.flags & csg_actors::BONE_OUT_VISIBLE) != 0)
+            .count();
+
+        assert_eq!(vis_025, 0, "50 m actor must be culled at lod_bias=0.25 (cull=45 m)");
+        assert!(
+            vis_100 > 0 && vis_400 > vis_100,
+            "expected monotonic GPU crowd LOD bone visibility across lod_bias: 0.25={vis_025}, 1.0={vis_100}, 4.0={vis_400}"
+        );
     }
 }

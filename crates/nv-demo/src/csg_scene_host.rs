@@ -41,6 +41,7 @@ use csg_scene::{
 };
 
 use crate::app_events::PossessInfo;
+use crate::cuda_crowd::scale_crowd_lod_dists;
 use crate::renderer::{CameraFrame, CameraProjection};
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
@@ -353,11 +354,15 @@ pub enum CsgSyncResult {
     FullRepack,
 }
 
-/// Default pinned host staging capacity (`256 KiB` = 4,096 `GpuInstance` records) for true
-/// async DMA updates of `dynamic_instances[0..D]`.
-const CSG_PINNED_STAGING_BYTES: usize = 256 * 1024;
+/// Default pinned host staging capacity (`2 MiB` = 32,768 `GpuInstance` records or 43,690
+/// `[f32; 12]` previous-frame transforms) for zero-stall async DMA updates of `dynamic_instances[0..D]`
+/// across 5x urban crowds (600-900+ actors / ~10k-15k+ bones).
+const CSG_PINNED_STAGING_BYTES: usize = 2 * 1024 * 1024;
 
-/// Reusable page-locked host staging buffer (`cuMemAllocHost_v2` / `cuMemFreeHost`).
+/// Hard upper cap for grow-on-demand pinned host staging (`16 MiB` = 262,144 `GpuInstance`s).
+const CSG_PINNED_STAGING_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Reusable grow-on-demand page-locked host staging buffer (`cuMemAllocHost_v2` / `cuMemFreeHost`).
 struct PinnedStagingBuffer {
     ptr: *mut c_void,
     bytes: usize,
@@ -384,6 +389,31 @@ impl PinnedStagingBuffer {
             })
         } else {
             None
+        }
+    }
+
+    /// Ensures this page-locked staging buffer holds at least `needed_bytes`, growing power-of-two
+    /// up to [`CSG_PINNED_STAGING_MAX_BYTES`] with zero cost once warm.
+    fn ensure_capacity(&mut self, stream: &Arc<Stream>, needed_bytes: usize) -> bool {
+        if needed_bytes <= self.bytes {
+            return true;
+        }
+        if needed_bytes > CSG_PINNED_STAGING_MAX_BYTES {
+            return false;
+        }
+        // Synchronize only on the rare cold growth edge so any in-flight async DMA reading the
+        // previous host staging buffer finishes before `cuMemFreeHost`.
+        if stream.synchronize().is_err() {
+            return false;
+        }
+        let target = needed_bytes
+            .next_power_of_two()
+            .min(CSG_PINNED_STAGING_MAX_BYTES);
+        if let Some(grown) = Self::try_new(&self.ctx, target) {
+            *self = grown;
+            true
+        } else {
+            false
         }
     }
 }
@@ -458,12 +488,12 @@ impl<T: Pod> GrowDeviceBuffer<T> {
     }
 
     /// Streams a leading prefix `items` into `self.buf[0..items.len()]` using `pinned` staging
-    /// memory when available so `cuMemcpyHtoDAsync_v2` executes as true asynchronous DMA with
-    /// zero VRAM allocations and zero pageable-memory stalls.
+    /// memory (growing on demand up to `16 MiB`) so `cuMemcpyHtoDAsync_v2` executes as true
+    /// asynchronous DMA with zero VRAM allocations and zero pageable-memory stalls.
     fn upload_prefix_pinned(
         &self,
         stream: &Arc<Stream>,
-        pinned: Option<&PinnedStagingBuffer>,
+        pinned: Option<&mut PinnedStagingBuffer>,
         items: &[T],
     ) -> Result<(), String> {
         if items.is_empty() {
@@ -481,7 +511,7 @@ impl<T: Pod> GrowDeviceBuffer<T> {
         };
         let bytes: &[u8] = bytemuck::cast_slice(items);
         if let Some(stage) = pinned
-            && bytes.len() <= stage.bytes
+            && stage.ensure_capacity(stream, bytes.len())
         {
             // SAFETY: `bytes` is valid initialized `Pod` memory, `stage.ptr` holds at least
             // `bytes.len()` page-locked host bytes, and `buf` holds at least `bytes.len()` device bytes.
@@ -584,11 +614,13 @@ fn xform_max_scale(m: Mat3x4) -> f32 {
 /// Packs ONLY `world.dynamic_instances()` against `view` into `out_insts` & `out_prev` with zero
 /// iteration over static spatial chunks and zero static-tail topology hashing.
 ///
-/// Mirrors `WorldScene::pack_visible` dynamic pass verbatim so `TrafficOnly` ticks run in
-/// O(`dynamic_instances.len()`) instead of O(`static_instances.len()`).
+/// Mirrors `WorldScene::pack_visible` dynamic pass verbatim (using `view.effective_detail_cull_factor()`
+/// and `view.effective_lod_distance(dist)`) so `TrafficOnly` ticks run in O(`dynamic_instances.len()`)
+/// — or O(`traffic_vehicles`) when `skip_crowd_bones` is enabled for GPU-direct CUDA crowds.
 fn pack_dynamic_prefix_only(
     world: &WorldScene,
     view: &CameraView,
+    skip_crowd_bones: bool,
     dyn_prev_lods: &mut Vec<u8>,
     out_insts: &mut Vec<GpuInstance>,
     out_prev: &mut Vec<[f32; 12]>,
@@ -602,6 +634,7 @@ fn pack_dynamic_prefix_only(
 
     let fixed_bytes = world.fixed_gpu_bytes();
     let max_emit = world.budget.instance_budget(fixed_bytes);
+    let eff_detail_cull = view.effective_detail_cull_factor();
     let max_radius = if view.max_radius.is_nan() {
         0.0
     } else {
@@ -620,13 +653,16 @@ fn pack_dynamic_prefix_only(
     let shadow_radius_sq = shadow_radius * shadow_radius;
 
     for (inst, prev_lod_slot) in dyn_slice.iter().zip(dyn_prev_lods.iter_mut()) {
+        let is_crowd_bone = inst.user_id >= CROWD_USER_ID_BASE;
+        if skip_crowd_bones && is_crowd_bone {
+            continue;
+        }
         if !inst.is_visible() {
             continue;
         }
         let Some(assembly) = world.assembly(inst.assembly_id) else {
             continue;
         };
-        let is_crowd_bone = inst.user_id >= CROWD_USER_ID_BASE;
         let world_aabb = inst.xform.xform_aabb(assembly.local_aabb);
         let dist_sq = csg_aabb_distance_sq(world_aabb, view.position);
         if !is_crowd_bone && max_radius_sq.is_finite() && dist_sq > max_radius_sq {
@@ -652,12 +688,13 @@ fn pack_dynamic_prefix_only(
             inst.xform.xform_pt(assembly.local_aabb.center())
         };
         let dist = (center - view.position).len();
-        let part_end = assembly.visible_part_end(dist, view.small_detail_cull_factor);
+        let part_end = assembly.visible_part_end(dist, eff_detail_cull);
         if part_end == 0 {
             continue;
         }
 
         let scale_max = xform_max_scale(inst.xform);
+        let eff_lod_dist = view.effective_lod_distance(dist);
         let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
             None
         } else {
@@ -672,7 +709,7 @@ fn pack_dynamic_prefix_only(
                 assembly.local_aabb.diameter() * scale_max
             };
             let proj_px = view.project_diameter_px(part_diam, dist);
-            let lod = part.lods.select_lod(dist, proj_px, prev_lod);
+            let lod = part.lods.select_lod(eff_lod_dist, proj_px, prev_lod);
             if recorded_lod.is_none() && part.lods.num_levels() > 1 {
                 recorded_lod = Some(lod);
             }
@@ -841,6 +878,8 @@ pub struct CsgGpuHost {
     pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
     prev_dyn_sig: Vec<(u32, u32)>,
+    prev_non_crowd_dyn_count: usize,
+    crowd_at_dyn_tail: bool,
     dyn_packed_scratch: Vec<GpuInstance>,
     dyn_prev_scratch: Vec<[f32; 12]>,
     dyn_prev_lods: Vec<u8>,
@@ -895,6 +934,8 @@ impl CsgGpuHost {
             pinned_prev_staging: None,
             prev_packed_len: 0,
             prev_dyn_sig: Vec::new(),
+            prev_non_crowd_dyn_count: 0,
+            crowd_at_dyn_tail: false,
             dyn_packed_scratch: Vec::with_capacity(1024),
             dyn_prev_scratch: Vec::with_capacity(1024),
             dyn_prev_lods: Vec::with_capacity(1024),
@@ -964,6 +1005,38 @@ impl CsgGpuHost {
             .map_err(|e| format!("Random rail gen failed: {e}"))
     }
 
+    /// Synthesizes up to 4 distinct collision-verified multi-landmark & street-network smart rail
+    /// candidates using the active scene's `world`, `hints`, and curated `viewpoints`.
+    pub fn build_smart_rail_candidates(&self, seed: u64) -> Result<Vec<RailSpec>, String> {
+        let Some(ref scene) = self.scene else {
+            return Err("Load a CSG scene before running Smart Rail".to_string());
+        };
+        let cfg = RailGenConfig {
+            seed,
+            ..RailGenConfig::default()
+        };
+        let rails = csg_scene::rail_gen::build_smart_rail_candidates(
+            &scene.world,
+            &scene.hints,
+            &scene.viewpoints,
+            seed,
+            &cfg,
+        );
+        if rails.is_empty() {
+            let single = csg_scene::rail_gen::build_smart_rail(
+                &scene.world,
+                &scene.hints,
+                &scene.viewpoints,
+                seed,
+                &cfg,
+            )
+            .map_err(|e| format!("Smart rail gen failed: {e}"))?;
+            Ok(vec![single])
+        } else {
+            Ok(rails)
+        }
+    }
+
     /// Returns references to the active `WorldScene` and `SceneHints`, if a CSG scene is loaded.
     pub fn world_and_hints(&self) -> Option<(&WorldScene, &SceneHints)> {
         self.scene.as_ref().map(|s| (&s.world, &s.hints))
@@ -996,9 +1069,9 @@ impl CsgGpuHost {
     /// Computes the exact 1:1 mapping `bone_slot_map[gidx] -> packed_instance_slot` (or `u32::MAX`
     /// when a bone is frustum/LOD-culled from `self.packed`) in O(`dyn_count + total_bones`) time.
     ///
-    /// Uses `(user_id, compound_id, xform_bits)` matching along the strictly monotonic ascending
-    /// `crowd_inst_ids` order so partial frustum culling or identical adjacent bone materials can
-    /// never cross-wire slots.
+    /// Uses `(user_id, compound_id, canonical_xform_bits)` matching along the strictly monotonic
+    /// ascending `crowd_inst_ids` order so partial frustum culling, `-0.0` vs `+0.0` float signs,
+    /// or identical adjacent bone materials can never cross-wire slots.
     pub fn fill_crowd_bone_slot_map(&self, out: &mut Vec<u32>) {
         out.clear();
         let Some(ref scene) = self.scene else {
@@ -1022,6 +1095,8 @@ impl CsgGpuHost {
                 continue;
             }
             let target_bits = xform_to_bits(gpu_inst.xform);
+            let saved_gidx = gidx;
+            let mut matched = false;
             while gidx < n_bones {
                 let bone_inst_id = scene.crowd_inst_ids[gidx];
                 let Some(world_inst) = scene.world.dynamic_instance(bone_inst_id) else {
@@ -1034,9 +1109,13 @@ impl CsgGpuHost {
                 {
                     out[gidx] = slot as u32;
                     gidx += 1;
+                    matched = true;
                     break;
                 }
                 gidx += 1;
+            }
+            if !matched {
+                gidx = saved_gidx;
             }
         }
     }
@@ -1056,7 +1135,11 @@ impl CsgGpuHost {
         let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
             + cam.fwd[1] * self.last_pack_fwd[1]
             + cam.fwd[2] * self.last_pack_fwd[2];
-        let lod_bits = cam.lod_bias.clamp(0.25, 4.0).to_bits();
+        let lod_bits = if cam.lod_bias.is_finite() {
+            cam.lod_bias.clamp(0.25, 4.0).to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
         let viewport_or_fov_changed = self.last_pack_cam_params.is_none_or(|prev| {
             prev.viewport_w != cam.viewport_w
                 || prev.viewport_h != cam.viewport_h
@@ -1424,6 +1507,8 @@ impl CsgGpuHost {
     /// Advances dynamic 3D Frenet traffic and articulated crowd actors in-place before resolving
     /// possessed vehicle mounts so cameras lock to exact current-frame transforms.
     ///
+    /// Scales `CrowdSim` LOD thresholds (`lod1_dist_m`, `lod2_dist_m`, `cull_dist_m`) by `lod_bias`
+    /// (`0.25..=4.0`) for the step while keeping the scene's nominal `1.0x` thresholds unmodified.
     /// Respects `freeze_pose` (pausing both traffic and crowd stepping so progressive path tracing
     /// can accumulate cleanly for Synthetic Data Generation captures).
     pub fn step_dynamic(
@@ -1431,6 +1516,7 @@ impl CsgGpuHost {
         dt: f32,
         time_s: f32,
         cam_eye: [f32; 3],
+        lod_bias: f32,
         freeze_pose: bool,
         step_traffic: bool,
     ) -> bool {
@@ -1467,12 +1553,63 @@ impl CsgGpuHost {
         }
 
         if scene.crowd.actor_count() > 0 && dt > 0.0 && dt.is_finite() {
+            let orig = (
+                scene.crowd.lod1_dist_m,
+                scene.crowd.lod2_dist_m,
+                scene.crowd.cull_dist_m,
+            );
+            let (l1, l2, cull) = scale_crowd_lod_dists(orig.0, orig.1, orig.2, lod_bias);
+            scene.crowd.lod1_dist_m = l1;
+            scene.crowd.lod2_dist_m = l2;
+            scene.crowd.cull_dist_m = cull;
             scene.step_crowd(dt, time_s, Vec3::new(cam_eye[0], cam_eye[1], cam_eye[2]));
+            scene.crowd.lod1_dist_m = orig.0;
+            scene.crowd.lod2_dist_m = orig.1;
+            scene.crowd.cull_dist_m = orig.2;
             self.traffic_dirty = true;
             moved = true;
         }
 
         moved
+    }
+
+    /// Re-evaluates CPU crowd LOD visibility against `lod_bias` with zero actor motion (used when
+    /// dragging the LOD bias slider while crowd simulation is paused or frozen).
+    pub fn refresh_crowd_lod_cpu(
+        &mut self,
+        time_s: f32,
+        cam_eye: [f32; 3],
+        lod_bias: f32,
+    ) -> bool {
+        let Some(ref mut scene) = self.scene else {
+            return false;
+        };
+        if scene.crowd.actor_count() == 0 {
+            return false;
+        }
+        let was_frozen = self.crowd_frozen;
+        if !was_frozen {
+            scene.set_crowd_frozen(true);
+        }
+        let orig = (
+            scene.crowd.lod1_dist_m,
+            scene.crowd.lod2_dist_m,
+            scene.crowd.cull_dist_m,
+        );
+        let (l1, l2, cull) = scale_crowd_lod_dists(orig.0, orig.1, orig.2, lod_bias);
+        scene.crowd.lod1_dist_m = l1;
+        scene.crowd.lod2_dist_m = l2;
+        scene.crowd.cull_dist_m = cull;
+        scene.step_crowd(1.0 / 60.0, time_s, Vec3::new(cam_eye[0], cam_eye[1], cam_eye[2]));
+        scene.crowd.lod1_dist_m = orig.0;
+        scene.crowd.lod2_dist_m = orig.1;
+        scene.crowd.cull_dist_m = orig.2;
+        if !was_frozen {
+            scene.set_crowd_frozen(false);
+        }
+        scene.reset_crowd_motion_history();
+        self.traffic_dirty = true;
+        true
     }
 
     /// Builds the SSOT [`SdgCamera`] matching `cam`, `projection`, and viewport `(width, height)`.
@@ -1564,12 +1701,12 @@ impl CsgGpuHost {
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
     /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes,
     /// steps 3D Frenet dynamic traffic (unless `freeze_pose` is enabled), and either streams only
-    /// `dynamic_instances[0..D]` via the reusable `256 KiB` pinned staging buffers
-    /// (`CsgSyncResult::TrafficOnly`) or repacks visible instances with live frustum + small-detail
-    /// culling (`CsgSyncResult::FullRepack`).
+    /// `dynamic_instances[0..D]` (or just non-crowd traffic vehicles when `gpu_crowd_active` is
+    /// true) via the growable pinned staging buffers (`CsgSyncResult::TrafficOnly`) or repacks
+    /// visible instances with live frustum + small-detail culling (`CsgSyncResult::FullRepack`).
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates scene key, material params, camera frustum, freeze flag, and OptiX resources cleanly"
+        reason = "coordinates scene key, material params, camera frustum, freeze/GPU-crowd flags, and OptiX resources cleanly"
     )]
     pub fn sync(
         &mut self,
@@ -1582,6 +1719,7 @@ impl CsgGpuHost {
         cam: CsgCameraParams,
         traffic_time_s: f32,
         freeze_pose: bool,
+        gpu_crowd_active: bool,
     ) -> Result<CsgSyncResult, String> {
         if self.pinned_staging.is_none() {
             self.pinned_staging =
@@ -1645,7 +1783,11 @@ impl CsgGpuHost {
         let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
             + cam.fwd[1] * self.last_pack_fwd[1]
             + cam.fwd[2] * self.last_pack_fwd[2];
-        let lod_bits = cam.lod_bias.clamp(0.25, 4.0).to_bits();
+        let lod_bits = if cam.lod_bias.is_finite() {
+            cam.lod_bias.clamp(0.25, 4.0).to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
         let viewport_or_fov_changed = self.last_pack_cam_params.is_none_or(|prev| {
             prev.viewport_w != cam.viewport_w
                 || prev.viewport_h != cam.viewport_h
@@ -1664,7 +1806,6 @@ impl CsgGpuHost {
         if (camera_repack_needed || traffic_dirty)
             && let Some(ref mut scene) = self.scene
         {
-            let world = &mut scene.world;
             // On traffic-only ticks (`!camera_repack_needed`), pack with the exact cached frustum
             // camera so static instance membership & LOD selection cannot drift out of sync with
             // the GPU IAS static tail.
@@ -1697,12 +1838,17 @@ impl CsgGpuHost {
                     (pack_cam.viewport_h.max(144)) as f32,
                 )
             };
-            cam_view.lod_bias = pack_cam.lod_bias.clamp(0.25, 4.0);
+            cam_view.lod_bias = if pack_cam.lod_bias.is_finite() {
+                pack_cam.lod_bias.clamp(0.25, 4.0)
+            } else {
+                1.0
+            };
 
             // W3.1: Static-tail vs dynamic-prefix split!
             // On `!camera_repack_needed` dynamic ticks, pack ONLY `world.dynamic_instances()`
-            // against the cached frustum camera, leaving the 10k-100k static tail untouched in
-            // `self.packed.instances[D..]` (zero static chunk scan, zero static-tail hashing).
+            // (or ONLY non-crowd traffic vehicles when `gpu_crowd_active` scatters crowd bones
+            // directly in VRAM) against the cached frustum camera, leaving the 10k-100k static
+            // tail untouched in `self.packed.instances[D..]`.
             let can_try_dyn_only = !camera_repack_needed
                 && !self.prev_dyn_sig.is_empty()
                 && self.prev_packed_len == self.packed.instances.len()
@@ -1712,35 +1858,45 @@ impl CsgGpuHost {
 
             let mut handled_traffic_only = None;
             if can_try_dyn_only {
+                let skip_crowd = gpu_crowd_active && self.crowd_at_dyn_tail;
                 pack_dynamic_prefix_only(
-                    world,
+                    &scene.world,
                     &cam_view,
+                    skip_crowd,
                     &mut self.dyn_prev_lods,
                     &mut self.dyn_packed_scratch,
                     &mut self.dyn_prev_scratch,
                 );
+                let expected_sig: &[(u32, u32)] = if skip_crowd {
+                    &self.prev_dyn_sig[..self.prev_non_crowd_dyn_count]
+                } else {
+                    &self.prev_dyn_sig
+                };
                 let dyn_count = self.dyn_packed_scratch.len();
-                let same_dyn_topology = dyn_count == self.prev_dyn_sig.len()
+                let same_dyn_topology = dyn_count == expected_sig.len()
                     && self.dyn_prev_scratch.len() == dyn_count
                     && self
                         .dyn_packed_scratch
                         .iter()
-                        .zip(&self.prev_dyn_sig)
+                        .zip(expected_sig)
                         .all(|(inst, &(cid, uid))| inst.compound_id == cid && inst.user_id == uid);
                 if same_dyn_topology {
-                    self.packed.instances[..dyn_count].copy_from_slice(&self.dyn_packed_scratch);
-                    self.packed.motion_prev_xforms[..dyn_count]
-                        .copy_from_slice(&self.dyn_prev_scratch);
-                    self.instances_buf.upload_prefix_pinned(
-                        stream,
-                        self.pinned_staging.as_ref(),
-                        &self.dyn_packed_scratch,
-                    )?;
-                    self.prev_xforms_buf.upload_prefix_pinned(
-                        stream,
-                        self.pinned_prev_staging.as_ref(),
-                        &self.dyn_prev_scratch,
-                    )?;
+                    if dyn_count > 0 {
+                        self.packed.instances[..dyn_count]
+                            .copy_from_slice(&self.dyn_packed_scratch);
+                        self.packed.motion_prev_xforms[..dyn_count]
+                            .copy_from_slice(&self.dyn_prev_scratch);
+                        self.instances_buf.upload_prefix_pinned(
+                            stream,
+                            self.pinned_staging.as_mut(),
+                            &self.dyn_packed_scratch,
+                        )?;
+                        self.prev_xforms_buf.upload_prefix_pinned(
+                            stream,
+                            self.pinned_prev_staging.as_mut(),
+                            &self.dyn_prev_scratch,
+                        )?;
+                    }
                     handled_traffic_only = Some(CsgSyncResult::TrafficOnly {
                         dynamic_count: dyn_count,
                     });
@@ -1750,7 +1906,10 @@ impl CsgGpuHost {
             let result = if let Some(fast_res) = handled_traffic_only {
                 fast_res
             } else {
-                world.pack_visible(&cam_view, &mut self.packed);
+                if gpu_crowd_active {
+                    mark_crowd_bones_visible(scene);
+                }
+                scene.world.pack_visible(&cam_view, &mut self.packed);
                 let slice = self.packed.instances_slice();
                 let prev_slice = self.packed.motion_prev_xforms_slice();
                 let dyn_count = slice
@@ -1762,11 +1921,24 @@ impl CsgGpuHost {
                 self.prev_packed_len = slice.len();
                 self.prev_dyn_sig.clear();
                 self.prev_dyn_sig.reserve(dyn_count);
-                for inst in &slice[..dyn_count] {
+                let mut first_crowd = dyn_count;
+                let mut saw_crowd = false;
+                let mut crowd_tail_contiguous = true;
+                for (i, inst) in slice[..dyn_count].iter().enumerate() {
                     self.prev_dyn_sig.push((inst.compound_id, inst.user_id));
+                    if inst.user_id >= CROWD_USER_ID_BASE {
+                        if !saw_crowd {
+                            first_crowd = i;
+                            saw_crowd = true;
+                        }
+                    } else if saw_crowd {
+                        crowd_tail_contiguous = false;
+                    }
                 }
+                self.prev_non_crowd_dyn_count = first_crowd;
+                self.crowd_at_dyn_tail = saw_crowd && crowd_tail_contiguous;
                 self.dyn_prev_lods
-                    .resize(world.dynamic_instance_count(), PREV_LOD_NONE);
+                    .resize(scene.world.dynamic_instance_count(), PREV_LOD_NONE);
                 self.dyn_prev_lods.fill(PREV_LOD_NONE);
                 CsgSyncResult::FullRepack
             };
@@ -1777,9 +1949,9 @@ impl CsgGpuHost {
                 + self.prev_xforms_buf.active_bytes();
             self.stats = CsgStats {
                 visible_instances: self.packed.len() as u32,
-                total_instances: world.total_instance_count() as u32,
-                compounds: world.library.compounds.len() as u32,
-                primitives: world.library.prims.len() as u32,
+                total_instances: scene.world.total_instance_count() as u32,
+                compounds: scene.world.library.compounds.len() as u32,
+                primitives: scene.world.library.prims.len() as u32,
                 gpu_bytes: gpu_bytes as u64,
                 aux_planes_bytes: self.aux_planes_buf.active_bytes() as u64,
             };
@@ -1934,6 +2106,8 @@ impl CsgGpuHost {
         self.prev_xforms_buf.clear();
         self.prev_packed_len = 0;
         self.prev_dyn_sig.clear();
+        self.prev_non_crowd_dyn_count = 0;
+        self.crowd_at_dyn_tail = false;
         self.dyn_prev_lods.clear();
         self.static_gpu_bytes = 0;
         self.stats = CsgStats::default();
@@ -1941,6 +2115,7 @@ impl CsgGpuHost {
         self.last_pack_cam = [f32::NAN; 3];
         self.last_pack_fwd = [f32::NAN; 3];
         self.last_pack_cam_params = None;
+        self.last_pack_lod_bits = 0;
         self.last_pack_omni = false;
         self.active_possess = None;
         self.next_vehicle_cursor = 0;
@@ -2064,12 +2239,24 @@ impl CsgGpuHost {
     }
 }
 
-/// Exact bit representation of a row-major 3x4 affine transform for deterministic bone-slot matching.
+/// Ensures every dynamic crowd bone instance in `scene.world` carries `inst_flags::VISIBLE` so
+/// GPU-direct scatter (`scatter_crowd_to_csg_and_optix`) always receives a 1:1 packed slot.
+#[inline]
+fn mark_crowd_bones_visible(scene: &mut SceneBuilt) {
+    for &inst_id in &scene.crowd_inst_ids {
+        if let Some(inst) = scene.world.dynamic_instance_mut(inst_id) {
+            inst.flags |= inst_flags::VISIBLE;
+        }
+    }
+}
+
+/// Canonical bit representation of a row-major 3x4 affine transform for deterministic bone-slot
+/// matching (canonicalizes `-0.0` to `+0.0` so `xform * Mat3x4::IDENTITY` never mismatches).
 #[inline]
 fn xform_to_bits(xf: [f32; 12]) -> [u32; 12] {
     let mut out = [0u32; 12];
     for (dst, &v) in out.iter_mut().zip(&xf) {
-        *dst = v.to_bits();
+        *dst = if v == 0.0 { 0.0f32 } else { v }.to_bits();
     }
     out
 }
@@ -2258,13 +2445,13 @@ mod tests {
 
         assert!(host.has_crowd());
         // Freeze Pose must prevent crowd stepping and set FREEZE_POSE flag.
-        assert!(!host.step_dynamic(0.05, 0.05, cam_eye, true, true));
+        assert!(!host.step_dynamic(0.05, 0.05, cam_eye, 1.0, true, true));
         assert!(host.crowd_frozen);
 
         // Unfreezing steps the crowd and populates motion_prev_xforms.
-        assert!(host.step_dynamic(0.05, 0.10, cam_eye, false, true));
+        assert!(host.step_dynamic(0.05, 0.10, cam_eye, 1.0, false, true));
         assert!(!host.crowd_frozen);
-        assert!(host.step_dynamic(0.05, 0.15, cam_eye, false, true));
+        assert!(host.step_dynamic(0.05, 0.15, cam_eye, 1.0, false, true));
 
         let fwd = (vp.target - vp.eye).norm();
         let right = fwd.cross(Vec3::Y).norm();
@@ -2325,7 +2512,7 @@ mod tests {
         // Transitioning freeze_pose false -> true must snap prev_xform = xform for all dynamic
         // instances and mark traffic_dirty so Motion AOV emits zero stale object optical flow.
         host.traffic_dirty = false;
-        assert!(!host.step_dynamic(0.05, 0.20, cam_eye, true, true));
+        assert!(!host.step_dynamic(0.05, 0.20, cam_eye, 1.0, true, true));
         assert!(host.crowd_frozen);
         assert!(
             host.traffic_dirty,
@@ -2395,7 +2582,7 @@ mod tests {
             .map(|i| i.xform.0)
             .collect();
         assert!(
-            host.step_dynamic(0.0, 1.5, cam_eye, false, true),
+            host.step_dynamic(0.0, 1.5, cam_eye, 1.0, false, true),
             "step_dynamic must advance SoA city traffic"
         );
         let moved_any = host
@@ -2438,7 +2625,14 @@ mod tests {
         host.scene = Some(built);
 
         // Advance SoA traffic so vehicles are actively moving at bluff elevation (~30-45 m).
-        assert!(host.step_dynamic(0.05, 1.5, [vp.eye.x, vp.eye.y, vp.eye.z], false, true));
+        assert!(host.step_dynamic(
+            0.05,
+            1.5,
+            [vp.eye.x, vp.eye.y, vp.eye.z],
+            1.0,
+            false,
+            true
+        ));
 
         let car_sample = {
             let scene = host.scene.as_ref().expect("scene");
@@ -2539,7 +2733,7 @@ mod tests {
         host.scene = Some(built);
 
         // Step crowd once and verify bone_slot_map matches every visible bone exactly.
-        assert!(host.step_dynamic(1.0 / 60.0, 0.1, [0.0, 2.0, -8.0], false, false));
+        assert!(host.step_dynamic(1.0 / 60.0, 0.1, [0.0, 2.0, -8.0], 1.0, false, false));
         {
             let scene = host.scene.as_mut().expect("scene");
             scene.world.pack_all(Vec3::new(0.0, 2.0, -8.0), &mut host.packed);
@@ -2698,12 +2892,43 @@ mod tests {
         let mut dyn_lods = Vec::new();
         let mut dyn_insts = Vec::new();
         let mut dyn_prev = Vec::new();
-        pack_dynamic_prefix_only(&built.world, &view, &mut dyn_lods, &mut dyn_insts, &mut dyn_prev);
+        pack_dynamic_prefix_only(
+            &built.world,
+            &view,
+            false,
+            &mut dyn_lods,
+            &mut dyn_insts,
+            &mut dyn_prev,
+        );
         assert_eq!(dyn_insts.len(), full_dyn_count);
         assert_eq!(dyn_insts, full_packed.instances_slice()[..full_dyn_count]);
         assert_eq!(
             dyn_prev,
             full_packed.motion_prev_xforms_slice()[..full_dyn_count]
+        );
+
+        // Verify `skip_crowd_bones = true` emits strictly the non-crowd traffic prefix.
+        let expected_non_crowd = full_packed.instances_slice()[..full_dyn_count]
+            .iter()
+            .filter(|inst| inst.user_id < CROWD_USER_ID_BASE)
+            .count();
+        let mut traffic_lods = Vec::new();
+        let mut traffic_insts = Vec::new();
+        let mut traffic_prev = Vec::new();
+        pack_dynamic_prefix_only(
+            &built.world,
+            &view,
+            true,
+            &mut traffic_lods,
+            &mut traffic_insts,
+            &mut traffic_prev,
+        );
+        assert_eq!(traffic_insts.len(), expected_non_crowd);
+        assert!(
+            traffic_insts
+                .iter()
+                .all(|inst| inst.user_id < CROWD_USER_ID_BASE),
+            "skip_crowd_bones must omit all GPU-scattered crowd bones"
         );
 
         // Verify LRU cache hit, metadata retention, and eviction bound.
@@ -2718,5 +2943,203 @@ mod tests {
         let restored = host.cache_take_scene(key_a).expect("LRU cache hit");
         assert_eq!(restored.viewpoints.len(), vp_count);
         assert!(host.cache_take_scene(key_a).is_none());
+    }
+
+    #[test]
+    fn lod_bias_change_triggers_repack_and_changes_gundo_visible_instances() {
+        let mut host = CsgGpuHost::new();
+        let gundo_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo")
+            .expect("gundo registered");
+        let module = host
+            .registry
+            .get_by_index(gundo_idx)
+            .expect("gundo module");
+        let built = module.build(&SceneBuildConfig::default());
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+
+        let key = CsgSceneKey {
+            scene_idx: (gundo_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+        host.scene_key = key;
+        host.active_reg_idx = Some(gundo_idx);
+        host.scene = Some(built);
+
+        let base_cam = CsgCameraParams {
+            eye: [vp.eye.x, vp.eye.y, vp.eye.z],
+            fwd: [fwd.x, fwd.y, fwd.z],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: vp.vfov_deg.to_radians(),
+            lod_bias: 0.25,
+            omnidirectional: false,
+        };
+
+        // Prime cached pack state at `lod_bias = 0.25`.
+        host.last_pack_cam = base_cam.eye;
+        host.last_pack_fwd = base_cam.fwd;
+        host.last_pack_cam_params = Some(base_cam);
+        host.last_pack_lod_bits = base_cam.lod_bias.clamp(0.25, 4.0).to_bits();
+        host.last_pack_omni = false;
+        host.ias_dirty = false;
+
+        assert!(
+            !host.will_camera_repack(key, base_cam),
+            "unchanged camera and lod_bias must not spuriously force FullRepack"
+        );
+        let high_cam = CsgCameraParams {
+            lod_bias: 4.0,
+            ..base_cam
+        };
+        assert!(
+            host.will_camera_repack(key, high_cam),
+            "changing lod_bias from 0.25 to 4.0 must always trigger FullRepack even when camera is stationary"
+        );
+        // Non-finite lod_bias must safely normalize to 1.0 and trigger repack from 0.25.
+        let nan_cam = CsgCameraParams {
+            lod_bias: f32::NAN,
+            ..base_cam
+        };
+        assert!(host.will_camera_repack(key, nan_cam));
+
+        // Pack Gundo at lod_bias = 0.25, 1.0, and 4.0 and verify visible instance count increases.
+        let make_view = |bias: f32| {
+            CameraView::perspective(
+                vp.eye,
+                fwd,
+                Vec3::Y,
+                (vp.vfov_deg.to_radians() * 1.35).clamp(0.15, 2.7),
+                16.0 / 9.0,
+                [0.05, 1500.0],
+                720.0,
+            )
+            .with_lod_bias(bias)
+        };
+        let scene = host.scene.as_mut().expect("gundo scene");
+        let mut packed_low = PackedGpuScene::new();
+        let mut packed_mid = PackedGpuScene::new();
+        let mut packed_high = PackedGpuScene::new();
+        scene.world.pack_visible(&make_view(0.25), &mut packed_low);
+        scene.world.pack_visible(&make_view(1.0), &mut packed_mid);
+        scene.world.pack_visible(&make_view(4.0), &mut packed_high);
+
+        assert!(
+            !packed_low.is_empty(),
+            "Gundo must retain primary terrain/buildings/roads even at lod_bias=0.25"
+        );
+        assert!(
+            packed_low.len() < packed_high.len(),
+            "Gundo visible packed instances must strictly increase from lod_bias=0.25 ({}) to 4.0 ({}) (mid 1.0 = {})",
+            packed_low.len(),
+            packed_high.len(),
+            packed_mid.len()
+        );
+        assert!(
+            packed_low.len() <= packed_mid.len() && packed_mid.len() <= packed_high.len(),
+            "Gundo visible packed instances must be monotonic across 0.25 ({}) <= 1.0 ({}) <= 4.0 ({})",
+            packed_low.len(),
+            packed_mid.len(),
+            packed_high.len()
+        );
+    }
+
+    #[test]
+    fn crowd_bone_slot_map_handles_neg_zero_and_all_slotted_bones() {
+        assert_eq!(
+            xform_to_bits([-0.0, 1.0, 0.0, -0.0, 0.0, 1.0, -0.0, 0.0, -0.0, 0.0, 1.0, -0.0]),
+            xform_to_bits([0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            "xform_to_bits must canonicalize -0.0 to +0.0 for deterministic bone slot mapping"
+        );
+
+        let mut host = CsgGpuHost::new();
+        let insp_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "inspector")
+            .expect("inspector registered");
+        let module = host
+            .registry
+            .get_by_index(insp_idx)
+            .expect("inspector module");
+        let built = module.build(&SceneBuildConfig {
+            variant_idx: 109,
+            ..SceneBuildConfig::default()
+        });
+        host.scene_key = CsgSceneKey {
+            scene_idx: (insp_idx + 1) as u32,
+            variant_idx: 109,
+            seed: 1,
+            road_mode: 2,
+        };
+        host.active_reg_idx = Some(insp_idx);
+        host.scene = Some(built);
+
+        // Simulate low lod_bias culling all actors far from camera, then reviving for GPU scatter.
+        assert!(host.refresh_crowd_lod_cpu(0.0, [0.0, 2.0, 500.0], 0.25));
+        {
+            let scene = host.scene.as_mut().expect("scene");
+            mark_crowd_bones_visible(scene);
+            scene
+                .world
+                .pack_all(Vec3::new(0.0, 2.0, 500.0), &mut host.packed);
+        }
+        let mut slot_map = Vec::new();
+        host.fill_crowd_bone_slot_map(&mut slot_map);
+        let n_bones = host.active_crowd().expect("crowd").bone_count();
+        assert_eq!(slot_map.len(), n_bones);
+        let unmapped = slot_map.iter().filter(|&&s| s == u32::MAX).count();
+        assert_eq!(
+            unmapped, 0,
+            "every crowd bone must stay mapped after ensure_all_crowd_bones_slotted so GPU scatter can revive culled actors"
+        );
+    }
+
+    #[test]
+    fn smart_rail_candidates_builds_verified_multi_landmark_rails_for_gundo() {
+        let mut host = CsgGpuHost::new();
+        let gundo_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo")
+            .expect("gundo registered");
+        let module = host
+            .registry
+            .get_by_index(gundo_idx)
+            .expect("gundo module");
+        let built = module.build(&SceneBuildConfig::default());
+        host.scene_key = CsgSceneKey {
+            scene_idx: (gundo_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+        host.active_reg_idx = Some(gundo_idx);
+        host.scene = Some(built);
+
+        let rails = host
+            .build_smart_rail_candidates(42)
+            .expect("build_smart_rail_candidates on Gundo");
+        assert!(
+            !rails.is_empty(),
+            "build_smart_rail_candidates must return at least one verified rail"
+        );
+        for rail in &rails {
+            assert!(
+                rail.waypoints.len() >= 4,
+                "smart rail '{}' should visit multiple waypoints, got {}",
+                rail.label,
+                rail.waypoints.len()
+            );
+        }
     }
 }

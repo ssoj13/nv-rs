@@ -2108,6 +2108,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         },
         0.0,
         initial_settings.csg_freeze_pose,
+        false,
     ) {
         eprintln!("nv-demo: initial CSG scene sync failed: {err}");
     }
@@ -3108,6 +3109,11 @@ pub fn spawn_render_thread(
             let mut last_crowd_step_ms: f32 = 0.0;
             let mut last_crowd_backend = ActiveCrowdBackend::None;
             let mut last_cuda_crowd_err: Option<String> = None;
+            let mut last_crowd_lod_bits: u32 = if settings.csg_lod_bias.is_finite() {
+                settings.csg_lod_bias.clamp(0.25, 4.0).to_bits()
+            } else {
+                1.0f32.to_bits()
+            };
             let mut rec_active = false;
             let mut rec_fixed_fps: u32 = 0;
             let mut rec_shutter_subframes: u32 = 1;
@@ -3462,71 +3468,85 @@ pub fn spawn_render_thread(
                         }
                         RenderControl::RunSmartRail { seed, backend } => {
                             let t0 = Instant::now();
-                            let mut rails = Vec::with_capacity(4);
-                            for k in 0..4u64 {
-                                if let Ok(r) = rig.csg_host.generate_random_rail(seed.wrapping_add(k * 7919)) {
-                                    rails.push(r);
+                            match rig.csg_host.build_smart_rail_candidates(*seed) {
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
                                 }
-                            }
-                            if rails.is_empty() {
-                                bus.emit_render_event(RenderEvent::StatusMessage(
-                                    "Load a CSG scene before running Smart Rail".to_string(),
-                                ));
-                            } else {
-                                let mut cands = Vec::with_capacity(rails.len() * 4);
-                                for rail in &rails {
-                                    let compiled = rail.compile();
-                                    for s_idx in 0..4u32 {
-                                        let u = (s_idx as f32 + 0.5) * 0.25;
-                                        let sample = compiled.eval_at_fraction(u);
-                                        cands.push(ViewCandidate {
-                                            eye: sample.eye,
-                                            forward: sample.forward,
-                                            up: sample.up,
-                                            vfov_deg: sample.vfov_deg,
-                                            target_sem: None,
-                                        });
+                                Ok(mut rails) if !rails.is_empty() => {
+                                    const SAMPLES_PER_RAIL: usize = 8;
+                                    let mut cands =
+                                        Vec::with_capacity(rails.len() * SAMPLES_PER_RAIL);
+                                    for rail in &rails {
+                                        let compiled = rail.compile();
+                                        for s_idx in 0..SAMPLES_PER_RAIL {
+                                            let u = (s_idx as f32 + 0.5) / SAMPLES_PER_RAIL as f32;
+                                            let sample = compiled.eval_at_fraction(u);
+                                            cands.push(ViewCandidate {
+                                                eye: sample.eye,
+                                                forward: sample.forward,
+                                                up: sample.up,
+                                                vfov_deg: sample.vfov_deg,
+                                                target_sem: None,
+                                            });
+                                        }
+                                    }
+                                    match score_views_on_rig(&mut rig, *backend, &cands, 16, 12) {
+                                        Ok(scores) => {
+                                            let mut best_rail_idx = 0usize;
+                                            let mut best_avg = -1.0f32;
+                                            let mut used_backend = ProbeBackendKind::Cpu;
+                                            for (ri, chunk) in
+                                                scores.chunks(SAMPLES_PER_RAIL).enumerate()
+                                            {
+                                                if ri >= rails.len() || chunk.is_empty() {
+                                                    break;
+                                                }
+                                                used_backend = chunk[0].backend;
+                                                let avg =
+                                                    chunk.iter().map(|s| s.composite).sum::<f32>()
+                                                        / chunk.len() as f32;
+                                                if avg > best_avg {
+                                                    best_avg = avg;
+                                                    best_rail_idx = ri;
+                                                }
+                                            }
+                                            if rig.csg_host.eject_possess() {
+                                                bus.emit_render_event(
+                                                    RenderEvent::PossessChanged(None),
+                                                );
+                                            }
+                                            let mut winner = rails.swap_remove(best_rail_idx);
+                                            winner.label = format!(
+                                                "{} ({:.2})",
+                                                winner.label,
+                                                best_avg.max(0.0)
+                                            );
+                                            let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!(
+                                                    "Smart Rail ({}): avg {:.2} across {} rails in {:.1} ms",
+                                                    used_backend.label(),
+                                                    best_avg.max(0.0),
+                                                    scores.len() / SAMPLES_PER_RAIL,
+                                                    elapsed_ms
+                                                ),
+                                            ));
+                                            bus.emit_render_event(RenderEvent::RailGenerated(
+                                                winner,
+                                            ));
+                                            accum_count = 0;
+                                        }
+                                        Err(e) => {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("Smart Rail scoring failed: {e}"),
+                                            ));
+                                        }
                                     }
                                 }
-                                match score_views_on_rig(&mut rig, *backend, &cands, 16, 12) {
-                                    Ok(scores) => {
-                                        let mut best_rail_idx = 0usize;
-                                        let mut best_avg = -1.0f32;
-                                        let mut used_backend = ProbeBackendKind::Cpu;
-                                        for (ri, chunk) in scores.chunks(4).enumerate() {
-                                            if ri >= rails.len() || chunk.is_empty() {
-                                                break;
-                                            }
-                                            used_backend = chunk[0].backend;
-                                            let avg = chunk.iter().map(|s| s.composite).sum::<f32>()
-                                                / chunk.len() as f32;
-                                            if avg > best_avg {
-                                                best_avg = avg;
-                                                best_rail_idx = ri;
-                                            }
-                                        }
-                                        if rig.csg_host.eject_possess() {
-                                            bus.emit_render_event(RenderEvent::PossessChanged(None));
-                                        }
-                                        let mut winner = rails.swap_remove(best_rail_idx);
-                                        winner.label =
-                                            format!("{} ({:.2})", winner.label, best_avg.max(0.0));
-                                        let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                            "Smart Rail ({}): avg {:.2} across {} rails in {:.1} ms",
-                                            used_backend.label(),
-                                            best_avg.max(0.0),
-                                            scores.len() / 4,
-                                            elapsed_ms
-                                        )));
-                                        bus.emit_render_event(RenderEvent::RailGenerated(winner));
-                                        accum_count = 0;
-                                    }
-                                    Err(e) => {
-                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                            "Smart Rail scoring failed: {e}"
-                                        )));
-                                    }
+                                Ok(_) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(
+                                        "Smart Rail generated zero verified candidates".to_string(),
+                                    ));
                                 }
                             }
                         }
@@ -3793,6 +3813,14 @@ pub fn spawn_render_thread(
                     cc.mark_intents_dirty();
                 }
 
+                let cur_lod_bits = if settings.csg_lod_bias.is_finite() {
+                    settings.csg_lod_bias.clamp(0.25, 4.0).to_bits()
+                } else {
+                    1.0f32.to_bits()
+                };
+                let crowd_lod_changed = cur_lod_bits != last_crowd_lod_bits;
+                last_crowd_lod_bits = cur_lod_bits;
+
                 let mut run_cuda_crowd_after_sync = false;
                 if rig.csg_host.has_crowd() && crowd_step_dt > 0.0 {
                     match settings.crowd_backend {
@@ -3807,6 +3835,7 @@ pub fn spawn_render_thread(
                                 crowd_step_dt,
                                 traffic_time,
                                 last_rendered_camera.eye,
+                                settings.csg_lod_bias,
                                 false,
                                 step_traffic_now,
                             );
@@ -3822,6 +3851,7 @@ pub fn spawn_render_thread(
                                 0.0,
                                 traffic_time,
                                 last_rendered_camera.eye,
+                                settings.csg_lod_bias,
                                 false,
                                 step_traffic_now,
                             );
@@ -3855,6 +3885,7 @@ pub fn spawn_render_thread(
                                             crowd_step_dt,
                                             traffic_time,
                                             last_rendered_camera.eye,
+                                            settings.csg_lod_bias,
                                             false,
                                             false,
                                         );
@@ -3874,6 +3905,7 @@ pub fn spawn_render_thread(
                         0.0,
                         traffic_time,
                         last_rendered_camera.eye,
+                        settings.csg_lod_bias,
                         freeze_now,
                         step_traffic_now,
                     );
@@ -3883,6 +3915,65 @@ pub fn spawn_render_thread(
                     if !rig.csg_host.has_crowd() {
                         last_crowd_step_ms = 0.0;
                         last_crowd_backend = ActiveCrowdBackend::None;
+                    } else if crowd_lod_changed {
+                        match settings.crowd_backend {
+                            CrowdBackend::Cuda => {
+                                if freeze_now {
+                                    match ensure_cuda_crowd(&mut rig, &cuda) {
+                                        Ok(_) => {
+                                            run_cuda_crowd_after_sync = true;
+                                            last_cuda_crowd_err = None;
+                                        }
+                                        Err(err) => {
+                                            if last_cuda_crowd_err.as_deref() != Some(err.as_str())
+                                            {
+                                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                                    format!("CUDA crowd error: {err}"),
+                                                ));
+                                                last_cuda_crowd_err = Some(err);
+                                            }
+                                            last_crowd_step_ms = 0.0;
+                                            last_crowd_backend = ActiveCrowdBackend::None;
+                                        }
+                                    }
+                                }
+                            }
+                            CrowdBackend::Auto => {
+                                if freeze_now && ensure_cuda_crowd(&mut rig, &cuda).is_ok() {
+                                    run_cuda_crowd_after_sync = true;
+                                    last_cuda_crowd_err = None;
+                                } else {
+                                    if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                            "CUDA crowd LOD sync failed: {e}"
+                                        )));
+                                    }
+                                    if rig.csg_host.refresh_crowd_lod_cpu(
+                                        traffic_time,
+                                        last_rendered_camera.eye,
+                                        settings.csg_lod_bias,
+                                    ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
+                                    {
+                                        cc.mark_scene_dirty();
+                                    }
+                                }
+                            }
+                            CrowdBackend::Cpu => {
+                                if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "CUDA crowd LOD sync failed: {e}"
+                                    )));
+                                }
+                                if rig.csg_host.refresh_crowd_lod_cpu(
+                                    traffic_time,
+                                    last_rendered_camera.eye,
+                                    settings.csg_lod_bias,
+                                ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
+                                {
+                                    cc.mark_scene_dirty();
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3978,6 +4069,7 @@ pub fn spawn_render_thread(
                     csg_cam_params,
                     traffic_time,
                     freeze_for_sync,
+                    run_cuda_crowd_after_sync,
                 ) {
                     Ok(sync_res) => sync_res,
                     Err(e) => {
@@ -4024,34 +4116,40 @@ pub fn spawn_render_thread(
                             && rig.ias_classic_count + dynamic_count
                                 <= rig.d_optix_instances.len() =>
                     {
-                        // Zero-churn fast path: stream ONLY `dynamic_instances[0..D]` via the
-                        // reusable 256 KiB pinned host buffer + `OPTIX_BUILD_OPERATION_UPDATE`.
+                        // Zero-churn fast path: stream ONLY `dynamic_instances[0..D]` (or only
+                        // non-crowd vehicles when CUDA crowd scatters directly in VRAM) via pinned
+                        // staging + `OPTIX_BUILD_OPERATION_UPDATE`.
                         rig.csg_host
                             .fill_dynamic_optix_instances(dynamic_count, &mut rig.ias_dyn_scratch);
-                        if !rig.ias_dyn_scratch.is_empty()
-                            && rig
-                                .d_optix_instances
-                                .update_prefix(
-                                    &rig.stream,
-                                    rig.ias_classic_count,
-                                    &rig.ias_dyn_scratch,
-                                )
-                                .is_ok()
-                            && !run_cuda_crowd_after_sync
-                        {
-                            // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
-                            let _ = unsafe {
-                                Accel::instances_into(
-                                    &rig._optix_ctx,
-                                    &rig.stream,
-                                    &mut rig._scratch,
-                                    &rig.d_optix_instances,
-                                    ias_build_opts(),
-                                    false,
-                                    &mut rig.ias,
-                                )
+                        if !rig.ias_dyn_scratch.is_empty() {
+                            match rig.d_optix_instances.update_prefix(
+                                &rig.stream,
+                                rig.ias_classic_count,
+                                &rig.ias_dyn_scratch,
+                            ) {
+                                Ok(()) => {
+                                    if !run_cuda_crowd_after_sync {
+                                        // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
+                                        let _ = unsafe {
+                                            Accel::instances_into(
+                                                &rig._optix_ctx,
+                                                &rig.stream,
+                                                &mut rig._scratch,
+                                                &rig.d_optix_instances,
+                                                ias_build_opts(),
+                                                false,
+                                                &mut rig.ias,
+                                            )
+                                        }
+                                        .expect("IAS traffic update");
+                                    }
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "IAS dynamic prefix update failed: {e}"
+                                    )));
+                                }
                             }
-                            .expect("IAS traffic update");
                         }
                     }
                     _ => {
@@ -4164,6 +4262,7 @@ pub fn spawn_render_thread(
                             crowd_step_dt,
                             traffic_time,
                             active_camera.eye,
+                            settings.csg_lod_bias,
                             Some(scatter),
                             possessing_crowd,
                         ),

@@ -6,13 +6,34 @@
 //! `cusparseStatus_t_CUSPARSE_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cusparse` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
+use nv_loader::Rejection;
 
 nv_loader::exports_sys! {
     lib: "cusparse",
     api: CusparseApi,
     loader: cusparse_api,
-    dll: DllSpec { lib: "cusparse", group: Group::Toolkit, windows: &["cusparse64_*"], linux: &["libcusparse.so.12", "libcusparse.so"] },
+    dll: nv_loader::catalog::CUSPARSE.spec,
+    version: runtime_version,
+}
+
+/// Rejects a runtime whose major version is older than the `CUSPARSE_VER_MAJOR` of the headers these
+/// bindings were generated from: within a major, NVIDIA keeps struct layouts and enum values
+/// stable; across majors they may differ, which would be silent ABI mismatch.
+fn runtime_version(lib: &api::CusparseApi) -> Result<(), Rejection> {
+    let get = *lib
+        .cusparseGetProperty
+        .as_ref()
+        .map_err(|e| format!("cusparseGetProperty is unavailable: {e}"))?;
+    let mut major = 0;
+    // SAFETY: `cusparseGetProperty(libraryPropertyType, int*)` (cusparse.h) needs no handle or initialisation and
+    // writes one int through the valid, exclusive pointer.
+    let status = unsafe { get(libraryPropertyType_t_MAJOR_VERSION, &mut major) };
+    if status != cusparseStatus_t_CUSPARSE_STATUS_SUCCESS {
+        return Err(format!("cusparseGetProperty(MAJOR_VERSION) returned {status}").into());
+    }
+    let found = u32::try_from(major)
+        .map_err(|_| format!("cusparseGetProperty reported major version {major}"))?;
+    nv_loader::check_version(CUSPARSE_VER_MAJOR, found)
 }
 
 #[cfg(test)]

@@ -219,6 +219,27 @@ pub enum Error {
         /// The unusable path.
         path: PathBuf,
     },
+    /// The SDK headers were found but libclang cannot be loaded, and no usable prebuilt bindings
+    /// exist for this target.
+    #[error(
+        "{lib}: libclang is unavailable ({reason}) and no prebuilt bindings could be used ({prebuilt}); install LLVM and set LIBCLANG_PATH"
+    )]
+    Libclang {
+        /// The library.
+        lib: &'static str,
+        /// Why libclang could not be loaded.
+        reason: String,
+        /// Why the prebuilt bindings could not be used.
+        prebuilt: String,
+    },
+    /// A variable Cargo sets for build scripts is missing (the function runs outside `build.rs`).
+    #[error("{lib}: {var} is unset: this runs from a build script")]
+    CargoEnv {
+        /// The library.
+        lib: &'static str,
+        /// The variable.
+        var: &'static str,
+    },
     /// A static-only SDK has no native link-library directory for the selected target.
     #[error("{lib}: the SDK provides no native link-library directory for this target")]
     MissingLinkDirectory {
@@ -247,6 +268,9 @@ pub struct Output {
     pub parts: Vec<GeneratedPart>,
     /// Entry points and header hashes.
     pub inventory: Inventory,
+    /// Every file libclang opened from the SDK include directories (the bound headers and the
+    /// sub-headers they include), sorted: the rebuild inputs.
+    pub includes: Vec<PathBuf>,
 }
 
 /// The generated sources for one DLL.
@@ -289,13 +313,22 @@ pub struct HeaderHash {
 /// Generates `spec` into `$OUT_DIR` (see the module docs) and prints the `cargo:rerun-if-*` lines.
 /// Returns the generated sources' inventory.
 ///
-/// Falls back to pre-generated bindings when `NV_RS_USE_PREBUILT=1` or when SDK headers /
-/// `libclang` are unavailable and matching prebuilt files exist for `TARGET` under
-/// `NV_RS_PREBUILT_DIR` or `<CARGO_MANIFEST_DIR>/prebuilt/<TARGET>/`.
+/// Pre-generated bindings (`<NV_RS_PREBUILT_DIR>[/<TARGET>]`, else
+/// `<CARGO_MANIFEST_DIR>/prebuilt/<TARGET>/`) replace generation in exactly three cases, each named
+/// in a cargo warning: `NV_RS_USE_PREBUILT=1` (explicit request), the SDK is not installed, or
+/// libclang cannot be loaded. When the SDK headers were found, every other failure of the
+/// generator (a `bindgen` error, a missing header, a panic) is a build error with its own cause.
+/// Whenever prebuilt bindings are used although the SDK is installed, the header sha256 recorded in
+/// the prebuilt inventory is compared with the installed headers and every difference is warned
+/// about. A fallback is not sticky: the SDK root variables, the libclang inputs and the found
+/// headers are rerun triggers.
 pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     println!("cargo::rerun-if-env-changed=NV_RS_USE_PREBUILT");
     println!("cargo::rerun-if-env-changed=NV_RS_PREBUILT_DIR");
-    for var in rerun_vars(spec) {
+    for var in rerun_vars(spec, vcv_rs::cuda::requested_root().is_some()) {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    for var in LIBCLANG_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
@@ -306,27 +339,38 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     let target = std::env::var("TARGET").unwrap_or_default();
     let use_prebuilt = std::env::var("NV_RS_USE_PREBUILT")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let static_libs = match spec.shape {
+        Shape::StaticLink { link_libs, .. } => link_libs,
+        _ => &[],
+    };
 
     if use_prebuilt {
-        let discovered = sdk_paths(spec).ok();
-        emit_runtime_env(
-            spec.name,
-            discovered.as_ref().map_or(&[][..], |d| &d.nvidia),
-        )?;
+        // Only an absent SDK is acceptable here; any other discovery failure is real.
+        let (discovered, absent) = match sdk_paths(spec) {
+            Ok(paths) => (Some(paths), None),
+            Err(err @ Error::SdkNotFound { .. }) => (None, Some(err)),
+            Err(err) => return Err(err),
+        };
+        // A static library is linked from an installed SDK; prebuilt bindings cannot supply it.
+        if let Some(err) = absent
+            && !static_libs.is_empty()
+        {
+            return Err(err);
+        }
+        let nvidia = discovered.as_ref().map_or(&[][..], |d| &d.nvidia);
+        emit_runtime_env(spec.name, nvidia)?;
         if let Shape::StaticLink {
             link_libs,
             system_libs,
         } = spec.shape
         {
-            emit_static_link_directives(
-                spec.name,
-                link_libs,
-                system_libs,
-                discovered.as_ref().map_or(&[][..], |d| &d.nvidia),
-                false,
-            )?;
+            emit_static_link_directives(spec.name, link_libs, system_libs, nvidia, true)?;
         }
-        return use_prebuilt_bindings(spec, &out_dir, &target, "NV_RS_USE_PREBUILT=1");
+        let inv = use_prebuilt_bindings(spec, &out_dir, &target, "NV_RS_USE_PREBUILT=1")?;
+        if let Some(found) = &discovered {
+            warn_header_drift(spec, &found.includes, &inv);
+        }
+        return Ok(inv);
     }
 
     // One discovery snapshot supplies both the headers and their matching native libraries.
@@ -335,20 +379,24 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         nvidia,
     } = match sdk_paths(spec) {
         Ok(paths) => paths,
-        Err(err)
-            if matches!(
-                err,
-                Error::SdkNotFound { .. } | Error::MissingLinkDirectory { .. }
-            ) =>
-        {
-            if matches!(spec.shape, Shape::StaticLink { link_libs, .. } if !link_libs.is_empty()) {
+        Err(err @ Error::SdkNotFound { .. }) => {
+            if !static_libs.is_empty() {
                 return Err(err);
             }
-            if let Ok(inv) = use_prebuilt_bindings(spec, &out_dir, &target, &err.to_string()) {
-                println!("cargo:rustc-env=NV_RS_SDK_BIN=");
-                return Ok(inv);
-            }
-            return Err(err);
+            return match use_prebuilt_bindings(spec, &out_dir, &target, &format!("SDK absent: {err}"))
+            {
+                Ok(inv) => {
+                    println!("cargo:rustc-env=NV_RS_SDK_BIN=");
+                    Ok(inv)
+                }
+                Err(prebuilt) => {
+                    println!(
+                        "cargo::warning=nv-bindgen: {}: no usable prebuilt bindings either: {prebuilt}",
+                        spec.name
+                    );
+                    Err(err)
+                }
+            };
         }
         Err(err) => return Err(err),
     };
@@ -361,28 +409,42 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     {
         emit_static_link_directives(spec.name, link_libs, system_libs, &nvidia, true)?;
     }
-
-    let system_dirs = system_include_dirs();
-    let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bindings(spec, &include_dirs, &system_dirs)
-    })) {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) if matches!(err, Error::HeaderNotFound { .. } | Error::Bindgen { .. }) => {
-            if let Ok(inv) = use_prebuilt_bindings(spec, &out_dir, &target, &err.to_string()) {
-                return Ok(inv);
-            }
-            return Err(err);
-        }
-        Ok(Err(err)) => return Err(err),
-        Err(panic_payload) => {
-            if let Ok(inv) =
-                use_prebuilt_bindings(spec, &out_dir, &target, "libclang is unavailable")
-            {
-                return Ok(inv);
-            }
-            std::panic::resume_unwind(panic_payload);
-        }
+    // Watch the found headers before anything can fail, so fixing the SDK or the toolchain reruns.
+    let interface_header = match spec.shape {
+        Shape::QueryInterface {
+            interface_header, ..
+        } => Some(interface_header),
+        _ => None,
     };
+    for name in spec.headers.iter().copied().chain(interface_header) {
+        if let Some(path) = find_header(&include_dirs, name) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
+    let system_dirs = system_include_dirs(spec.name)?;
+    if let Err(reason) = libclang_available() {
+        // The installed SDK cannot be parsed without libclang: the one toolchain condition that
+        // permits prebuilt bindings. libclang is found through these, so a change reruns this.
+        for var in ["PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH"] {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+        let inv = use_prebuilt_bindings(
+            spec,
+            &out_dir,
+            &target,
+            &format!("libclang unavailable: {reason}"),
+        )
+        .map_err(|prebuilt| Error::Libclang {
+            lib: spec.name,
+            reason,
+            prebuilt: prebuilt.to_string(),
+        })?;
+        warn_header_drift(spec, &include_dirs, &inv);
+        return Ok(inv);
+    }
+    // No fallback past this point: an error or a panic here is a generator or header problem.
+    let out = bindings(spec, &include_dirs, &system_dirs)?;
 
     let write = |suffix: &str, text: &str| {
         let path = out_dir.join(format!("{}_{suffix}", spec.name));
@@ -411,19 +473,95 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         msg: e.to_string(),
     })?;
     write("inventory.json", &json)?;
-    for h in &out.inventory.headers {
-        if let Some(path) = find_header(&include_dirs, &h.name) {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-    if let Shape::QueryInterface {
-        interface_header, ..
-    } = spec.shape
-        && let Some(path) = find_header(&include_dirs, interface_header)
-    {
+    // Umbrella headers (`cudnn.h`, `npp.h`, `nvapi.h`) hide most of the API in sub-headers.
+    for path in &out.includes {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     Ok(out.inventory)
+}
+
+/// Inputs of libclang discovery (clang-sys `runtime` loading) and of bindgen's own arguments.
+/// `CLANG_PATH` selects the clang whose builtin include directories bindgen adds.
+const LIBCLANG_VARS: [&str; 4] = [
+    "LIBCLANG_PATH",
+    "LLVM_CONFIG_PATH",
+    "CLANG_PATH",
+    "BINDGEN_EXTRA_CLANG_ARGS",
+];
+
+/// Whether bindgen can load libclang, or why not.
+///
+/// bindgen 0.72 loads libclang at run time and panics when it cannot. Only that load is probed
+/// here (through `bindgen::clang_version`), so every later panic of the generator surfaces as
+/// itself instead of being mistaken for a missing libclang.
+fn libclang_available() -> Result<(), String> {
+    catch_quietly(|| {
+        bindgen::clang_version();
+    })
+}
+
+/// Runs `f`, turning a panic into its message without printing the default panic report.
+fn catch_quietly(f: impl FnOnce() + std::panic::UnwindSafe) -> Result<(), String> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f);
+    std::panic::set_hook(previous);
+    result.map_err(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "a panic without a message".to_string())
+    })
+}
+
+/// The bound headers whose installed bytes differ from the sha256 recorded in `inventory`, or that
+/// are missing from `include_dirs`, as `"<name> (changed)"` / `"<name> (missing)"`.
+fn header_drift(include_dirs: &[PathBuf], inventory: &Inventory) -> Vec<String> {
+    inventory
+        .headers
+        .iter()
+        .filter_map(|h| match find_header(include_dirs, &h.name) {
+            None => Some(format!("{} (missing)", h.name)),
+            Some(path) => match std::fs::read(&path) {
+                Ok(bytes) if hex(&Sha256::digest(&bytes)) == h.sha256 => None,
+                Ok(_) => Some(format!("{} (changed)", h.name)),
+                Err(e) => Some(format!("{} (unreadable: {e})", h.name)),
+            },
+        })
+        .collect()
+}
+
+/// Warns when prebuilt bindings were generated from other headers than the installed SDK's.
+fn warn_header_drift(spec: &LibSpec, include_dirs: &[PathBuf], inventory: &Inventory) {
+    let drift = header_drift(include_dirs, inventory);
+    if !drift.is_empty() {
+        println!(
+            "cargo::warning=nv-bindgen: prebuilt bindings for {} were generated from other headers than the installed SDK: {}; layouts and constants may not match the installed library",
+            spec.name,
+            drift.join(", ")
+        );
+    }
+}
+
+/// Whether `header` is in the include directories `spec`'s SDKs provide (e.g. an optional part of
+/// an SDK that only newer releases ship). Fails like [`generate`] when an SDK is not installed.
+pub fn has_header(spec: &LibSpec, header: &str) -> Result<bool, Error> {
+    Ok(find_header(&sdk_paths(spec)?.includes, header).is_some())
+}
+
+/// `CARGO_CFG_TARGET_OS` of the build script's target (`"windows"`, `"linux"`, ...).
+pub fn target_os(lib: &'static str) -> Result<String, Error> {
+    cargo_cfg(lib, "CARGO_CFG_TARGET_OS")
+}
+
+/// `CARGO_CFG_TARGET_ARCH` of the build script's target (`"x86_64"`, `"aarch64"`, ...).
+pub fn target_arch(lib: &'static str) -> Result<String, Error> {
+    cargo_cfg(lib, "CARGO_CFG_TARGET_ARCH")
+}
+
+fn cargo_cfg(lib: &'static str, var: &'static str) -> Result<String, Error> {
+    std::env::var(var).map_err(|_| Error::CargoEnv { lib, var })
 }
 
 fn emit_runtime_env(lib: &'static str, nvidia: &[vcv_rs::nvsdk::SdkInfo]) -> Result<(), Error> {
@@ -504,11 +642,7 @@ fn resolve_prebuilt_dir(
         if has_all(base) {
             return Some(base.to_path_buf());
         }
-        return Some(if target.is_empty() {
-            base.to_path_buf()
-        } else {
-            base.join(target)
-        });
+        // `NV_RS_PREBUILT_DIR` may hold only some libraries: fall through to the crate's own.
     }
     if target.is_empty() {
         return None;
@@ -589,7 +723,10 @@ fn use_prebuilt_bindings(
 /// same header-derived definitions the host sys crate uses, so host and device agree on layouts
 /// and enum values without hand-copied constants. Headers are located as in [`generate`].
 pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
-    for var in rerun_vars(spec) {
+    for var in rerun_vars(spec, vcv_rs::cuda::requested_root().is_some()) {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    for var in LIBCLANG_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
     let include_dirs = sdk_paths(spec)?.includes;
@@ -614,7 +751,7 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
     for d in &include_dirs {
         b = b.clang_arg(format!("-I{}", d.display()));
     }
-    for d in system_include_dirs() {
+    for d in system_include_dirs(spec.name)? {
         b = b.clang_arg(format!("-idirafter{}", sdk_path_str(spec.name, &d)?));
     }
     for a in spec.clang_args {
@@ -739,6 +876,32 @@ pub fn bindings(
         }
         apis.push((stem, api_type, loader_fn, run(ab)?));
     }
+    let returns: &[ReturnPolicy<'_>] = match spec.shape {
+        Shape::Exports { returns, .. }
+        | Shape::SplitExports { returns, .. }
+        | Shape::QueryInterface { returns, .. } => returns,
+        Shape::FunctionTable { .. } | Shape::StaticLink { .. } => &[],
+    };
+    let api_structs: Vec<(&str, &str)> = apis
+        .iter()
+        .map(|(_, api_type, _, src)| (src.as_str(), *api_type))
+        .collect();
+    check_return_policies_used(spec.name, returns, &api_structs)?;
+    // A split part takes only its own headers' functions, so a function declared elsewhere would
+    // silently get no shim: list every allowlisted function no part claims.
+    let all_split_fns = match spec.shape {
+        Shape::SplitExports { .. } if !spec.allow_fn.is_empty() => {
+            let mut ab = base()
+                .dynamic_library_name(SPLIT_ALL_FNS)
+                .dynamic_link_require_all(false)
+                .with_codegen_config(bindgen::CodegenConfig::FUNCTIONS);
+            for f in spec.allow_fn {
+                ab = ab.allowlist_function(*f);
+            }
+            inventory(spec.name, &run(ab)?, SPLIT_ALL_FNS)?
+        }
+        _ => Vec::new(),
+    };
     // Statically linked libraries: plain `extern "C"` declarations instead of a loading struct.
     let externs = match spec.shape {
         Shape::StaticLink { .. } => {
@@ -761,8 +924,13 @@ pub fn bindings(
     signature_types_all.dedup();
     let signature_types = signature_types_all;
 
-    // Types pass: the allowlisted types and constants plus every type an entry point names.
-    let mut tb = base().derive_default(true).blocklist_function(".*");
+    // Types pass: the allowlisted types and constants plus every type an entry point names. It
+    // parses every header, so it also records which files libclang opened.
+    let opened = IncludeLog::default();
+    let mut tb = base()
+        .derive_default(true)
+        .blocklist_function(".*")
+        .parse_callbacks(Box::new(opened.clone()));
     for t in &signature_types {
         tb = tb.allowlist_type(format!("^{t}$"));
     }
@@ -775,7 +943,7 @@ pub fn bindings(
     for t in spec.reuse_cuda_types {
         tb = tb.blocklist_type(*t);
     }
-    let mut types = normalize_positive_enums(&run(tb)?, spec.positive_enums);
+    let mut types = normalize_positive_enums(spec.name, &run(tb)?, spec.positive_enums)?;
     if !spec.reuse_cuda_types.is_empty() {
         types = format!(
             "pub use cuda_bindings::{{{}}};\n{types}",
@@ -842,7 +1010,23 @@ pub fn bindings(
     }
     symbols.sort();
     symbols.dedup();
+    unshimmed.extend(
+        all_split_fns
+            .into_iter()
+            .filter(|f| symbols.binary_search(f).is_err()),
+    );
     unshimmed.sort();
+    unshimmed.dedup();
+
+    let mut includes: Vec<PathBuf> = opened
+        .0
+        .borrow()
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| include_dirs.iter().any(|d| p.starts_with(d)))
+        .collect();
+    includes.sort();
+    includes.dedup();
 
     Ok(Output {
         types,
@@ -853,7 +1037,74 @@ pub fn bindings(
             symbols,
             unshimmed,
         },
+        includes,
     })
+}
+
+/// Internal name of the throwaway struct listing every allowlisted function of a split library.
+const SPLIT_ALL_FNS: &str = "NvBindgenSplitAllFns";
+
+/// Records every file libclang opens through an `#include` (bindgen's `include_file` callback).
+#[derive(Debug, Default, Clone)]
+struct IncludeLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+impl bindgen::callbacks::ParseCallbacks for IncludeLog {
+    fn include_file(&self, filename: &str) {
+        self.0.borrow_mut().push(filename.to_string());
+    }
+}
+
+/// Fails when a return policy names no type any entry point returns: such a policy is a recipe
+/// error that silently leaves its functions on the checked Rust ABI (bindgen spells `size_t` /
+/// `ssize_t` as `usize` / `isize`, so a policy keyed on the C name never matches).
+fn check_return_policies_used(
+    lib: &'static str,
+    returns: &[ReturnPolicy<'_>],
+    apis: &[(&str, &str)],
+) -> Result<(), Error> {
+    let gen_err = |msg: String| Error::Generated { lib, msg };
+    let mut used = vec![false; returns.len()];
+    for (src, struct_name) in apis {
+        let file = syn::parse_file(src).map_err(|e| gen_err(e.to_string()))?;
+        let api = find_struct(&file, struct_name)
+            .ok_or_else(|| gen_err(format!("no struct {struct_name}")))?;
+        let Fields::Named(fields) = &api.fields else {
+            continue;
+        };
+        for field in &fields.named {
+            let Some(bare) = result_bare_fn(&field.ty) else {
+                continue;
+            };
+            let ReturnType::Type(_, ty) = &bare.output else {
+                continue;
+            };
+            let Type::Path(path) = ty.as_ref() else {
+                continue;
+            };
+            let Some(last) = path.path.segments.last() else {
+                continue;
+            };
+            for (flag, policy) in used.iter_mut().zip(returns) {
+                if policy.types.iter().any(|t| last.ident == *t) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    let unused: Vec<String> = returns
+        .iter()
+        .zip(&used)
+        .filter(|(_, used)| !**used)
+        .map(|(policy, _)| policy.types.join("/"))
+        .collect();
+    if unused.is_empty() {
+        Ok(())
+    } else {
+        Err(gen_err(format!(
+            "return policy for {} matches no entry point's return type (bindgen spells size_t/ssize_t as usize/isize)",
+            unused.join(", ")
+        )))
+    }
 }
 
 /// Names of the functions declared in `extern` blocks of `source`, and every single-segment type
@@ -1448,23 +1699,48 @@ fn wrapped_bare_fn<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a TypeBareFn> {
     }
 }
 
-fn normalize_positive_enums(source: &str, enums: &[&str]) -> String {
+/// Pins each of `enums` to `c_uint`; an entry that names no `c_int`/`c_uint` typedef in `source` is
+/// a recipe error (a typo, a renamed typedef or a changed bindgen spelling), not a silent no-op.
+fn normalize_positive_enums(
+    lib: &'static str,
+    source: &str,
+    enums: &[&str],
+) -> Result<String, Error> {
+    let mut pinned_any = vec![false; enums.len()];
     let mut out: String = source
         .lines()
         .map(|line| {
-            let pinned = enums.iter().any(|e| {
+            let pinned = enums.iter().position(|e| {
                 line == format!("pub type {e} = ::std::os::raw::c_int;")
                     || line == format!("pub type {e} = ::std::os::raw::c_uint;")
             });
-            match line.split_once(" = ") {
-                Some((lhs, _)) if pinned => format!("{lhs} = ::core::ffi::c_uint;"),
+            match (pinned, line.split_once(" = ")) {
+                (Some(i), Some((lhs, _))) => {
+                    pinned_any[i] = true;
+                    format!("{lhs} = ::core::ffi::c_uint;")
+                }
                 _ => line.to_string(),
             }
         })
         .collect::<Vec<_>>()
         .join("\n");
     out.push('\n');
-    out
+    let missing: Vec<&str> = enums
+        .iter()
+        .zip(&pinned_any)
+        .filter(|(_, pinned)| !**pinned)
+        .map(|(e, _)| *e)
+        .collect();
+    if missing.is_empty() {
+        Ok(out)
+    } else {
+        Err(Error::Generated {
+            lib,
+            msg: format!(
+                "positive_enums {missing:?} name no `pub type X = c_int/c_uint` typedef in the generated types"
+            ),
+        })
+    }
 }
 
 fn find_header(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
@@ -1476,14 +1752,23 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Environment variables whose change must re-run generation.
-fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
+///
+/// vcv-rs reads `PATH` (an `nvcc` on it) only when no CUDA root variable is set, so `PATH` is an
+/// input only then: with `CUDA_PATH` set (the CUDA installer sets it), switching shells no longer
+/// regenerates every CUDA-based sys crate. Where the selected toolkit's headers change, their
+/// `rerun-if-changed` lines cover it.
+fn rerun_vars(spec: &LibSpec, cuda_root_requested: bool) -> Vec<&'static str> {
     let mut vars = Vec::new();
+    let cuda = |vars: &mut Vec<&'static str>| {
+        vars.extend(vcv_rs::cuda::root_vars());
+        vars.push("ProgramFiles");
+        if !cuda_root_requested {
+            vars.push("PATH");
+        }
+    };
     for sdk in spec.sdks {
         match sdk {
-            Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => {
-                vars.extend(vcv_rs::cuda::root_vars());
-                vars.extend(["PATH", "ProgramFiles"]);
-            }
+            Sdk::CudaToolkit | Sdk::CudaToolkitSubdir(_) => cuda(&mut vars),
             Sdk::Optix => {
                 vars.extend(vcv_rs::optix::root_vars());
                 vars.push("ProgramData");
@@ -1491,12 +1776,15 @@ fn rerun_vars(spec: &LibSpec) -> Vec<&'static str> {
             Sdk::EnvRoot(v) | Sdk::EnvRootSubdir { var: v, .. } => vars.push(v),
             Sdk::Nv(kind) => {
                 vars.extend(kind.root_vars());
-                vars.extend(vcv_rs::cuda::root_vars());
-                vars.extend(["NV_SDK_DIRS", "PATH", "ProgramFiles", "ProgramData"]);
+                // vcv-rs picks an SDK build matching the detected CUDA toolkit.
+                cuda(&mut vars);
+                vars.extend(["NV_SDK_DIRS", "ProgramData"]);
             }
             Sdk::CrateDir(_) => {}
         }
     }
+    vars.sort_unstable();
+    vars.dedup();
     vars
 }
 
@@ -1623,28 +1911,39 @@ fn sdk_paths(spec: &LibSpec) -> Result<SdkPaths, Error> {
 }
 
 /// MSVC + Windows SDK + UCRT include directories from vcv-rs, so libclang finds `stddef.h` & co.
-/// from any shell. Empty when no Visual Studio is installed (libclang then uses its own search).
-fn system_include_dirs() -> Vec<PathBuf> {
+/// from any shell, for the host running the build and the Cargo target's architecture. Empty when
+/// no Visual Studio is installed (libclang then uses its own search).
+fn system_include_dirs(lib: &'static str) -> Result<Vec<PathBuf>, Error> {
     #[cfg(windows)]
     {
+        let (host, target) = msvc_arches(lib, std::env::var_os("CARGO_CFG_TARGET_ARCH").as_deref())?;
         let Some(vs) = vcv_rs::detect::detect_vs(None) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let sdk = vcv_rs::detect::detect_sdk();
         let ucrt = vcv_rs::detect::detect_ucrt();
-        vcv_rs::env::build_env(
-            &vs,
-            sdk.as_ref(),
-            ucrt.as_ref(),
-            vcv_rs::Arch::X64,
-            vcv_rs::Arch::X64,
-        )
-        .include
+        Ok(vcv_rs::env::build_env(&vs, sdk.as_ref(), ucrt.as_ref(), host, target).include)
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        // The MSVC toolset pair is a Windows-only input.
+        let _ = lib;
+        Ok(Vec::new())
     }
+}
+
+/// The MSVC toolset (host, target) pair: the build host's architecture and the Cargo target's
+/// (`CARGO_CFG_TARGET_ARCH`, as [`sdk_target_arch`] reads it).
+#[cfg(any(windows, test))]
+fn msvc_arches(
+    lib: &'static str,
+    requested: Option<&OsStr>,
+) -> Result<(vcv_rs::Arch, vcv_rs::Arch), Error> {
+    let host = vcv_rs::Arch::native().ok_or_else(|| Error::UnsupportedTarget {
+        lib,
+        arch: std::env::consts::ARCH.to_string(),
+    })?;
+    Ok((host, sdk_target_arch(lib, requested)?))
 }
 
 #[cfg(test)]
@@ -1685,6 +1984,10 @@ mod tests {
         },
     };
 
+    fn system_includes() -> Vec<PathBuf> {
+        system_include_dirs("fake").expect("the test host is a supported architecture")
+    }
+
     fn fixture() -> Vec<PathBuf> {
         vec![
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1712,7 +2015,7 @@ mod tests {
             sdks: &[Sdk::CudaToolkit, Sdk::Optix, Sdk::Nv(Kind::Nvcomp)],
             ..FAKE
         };
-        let vars = rerun_vars(&spec);
+        let vars = rerun_vars(&spec, false);
         for input in vcv_rs::cuda::root_vars()
             .iter()
             .chain(vcv_rs::optix::root_vars())
@@ -1725,6 +2028,174 @@ mod tests {
                 "discovery input {input} must rerun generation"
             );
         }
+    }
+
+    #[test]
+    fn path_reruns_generation_only_when_no_cuda_root_is_set() {
+        // L-17: with CUDA_PATH set, vcv-rs never reads PATH, so a PATH change must not regenerate.
+        let spec = LibSpec {
+            sdks: &[Sdk::CudaToolkit, Sdk::Nv(Kind::Cudnn)],
+            ..FAKE
+        };
+        assert!(!rerun_vars(&spec, true).contains(&"PATH"));
+        assert!(rerun_vars(&spec, true).contains(&"CUDA_PATH"));
+        assert!(rerun_vars(&spec, false).contains(&"PATH"));
+    }
+
+    #[test]
+    fn msvc_include_toolset_follows_the_cargo_target() {
+        // L-35: the target half was hard-coded to x64.
+        let (host, target) =
+            msvc_arches("fake", Some(OsStr::new("aarch64"))).expect("supported target");
+        assert_eq!(target, vcv_rs::Arch::Arm64);
+        assert_eq!(host, vcv_rs::Arch::native().expect("supported test host"));
+        assert!(matches!(
+            msvc_arches("fake", Some(OsStr::new("riscv64"))),
+            Err(Error::UnsupportedTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn a_libclang_probe_panic_keeps_its_message() {
+        // L-01: the payload used to be dropped and replaced by "libclang is unavailable".
+        assert_eq!(catch_quietly(|| {}), Ok(()));
+        let err = catch_quietly(|| panic!("Unable to find libclang: no DLL")).expect_err("panics");
+        assert_eq!(err, "Unable to find libclang: no DLL");
+        let err = catch_quietly(|| std::panic::panic_any(7_u8)).expect_err("panics");
+        assert_eq!(err, "a panic without a message");
+    }
+
+    #[test]
+    fn header_drift_names_changed_and_missing_headers() {
+        // L-02: prebuilt bindings used beside an installed SDK are compared header by header.
+        let bytes = std::fs::read(fixture()[0].join("fake.h")).expect("fixture");
+        let inventory = |headers: Vec<HeaderHash>| Inventory {
+            lib: "fake".into(),
+            headers,
+            symbols: Vec::new(),
+            unshimmed: Vec::new(),
+        };
+        let same = inventory(vec![HeaderHash {
+            name: "fake.h".into(),
+            sha256: hex(&Sha256::digest(&bytes)),
+        }]);
+        assert!(header_drift(&fixture(), &same).is_empty());
+        let drifted = inventory(vec![
+            HeaderHash {
+                name: "fake.h".into(),
+                sha256: "0".repeat(64),
+            },
+            HeaderHash {
+                name: "absent.h".into(),
+                sha256: "0".repeat(64),
+            },
+        ]);
+        assert_eq!(
+            header_drift(&fixture(), &drifted),
+            ["fake.h (changed)", "absent.h (missing)"]
+        );
+    }
+
+    #[test]
+    fn a_return_policy_that_matches_no_entry_point_is_rejected() {
+        // L-05: cufile's `ssize_t` policy never matched (bindgen emits `isize`) and nothing said so.
+        let api = r#"pub struct Api { pub read: Result<unsafe extern "C" fn() -> isize, ::libloading::Error> }"#;
+        let policy = ReturnPolicy {
+            types: &["ssize_t"],
+            not_loaded: "-1",
+            missing_symbol: "-2",
+        };
+        let err = check_return_policies_used("cufile", &[policy], &[(api, "Api")])
+            .expect_err("ssize_t is never a generated return type");
+        assert!(err.to_string().contains("ssize_t"), "{err}");
+        let isize_policy = ReturnPolicy {
+            types: &["isize"],
+            ..policy
+        };
+        check_return_policies_used("cufile", &[isize_policy], &[(api, "Api")])
+            .expect("isize matches");
+    }
+
+    #[test]
+    fn split_functions_no_part_claims_are_listed_unshimmed() {
+        // L-21: a header no part lists used to drop out of both `symbols` and `unshimmed`.
+        const ONLY_A: &[ExportPart] = &[ExportPart {
+            name: "a",
+            api_type: "SplitAApi",
+            loader_fn: "split_a_api",
+            header_files: &["split_a.h"],
+        }];
+        let spec = LibSpec {
+            name: "split",
+            headers: &["split.h"],
+            allow_fn: &["^split.*"],
+            allow_type: &["^split.*"],
+            allow_var: &[],
+            positive_enums: &[],
+            shape: Shape::SplitExports {
+                parts: ONLY_A,
+                returns: &[ReturnPolicy {
+                    types: &["splitStatus"],
+                    not_loaded: "splitStatus_enum_SPLIT_NOT_LOADED",
+                    missing_symbol: "splitStatus_enum_SPLIT_MISSING",
+                }],
+            },
+            ..FAKE
+        };
+        let out = bindings(&spec, &fixture(), &system_includes()).expect("split fixture binds");
+        assert_eq!(out.inventory.symbols, ["splitAlpha", "splitAlphaToo"]);
+        assert_eq!(out.inventory.unshimmed, ["splitBeta"]);
+    }
+
+    #[test]
+    fn generation_reports_the_sub_headers_libclang_opened() {
+        // L-16: only `split.h` was a rebuild input although the API lives in its sub-headers.
+        const PARTS: &[ExportPart] = &[
+            ExportPart {
+                name: "a",
+                api_type: "SplitAApi",
+                loader_fn: "split_a_api",
+                header_files: &["split_a.h"],
+            },
+            ExportPart {
+                name: "b",
+                api_type: "SplitBApi",
+                loader_fn: "split_b_api",
+                header_files: &["split_b.h"],
+            },
+        ];
+        let spec = LibSpec {
+            name: "split",
+            headers: &["split.h"],
+            allow_fn: &["^split.*"],
+            allow_type: &["^split.*"],
+            allow_var: &[],
+            positive_enums: &[],
+            shape: Shape::SplitExports {
+                parts: PARTS,
+                returns: &[ReturnPolicy {
+                    types: &["splitStatus"],
+                    not_loaded: "splitStatus_enum_SPLIT_NOT_LOADED",
+                    missing_symbol: "splitStatus_enum_SPLIT_MISSING",
+                }],
+            },
+            ..FAKE
+        };
+        let out = bindings(&spec, &fixture(), &system_includes()).expect("split fixture binds");
+        let names: Vec<String> = out
+            .includes
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        for header in ["split_a.h", "split_b.h", "split_common.h"] {
+            assert!(names.iter().any(|n| n == header), "{header} missing from {names:?}");
+        }
+        assert!(
+            out.includes.iter().all(|p| p.starts_with(&fixture()[0])),
+            "only files under the SDK include directories are rebuild inputs: {:?}",
+            out.includes
+        );
+        assert!(out.inventory.unshimmed.is_empty(), "every function has a part");
     }
 
     #[test]
@@ -1783,7 +2254,7 @@ mod tests {
 
     #[test]
     fn exports_produce_shims_for_allowlisted_functions_only() {
-        let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
+        let out = bindings(&FAKE, &fixture(), &system_includes()).expect("fixture binds");
         assert_eq!(
             out.inventory.symbols,
             [
@@ -1849,7 +2320,7 @@ mod tests {
 
     #[test]
     fn types_exclude_functions_and_pin_positive_enums() {
-        let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
+        let out = bindings(&FAKE, &fixture(), &system_includes()).expect("fixture binds");
         assert!(
             out.types
                 .contains("pub type fakeStatus_enum = ::core::ffi::c_uint;"),
@@ -1869,15 +2340,27 @@ mod tests {
 pub type winPos = ::std::os::raw::c_int;\n\
 pub type gccPos = ::std::os::raw::c_uint;\n\
 pub type signedErr = ::std::os::raw::c_int;\n";
-        let normalized = normalize_positive_enums(raw, &["winPos", "gccPos"]);
+        let normalized =
+            normalize_positive_enums("t", raw, &["winPos", "gccPos"]).expect("both are typedefs");
         assert!(normalized.contains("pub type winPos = ::core::ffi::c_uint;\n"));
         assert!(normalized.contains("pub type gccPos = ::core::ffi::c_uint;\n"));
         assert!(normalized.contains("pub type signedErr = ::std::os::raw::c_int;\n"));
     }
 
     #[test]
+    fn a_positive_enum_that_matches_no_typedef_is_rejected() {
+        // L-20: an entry that matched nothing used to be skipped silently.
+        let raw = "pub type realEnum = ::std::os::raw::c_int;
+";
+        let err = normalize_positive_enums("t", raw, &["realEnum", "renamedEnum"])
+            .expect_err("renamedEnum is not in the source");
+        assert!(err.to_string().contains("renamedEnum"), "{err}");
+        assert!(!err.to_string().contains("\"realEnum\""), "{err}");
+    }
+
+    #[test]
     fn inventory_hashes_the_header_bytes() {
-        let out = bindings(&FAKE, &fixture(), &system_include_dirs()).expect("fixture binds");
+        let out = bindings(&FAKE, &fixture(), &system_includes()).expect("fixture binds");
         let bytes = std::fs::read(fixture()[0].join("fake.h")).expect("fixture");
         assert_eq!(
             out.inventory.headers,
@@ -1934,7 +2417,7 @@ pub type signedErr = ::std::os::raw::c_int;\n";
             },
             ..FAKE
         };
-        let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("split fixture binds");
+        let out = bindings(&spec, &fixture(), &system_includes()).expect("split fixture binds");
         assert_eq!(
             out.inventory.symbols,
             ["splitAlpha", "splitAlphaToo", "splitBeta"]
@@ -1981,7 +2464,7 @@ pub type signedErr = ::std::os::raw::c_int;\n";
             },
             ..FAKE
         };
-        let out = bindings(&spec, &fixture(), &system_include_dirs()).expect("qi fixture binds");
+        let out = bindings(&spec, &fixture(), &system_includes()).expect("qi fixture binds");
         assert_eq!(
             out.inventory.symbols,
             [
@@ -2238,7 +2721,11 @@ pub type signedErr = ::std::os::raw::c_int;\n";
 
     #[test]
     fn prebuilt_copy_and_resolution_work() {
-        let base = std::env::temp_dir().join("nv_bindgen_prebuilt_test");
+        // L-37: a per-process directory, so concurrent runs (two targets, two checkouts) never race.
+        let base = std::env::temp_dir().join(format!(
+            "nv_bindgen_prebuilt_test_{}",
+            std::process::id()
+        ));
         std::fs::remove_dir_all(&base).ok();
         let target = "x86_64-pc-windows-msvc";
         let prebuilt = base.join("prebuilt").join(target);
@@ -2271,6 +2758,16 @@ pub type signedErr = ::std::os::raw::c_int;\n";
         // Resolves <CARGO_MANIFEST_DIR>/prebuilt/<target> when NV_RS_PREBUILT_DIR is unset.
         let resolved_default = resolve_prebuilt_dir(Some(&base), None, target, &expected);
         assert_eq!(resolved_default.as_deref(), Some(prebuilt.as_path()));
+        // L-19: an NV_RS_PREBUILT_DIR without this library's files falls through to the crate's.
+        let other_family = base.join("other_family");
+        std::fs::create_dir_all(other_family.join(target)).expect("other prebuilt dir");
+        let resolved_fallthrough = resolve_prebuilt_dir(
+            Some(&base),
+            Some(OsStr::new(&other_family)),
+            target,
+            &expected,
+        );
+        assert_eq!(resolved_fallthrough.as_deref(), Some(prebuilt.as_path()));
 
         let (sources, inv) = copy_prebuilt_bindings(&FAKE, &prebuilt, &out).expect("copy prebuilt");
         assert_eq!(sources.len(), expected.len());

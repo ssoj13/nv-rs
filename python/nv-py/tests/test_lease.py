@@ -9,8 +9,8 @@ generation later writes into it.
 generation into `x` cannot have run when `x` is dropped. The replacement `y` is read on B once
 while A is still busy and once after A finished; any difference is a write into memory that
 Python freed. Modelled on `crates/curand/tests/lease.rs`.
-**Fix.** The binding must run its FFI enqueue through `buf_util::enqueue_leased`
-(`compute.rs` `CurandGenerator.fill_uniform_f32` does not yet: strict xfail until it does).
+**Fix.** `compute.rs` `CurandGenerator.fill_uniform_f32` runs its enqueue through
+`buf_util::enqueue_leased`, which keeps `x` allocated until the generation completes.
 """
 
 import time
@@ -51,11 +51,6 @@ def _busy_fills(gen, a, busy):
     return max(1, int(BUSY_S / per_fill))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="LEASE-API: compute.rs CurandGenerator.fill_uniform_f32 does not use "
-    "buf_util::enqueue_leased yet",
-)
 def test_lease_buffer_dropped_while_other_stream_writes_is_not_reused():
     a, b, gen = _setup()
     busy = nv_rs.core.DeviceBuffer.alloc(a, [BUSY_N], dtype="f32")

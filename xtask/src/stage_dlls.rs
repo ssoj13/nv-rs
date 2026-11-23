@@ -2,8 +2,12 @@
 //!
 //! **What.** Implements `cargo xtask stage-dlls --out <dir> [--libs <csv>] [--include-driver]
 //! [--dry-run]`. Uses [`nv_loader::candidates`] to locate the first existing runtime library on
-//! disk for each selected `*-sys` [`DllSpec`], and copies it into `--out` (skipping files that
-//! already match in size and modification time).
+//! disk for each selected `*-sys` [`DllSpec`], and copies it into `--out` atomically
+//! ([`crate::atomic_io::copy`]), skipping files that already match in size and modification time.
+//! A library named in `--libs` that is not found fails the command (non-zero exit, nothing
+//! copied); without `--libs`, missing libraries are reported as warnings. Libraries that are
+//! optional by definition stay warnings either way: driver-installed ones without
+//! `--include-driver`, and ones with no file name on the current platform.
 //!
 //! **Why.** Applications and Python wheels built against `nv-rs` need redistributable CUDA
 //! Toolkit and SDK DLLs next to their binaries or in a staging directory without hand-hunting
@@ -21,8 +25,12 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str =
-    "usage: cargo xtask stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]";
+const USAGE: &str = "\
+usage: cargo xtask stage-dlls|d --out <dir> [--libs <csv>] [--include-driver] [--dry-run]
+  --libs <csv>      stage only these libraries; one that is not found fails the command
+  --include-driver  also stage driver-installed libraries (nvml, nvapi, optix, ...)
+  --dry-run         print what would be copied without copying
+example: cargo xtask stage-dlls --out dist --libs cufft,nvjpeg,nvrtc";
 
 macro_rules! npp_dll {
     ($name:literal, $linux:literal) => {
@@ -184,6 +192,9 @@ const SPECS: &[DllSpec] = &[
 
 /// Runs `cargo xtask stage-dlls`.
 pub fn run(args: &[&str]) -> Result<String, String> {
+    if args.iter().any(|a| matches!(*a, "-h" | "--help")) {
+        return Ok(USAGE.to_string());
+    }
     let opts = parse_args(args)?;
     stage_with(&opts, SPECS, find_first_existing)
 }
@@ -253,6 +264,15 @@ fn is_selected_group(group: Group, include_driver: bool) -> bool {
     }
 }
 
+/// The file names `spec` lists for the OS xtask runs on (the loader searches the same list).
+fn platform_names(spec: &DllSpec) -> &'static [&'static str] {
+    if cfg!(windows) {
+        spec.windows
+    } else {
+        spec.linux
+    }
+}
+
 enum CandidateOutcome {
     Found(PathBuf),
     Missing(String),
@@ -303,15 +323,11 @@ fn stage_with(
         }
     }
 
-    if !opts.dry_run {
-        std::fs::create_dir_all(&opts.out)
-            .map_err(|e| format!("creating {}: {e}", opts.out.display()))?;
-    }
-
-    let mut copied = 0usize;
+    // Resolve every selected library before copying anything, so a missing requested library
+    // fails the command without leaving a partial bundle behind.
+    let mut found: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut missing: Vec<(String, String)> = Vec::new();
-    let mut log = String::new();
 
     for spec in specs {
         if let Some(filter) = &opts.libs
@@ -329,58 +345,82 @@ fn stage_with(
             }
             continue;
         }
+        if platform_names(spec).is_empty() {
+            // The library does not exist on this OS (`cufile`/`nccl` on Windows, `nvapi` on
+            // Linux): nothing to stage, so it is optional here even when requested.
+            if opts.libs.is_some() {
+                skipped.push((spec.lib.to_string(), "not shipped on this platform".into()));
+            }
+            continue;
+        }
 
         match find_candidate(spec) {
             CandidateOutcome::Missing(reason) => {
                 missing.push((spec.lib.to_string(), reason));
             }
             CandidateOutcome::Found(src) => {
-                let Some(file_name) = src.file_name() else {
-                    missing.push((
+                let dst = src.file_name().map(|name| opts.out.join(name));
+                match dst {
+                    Some(dst) => found.push((spec.lib, src, dst)),
+                    None => missing.push((
                         spec.lib.to_string(),
-                        "candidate path has no file name".into(),
-                    ));
-                    continue;
-                };
-                let dst = opts.out.join(file_name);
-                if is_same_file(&src, &dst) {
-                    skipped.push((
-                        spec.lib.to_string(),
-                        "up to date (identical size and mtime)".into(),
-                    ));
-                    let _ = writeln!(log, "skip  {:<12} {} (up to date)", spec.lib, dst.display());
-                    continue;
+                        format!("candidate {} has no file name", src.display()),
+                    )),
                 }
-                if opts.dry_run {
-                    let verb = if dst.exists() { "overwrite" } else { "copy" };
-                    let _ = writeln!(
-                        log,
-                        "[dry-run] would {verb} {:<12} {} -> {}",
-                        spec.lib,
-                        src.display(),
-                        dst.display()
-                    );
-                } else {
-                    std::fs::copy(&src, &dst).map_err(|e| {
-                        format!("copying {} -> {}: {e}", src.display(), dst.display())
-                    })?;
-                    if let Ok(mtime) = std::fs::metadata(&src).and_then(|m| m.modified())
-                        && let Ok(f) = std::fs::File::options().write(true).open(&dst)
-                        && let Err(e) = f.set_modified(mtime)
-                    {
-                        return Err(format!("setting mtime on {}: {e}", dst.display()));
-                    }
-                    let _ = writeln!(
-                        log,
-                        "copy  {:<12} {} -> {}",
-                        spec.lib,
-                        src.display(),
-                        dst.display()
-                    );
-                }
-                copied += 1;
             }
         }
+    }
+
+    if opts.libs.is_some() && !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().map(|(lib, _)| lib.as_str()).collect();
+        let details: String = missing
+            .iter()
+            .map(|(lib, reason)| format!("\n  missing {lib}: {reason}"))
+            .collect();
+        return Err(format!(
+            "stage-dlls: requested {} not found: {}; nothing was copied to {}{details}",
+            if names.len() == 1 { "library" } else { "libraries" },
+            names.join(", "),
+            opts.out.display()
+        ));
+    }
+
+    if !opts.dry_run {
+        std::fs::create_dir_all(&opts.out)
+            .map_err(|e| format!("creating {}: {e}", opts.out.display()))?;
+    }
+
+    let mut copied = 0usize;
+    let mut log = String::new();
+    for (lib, src, dst) in &found {
+        if is_same_file(src, dst) {
+            skipped.push((
+                lib.to_string(),
+                "up to date (identical size and mtime)".into(),
+            ));
+            let _ = writeln!(log, "skip  {:<12} {} (up to date)", lib, dst.display());
+            continue;
+        }
+        if opts.dry_run {
+            let verb = if dst.exists() { "overwrite" } else { "copy" };
+            let _ = writeln!(
+                log,
+                "[dry-run] would {verb} {:<12} {} -> {}",
+                lib,
+                src.display(),
+                dst.display()
+            );
+        } else {
+            crate::atomic_io::copy(src, dst)?;
+            let _ = writeln!(
+                log,
+                "copy  {:<12} {} -> {}",
+                lib,
+                src.display(),
+                dst.display()
+            );
+        }
+        copied += 1;
     }
 
     let action = if opts.dry_run { "would copy" } else { "copied" };
@@ -462,35 +502,42 @@ mod tests {
         assert!(is_selected_group(Group::DriverStore, true));
     }
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "nv_rs_xtask_stage_dlls_{label}_{}_{id}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
     #[test]
     fn stage_copies_skips_up_to_date_and_supports_dry_run() {
-        let root = std::env::temp_dir().join("nv_rs_xtask_stage_dlls_test");
-        std::fs::remove_dir_all(&root).ok();
+        let root = unique_test_dir("copy");
         let src_dir = root.join("src");
         let out_dir = root.join("out");
         std::fs::create_dir_all(&src_dir).expect("src dir");
         let cublas_dll = src_dir.join("cublas64_13.dll");
         std::fs::write(&cublas_dll, b"cublas-bytes").expect("write dll");
+        let find = |spec: &DllSpec| match spec.lib {
+            "cublas" => CandidateOutcome::Found(cublas_dll.clone()),
+            _ => CandidateOutcome::Missing("not installed".into()),
+        };
 
         // Dry run should not create `out_dir` or copy the file.
         let dry_opts = Opts {
             out: out_dir.clone(),
-            libs: Some(BTreeSet::from(["cublas".into(), "cufft".into()])),
+            libs: Some(BTreeSet::from(["cublas".into()])),
             include_driver: false,
             dry_run: true,
         };
-        let dry_msg = stage_with(&dry_opts, SPECS, |spec| match spec.lib {
-            "cublas" => CandidateOutcome::Found(cublas_dll.clone()),
-            _ => CandidateOutcome::Missing("not installed".into()),
-        })
-        .expect("dry run");
+        let dry_msg = stage_with(&dry_opts, SPECS, find).expect("dry run");
         assert!(!out_dir.exists());
         assert!(
-            dry_msg.contains("would copy 1, skipped 0, missing 1"),
-            "{dry_msg}"
-        );
-        assert!(
-            dry_msg.contains("missing cufft: not installed"),
+            dry_msg.contains("would copy 1, skipped 0, missing 0"),
             "{dry_msg}"
         );
 
@@ -499,25 +546,17 @@ mod tests {
             dry_run: false,
             ..dry_opts
         };
-        let copy_msg = stage_with(&real_opts, SPECS, |spec| match spec.lib {
-            "cublas" => CandidateOutcome::Found(cublas_dll.clone()),
-            _ => CandidateOutcome::Missing("not installed".into()),
-        })
-        .expect("real run");
+        let copy_msg = stage_with(&real_opts, SPECS, find).expect("real run");
         assert!(out_dir.join("cublas64_13.dll").is_file());
         assert!(
-            copy_msg.contains("copied 1, skipped 0, missing 1"),
+            copy_msg.contains("copied 1, skipped 0, missing 0"),
             "{copy_msg}"
         );
 
-        // Second run skips because size and mtime match.
-        let skip_msg = stage_with(&real_opts, SPECS, |spec| match spec.lib {
-            "cublas" => CandidateOutcome::Found(cublas_dll.clone()),
-            _ => CandidateOutcome::Missing("not installed".into()),
-        })
-        .expect("second run");
+        // Second run skips because size and mtime match (the atomic copy keeps the mtime).
+        let skip_msg = stage_with(&real_opts, SPECS, find).expect("second run");
         assert!(
-            skip_msg.contains("copied 0, skipped 1, missing 1"),
+            skip_msg.contains("copied 0, skipped 1, missing 0"),
             "{skip_msg}"
         );
         assert!(
@@ -532,6 +571,89 @@ mod tests {
         };
         assert!(stage_with(&bad_opts, SPECS, |_| CandidateOutcome::Missing("x".into())).is_err());
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_requested_library_fails_and_copies_nothing() {
+        let root = unique_test_dir("missing");
+        let src_dir = root.join("src");
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        let cublas_dll = src_dir.join("cublas64_13.dll");
+        std::fs::write(&cublas_dll, b"cublas-bytes").expect("write dll");
+        let find = |spec: &DllSpec| match spec.lib {
+            "cublas" => CandidateOutcome::Found(cublas_dll.clone()),
+            _ => CandidateOutcome::Missing("not installed".into()),
+        };
+
+        for dry_run in [true, false] {
+            let opts = Opts {
+                out: out_dir.clone(),
+                libs: Some(BTreeSet::from([
+                    "cublas".into(),
+                    "cufft".into(),
+                    "nvrtc".into(),
+                ])),
+                include_driver: false,
+                dry_run,
+            };
+            let err = stage_with(&opts, SPECS, find).expect_err("requested libs are missing");
+            assert!(
+                err.contains("requested libraries not found: cufft, nvrtc"),
+                "{err}"
+            );
+            assert!(err.contains("missing cufft: not installed"), "{err}");
+            assert!(err.contains("missing nvrtc: not installed"), "{err}");
+            assert!(!out_dir.exists(), "nothing may be copied: {err}");
+        }
+
+        // Without `--libs` a missing library is only a warning.
+        let opts = Opts {
+            out: out_dir.clone(),
+            libs: None,
+            include_driver: false,
+            dry_run: false,
+        };
+        let msg = stage_with(&opts, SPECS, find).expect("missing is a warning without --libs");
+        assert!(msg.contains("missing cufft: not installed"), "{msg}");
+        assert!(out_dir.join("cublas64_13.dll").is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn optional_libraries_stay_warnings_when_requested() {
+        const SPECS_WITH_OPTIONAL: &[DllSpec] = &[
+            DllSpec {
+                lib: "nowhere",
+                group: Group::Toolkit,
+                windows: &[],
+                linux: &[],
+            },
+            DllSpec {
+                lib: "drv",
+                group: Group::Driver,
+                windows: &["drv.dll"],
+                linux: &["libdrv.so.1"],
+            },
+        ];
+        let root = unique_test_dir("optional");
+        let opts = Opts {
+            out: root.join("out"),
+            libs: Some(BTreeSet::from(["nowhere".into(), "drv".into()])),
+            include_driver: false,
+            dry_run: true,
+        };
+        let msg = stage_with(&opts, SPECS_WITH_OPTIONAL, |spec| {
+            panic!("{} must not be searched", spec.lib)
+        })
+        .expect("optional libraries do not fail the command");
+        assert!(
+            msg.contains("skipped nowhere: not shipped on this platform"),
+            "{msg}"
+        );
+        assert!(msg.contains("skipped drv: driver library"), "{msg}");
         std::fs::remove_dir_all(&root).ok();
     }
 }

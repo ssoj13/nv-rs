@@ -2,14 +2,14 @@
 //!
 //! **What.** Types are generated at build time by `nv-bindgen` from the Optical Flow SDK's
 //! `nvOpticalFlowCuda.h` (located by vcv-rs; never committed). [`api`] opens the driver's
-//! `nvofapi64.dll` / `libnvidia-opticalflow.so.1`, checks `NvOFGetMaxSupportedApiVersion` against
-//! the header's [`API_VERSION`] (an older driver is a typed load error) and fills
+//! `nvofapi64.dll` / `libnvidia-opticalflow.so.1` through `nv_loader::open_library`, checks
+//! `NvOFGetMaxSupportedApiVersion` against the header's [`API_VERSION`] (an older driver is
+//! `LoadError::RuntimeTooOld`) and fills
 //! [`NV_OF_CUDA_API_FUNCTION_LIST`] through `NvOFAPICreateInstanceCuda`. CUDA types are the
 //! `cuda-bindings` ones. The D3D11/D3D12/Vulkan variants of the interface are not bound yet.
 //! **Used by** a future safe `nvofa` crate (motion vectors, frame interpolation).
 
-use nv_loader::{DllSpec, Group, LoadError, Loaded, open_first};
-use std::sync::OnceLock;
+use nv_loader::{DllSpec, Rejection};
 
 // Generated code: lint levels differ per header.
 #[allow(
@@ -28,12 +28,7 @@ mod types {
 pub use types::*;
 
 /// Where NVOFA ships: the display driver.
-pub const DLL: DllSpec = DllSpec {
-    lib: "nvofa",
-    group: Group::Driver,
-    windows: &["nvofapi64.dll"],
-    linux: &["libnvidia-opticalflow.so.1"],
-};
+pub const DLL: DllSpec = nv_loader::catalog::NVOFA.spec;
 
 /// Entry points (function-list fields) and header sha256 (coverage evidence).
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/nvofa_inventory.json"));
@@ -60,14 +55,16 @@ unsafe impl Sync for NvofaApi {}
 type MaxVersionFn = unsafe extern "C" fn(*mut u32) -> NV_OF_STATUS;
 type CreateCudaFn = unsafe extern "C" fn(u32, *mut NV_OF_CUDA_API_FUNCTION_LIST) -> NV_OF_STATUS;
 
-fn loaded() -> &'static Result<Loaded<NvofaApi>, LoadError> {
-    static API: OnceLock<Result<Loaded<NvofaApi>, LoadError>> = OnceLock::new();
-    API.get_or_init(|| open_first(&DLL, open))
+nv_loader::cached_loader! {
+    dll: DLL,
+    value: NvofaApi,
+    open: open,
+    /// The NVOFA CUDA function list for this process, loaded on first call.
+    pub fn api
 }
 
-fn open(path: &std::path::Path) -> Result<NvofaApi, String> {
-    // SAFETY: loading the driver's optical-flow library runs only its initialisers.
-    let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
+fn open(path: &std::path::Path) -> Result<NvofaApi, Rejection> {
+    let lib = nv_loader::open_library(path).map_err(|e| e.to_string())?;
     // SAFETY: both exports have these signatures in nvOpticalFlowCommon.h / nvOpticalFlowCuda.h.
     let max_version: MaxVersionFn =
         unsafe { lib.get::<MaxVersionFn>(b"NvOFGetMaxSupportedApiVersion\0") }
@@ -82,36 +79,21 @@ fn open(path: &std::path::Path) -> Result<NvofaApi, String> {
     // SAFETY: valid out-pointer.
     let r = unsafe { max_version(&mut driver_max_version) };
     if r != _NV_OF_STATUS_NV_OF_SUCCESS {
-        return Err(format!("NvOFGetMaxSupportedApiVersion returned {r}"));
+        return Err(format!("NvOFGetMaxSupportedApiVersion returned {r}").into());
     }
-    if driver_max_version < API_VERSION {
-        return Err(format!(
-            "driver supports NVOFA API {}.{}, these bindings need {NV_OF_API_MAJOR_VERSION}.{NV_OF_API_MINOR_VERSION}",
-            driver_max_version >> 4,
-            driver_max_version & 0xf
-        ));
-    }
+    // Both sides are `major << 4 | minor`; an older driver is `LoadError::RuntimeTooOld`.
+    nv_loader::check_version(API_VERSION, driver_max_version)?;
     let mut list = NV_OF_CUDA_API_FUNCTION_LIST::default();
     // SAFETY: `list` is a writable function list of the header's layout.
     let r = unsafe { create(API_VERSION, &mut list) };
     if r != _NV_OF_STATUS_NV_OF_SUCCESS {
-        return Err(format!("NvOFAPICreateInstanceCuda returned {r}"));
+        return Err(format!("NvOFAPICreateInstanceCuda returned {r}").into());
     }
     Ok(NvofaApi {
         _lib: lib,
         driver_max_version,
         list,
     })
-}
-
-/// The NVOFA CUDA function list for this process, loaded on first call.
-pub fn api() -> Result<&'static NvofaApi, &'static LoadError> {
-    loaded().as_ref().map(|l| &l.value)
-}
-
-/// Loads NVOFA now and reports which file was used, or why loading failed.
-pub fn load() -> Result<&'static std::path::Path, &'static LoadError> {
-    loaded().as_ref().map(|l| l.path.as_path())
 }
 
 #[cfg(test)]

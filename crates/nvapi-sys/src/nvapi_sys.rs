@@ -9,13 +9,11 @@
 //! **Used by** a future safe `nvapi` crate (driver settings, GPU topology, D3D extensions).
 #![cfg(target_os = "windows")]
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::query_interface_sys! {
     lib: "nvapi",
     loader: nvapi_api,
     query_symbol: b"nvapi_QueryInterface\0",
-    dll: DllSpec { lib: "nvapi", group: Group::Driver, windows: &["nvapi64.dll"], linux: &[] },
+    dll: nv_loader::catalog::NVAPI.spec,
 }
 
 #[cfg(test)]

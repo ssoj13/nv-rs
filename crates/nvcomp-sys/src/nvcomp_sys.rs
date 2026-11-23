@@ -6,21 +6,32 @@
 //! CUDA streams are the same `cuda_bindings::CUstream_st` used by `cuda-core`.
 //! Used by nv-rs consumers needing batched compression, checksums, or native bitcomp.
 
-use nv_loader::{DllSpec, Group};
+use nv_loader::Rejection;
 
 nv_loader::exports_sys! {
     lib: "nvcomp",
     api: NvcompApi,
     loader: nvcomp_api,
-    dll: DllSpec {
-        lib: "nvcomp",
-        group: Group::Sdk {
-            root_var: "NVCOMP_ROOT",
-            hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
-        },
-        windows: &["nvcomp64_*"],
-        linux: &["libnvcomp.so.6", "libnvcomp.so"],
-    },
+    dll: nv_loader::catalog::NVCOMP.spec.with_hint(env!("NV_RS_SDK_BIN")),
+    version: runtime_version,
+}
+
+/// Rejects a runtime whose major version is older than the headers' `NVCOMP_VER_MAJOR`.
+/// `nvcompProperties_t::version` is `MAKE_SEMANTIC_VERSION(major, minor, patch)` =
+/// `major * 1000 + minor * 100 + patch` (`nvcomp/version.h`).
+fn runtime_version(lib: &api::NvcompApi) -> Result<(), Rejection> {
+    let get = *lib
+        .nvcompGetProperties
+        .as_ref()
+        .map_err(|e| format!("nvcompGetProperties is unavailable: {e}"))?;
+    let mut props = nvcompProperties_t::default();
+    // SAFETY: `nvcompGetProperties(nvcompProperties_t*)` (nvcomp.h) writes the plain struct
+    // through the valid, exclusive pointer and needs no initialisation.
+    let status = unsafe { get(&mut props) };
+    if status != nvcompStatus_t_nvcompSuccess {
+        return Err(format!("nvcompGetProperties returned {status}").into());
+    }
+    nv_loader::check_version(NVCOMP_VER_MAJOR, props.version / 1000)
 }
 
 #[cfg(test)]

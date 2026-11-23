@@ -130,7 +130,7 @@ fn write_file_utf8(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()))
+    crate::atomic_io::write(path, content.as_bytes())
 }
 
 // ============================================================================
@@ -425,7 +425,7 @@ fn assemble_model(
                 classes.push(ClassSpec {
                     py_name: raw_cls.py_name.clone(),
                     doc: raw_cls.doc.clone(),
-                    methods,
+                    methods: order_property_accessors(methods, &raw_cls.py_name)?,
                 });
             }
 
@@ -1565,6 +1565,40 @@ struct TypeCtx<'a> {
     self_class: Option<(&'a str, &'a str)>,
 }
 
+/// Moves every `#[setter]` directly after the `#[getter]` of the same property. A `.pyi`
+/// `@prop.setter` needs a preceding `@property def prop`, but Rust source order is free (and
+/// `#[pymethods]` blocks are merged), so render order cannot follow it. A setter without a getter
+/// is a write-only property, which a stub cannot express: rejected with the class name.
+fn order_property_accessors(
+    methods: Vec<MethodSpec>,
+    class: &str,
+) -> Result<Vec<MethodSpec>, String> {
+    let mut ordered: Vec<MethodSpec> = Vec::with_capacity(methods.len());
+    let mut setters: Vec<(String, MethodSpec)> = Vec::new();
+    for m in methods {
+        let setter_prop = match &m.kind {
+            MethodKind::Setter(prop) => Some(prop.clone()),
+            _ => None,
+        };
+        match setter_prop {
+            Some(prop) => setters.push((prop, m)),
+            None => ordered.push(m),
+        }
+    }
+    for (prop, setter) in setters {
+        let getter = ordered
+            .iter()
+            .position(|o| matches!(&o.kind, MethodKind::Getter(g) if *g == prop))
+            .ok_or_else(|| {
+                format!(
+                    "class `{class}`: #[setter] for property `{prop}` has no #[getter]; a .pyi `@{prop}.setter` needs a preceding `@property`"
+                )
+            })?;
+        ordered.insert(getter + 1, setter);
+    }
+    Ok(ordered)
+}
+
 fn resolve_method(rm: &RawMethod, ctx: &TypeCtx<'_>) -> Result<Option<MethodSpec>, String> {
     let base_name = rm
         .attrs
@@ -2654,6 +2688,9 @@ mod tests {
                 #[setter]
                 fn set_label(&mut self, value: &str) { let _ = value; }
 
+                #[getter]
+                fn label(&self) -> String { String::new() }
+
                 fn __repr__(&self) -> String { String::new() }
             }
 
@@ -2703,9 +2740,41 @@ __all__ = ["__version__", "demo", "legacy"]
             pyi.contains("@label.setter\n        def label(self, value: str) -> None: ..."),
             "{pyi}"
         );
+        // The setter precedes its getter in the Rust source; the stub must not.
+        let property = pyi.find("def label(self) ->").expect("label property");
+        let setter = pyi.find("@label.setter").expect("label setter");
+        assert!(property < setter, "@property must precede @label.setter: {pyi}");
         assert!(!pyi.contains("__repr__"), "must omit __repr__: {pyi}");
         assert!(pyi.contains("SUPPORTED: bool"), "{pyi}");
         assert!(pyi.contains("def ping() -> bool: ..."), "{pyi}");
+    }
+
+    #[test]
+    fn setter_without_getter_is_rejected() {
+        let mod_rs = r#"
+            use pyo3::prelude::*;
+            #[pyclass(name = "Knob", module = "nv_rs.demo")]
+            pub struct PyKnob;
+            #[pymethods]
+            impl PyKnob {
+                #[setter]
+                fn set_level(&mut self, value: u32) { let _ = value; }
+            }
+            pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+                py_register_submodule!(py, parent, "demo", |m| {
+                    m.add_class::<PyKnob>()?;
+                })
+            }
+        "#;
+        let init_py = r#"
+from ._nv_rs import (__version__, demo)
+__all__ = ["__version__", "demo"]
+"#;
+        let err = build_synthetic_model(mod_rs, init_py).expect_err("write-only property");
+        assert!(
+            err.contains("class `Knob`: #[setter] for property `level` has no #[getter]"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2956,19 +3025,30 @@ __all__ = ["__version__", "diag", "trace"]
             .parent()
             .expect("repo root");
         let model = build_api_model(repo_root).expect("real python/nv-py parses cleanly");
+        let names: BTreeSet<&str> = model.submodules.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.is_empty(), "nv_rs registers no submodules");
         assert_eq!(
+            names.len(),
             model.submodules.len(),
-            25,
-            "expected all 25 nv_rs submodules"
+            "submodule names must be unique"
         );
 
+        // Two independent parses: any hash-ordered collection in the pipeline (a fresh random
+        // seed per map) would make them differ. Rendering one model twice proves nothing.
+        let again = build_api_model(repo_root).expect("second parse");
         let pyi_a = render_pyi(&model);
-        let pyi_b = render_pyi(&model);
-        assert_eq!(pyi_a, pyi_b, "pyi rendering must be deterministic");
-
-        let md_a = render_docs_md(&model);
-        let md_b = render_docs_md(&model);
-        assert_eq!(md_a, md_b, "docs rendering must be deterministic");
+        assert_eq!(pyi_a, render_pyi(&again), "pyi must not depend on map order");
+        assert_eq!(
+            render_docs_md(&model),
+            render_docs_md(&again),
+            "docs must not depend on map order"
+        );
+        for name in &names {
+            assert!(
+                pyi_a.contains(&format!("\nclass {name}:")),
+                "submodule `{name}` missing from the stub"
+            );
+        }
 
         // Key audit regression checks:
         assert!(

@@ -5,21 +5,31 @@
 //! (interleaved RGB/BGR or single-plane Y) and Python buffer-protocol inputs (`bytes`,
 //! `bytearray`, `memoryview`, `numpy.ndarray`) with the GIL released via `py.detach`.
 //!
+//! **How.** A decode writes a new nv_rs-owned buffer whose producer stream is the decode stream,
+//! under a write lease (`buf_util::enqueue_leased`), so a consumer on another stream either waits
+//! (DLPack / CAI export) or is rejected until the decode completes. An encode reads its
+//! `DeviceBuffer` input (owned or DLPack import, validated by `buf_util::check_buf`) under a read
+//! lease. The decoder's single `JpegState` is reused across per-call streams only after the
+//! previous stream has drained, because nvJPEG keeps per-decode buffers in the state.
+//!
 //! **Used by** `nv_rs` Python extension module (`python/nv-py/src/lib.rs`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use cuda_core::DeviceBuffer as CudaDeviceBuffer;
+use cuda_core::{DeviceBuffer as CudaDeviceBuffer, Stream};
 use nv_loader::diag::{self, Level};
 use nvjpeg::{
     Backend, ChromaSubsampling, EncoderParams, EncoderState, Handle, ImagePlanes, ImagePlanesMut,
     InputFormat, JpegState, OutputFormat,
 };
 use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::buf_util::{Access, check_buf, enqueue_leased};
+use crate::compute::typed_view;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -110,6 +120,11 @@ fn copy_py_bytes(py: Python<'_>, data: &Bound<'_, PyAny>, op: &str) -> PyResult<
     Ok(host)
 }
 
+/// Resolves the image size: both `width` and `height` given, or both inferred from an
+/// `(H, W, channels)` `shape` attribute.
+///
+/// Giving only one of them is rejected (it would mix an explicit and an inferred dimension). An
+/// input without a `shape` attribute needs both; any other error reading `shape` propagates.
 fn resolve_image_dims(
     image: &Bound<'_, PyAny>,
     width: Option<u32>,
@@ -117,101 +132,91 @@ fn resolve_image_dims(
     expected_channels: usize,
     op: &str,
 ) -> PyResult<(u32, u32)> {
-    if let (Some(w), Some(h)) = (width, height) {
-        if w == 0 || h == 0 {
-            return Err(record_and_err(
-                "nvjpeg",
-                op,
-                "width and height must be > 0",
-                ErrorKind::InvalidArgument,
+    let invalid = |msg: String| record_and_err("nvjpeg", op, msg, ErrorKind::InvalidArgument);
+    let (w, h) = match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (None, None) => {
+            let shape = match image.getattr("shape") {
+                Ok(shape) => shape.extract::<Vec<i64>>().map_err(|e| {
+                    invalid(format!("cannot read the input's shape as integers: {e}"))
+                })?,
+                Err(e) if e.is_instance_of::<PyAttributeError>(image.py()) => {
+                    return Err(invalid(
+                        "width and height are required for an input without a shape".to_owned(),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            match shape.as_slice() {
+                [h, w, c] if *c == expected_channels as i64 => {
+                    let dim = |v: i64, what: &str| {
+                        u32::try_from(v)
+                            .map_err(|_| invalid(format!("{what} {v} out of range for u32")))
+                    };
+                    (dim(*w, "width")?, dim(*h, "height")?)
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "input shape {shape:?} is not (H, W, {expected_channels}); pass width and height"
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "pass both width and height, or neither to infer them from the shape".to_owned(),
             ));
         }
-        return Ok((w, h));
-    }
-
-    let shape = image
-        .getattr("shape")
-        .ok()
-        .and_then(|s| s.extract::<Vec<i64>>().ok());
-
-    let (inferred_w, inferred_h) = match shape.as_deref() {
-        Some([h, w, c]) if *h > 0 && *w > 0 && *c == expected_channels as i64 => {
-            let w_u32 = u32::try_from(*w).map_err(|_| {
-                record_and_err(
-                    "nvjpeg",
-                    op,
-                    "width overflows u32",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            let h_u32 = u32::try_from(*h).map_err(|_| {
-                record_and_err(
-                    "nvjpeg",
-                    op,
-                    "height overflows u32",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            (Some(w_u32), Some(h_u32))
-        }
-        _ => (None, None),
     };
-
-    let w = width.or(inferred_w).ok_or_else(|| {
-        record_and_err(
-            "nvjpeg",
-            op,
-            "width and height are required when input shape is not (H, W, 3)",
-            ErrorKind::InvalidArgument,
-        )
-    })?;
-    let h = height.or(inferred_h).ok_or_else(|| {
-        record_and_err(
-            "nvjpeg",
-            op,
-            "width and height are required when input shape is not (H, W, 3)",
-            ErrorKind::InvalidArgument,
-        )
-    })?;
     if w == 0 || h == 0 {
-        return Err(record_and_err(
-            "nvjpeg",
-            op,
-            "width and height must be > 0",
-            ErrorKind::InvalidArgument,
-        ));
+        return Err(invalid("width and height must be > 0".to_owned()));
     }
     Ok((w, h))
+}
+
+/// Decode state plus the stream its last decode was queued on.
+struct DecoderState {
+    state: JpegState,
+    /// nvJPEG keeps per-decode buffers in `state`; a decode on another stream waits for this one
+    /// to drain first so it cannot overwrite them under queued work.
+    last_stream: Arc<Stream>,
 }
 
 /// GPU-accelerated JPEG decoder bound to a CUDA context and default stream.
 #[pyclass(name = "NvjpegDecoder", module = "nv_rs.nvjpeg")]
 pub struct PyNvjpegDecoder {
     handle: Arc<Handle>,
-    state: Arc<Mutex<JpegState>>,
+    state: Arc<Mutex<DecoderState>>,
     stream: PyStream,
 }
 
 #[pymethods]
 impl PyNvjpegDecoder {
-    /// Creates a new `NvjpegDecoder` on `stream`'s CUDA context.
+    /// Creates a new `NvjpegDecoder` on `stream`'s CUDA context, GIL-free.
     #[new]
     #[pyo3(signature = (stream, backend="default"))]
-    fn new(stream: &PyStream, backend: &str) -> PyResult<Self> {
+    fn new(py: Python<'_>, stream: &PyStream, backend: &str) -> PyResult<Self> {
         let parsed_backend = parse_backend(backend)?;
-        let ctx = stream.inner.context();
-        let handle = if parsed_backend == Backend::Default {
-            Handle::new(ctx)
-        } else {
-            Handle::with_backend(ctx, parsed_backend, 0)
-        }
-        .map_err(|e| map_nvjpeg_err("NvjpegDecoder::new", e))?;
-
-        let state = JpegState::new(&handle).map_err(|e| map_nvjpeg_err("NvjpegDecoder::new", e))?;
+        let s = stream.inner.clone();
+        let (handle, state) = py
+            .detach(move || -> nvjpeg::Result<(Arc<Handle>, JpegState)> {
+                let ctx = s.context();
+                let handle = if parsed_backend == Backend::Default {
+                    Handle::new(ctx)
+                } else {
+                    Handle::with_backend(ctx, parsed_backend, 0)
+                }?;
+                let state = JpegState::new(&handle)?;
+                Ok((handle, state))
+            })
+            .map_err(|e| map_nvjpeg_err("NvjpegDecoder::new", e))?;
 
         Ok(Self {
             handle,
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(DecoderState {
+                state,
+                last_stream: stream.inner.clone(),
+            })),
             stream: stream.clone(),
         })
     }
@@ -244,6 +249,8 @@ impl PyNvjpegDecoder {
     }
 
     /// Decodes JPEG bytes into a GPU `DeviceBuffer` (interleaved RGB/BGR or Y), GIL-free.
+    ///
+    /// The result's producer stream is the decode stream (`stream`, or the decoder's own).
     #[pyo3(signature = (data, stream=None, output_format="rgbi"))]
     fn decode(
         &self,
@@ -254,70 +261,80 @@ impl PyNvjpegDecoder {
     ) -> PyResult<PyDeviceBuffer> {
         let (fmt, bpp) = parse_output_format(output_format)?;
         let host = copy_py_bytes(py, data, "decode")?;
-        let s = stream.unwrap_or(&self.stream).clone();
+        let s = stream.unwrap_or(&self.stream).inner.clone();
         let handle = self.handle.clone();
         let state_arc = self.state.clone();
         let t0 = Instant::now();
 
-        let (dev_buf, w, h) = py
-            .detach(
-                move || -> nvjpeg::Result<(CudaDeviceBuffer<u8>, u32, u32)> {
-                    let info = handle.image_info(&host)?;
-                    let w = info.widths[0];
-                    let h = info.heights[0];
-                    let pitch = (w as usize)
-                        .checked_mul(bpp)
-                        .ok_or(nvjpeg::Error::InvalidInput("row bytes overflow"))?;
-                    let nbytes = pitch
-                        .checked_mul(h as usize)
-                        .ok_or(nvjpeg::Error::InvalidInput("image byte size overflow"))?;
+        let (out, w, h) = py.detach(move || -> PyResult<(PyDeviceBuffer, u32, u32)> {
+            let map = |e| map_nvjpeg_err("decode", e);
+            let invalid =
+                |msg: &str| record_and_err("nvjpeg", "decode", msg, ErrorKind::InvalidArgument);
+            let info = handle.image_info(&host).map_err(map)?;
+            let w = info.widths[0];
+            let h = info.heights[0];
+            let pitch = (w as usize)
+                .checked_mul(bpp)
+                .ok_or_else(|| invalid("row bytes overflow"))?;
+            let nbytes = pitch
+                .checked_mul(h as usize)
+                .ok_or_else(|| invalid("image byte size overflow"))?;
+            let shape = if bpp == 1 {
+                vec![h as i64, w as i64]
+            } else {
+                vec![h as i64, w as i64, bpp as i64]
+            };
 
-                    // SAFETY: Uninitialized GPU memory is immediately written by `nvjpegDecode` before any read.
-                    let mut dev_buf =
-                        unsafe { CudaDeviceBuffer::<u8>::uninitialized_async(&s.inner, nbytes) }?;
+            // SAFETY: the decode below writes every byte before the buffer is handed to Python;
+            // if it fails, the buffer is dropped unread.
+            let dev_buf = unsafe { CudaDeviceBuffer::<u8>::uninitialized_async(&s, nbytes) }
+                .map_err(|e| record_and_err("nvjpeg", "decode", e, ErrorKind::Cuda))?;
+            let out = PyDeviceBuffer::from_owned_cuda(dev_buf, "u8", shape, &s)?;
+            let mut view = typed_view::<u8>("nvjpeg", "decode", "output", &out, nbytes)?;
+            let mut planes = if bpp == 1 {
+                ImagePlanesMut::single_y(&mut view, w, h, pitch)
+            } else {
+                ImagePlanesMut::interleaved(&mut view, w, h, bpp as u32, pitch)
+            }
+            .map_err(map)?;
 
-                    let mut planes = if bpp == 1 {
-                        ImagePlanesMut::single_y(&mut dev_buf, w, h, pitch)?
-                    } else {
-                        ImagePlanesMut::interleaved(&mut dev_buf, w, h, bpp as u32, pitch)?
-                    };
+            let mut guard = state_arc
+                .lock()
+                .map_err(|_| invalid("decoder state mutex poisoned"))?;
+            if guard.last_stream.cu_stream() != s.cu_stream() {
+                guard
+                    .last_stream
+                    .synchronize()
+                    .map_err(|e| record_and_err("nvjpeg", "decode", e, ErrorKind::Cuda))?;
+                guard.last_stream = s.clone();
+            }
+            enqueue_leased("nvjpeg", "decode", &s, [(&out, Access::Write)], || {
+                guard.state.decode(&host, fmt, &mut planes, &s).map_err(map)
+            })?;
+            Ok((out, w, h))
+        })?;
 
-                    let mut state = state_arc
-                        .lock()
-                        .map_err(|_| nvjpeg::Error::InvalidInput("decoder state mutex poisoned"))?;
-                    state.decode(&host, fmt, &mut planes, &s.inner)?;
-                    Ok((dev_buf, w, h))
-                },
-            )
-            .map_err(|e| map_nvjpeg_err("decode", e))?;
-
-        let nbytes = dev_buf.len();
         diag::record_event(
             Level::Info,
             "nvjpeg",
             "decode",
-            format!("{w}x{h} fmt={output_format} {nbytes} B"),
+            format!("{w}x{h} fmt={output_format} {} B", out.byte_len()),
             t0.elapsed().as_nanos() as u64,
             true,
         );
-
-        let shape = if bpp == 1 {
-            vec![h as i64, w as i64]
-        } else {
-            vec![h as i64, w as i64, bpp as i64]
-        };
-        Ok(PyDeviceBuffer::from_owned_cuda(
-            dev_buf,
-            s.device_id,
-            "u8",
-            shape,
-        ))
+        Ok(out)
     }
 }
 
 struct EncoderInner {
     params: EncoderParams,
     state: EncoderState,
+    /// Constructor defaults, applied to every call that does not override them.
+    default_quality: u8,
+    default_css: ChromaSubsampling,
+    /// Values currently set on `params`.
+    quality: u8,
+    css: ChromaSubsampling,
 }
 
 /// GPU-accelerated JPEG encoder bound to a CUDA context and default stream.
@@ -329,34 +346,51 @@ pub struct PyNvjpegEncoder {
 
 #[pymethods]
 impl PyNvjpegEncoder {
-    /// Creates a new `NvjpegEncoder` on `stream`'s CUDA context.
+    /// Creates a new `NvjpegEncoder` on `stream`'s CUDA context, GIL-free.
+    ///
+    /// `quality` and `subsampling` are the defaults of every `encode` call.
     #[new]
     #[pyo3(signature = (stream, quality=90, subsampling=None))]
-    fn new(stream: &PyStream, quality: u8, subsampling: Option<&str>) -> PyResult<Self> {
-        let handle = Handle::new(stream.inner.context())
-            .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
-        let mut params = EncoderParams::new(&handle, &stream.inner)
-            .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
-        params
-            .set_quality(quality, &stream.inner)
-            .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
+    fn new(
+        py: Python<'_>,
+        stream: &PyStream,
+        quality: u8,
+        subsampling: Option<&str>,
+    ) -> PyResult<Self> {
         let css = match subsampling {
             Some(sub) => parse_subsampling(sub)?,
             None => ChromaSubsampling::Yuv420,
         };
-        params
-            .set_sampling_factors(css, &stream.inner)
-            .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
-        let state = EncoderState::new(&handle, &stream.inner)
+        let s = stream.inner.clone();
+        let (params, state) = py
+            .detach(move || -> nvjpeg::Result<(EncoderParams, EncoderState)> {
+                let handle = Handle::new(s.context())?;
+                let mut params = EncoderParams::new(&handle, &s)?;
+                params.set_quality(quality, &s)?;
+                params.set_sampling_factors(css, &s)?;
+                let state = EncoderState::new(&handle, &s)?;
+                Ok((params, state))
+            })
             .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(EncoderInner { params, state })),
+            inner: Arc::new(Mutex::new(EncoderInner {
+                params,
+                state,
+                default_quality: quality,
+                default_css: css,
+                quality,
+                css,
+            })),
             stream: stream.clone(),
         })
     }
 
-    /// Encodes a `DeviceBuffer` or host buffer (`bytes`/`bytearray`/`memoryview`/`ndarray`) to JPEG `bytes`, GIL-free.
+    /// Encodes a `DeviceBuffer` (`u8`, owned or DLPack import) or host buffer
+    /// (`bytes`/`bytearray`/`memoryview`/`ndarray`) to JPEG `bytes`, GIL-free.
+    ///
+    /// `width` and `height` are given together or inferred together from an `(H, W, 3)` shape.
+    /// `quality` and `subsampling` apply to this call only (the constructor's values otherwise).
     #[pyo3(signature = (image, width=None, height=None, quality=None, subsampling=None, input_format="rgbi", stream=None))]
     #[expect(
         clippy::too_many_arguments,
@@ -376,64 +410,79 @@ impl PyNvjpegEncoder {
         let (fmt, bpp) = parse_input_format(input_format)?;
         let (w, h) = resolve_image_dims(image, width, height, bpp, "encode")?;
         let css = subsampling.map(parse_subsampling).transpose()?;
-        let s = stream.unwrap_or(&self.stream).clone();
+        let s = stream.unwrap_or(&self.stream).inner.clone();
+        let invalid =
+            |msg: &str| record_and_err("nvjpeg", "encode", msg, ErrorKind::InvalidArgument);
+        let pitch = (w as usize)
+            .checked_mul(bpp)
+            .ok_or_else(|| invalid("row bytes overflow"))?;
+        let need = pitch
+            .checked_mul(h as usize)
+            .ok_or_else(|| invalid("image byte size overflow"))?;
 
-        enum EncodeInput {
-            Device(Arc<CudaDeviceBuffer<u8>>),
+        enum EncodeInput<'a> {
+            /// The Python buffer (leased while the encode reads it) and a typed view of it.
+            Device(&'a PyDeviceBuffer, CudaDeviceBuffer<u8>),
             Host(Vec<u8>),
         }
 
-        let input = if let Ok(py_buf) = image.extract::<PyRef<'_, PyDeviceBuffer>>() {
-            let dev = py_buf
-                .owned_cuda_buf()
-                .ok_or_else(|| {
-                    record_and_err(
-                        "nvjpeg",
-                        "encode",
-                        "encode requires an nv_rs-owned DeviceBuffer (use DeviceBuffer.from_buffer)",
-                        ErrorKind::InvalidArgument,
-                    )
-                })?
-                .clone();
-            EncodeInput::Device(dev)
-        } else {
-            let host = copy_py_bytes(py, image, "encode")?;
-            EncodeInput::Host(host)
+        // A failed extraction only means "not a DeviceBuffer": the host path then requires the
+        // buffer protocol and reports its own error.
+        let dev_arg = image.extract::<PyRef<'_, PyDeviceBuffer>>();
+        let input = match &dev_arg {
+            Ok(buf) => {
+                let buf: &PyDeviceBuffer = buf;
+                check_buf("nvjpeg", "encode", "image", buf, &["u8"], need, s.context())?;
+                EncodeInput::Device(
+                    buf,
+                    typed_view::<u8>("nvjpeg", "encode", "image", buf, need)?,
+                )
+            }
+            Err(_) => EncodeInput::Host(copy_py_bytes(py, image, "encode")?),
         };
 
         let inner_arc = self.inner.clone();
         let t0 = Instant::now();
 
-        let jpeg = py
-            .detach(move || -> nvjpeg::Result<Vec<u8>> {
-                let uploaded;
-                let dev_ref: &CudaDeviceBuffer<u8> = match &input {
-                    EncodeInput::Device(buf) => buf.as_ref(),
-                    EncodeInput::Host(host) => {
-                        uploaded = CudaDeviceBuffer::from_host(&s.inner, host)?;
-                        &uploaded
-                    }
-                };
-
-                let pitch = (w as usize)
-                    .checked_mul(bpp)
-                    .ok_or(nvjpeg::Error::InvalidInput("row bytes overflow"))?;
-                let planes = ImagePlanes::interleaved(dev_ref, w, h, bpp as u32, pitch)?;
-
-                let mut inner = inner_arc
-                    .lock()
-                    .map_err(|_| nvjpeg::Error::InvalidInput("encoder state mutex poisoned"))?;
-                if let Some(q) = quality {
-                    inner.params.set_quality(q, &s.inner)?;
+        let jpeg = py.detach(move || -> PyResult<Vec<u8>> {
+            let map = |e| map_nvjpeg_err("encode", e);
+            let uploaded;
+            let (src, leased): (&CudaDeviceBuffer<u8>, Option<&PyDeviceBuffer>) = match &input {
+                EncodeInput::Device(buf, view) => (view, Some(*buf)),
+                EncodeInput::Host(host) => {
+                    uploaded = CudaDeviceBuffer::from_host(&s, host)
+                        .map_err(|e| record_and_err("nvjpeg", "encode", e, ErrorKind::Cuda))?;
+                    (&uploaded, None)
                 }
-                if let Some(sub) = css {
-                    inner.params.set_sampling_factors(sub, &s.inner)?;
-                }
-                let EncoderInner { params, state } = &mut *inner;
-                state.encode_image(params, &planes, fmt, w, h, &s.inner)?;
-                state.retrieve_bitstream(&s.inner)
-            })
-            .map_err(|e| map_nvjpeg_err("encode", e))?;
+            };
+            let planes = ImagePlanes::interleaved(src, w, h, bpp as u32, pitch).map_err(map)?;
+
+            let mut guard = inner_arc
+                .lock()
+                .map_err(|_| invalid("encoder state mutex poisoned"))?;
+            let inner = &mut *guard;
+            let q = quality.unwrap_or(inner.default_quality);
+            if q != inner.quality {
+                inner.params.set_quality(q, &s).map_err(map)?;
+                inner.quality = q;
+            }
+            let sub = css.unwrap_or(inner.default_css);
+            if sub != inner.css {
+                inner.params.set_sampling_factors(sub, &s).map_err(map)?;
+                inner.css = sub;
+            }
+            let (params, state) = (&inner.params, &mut inner.state);
+            let mut encode = || {
+                state
+                    .encode_image(params, &planes, fmt, w, h, &s)
+                    .map_err(map)
+            };
+            match leased {
+                Some(buf) => enqueue_leased("nvjpeg", "encode", &s, [(buf, Access::Read)], encode)?,
+                None => encode()?,
+            }
+            state.retrieve_bitstream(&s).map_err(map)
+        })?;
 
         diag::record_event(
             Level::Info,

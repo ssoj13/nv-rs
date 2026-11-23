@@ -373,23 +373,20 @@ pub struct FftBloomPass {
 }
 
 impl FftBloomPass {
-    /// Compiles the NVRTC bloom kernels and initializes the cuFFT workspace scratch pool.
+    /// Compiles the NVRTC bloom kernels (through the shared on-disk PTX cache) and initializes the
+    /// cuFFT workspace scratch pool.
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
-        let opts = nvrtc::CompileOptions::new()
-            .arch("compute_75")
-            .std("c++17")
-            .fast_math();
-        let mut prog = nvrtc::Program::new(FFT_BLOOM_CU, Some("fft_bloom.cu"), &[])
-            .map_err(|e| format!("NVRTC program creation failed: {e}"))?;
-        prog.compile(&opts)
-            .map_err(|e| format!("NVRTC compile fft_bloom.cu failed: {e}"))?;
-        let ptx = prog
-            .ptx()
-            .map_err(|e| format!("NVRTC PTX extraction failed: {e}"))?;
-
-        let module = cuda
-            .load_module_from_image(&ptx)
-            .map_err(|e| format!("cuModuleLoadData failed: {e}"))?;
+        let module = crate::gpu_export::load_ptx_cached(
+            FFT_BLOOM_CU,
+            "fft_bloom.cu",
+            "compute_75",
+            &[],
+            &[],
+            |ptx| {
+                cuda.load_module_from_image(ptx)
+                    .map_err(|e| format!("cuModuleLoadData(fft_bloom) failed: {e}"))
+            },
+        )?;
         let fn_bright_pass = module
             .load_function("bright_pass_extract")
             .map_err(|e| format!("load_function bright_pass_extract failed: {e}"))?;

@@ -6,13 +6,11 @@
 //! `CUptiResult_CUPTI_ERROR_NOT_SUPPORTED` when a symbol is missing — never a panic. CUPTI lives in extras/CUPTI: headers from extras/CUPTI/include, DLL from extras/CUPTI/lib64.
 //! **Used by** a future safe `cupti` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "cupti",
     api: CuptiApi,
     loader: cupti_api,
-    dll: DllSpec { lib: "cupti", group: Group::Toolkit, windows: &["cupti64_*"], linux: &["libcupti.so.13", "libcupti.so.12", "libcupti.so"] },
+    dll: nv_loader::catalog::CUPTI.spec,
 }
 
 #[cfg(test)]

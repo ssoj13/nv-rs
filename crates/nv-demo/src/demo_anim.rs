@@ -9,12 +9,33 @@
 
 use std::collections::BTreeSet;
 use std::f32::consts::TAU;
+use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
 use crate::renderer::DemoSettings;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One animatable `DemoSettings` parameter: its persisted key and its `[min, max]` range, which
+/// is both the slider range and the oscillation clamp.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnimParam {
+    pub key: &'static str,
+    pub min: f32,
+    pub max: f32,
+}
+
+/// Range of the animatable parameter `key` (the single source for animator and UI sliders), or
+/// `None` if `key` is not animatable.
+pub fn anim_range(key: &str) -> Option<RangeInclusive<f32>> {
+    ANIM_PARAMS
+        .iter()
+        .find(|p| p.key == key)
+        .map(|p| p.min..=p.max)
+}
+
+/// Equality compares the persisted fields only: `time_s` is skipped by serde, so including it
+/// would mark an unchanged config dirty on every save tick while the animator runs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DemoAnimator {
     pub playing: bool,
@@ -39,6 +60,16 @@ impl Default for DemoAnimator {
     }
 }
 
+impl PartialEq for DemoAnimator {
+    fn eq(&self, other: &Self) -> bool {
+        self.playing == other.playing
+            && self.enabled == other.enabled
+            && self.period_s == other.period_s
+            && self.amp == other.amp
+            && self.active == other.active
+    }
+}
+
 impl DemoAnimator {
     pub fn is_running(&self) -> bool {
         self.playing && self.enabled && !self.active.is_empty()
@@ -48,8 +79,15 @@ impl DemoAnimator {
         self.active.contains(key)
     }
 
+    /// Arms or disarms `key`. Keys missing from [`ANIM_PARAMS`] are rejected (a debug assertion
+    /// flags the caller's typo) so `active` never holds a key that silently does nothing.
     pub fn toggle(&mut self, key: &str) {
         if !self.active.remove(key) {
+            let known = anim_range(key).is_some();
+            debug_assert!(known, "unknown DemoAnimator key `{key}`");
+            if !known {
+                return;
+            }
             self.active.insert(key.to_string());
             if !self.enabled {
                 self.enabled = true;
@@ -112,109 +150,125 @@ fn anim_vec3(v: &mut [f32; 3], amp: f32, phase: f32, min: f32, max: f32) {
     }
 }
 
-fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) {
-    match key {
-        // Mandelbulb
-        "bulb_power" => anim_f32(&mut s.bulb_power, amp, phase, 2.0, 16.0),
-        "bulb_bailout" => anim_f32(&mut s.bulb_bailout, amp, phase, 2.0, 32.0),
-        "bulb_theta_mult" => anim_f32(&mut s.bulb_theta_mult, amp, phase, 0.25, 2.5),
-        "bulb_phi_mult" => anim_f32(&mut s.bulb_phi_mult, amp, phase, 0.25, 2.5),
-        "bulb_theta_phase" => anim_f32(&mut s.bulb_theta_phase, amp, phase, -90.0, 90.0),
-        "bulb_phi_phase" => anim_f32(&mut s.bulb_phi_phase, amp, phase, -180.0, 180.0),
-        "bulb_c" => anim_vec3(&mut s.bulb_c, amp, phase, -1.5, 1.5),
-        // Mandelbox
-        "box_scale" => anim_f32(&mut s.box_scale, amp, phase, -3.5, 3.5),
-        "box_fold" => anim_f32(&mut s.box_fold, amp, phase, 0.2, 2.2),
-        "box_fold_mult" => anim_f32(&mut s.box_fold_mult, amp, phase, 1.2, 3.0),
-        "box_min_r" => anim_f32(&mut s.box_min_r, amp, phase, 0.05, 1.2),
-        "box_fixed_r" => anim_f32(&mut s.box_fixed_r, amp, phase, 0.4, 2.5),
-        "box_iter_rot" => anim_f32(&mut s.box_iter_rot, amp, phase, -45.0, 45.0),
-        "box_bailout" => anim_f32(&mut s.box_bailout, amp, phase, 4.0, 128.0),
-        // KIFS Octahedron
-        "kifs_scale" => anim_f32(&mut s.kifs_scale, amp, phase, 1.3, 3.5),
-        "kifs_rot1" => anim_f32(&mut s.kifs_rot1, amp, phase, -180.0, 180.0),
-        "kifs_rot2" => anim_f32(&mut s.kifs_rot2, amp, phase, -180.0, 180.0),
-        "kifs_offset" => anim_vec3(&mut s.kifs_offset, amp, phase, 0.1, 2.0),
-        "kifs_thickness" => anim_f32(&mut s.kifs_thickness, amp, phase, 0.005, 0.25),
-        "kifs_z_bias" => anim_f32(&mut s.kifs_z_bias, amp, phase, 0.0, 1.5),
-        "kifs_bailout" => anim_f32(&mut s.kifs_bailout, amp, phase, 4.0, 32.0),
-        // Transform
-        "fractal_translate" => anim_vec3(&mut s.fractal_translate, amp, phase, -500.0, 500.0),
-        "obj_scale" => anim_f32(&mut s.obj_scale, amp, phase, 0.05, 50.0),
-        "rot_x" => anim_f32(&mut s.rot_x, amp, phase, -180.0, 180.0),
-        "rot_y" => anim_f32(&mut s.rot_y, amp, phase, -180.0, 180.0),
-        "rot_z" => anim_f32(&mut s.rot_z, amp, phase, -180.0, 180.0),
-        // Detail & Shading
-        "detail_eps" => anim_f32(&mut s.detail_eps, amp, phase, 0.00002, 0.005),
-        "norm_eps" => anim_f32(&mut s.norm_eps, amp, phase, 0.00002, 0.005),
-        "fudge" => anim_f32(&mut s.fudge, amp, phase, 0.3, 1.1),
-        "metallic" => anim_f32(&mut s.metallic, amp, phase, 0.0, 1.0),
-        "roughness" => anim_f32(&mut s.roughness, amp, phase, 0.02, 0.85),
-        "trap_scale" => anim_f32(&mut s.trap_scale, amp, phase, 0.1, 3.0),
-        "palette_shift" => anim_f32(&mut s.palette_shift, amp, phase, 0.0, 1.0),
-        // Sky & Lighting
-        "sun_intensity" => anim_f32(&mut s.sun_intensity, amp, phase, 0.0, 4.0),
-        "sun_azimuth" => anim_f32(&mut s.sun_azimuth, amp, phase, -180.0, 180.0),
-        "sun_elevation" => anim_f32(&mut s.sun_elevation, amp, phase, 2.0, 88.0),
-        "sky_intensity" => anim_f32(&mut s.sky_intensity, amp, phase, 0.1, 2.0),
-        "horizon_haze" => anim_f32(&mut s.horizon_haze, amp, phase, 0.4, 2.5),
-        "exposure" => anim_f32(&mut s.exposure, amp, phase, 0.25, 2.0),
-        // Environment (per-sky_mode)
-        "env_cloud_cover" => anim_f32(&mut s.env.cloud_cover, amp, phase, 0.0, 1.0),
-        "env_cloud_density" => anim_f32(&mut s.env.cloud_density, amp, phase, 0.0, 1.5),
-        "env_softbox_power" => anim_f32(&mut s.env.softbox_power, amp, phase, 0.2, 3.0),
-        "env_softbox_softness" => anim_f32(&mut s.env.softbox_softness, amp, phase, 0.02, 0.5),
-        "env_nebula_density" => anim_f32(&mut s.env.nebula_density, amp, phase, 0.2, 2.5),
-        "env_nebula_contrast" => anim_f32(&mut s.env.nebula_contrast, amp, phase, 0.5, 3.0),
-        "env_nebula_dust" => anim_f32(&mut s.env.nebula_dust, amp, phase, 0.0, 3.0),
-        "env_nebula_scale" => anim_f32(&mut s.env.nebula_scale, amp, phase, 0.5, 4.0),
-        "env_star_density" => anim_f32(&mut s.env.star_density, amp, phase, 0.0, 2.0),
-        "env_star_brightness" => anim_f32(&mut s.env.star_brightness, amp, phase, 0.0, 4.0),
-        "env_grid_glow" => anim_f32(&mut s.env.grid_glow, amp, phase, 0.1, 3.0),
-        "env_grid_density" => anim_f32(&mut s.env.grid_density, amp, phase, 4.0, 32.0),
-        "env_elev_cloud_cover" => anim_f32(&mut s.env.elev_cloud_cover, amp, phase, 0.0, 1.0),
-        "env_elev_fog" => anim_f32(&mut s.env.elev_fog, amp, phase, 0.2, 2.5),
-        "env_city_fog" => anim_f32(&mut s.env.city_fog, amp, phase, 0.2, 2.5),
-        "env_city_windows" => anim_f32(&mut s.env.city_windows, amp, phase, 0.0, 3.0),
-        "env_colony_glow" => anim_f32(&mut s.env.colony_glow, amp, phase, 0.0, 3.0),
-        "env_planet_limb" => anim_f32(&mut s.env.planet_limb, amp, phase, 0.0, 2.5),
-        // Lens DoF
-        "aperture" => anim_f32(&mut s.aperture, amp, phase, 0.0, 0.12),
-        "focus_dist" => anim_f32(&mut s.focus_dist, amp, phase, 0.5, 12.0),
-        // Floor
-        "floor_roughness" => anim_f32(&mut s.floor_roughness, amp, phase, 0.03, 0.80),
-        "floor_scratch" => anim_f32(&mut s.floor_scratch, amp, phase, 0.0, 1.5),
-        "floor_scale" => anim_f32(&mut s.floor_scale, amp, phase, 0.3, 5.0),
-        "floor_metallic" => anim_f32(&mut s.floor_metallic, amp, phase, 0.0, 1.0),
-        // Scene / Spheres
-        "sat_size_min" => anim_f32(&mut s.sat_size_min, amp, phase, 0.001, 0.80),
-        "sat_size_max" => anim_f32(&mut s.sat_size_max, amp, phase, 0.001, 0.80),
-        "sat_orbit_min" => anim_f32(&mut s.sat_orbit_min, amp, phase, 0.6, 4.5),
-        "sat_orbit_max" => anim_f32(&mut s.sat_orbit_max, amp, phase, 0.6, 4.5),
-        "sat_height_min" => anim_f32(&mut s.sat_height_min, amp, phase, -1.0, 2.0),
-        "sat_height_max" => anim_f32(&mut s.sat_height_max, amp, phase, -1.0, 2.0),
-        "sat_speed_min" => anim_f32(&mut s.sat_speed_min, amp, phase, -3.0, 3.0),
-        "sat_speed_max" => anim_f32(&mut s.sat_speed_max, amp, phase, -3.0, 3.0),
-        "sat_bob_amp_min" => anim_f32(&mut s.sat_bob_amp_min, amp, phase, 0.0, 0.80),
-        "sat_bob_amp_max" => anim_f32(&mut s.sat_bob_amp_max, amp, phase, 0.0, 0.80),
-        "sat_bob_freq_min" => anim_f32(&mut s.sat_bob_freq_min, amp, phase, 0.0, 5.0),
-        "sat_bob_freq_max" => anim_f32(&mut s.sat_bob_freq_max, amp, phase, 0.0, 5.0),
-        "sat_hue_spread" => anim_f32(&mut s.sat_hue_spread, amp, phase, 0.0, 1.0),
-        "glass_ior" => anim_f32(&mut s.glass_ior, amp, phase, 1.05, 2.40),
-        "glass_roughness" => anim_f32(&mut s.glass_roughness, amp, phase, 0.0, 0.35),
-        "glass_absorb" => anim_f32(&mut s.glass_absorb, amp, phase, 0.0, 12.0),
-        // Bloom & Split & Spin & DLSS
-        "bloom_threshold" => anim_f32(&mut s.bloom_threshold, amp, phase, 0.2, 5.0),
-        "bloom_intensity" => anim_f32(&mut s.bloom_intensity, amp, phase, 0.0, 2.0),
-        "split_x" => anim_f32(&mut s.split_x, amp, phase, 0.02, 0.98),
-        "spin_speed" => anim_f32(&mut s.spin_speed, amp, phase, 0.0, 2.0),
-        "dlss_sharpness" => anim_f32(&mut s.dlss_sharpness, amp, phase, 0.0, 1.0),
-        // CSG World
-        "csg_wetness" => anim_f32(&mut s.csg_wetness, amp, phase, 0.0, 1.0),
-        "csg_traffic_speed" => anim_f32(&mut s.csg_traffic_speed, amp, phase, 0.0, 3.0),
-        "csg_lod_bias" => anim_f32(&mut s.csg_lod_bias, amp, phase, 0.25, 4.0),
-        _ => {}
-    }
+/// Generates [`ANIM_PARAMS`] and `apply_key` from ONE list, so a key, its `DemoSettings`
+/// field and its range cannot drift apart.
+macro_rules! anim_params {
+    ($($key:literal => $anim:ident($($field:ident).+), $min:expr, $max:expr;)*) => {
+        /// Every animatable key with its range: the single source for the animator and the UI.
+        pub const ANIM_PARAMS: &[AnimParam] = &[$(AnimParam { key: $key, min: $min, max: $max }),*];
+
+        /// Applies the oscillation of `key`; returns `false` for a key not in [`ANIM_PARAMS`]
+        /// (only reachable through a stale persisted `active` set).
+        fn apply_key(s: &mut DemoSettings, key: &str, phase: f32, amp: f32) -> bool {
+            match key {
+                $($key => $anim(&mut s.$($field).+, amp, phase, $min, $max),)*
+                _ => return false,
+            }
+            true
+        }
+    };
+}
+
+anim_params! {
+    // Mandelbulb
+    "bulb_power" => anim_f32(bulb_power), 2.0, 16.0;
+    "bulb_bailout" => anim_f32(bulb_bailout), 2.0, 32.0;
+    "bulb_theta_mult" => anim_f32(bulb_theta_mult), 0.25, 2.5;
+    "bulb_phi_mult" => anim_f32(bulb_phi_mult), 0.25, 2.5;
+    "bulb_theta_phase" => anim_f32(bulb_theta_phase), -90.0, 90.0;
+    "bulb_phi_phase" => anim_f32(bulb_phi_phase), -180.0, 180.0;
+    "bulb_c" => anim_vec3(bulb_c), -1.5, 1.5;
+    // Mandelbox
+    "box_scale" => anim_f32(box_scale), -3.5, 3.5;
+    "box_fold" => anim_f32(box_fold), 0.2, 2.2;
+    "box_fold_mult" => anim_f32(box_fold_mult), 1.2, 3.0;
+    "box_min_r" => anim_f32(box_min_r), 0.05, 1.2;
+    "box_fixed_r" => anim_f32(box_fixed_r), 0.4, 2.5;
+    "box_iter_rot" => anim_f32(box_iter_rot), -45.0, 45.0;
+    "box_bailout" => anim_f32(box_bailout), 4.0, 128.0;
+    // KIFS Octahedron
+    "kifs_scale" => anim_f32(kifs_scale), 1.3, 3.5;
+    "kifs_rot1" => anim_f32(kifs_rot1), -180.0, 180.0;
+    "kifs_rot2" => anim_f32(kifs_rot2), -180.0, 180.0;
+    "kifs_offset" => anim_vec3(kifs_offset), 0.1, 2.0;
+    "kifs_thickness" => anim_f32(kifs_thickness), 0.005, 0.25;
+    "kifs_z_bias" => anim_f32(kifs_z_bias), 0.0, 1.5;
+    "kifs_bailout" => anim_f32(kifs_bailout), 4.0, 32.0;
+    // Transform
+    "fractal_translate" => anim_vec3(fractal_translate), -500.0, 500.0;
+    "obj_scale" => anim_f32(obj_scale), 0.05, 50.0;
+    "rot_x" => anim_f32(rot_x), -180.0, 180.0;
+    "rot_y" => anim_f32(rot_y), -180.0, 180.0;
+    "rot_z" => anim_f32(rot_z), -180.0, 180.0;
+    // Detail & Shading
+    "detail_eps" => anim_f32(detail_eps), 0.00002, 0.005;
+    "norm_eps" => anim_f32(norm_eps), 0.00002, 0.005;
+    "fudge" => anim_f32(fudge), 0.3, 1.1;
+    "metallic" => anim_f32(metallic), 0.0, 1.0;
+    "roughness" => anim_f32(roughness), 0.02, 0.85;
+    "trap_scale" => anim_f32(trap_scale), 0.1, 3.0;
+    "palette_shift" => anim_f32(palette_shift), 0.0, 1.0;
+    // Sky & Lighting
+    "sun_intensity" => anim_f32(sun_intensity), 0.0, 4.0;
+    "sun_azimuth" => anim_f32(sun_azimuth), -180.0, 180.0;
+    "sun_elevation" => anim_f32(sun_elevation), 2.0, 88.0;
+    "sky_intensity" => anim_f32(sky_intensity), 0.1, 2.0;
+    "horizon_haze" => anim_f32(horizon_haze), 0.4, 2.5;
+    "exposure" => anim_f32(exposure), 0.25, 2.0;
+    // Environment (per-sky_mode)
+    "env_cloud_cover" => anim_f32(env.cloud_cover), 0.0, 1.0;
+    "env_cloud_density" => anim_f32(env.cloud_density), 0.0, 1.5;
+    "env_softbox_power" => anim_f32(env.softbox_power), 0.2, 3.0;
+    "env_softbox_softness" => anim_f32(env.softbox_softness), 0.02, 0.5;
+    "env_nebula_density" => anim_f32(env.nebula_density), 0.2, 2.5;
+    "env_nebula_contrast" => anim_f32(env.nebula_contrast), 0.5, 3.0;
+    "env_nebula_dust" => anim_f32(env.nebula_dust), 0.0, 3.0;
+    "env_nebula_scale" => anim_f32(env.nebula_scale), 0.5, 4.0;
+    "env_star_density" => anim_f32(env.star_density), 0.0, 2.0;
+    "env_star_brightness" => anim_f32(env.star_brightness), 0.0, 4.0;
+    "env_grid_glow" => anim_f32(env.grid_glow), 0.1, 3.0;
+    "env_grid_density" => anim_f32(env.grid_density), 4.0, 32.0;
+    "env_elev_cloud_cover" => anim_f32(env.elev_cloud_cover), 0.0, 1.0;
+    "env_elev_fog" => anim_f32(env.elev_fog), 0.2, 2.5;
+    "env_city_fog" => anim_f32(env.city_fog), 0.2, 2.5;
+    "env_city_windows" => anim_f32(env.city_windows), 0.0, 3.0;
+    "env_colony_glow" => anim_f32(env.colony_glow), 0.0, 3.0;
+    "env_planet_limb" => anim_f32(env.planet_limb), 0.0, 2.5;
+    // Lens DoF
+    "aperture" => anim_f32(aperture), 0.0, 0.12;
+    "focus_dist" => anim_f32(focus_dist), 0.5, 12.0;
+    // Floor
+    "floor_roughness" => anim_f32(floor_roughness), 0.03, 0.80;
+    "floor_scratch" => anim_f32(floor_scratch), 0.0, 1.5;
+    "floor_scale" => anim_f32(floor_scale), 0.3, 5.0;
+    "floor_metallic" => anim_f32(floor_metallic), 0.0, 1.0;
+    // Scene / Spheres
+    "sat_size_min" => anim_f32(sat_size_min), 0.001, 0.80;
+    "sat_size_max" => anim_f32(sat_size_max), 0.001, 0.80;
+    "sat_orbit_min" => anim_f32(sat_orbit_min), 0.6, 4.5;
+    "sat_orbit_max" => anim_f32(sat_orbit_max), 0.6, 4.5;
+    "sat_height_min" => anim_f32(sat_height_min), -1.0, 2.0;
+    "sat_height_max" => anim_f32(sat_height_max), -1.0, 2.0;
+    "sat_speed_min" => anim_f32(sat_speed_min), -3.0, 3.0;
+    "sat_speed_max" => anim_f32(sat_speed_max), -3.0, 3.0;
+    "sat_bob_amp_min" => anim_f32(sat_bob_amp_min), 0.0, 0.80;
+    "sat_bob_amp_max" => anim_f32(sat_bob_amp_max), 0.0, 0.80;
+    "sat_bob_freq_min" => anim_f32(sat_bob_freq_min), 0.0, 5.0;
+    "sat_bob_freq_max" => anim_f32(sat_bob_freq_max), 0.0, 5.0;
+    "sat_hue_spread" => anim_f32(sat_hue_spread), 0.0, 1.0;
+    "glass_ior" => anim_f32(glass_ior), 1.05, 2.40;
+    "glass_roughness" => anim_f32(glass_roughness), 0.0, 0.35;
+    "glass_absorb" => anim_f32(glass_absorb), 0.0, 12.0;
+    // Bloom & Split & Spin & DLSS
+    "bloom_threshold" => anim_f32(bloom_threshold), 0.2, 5.0;
+    "bloom_intensity" => anim_f32(bloom_intensity), 0.0, 2.0;
+    "split_x" => anim_f32(split_x), 0.02, 0.98;
+    "spin_speed" => anim_f32(spin_speed), 0.0, 2.0;
+    "dlss_sharpness" => anim_f32(dlss_sharpness), 0.0, 1.0;
+    // CSG World
+    "csg_wetness" => anim_f32(csg_wetness), 0.0, 1.0;
+    "csg_traffic_speed" => anim_f32(csg_traffic_speed), 0.0, 3.0;
+    "csg_lod_bias" => anim_f32(csg_lod_bias), 0.25, 4.0;
 }
 
 #[cfg(test)]
@@ -283,6 +337,59 @@ mod tests {
 
         anim.toggle_play(&mut settings);
         assert!(!anim.playing);
+    }
+
+    #[test]
+    fn anim_table_is_unique_ordered_and_drives_every_key() {
+        assert_eq!(ANIM_PARAMS.len(), 87);
+        let base = DemoSettings::default();
+        let mut seen = BTreeSet::new();
+        for p in ANIM_PARAMS {
+            assert!(seen.insert(p.key), "duplicate key {}", p.key);
+            assert!(p.min.is_finite() && p.max.is_finite() && p.min < p.max, "{}", p.key);
+            assert_eq!(anim_range(p.key), Some(p.min..=p.max));
+            let mut hi = base;
+            let mut lo = base;
+            assert!(apply_key(&mut hi, p.key, TAU / 4.0, 1.0), "{}", p.key);
+            assert!(apply_key(&mut lo, p.key, -TAU / 4.0, 1.0), "{}", p.key);
+            assert!(hi != base || lo != base, "{} does not move its field", p.key);
+        }
+        assert_eq!(anim_range("bulb_powr"), None);
+        let mut s = base;
+        assert!(!apply_key(&mut s, "bulb_powr", TAU / 4.0, 1.0));
+        assert_eq!(s, base);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "unknown DemoAnimator key")]
+    fn toggle_rejects_unknown_key_in_debug() {
+        DemoAnimator::default().toggle("bulb_powr");
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn toggle_rejects_unknown_key_in_release() {
+        let mut anim = DemoAnimator::default();
+        anim.toggle("bulb_powr");
+        assert!(anim.active.is_empty());
+        assert!(!anim.playing);
+    }
+
+    #[test]
+    fn equality_ignores_runtime_clock() {
+        let saved = DemoAnimator {
+            playing: true,
+            enabled: true,
+            active: ["metallic".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut running = saved.clone();
+        running.tick(1.5);
+        assert!(running.time_s > 0.0);
+        assert_eq!(running, saved, "time_s is not persisted, so it must not mark dirty");
+        running.amp = 0.5;
+        assert_ne!(running, saved);
     }
 
     #[test]

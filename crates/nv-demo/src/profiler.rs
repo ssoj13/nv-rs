@@ -11,7 +11,7 @@
 //!   **Tensor Cores (Denoiser / DLSS)**, and **CUDA Compute (IAS / cuFFT / Tonemap)**.
 //! - [`GpuTelemetry`] — extended GPU telemetry snapshot (NVML thermals, utilization, VRAM,
 //!   power, graphics/memory clocks, plus CUPTI kernel time and CUPTI/NGX availability strings).
-//! - [`Profiler`] — probes `cupti` (`ActivityProfiler` + `Subscriber`) and `ngx`
+//! - [`Profiler`] — probes `cupti` (kernel `ActivityProfiler`, no callback subscriber) and `ngx`
 //!   (`NgxVulkan::required_extensions`) gracefully at startup without panicking on non-admin
 //!   Windows or missing runtimes, and polls NVML + CUPTI telemetry.
 //!
@@ -19,11 +19,12 @@
 //! timings across RTX RT Cores, Tensor Cores, and CUDA Compute SMs in the `nv-demo` UI.
 //! **Used by** `nv-demo` (`main.rs`, `renderer.rs`, `ui.rs`).
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, Stream};
-use cupti::{ActivityKind, ActivityProfiler, ActivityRecord, CallbackDomain, Subscriber};
+use cupti::{ActivityKind, ActivityProfiler, ActivityRecord};
 use ngx::NgxVulkan;
 use nvml::{ClockDomain, Device as NvmlDevice};
 
@@ -70,28 +71,49 @@ struct FrameEventSlot {
     bloom_end: cu::CUevent,
     frame_end: cu::CUevent,
     pending: bool,
+    /// First failed `cuEventRecord` of the frame in flight; its timings are not reported.
+    record_failed: Cell<Option<cu::CUresult>>,
 }
 
 impl FrameEventSlot {
+    /// Creates all six events on the bound context; on failure the events created so far are
+    /// destroyed before the error is returned.
     fn new() -> Result<Self, String> {
-        let create = |label: &str| -> Result<cu::CUevent, String> {
-            let mut ev: cu::CUevent = std::ptr::null_mut();
-            // SAFETY: active CUDA context is bound; `CU_EVENT_DEFAULT` enables hardware timing.
-            let res = unsafe { cu::cuEventCreate(&mut ev, cu::CUevent_flags_enum_CU_EVENT_DEFAULT) };
-            if res != cu::cudaError_enum_CUDA_SUCCESS || ev.is_null() {
-                return Err(format!("cuEventCreate({label}) failed ({res:?})"));
-            }
-            Ok(ev)
-        };
-        Ok(Self {
-            start: create("start")?,
-            accel_end: create("accel_end")?,
-            rt_end: create("rt_end")?,
-            denoise_end: create("denoise_end")?,
-            bloom_end: create("bloom_end")?,
-            frame_end: create("frame_end")?,
+        let mut slot = Self {
+            start: std::ptr::null_mut(),
+            accel_end: std::ptr::null_mut(),
+            rt_end: std::ptr::null_mut(),
+            denoise_end: std::ptr::null_mut(),
+            bloom_end: std::ptr::null_mut(),
+            frame_end: std::ptr::null_mut(),
             pending: false,
-        })
+            record_failed: Cell::new(None),
+        };
+        let created = (|| -> Result<(), String> {
+            for (ev, label) in [
+                (&mut slot.start, "start"),
+                (&mut slot.accel_end, "accel_end"),
+                (&mut slot.rt_end, "rt_end"),
+                (&mut slot.denoise_end, "denoise_end"),
+                (&mut slot.bloom_end, "bloom_end"),
+                (&mut slot.frame_end, "frame_end"),
+            ] {
+                // SAFETY: active CUDA context is bound; `CU_EVENT_DEFAULT` enables hardware timing.
+                let res = unsafe { cu::cuEventCreate(ev, cu::CUevent_flags_enum_CU_EVENT_DEFAULT) };
+                if res != cu::cudaError_enum_CUDA_SUCCESS || ev.is_null() {
+                    *ev = std::ptr::null_mut();
+                    return Err(format!("cuEventCreate({label}) failed ({res:?})"));
+                }
+            }
+            Ok(())
+        })();
+        match created {
+            Ok(()) => Ok(slot),
+            Err(err) => {
+                slot.destroy();
+                Err(err)
+            }
+        }
     }
 
     fn destroy(&mut self) {
@@ -104,14 +126,26 @@ impl FrameEventSlot {
             &mut self.frame_end,
         ] {
             if !ev.is_null() {
-                // SAFETY: each handle was created by `cuEventCreate` on the owning CUDA context.
-                unsafe {
-                    let _ = cu::cuEventDestroy_v2(*ev);
+                // SAFETY: each handle was created by `cuEventCreate` on the owning CUDA context,
+                // which the caller has bound to this thread.
+                let rc = unsafe { cu::cuEventDestroy_v2(*ev) };
+                if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                    eprintln!("nv-demo: GpuPassProfiler cuEventDestroy failed ({rc:?})");
                 }
                 *ev = std::ptr::null_mut();
             }
         }
         self.pending = false;
+    }
+
+    /// Records `ev` on `stream`, remembering the first failure of this frame.
+    #[inline]
+    fn record(&self, ev: cu::CUevent, stream: &Stream) {
+        if let Err(rc) = record_event(ev, stream)
+            && self.record_failed.get().is_none()
+        {
+            self.record_failed.set(Some(rc));
+        }
     }
 }
 
@@ -122,6 +156,8 @@ pub struct GpuPassProfiler {
     slots: [FrameEventSlot; GPU_PROFILER_SLOTS],
     write_idx: usize,
     latest: GpuPassSample,
+    /// Event record/query failures are reported once per profiler, not once per frame.
+    error_reported: bool,
 }
 
 // SAFETY: CUDA event handles belong to `ctx` and are accessed exclusively from the render worker.
@@ -132,14 +168,28 @@ impl GpuPassProfiler {
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
         cuda.bind_to_thread()
             .map_err(|e| format!("GpuPassProfiler bind_to_thread failed: {e}"))?;
-        let s0 = FrameEventSlot::new()?;
-        let s1 = FrameEventSlot::new()?;
-        let s2 = FrameEventSlot::new()?;
+        let mut s0 = FrameEventSlot::new()?;
+        let mut s1 = match FrameEventSlot::new() {
+            Ok(s) => s,
+            Err(err) => {
+                s0.destroy();
+                return Err(err);
+            }
+        };
+        let s2 = match FrameEventSlot::new() {
+            Ok(s) => s,
+            Err(err) => {
+                s0.destroy();
+                s1.destroy();
+                return Err(err);
+            }
+        };
         Ok(Self {
             ctx: cuda.clone(),
             slots: [s0, s1, s2],
             write_idx: 0,
             latest: GpuPassSample::default(),
+            error_reported: false,
         })
     }
 
@@ -147,8 +197,10 @@ impl GpuPassProfiler {
     #[inline]
     pub fn begin_frame(&mut self, stream: &Stream) -> usize {
         let slot = self.write_idx;
-        self.slots[slot].pending = false;
-        record_event(self.slots[slot].start, stream);
+        let s = &mut self.slots[slot];
+        s.pending = false;
+        s.record_failed.set(None);
+        s.record(s.start, stream);
         slot
     }
 
@@ -156,7 +208,7 @@ impl GpuPassProfiler {
     #[inline]
     pub fn mark_accel_end(&self, slot: usize, stream: &Stream) {
         if let Some(s) = self.slots.get(slot) {
-            record_event(s.accel_end, stream);
+            s.record(s.accel_end, stream);
         }
     }
 
@@ -164,7 +216,7 @@ impl GpuPassProfiler {
     #[inline]
     pub fn mark_rt_end(&self, slot: usize, stream: &Stream) {
         if let Some(s) = self.slots.get(slot) {
-            record_event(s.rt_end, stream);
+            s.record(s.rt_end, stream);
         }
     }
 
@@ -172,7 +224,7 @@ impl GpuPassProfiler {
     #[inline]
     pub fn mark_denoise_end(&self, slot: usize, stream: &Stream) {
         if let Some(s) = self.slots.get(slot) {
-            record_event(s.denoise_end, stream);
+            s.record(s.denoise_end, stream);
         }
     }
 
@@ -180,7 +232,7 @@ impl GpuPassProfiler {
     #[inline]
     pub fn mark_bloom_end(&self, slot: usize, stream: &Stream) {
         if let Some(s) = self.slots.get(slot) {
-            record_event(s.bloom_end, stream);
+            s.record(s.bloom_end, stream);
         }
     }
 
@@ -189,7 +241,7 @@ impl GpuPassProfiler {
     #[inline]
     pub fn mark_frame_end(&mut self, slot: usize, stream: &Stream) {
         if let Some(s) = self.slots.get_mut(slot) {
-            record_event(s.frame_end, stream);
+            s.record(s.frame_end, stream);
             s.pending = true;
         }
         self.write_idx = (slot + 1) % GPU_PROFILER_SLOTS;
@@ -197,6 +249,9 @@ impl GpuPassProfiler {
 
     /// Polls all completed pending slots using non-blocking `cuEventQuery` (never blocks or calls
     /// `cuEventSynchronize`) and returns the latest resolved [`GpuPassSample`].
+    ///
+    /// A frame whose event record or query failed is dropped (the previous sample stays), so a
+    /// stale event can never be reported as a timing.
     pub fn poll_completed(&mut self) -> GpuPassSample {
         // Walk chronologically from oldest slot (`write_idx`) to newest so `self.latest` always
         // reflects the most recent completed frame.
@@ -208,15 +263,33 @@ impl GpuPassProfiler {
             }
             // SAFETY: `slot.frame_end` is a valid `CUevent` created on `self.ctx`.
             let status = unsafe { cu::cuEventQuery(slot.frame_end) };
-            if status == cu::cudaError_enum_CUDA_SUCCESS {
-                self.latest = GpuPassSample {
-                    accel_ms: elapsed_ms(slot.start, slot.accel_end),
-                    rt_cores_ms: elapsed_ms(slot.accel_end, slot.rt_end),
-                    tensor_cores_ms: elapsed_ms(slot.rt_end, slot.denoise_end),
-                    bloom_ms: elapsed_ms(slot.denoise_end, slot.bloom_end),
-                    tonemap_ms: elapsed_ms(slot.bloom_end, slot.frame_end),
-                };
-                slot.pending = false;
+            if status == cu::cudaError_enum_CUDA_ERROR_NOT_READY {
+                continue;
+            }
+            slot.pending = false;
+            let failure = if status == cu::cudaError_enum_CUDA_SUCCESS {
+                slot.record_failed.get().map(|rc| ("cuEventRecord", rc))
+            } else {
+                Some(("cuEventQuery", status))
+            };
+            match failure {
+                None => {
+                    self.latest = GpuPassSample {
+                        accel_ms: elapsed_ms(slot.start, slot.accel_end),
+                        rt_cores_ms: elapsed_ms(slot.accel_end, slot.rt_end),
+                        tensor_cores_ms: elapsed_ms(slot.rt_end, slot.denoise_end),
+                        bloom_ms: elapsed_ms(slot.denoise_end, slot.bloom_end),
+                        tonemap_ms: elapsed_ms(slot.bloom_end, slot.frame_end),
+                    };
+                }
+                Some((call, rc)) => {
+                    if !self.error_reported {
+                        self.error_reported = true;
+                        eprintln!(
+                            "nv-demo: GpuPassProfiler {call} failed ({rc:?}); dropping GPU pass timings for affected frames"
+                        );
+                    }
+                }
             }
         }
         self.latest
@@ -234,12 +307,16 @@ impl Drop for GpuPassProfiler {
 }
 
 #[inline]
-fn record_event(ev: cu::CUevent, stream: &Stream) {
-    if !ev.is_null() {
-        // SAFETY: `ev` is a valid timing event on the active context and `stream` is live.
-        unsafe {
-            let _ = cu::cuEventRecord(ev, stream.cu_stream());
-        }
+fn record_event(ev: cu::CUevent, stream: &Stream) -> Result<(), cu::CUresult> {
+    if ev.is_null() {
+        return Ok(());
+    }
+    // SAFETY: `ev` is a valid timing event on the active context and `stream` is live.
+    let rc = unsafe { cu::cuEventRecord(ev, stream.cu_stream()) };
+    if rc == cu::cudaError_enum_CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(rc)
     }
 }
 
@@ -482,7 +559,6 @@ pub struct Profiler {
     /// Fixed-capacity frame timing ring buffers.
     pub timings: FrameTimings,
     cupti_profiler: Option<ActivityProfiler>,
-    _cupti_subscriber: Option<Subscriber>,
     cupti_records: Vec<ActivityRecord>,
     cupti_status: String,
     ngx_status: String,
@@ -490,20 +566,19 @@ pub struct Profiler {
 }
 
 impl Profiler {
-    /// Initializes the profiler, probing CUPTI (`ActivityProfiler` + `Subscriber`) and NGX
-    /// gracefully without panicking if privileges or runtimes are missing.
+    /// Initializes the profiler, probing CUPTI kernel activity and NGX gracefully without
+    /// panicking if privileges or runtimes are missing.
     pub fn new(cuda: Option<&Arc<CudaContext>>) -> Self {
         let (_ngx_available, ngx_status) = probe_ngx_status();
 
-        let (cupti_profiler, cupti_subscriber, cupti_status) = match cuda {
+        let (cupti_profiler, cupti_status) = match cuda {
             Some(ctx) => probe_cupti(ctx),
-            None => (None, None, "Unavailable: no CUDA context".to_string()),
+            None => (None, "Unavailable: no CUDA context".to_string()),
         };
 
         Self {
             timings: FrameTimings::new(),
             cupti_profiler,
-            _cupti_subscriber: cupti_subscriber,
             cupti_records: Vec::with_capacity(256),
             cupti_status,
             ngx_status,
@@ -625,10 +700,15 @@ fn populate_nvml_telemetry(d: &NvmlDevice, out: &mut GpuTelemetry) {
     out.mem_clock_mhz = d.clock_mhz(ClockDomain::Memory).unwrap_or(0);
 }
 
-fn probe_cupti(cuda: &Arc<CudaContext>) -> (Option<ActivityProfiler>, Option<Subscriber>, String) {
+/// Enables CUPTI kernel activity records (the only CUPTI data the UI shows).
+///
+/// No callback `Subscriber` is registered: CUPTI allows one subscriber per process, so holding one
+/// would lock Nsight Systems / Compute out, and a driver-API callback costs CPU time on every driver
+/// call while nothing here consumes it.
+fn probe_cupti(cuda: &Arc<CudaContext>) -> (Option<ActivityProfiler>, String) {
     let ver = match cupti::version() {
         Ok(v) => v,
-        Err(err) => return (None, None, format!("Unavailable: {err}")),
+        Err(err) => return (None, format!("Unavailable: {err}")),
     };
 
     let activity_res = ActivityProfiler::new(cuda).and_then(|mut prof| {
@@ -638,32 +718,9 @@ fn probe_cupti(cuda: &Arc<CudaContext>) -> (Option<ActivityProfiler>, Option<Sub
         Ok(prof)
     });
 
-    let sub_res = Subscriber::new(cuda, Box::new(|_domain, _cbid| {})).and_then(|sub| {
-        sub.enable_domain(CallbackDomain::DriverApi, true)?;
-        Ok(sub)
-    });
-
-    match (activity_res, sub_res) {
-        (Ok(prof), Ok(sub)) => (
-            Some(prof),
-            Some(sub),
-            format!("Active v{ver} (Activity + Subscriber)"),
-        ),
-        (Ok(prof), Err(sub_err)) => (
-            Some(prof),
-            None,
-            format!("Partial v{ver} (Activity only; Subscriber: {sub_err})"),
-        ),
-        (Err(act_err), Ok(sub)) => (
-            None,
-            Some(sub),
-            format!("Partial v{ver} (Subscriber only; Activity: {act_err})"),
-        ),
-        (Err(act_err), Err(sub_err)) => (
-            None,
-            None,
-            format!("Init failed v{ver} (Activity: {act_err}; Subscriber: {sub_err})"),
-        ),
+    match activity_res {
+        Ok(prof) => (Some(prof), format!("Active v{ver} (kernel activity)")),
+        Err(act_err) => (None, format!("Init failed v{ver} (Activity: {act_err})")),
     }
 }
 

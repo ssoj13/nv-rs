@@ -7,21 +7,11 @@
 //! Used by nv-rs collective communication consumers; device code is a separate NCCL API.
 #![cfg(target_os = "linux")]
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "nccl",
     api: NcclApi,
     loader: nccl_api,
-    dll: DllSpec {
-        lib: "nccl",
-        group: Group::Sdk {
-            root_var: "NCCL_ROOT",
-            hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
-        },
-        windows: &[],
-        linux: &["libnccl.so.2", "libnccl.so"],
-    },
+    dll: nv_loader::catalog::NCCL.spec.with_hint(env!("NV_RS_SDK_BIN")),
 }
 
 #[cfg(test)]

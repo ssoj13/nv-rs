@@ -1,8 +1,11 @@
 //! `nv_rs.nvml` — safe NVML GPU telemetry and enumeration.
+//!
+//! Optional telemetry fields (`clocks_mhz`, `summary`) are `None` only when the device reports
+//! `NVML_ERROR_NOT_SUPPORTED` (typed status, see [`optional`]); every other NVML error raises.
 
 use std::sync::Arc;
 
-use nvml::{ClockDomain, Device, Nvml};
+use nvml::{ClockDomain, Device, MemoryInfo, Nvml, Utilization};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -11,8 +14,34 @@ use crate::errors::ErrorKind;
 py_err_mapper!(map_nvml_err, "nvml", nvml::Error, {
     nvml::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
     nvml::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-    _ => ErrorKind::Cuda,
+    nvml::Error::Status { .. } => ErrorKind::Cuda,
 });
+
+/// `Some(value)`, or `None` when the device does not support the query
+/// (`NVML_ERROR_NOT_SUPPORTED`, which is not recorded as an error); any other failure (GPU lost,
+/// driver error, ...) is raised and recorded in `nv_rs.diag`.
+fn optional<T>(op: &str, res: nvml::Result<T>) -> PyResult<Option<T>> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(nvml::Error::Status { status, .. }) if status.is_not_supported() => Ok(None),
+        Err(e) => Err(map_nvml_err(op, e)),
+    }
+}
+
+fn memory_dict<'py>(py: Python<'py>, mem: &MemoryInfo) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("total", mem.total)?;
+    d.set_item("free", mem.free)?;
+    d.set_item("used", mem.used)?;
+    Ok(d)
+}
+
+fn utilization_dict<'py>(py: Python<'py>, u: &Utilization) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("gpu", u.gpu)?;
+    d.set_item("memory", u.memory)?;
+    Ok(d)
+}
 
 /// NVML session handle.
 #[pyclass(name = "Nvml", module = "nv_rs.nvml")]
@@ -115,11 +144,7 @@ impl PyNvmlDevice {
             .inner
             .memory_info()
             .map_err(|e| map_nvml_err("memory_info", e))?;
-        let d = PyDict::new(py);
-        d.set_item("total", mem.total)?;
-        d.set_item("free", mem.free)?;
-        d.set_item("used", mem.used)?;
-        Ok(d.unbind())
+        Ok(memory_dict(py, &mem)?.unbind())
     }
 
     /// @py-return: dict[str, int]
@@ -128,32 +153,53 @@ impl PyNvmlDevice {
             .inner
             .utilization_rates()
             .map_err(|e| map_nvml_err("utilization_rates", e))?;
-        let d = PyDict::new(py);
-        d.set_item("gpu", u.gpu)?;
-        d.set_item("memory", u.memory)?;
-        Ok(d.unbind())
+        Ok(utilization_dict(py, &u)?.unbind())
     }
 
+    /// Clock of each domain in MHz; `None` where the device does not support the query.
     /// @py-return: dict[str, int | None]
     fn clocks_mhz(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let d = PyDict::new(py);
-        d.set_item("graphics", self.inner.clock_mhz(ClockDomain::Graphics).ok())?;
-        d.set_item("sm", self.inner.clock_mhz(ClockDomain::Sm).ok())?;
-        d.set_item("memory", self.inner.clock_mhz(ClockDomain::Memory).ok())?;
+        for (key, domain) in [
+            ("graphics", ClockDomain::Graphics),
+            ("sm", ClockDomain::Sm),
+            ("memory", ClockDomain::Memory),
+        ] {
+            d.set_item(key, optional("clock_mhz", self.inner.clock_mhz(domain))?)?;
+        }
         Ok(d.unbind())
     }
 
+    /// Identity plus telemetry; a telemetry field is `None` only where the device does not
+    /// support it, any other NVML error raises.
     /// @py-return: dict[str, Any]
     fn summary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let d = PyDict::new(py);
         d.set_item("index", self.index()?)?;
         d.set_item("name", self.name()?)?;
         d.set_item("uuid", self.uuid()?)?;
-        d.set_item("compute_capability", self.compute_capability().ok())?;
-        d.set_item("temperature_c", self.temperature_c().ok())?;
-        d.set_item("power_usage_mw", self.power_usage_mw().ok())?;
-        d.set_item("memory", self.memory_info(py).ok())?;
-        d.set_item("utilization", self.utilization(py).ok())?;
+        d.set_item(
+            "compute_capability",
+            optional(
+                "cuda_compute_capability",
+                self.inner.cuda_compute_capability(),
+            )?,
+        )?;
+        d.set_item(
+            "temperature_c",
+            optional("temperature_gpu", self.inner.temperature_gpu())?,
+        )?;
+        d.set_item(
+            "power_usage_mw",
+            optional("power_usage_mw", self.inner.power_usage_mw())?,
+        )?;
+        let mem = optional("memory_info", self.inner.memory_info())?;
+        d.set_item("memory", mem.map(|m| memory_dict(py, &m)).transpose()?)?;
+        let util = optional("utilization_rates", self.inner.utilization_rates())?;
+        d.set_item(
+            "utilization",
+            util.map(|u| utilization_dict(py, &u)).transpose()?,
+        )?;
         Ok(d.unbind())
     }
 }

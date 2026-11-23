@@ -7,80 +7,23 @@
 //! **How.** On Windows, `cudnn64_9.dll` is a thin dispatcher that loads its sibling sub-libraries
 //! (`cudnn_graph64_9.dll`, `cudnn_ops64_9.dll`, `cudnn_cnn64_9.dll`, ...) by bare filename via
 //! `LoadLibraryA`. When the cuDNN `bin` directory is not on `PATH` (for example when located via
-//! `CUDNN_ROOT` or `NV_RS_SDK_BIN`), preloading matching `cudnn_*` siblings from the same directory
-//! with `LOAD_WITH_ALTERED_SEARCH_PATH` ensures those sub-libraries are already mapped in the process.
+//! `CUDNN_ROOT` or the debug-build hint), the `preload` hook of [`nv_loader::exports_sys!`] maps the
+//! matching `cudnn_*` siblings from the same directory first (through `nv_loader::open_library`), so
+//! those sub-libraries are already in the process. A runtime whose major version is older than the
+//! headers' `CUDNN_MAJOR` is a typed `LoadError::RuntimeTooOld`.
 //! **Used by** the safe `cudnn` crate; call [`load`] for a diagnosable load error.
 
 use std::path::Path;
-use std::sync::OnceLock;
 
-use nv_loader::{DllSpec, Group, LoadError, Loaded};
+use nv_loader::Rejection;
 
-// Generated code: lint levels differ per header, so the generated modules opt out.
-#[allow(
-    non_camel_case_types,
-    non_upper_case_globals,
-    non_snake_case,
-    dead_code,
-    missing_docs,
-    unnecessary_transmutes,
-    clippy::all,
-    clippy::undocumented_unsafe_blocks
-)]
-mod types {
-    include!(concat!(env!("OUT_DIR"), "/cudnn_types.rs"));
-}
-#[allow(
-    non_camel_case_types,
-    non_upper_case_globals,
-    non_snake_case,
-    dead_code,
-    missing_docs,
-    unnecessary_transmutes,
-    clippy::all,
-    clippy::undocumented_unsafe_blocks
-)]
-mod api {
-    use super::types::*;
-    include!(concat!(env!("OUT_DIR"), "/cudnn_api.rs"));
-}
-// Shim bodies share one safety argument, documented once in nv-bindgen (`shims`);
-// prettyplease drops comments, so the per-block SAFETY lint cannot be met here.
-#[allow(
-    non_camel_case_types,
-    non_upper_case_globals,
-    non_snake_case,
-    missing_docs,
-    unnecessary_transmutes,
-    clippy::all,
-    clippy::undocumented_unsafe_blocks
-)]
-mod shims {
-    use super::cudnn_api;
-    use super::types::*;
-    include!(concat!(env!("OUT_DIR"), "/cudnn_shims.rs"));
-}
-pub use shims::*;
-pub use types::*;
-
-/// Where this library ships and what its files are called.
-pub const DLL: DllSpec = DllSpec {
+nv_loader::exports_sys! {
     lib: "cudnn",
-    group: Group::Sdk {
-        root_var: "CUDNN_ROOT",
-        hint: nv_loader::hint(env!("NV_RS_SDK_BIN")),
-    },
-    windows: &["cudnn64_*"],
-    linux: &["libcudnn.so.9", "libcudnn.so"],
-};
-
-/// Entry points and header sha256 of the generated bindings (coverage evidence).
-pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/cudnn_inventory.json"));
-
-struct CudnnBundle {
-    api: api::CudnnApi,
-    #[cfg(windows)]
-    _siblings: Vec<libloading::Library>,
+    api: CudnnApi,
+    loader: cudnn_api,
+    dll: nv_loader::catalog::CUDNN.spec.with_hint(env!("NV_RS_SDK_BIN")),
+    preload: preload_siblings,
+    version: runtime_version,
 }
 
 /// Orders and filters sibling cuDNN sub-library filenames (`cudnn_<part><suffix>`) for `main_name`
@@ -118,21 +61,9 @@ fn sibling_dll_names(main_name: &str, entries: &[String]) -> Vec<String> {
     matches
 }
 
-#[cfg(windows)]
-fn load_windows_dll(path: &Path) -> Result<libloading::Library, libloading::Error> {
-    use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library as WinLibrary};
-
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    if abs.is_absolute() {
-        // SAFETY: `abs` is an absolute path to a cuDNN DLL; loading runs only its DllMain
-        // initializer and `LOAD_WITH_ALTERED_SEARCH_PATH` resolves static imports from `abs`'s folder.
-        unsafe { WinLibrary::load_with_flags(&abs, LOAD_WITH_ALTERED_SEARCH_PATH) }.map(Into::into)
-    } else {
-        // SAFETY: loading the DLL runs only its DllMain initializer and the handle stays alive.
-        unsafe { libloading::Library::new(path) }
-    }
-}
-
+/// Maps the dispatcher's sibling sub-libraries from `main_path`'s directory (Windows), leaf
+/// dependencies first; they stay loaded with the dispatcher. Linux resolves them through the
+/// dynamic linker, so nothing is preloaded there.
 #[cfg(windows)]
 fn preload_siblings(main_path: &Path) -> Result<Vec<libloading::Library>, String> {
     let Some(dir) = main_path.parent() else {
@@ -150,53 +81,51 @@ fn preload_siblings(main_path: &Path) -> Result<Vec<libloading::Library>, String
     let mut libs = Vec::with_capacity(names.len() + 1);
     for name in names {
         let sibling = dir.join(&name);
-        let lib = load_windows_dll(&sibling)
-            .map_err(|e| format!("failed to preload {}: {e}", sibling.display()))?;
+        let lib = nv_loader::open_library(&sibling)
+            .map_err(|e| format!("failed to preload {e}"))?;
         libs.push(lib);
     }
+    // Optional: older cuDNN builds import zlib from here; newer ones do not ship it.
     let zlib = dir.join("zlibwapi.dll");
-    if zlib.is_file()
-        && let Ok(lib) = load_windows_dll(&zlib)
-    {
-        libs.push(lib);
+    if zlib.is_file() {
+        match nv_loader::open_library(&zlib) {
+            Ok(lib) => libs.push(lib),
+            Err(e) => nv_loader::diag::record_event(
+                nv_loader::diag::Level::Warn,
+                "cudnn",
+                "preload",
+                format!("optional zlibwapi.dll did not load: {e}"),
+                0,
+                false,
+            ),
+        }
     }
     Ok(libs)
 }
 
-#[cfg(windows)]
-fn open_cudnn(path: &Path) -> Result<CudnnBundle, String> {
-    let siblings = preload_siblings(path)?;
-    let main_lib = load_windows_dll(path).map_err(|e| e.to_string())?;
-    // SAFETY: `main_lib` is the opened `cudnn64_*.dll` with sibling sub-libraries already loaded;
-    // symbols are resolved lazily and missing ones become `Err` fields in `CudnnApi`.
-    let api = unsafe { api::CudnnApi::from_library(main_lib) }.map_err(|e| e.to_string())?;
-    Ok(CudnnBundle {
-        api,
-        _siblings: siblings,
-    })
-}
-
+/// See the Windows variant: the dynamic linker resolves cuDNN's sub-libraries itself.
 #[cfg(not(windows))]
-fn open_cudnn(path: &Path) -> Result<CudnnBundle, String> {
-    // SAFETY: opening the library runs only its loader initialisers; symbols are resolved lazily
-    // and a missing one becomes an `Err` field, not a crash.
-    let api = unsafe { api::CudnnApi::new(path) }.map_err(|e| e.to_string())?;
-    Ok(CudnnBundle { api })
+fn preload_siblings(_main_path: &Path) -> Result<Vec<libloading::Library>, String> {
+    Ok(Vec::new())
 }
 
-fn loaded() -> &'static Result<Loaded<CudnnBundle>, LoadError> {
-    static API: OnceLock<Result<Loaded<CudnnBundle>, LoadError>> = OnceLock::new();
-    API.get_or_init(|| nv_loader::open_first(&DLL, open_cudnn))
-}
-
-/// The loaded library, for the shims.
-fn cudnn_api() -> Result<&'static api::CudnnApi, &'static LoadError> {
-    loaded().as_ref().map(|l| &l.value.api)
-}
-
-/// Loads the library and its sub-libraries now and reports which file was used, or why loading failed.
-pub fn load() -> Result<&'static Path, &'static LoadError> {
-    loaded().as_ref().map(|l| l.path.as_path())
+/// Rejects a runtime whose major version is older than the headers' `CUDNN_MAJOR` (cuDNN keeps its
+/// ABI within a major version).
+fn runtime_version(lib: &api::CudnnApi) -> Result<(), Rejection> {
+    let get = *lib
+        .cudnnGetProperty
+        .as_ref()
+        .map_err(|e| format!("cudnnGetProperty is unavailable: {e}"))?;
+    let mut major = 0;
+    // SAFETY: `cudnnGetProperty(libraryPropertyType, int*)` (cudnn_graph.h) needs no handle and
+    // writes one int through the valid, exclusive pointer.
+    let status = unsafe { get(libraryPropertyType_t_MAJOR_VERSION, &mut major) };
+    if status != cudnnStatus_t_CUDNN_STATUS_SUCCESS {
+        return Err(format!("cudnnGetProperty(MAJOR_VERSION) returned {status}").into());
+    }
+    let found =
+        u32::try_from(major).map_err(|_| format!("cudnnGetProperty reported major version {major}"))?;
+    nv_loader::check_version(CUDNN_MAJOR, found)
 }
 
 #[cfg(test)]

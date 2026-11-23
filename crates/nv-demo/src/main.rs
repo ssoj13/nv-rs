@@ -1158,6 +1158,402 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    /// Output directory for stills, videos and SDG exports (relative to the working directory).
+    const RENDERS_DIR: &str = "renders";
+    /// Encoded frame rate of every MP4 recording and of the Smooth 60 lockstep clock.
+    const RECORD_FPS: u32 = 60;
+    /// Duration of the damper glide into a newly started or switched rail (seconds).
+    const RAIL_BLEND_SECS: f32 = 1.6;
+    /// Longest UI-thread wait for one GPU copy submission before the capture is dropped.
+    const GPU_COPY_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Process-wide sequence number keeping output names unique within one millisecond.
+    static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique output file or directory name `{prefix}-{unix_ms}-{seq}{suffix}` (F03: two saves or
+    /// a stop/start within one second must not reuse a name and replace the earlier file).
+    pub(crate) fn output_file_name(prefix: &str, suffix: &str) -> String {
+        // A clock before 1970 only loses the timestamp part; `seq` keeps names unique.
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let seq = OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{ms}-{seq}{suffix}")
+    }
+
+    /// Returns `buf` to `pool`. A full pool first evicts an entry of another size, so a size change
+    /// (new recording resolution) does not leave the pool full of buffers no request can reuse.
+    /// Returns the buffer the caller has to drop, if any.
+    pub(crate) fn recycle_into_pool<T>(
+        pool: &mut Vec<T>,
+        buf: T,
+        size_of: impl Fn(&T) -> usize,
+        max: usize,
+    ) -> Option<T> {
+        if pool.len() < max {
+            pool.push(buf);
+            return None;
+        }
+        let size = size_of(&buf);
+        match pool.iter().position(|b| size_of(b) != size) {
+            Some(stale) => {
+                let evicted = pool.swap_remove(stale);
+                pool.push(buf);
+                Some(evicted)
+            }
+            None => Some(buf),
+        }
+    }
+
+    /// Duration of the next encoded frame. Live RT measures from the last *accepted* frame, so a
+    /// frame dropped under back-pressure lengthens the next one instead of shortening the clip.
+    pub(crate) fn video_frame_duration(
+        fixed_fps: bool,
+        fps: u32,
+        last_accepted: Option<Instant>,
+        now: Instant,
+    ) -> f64 {
+        let nominal = 1.0 / f64::from(fps.max(1));
+        if fixed_fps {
+            return nominal;
+        }
+        last_accepted
+            .map_or(nominal, |prev| now.duration_since(prev).as_secs_f64())
+            .clamp(1.0 / 240.0, 2.0)
+    }
+
+    /// DLSS render size: the width comes from the runtime's optimal settings aligned to 64 (the
+    /// 256-byte `bytes_per_row` rule for 4-byte copies) and the height is derived from that width
+    /// and the output aspect, so the render target and the upscaled output share one aspect ratio
+    /// (the shader's `aspect = width / height` would otherwise stretch the image).
+    pub(crate) fn dlss_render_dims(
+        opt: &ngx::DlssOptimalSettings,
+        out_w: u32,
+        out_h: u32,
+    ) -> (u32, u32) {
+        let max_w = (opt.max_width.min(out_w) & !63).max(64);
+        let min_w = ((opt.min_width.max(64) + 63) & !63).min(max_w);
+        let w = ((opt.render_width + 31) & !63).clamp(min_w, max_w);
+        let h_exact = u64::from(w) * u64::from(out_h) / u64::from(out_w.max(1));
+        let h_even = u32::try_from(h_exact).unwrap_or(out_h).saturating_add(1) & !1;
+        let floor_h = 144.min(out_h);
+        (w, h_even.clamp(floor_h, out_h.max(floor_h)))
+    }
+
+    /// Which texture or buffer holds the image the Viewport currently shows.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ViewportStillSource {
+        /// OptiX tonemapped `shared_rgba` (no upscaler, or an AOV under DLSS-RR).
+        RenderTarget,
+        /// DLSS-RR LDR display texture (SDR view).
+        DlssRrLdr,
+        /// DLSS-RR scRGB display texture (HDR view).
+        DlssRrHdr,
+        /// DLSS-SR upscaled output texture.
+        DlssSr,
+    }
+
+    /// Picks the still-capture source matching what the viewport draws (F01/F10): under DLSS the
+    /// worker's `shared_rgba` is the stale or pre-upscale render-resolution image.
+    pub(crate) fn viewport_still_source(
+        dlss_rr_on: bool,
+        aov_mode: u32,
+        has_rr_pass: bool,
+        dlss_on: bool,
+        has_dlss_pass: bool,
+        hdr_active: bool,
+    ) -> ViewportStillSource {
+        if viewport_uses_dlss_rr_output(dlss_rr_on, aov_mode, has_rr_pass) {
+            if hdr_active {
+                ViewportStillSource::DlssRrHdr
+            } else {
+                ViewportStillSource::DlssRrLdr
+            }
+        } else if dlss_on && !dlss_rr_on && has_dlss_pass {
+            ViewportStillSource::DlssSr
+        } else {
+            ViewportStillSource::RenderTarget
+        }
+    }
+
+    /// Lighting fields a [`TodTransition`] animates, plus the scene selection.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct LightingKey {
+        sun_azimuth: f32,
+        sun_elevation: f32,
+        sun_intensity: f32,
+        sky_intensity: f32,
+        exposure: f32,
+        sky_mode: u32,
+        csg_mode: u32,
+    }
+
+    impl LightingKey {
+        pub(crate) fn of(s: &DemoSettings) -> Self {
+            Self {
+                sun_azimuth: s.sun_azimuth,
+                sun_elevation: s.sun_elevation,
+                sun_intensity: s.sun_intensity,
+                sky_intensity: s.sky_intensity,
+                exposure: s.exposure,
+                sky_mode: s.sky_mode,
+                csg_mode: s.csg_mode,
+            }
+        }
+    }
+
+    /// Bitwise comparison: "did anything write a different value", NaN-safe.
+    impl PartialEq for LightingKey {
+        fn eq(&self, o: &Self) -> bool {
+            self.sun_azimuth.to_bits() == o.sun_azimuth.to_bits()
+                && self.sun_elevation.to_bits() == o.sun_elevation.to_bits()
+                && self.sun_intensity.to_bits() == o.sun_intensity.to_bits()
+                && self.sky_intensity.to_bits() == o.sky_intensity.to_bits()
+                && self.exposure.to_bits() == o.exposure.to_bits()
+                && self.sky_mode == o.sky_mode
+                && self.csg_mode == o.csg_mode
+        }
+    }
+
+    /// Cancels a running time-of-day transition when the UI pass changed any field it animates
+    /// since `before` (slider, sky combo, toolbar EV, scene switch), so the user's edit is not
+    /// overwritten every frame (F05). The sky crossfade snaps to the current `sky_mode`.
+    pub(crate) fn cancel_tod_on_user_edit(
+        before: LightingKey,
+        s: &mut DemoSettings,
+        tr: &mut Option<TodTransition>,
+    ) -> bool {
+        if tr.is_none() || LightingKey::of(s) == before {
+            return false;
+        }
+        *tr = None;
+        s.sky_mode_from = s.sky_mode;
+        s.sky_blend = 0.0;
+        true
+    }
+
+    /// `(sim_dt, damper_dt)` for one Live (non-lockstep) UI frame (F16). Simulation-time
+    /// subsystems (animator, rail, TOD transition, rail glide) advance by `dt * time_scale`, as they
+    /// do in Smooth 60 lockstep; the damper follows the clock of whatever drives the camera (rail:
+    /// simulation time; manual navigation: wall time, which the driver also uses).
+    pub(crate) fn live_step_dts(dt: f32, time_scale: f32, rail_active: bool) -> (f32, f32) {
+        let sim_dt = dt * time_scale;
+        (sim_dt, if rail_active { sim_dt } else { dt })
+    }
+
+    /// Auto-framing request for a `SelectScene` (F30): none for Classic (`scene_idx == 0`, the
+    /// worker builds no scene) and none when the target already is the loaded scene (A -> B -> A
+    /// coalesced in the `StateSlot` rebuilds nothing, so no `SceneMetaUpdated` would clear the
+    /// flag and a later rebuild of the same key would teleport the camera).
+    pub(crate) fn scene_auto_frame_target(
+        loaded: Option<(u32, u32)>,
+        target: (u32, u32),
+    ) -> Option<(u32, u32)> {
+        (target.0 != 0 && loaded != Some(target)).then_some(target)
+    }
+
+    /// Whether a render-target reallocation may be sent this frame (F14). Pure size changes
+    /// (window or dock drags) wait until the worker acknowledged the previous `Resize` with a frame
+    /// of the newest generation: a blocked worker (multi-second scene build) would otherwise retire
+    /// one full buffer set per 120 ms throttle tick. Buffer-set changes (DLSS / HDR toggles) are
+    /// rare user actions and go through at once.
+    pub(crate) fn resize_allowed(
+        size_changed: bool,
+        buffers_changed: bool,
+        throttle_elapsed: bool,
+        dlss_toggled: bool,
+        prev_acked: bool,
+    ) -> bool {
+        buffers_changed || (size_changed && (dlss_toggled || (throttle_elapsed && prev_acked)))
+    }
+
+    /// Joins a render thread that has already finished and describes why it ended (F12).
+    pub(crate) fn render_exit_reason(handle: JoinHandle<()>) -> String {
+        match handle.join() {
+            Ok(()) => "render worker exited without reporting an error".to_string(),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                format!("render worker panicked: {msg}")
+            }
+        }
+    }
+
+    /// Startup values this session overrode because the host lacks the feature (F18).
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub(crate) struct StartupIntent {
+        /// Persisted `hdr_display = true` forced off (no HDR surface).
+        pub hdr_display: Option<bool>,
+        /// Persisted `dlss_rr_on = true` forced off (DLSS-RR unavailable).
+        pub dlss_rr_on: Option<bool>,
+        /// `(dlss_on, denoiser_on)` right after startup; restoring `dlss_rr_on` only makes sense
+        /// while the user has not picked another AI mode.
+        pub ai_at_start: (bool, bool),
+    }
+
+    /// Settings as the user chose them (F18): transient session overrides are undone before saving
+    /// (LiDAR mount lens switch, an unfinished TOD transition, features forced off on this host).
+    pub(crate) fn user_intent_settings(
+        live: &DemoSettings,
+        saved_projection: Option<crate::renderer::CameraProjection>,
+        tod: Option<&TodTransition>,
+        intent: StartupIntent,
+    ) -> DemoSettings {
+        let mut s = *live;
+        if let Some(p) = saved_projection {
+            s.camera_projection = p;
+        }
+        if let Some(tr) = tod {
+            tr.apply_target(&mut s);
+        }
+        if let Some(v) = intent.hdr_display {
+            s.hdr_display = v;
+        }
+        if let Some(v) = intent.dlss_rr_on
+            && (live.dlss_on, live.denoiser_on) == intent.ai_at_start
+        {
+            s.dlss_rr_on = v;
+        }
+        s
+    }
+
+    /// Stable reference to the selected scene for persistence (F17).
+    pub(crate) fn saved_scene_of(
+        descs: &[csg_scene::SceneDescriptor],
+        csg_mode: u32,
+        asset_idx: u32,
+    ) -> Option<crate::persist::SavedScene> {
+        let Some(idx) = csg_mode.checked_sub(1) else {
+            return Some(crate::persist::SavedScene::default());
+        };
+        let d = descs.get(idx as usize)?;
+        Some(crate::persist::SavedScene {
+            id: d.id.to_string(),
+            variant: d
+                .variant_labels
+                .get(asset_idx as usize)
+                .map_or_else(String::new, |v| (*v).to_string()),
+        })
+    }
+
+    /// Resolves a saved scene reference to `(csg_mode, csg_asset_idx)` (F17); `None` when the id
+    /// is no longer registered. An unknown variant label keeps `fallback_asset`, clamped.
+    pub(crate) fn resolve_saved_scene(
+        descs: &[csg_scene::SceneDescriptor],
+        saved: &crate::persist::SavedScene,
+        fallback_asset: u32,
+    ) -> Option<(u32, u32)> {
+        if saved.id.is_empty() {
+            return Some((0, fallback_asset));
+        }
+        let (pos, d) = descs.iter().enumerate().find(|(_, d)| d.id == saved.id)?;
+        let max_asset = u32::try_from(d.variant_labels.len().saturating_sub(1)).unwrap_or(0);
+        let asset = d
+            .variant_labels
+            .iter()
+            .position(|v| *v == saved.variant)
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(fallback_asset.min(max_asset));
+        let mode = u32::try_from(pos + 1).ok()?;
+        Some((mode, asset))
+    }
+
+    /// Persistent staging buffer for copying a displayed texture (DLSS output) into CUDA memory.
+    struct TexReadback {
+        copy_buf: SharedBuffer,
+        width: u32,
+        height: u32,
+        pixel_format: crate::gpu_export::SourcePixelFormat,
+        copy_bpr: u32,
+        copy_pitch_px: u32,
+    }
+
+    /// Copies `tex` into `staging` (reallocated on size or format change), waits for that one
+    /// submission with [`GPU_COPY_WAIT_TIMEOUT`] and returns the pitched CUDA view of the copy.
+    fn copy_texture_for_cuda(
+        interop: &InteropContext,
+        staging: &mut Option<TexReadback>,
+        tex: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<PitchedDeviceImage, String> {
+        let fmt = tex.format();
+        let pixel_format = crate::gpu_export::SourcePixelFormat::from_wgpu(fmt)
+            .ok_or_else(|| format!("unsupported still source format {fmt:?}"))?;
+        let reusable = staging.as_ref().is_some_and(|s| {
+            s.width == width && s.height == height && s.pixel_format == pixel_format
+        });
+        if !reusable {
+            let (copy_bpr, copy_pitch_px) =
+                crate::gpu_export::copy_pitch_for_width(width, pixel_format.bytes_per_pixel())
+                    .ok_or_else(|| format!("invalid still dimensions ({width}x{height})"))?;
+            let size = u64::from(copy_bpr)
+                .checked_mul(u64::from(height))
+                .ok_or_else(|| "still copy buffer size overflow".to_string())?;
+            let copy_buf = interop
+                .create_buffer(&SharedBufferDescriptor {
+                    label: Some("viewport-still-copy"),
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST,
+                })
+                .map_err(|e| format!("still copy buffer: {e}"))?;
+            *staging = Some(TexReadback {
+                copy_buf,
+                width,
+                height,
+                pixel_format,
+                copy_bpr,
+                copy_pitch_px,
+            });
+        }
+        let Some(st) = staging.as_ref() else {
+            return Err("still copy buffer unavailable".to_string());
+        };
+        let mut enc = interop
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("viewport-still-copy"),
+            });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: st.copy_buf.wgpu_buffer(),
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(st.copy_bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let idx = interop.queue().submit(Some(enc.finish()));
+        if let Err(e) = interop.device().poll(wgpu::PollType::Wait {
+            submission_index: Some(idx),
+            timeout: Some(GPU_COPY_WAIT_TIMEOUT),
+        }) {
+            return Err(format!("still GPU copy wait failed: {e}"));
+        }
+        Ok(PitchedDeviceImage {
+            ptr: st.copy_buf.cu_deviceptr(),
+            width,
+            height,
+            pitch_px: st.copy_pitch_px,
+            fmt: pixel_format,
+        })
+    }
+
     /// RAII CUDA device staging buffer (`Send`) for zero-copy async export handoff to [`ExportWorker`].
     struct OwnedDeviceBytes {
         cuda: Arc<cuda_core::Context>,
@@ -1200,6 +1596,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if res != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
                 return Err(format!("cuMemcpyDtoD_v2({bytes}) failed ({res:?})"));
             }
+            // A device-to-device `cuMemcpy` returns before the copy has run (legacy stream). The
+            // source may be reused by wgpu right after this returns and the export thread reads
+            // the copy on a non-blocking stream that does not order after the legacy stream, so
+            // wait for the legacy stream here. Non-blocking streams (the render worker) are not
+            // waited on.
+            // SAFETY: the null handle names the legacy default stream of the bound context.
+            let res = unsafe { cuda_bindings::cuStreamSynchronize(std::ptr::null_mut()) };
+            if res != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+                return Err(format!("cuStreamSynchronize after D2D copy failed ({res:?})"));
+            }
             Ok(())
         }
     }
@@ -1228,7 +1634,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), String> {
-        use std::io::Write as _;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1248,9 +1653,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .and_then(|mut wtr| wtr.write_image_data(rgba))
                     .map_err(|e| format!("PNG encode failed: {e}"))?;
             }
-            writer
-                .flush()
-                .map_err(|e| format!("PNG flush failed: {e}"))?;
+            // Same durability contract as `persist::save_to`: data on disk before the rename.
+            let file = writer
+                .into_inner()
+                .map_err(|e| format!("PNG flush failed: {}", e.error()))?;
+            file.sync_all()
+                .map_err(|e| format!("PNG sync failed: {e}"))?;
             Ok(())
         })();
         if let Err(e) = write_res {
@@ -1352,10 +1760,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let w_failed = Arc::clone(&video_failed_session);
 
             let recycle_buf = |pool: &Mutex<Vec<OwnedDeviceBytes>>, buf: OwnedDeviceBytes| {
-                let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.len() < MAX_VIDEO_FRAMES_IN_FLIGHT {
-                    guard.push(buf);
-                }
+                let evicted = {
+                    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+                    recycle_into_pool(
+                        &mut *guard,
+                        buf,
+                        |b: &OwnedDeviceBytes| b.cap,
+                        MAX_VIDEO_FRAMES_IN_FLIGHT,
+                    )
+                };
+                // Freed after the lock is released: `cuMemFree` synchronizes the device.
+                drop(evicted);
             };
 
             let handle = std::thread::Builder::new()
@@ -1794,8 +2209,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pub(crate) fn new(current: &DemoSettings, target_tod: u32, duration_s: f32) -> Self {
             let mut target = *current;
             crate::ui::apply_csg_time_of_day_preset(&mut target, target_tod);
+            // Restarted mid-crossfade: start from the sky that dominates the current blend. The
+            // shader blends two skies only, so up to half a blend can still pop (F15).
+            let from_sky_mode = if current.sky_blend > 0.0 && current.sky_blend < 0.5 {
+                current.sky_mode_from
+            } else {
+                current.sky_mode
+            };
             Self {
-                from_sky_mode: current.sky_mode,
+                from_sky_mode,
                 from_azimuth: current.sun_azimuth,
                 from_elevation: current.sun_elevation,
                 from_sun_intensity: current.sun_intensity,
@@ -1843,13 +2265,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 s.csg_time_of_day = self.to_tod;
             }
             if t >= 1.0 {
-                crate::ui::apply_csg_time_of_day_preset(s, self.to_tod);
-                s.sky_mode_from = s.sky_mode;
-                s.sky_blend = 0.0;
+                self.apply_target(s);
                 true
             } else {
                 false
             }
+        }
+
+        /// Writes the transition's end state (target preset, crossfade finished) into `s`.
+        pub(crate) fn apply_target(&self, s: &mut DemoSettings) {
+            crate::ui::apply_csg_time_of_day_preset(s, self.to_tod);
+            s.sky_mode_from = s.sky_mode;
+            s.sky_blend = 0.0;
         }
     }
 
@@ -1989,12 +2416,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             if requesting_release {
                 self.pending_grab = None;
+                // `CursorGrab::None` + `CursorVisible(false)` is camera-rs `CursorRequest::Hidden`
+                // (RMB hold-to-fly): an explicit hide of a free cursor, honoured as such. Leaving
+                // a lock for it (persistent fly -> RMB hold) must not show the cursor or warp it
+                // back to the pre-grab position: the fly look reads window pointer deltas, so a
+                // warp would turn into a look jump.
+                let hide = want_visible == Some(false);
                 if self.grab_active {
-                    return self.release_grab();
+                    let mut act = self.release_grab();
+                    if hide {
+                        act.visible = Some(false);
+                        act.restore_pos = None;
+                    }
+                    return act;
                 }
                 return CursorOsAction {
                     grab: None,
-                    visible: want_visible.filter(|&v| v),
+                    visible: want_visible,
                     restore_pos: None,
                 };
             }
@@ -2144,6 +2582,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         possess_saved_projection: Option<crate::renderer::CameraProjection>,
         viewport_toolbar: crate::viewport_toolbar::ToolbarState,
         tod_transition: Option<TodTransition>,
+        /// Set once the render worker reported `Fatal` or ended; no render work is sent after it.
+        render_fatal: Option<String>,
+        /// `false` while the newest `Resize` has not been answered by a frame of its generation.
+        resize_acked: bool,
+        startup_intent: StartupIntent,
+        still_readback: Option<TexReadback>,
+        /// Why `is_dlss_rr_available` failed at startup (`None` when it answered).
+        dlss_rr_error: Option<String>,
+        /// `(scene_idx, variant_idx)` of the last `SceneMetaUpdated` (`None` = Classic / none yet).
+        loaded_scene_key: Option<(u32, u32)>,
         cursor_grab: CursorGrabController,
         last_sent_possess_look: (u32, u32, u32, bool),
         last_possess_camera: Option<CameraFrame>,
@@ -2190,26 +2638,116 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     impl DemoApp {
-        pub fn new(window: Arc<Window>, persisted: crate::persist::PersistedState) -> Self {
+        /// Sends a render control unless the worker is gone (F12: no work after `Fatal`).
+        fn send_render(&self, cmd: RenderControl) {
+            if self.render_fatal.is_none() {
+                self.bus.send_render(cmd);
+            }
+        }
+
+        /// Publishes the coalesced render state unless the worker is gone (F12).
+        fn publish_state(&self, snapshot: RenderStateSnapshot) {
+            if self.render_fatal.is_none() {
+                self.bus.publish_render_state(snapshot);
+            }
+        }
+
+        /// Enters the terminal render-failure state once: persistent status, recording finished
+        /// cleanly (the MP4 is finalized by the export worker), lockstep left.
+        fn enter_render_fatal(&mut self, reason: String) {
+            if self.render_fatal.is_some() {
+                return;
+            }
+            eprintln!("nv-demo render worker stopped: {reason}");
+            if let Some(active) = self.video_recorder.take() {
+                self.export_worker.finish_video(
+                    active.session_id,
+                    Some("Recording stopped: render worker failed".to_string()),
+                );
+            }
+            self.is_recording = false;
+            self.record_frames = 0;
+            self.shutter_in_flight = false;
+            self.interacting_until = None;
+            self.render_fatal = Some(format!("Render worker stopped: {reason}"));
+        }
+
+        /// Copies the DLSS texture the viewport currently shows into CUDA-visible memory, or
+        /// `None` when the viewport shows the worker's `shared_rgba` (F01/F10).
+        fn copy_displayed_viewport(
+            &mut self,
+            src: ViewportStillSource,
+        ) -> Option<Result<PitchedDeviceImage, String>> {
+            match src {
+                ViewportStillSource::RenderTarget => None,
+                ViewportStillSource::DlssRrLdr | ViewportStillSource::DlssRrHdr => {
+                    let rr = self.dlss_rr_pass.as_ref()?;
+                    let tex = if src == ViewportStillSource::DlssRrHdr {
+                        &rr.display_hdr
+                    } else {
+                        &rr.display_ldr
+                    };
+                    Some(copy_texture_for_cuda(
+                        &self.interop,
+                        &mut self.still_readback,
+                        tex,
+                        rr.out_w,
+                        rr.out_h,
+                    ))
+                }
+                ViewportStillSource::DlssSr => {
+                    let dlss = self.dlss_pass.as_ref()?;
+                    Some(copy_texture_for_cuda(
+                        &self.interop,
+                        &mut self.still_readback,
+                        dlss.output_out.wgpu_texture(),
+                        dlss.out_w,
+                        dlss.out_h,
+                    ))
+                }
+            }
+        }
+    }
+
+    impl DemoApp {
+        pub fn new(window: Arc<Window>, loaded: crate::persist::LoadReport) -> Self {
+            let crate::persist::LoadReport {
+                state: mut persisted,
+                problem: persist_problem,
+            } = loaded;
             let size = window.inner_size();
-            let ngx_exts = ngx::NgxVulkan::required_extensions().ok();
+            // F26: keep the first failure of every startup stage so the UI can name the real
+            // reason instead of a generic "unavailable".
+            let mut ngx_ext_error: Option<String> = None;
+            let ngx_exts = match ngx::NgxVulkan::required_extensions() {
+                Ok(exts) => Some(exts),
+                Err(e) => {
+                    ngx_ext_error = Some(format!("NGX required extensions query failed: {e}"));
+                    None
+                }
+            };
+            let plain_instance = || {
+                wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::VULKAN,
+                    ..wgpu::InstanceDescriptor::new_without_display_handle()
+                })
+            };
             let instance = if let Some(ref exts) = ngx_exts {
                 let inst_strs: Vec<&str> = exts
                     .instance_extensions
                     .iter()
                     .map(String::as_str)
                     .collect();
-                nv_wgpu::create_vulkan_instance_with_extensions(&inst_strs).unwrap_or_else(|_| {
-                    wgpu::Instance::new(wgpu::InstanceDescriptor {
-                        backends: wgpu::Backends::VULKAN,
-                        ..wgpu::InstanceDescriptor::new_without_display_handle()
-                    })
-                })
+                match nv_wgpu::create_vulkan_instance_with_extensions(&inst_strs) {
+                    Ok(inst) => inst,
+                    Err(e) => {
+                        ngx_ext_error =
+                            Some(format!("Vulkan instance with NGX extensions failed: {e}"));
+                        plain_instance()
+                    }
+                }
             } else {
-                wgpu::Instance::new(wgpu::InstanceDescriptor {
-                    backends: wgpu::Backends::VULKAN,
-                    ..wgpu::InstanceDescriptor::new_without_display_handle()
-                })
+                plain_instance()
             };
             let surface = instance
                 .create_surface(window.clone())
@@ -2218,36 +2756,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let adapters = pollster_block(instance.enumerate_adapters(wgpu::Backends::VULKAN));
             let mut chosen = None;
             let mut used_ngx_exts = false;
+            let mut open_errors: Vec<String> = Vec::new();
             for adapter in adapters {
                 if !adapter.is_surface_supported(&surface) {
+                    open_errors.push(format!("{}: surface not supported", adapter.get_info().name));
                     continue;
                 }
                 if let Some(ref exts) = ngx_exts {
                     let dev_strs: Vec<&str> =
                         exts.device_extensions.iter().map(String::as_str).collect();
-                    if let Ok(ctx) = InteropContext::open_vulkan_with_extensions(
+                    match InteropContext::open_vulkan_with_extensions(
                         &adapter,
                         wgpu::Features::empty(),
                         &wgpu::Limits::default(),
                         Some("nv-rtx-demo"),
                         &dev_strs,
                     ) {
-                        chosen = Some((adapter, ctx));
-                        used_ngx_exts = true;
-                        break;
+                        Ok(ctx) => {
+                            chosen = Some((adapter, ctx));
+                            used_ngx_exts = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let msg = format!(
+                                "{} with NGX device extensions: {e}",
+                                adapter.get_info().name
+                            );
+                            if ngx_ext_error.is_none() {
+                                ngx_ext_error = Some(msg.clone());
+                            }
+                            open_errors.push(msg);
+                        }
                     }
                 }
-                if let Ok(ctx) = InteropContext::open_vulkan(
+                match InteropContext::open_vulkan(
                     &adapter,
                     wgpu::Features::empty(),
                     &wgpu::Limits::default(),
                     Some("nv-rtx-demo"),
                 ) {
-                    chosen = Some((adapter, ctx));
-                    break;
+                    Ok(ctx) => {
+                        chosen = Some((adapter, ctx));
+                        break;
+                    }
+                    Err(e) => open_errors.push(format!("{}: {e}", adapter.get_info().name)),
                 }
             }
-            let (adapter, interop) = chosen.expect("Vulkan+CUDA interop adapter");
+            let Some((adapter, interop)) = chosen else {
+                panic!(
+                    "no Vulkan+CUDA interop adapter ({})",
+                    if open_errors.is_empty() {
+                        "no Vulkan adapters found".to_string()
+                    } else {
+                        open_errors.join("; ")
+                    }
+                );
+            };
 
             let (ngx_vulkan, ngx_init_error) = if used_ngx_exts {
                 match (
@@ -2278,14 +2842,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 (
                     None,
-                    Some("NGX Vulkan extensions unavailable on this host/adapter".to_string()),
+                    Some(match ngx_ext_error {
+                        Some(e) => format!("NGX Vulkan extensions unavailable: {e}"),
+                        None => "NGX Vulkan extensions unavailable on this host/adapter".to_string(),
+                    }),
                 )
             };
 
-            let dlss_rr_available = ngx_vulkan
-                .as_ref()
-                .and_then(|v| v.is_dlss_rr_available().ok())
-                .unwrap_or(false);
+            let (dlss_rr_available, dlss_rr_error) = match ngx_vulkan.as_ref() {
+                Some(v) => match v.is_dlss_rr_available() {
+                    Ok(avail) => (avail, None),
+                    Err(e) => (false, Some(format!("DLSS-RR capability query failed: {e}"))),
+                },
+                None => (false, None),
+            };
             let hdr_tonemap = HdrTonemapPipeline::new(interop.device());
 
             let mut surface_config = surface
@@ -2424,17 +2994,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 assert_eq!(hdr_id, display_tex_id);
             }
 
+            // F17: the scene is persisted by descriptor id; the 1-based index is only a fallback
+            // for files written before `scene` existed.
+            let scene_descriptors = crate::csg_scene_host::default_scene_descriptors();
+            let protect_config = persist_problem.is_some();
+            if let Some(ref p) = persist_problem {
+                eprintln!("nv-demo config: {p}");
+            }
+            let mut startup_msg = persist_problem;
+            match persisted.scene.as_ref() {
+                Some(saved) => match resolve_saved_scene(
+                    &scene_descriptors,
+                    saved,
+                    persisted.settings.csg_asset_idx,
+                ) {
+                    Some((mode, asset)) => {
+                        persisted.settings.csg_mode = mode;
+                        persisted.settings.csg_asset_idx = asset;
+                    }
+                    None => {
+                        persisted.settings.csg_mode = 0;
+                        if startup_msg.is_none() {
+                            startup_msg =
+                                Some(format!("Saved scene '{}' is no longer registered", saved.id));
+                        }
+                    }
+                },
+                None => {
+                    if persisted.settings.csg_mode as usize > scene_descriptors.len() {
+                        persisted.settings.csg_mode = 0;
+                    }
+                }
+            }
+
             let mut settings = persisted.settings;
+            let mut startup_intent = StartupIntent::default();
             if settings.hdr_display && !hdr_surface_supported {
                 settings.hdr_display = false;
+                startup_intent.hdr_display = Some(true);
             }
             if settings.dlss_rr_on && !dlss_rr_available {
                 settings.dlss_rr_on = false;
+                startup_intent.dlss_rr_on = Some(true);
             }
             if settings.dlss_rr_on {
                 settings.dlss_on = false;
                 settings.denoiser_on = false;
             }
+            startup_intent.ai_at_start = (settings.dlss_on, settings.denoiser_on);
             let initial_camera = pose_to_frame(cam_pose);
             let bus = AppBus::new(RenderStateSnapshot {
                 settings,
@@ -2454,16 +3061,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 bus.clone(),
             );
 
-            let nvml_lib = nvml::Nvml::init()
-                .ok()
-                .map(|n| Box::leak(Box::new(n)) as &'static nvml::Nvml);
-            let nvml_dev = nvml_lib.and_then(|n| n.device_by_index(0).ok());
+            // NVML is optional telemetry: a failure only hides the GPU gauges, so it is logged.
+            let nvml_lib = match nvml::Nvml::init() {
+                Ok(n) => Some(Box::leak(Box::new(n)) as &'static nvml::Nvml),
+                Err(e) => {
+                    eprintln!("nv-demo NVML init failed (GPU telemetry disabled): {e}");
+                    None
+                }
+            };
+            let nvml_dev = nvml_lib.and_then(|n| match n.device_by_index(0) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("nv-demo NVML device 0 unavailable (GPU telemetry disabled): {e}");
+                    None
+                }
+            });
             let mut profiler = Profiler::new(Some(interop.cuda_context()));
             let telemetry = profiler.read_telemetry(nvml_dev.as_ref());
 
             let export_worker =
                 ExportWorker::spawn(Arc::clone(interop.cuda_context()), bus.clone());
-            let persist_worker = crate::persist::PersistWorker::spawn();
+            // F07: a config file that could not be read in full is never overwritten; this
+            // session then writes nowhere (see `persist` module docs).
+            let persist_worker = if protect_config {
+                crate::persist::PersistWorker::spawn_for_path(None)
+            } else {
+                crate::persist::PersistWorker::spawn()
+            };
 
             let dock_state = default_dock_state();
             let theme = persisted.theme;
@@ -2513,7 +3137,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 using_dlss_tex: false,
                 bound_hdr_tex: false,
                 last_jitter: [0.0, 0.0],
-                last_saved_msg: None,
+                last_saved_msg: startup_msg,
                 bus,
                 ui_cmd_scratch: Vec::with_capacity(16),
                 render_ev_scratch: Vec::with_capacity(32),
@@ -2551,7 +3175,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 crowd_active_backend: crate::sdg_export::ActiveCrowdBackend::None,
                 crowd_actor_count: 0,
                 last_rendered_camera: initial_camera,
-                scene_descriptors: crate::csg_scene_host::default_scene_descriptors(),
+                scene_descriptors,
                 scene_viewpoints: Vec::new(),
                 pending_scene_auto_frame: None,
                 rail_random_seed: 2026,
@@ -2562,8 +3186,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_auto_level: true,
                 possess_zoom_offset: 0.0,
                 possess_saved_projection: None,
-                viewport_toolbar: crate::viewport_toolbar::ToolbarState::default(),
+                viewport_toolbar: crate::viewport_toolbar::ToolbarState {
+                    edge: persisted.viewport_toolbar.edge,
+                    expanded: persisted.viewport_toolbar.expanded,
+                    ..crate::viewport_toolbar::ToolbarState::default()
+                },
                 tod_transition: None,
+                render_fatal: None,
+                resize_acked: true,
+                startup_intent,
+                still_readback: None,
+                dlss_rr_error,
+                loaded_scene_key: None,
                 cursor_grab: CursorGrabController::default(),
                 last_sent_possess_look: (
                     0.0f32.to_bits(),
@@ -2606,7 +3240,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         fn notify_recording(&mut self, active: bool) {
             self.shutter_in_flight = false;
             let fixed_fps = if active && self.settings.record_fixed_fps {
-                60
+                RECORD_FPS
             } else {
                 0
             };
@@ -2615,7 +3249,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 1
             };
-            self.bus.send_render(RenderControl::SetRecording {
+            self.send_render(RenderControl::SetRecording {
                 active,
                 fixed_fps,
                 shutter_subframes,
@@ -2626,7 +3260,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             crate::persist::PersistedState {
                 window: self.win_state,
                 theme: self.theme,
-                settings: self.settings,
+                settings: user_intent_settings(
+                    &self.settings,
+                    self.possess_saved_projection,
+                    self.tod_transition.as_ref(),
+                    self.startup_intent,
+                ),
                 demo_anim: self.demo_anim.clone(),
                 camera: crate::persist::CameraState::from_runtime(
                     self.cam_mode,
@@ -2636,6 +3275,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.cam_pose,
                 ),
                 camera_rail: self.camera_rail.clone(),
+                scene: saved_scene_of(
+                    &self.scene_descriptors,
+                    self.settings.csg_mode,
+                    self.settings.csg_asset_idx,
+                ),
+                viewport_toolbar: crate::persist::PersistedToolbar {
+                    edge: self.viewport_toolbar.edge,
+                    expanded: self.viewport_toolbar.expanded,
+                },
             }
         }
 
@@ -2766,6 +3414,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
+            let mut fatal_reason: Option<String> = None;
             self.bus.poll_render_events(&mut self.render_ev_scratch);
             for boxed in &self.render_ev_scratch {
                 let Some(ev) = downcast_event::<RenderEvent>(boxed) else {
@@ -2777,6 +3426,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             continue;
                         }
                         frames_received += 1;
+                        self.resize_acked = true;
                         self.shutter_in_flight = false;
                         if self.has_frame && self.front_buf_idx != msg.buf_idx {
                             self.bus.send_render(RenderControl::ReturnBuffer {
@@ -2830,6 +3480,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
                     }
                     RenderEvent::SceneMetaUpdated(meta) => {
+                        self.loaded_scene_key = Some((meta.scene_idx, meta.variant_idx));
                         self.scene_viewpoints = meta.viewpoints.clone();
                         self.camera_rail.set_scene_rails(meta.rails.clone());
                         if self.camera_rail.is_active() {
@@ -2864,7 +3515,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     RenderEvent::RailGenerated(rail_spec) => {
                         self.camera_rail.push_generated_rail(rail_spec.clone());
-                        self.rail_blend_remaining = 1.6;
+                        self.rail_blend_remaining = RAIL_BLEND_SECS;
                     }
                     RenderEvent::PossessChanged(info) => {
                         if let Some(pinfo) = info {
@@ -2930,12 +3581,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
                     }
+                    RenderEvent::Fatal(reason) => {
+                        if fatal_reason.is_none() {
+                            fatal_reason = Some(reason.clone());
+                        }
+                    }
                 }
+            }
+            if let Some(reason) = fatal_reason {
+                self.enter_render_fatal(reason);
+            }
+            // F12: a worker that ended without `Fatal` (panic) is detected here; the check is one
+            // atomic load per frame and the join cannot block because the thread has finished.
+            if self.render_fatal.is_none()
+                && self
+                    .render_thread
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+                && let Some(handle) = self.render_thread.take()
+            {
+                let reason = render_exit_reason(handle);
+                self.enter_render_fatal(reason);
             }
 
             // 2. Docked egui pass (60+ FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let prev_theme = self.theme;
+            let lighting_before = LightingKey::of(&self.settings);
             let cam_fixed_dt = if self.is_recording && self.settings.record_fixed_fps {
                 // Lockstep recording steps camera strictly inside `RenderShutterSubframe` batches.
                 Some(0.0)
@@ -2998,7 +3670,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 pick_possess_mode: &mut self.pick_possess_mode,
                 smart_view_seed: &mut self.smart_view_seed,
                 last_smart_view: self.last_smart_view,
-                last_saved_msg: self.last_saved_msg.as_deref(),
+                // A render-worker failure stays on screen; later status messages do not hide it.
+                last_saved_msg: self
+                    .render_fatal
+                    .as_deref()
+                    .or(self.last_saved_msg.as_deref()),
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                 egui::Panel::top("top_toolbar").show(ui, |ui| {
@@ -3011,6 +3687,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .show_leaf_collapse_buttons(false)
                     .show_inside(ui, &mut ui_ctx);
             });
+            cancel_tod_on_user_edit(lighting_before, &mut self.settings, &mut self.tod_transition);
 
             let mut reset_accum_requested = false;
             let mut cam_snap_requested = false;
@@ -3032,6 +3709,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut poke_crowd_req: Option<(f32, bool)> = None;
             let mut spawn_crowd_stress: Option<usize> = None;
             let mut start_sdg_burst: Option<u32> = None;
+            let mut cancel_sdg_burst_requested = false;
             self.bus.poll_ui_commands(&mut self.ui_cmd_scratch);
             for boxed in &self.ui_cmd_scratch {
                 let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
@@ -3089,6 +3767,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     UiCommand::StartSdgBurst { frames } => {
                         start_sdg_burst = Some(frames);
                     }
+                    UiCommand::CancelSdgBurst => cancel_sdg_burst_requested = true,
                     UiCommand::SetTimeOfDay(tod) => {
                         let target_tod = tod.min(2);
                         if self.settings.tod_transition_enabled
@@ -3109,12 +3788,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
-            if !(self.is_recording && self.settings.record_fixed_fps)
-                && let Some(tr) = self.tod_transition.as_mut()
-                && tr.step(&mut self.settings, dt)
-            {
-                self.tod_transition = None;
-            }
             if self.theme != prev_theme {
                 self.dock_style = self.theme.apply(&self.egui_ctx);
             }
@@ -3132,10 +3805,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                 } else if !self.dlss_rr_available {
                     self.settings.dlss_rr_on = false;
-                    self.last_saved_msg = Some(
+                    self.last_saved_msg = Some(self.dlss_rr_error.clone().unwrap_or_else(|| {
                         "DLSS-RR unavailable: SuperSamplingDenoising not supported on this host/runtime"
-                            .to_string(),
-                    );
+                            .to_string()
+                    }));
                 }
             } else if self.settings.dlss_on && self.ngx_vulkan.is_none() {
                 self.settings.dlss_on = false;
@@ -3169,18 +3842,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                     };
                     match opt_res {
-                        Ok(opt) => {
-                            // `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT = 256` requires `render_w % 64 == 0`
-                            // for 4-byte formats (`Rgba8Unorm`, `R32Float`).
-                            let max_w = (opt.max_width.min(out_w) & !63).max(64);
-                            let min_w = ((opt.min_width.max(64) + 63) & !63).min(max_w);
-                            let min_h = opt.min_height.max(144.min(out_h)).min(out_h);
-                            let max_h = opt.max_height.min(out_h).max(min_h);
-                            (
-                                ((opt.render_width + 31) & !63).clamp(min_w, max_w),
-                                (opt.render_height & !1).clamp(min_h, max_h),
-                            )
-                        }
+                        Ok(opt) => dlss_render_dims(&opt, out_w, out_h),
                         Err(e) => {
                             if is_rr {
                                 self.settings.dlss_rr_on = false;
@@ -3242,18 +3904,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let drop_rr_bufs = !self.settings.dlss_rr_on && self.rr_shared.is_some();
             let needs_hdr_bufs = need_hdr_buf && self.shared_hdr.is_none();
             let drop_hdr_bufs = !need_hdr_buf && self.shared_hdr.is_some();
-            if (target_w != self.render_w
-                || target_h != self.render_h
-                || needs_rr_bufs
-                || drop_rr_bufs
-                || needs_hdr_bufs
-                || drop_hdr_bufs)
-                && (self.last_resize_at.elapsed().as_millis() >= 120
-                    || dlss_toggled
-                    || needs_rr_bufs
-                    || drop_rr_bufs
-                    || needs_hdr_bufs
-                    || drop_hdr_bufs)
+            if self.render_fatal.is_none()
+                && resize_allowed(
+                    target_w != self.render_w || target_h != self.render_h,
+                    needs_rr_bufs || drop_rr_bufs || needs_hdr_bufs || drop_hdr_bufs,
+                    self.last_resize_at.elapsed().as_millis() >= 120,
+                    dlss_toggled,
+                    self.resize_acked,
+                )
             {
                 self.last_resize_at = Instant::now();
                 let rr_alloc = if self.settings.dlss_rr_on {
@@ -3340,7 +3998,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.front_buf_idx = 0;
                         self.accum_count = 0;
                         self.total_samples = 0;
-                        self.bus.send_render(RenderControl::Resize {
+                        self.resize_acked = false;
+                        self.send_render(RenderControl::Resize {
                             width: target_w,
                             height: target_h,
                             buf_ptrs: new_ptrs,
@@ -3563,38 +4222,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut capture_window_png = false;
             let mut capture_window_jpeg = false;
             let mut companion_sdg_requested = false;
+            let still_src = viewport_still_source(
+                self.settings.dlss_rr_on,
+                self.settings.aov_mode,
+                self.dlss_rr_pass.is_some(),
+                self.settings.dlss_on,
+                self.dlss_pass.is_some(),
+                hdr_active,
+            );
             if save_png_requested {
                 if self.settings.capture_source == CaptureSource::FullWindow {
                     capture_window_png = true;
                 } else if self.has_frame {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let path = PathBuf::from("renders").join(format!("nv-demo-{ts}.png"));
-                    let byte_len = (self.render_w as usize)
-                        .saturating_mul(self.render_h as usize)
-                        .saturating_mul(4);
-                    match readback_device_bytes(
-                        self.interop.cuda_context(),
-                        self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
-                        byte_len,
-                    )
-                    .and_then(|rgba| {
-                        self.export_worker.enqueue_png_rgba(
-                            rgba,
-                            self.render_w,
-                            self.render_h,
-                            path.clone(),
-                        )
-                    }) {
-                        Ok(()) => {
-                            self.last_saved_msg = Some(format!("Saving {}...", path.display()));
+                    let path = PathBuf::from(RENDERS_DIR).join(output_file_name("nv-demo", ".png"));
+                    let res = match self.copy_displayed_viewport(still_src) {
+                        Some(Ok(img)) => {
+                            let byte_len = (img.pitch_px as usize)
+                                .saturating_mul(img.height as usize)
+                                .saturating_mul(img.fmt.bytes_per_pixel() as usize);
+                            readback_device_bytes(self.interop.cuda_context(), img.ptr, byte_len)
+                                .and_then(|raw| {
+                                    self.export_worker.enqueue_png_pitched(
+                                        raw,
+                                        img.width,
+                                        img.height,
+                                        img.pitch_px,
+                                        img.fmt,
+                                        path.clone(),
+                                    )
+                                })
                         }
-                        Err(e) => {
-                            self.last_saved_msg = Some(e);
+                        Some(Err(e)) => Err(e),
+                        None => {
+                            let byte_len = (self.render_w as usize)
+                                .saturating_mul(self.render_h as usize)
+                                .saturating_mul(4);
+                            readback_device_bytes(
+                                self.interop.cuda_context(),
+                                self.shared_rgba[self.front_buf_idx].cu_deviceptr(),
+                                byte_len,
+                            )
+                            .and_then(|rgba| {
+                                self.export_worker.enqueue_png_rgba(
+                                    rgba,
+                                    self.render_w,
+                                    self.render_h,
+                                    path.clone(),
+                                )
+                            })
                         }
-                    }
+                    };
+                    self.last_saved_msg = Some(match res {
+                        Ok(()) => format!("Saving {}...", path.display()),
+                        Err(e) => e,
+                    });
+                } else {
+                    self.last_saved_msg = Some("No rendered frame yet: PNG not saved".to_string());
                 }
                 if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
                     companion_sdg_requested = true;
@@ -3604,33 +4287,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if self.settings.capture_source == CaptureSource::FullWindow {
                     capture_window_jpeg = true;
                 } else if self.has_frame {
-                    let dir = std::path::Path::new("renders");
+                    let dir = std::path::Path::new(RENDERS_DIR);
                     if let Err(e) = std::fs::create_dir_all(dir) {
-                        self.last_saved_msg = Some(format!("Failed to create renders/: {e}"));
+                        self.last_saved_msg = Some(format!("Failed to create {RENDERS_DIR}/: {e}"));
                     } else {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let path = dir.join(format!("nv-demo-{ts}.jpg"));
-                        self.bus.send_render(RenderControl::SaveJpeg { path, quality: 92 });
+                        let path = dir.join(output_file_name("nv-demo", ".jpg"));
+                        match self.copy_displayed_viewport(still_src) {
+                            Some(Ok(img)) => {
+                                self.last_saved_msg = Some(
+                                    match self.export_worker.enqueue_jpeg_device(
+                                        img,
+                                        path.clone(),
+                                        92,
+                                    ) {
+                                        Ok(()) => format!("Saving {}...", path.display()),
+                                        Err(e) => format!("Viewport JPEG failed: {e}"),
+                                    },
+                                );
+                            }
+                            Some(Err(e)) => {
+                                self.last_saved_msg = Some(format!("Viewport JPEG failed: {e}"));
+                            }
+                            None => self.send_render(RenderControl::SaveJpeg { path, quality: 92 }),
+                        }
                     }
+                } else {
+                    self.last_saved_msg = Some("No rendered frame yet: JPEG not saved".to_string());
                 }
                 if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
                     companion_sdg_requested = true;
                 }
             }
             if (export_sdg_json_requested || companion_sdg_requested) && self.settings.csg_mode > 0 {
-                let dir = std::path::Path::new("renders");
+                let dir = std::path::Path::new(RENDERS_DIR);
                 if let Err(e) = std::fs::create_dir_all(dir) {
-                    self.last_saved_msg = Some(format!("Failed to create renders/: {e}"));
+                    self.last_saved_msg = Some(format!("Failed to create {RENDERS_DIR}/: {e}"));
                 } else {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let path = dir.join(format!("nv-demo-sdg-{ts}.json"));
-                    self.bus.send_render(RenderControl::ExportSdgJson {
+                    let path = dir.join(output_file_name("nv-demo-sdg", ".json"));
+                    self.send_render(RenderControl::ExportSdgJson {
                         path,
                         occluder: self.settings.sdg_occluder_backend,
                     });
@@ -3639,22 +4333,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if let Some(frames) = start_sdg_burst
                 && self.settings.csg_mode > 0
             {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let dir = std::path::Path::new("renders").join(format!("sdg-burst-{ts}"));
-                self.bus.send_render(RenderControl::StartSdgBurst {
+                let dir = std::path::Path::new(RENDERS_DIR).join(output_file_name("sdg-burst", ""));
+                self.send_render(RenderControl::StartSdgBurst {
                     dir,
                     frames: frames.clamp(1, 240),
                     occluder: self.settings.sdg_occluder_backend,
                 });
             }
+            if cancel_sdg_burst_requested {
+                self.send_render(RenderControl::CancelSdgBurst);
+            }
             if let Some((impulse, all)) = poke_crowd_req
                 && self.settings.csg_mode > 0
             {
                 let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
-                self.bus.send_render(RenderControl::PokeCrowd {
+                self.send_render(RenderControl::PokeCrowd {
                     origin: active_cam.eye,
                     forward: active_cam.fwd,
                     impulse: impulse.clamp(0.5, 4.0),
@@ -3665,7 +4358,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 && self.settings.csg_mode > 0
             {
                 let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
-                self.bus.send_render(RenderControl::SpawnCrowdStress {
+                self.send_render(RenderControl::SpawnCrowdStress {
                     target_count,
                     origin: active_cam.eye,
                 });
@@ -3677,6 +4370,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.is_recording = false;
                     self.record_frames = 0;
                     self.notify_recording(false);
+                } else if self.render_fatal.is_some() {
+                    self.last_saved_msg =
+                        Some("Recording unavailable: the render worker has stopped".to_string());
                 } else {
                     let use_pq10 = match self.settings.record_video_mode {
                         1 => false,
@@ -3689,23 +4385,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         crate::gpu_export::VideoProfile::SdrH264
                     };
                     let tag = if use_pq10 { "pq10" } else { "sdr" };
-                    let dir = std::path::Path::new("renders");
+                    let dir = std::path::Path::new(RENDERS_DIR);
                     if let Err(e) = std::fs::create_dir_all(dir) {
-                        self.last_saved_msg = Some(format!("Failed to create renders/: {e}"));
+                        self.last_saved_msg = Some(format!("Failed to create {RENDERS_DIR}/: {e}"));
                     } else {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-
-                        if self.settings.capture_source == CaptureSource::FullWindow {
+                        let full_window = self.settings.capture_source == CaptureSource::FullWindow;
+                        if full_window {
                             let win_w = self.surface_config.width;
                             let win_h = self.surface_config.height;
                             let win_tex_fmt = self.surface_config.format;
                             let win_fmt =
                                 crate::gpu_export::SourcePixelFormat::from_wgpu(win_tex_fmt);
                             let even_dims = crate::gpu_export::align_even_dims(win_w, win_h);
-                            let path = dir.join(format!("nv-demo-{ts}-win-{tag}.mp4"));
+                            let path = dir.join(output_file_name("nv-demo", &format!("-win-{tag}.mp4")));
 
                             if let (Some(src_fmt), Some((rec_w, rec_h))) = (win_fmt, even_dims) {
                                 if use_pq10
@@ -3739,7 +4431,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                             .start_video(
                                                 rec_w,
                                                 rec_h,
-                                                60,
+                                                RECORD_FPS,
                                                 profile,
                                                 src_fmt,
                                                 path.clone(),
@@ -3754,7 +4446,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                                 pixel_format: src_fmt,
                                                 width: rec_w,
                                                 height: rec_h,
-                                                fps: 60,
+                                                fps: RECORD_FPS,
                                                 copy_buf: None,
                                                 copy_pitch_px,
                                                 last_frame_at: None,
@@ -3800,7 +4492,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 } else {
                                     (self.render_w & !1, self.render_h & !1, false)
                                 };
-                            let path = dir.join(format!("nv-demo-{ts}-{tag}.mp4"));
+                            let path = dir.join(output_file_name("nv-demo", &format!("-{tag}.mp4")));
 
                             let src_fmt = if use_pq10 {
                                 crate::gpu_export::SourcePixelFormat::ScrgbF16
@@ -3824,7 +4516,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             };
                             match copy_buf_res.and_then(|copy_buf| {
                                 self.export_worker
-                                    .start_video(src_w, src_h, 60, profile, src_fmt, path.clone())
+                                    .start_video(src_w, src_h, RECORD_FPS, profile, src_fmt, path.clone())
                                     .map(|session_id| (session_id, copy_buf))
                             }) {
                                 Ok((session_id, copy_buf)) => {
@@ -3835,7 +4527,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                         pixel_format: src_fmt,
                                         width: src_w,
                                         height: src_h,
-                                        fps: 60,
+                                        fps: RECORD_FPS,
                                         copy_buf,
                                         copy_pitch_px,
                                         last_frame_at: None,
@@ -3858,17 +4550,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
             if let Some((scene_idx, variant_idx)) = select_scene_target {
-                self.pending_scene_auto_frame = Some((scene_idx, variant_idx));
+                self.pending_scene_auto_frame =
+                    scene_auto_frame_target(self.loaded_scene_key, (scene_idx, variant_idx));
+                if scene_idx == 0 {
+                    // Classic unloads the CSG world: returning to the previous scene rebuilds it.
+                    self.loaded_scene_key = None;
+                }
                 self.camera_rail.set_playing(false);
                 if self.possess_info.is_some() {
-                    self.bus.send_render(RenderControl::EjectPossess);
+                    self.send_render(RenderControl::EjectPossess);
                 }
             }
             if let Some(seed) = generate_random_rail_seed {
                 if self.possess_info.is_some() {
-                    self.bus.send_render(RenderControl::EjectPossess);
+                    self.send_render(RenderControl::EjectPossess);
                 }
-                self.bus.send_render(RenderControl::GenerateRandomRail { seed });
+                self.send_render(RenderControl::GenerateRandomRail { seed });
             }
             if let Some((norm_x, norm_y)) = pick_possess_uv {
                 let active_cam = self.last_rendered_camera;
@@ -3880,38 +4577,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     norm_y,
                     aspect,
                 ) {
-                    self.bus.send_render(RenderControl::PickPossess { origin, dir });
+                    self.send_render(RenderControl::PickPossess { origin, dir });
                 } else {
                     self.last_saved_msg = Some("Click inside the fisheye sensor circle to pick".to_string());
                 }
             }
             if possess_next_vehicle_requested {
-                self.bus.send_render(RenderControl::PossessNextVehicle);
+                self.send_render(RenderControl::PossessNextVehicle);
             }
             if let Some(mount_idx) = select_possess_mount {
-                self.bus.send_render(RenderControl::SetPossessMount { mount_idx });
+                self.send_render(RenderControl::SetPossessMount { mount_idx });
             } else if cycle_possess_mount_delta != 0
                 && let Some(ref info) = self.possess_info
                 && !info.mounts.is_empty()
             {
                 let next_idx = (info.mount_idx as i32 + cycle_possess_mount_delta)
                     .rem_euclid(info.mounts.len() as i32) as usize;
-                self.bus
-                    .send_render(RenderControl::SetPossessMount { mount_idx: next_idx });
+                self.send_render(RenderControl::SetPossessMount { mount_idx: next_idx });
             }
             if eject_possess_requested {
-                self.bus.send_render(RenderControl::EjectPossess);
+                self.send_render(RenderControl::EjectPossess);
             }
             if let Some((seed, backend)) = run_smart_view {
-                self.bus
-                    .send_render(RenderControl::RunSmartView { seed, backend });
+                self.send_render(RenderControl::RunSmartView { seed, backend });
             }
             if let Some((seed, backend)) = run_smart_rail {
-                self.bus
-                    .send_render(RenderControl::RunSmartRail { seed, backend });
+                self.send_render(RenderControl::RunSmartRail { seed, backend });
             }
             if reload_shader_requested {
-                self.bus.send_render(RenderControl::ReloadShader);
+                self.send_render(RenderControl::ReloadShader);
             }
 
             // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.
@@ -3925,9 +4619,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             };
             if rail_blend_requested {
                 if self.possess_info.is_some() {
-                    self.bus.send_render(RenderControl::EjectPossess);
+                    self.send_render(RenderControl::EjectPossess);
                 }
-                self.rail_blend_remaining = 1.6;
+                self.rail_blend_remaining = RAIL_BLEND_SECS;
             }
             if cam_snap_requested {
                 self.rail_blend_remaining = 0.0;
@@ -3946,7 +4640,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             if self.is_recording && self.settings.record_fixed_fps {
                 if !self.shutter_in_flight {
-                    let frame_dt = (1.0 / 60.0) * time_scale;
+                    let frame_dt = time_scale / RECORD_FPS as f32;
                     let mut final_settings = self.last_sent_settings;
                     let mut final_cam = self.last_sent_camera;
                     for sub_idx in 0..shutter_n {
@@ -3980,7 +4674,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.cam_pose = df.pose;
                         }
                         let effective_tau = if self.rail_blend_remaining > 0.0 {
-                            let frac = (self.rail_blend_remaining / 1.6).clamp(0.0, 1.0);
+                            let frac = (self.rail_blend_remaining / RAIL_BLEND_SECS).clamp(0.0, 1.0);
                             self.rail_blend_remaining = (self.rail_blend_remaining - sub_dt).max(0.0);
                             self.settings.cam_smooth_tau.max(0.32 * frac)
                         } else {
@@ -3999,7 +4693,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let cam_frame = pose_to_frame(smoothed);
                         final_settings = effective_settings;
                         final_cam = cam_frame;
-                        self.bus.send_render(RenderControl::RenderShutterSubframe {
+                        self.send_render(RenderControl::RenderShutterSubframe {
                             settings: Box::new(effective_settings),
                             camera: cam_frame,
                             sim_dt: sub_dt,
@@ -4016,7 +4710,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.last_sent_settings = final_settings;
                     self.last_sent_camera = final_cam;
                     self.last_sent_possess_look = possess_look;
-                    self.bus.publish_render_state(RenderStateSnapshot {
+                    self.publish_state(RenderStateSnapshot {
                         settings: final_settings,
                         camera: final_cam,
                         interacting_until: None,
@@ -4040,7 +4734,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.interacting_until = None;
                         self.last_sent_settings = effective_settings;
                         self.last_sent_possess_look = possess_look;
-                        self.bus.publish_render_state(RenderStateSnapshot {
+                        self.publish_state(RenderStateSnapshot {
                             settings: effective_settings,
                             camera: self.last_sent_camera,
                             interacting_until: None,
@@ -4053,8 +4747,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             } else {
-                let step_dt = dt * time_scale;
+                let (step_dt, damper_dt) =
+                    live_step_dts(dt, time_scale, self.camera_rail.is_active());
                 self.demo_anim.tick(step_dt);
+                if let Some(tr) = self.tod_transition.as_mut()
+                    && tr.step(&mut self.settings, step_dt)
+                {
+                    self.tod_transition = None;
+                }
                 if self.camera_rail.is_active() {
                     self.camera_rail.tick(step_dt);
                     if let Some(rp) = self
@@ -4066,13 +4766,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
                 let effective_tau = if self.rail_blend_remaining > 0.0 {
-                    let frac = (self.rail_blend_remaining / 1.6).clamp(0.0, 1.0);
-                    self.rail_blend_remaining = (self.rail_blend_remaining - dt).max(0.0);
+                    let frac = (self.rail_blend_remaining / RAIL_BLEND_SECS).clamp(0.0, 1.0);
+                    self.rail_blend_remaining = (self.rail_blend_remaining - step_dt).max(0.0);
                     self.settings.cam_smooth_tau.max(0.32 * frac)
                 } else {
                     self.settings.cam_smooth_tau
                 };
-                let render_pose = self.cam_damper.step(self.cam_pose, dt, effective_tau);
+                let render_pose = self.cam_damper.step(self.cam_pose, damper_dt, effective_tau);
                 let mut effective_settings = self.demo_anim.apply(&self.settings);
                 if !self.demo_anim.playing {
                     effective_settings.auto_rotate = false;
@@ -4096,7 +4796,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.last_sent_settings = effective_settings;
                     self.last_sent_camera = cam_frame;
                     self.last_sent_possess_look = possess_look;
-                    self.bus.publish_render_state(RenderStateSnapshot {
+                    self.publish_state(RenderStateSnapshot {
                         settings: effective_settings,
                         camera: cam_frame,
                         interacting_until: self.interacting_until,
@@ -4110,23 +4810,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             // 5. wgpu present (copy latest SharedBuffer -> display_texture + render egui).
+            // F02: a frame without a surface texture (resize, minimize, timeout) skips only the
+            // surface draw and present. Texture deltas, platform output, cursor commands, window
+            // captures and recorder pushes below still run, or glyph-atlas patches, the one-shot
+            // cursor grab and Smooth 60 frames would be lost.
             let frame = match self.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(f)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+                | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                     let s = self.window.inner_size();
                     self.resize(s.width, s.height);
-                    return;
+                    None
                 }
                 wgpu::CurrentSurfaceTexture::Timeout
                 | wgpu::CurrentSurfaceTexture::Occluded
-                | wgpu::CurrentSurfaceTexture::Validation => {
-                    return;
-                }
+                | wgpu::CurrentSurfaceTexture::Validation => None,
             };
-            let view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            let view = frame.as_ref().map(|f| {
+                f.texture
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            });
 
             self.egui_winit
                 .handle_platform_output(&self.window, full_output.platform_output);
@@ -4245,17 +4948,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             rr.normals_in.wgpu_texture(),
                             8,
                         );
+                        // No host wait (F27): `submit_vulkan_commands` now records the NGX work
+                        // into a wgpu encoder on the same queue, so it is submitted after these
+                        // copies, and its `TransferDst -> ShaderRead` barriers order their writes.
                         self.interop.queue().submit(Some(copy_enc.finish()));
-                        // Wait for wgpu's Vulkan queue to complete all 6 buffer->texture copies
-                        // before `rr.evaluate` submits on the dedicated barrier VkQueue (prevents
-                        // cross-queue normal/depth read hazards and periodic flashes).
-                        if let Err(e) = self
-                            .interop
-                            .device()
-                            .poll(wgpu::PollType::wait_indefinitely())
-                        {
-                            eprintln!("nv-demo wgpu poll (DLSS-RR) failed: {e}");
-                        }
                         let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
                         let rc = self.last_rendered_camera;
                         let rc_fov_y = (2.0 * rc.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
@@ -4397,14 +5093,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             dlss.motion_in.wgpu_texture(),
                             8,
                         );
+                        // Same-queue ordering as for DLSS-RR above: no host wait needed (F27).
                         self.interop.queue().submit(Some(copy_enc.finish()));
-                        if let Err(e) = self
-                            .interop
-                            .device()
-                            .poll(wgpu::PollType::wait_indefinitely())
-                        {
-                            eprintln!("nv-demo wgpu poll (DLSS-SR) failed: {e}");
-                        }
                         let t_dlss = Instant::now();
                         if let Err(e) = dlss.evaluate(
                             &self.interop,
@@ -4598,7 +5288,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     height: cap.height,
                     depth_or_array_layers: 1,
                 };
-                if self.surface_supports_copy_dst {
+                if self.surface_supports_copy_dst
+                    && let Some(ref surface_frame) = frame
+                {
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: &cap.texture,
@@ -4607,18 +5299,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             aspect: wgpu::TextureAspect::All,
                         },
                         wgpu::TexelCopyTextureInfo {
-                            texture: &frame.texture,
+                            texture: &surface_frame.texture,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         extent,
                     );
-                } else {
+                } else if !self.surface_supports_copy_dst
+                    && let Some(ref surface_view) = view
+                {
                     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("egui-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
+                            view: surface_view,
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
@@ -4652,11 +5346,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     extent,
                 );
                 win_gpu_copied = true;
-            } else {
+            } else if let Some(ref surface_view) = view {
                 let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view: surface_view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -4740,13 +5434,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            self.interop.queue().submit(Some(encoder.finish()));
+            let frame_submission = self.interop.queue().submit(Some(encoder.finish()));
+            // F27: the copies below are read by CUDA, so wait for this submission only, bounded:
+            // a GPU hang drops the capture with a message instead of freezing the UI thread.
+            let frame_copy_wait = wgpu::PollType::Wait {
+                submission_index: Some(frame_submission),
+                timeout: Some(GPU_COPY_WAIT_TIMEOUT),
+            };
 
             if win_gpu_copied && let Some(ref cap) = self.window_capture {
                 let poll_err = self
                     .interop
                     .device()
-                    .poll(wgpu::PollType::wait_indefinitely())
+                    .poll(frame_copy_wait.clone())
                     .err();
                 if let Some(e) = poll_err {
                     eprintln!("nv-demo wgpu poll (window capture) failed: {e}");
@@ -4759,12 +5459,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let cap_fmt = cap.pixel_format;
 
                     if capture_window_png {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let path = PathBuf::from("renders")
-                            .join(format!("nv-demo-{ts}-win.png"));
+                        let path =
+                            PathBuf::from(RENDERS_DIR).join(output_file_name("nv-demo", "-win.png"));
                         let byte_len = (cap_pitch_px as usize)
                             .saturating_mul(cap_h as usize)
                             .saturating_mul(cap_fmt.bytes_per_pixel() as usize);
@@ -4787,12 +5483,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
 
                     if capture_window_jpeg {
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let path = PathBuf::from("renders")
-                            .join(format!("nv-demo-{ts}-win.jpg"));
+                        let path =
+                            PathBuf::from(RENDERS_DIR).join(output_file_name("nv-demo", "-win.jpg"));
                         self.last_saved_msg = Some(
                             match self.export_worker.enqueue_jpeg_device(
                                 PitchedDeviceImage {
@@ -4830,16 +5522,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.last_saved_msg = Some(reason);
                         } else {
                             let rec_now = Instant::now();
-                            let frame_dur = if self.settings.record_fixed_fps {
-                                1.0 / f64::from(active.fps.max(1))
-                            } else {
-                                let d = active.last_frame_at.map_or(
-                                    1.0 / f64::from(active.fps.max(1)),
-                                    |prev| rec_now.duration_since(prev).as_secs_f64(),
-                                );
-                                d.clamp(1.0 / 240.0, 2.0)
-                            };
-                            active.last_frame_at = Some(rec_now);
+                            let frame_dur = video_frame_duration(
+                                self.settings.record_fixed_fps,
+                                active.fps,
+                                active.last_frame_at,
+                                rec_now,
+                            );
                             match self.export_worker.push_video_frame(
                                 active.session_id,
                                 PitchedDeviceImage {
@@ -4852,7 +5540,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 frame_dur,
                                 !self.settings.record_fixed_fps,
                             ) {
-                                Ok(_) => {
+                                Ok(accepted) => {
+                                    // F04: a dropped frame's interval goes to the next frame.
+                                    if accepted {
+                                        active.last_frame_at = Some(rec_now);
+                                    }
                                     self.record_frames = self.export_worker.recorded_frames();
                                     self.video_recorder = Some(active);
                                 }
@@ -4880,11 +5572,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let mut waiting_for_hdr = false;
                 let mut stop_reason: Option<String> = None;
                 let (src_ptr, src_pitch, dims_ok) = if rec_gpu_copied {
-                    if let Err(e) = self
-                        .interop
-                        .device()
-                        .poll(wgpu::PollType::wait_indefinitely())
-                    {
+                    if let Err(e) = self.interop.device().poll(frame_copy_wait) {
                         stop_reason = Some(format!("Video GPU poll failed: {e}"));
                         (0, 0, false)
                     } else {
@@ -4938,16 +5626,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.last_saved_msg = Some(reason);
                 } else {
                     let rec_now = Instant::now();
-                    let frame_dur = if self.settings.record_fixed_fps {
-                        1.0 / f64::from(active.fps.max(1))
-                    } else {
-                        let d = active.last_frame_at.map_or(
-                            1.0 / f64::from(active.fps.max(1)),
-                            |prev| rec_now.duration_since(prev).as_secs_f64(),
-                        );
-                        d.clamp(1.0 / 240.0, 2.0)
-                    };
-                    active.last_frame_at = Some(rec_now);
+                    let frame_dur = video_frame_duration(
+                        self.settings.record_fixed_fps,
+                        active.fps,
+                        active.last_frame_at,
+                        rec_now,
+                    );
                     match self.export_worker.push_video_frame(
                         active.session_id,
                         PitchedDeviceImage {
@@ -4960,7 +5644,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         frame_dur,
                         !self.settings.record_fixed_fps,
                     ) {
-                        Ok(_) => {
+                        Ok(accepted) => {
+                            // F04: a dropped frame's interval goes to the next frame.
+                            if accepted {
+                                active.last_frame_at = Some(rec_now);
+                            }
                             self.record_frames = self.export_worker.recorded_frames();
                             self.video_recorder = Some(active);
                         }
@@ -4977,7 +5665,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            self.interop.queue().present(frame);
+            if let Some(frame) = frame {
+                self.interop.queue().present(frame);
+            }
             if self.last_persist_at.elapsed().as_secs_f32() >= 1.5 {
                 self.update_window_geometry();
                 self.save_persisted();
@@ -5191,8 +5881,8 @@ struct Runner {
 impl ApplicationHandler for Runner {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_none() {
-            let persisted = crate::persist::load();
-            let win_cfg = persisted.window.sanitized();
+            let loaded = crate::persist::load();
+            let win_cfg = loaded.state.window.sanitized();
             let mut attrs = Window::default_attributes()
                 .with_title("nv-rs RTX Fractal Path Tracer (OptiX 9 + AI Denoiser + nv-wgpu)")
                 .with_inner_size(winit::dpi::PhysicalSize::new(win_cfg.width, win_cfg.height))
@@ -5201,7 +5891,7 @@ impl ApplicationHandler for Runner {
                 attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
             }
             let win = Arc::new(event_loop.create_window(attrs).expect("window"));
-            self.app = Some(DemoApp::new(win, persisted));
+            self.app = Some(DemoApp::new(win, loaded));
             let now = Instant::now();
             self.next_redraw_at = Some(now);
             event_loop.set_control_flow(ControlFlow::WaitUntil(now));
@@ -5472,6 +6162,255 @@ mod ui_pacing_tests {
         assert_eq!(sub.wheel.lines, glam::Vec2::ZERO);
         assert_eq!(sub.pinch, 1.0);
         assert!((sub.dt - 1.0 / 240.0).abs() < 1e-6);
+    }
+
+    /// F03: names created within the same millisecond differ.
+    #[test]
+    fn output_names_are_unique_within_one_millisecond() {
+        let a = demo_app::output_file_name("nv-demo", ".png");
+        let b = demo_app::output_file_name("nv-demo", ".png");
+        assert_ne!(a, b);
+        assert!(a.starts_with("nv-demo-") && a.ends_with(".png"));
+    }
+
+    /// F11: a full pool of stale-size buffers converges to the new size instead of staying full.
+    #[test]
+    fn export_pool_evicts_buffers_of_another_size() {
+        let size = |b: &usize| *b;
+        let mut pool: Vec<usize> = vec![10, 10, 10, 10];
+        for _ in 0..4 {
+            let dropped = demo_app::recycle_into_pool(&mut pool, 20, size, 4);
+            assert_eq!(dropped, Some(10));
+        }
+        assert_eq!(pool, vec![20, 20, 20, 20]);
+        // Same size when full: the incoming buffer is the one dropped.
+        assert_eq!(demo_app::recycle_into_pool(&mut pool, 20, size, 4), Some(20));
+    }
+
+    /// F04: in Live RT a dropped frame's interval is carried by the next accepted frame, so the
+    /// accepted durations add up to wall time.
+    #[test]
+    fn live_video_duration_carries_dropped_frame_interval() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(16);
+        let t2 = t0 + Duration::from_millis(33);
+        let last_accepted = Some(t0);
+        // The frame at t1 is dropped (back-pressure), so `last_accepted` stays at t0.
+        let d1 = demo_app::video_frame_duration(false, 60, last_accepted, t1);
+        assert!((d1 - 0.016).abs() < 1e-9);
+        let d2 = demo_app::video_frame_duration(false, 60, last_accepted, t2);
+        assert!((d2 - 0.033).abs() < 1e-9);
+        // Smooth 60 always uses the nominal duration.
+        assert!((demo_app::video_frame_duration(true, 60, None, t2) - 1.0 / 60.0).abs() < 1e-12);
+    }
+
+    /// F09: the DLSS render target keeps the output aspect (1920x1080 Balanced used to give
+    /// 1088x626, a 2.3 % horizontal stretch).
+    #[test]
+    fn dlss_render_dims_keep_the_output_aspect() {
+        let opt = ngx::DlssOptimalSettings {
+            render_width: 1114,
+            render_height: 626,
+            min_width: 1114,
+            min_height: 626,
+            max_width: 1114,
+            max_height: 626,
+            sharpness: 0.0,
+        };
+        let (w, h) = demo_app::dlss_render_dims(&opt, 1920, 1080);
+        assert_eq!(w % 64, 0);
+        assert_eq!(h % 2, 0);
+        let err = ((w as f32 / h as f32) / (1920.0 / 1080.0) - 1.0).abs();
+        assert!(err < 0.005, "{w}x{h} aspect error {err}");
+
+        let opt4k = ngx::DlssOptimalSettings {
+            render_width: 2560,
+            render_height: 1440,
+            min_width: 1280,
+            min_height: 720,
+            max_width: 3840,
+            max_height: 2160,
+            sharpness: 0.0,
+        };
+        assert_eq!(demo_app::dlss_render_dims(&opt4k, 3840, 2160), (2560, 1440));
+    }
+
+    /// F01/F10: stills come from the texture the viewport draws.
+    #[test]
+    fn viewport_still_source_follows_the_displayed_texture() {
+        use demo_app::{ViewportStillSource as S, viewport_still_source as src};
+        // (dlss_rr_on, aov, has_rr, dlss_on, has_dlss, hdr)
+        assert_eq!(src(true, 0, true, false, false, false), S::DlssRrLdr);
+        assert_eq!(src(true, 0, true, false, false, true), S::DlssRrHdr);
+        assert_eq!(src(true, 3, true, false, false, false), S::RenderTarget);
+        assert_eq!(src(true, 0, false, false, false, false), S::RenderTarget);
+        assert_eq!(src(false, 0, false, true, true, false), S::DlssSr);
+        assert_eq!(src(false, 0, false, true, false, false), S::RenderTarget);
+        assert_eq!(src(false, 0, false, false, false, true), S::RenderTarget);
+    }
+
+    /// F05: editing a lighting field during a transition cancels it and finishes the crossfade;
+    /// an untouched frame keeps it running.
+    #[test]
+    fn user_lighting_edit_cancels_tod_transition() {
+        let mut s = crate::renderer::DemoSettings::default();
+        crate::ui::apply_csg_time_of_day_preset(&mut s, 0);
+        let mut tr = Some(demo_app::TodTransition::new(&s, 2, 4.0));
+        if let Some(t) = tr.as_mut() {
+            assert!(!t.step(&mut s, 1.0));
+        }
+        let before = demo_app::LightingKey::of(&s);
+        assert!(!demo_app::cancel_tod_on_user_edit(before, &mut s, &mut tr));
+        assert!(tr.is_some());
+
+        s.exposure = 1.7; // user drags Exposure / toolbar EV
+        assert!(demo_app::cancel_tod_on_user_edit(before, &mut s, &mut tr));
+        assert!(tr.is_none());
+        assert_eq!(s.sky_blend, 0.0);
+        assert_eq!(s.sky_mode_from, s.sky_mode);
+        assert_eq!(s.exposure, 1.7);
+    }
+
+    /// F15: a transition restarted mid-crossfade starts from the sky that dominates the blend.
+    #[test]
+    fn tod_restart_starts_from_the_dominant_sky() {
+        let mut s = crate::renderer::DemoSettings::default();
+        crate::ui::apply_csg_time_of_day_preset(&mut s, 0); // Day, sky 0
+        let mut tr = demo_app::TodTransition::new(&s, 2, 10.0); // -> Night, sky 8
+        assert!(!tr.step(&mut s, 2.0)); // u < 0.5: Day still dominates
+        assert!(s.sky_blend > 0.0 && s.sky_blend < 0.5);
+        let mut restart = demo_app::TodTransition::new(&s, 1, 10.0); // -> Sunset
+        let mut probe = s;
+        assert!(!restart.step(&mut probe, 0.0));
+        assert_eq!(probe.sky_mode_from, 0, "restart must start from the dominant Day sky");
+    }
+
+    /// F16: Live mode advances simulation time like lockstep; the damper follows its driver.
+    #[test]
+    fn live_step_dts_scale_simulation_time() {
+        assert_eq!(demo_app::live_step_dts(0.02, 0.25, true), (0.005, 0.005));
+        assert_eq!(demo_app::live_step_dts(0.02, 0.25, false), (0.005, 0.02));
+    }
+
+    /// F30: no auto-frame request for Classic or for the scene that is already loaded.
+    #[test]
+    fn scene_auto_frame_is_not_armed_for_the_loaded_scene() {
+        use demo_app::scene_auto_frame_target as arm;
+        assert_eq!(arm(Some((1, 0)), (2, 0)), Some((2, 0)));
+        assert_eq!(arm(Some((1, 0)), (1, 0)), None); // A -> B -> A coalesced
+        assert_eq!(arm(None, (1, 0)), Some((1, 0)));
+        assert_eq!(arm(Some((1, 0)), (0, 0)), None);
+    }
+
+    /// F14: size-only resizes wait for the previous `Resize` to be acknowledged.
+    #[test]
+    fn size_only_resize_waits_for_the_previous_acknowledgement() {
+        use demo_app::resize_allowed as ok;
+        // (size_changed, buffers_changed, throttle_elapsed, dlss_toggled, prev_acked)
+        assert!(!ok(true, false, true, false, false));
+        assert!(ok(true, false, true, false, true));
+        assert!(!ok(true, false, false, false, true));
+        assert!(ok(true, false, false, true, false));
+        assert!(ok(false, true, false, false, false));
+        assert!(!ok(false, false, true, true, true));
+    }
+
+    /// F12: a render thread that ended without `Fatal` is described with its panic payload.
+    #[test]
+    fn render_exit_reason_reports_the_panic_payload() {
+        let panicked = std::thread::spawn(|| panic!("cuLaunchKernel assert"));
+        let reason = demo_app::render_exit_reason(panicked);
+        assert!(reason.contains("panicked") && reason.contains("cuLaunchKernel assert"), "{reason}");
+        let clean = std::thread::spawn(|| {});
+        assert!(demo_app::render_exit_reason(clean).contains("without reporting"));
+    }
+
+    /// F18: transient overrides are not persisted as user preferences.
+    #[test]
+    fn persisted_settings_undo_transient_overrides() {
+        use crate::renderer::CameraProjection;
+        let mut live = crate::renderer::DemoSettings::default();
+        crate::ui::apply_csg_time_of_day_preset(&mut live, 0);
+        let mut tr = demo_app::TodTransition::new(&live, 2, 4.0);
+        assert!(!tr.step(&mut live, 1.0));
+        live.camera_projection = CameraProjection::Equirect360;
+        live.hdr_display = false;
+        live.dlss_rr_on = false;
+        let intent = demo_app::StartupIntent {
+            hdr_display: Some(true),
+            dlss_rr_on: Some(true),
+            ai_at_start: (live.dlss_on, live.denoiser_on),
+        };
+        let saved = demo_app::user_intent_settings(
+            &live,
+            Some(CameraProjection::Pinhole),
+            Some(&tr),
+            intent,
+        );
+        let mut night = live;
+        crate::ui::apply_csg_time_of_day_preset(&mut night, 2);
+        assert_eq!(saved.camera_projection, CameraProjection::Pinhole);
+        assert_eq!(saved.sun_elevation, night.sun_elevation);
+        assert_eq!(saved.sky_blend, 0.0);
+        assert!(saved.hdr_display);
+        assert!(saved.dlss_rr_on);
+
+        // The user picked another AI mode this session: the forced-off RR is not restored.
+        let mut changed = live;
+        changed.dlss_on = !live.dlss_on;
+        assert!(!demo_app::user_intent_settings(&changed, None, None, intent).dlss_rr_on);
+    }
+
+    /// F17: the scene is persisted by id and resolves to its current registry index.
+    #[test]
+    fn saved_scene_resolves_by_id_after_a_registry_reorder() {
+        let d = |id: &'static str, variants: &'static [&'static str]| csg_scene::SceneDescriptor {
+            id,
+            name: id,
+            description: "",
+            default_tod: csg_scene::TimeOfDay::Day,
+            default_wetness: 0.0,
+            supports_traffic: false,
+            variant_labels: variants,
+        };
+        let old = [d("gundo", &[]), d("inspector", &["Robotaxi", "Bridge"])];
+        let saved = demo_app::saved_scene_of(&old, 2, 1).expect("scene ref");
+        assert_eq!(saved.id, "inspector");
+        assert_eq!(saved.variant, "Bridge");
+
+        let reordered = [
+            d("marina", &[]),
+            d("inspector", &["Bridge", "Robotaxi"]),
+            d("gundo", &[]),
+        ];
+        assert_eq!(demo_app::resolve_saved_scene(&reordered, &saved, 1), Some((2, 0)));
+        let removed = [d("gundo", &[])];
+        assert_eq!(demo_app::resolve_saved_scene(&removed, &saved, 1), None);
+        let classic = demo_app::saved_scene_of(&old, 0, 3).expect("classic ref");
+        assert_eq!(demo_app::resolve_saved_scene(&reordered, &classic, 3), Some((0, 3)));
+    }
+
+    /// CAM-CURSOR: camera-rs `Hidden` (grab None + invisible) during RMB hold-to-fly hides the
+    /// cursor, also when it replaces a persistent-fly lock, and does not warp it.
+    #[test]
+    fn cursor_hidden_request_hides_without_warp() {
+        let mut ctl = demo_app::CursorGrabController::default();
+        ctl.on_cursor_moved(winit::dpi::PhysicalPosition::new(200.0, 150.0));
+        let hidden = ctl.apply_egui_request(Some(egui::CursorGrab::None), Some(false));
+        assert_eq!(hidden.grab, None);
+        assert_eq!(hidden.visible, Some(false));
+
+        // Persistent fly lock, then RMB hold switches the request to Hidden.
+        let lock = ctl.apply_egui_request(Some(egui::CursorGrab::Locked), Some(false));
+        assert_eq!(lock.grab, Some(winit::window::CursorGrabMode::Locked));
+        let to_hidden = ctl.apply_egui_request(Some(egui::CursorGrab::None), Some(false));
+        assert_eq!(to_hidden.grab, Some(winit::window::CursorGrabMode::None));
+        assert_eq!(to_hidden.visible, Some(false));
+        assert_eq!(to_hidden.restore_pos, None);
+
+        // Back to Default shows the cursor.
+        let shown = ctl.apply_egui_request(Some(egui::CursorGrab::None), Some(true));
+        assert_eq!(shown.visible, Some(true));
     }
 
     #[test]

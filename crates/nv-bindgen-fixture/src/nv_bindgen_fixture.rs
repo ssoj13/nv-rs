@@ -153,8 +153,7 @@ mod tests {
         }))
     }
 
-    // prettyplease removes generated SAFETY comments; the shared generator owns the invariant.
-    #[allow(clippy::undocumented_unsafe_blocks)]
+    // Generated shim unsafe blocks carry `// SAFETY:` comments emitted by `nv-bindgen`.
     mod present {
         use super::super::types::*;
         use super::present_api as fake_api;
@@ -245,7 +244,6 @@ mod tests {
     }
 
     // Same generated-code boundary as exports_sys!/query_interface_sys!, without hiding test code.
-    #[allow(clippy::undocumented_unsafe_blocks)]
     mod present_qi {
         use super::present_query as qi_api;
         use crate::qi::*;

@@ -1,24 +1,18 @@
 //! Raw Linux cuFile C API, generated from the installed CUDA Toolkit by `nv-bindgen`.
 //!
-//! Structured status and negative byte-count failures preserve cuFile's C contracts.
-//! `cuFileUseCount` has no documented failure sentinel, so its generated Rust function returns
-//! `Result<c_long, nv_loader::CallError>`. The shared loader owns the library for every call.
+//! Structured `CUfileError_t` failures preserve cuFile's C contract. `cuFileRead`, `cuFileWrite`
+//! and `cuFileUseCount` have no failure value the generator can invent for a missing library
+//! (bindgen maps `ssize_t` to `isize`), so their generated Rust functions return
+//! `Result<_, nv_loader::CallError>`; a negative `Ok` byte count is cuFile's own I/O error. The shared loader owns the library for every call.
 //! CUDA result and stream types are reused from `cuda-bindings`.
 //! Used by nv-rs storage consumers; loading or querying a version does not establish GDS support.
 #![cfg(target_os = "linux")]
-
-use nv_loader::{DllSpec, Group};
 
 nv_loader::exports_sys! {
     lib: "cufile",
     api: CufileApi,
     loader: cufile_api,
-    dll: DllSpec {
-        lib: "cufile",
-        group: Group::Toolkit,
-        windows: &[],
-        linux: &["libcufile.so.0", "libcufile.so"],
-    },
+    dll: nv_loader::catalog::CUFILE.spec,
 }
 
 #[cfg(test)]

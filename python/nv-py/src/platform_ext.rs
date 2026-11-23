@@ -4,6 +4,16 @@
 //! Every submodule registers unconditionally on all operating systems with a `SUPPORTED: bool`
 //! constant (`True` on its target OS, `False` elsewhere) so `import nv_rs` never fails on
 //! Windows or Linux. Runtime entry points raise `NvInvalidArgumentError` on unsupported hosts.
+//!
+//! **Buffers (Linux).** NCCL and cuFile take Python buffers (nv_rs-owned or DLPack imports) as a
+//! byte-typed `DeviceBuffer` over the buffer's own storage ([`byte_span`]: same allocation and
+//! access tracker, no copy); a completion lease (`buf_util::enqueue_leased`) makes each access
+//! exclusive and keeps the memory allocated until the work completes.
+//! **NCCL groups.** Inside `group_start()` / `group_end()` NCCL defers every collective to the
+//! outermost `group_end`, after the call returned. The binding mirrors the per-thread group depth
+//! ([`NCCL_GROUP`]) and holds the leases of each grouped collective until that `group_end` has
+//! queued it, then retains them until the work completes ([`settle_group`]).
+//! **Mutexes** recover from poisoning (as in `sys_ext`): each guards one handle's ownership.
 
 use std::time::Instant;
 
@@ -15,10 +25,19 @@ use crate::core::{PyContext, PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[cfg(target_os = "linux")]
-use cuda_core::{DeviceBuffer as CudaDeviceBuffer, IntoResult};
+use cuda_core::{AllocationLease, DeviceBuffer as CudaDeviceBuffer, Stream};
+
+#[cfg(target_os = "linux")]
+use crate::buf_util::{Access, check_buf, enqueue_leased};
+#[cfg(target_os = "linux")]
+use crate::sys_ext::without_gil;
 
 #[cfg(not(target_os = "linux"))]
 fn unsupported_linux(category: &str, op: &str) -> PyErr {
@@ -79,52 +98,130 @@ py_parse_enum!(parse_nccl_redop, "nccl", "parse_redop", nccl::RedOp, "NCCL reduc
 });
 
 #[cfg(target_os = "linux")]
-fn owned_cuda_buf(buf: &PyDeviceBuffer, op: &str) -> PyResult<Arc<CudaDeviceBuffer<u8>>> {
-    buf.owned_cuda_buf().cloned().ok_or_else(|| {
-        record_and_err(
-            "nccl",
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Validates `buf` for native call `category`/`op` on `stream` and returns a byte-typed
+/// `DeviceBuffer` over its own storage (same allocation and access tracker; nothing is copied or
+/// allocated). The NCCL and cuFile wrappers take such owned spans; exclusivity of the access comes
+/// from the completion lease the caller takes on `buf` (`enqueue_leased`).
+#[cfg(target_os = "linux")]
+fn byte_span(
+    category: &str,
+    op: &str,
+    name: &str,
+    buf: &PyDeviceBuffer,
+    stream: &Stream,
+) -> PyResult<CudaDeviceBuffer<u8>> {
+    check_buf(category, op, name, buf, &[], 0, stream.context())?;
+    let storage = buf.storage().clone();
+    let len = storage.len_bytes();
+    // SAFETY: every bit pattern is a valid `u8`. The view is handed only to NCCL / cuFile, which
+    // move bytes with kernels, DMA or driver copies and never form a Rust reference to device
+    // memory, and every access through it runs under a completion lease on `storage`.
+    unsafe { CudaDeviceBuffer::<u8>::from_storage(storage, len) }
+        .map_err(|e| record_and_err(category, op, e, ErrorKind::InvalidArgument))
+}
+
+/// Leases of one collective issued inside an open NCCL group, held until the outermost
+/// `group_end` queues the collective (see the module docs).
+#[cfg(target_os = "linux")]
+struct GroupedOp {
+    stream: Arc<Stream>,
+    leases: Vec<AllocationLease>,
+}
+
+#[cfg(target_os = "linux")]
+struct GroupState {
+    depth: usize,
+    ops: Vec<GroupedOp>,
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Mirror of NCCL's per-thread group nesting (`ncclGroupStart` / `ncclGroupEnd`) as entered
+    /// through `nv_rs.nccl.group_start` / `group_end`.
+    static NCCL_GROUP: RefCell<GroupState> = const {
+        RefCell::new(GroupState {
+            depth: 0,
+            ops: Vec::new(),
+        })
+    };
+}
+
+#[cfg(target_os = "linux")]
+fn live_comm<'a>(slot: &'a Option<nccl::Comm>, op: &str) -> PyResult<&'a nccl::Comm> {
+    slot.as_ref().ok_or_else(|| {
+        map_nccl_err(
             op,
-            "NCCL requires an nv_rs-owned DeviceBuffer (use DeviceBuffer.alloc or from_buffer)",
-            ErrorKind::InvalidArgument,
+            nccl::Error::Invalid("communicator already finalized"),
         )
     })
 }
 
+/// Runs collective `run` on `stream` with completion leases on `buffers`.
+///
+/// Outside a group the leases cover the queued collective. Inside a group `run` only records the
+/// collective, so a second set of leases is held until the outermost `group_end` (taken even when
+/// `run` failed: NCCL may have recorded part of the work).
 #[cfg(target_os = "linux")]
-fn stage_and_copy_recv(
-    stream: &Arc<cuda_core::Stream>,
-    recv_ptr: u64,
-    recv_nbytes: usize,
-    needed_bytes: usize,
-    op: &str,
-    run: impl FnOnce(&mut CudaDeviceBuffer<u8>) -> nccl::Result<()>,
+fn submit<const N: usize>(
+    comm: &Mutex<Option<nccl::Comm>>,
+    op: &'static str,
+    stream: &Arc<Stream>,
+    buffers: [(&PyDeviceBuffer, Access); N],
+    run: impl FnOnce(&nccl::Comm) -> nccl::Result<()>,
 ) -> PyResult<()> {
-    if recv_nbytes < needed_bytes {
-        return Err(record_and_err(
-            "nccl",
-            op,
-            format!("recv buffer smaller than required {needed_bytes} bytes (got {recv_nbytes})"),
-            ErrorKind::InvalidArgument,
-        ));
+    let guard = lock(comm);
+    let comm = live_comm(&guard, op)?;
+    let grouped = NCCL_GROUP.with(|g| g.borrow().depth > 0);
+    let mut ran = false;
+    let queued = enqueue_leased("nccl", op, stream, buffers, || {
+        ran = true;
+        run(comm).map_err(|e| map_nccl_err(op, e))
+    });
+    if !(grouped && ran) {
+        return queued;
     }
-    // SAFETY: `tmp` is immediately populated by the NCCL collective before being copied to `recv_ptr`.
-    let mut tmp = unsafe { CudaDeviceBuffer::<u8>::uninitialized_async(stream, needed_bytes) }
-        .map_err(|e| record_and_err("nccl", op, e, ErrorKind::Cuda))?;
-    run(&mut tmp).map_err(|e| map_nccl_err(op, e))?;
-    if needed_bytes > 0 {
-        // SAFETY: `tmp` and `recv_ptr` both span at least `needed_bytes` on the same CUDA stream.
-        unsafe {
-            cuda_bindings::cuMemcpyDtoDAsync_v2(
-                recv_ptr,
-                tmp.cu_deviceptr(),
-                needed_bytes,
-                stream.cu_stream(),
-            )
-            .result()
+    let mut held = Ok(());
+    let mut leases = Vec::with_capacity(N);
+    for (buf, access) in buffers {
+        match buf.storage().acquire(stream, access == Access::Write, false) {
+            Ok(lease) => leases.push(lease),
+            Err(e) => {
+                held = held.and(Err(record_and_err("nccl", op, e, ErrorKind::Cuda)));
+            }
         }
-        .map_err(|e| record_and_err("nccl", op, e, ErrorKind::Cuda))?;
     }
-    Ok(())
+    NCCL_GROUP.with(|g| {
+        g.borrow_mut().ops.push(GroupedOp {
+            stream: stream.clone(),
+            leases,
+        })
+    });
+    queued.and(held)
+}
+
+/// Retains the leases of the collectives of a closed outermost group until the work queued on
+/// their streams so far, which now includes those collectives, completes.
+#[cfg(target_os = "linux")]
+fn settle_group(ops: Vec<GroupedOp>) -> PyResult<()> {
+    let mut settled = Ok(());
+    for GroupedOp { stream, leases } in ops {
+        for lease in leases {
+            // On failure `cuda-core` leaks the lease: the memory stays allocated.
+            if let Err(e) = lease.retain_until_complete(&stream) {
+                settled = settled.and(Err(record_and_err(
+                    "nccl",
+                    "group_end",
+                    e,
+                    ErrorKind::Cuda,
+                )));
+            }
+        }
+    }
+    settled
 }
 
 /// Returns the loaded NCCL library version integer (`MAJOR * 10000 + MINOR * 100 + PATCH`).
@@ -181,14 +278,17 @@ fn nccl_unique_id(py: Python<'_>) -> PyResult<Py<PyBytes>> {
     }
 }
 
-/// Begins a fused NCCL operation group (`ncclGroupStart`).
+/// Begins a fused NCCL operation group (`ncclGroupStart`) on the calling thread.
 #[pyfunction]
 #[pyo3(name = "group_start")]
 fn nccl_group_start(py: Python<'_>) -> PyResult<()> {
     #[cfg(target_os = "linux")]
     {
-        py.detach(nccl::group_start)
-            .map_err(|e| map_nccl_err("group_start", e))
+        py.detach(|| {
+            nccl::group_start().map_err(|e| map_nccl_err("group_start", e))?;
+            NCCL_GROUP.with(|g| g.borrow_mut().depth += 1);
+            Ok(())
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -197,14 +297,30 @@ fn nccl_group_start(py: Python<'_>) -> PyResult<()> {
     }
 }
 
-/// Ends a fused NCCL operation group (`ncclGroupEnd`).
+/// Ends a fused NCCL operation group (`ncclGroupEnd`) on the calling thread. The outermost end
+/// queues the group's collectives and keeps their buffers leased until they complete.
 #[pyfunction]
 #[pyo3(name = "group_end")]
 fn nccl_group_end(py: Python<'_>) -> PyResult<()> {
     #[cfg(target_os = "linux")]
     {
-        py.detach(nccl::group_end)
-            .map_err(|e| map_nccl_err("group_end", e))
+        py.detach(|| {
+            let ended = nccl::group_end().map_err(|e| map_nccl_err("group_end", e));
+            let ops = NCCL_GROUP.with(|g| {
+                let mut g = g.borrow_mut();
+                // `ncclGroupEnd` leaves the group even when launching fails; only a call outside
+                // any group changes nothing.
+                g.depth = g.depth.saturating_sub(1);
+                if g.depth == 0 {
+                    std::mem::take(&mut g.ops)
+                } else {
+                    Vec::new()
+                }
+            });
+            // Settled whatever `ncclGroupEnd` returned: part of the group may have been queued.
+            let settled = settle_group(ops);
+            ended.and(settled)
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -237,6 +353,17 @@ impl PyNcclComm {
             nranks,
             rank,
             device_id,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PyNcclComm {
+    fn drop(&mut self) {
+        let comm = lock(&self.inner).take();
+        if let Some(comm) = comm {
+            // `ncclCommDestroy` can block until peers post matching work: never under the GIL.
+            without_gil(move || drop(comm));
         }
     }
 }
@@ -357,18 +484,12 @@ impl PyNcclComm {
     fn async_error(&self, py: Python<'_>) -> PyResult<String> {
         #[cfg(target_os = "linux")]
         {
-            let inner = self.inner.clone();
-            let state = py
-                .detach(move || {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| nccl::Error::Invalid("NcclComm mutex poisoned"))?;
-                    let comm = guard
-                        .as_ref()
-                        .ok_or(nccl::Error::Invalid("communicator already finalized"))?;
-                    comm.async_error()
-                })
-                .map_err(|e| map_nccl_err("async_error", e))?;
+            let state = py.detach(|| {
+                let guard = lock(&self.inner);
+                live_comm(&guard, "async_error")?
+                    .async_error()
+                    .map_err(|e| map_nccl_err("async_error", e))
+            })?;
             Ok(match state {
                 nccl::AsyncState::Ok => "ok".to_owned(),
                 nccl::AsyncState::InProgress => "in_progress".to_owned(),
@@ -386,19 +507,8 @@ impl PyNcclComm {
     fn last_error(&self) -> PyResult<Option<String>> {
         #[cfg(target_os = "linux")]
         {
-            let guard = self.inner.lock().map_err(|_| {
-                map_nccl_err(
-                    "last_error",
-                    nccl::Error::Invalid("NcclComm mutex poisoned"),
-                )
-            })?;
-            let comm = guard.as_ref().ok_or_else(|| {
-                map_nccl_err(
-                    "last_error",
-                    nccl::Error::Invalid("communicator already finalized"),
-                )
-            })?;
-            Ok(comm.last_error())
+            let guard = lock(&self.inner);
+            Ok(live_comm(&guard, "last_error")?.last_error())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -406,19 +516,14 @@ impl PyNcclComm {
         }
     }
 
-    /// Gracefully finalizes pending communications and destroys the communicator.
+    /// Gracefully finalizes pending communications and destroys the communicator. Calling it
+    /// again (or after `abort`) is a no-op.
     fn finalize(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(target_os = "linux")]
         {
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| nccl::Error::Invalid("NcclComm mutex poisoned"))?;
-                if let Some(comm) = guard.take() {
-                    comm.finalize()?;
-                }
-                Ok(())
+            py.detach(|| {
+                let taken = lock(&self.inner).take();
+                taken.map_or(Ok(()), nccl::Comm::finalize)
             })
             .map_err(|e| map_nccl_err("finalize", e))
         }
@@ -429,19 +534,14 @@ impl PyNcclComm {
         }
     }
 
-    /// Immediately aborts all queued work and destroys the communicator.
+    /// Immediately aborts all queued work and destroys the communicator. Calling it again (or
+    /// after `finalize`) is a no-op.
     fn abort(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(target_os = "linux")]
         {
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| nccl::Error::Invalid("NcclComm mutex poisoned"))?;
-                if let Some(comm) = guard.take() {
-                    comm.abort()?;
-                }
-                Ok(())
+            py.detach(|| {
+                let taken = lock(&self.inner).take();
+                taken.map_or(Ok(()), nccl::Comm::abort)
             })
             .map_err(|e| map_nccl_err("abort", e))
         }
@@ -472,39 +572,16 @@ impl PyNcclComm {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
             let red_op = parse_nccl_redop(op)?;
-            let needed = count.checked_mul(dt.elem_bytes()).ok_or_else(|| {
-                record_and_err(
-                    "nccl",
+            let s = &stream.inner;
+            let send_span = byte_span("nccl", "all_reduce", "send", send, s)?;
+            let mut recv_span = byte_span("nccl", "all_reduce", "recv", recv, s)?;
+            py.detach(|| {
+                submit(
+                    &self.inner,
                     "all_reduce",
-                    "element count overflow",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            let send_buf = owned_cuda_buf(send, "all_reduce")?;
-            let recv_ptr = recv.raw_device_ptr();
-            let recv_len = recv.byte_len();
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err(
-                        "all_reduce",
-                        nccl::Error::Invalid("NcclComm mutex poisoned"),
-                    )
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
-                        "all_reduce",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                stage_and_copy_recv(
-                    &stream_arc,
-                    recv_ptr,
-                    recv_len,
-                    needed,
-                    "all_reduce",
-                    |tmp| comm.all_reduce(send_buf.as_ref(), tmp, count, dt, red_op, &stream_arc),
+                    s,
+                    [(send, Access::Read), (recv, Access::Write)],
+                    |c| c.all_reduce(&send_span, &mut recv_span, count, dt, red_op, s),
                 )
             })?;
             diag::record_event(
@@ -543,40 +620,25 @@ impl PyNcclComm {
         {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
-            let needed = count.checked_mul(dt.elem_bytes()).ok_or_else(|| {
-                record_and_err(
-                    "nccl",
-                    "broadcast",
-                    "element count overflow",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            let send_buf = match send {
-                Some(s) => Some(owned_cuda_buf(s, "broadcast")?),
-                None => None,
-            };
-            let recv_ptr = recv.raw_device_ptr();
-            let recv_len = recv.byte_len();
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err("broadcast", nccl::Error::Invalid("NcclComm mutex poisoned"))
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
+            let s = &stream.inner;
+            let send_span = send
+                .map(|b| byte_span("nccl", "broadcast", "send", b, s))
+                .transpose()?;
+            let mut recv_span = byte_span("nccl", "broadcast", "recv", recv, s)?;
+            py.detach(|| {
+                let run = |c: &nccl::Comm| {
+                    c.broadcast(send_span.as_ref(), &mut recv_span, count, dt, root, s)
+                };
+                match send {
+                    Some(b) => submit(
+                        &self.inner,
                         "broadcast",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                stage_and_copy_recv(
-                    &stream_arc,
-                    recv_ptr,
-                    recv_len,
-                    needed,
-                    "broadcast",
-                    |tmp| comm.broadcast(send_buf.as_deref(), tmp, count, dt, root, &stream_arc),
-                )
+                        s,
+                        [(b, Access::Read), (recv, Access::Write)],
+                        run,
+                    ),
+                    None => submit(&self.inner, "broadcast", s, [(recv, Access::Write)], run),
+                }
             })?;
             diag::record_event(
                 Level::Info,
@@ -616,51 +678,32 @@ impl PyNcclComm {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
             let red_op = parse_nccl_redop(op)?;
-            let needed = count.checked_mul(dt.elem_bytes()).ok_or_else(|| {
-                record_and_err(
-                    "nccl",
-                    "reduce",
-                    "element count overflow",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            let send_buf = owned_cuda_buf(send, "reduce")?;
-            let recv_info = recv.map(|r| (r.raw_device_ptr(), r.byte_len()));
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err("reduce", nccl::Error::Invalid("NcclComm mutex poisoned"))
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
-                        "reduce",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                if let Some((recv_ptr, recv_len)) = recv_info {
-                    stage_and_copy_recv(&stream_arc, recv_ptr, recv_len, needed, "reduce", |tmp| {
-                        comm.reduce(
-                            send_buf.as_ref(),
-                            Some(tmp),
-                            count,
-                            dt,
-                            red_op,
-                            root,
-                            &stream_arc,
-                        )
-                    })
-                } else {
-                    comm.reduce::<CudaDeviceBuffer<u8>, u8>(
-                        send_buf.as_ref(),
-                        None,
+            let s = &stream.inner;
+            let send_span = byte_span("nccl", "reduce", "send", send, s)?;
+            let mut recv_span = recv
+                .map(|b| byte_span("nccl", "reduce", "recv", b, s))
+                .transpose()?;
+            py.detach(|| {
+                let run = |c: &nccl::Comm| {
+                    c.reduce(
+                        &send_span,
+                        recv_span.as_mut(),
                         count,
                         dt,
                         red_op,
                         root,
-                        &stream_arc,
+                        s,
                     )
-                    .map_err(|e| map_nccl_err("reduce", e))
+                };
+                match recv {
+                    Some(b) => submit(
+                        &self.inner,
+                        "reduce",
+                        s,
+                        [(send, Access::Read), (b, Access::Write)],
+                        run,
+                    ),
+                    None => submit(&self.inner, "reduce", s, [(send, Access::Read)], run),
                 }
             })?;
             diag::record_event(
@@ -694,42 +737,16 @@ impl PyNcclComm {
         {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
-            let needed = send_count
-                .checked_mul(self.nranks)
-                .and_then(|n| n.checked_mul(dt.elem_bytes()))
-                .ok_or_else(|| {
-                    record_and_err(
-                        "nccl",
-                        "all_gather",
-                        "element count overflow",
-                        ErrorKind::InvalidArgument,
-                    )
-                })?;
-            let send_buf = owned_cuda_buf(send, "all_gather")?;
-            let recv_ptr = recv.raw_device_ptr();
-            let recv_len = recv.byte_len();
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err(
-                        "all_gather",
-                        nccl::Error::Invalid("NcclComm mutex poisoned"),
-                    )
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
-                        "all_gather",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                stage_and_copy_recv(
-                    &stream_arc,
-                    recv_ptr,
-                    recv_len,
-                    needed,
+            let s = &stream.inner;
+            let send_span = byte_span("nccl", "all_gather", "send", send, s)?;
+            let mut recv_span = byte_span("nccl", "all_gather", "recv", recv, s)?;
+            py.detach(|| {
+                submit(
+                    &self.inner,
                     "all_gather",
-                    |tmp| comm.all_gather(send_buf.as_ref(), tmp, send_count, dt, &stream_arc),
+                    s,
+                    [(send, Access::Read), (recv, Access::Write)],
+                    |c| c.all_gather(&send_span, &mut recv_span, send_count, dt, s),
                 )
             })?;
             diag::record_event(
@@ -769,48 +786,16 @@ impl PyNcclComm {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
             let red_op = parse_nccl_redop(op)?;
-            let needed = recv_count.checked_mul(dt.elem_bytes()).ok_or_else(|| {
-                record_and_err(
-                    "nccl",
+            let s = &stream.inner;
+            let send_span = byte_span("nccl", "reduce_scatter", "send", send, s)?;
+            let mut recv_span = byte_span("nccl", "reduce_scatter", "recv", recv, s)?;
+            py.detach(|| {
+                submit(
+                    &self.inner,
                     "reduce_scatter",
-                    "element count overflow",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
-            let send_buf = owned_cuda_buf(send, "reduce_scatter")?;
-            let recv_ptr = recv.raw_device_ptr();
-            let recv_len = recv.byte_len();
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err(
-                        "reduce_scatter",
-                        nccl::Error::Invalid("NcclComm mutex poisoned"),
-                    )
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
-                        "reduce_scatter",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                stage_and_copy_recv(
-                    &stream_arc,
-                    recv_ptr,
-                    recv_len,
-                    needed,
-                    "reduce_scatter",
-                    |tmp| {
-                        comm.reduce_scatter(
-                            send_buf.as_ref(),
-                            tmp,
-                            recv_count,
-                            dt,
-                            red_op,
-                            &stream_arc,
-                        )
-                    },
+                    s,
+                    [(send, Access::Read), (recv, Access::Write)],
+                    |c| c.reduce_scatter(&send_span, &mut recv_span, recv_count, dt, red_op, s),
                 )
             })?;
             diag::record_event(
@@ -844,19 +829,17 @@ impl PyNcclComm {
         {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
-            let send_buf = owned_cuda_buf(send, "send")?;
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner
-                    .lock()
-                    .map_err(|_| nccl::Error::Invalid("NcclComm mutex poisoned"))?;
-                let comm = guard
-                    .as_ref()
-                    .ok_or(nccl::Error::Invalid("communicator already finalized"))?;
-                comm.send(send_buf.as_ref(), count, dt, peer, &stream_arc)
-            })
-            .map_err(|e| map_nccl_err("send", e))?;
+            let s = &stream.inner;
+            let send_span = byte_span("nccl", "send", "send", send, s)?;
+            py.detach(|| {
+                submit(
+                    &self.inner,
+                    "send",
+                    s,
+                    [(send, Access::Read)],
+                    |c| c.send(&send_span, count, dt, peer, s),
+                )
+            })?;
             diag::record_event(
                 Level::Info,
                 "nccl",
@@ -888,31 +871,16 @@ impl PyNcclComm {
         {
             let t0 = Instant::now();
             let dt = parse_nccl_dtype(dtype)?;
-            let needed = count.checked_mul(dt.elem_bytes()).ok_or_else(|| {
-                record_and_err(
-                    "nccl",
+            let s = &stream.inner;
+            let mut recv_span = byte_span("nccl", "recv", "recv", recv, s)?;
+            py.detach(|| {
+                submit(
+                    &self.inner,
                     "recv",
-                    "element count overflow",
-                    ErrorKind::InvalidArgument,
+                    s,
+                    [(recv, Access::Write)],
+                    |c| c.recv(&mut recv_span, count, dt, peer, s),
                 )
-            })?;
-            let recv_ptr = recv.raw_device_ptr();
-            let recv_len = recv.byte_len();
-            let stream_arc = stream.inner.clone();
-            let inner = self.inner.clone();
-            py.detach(move || {
-                let guard = inner.lock().map_err(|_| {
-                    map_nccl_err("recv", nccl::Error::Invalid("NcclComm mutex poisoned"))
-                })?;
-                let comm = guard.as_ref().ok_or_else(|| {
-                    map_nccl_err(
-                        "recv",
-                        nccl::Error::Invalid("communicator already finalized"),
-                    )
-                })?;
-                stage_and_copy_recv(&stream_arc, recv_ptr, recv_len, needed, "recv", |tmp| {
-                    comm.recv(tmp, count, dt, peer, &stream_arc)
-                })
             })?;
             diag::record_event(
                 Level::Info,
@@ -993,11 +961,64 @@ fn cufile_version(py: Python<'_>) -> PyResult<i32> {
     }
 }
 
+/// `CufileHandle`s registered in this process and not yet deregistered. Whether a registered
+/// handle keeps the cuFile driver open by itself is not established, so the driver session is
+/// never closed under one: `CufileDriver.close` raises and a collected driver leaves the session
+/// open.
+#[cfg(target_os = "linux")]
+static LIVE_CUFILE_HANDLES: AtomicUsize = AtomicUsize::new(0);
+
+/// A registered handle counted in [`LIVE_CUFILE_HANDLES`] until it is deregistered (`close`) or
+/// dropped (the count falls only after the handle itself is gone).
+#[cfg(target_os = "linux")]
+struct LiveHandle(Option<Arc<cufile::FileHandle>>);
+
+#[cfg(target_os = "linux")]
+impl LiveHandle {
+    fn new(fh: Arc<cufile::FileHandle>) -> Self {
+        LIVE_CUFILE_HANDLES.fetch_add(1, Ordering::SeqCst);
+        Self(Some(fh))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHandle {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        LIVE_CUFILE_HANDLES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn live_handle<'a>(slot: &'a Option<LiveHandle>, op: &str) -> PyResult<&'a cufile::FileHandle> {
+    slot.as_ref()
+        .and_then(|h| h.0.as_deref())
+        .ok_or_else(|| map_cufile_err(op, cufile::Error::Invalid("cuFile handle already closed")))
+}
+
 /// RAII GPUDirect Storage driver session (`cuFileDriverOpen` / `cuFileDriverClose_v2`).
 #[pyclass(name = "CufileDriver", module = "nv_rs.cufile")]
 pub struct PyCufileDriver {
     #[cfg(target_os = "linux")]
     inner: Arc<Mutex<Option<cufile::DriverSession>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PyCufileDriver {
+    fn drop(&mut self) {
+        let open = LIVE_CUFILE_HANDLES.load(Ordering::SeqCst);
+        if open == 0 {
+            return;
+        }
+        if let Some(sess) = lock(&self.inner).take() {
+            diag::record_error(
+                "cufile",
+                "CufileDriver::drop",
+                &format!("{open} CufileHandle(s) still registered: driver session left open"),
+            );
+            std::mem::forget(sess);
+        }
+    }
 }
 
 #[pymethods]
@@ -1054,9 +1075,7 @@ impl PyCufileDriver {
             let inner = self.inner.clone();
             let props = py
                 .detach(move || {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| cufile::Error::Invalid("CufileDriver mutex poisoned"))?;
+                    let guard = lock(&inner);
                     let sess = guard.as_ref().ok_or(cufile::Error::Invalid(
                         "cuFile driver session already closed",
                     ))?;
@@ -1094,21 +1113,31 @@ impl PyCufileDriver {
         }
     }
 
-    /// Explicitly closes the cuFile driver session.
+    /// Explicitly closes the cuFile driver session. Raises `NvInvalidArgumentError` while any
+    /// `CufileHandle` is still registered (close those first). Closing again is a no-op.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(target_os = "linux")]
         {
             let inner = self.inner.clone();
             py.detach(move || {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| cufile::Error::Invalid("CufileDriver mutex poisoned"))?;
-                if let Some(sess) = guard.take() {
-                    sess.close()?;
+                let mut guard = lock(&inner);
+                if guard.is_none() {
+                    return Ok(());
                 }
-                Ok(())
+                let open = LIVE_CUFILE_HANDLES.load(Ordering::SeqCst);
+                if open > 0 {
+                    return Err(record_and_err(
+                        "cufile",
+                        "close",
+                        format!("{open} CufileHandle(s) still registered; close them first"),
+                        ErrorKind::InvalidArgument,
+                    ));
+                }
+                guard
+                    .take()
+                    .map_or(Ok(()), cufile::DriverSession::close)
+                    .map_err(|e| map_cufile_err("close", e))
             })
-            .map_err(|e| map_cufile_err("close", e))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1135,11 +1164,12 @@ impl PyCufileDriver {
     }
 }
 
-/// Registered cuFile handle for synchronous GPU direct reads/writes on `DeviceBuffer`.
+/// Registered cuFile handle for synchronous GPU direct reads/writes on `DeviceBuffer`
+/// (nv_rs-owned buffers and DLPack imports).
 #[pyclass(name = "CufileHandle", module = "nv_rs.cufile")]
 pub struct PyCufileHandle {
     #[cfg(target_os = "linux")]
-    inner: Arc<Mutex<Option<Arc<cufile::FileHandle>>>>,
+    inner: Arc<Mutex<Option<LiveHandle>>>,
 }
 
 #[pymethods]
@@ -1187,7 +1217,7 @@ impl PyCufileHandle {
                 true,
             );
             Ok(Self {
-                inner: Arc::new(Mutex::new(Some(fh))),
+                inner: Arc::new(Mutex::new(Some(LiveHandle::new(fh)))),
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -1198,11 +1228,17 @@ impl PyCufileHandle {
     }
 
     /// Synchronously reads up to `len` bytes from `file_offset` into `dst` at `buf_offset`.
-    #[pyo3(signature = (dst, file_offset=0, buf_offset=0, len=None))]
+    ///
+    /// `stream` must order `dst` (its producer stream, `dst.stream`, or one already synchronized
+    /// with it): it is synchronized first, because the transfer itself is ordered with no stream
+    /// and `dst` may be a stream-ordered allocation or still being written. Unfinished leased
+    /// work on `dst` from another stream is rejected with `NvInvalidArgumentError`.
+    #[pyo3(signature = (dst, stream, file_offset=0, buf_offset=0, len=None))]
     fn read(
         &self,
         py: Python<'_>,
         dst: &PyDeviceBuffer,
+        stream: &PyStream,
         file_offset: u64,
         buf_offset: usize,
         len: Option<usize>,
@@ -1210,30 +1246,23 @@ impl PyCufileHandle {
         #[cfg(target_os = "linux")]
         {
             let t0 = Instant::now();
-            let buf = dst
-                .owned_cuda_buf()
-                .ok_or_else(|| {
-                    record_and_err(
-                        "cufile",
-                        "read",
-                        "cufile.read requires an nv_rs-owned DeviceBuffer",
-                        ErrorKind::InvalidArgument,
-                    )
-                })?
-                .clone();
-            let transfer_len = len.unwrap_or_else(|| dst.byte_len().saturating_sub(buf_offset));
-            let inner = self.inner.clone();
-            let n = py
-                .detach(move || {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| cufile::Error::Invalid("CufileHandle mutex poisoned"))?;
-                    let fh = guard
-                        .as_ref()
-                        .ok_or(cufile::Error::Invalid("cuFile handle already closed"))?;
-                    fh.read(file_offset, &buf, buf_offset, transfer_len)
-                })
-                .map_err(|e| map_cufile_err("read", e))?;
+            let s = &stream.inner;
+            let mut span = byte_span("cufile", "read", "dst", dst, s)?;
+            let transfer_len = len.unwrap_or_else(|| span.num_bytes().saturating_sub(buf_offset));
+            let n = py.detach(|| -> PyResult<usize> {
+                s.synchronize()
+                    .map_err(|e| record_and_err("cufile", "read", e, ErrorKind::Cuda))?;
+                let guard = lock(&self.inner);
+                let fh = live_handle(&guard, "read")?;
+                let mut n = 0;
+                enqueue_leased("cufile", "read", s, [(dst, Access::Write)], || {
+                    n = fh
+                        .read(file_offset, &mut span, buf_offset, transfer_len)
+                        .map_err(|e| map_cufile_err("read", e))?;
+                    Ok(())
+                })?;
+                Ok(n)
+            })?;
             diag::record_event(
                 Level::Info,
                 "cufile",
@@ -1246,17 +1275,20 @@ impl PyCufileHandle {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (py, dst, file_offset, buf_offset, len);
+            let _ = (py, dst, stream, file_offset, buf_offset, len);
             Err(unsupported_linux("cufile", "CufileHandle::read"))
         }
     }
 
     /// Synchronously writes up to `len` bytes from `src` at `buf_offset` to `file_offset`.
-    #[pyo3(signature = (src, file_offset=0, buf_offset=0, len=None))]
+    ///
+    /// `stream` must order `src` as for `read`; it is synchronized before the transfer.
+    #[pyo3(signature = (src, stream, file_offset=0, buf_offset=0, len=None))]
     fn write(
         &self,
         py: Python<'_>,
         src: &PyDeviceBuffer,
+        stream: &PyStream,
         file_offset: u64,
         buf_offset: usize,
         len: Option<usize>,
@@ -1264,30 +1296,23 @@ impl PyCufileHandle {
         #[cfg(target_os = "linux")]
         {
             let t0 = Instant::now();
-            let buf = src
-                .owned_cuda_buf()
-                .ok_or_else(|| {
-                    record_and_err(
-                        "cufile",
-                        "write",
-                        "cufile.write requires an nv_rs-owned DeviceBuffer",
-                        ErrorKind::InvalidArgument,
-                    )
-                })?
-                .clone();
-            let transfer_len = len.unwrap_or_else(|| src.byte_len().saturating_sub(buf_offset));
-            let inner = self.inner.clone();
-            let n = py
-                .detach(move || {
-                    let guard = inner
-                        .lock()
-                        .map_err(|_| cufile::Error::Invalid("CufileHandle mutex poisoned"))?;
-                    let fh = guard
-                        .as_ref()
-                        .ok_or(cufile::Error::Invalid("cuFile handle already closed"))?;
-                    fh.write(file_offset, &buf, buf_offset, transfer_len)
-                })
-                .map_err(|e| map_cufile_err("write", e))?;
+            let s = &stream.inner;
+            let span = byte_span("cufile", "write", "src", src, s)?;
+            let transfer_len = len.unwrap_or_else(|| span.num_bytes().saturating_sub(buf_offset));
+            let n = py.detach(|| -> PyResult<usize> {
+                s.synchronize()
+                    .map_err(|e| record_and_err("cufile", "write", e, ErrorKind::Cuda))?;
+                let guard = lock(&self.inner);
+                let fh = live_handle(&guard, "write")?;
+                let mut n = 0;
+                enqueue_leased("cufile", "write", s, [(src, Access::Read)], || {
+                    n = fh
+                        .write(file_offset, &span, buf_offset, transfer_len)
+                        .map_err(|e| map_cufile_err("write", e))?;
+                    Ok(())
+                })?;
+                Ok(n)
+            })?;
             diag::record_event(
                 Level::Info,
                 "cufile",
@@ -1300,21 +1325,22 @@ impl PyCufileHandle {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (py, src, file_offset, buf_offset, len);
+            let _ = (py, src, stream, file_offset, buf_offset, len);
             Err(unsupported_linux("cufile", "CufileHandle::write"))
         }
     }
 
-    /// Deregisters the cuFile handle and closes the underlying file.
+    /// Deregisters the cuFile handle and closes the underlying file. Closing again is a no-op.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         #[cfg(target_os = "linux")]
         {
             let inner = self.inner.clone();
             py.detach(move || {
-                let mut guard = inner
-                    .lock()
-                    .map_err(|_| cufile::Error::Invalid("CufileHandle mutex poisoned"))?;
-                if let Some(fh) = guard.take() {
+                let taken = lock(&inner).take();
+                // `live` is dropped (and uncounted) only after the deregistration below.
+                if let Some(mut live) = taken
+                    && let Some(fh) = live.0.take()
+                {
                     let file = cufile::FileHandle::deregister(fh)?;
                     drop(file);
                 }
@@ -1333,19 +1359,8 @@ impl PyCufileHandle {
     fn mode(&self) -> PyResult<&'static str> {
         #[cfg(target_os = "linux")]
         {
-            let guard = self.inner.lock().map_err(|_| {
-                map_cufile_err(
-                    "mode",
-                    cufile::Error::Invalid("CufileHandle mutex poisoned"),
-                )
-            })?;
-            let fh = guard.as_ref().ok_or_else(|| {
-                map_cufile_err(
-                    "mode",
-                    cufile::Error::Invalid("cuFile handle already closed"),
-                )
-            })?;
-            Ok(match fh.mode() {
+            let guard = lock(&self.inner);
+            Ok(match live_handle(&guard, "mode")?.mode() {
                 cufile::IoMode::GdsOnly => "gds",
                 cufile::IoMode::PosixFallback => "posix",
             })

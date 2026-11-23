@@ -139,13 +139,22 @@ pub struct SdgExrFrame<'a> {
     pub height: u32,
     /// Linear Beauty RGBA (`width * height`).
     pub color_rgba: &'a [[f32; 4]],
-    /// Linear view-space depth in meters (`width * height`).
+    /// `depth.Z` in meters (`width * height`); the meaning follows the manifest `projection`:
+    /// `Pinhole` stores planar camera-space Z along the view direction, `Fisheye180`,
+    /// `Equirect360` and `SlitCam` store Euclidean range from the camera centre (they have no image
+    /// plane). Sky misses and pixels outside the fisheye circle store `1e6`.
     pub depth: &'a [f32],
-    /// Screen-space pixel optical flow `[dx, dy]` (`width * height`).
+    /// Backward pixel motion `[dx, dy]` (`width * height`): previous-frame position minus current
+    /// position of the surface seen in this pixel, in pixels, +x right, +y down, sub-pixel jitter
+    /// removed, reprojected with the same sensor projection. `Equirect360` / `SlitCam` x motion
+    /// wraps across the image seam (shorter way round). `[0, 0]` where no previous camera exists.
     pub motion: &'a [[f32; 2]],
-    /// Per-pixel `SemanticId` (`0..=19`, `width * height`).
+    /// Per-pixel `SemanticId` (`0..=19`, `width * height`, `0` = sky / unknown); classic demo
+    /// geometry is `16` (GROUND) for the floor and `0` for the showcase objects.
     pub semantic_id: &'a [u32],
-    /// Per-pixel `InstanceId` / entity `user_id` (`width * height`).
+    /// Per-pixel instance ID (`width * height`, `0` = sky): the CSG instance `user_id`;
+    /// `0xFF00_0000 | instance index` for CSG instances without one; `0xFFFF_FF00 | slot` for
+    /// classic demo geometry.
     pub instance_id: &'a [u32],
 }
 
@@ -286,6 +295,9 @@ pub fn write_sdg_manifest_atomic(path: &Path, manifest: &SdgBurstManifest) -> Re
 }
 
 /// Writes `bytes` atomically via a same-directory temp file + `flush` + `sync_all` + `rename`.
+///
+/// On any failure after the temp file was created it is removed again, so failed writes leave
+/// neither a partial `path` nor a stray temp file.
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<(), String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -296,15 +308,32 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()
     let tmp_path = path.with_extension(tmp_ext);
     let mut file = std::fs::File::create(&tmp_path)
         .map_err(|e| format!("create temp {} failed: {e}", tmp_path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("write {} failed: {e}", tmp_path.display()))?;
-    file.flush()
-        .map_err(|e| format!("flush {} failed: {e}", tmp_path.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("sync_all {} failed: {e}", tmp_path.display()))?;
+    let written = file
+        .write_all(bytes)
+        .map_err(|e| format!("write {} failed: {e}", tmp_path.display()))
+        .and_then(|()| {
+            file.flush()
+                .map_err(|e| format!("flush {} failed: {e}", tmp_path.display()))
+        })
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|e| format!("sync_all {} failed: {e}", tmp_path.display()))
+        });
     drop(file);
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| format!("atomic rename to {} failed: {e}", path.display()))
+    let result = written.and_then(|()| {
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("atomic rename to {} failed: {e}", path.display()))
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => match std::fs::remove_file(&tmp_path) {
+            Ok(()) => Err(err),
+            Err(rm_err) => Err(format!(
+                "{err}; removing temp {} also failed: {rm_err}",
+                tmp_path.display()
+            )),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +437,118 @@ mod tests {
             assert_eq!(sem_back[i], semantic_id[i]);
             assert_eq!(inst_back[i], instance_id[i]);
         }
+    }
+
+    /// Mirror of `__raygen__render` ray generation (`shaders/raytracer.cu`) in the camera frame
+    /// (x = right, y = up, z = forward); `None` for pixels outside the fisheye circle.
+    fn mirror_cast(proj: u32, px: f32, py: f32, w: f32, h: f32, tan_fov: f32) -> Option<[f32; 3]> {
+        let (u01, v01) = (px / w, py / h);
+        match proj {
+            1 => {
+                let half_min = (0.5 * w.min(h)).max(1.0);
+                let dx = (px - 0.5 * w) / half_min;
+                let dy = (0.5 * h - py) / half_min;
+                let r = (dx * dx + dy * dy).sqrt();
+                if r > 1.0 {
+                    return None;
+                }
+                let theta = r * std::f32::consts::FRAC_PI_2;
+                let phi = dy.atan2(dx);
+                Some([theta.sin() * phi.cos(), theta.sin() * phi.sin(), theta.cos()])
+            }
+            2 => {
+                let yaw = (u01 - 0.5) * std::f32::consts::TAU;
+                let pitch = (0.5 - v01) * std::f32::consts::PI;
+                Some([yaw.sin() * pitch.cos(), pitch.sin(), yaw.cos() * pitch.cos()])
+            }
+            3 => {
+                let yaw = (u01 - 0.5) * std::f32::consts::TAU;
+                Some([yaw.sin(), (0.5 - v01) * 2.0 * tan_fov, yaw.cos()])
+            }
+            _ => {
+                let aspect = w / h;
+                Some([(u01 * 2.0 - 1.0) * aspect * tan_fov, (1.0 - v01 * 2.0) * tan_fov, 1.0])
+            }
+        }
+    }
+
+    /// Mirror of `project_prev_pixel` (`shaders/raytracer.cu`) in the camera frame.
+    fn mirror_project(proj: u32, d: [f32; 3], w: f32, h: f32, tan_fov: f32) -> Option<(f32, f32)> {
+        let [x, y, z] = d;
+        match proj {
+            1 => {
+                let len = (x * x + y * y + z * z).sqrt();
+                let r = (z / len).clamp(-1.0, 1.0).acos() * std::f32::consts::FRAC_2_PI;
+                let phi = y.atan2(x);
+                let half_min = (0.5 * w.min(h)).max(1.0);
+                Some((0.5 * w + r * phi.cos() * half_min, 0.5 * h - r * phi.sin() * half_min))
+            }
+            2 | 3 => {
+                let yaw = x.atan2(z);
+                let hl = (x * x + z * z).sqrt();
+                let v01 = if proj == 2 {
+                    0.5 - y.atan2(hl) * std::f32::consts::FRAC_1_PI
+                } else {
+                    0.5 - (y / hl) / (2.0 * tan_fov)
+                };
+                Some(((yaw / std::f32::consts::TAU + 0.5) * w, v01 * h))
+            }
+            _ => {
+                if z <= 1e-4 {
+                    return None;
+                }
+                let aspect = w / h;
+                let ndc_x = x / (z * aspect * tan_fov);
+                let ndc_y = y / (z * tan_fov);
+                Some(((ndc_x * 0.5 + 0.5) * w, (0.5 - ndc_y * 0.5) * h))
+            }
+        }
+    }
+
+    #[test]
+    fn motion_reprojection_inverts_every_sensor_projection() {
+        let (w, h, tan_fov) = (320.0f32, 180.0f32, 0.6f32);
+        for proj in 0..4u32 {
+            let mut checked = 0;
+            for iy in 0..18 {
+                for ix in 0..32 {
+                    let px = ix as f32 * 10.0 + 3.25;
+                    let py = iy as f32 * 10.0 + 4.75;
+                    let Some(d) = mirror_cast(proj, px, py, w, h, tan_fov) else {
+                        continue;
+                    };
+                    let (qx, qy) = mirror_project(proj, d, w, h, tan_fov)
+                        .expect("every cast direction has an image");
+                    assert!(
+                        (qx - px).abs() < 5e-2 && (qy - py).abs() < 5e-2,
+                        "proj {proj}: pixel ({px}, {py}) reprojects to ({qx}, {qy})"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 100, "proj {proj}: only {checked} pixels checked");
+        }
+    }
+
+    #[test]
+    fn write_bytes_atomic_removes_temp_file_when_rename_fails() {
+        // Renaming a file onto an existing directory fails on Windows and Linux alike.
+        let dir = std::env::temp_dir().join(format!(
+            "nv_demo_atomic_rename_fail_{}",
+            std::process::id()
+        ));
+        let target = dir.join("out.bin");
+        std::fs::create_dir_all(&target).expect("create directory at the target path");
+        let tmp = target.with_extension("bin.tmp");
+
+        let res = write_bytes_atomic(&target, b"payload", "bin.tmp");
+
+        let tmp_left = tmp.exists();
+        let target_is_dir = target.is_dir();
+        std::fs::remove_dir_all(&dir).expect("clean test directory");
+        assert!(res.is_err(), "rename onto a directory must fail");
+        assert!(!tmp_left, "temp file must be removed on failure");
+        assert!(target_is_dir, "target must be left untouched");
     }
 
     #[test]

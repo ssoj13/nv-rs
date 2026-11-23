@@ -1,7 +1,7 @@
 //! Asynchronous OptiX path-tracing worker thread communicating with the 60+ FPS GUI via `appbus`.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CString, c_void};
+use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -55,6 +55,10 @@ const RAYTRACER_CU: &str = include_str!("../shaders/raytracer.cu");
 #[cfg(not(has_embedded_ptx))]
 const TONEMAP_CU: &str = include_str!("../shaders/tonemap.cu");
 
+/// Absolute path of the ray-tracing shader read by `ReloadShader`, independent of the working
+/// directory the binary was launched from.
+const RAYTRACER_CU_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/raytracer.cu");
+
 pub const DEFAULT_W: u32 = 896;
 pub const DEFAULT_H: u32 = 512;
 
@@ -87,6 +91,8 @@ struct LaunchParams {
     fractal_p1: [f32; 4],
     fractal_p2: [f32; 4],
     fractal_p3: [f32; 4],
+    /// Unread by `raytracer.cu` (the fractal TRS lives in the TLAS instance transform); kept so
+    /// the 640-byte layout and every later offset stay fixed.
     fractal_xform: [f32; 4],
     fractal_r0: [f32; 4],
     fractal_r1: [f32; 4],
@@ -95,6 +101,7 @@ struct LaunchParams {
     fractal_kind: u32,
     bounces: u32,
     floor_params: [f32; 4],
+    /// `[sky_intensity, unread, horizon_haze, sky_mode]`; `raytracer.cu` never reads `[1]`.
     sky_params: [f32; 4],
     accum_count: u32,
     enable_ser: u32,
@@ -106,7 +113,9 @@ struct LaunchParams {
     prev_cam_forward: [f32; 4],
     prev_cam_right: [f32; 4],
     prev_cam_up: [f32; 4],
+    /// Unread by `raytracer.cu`; kept so the 640-byte layout and every later offset stay fixed.
     sat_pos: [f32; 4],
+    /// `[ior, absorption, roughness, unread]`; `raytracer.cu` never reads `[3]`.
     glass_params: [f32; 4],
     aov_mode: u32,
     jitter_x: f32,
@@ -402,6 +411,35 @@ impl EnvSettings {
                 0.0,
             ],
             _ => [0.0; 8],
+        }
+    }
+
+    /// Number of leading `env_params` slots `raytracer.cu` reads for `sky_mode` (`0` for modes
+    /// that read none, such as Coastal Night `8`).
+    const fn used_slots(sky_mode: u32) -> usize {
+        match sky_mode {
+            0 | 1 | 2 | 4 | 5 | 6 => 2,
+            3 => 6,
+            7 => 4,
+            _ => 0,
+        }
+    }
+
+    /// Packs `env_params` for a sky crossfade from `from_mode` to `to_mode`.
+    ///
+    /// `sky_color` in `raytracer.cu` evaluates both modes during the fade from one `env_params`
+    /// block, so the block must serve both: when only one of the two modes reads parameters, or
+    /// both read the same ones (Day `0` and Sunset `1`), that block is exact for the whole fade.
+    /// Two modes reading different parameters cannot share one block; the target mode wins, and
+    /// only a second parameter block in `Params` can fix that case.
+    pub fn pack_crossfade(&self, from_mode: u32, to_mode: u32, blend: f32) -> [f32; 8] {
+        let to = self.pack(to_mode);
+        // Same blend window as `sky_color`: outside it only `to_mode` is evaluated.
+        let fading = blend > 1e-4 && blend < 0.9999 && from_mode != to_mode;
+        if fading && Self::used_slots(to_mode) == 0 {
+            self.pack(from_mode)
+        } else {
+            to
         }
     }
 }
@@ -960,8 +998,16 @@ struct OptixRig {
     sdg_sbt: ShaderBindingTable,
     ser_supported: bool,
     denoiser: Option<Denoiser>,
+    /// Model actually running (`false` after a `TemporalAov` -> `Aov` downgrade).
     denoiser_is_temporal: bool,
+    /// `settings.temporal_denoise` the current denoiser (or failed attempt) was created for.
+    denoiser_requested_temporal: bool,
+    /// Creation or invocation failed for the current request; not retried until the request
+    /// changes or the viewport is resized.
+    denoiser_failed: bool,
     temporal_has_prev: bool,
+    /// A lazy AOV allocation failed; lazy allocations stay off until the next resize.
+    lazy_alloc_failed: bool,
     color_f32: DeviceBuffer<[f32; 4]>,
     albedo_f32: DeviceBuffer<[f32; 4]>,
     diffuse_albedo_f32: Option<DeviceBuffer<[f32; 4]>>,
@@ -975,8 +1021,11 @@ struct OptixRig {
     instance_u32: Option<DeviceBuffer<u32>>,
     params_buf: DeviceBuffer<u8>,
     tonemap: TonemapKernel,
-    bloom: Option<FftBloomPass>,
+    /// cuFFT bloom pass, or why it could not be created (reported when Bloom is requested).
+    bloom: Result<FftBloomPass, String>,
     gpu_profiler: Option<GpuPassProfiler>,
+    /// Non-fatal init problems (profiler, initial CSG scene), reported once after init.
+    init_warnings: Vec<String>,
     csg_host: CsgGpuHost,
     ias_instances_scratch: Vec<Instance>,
     ias_dyn_scratch: Vec<Instance>,
@@ -1060,6 +1109,85 @@ const fn should_skip_cuda_tonemap(
     has_pending_jpeg: bool,
 ) -> bool {
     dlss_rr_on && has_rr_ptrs && aov_mode == 0 && !split_on && !has_pending_jpeg
+}
+
+/// Returns `true` when the OptiX denoiser must be (re)created this frame.
+///
+/// The comparison is against the *requested* model, not the running one: after a
+/// `TemporalAov` -> `Aov` downgrade the running model differs from the request forever, and
+/// comparing against it would rebuild the denoiser every frame. A failed request is not retried
+/// until the request changes (or a resize clears `failed`).
+#[inline]
+const fn denoiser_needs_create(
+    has_denoiser: bool,
+    failed: bool,
+    requested_temporal: bool,
+    want_temporal: bool,
+) -> bool {
+    if requested_temporal != want_temporal {
+        true
+    } else {
+        !has_denoiser && !failed
+    }
+}
+
+/// Returns `true` when DLSS sub-pixel jitter runs this frame. Jitter restarts accumulation every
+/// frame, and an SDG burst needs `target_accum` accumulated samples per frame, so a burst renders
+/// unjittered.
+#[inline]
+const fn dlss_jitter_active(dlss_any: bool, aov_mode: u32, burst_active: bool) -> bool {
+    dlss_any && aov_mode == 0 && !burst_active
+}
+
+/// Returns `(spin, orbit)`: whether the classic-stage fractal spin and the satellite orbit
+/// advance this frame. Both restart accumulation every frame, so both pause during an SDG burst.
+#[inline]
+fn classic_animation(settings: &DemoSettings, burst_active: bool) -> (bool, bool) {
+    let show_classic = settings.csg_mode == 0 || settings.csg_show_fractal;
+    let spin = show_classic && settings.auto_rotate && !burst_active;
+    let orbit = show_classic
+        && settings.sat_on
+        && settings.sat_orbit
+        && settings.sat_count > 0
+        && !burst_active;
+    (spin, orbit)
+}
+
+/// Returns `true` when a crowd LOD change on a non-stepping frame is applied by the CUDA crowd
+/// backend. Explicit `Cuda` always uses it (it never downgrades to the CPU); `Auto` uses it only
+/// for a frozen crowd and otherwise re-evaluates on the CPU.
+#[inline]
+const fn crowd_lod_refresh_on_cuda(backend: CrowdBackend, freeze_now: bool) -> bool {
+    match backend {
+        CrowdBackend::Cuda => true,
+        CrowdBackend::Auto => freeze_now,
+        CrowdBackend::Cpu => false,
+    }
+}
+
+/// Build options for the throwaway Smart View probe IAS (`compact = false`: compaction would add
+/// an allocation and a synchronous stall for a structure that lives for one probe launch).
+fn probe_ias_build_opts() -> BuildOptions {
+    BuildOptions {
+        prefer_fast_trace: true,
+        compact: false,
+        ..Default::default()
+    }
+}
+
+/// Looks up kernel `name` in the loaded tonemap `module`.
+fn cu_module_function(module: cu::CUmodule, name: &CStr) -> Result<cu::CUfunction, String> {
+    let mut func: cu::CUfunction = std::ptr::null_mut();
+    // SAFETY: `module` was loaded by `cuModuleLoadData` on the current context, `name` is
+    // NUL-terminated and `func` is a valid out-pointer.
+    let res = unsafe { cu::cuModuleGetFunction(&mut func, module, name.as_ptr()) };
+    if res != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!(
+            "cuModuleGetFunction({}) failed ({res:?})",
+            name.to_string_lossy()
+        ));
+    }
+    Ok(func)
 }
 
 fn try_compile_ptx(src: &str, name: &str, include_optix: bool) -> Result<Vec<u8>, String> {
@@ -1388,15 +1516,20 @@ fn build_optix_pipeline(
     Ok((pipeline, sbt, probe_sbt, sdg_sbt))
 }
 
+/// Creates the OptiX AI denoiser and returns `(denoiser, is_temporal, downgrade_reason)`.
+///
+/// A `TemporalAov` request falls back to `Aov` when the driver rejects it; `downgrade_reason`
+/// then says why, so the caller reports which model actually runs.
 fn create_denoiser(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Arc<Stream>,
     width: u32,
     height: u32,
     temporal: bool,
-) -> (Denoiser, bool) {
-    if temporal
-        && let Ok(d) = Denoiser::new(
+) -> Result<(Denoiser, bool, Option<String>), String> {
+    let mut downgrade = None;
+    if temporal {
+        match Denoiser::new(
             optix_ctx,
             stream,
             DenoiserOptions {
@@ -1407,9 +1540,14 @@ fn create_denoiser(
             },
             width,
             height,
-        )
-    {
-        return (d, true);
+        ) {
+            Ok(d) => return Ok((d, true, None)),
+            Err(e) => {
+                downgrade = Some(format!(
+                    "Temporal denoiser unavailable ({e}); running the non-temporal Aov denoiser"
+                ));
+            }
+        }
     }
     let d = Denoiser::new(
         optix_ctx,
@@ -1423,8 +1561,8 @@ fn create_denoiser(
         width,
         height,
     )
-    .expect("Denoiser");
-    (d, false)
+    .map_err(|e| format!("Aov denoiser creation failed: {e}"))?;
+    Ok((d, false, downgrade))
 }
 
 fn build_uv_sphere(stacks: u32, slices: u32) -> Vec<[f32; 3]> {
@@ -1459,11 +1597,15 @@ fn build_sphere_mesh_gas(
     scratch: &mut Scratch,
     u_segs: u32,
     v_segs: u32,
-) -> Arc<Accel> {
+) -> Result<Arc<Accel>, String> {
     let sphere_tris = build_uv_sphere(v_segs.max(4), u_segs.max(4));
-    let sphere_verts = DeviceBuffer::from_host(stream, &sphere_tris).expect("sphere verts");
+    let sphere_verts = DeviceBuffer::from_host(stream, &sphere_tris)
+        .map_err(|e| format!("glass mesh vertex upload failed: {e}"))?;
+    // `compact = false`: the mesh is rebuilt on every "Sat U/V segs" slider tick, and compaction
+    // would add an allocation and a synchronous stall to each tick.
     let tri_build_opts = BuildOptions {
         prefer_fast_trace: true,
+        compact: false,
         ..Default::default()
     };
     Accel::triangles(
@@ -1476,7 +1618,7 @@ fn build_sphere_mesh_gas(
         }],
         tri_build_opts,
     )
-    .expect("glass mesh GAS")
+    .map_err(|e| format!("glass mesh GAS build failed: {e}"))
 }
 
 fn build_torus_ring(major_r: f32, minor_r: f32, segs: u32, tube_segs: u32) -> Vec<[f32; 3]> {
@@ -1539,7 +1681,7 @@ fn build_filigree_band_tris(radius: f32, half_h: f32, segs: u32) -> Vec<[f32; 3]
 
 /// Bakes 2 shared 4-state opacity micromaps (`[even, odd]`) at subdivision `level` using
 /// 1-Lipschitz SDF circumradius bounds so OMM and Any-Hit are pixel-identical.
-fn bake_filigree_omm_bytes(level: u32) -> Vec<u8> {
+fn bake_filigree_omm_bytes(level: u32) -> Result<Vec<u8>, String> {
     const STATE_TRANSPARENT: u8 = 0;
     const STATE_OPAQUE: u8 = 1;
     const STATE_UNKNOWN_TRANSPARENT: u8 = 2;
@@ -1552,7 +1694,8 @@ fn bake_filigree_omm_bytes(level: u32) -> Vec<u8> {
     for (map_idx, odd) in [false, true].into_iter().enumerate() {
         let map_slice = &mut bytes[map_idx * bytes_per_map..(map_idx + 1) * bytes_per_map];
         for idx in 0..micro_count {
-            let barys = micro_to_base_bary(idx, level).expect("micro_to_base_bary");
+            let barys = micro_to_base_bary(idx, level)
+                .map_err(|e| format!("micro_to_base_bary({idx}, {level}) failed: {e}"))?;
             let uvs: [[f32; 2]; 3] = barys.map(|[b1, b2]| {
                 if odd {
                     [b1, b1 + b2]
@@ -1583,7 +1726,7 @@ fn bake_filigree_omm_bytes(level: u32) -> Vec<u8> {
             map_slice[(idx / 4) as usize] |= state << ((idx % 4) * 2);
         }
     }
-    bytes
+    Ok(bytes)
 }
 
 /// Builds both the hardware OMM GAS and the unaccelerated Any-Hit GAS over the same filigree halo
@@ -1592,16 +1735,18 @@ fn build_omm_gases(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Arc<Stream>,
     scratch: &mut Scratch,
-) -> (Arc<Accel>, Arc<Accel>) {
+) -> Result<(Arc<Accel>, Arc<Accel>), String> {
     const OMM_SEGS: u32 = 24;
     const OMM_LEVEL: u32 = 5;
     let tris = build_filigree_band_tris(2.15, 0.45, OMM_SEGS);
     let tri_count = (tris.len() / 3) as u32;
-    let verts = DeviceBuffer::from_host(stream, &tris).expect("omm verts");
+    let verts = DeviceBuffer::from_host(stream, &tris)
+        .map_err(|e| format!("OMM vertex upload failed: {e}"))?;
 
-    let omm_bytes = bake_filigree_omm_bytes(OMM_LEVEL);
+    let omm_bytes = bake_filigree_omm_bytes(OMM_LEVEL)?;
     let per_map_bytes = (omm_bytes.len() / 2) as u32;
-    let omm_data = DeviceBuffer::from_host(stream, &omm_bytes).expect("omm data");
+    let omm_data = DeviceBuffer::from_host(stream, &omm_bytes)
+        .map_err(|e| format!("OMM data upload failed: {e}"))?;
     let descs = [
         MicromapDesc::new(0, OMM_LEVEL as u16, MicromapFormat::FourState),
         MicromapDesc::new(per_map_bytes, OMM_LEVEL as u16, MicromapFormat::FourState),
@@ -1614,10 +1759,11 @@ fn build_omm_gases(
         &descs,
         MicromapOptions::default(),
     )
-    .expect("OpacityMicromapArray");
+    .map_err(|e| format!("OpacityMicromapArray build failed: {e}"))?;
 
     let indices_host: Vec<i16> = (0..tri_count).map(|i| (i & 1) as i16).collect();
-    let indices_buf = DeviceBuffer::from_host(stream, &indices_host).expect("omm indices");
+    let indices_buf = DeviceBuffer::from_host(stream, &indices_host)
+        .map_err(|e| format!("OMM index upload failed: {e}"))?;
     let usage = [MicromapCount {
         count: tri_count,
         level: OMM_LEVEL,
@@ -1645,7 +1791,7 @@ fn build_omm_gases(
         }],
         build_opts,
     )
-    .expect("omm GAS");
+    .map_err(|e| format!("OMM GAS build failed: {e}"))?;
 
     let omm_anyhit_gas = Accel::triangles(
         optix_ctx,
@@ -1657,9 +1803,9 @@ fn build_omm_gases(
         }],
         build_opts,
     )
-    .expect("omm anyhit GAS");
+    .map_err(|e| format!("OMM any-hit GAS build failed: {e}"))?;
 
-    (omm_gas, omm_anyhit_gas)
+    Ok((omm_gas, omm_anyhit_gas))
 }
 
 struct SceneGas<'a> {
@@ -1810,11 +1956,18 @@ fn compute_ias_classic_state(
     } else {
         0.0
     };
+    // Segment counts select the glass mesh GAS, which the IAS references only for visible
+    // non-analytic satellites; keying them otherwise rebuilds the IAS on every slider tick.
+    let (sat_u_segs, sat_v_segs) = if settings.sat_on && !settings.glass_analytic {
+        (settings.sat_u_segs, settings.sat_v_segs)
+    } else {
+        (0, 0)
+    };
     let state = IasClassicState::Visible {
         sat_on: settings.sat_on,
         glass_analytic: settings.glass_analytic,
-        sat_u_segs: settings.sat_u_segs,
-        sat_v_segs: settings.sat_v_segs,
+        sat_u_segs,
+        sat_v_segs,
         sat_count: settings.sat_count,
         sat_seed: settings.sat_seed,
         neon_on: settings.neon_on,
@@ -1840,6 +1993,33 @@ fn compute_ias_classic_state(
     (state, fractal_transform)
 }
 
+/// Builds the classic-stage IAS inputs from `settings`; the single source for both the initial
+/// build and the frame loop.
+fn scene_state(
+    settings: &DemoSettings,
+    sat_angle: f32,
+    fractal_transform: [f32; 12],
+) -> SceneState {
+    SceneState {
+        sat_angle,
+        sat_count: settings.sat_count,
+        sat_seed: settings.sat_seed,
+        sat_size_range: [settings.sat_size_min, settings.sat_size_max],
+        sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
+        sat_height_range: [settings.sat_height_min, settings.sat_height_max],
+        sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
+        sat_bob_amp_range: [settings.sat_bob_amp_min, settings.sat_bob_amp_max],
+        sat_bob_freq_range: [settings.sat_bob_freq_min, settings.sat_bob_freq_max],
+        sat_hue_spread: settings.sat_hue_spread,
+        sat_on: settings.sat_on,
+        glass_analytic: settings.glass_analytic,
+        neon_on: settings.neon_on,
+        omm_mode: settings.omm_mode,
+        show_classic: settings.csg_mode == 0 || settings.csg_show_fractal,
+        fractal_transform,
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "coordinates persistent IAS buffer, scratch, GAS handles, and scene state with zero alloc"
@@ -1854,7 +2034,7 @@ fn build_ias_into(
     csg_host: &CsgGpuHost,
     instances: &mut Vec<Instance>,
     state: SceneState,
-) -> usize {
+) -> Result<usize, String> {
     instances.clear();
     if state.show_classic {
         let count = state.sat_count.min(24) as usize;
@@ -1974,9 +2154,10 @@ fn build_ias_into(
 
     d_instances
         .upload_all(stream, instances)
-        .expect("IAS instance upload");
+        .map_err(|e| format!("IAS instance upload failed: {e}"))?;
     // SAFETY: all ray-tracing launches on `stream` are strictly ordered before this build.
-    let _ = unsafe {
+    // `Ok(bool)` only says whether OptiX updated or rebuilt; this call always forces a rebuild.
+    unsafe {
         Accel::instances_into(
             optix_ctx,
             stream,
@@ -1987,29 +2168,34 @@ fn build_ias_into(
             target_ias,
         )
     }
-    .expect("IAS");
-    classic_count
+    .map_err(|e| format!("IAS build failed: {e}"))?;
+    Ok(classic_count)
 }
 
 #[cfg(has_embedded_ptx)]
-fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
-    (
+fn initial_ptx() -> Result<(Vec<u8>, Vec<u8>), String> {
+    Ok((
         EMBEDDED_RAYTRACER_PTX.as_bytes().to_vec(),
         EMBEDDED_TONEMAP_PTX.as_bytes().to_vec(),
-    )
+    ))
 }
 
 #[cfg(not(has_embedded_ptx))]
-fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
-    (
-        try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true).expect("raytracer.cu PTX"),
-        try_compile_ptx(TONEMAP_CU, "tonemap.cu", false).expect("tonemap.cu PTX"),
-    )
+fn initial_ptx() -> Result<(Vec<u8>, Vec<u8>), String> {
+    Ok((
+        try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true)
+            .map_err(|e| format!("raytracer.cu PTX: {e}"))?,
+        try_compile_ptx(TONEMAP_CU, "tonemap.cu", false)
+            .map_err(|e| format!("tonemap.cu PTX: {e}"))?,
+    ))
 }
 
-fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
+fn init_optix(
+    cuda: &Arc<CudaContext>,
+    initial_settings: &DemoSettings,
+) -> Result<OptixRig, String> {
     cuda.bind_to_thread()
-        .expect("cuda bind_to_thread before init_optix");
+        .map_err(|e| format!("CUDA bind_to_thread before OptiX init failed: {e}"))?;
     let stream = cuda.default_stream();
     let log_level = std::env::var("NV_DEMO_OPTIX_LOG_LEVEL")
         .ok()
@@ -2030,11 +2216,12 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             guard.push(line);
         }
     });
-    let optix_ctx = DeviceContext::new(cuda, Some(log_sink), log_level, false).unwrap_or_else(|e| {
+    let optix_ctx = DeviceContext::new(cuda, Some(log_sink), log_level, false).map_err(|e| {
+        // A poisoned log mutex still holds the lines captured before the panic that poisoned it.
         let details = captured_logs
             .lock()
-            .map(|g| g.join("\n"))
-            .unwrap_or_default();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .join("\n");
         let cache_hint = matches!(e, optix::Error::Optix { code: 7999, .. })
             .then_some(
                 "\nHint: OPTIX_ERROR_INTERNAL_ERROR (7999) is commonly caused by a locked or corrupt \
@@ -2042,8 +2229,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
                  OPTIX_CACHE_MAXSIZE=0.",
             )
             .unwrap_or("");
-        panic!("OptiX DeviceContext failed: {e}{cache_hint}\nOptiX log:\n{details}");
-    });
+        format!("OptiX DeviceContext failed: {e}{cache_hint}\nOptiX log:\n{details}")
+    })?;
     // Configure an isolated per-app OptiX disk cache directory unless the user overrode it via env.
     let env_cache_path_set = std::env::var_os("OPTIX_CACHE_PATH").is_some_and(|v| !v.is_empty());
     let env_cache_disabled = std::env::var("OPTIX_CACHE_MAXSIZE")
@@ -2063,52 +2250,27 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     let ser_supported = optix_ctx.shader_reordering().unwrap_or(false);
     let mut scratch = Scratch::new(&stream);
 
-    let (rt_ptx, tm_ptx) = initial_ptx();
+    let (rt_ptx, tm_ptx) = initial_ptx()?;
     let mut cu_mod: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `tm_ptx` is NUL-terminated PTX compiled by NVRTC on the current context.
     let res = unsafe { cu::cuModuleLoadData(&mut cu_mod, tm_ptx.as_ptr().cast()) };
-    assert_eq!(
-        res,
-        cu::cudaError_enum_CUDA_SUCCESS,
-        "cuModuleLoadData failed"
-    );
-    let mut cu_func: cu::CUfunction = std::ptr::null_mut();
-    let fn_name = CString::new("tonemap_f32_to_rgba8").unwrap();
-    // SAFETY: `cu_mod` is valid and `fn_name` is NUL-terminated.
-    let res = unsafe { cu::cuModuleGetFunction(&mut cu_func, cu_mod, fn_name.as_ptr()) };
-    assert_eq!(
-        res,
-        cu::cudaError_enum_CUDA_SUCCESS,
-        "cuModuleGetFunction failed"
-    );
-    let mut scrgb_func: cu::CUfunction = std::ptr::null_mut();
-    let scrgb_name = CString::new("tonemap_f32_to_scrgb_f16").unwrap();
-    // SAFETY: `cu_mod` is valid and `scrgb_name` is NUL-terminated.
-    let res = unsafe { cu::cuModuleGetFunction(&mut scrgb_func, cu_mod, scrgb_name.as_ptr()) };
-    assert_eq!(
-        res,
-        cu::cudaError_enum_CUDA_SUCCESS,
-        "cuModuleGetFunction(tonemap_f32_to_scrgb_f16) failed"
-    );
-    let mut pack_rr_func: cu::CUfunction = std::ptr::null_mut();
-    let pack_name = CString::new("pack_dlss_rr_aovs_f16").unwrap();
-    // SAFETY: `cu_mod` is valid and `pack_name` is NUL-terminated.
-    let res = unsafe { cu::cuModuleGetFunction(&mut pack_rr_func, cu_mod, pack_name.as_ptr()) };
-    assert_eq!(
-        res,
-        cu::cudaError_enum_CUDA_SUCCESS,
-        "cuModuleGetFunction(pack_dlss_rr_aovs_f16) failed"
-    );
-    let tonemap = TonemapKernel {
+    if res != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuModuleLoadData(tonemap) failed ({res:?})"));
+    }
+    // Owned from here on, so an early return below unloads the module in `Drop`.
+    let mut tonemap = TonemapKernel {
         cuda: cuda.clone(),
         module: cu_mod,
-        func: cu_func,
-        scrgb_func,
-        pack_rr_func,
+        func: std::ptr::null_mut(),
+        scrgb_func: std::ptr::null_mut(),
+        pack_rr_func: std::ptr::null_mut(),
     };
+    tonemap.func = cu_module_function(tonemap.module, c"tonemap_f32_to_rgba8")?;
+    tonemap.scrgb_func = cu_module_function(tonemap.module, c"tonemap_f32_to_scrgb_f16")?;
+    tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
-    let (pipeline, sbt, probe_sbt, sdg_sbt) =
-        build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
+    let (pipeline, sbt, probe_sbt, sdg_sbt) = build_optix_pipeline(&optix_ctx, &stream, &rt_ptx)
+        .map_err(|e| format!("OptiX pipeline: {e}"))?;
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
     let floor_verts = DeviceBuffer::from_host(
@@ -2122,7 +2284,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             [-15.0, -1.35, 15.0],
         ],
     )
-    .expect("floor verts");
+    .map_err(|e| format!("floor vertex upload failed: {e}"))?;
     let tri_build_opts = BuildOptions {
         random_vertex_access: true,
         ..BuildOptions::default()
@@ -2137,7 +2299,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         }],
         tri_build_opts,
     )
-    .expect("floor GAS");
+    .map_err(|e| format!("floor GAS build failed: {e}"))?;
 
     // Fractal AABB custom primitive [-1.85, 1.85]^3 (matches raytracer.cu; avoids rotated KIFS corner clipping)
     let aabb_buf = DeviceBuffer::from_host(
@@ -2147,7 +2309,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             max: [1.85, 1.85, 1.85],
         }],
     )
-    .expect("aabb");
+    .map_err(|e| format!("fractal AABB upload failed: {e}"))?;
     let fractal_gas = Accel::custom(
         &optix_ctx,
         &stream,
@@ -2155,7 +2317,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         &[CustomPrimitives::new(&aabb_buf)],
         BuildOptions::default(),
     )
-    .expect("fractal GAS");
+    .map_err(|e| format!("fractal GAS build failed: {e}"))?;
 
     // Analytic glass satellite sphere (unit sphere AABB, transformed via IAS)
     let sphere_aabb_buf = DeviceBuffer::from_host(
@@ -2165,7 +2327,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             max: [1.0, 1.0, 1.0],
         }],
     )
-    .expect("sphere aabb");
+    .map_err(|e| format!("sphere AABB upload failed: {e}"))?;
     let glass_analytic_gas = Accel::custom(
         &optix_ctx,
         &stream,
@@ -2173,7 +2335,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         &[CustomPrimitives::new(&sphere_aabb_buf)],
         BuildOptions::default(),
     )
-    .expect("glass analytic GAS");
+    .map_err(|e| format!("glass analytic GAS build failed: {e}"))?;
     let glass_mesh_segs = (initial_settings.sat_u_segs, initial_settings.sat_v_segs);
     let glass_mesh_gas = build_sphere_mesh_gas(
         &optix_ctx,
@@ -2181,11 +2343,12 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         &mut scratch,
         glass_mesh_segs.0,
         glass_mesh_segs.1,
-    );
+    )?;
 
     // Emissive neon accent ring around the stage
     let ring_tris = build_torus_ring(1.95, 0.045, 72, 14);
-    let ring_verts = DeviceBuffer::from_host(&stream, &ring_tris).expect("ring verts");
+    let ring_verts = DeviceBuffer::from_host(&stream, &ring_tris)
+        .map_err(|e| format!("neon ring vertex upload failed: {e}"))?;
     let neon_gas = Accel::triangles(
         &optix_ctx,
         &stream,
@@ -2196,11 +2359,12 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         }],
         tri_build_opts,
     )
-    .expect("neon GAS");
+    .map_err(|e| format!("neon GAS build failed: {e}"))?;
 
     // Perforated filigree halo GAS pair (hardware OMM vs pure Any-Hit benchmark)
-    let (omm_gas, omm_anyhit_gas) = build_omm_gases(&optix_ctx, &stream, &mut scratch);
+    let (omm_gas, omm_anyhit_gas) = build_omm_gases(&optix_ctx, &stream, &mut scratch)?;
 
+    let mut init_warnings = Vec::new();
     let mut csg_host = CsgGpuHost::new();
     let initial_csg_key = CsgSceneKey {
         scene_idx: initial_settings.csg_mode,
@@ -2225,17 +2389,15 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             lod_config: initial_settings.csg_lod_config(),
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
-        0.0,
-        initial_settings.csg_freeze_pose,
         false,
     ) {
-        eprintln!("nv-demo: initial CSG scene sync failed: {err}");
+        init_warnings.push(format!("Initial CSG scene sync failed: {err}"));
     }
     let mut ias_instances_scratch = Vec::with_capacity(4096);
     let ias_dyn_scratch = Vec::with_capacity(1024);
     let mut d_optix_instances = InstanceBuffer::new(&optix_ctx, &stream);
     let mut ias: Option<Arc<Accel>> = None;
-    let show_classic = initial_settings.csg_mode == 0 || initial_settings.csg_show_fractal;
+    let (_, initial_fractal_transform) = compute_ias_classic_state(initial_settings, 0.0, 0.0);
 
     let ias_classic_count = build_ias_into(
         &optix_ctx,
@@ -2254,60 +2416,33 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         },
         &csg_host,
         &mut ias_instances_scratch,
-        SceneState {
-            sat_angle: 0.0,
-            sat_count: initial_settings.sat_count,
-            sat_seed: initial_settings.sat_seed,
-            sat_size_range: [initial_settings.sat_size_min, initial_settings.sat_size_max],
-            sat_orbit_range: [
-                initial_settings.sat_orbit_min,
-                initial_settings.sat_orbit_max,
-            ],
-            sat_height_range: [
-                initial_settings.sat_height_min,
-                initial_settings.sat_height_max,
-            ],
-            sat_speed_range: [
-                initial_settings.sat_speed_min,
-                initial_settings.sat_speed_max,
-            ],
-            sat_bob_amp_range: [
-                initial_settings.sat_bob_amp_min,
-                initial_settings.sat_bob_amp_max,
-            ],
-            sat_bob_freq_range: [
-                initial_settings.sat_bob_freq_min,
-                initial_settings.sat_bob_freq_max,
-            ],
-            sat_hue_spread: initial_settings.sat_hue_spread,
-            sat_on: initial_settings.sat_on,
-            glass_analytic: initial_settings.glass_analytic,
-            neon_on: initial_settings.neon_on,
-            omm_mode: initial_settings.omm_mode,
-            show_classic,
-            fractal_transform: fractal_instance_transform(
-                initial_settings.fractal_translate,
-                [
-                    initial_settings.rot_x,
-                    initial_settings.rot_y,
-                    initial_settings.rot_z,
-                ],
-                initial_settings.obj_scale,
-            ),
-        },
-    );
+        scene_state(initial_settings, 0.0, initial_fractal_transform),
+    )?;
 
     let n = (DEFAULT_W * DEFAULT_H) as usize;
-    let color_f32 = DeviceBuffer::zeroed(&stream, n).expect("color_f32");
-    let albedo_f32 = DeviceBuffer::zeroed(&stream, n).expect("albedo_f32");
-    let normal_f32 = DeviceBuffer::zeroed(&stream, n).expect("normal_f32");
-    let params_buf =
-        DeviceBuffer::zeroed(&stream, std::mem::size_of::<LaunchParams>()).expect("params");
-    let bloom = FftBloomPass::new(cuda).ok();
-    let gpu_profiler = GpuPassProfiler::new(cuda).ok();
-    stream.synchronize().expect("init sync");
+    let color_f32 =
+        DeviceBuffer::zeroed(&stream, n).map_err(|e| format!("color_f32 alloc failed: {e}"))?;
+    let albedo_f32 =
+        DeviceBuffer::zeroed(&stream, n).map_err(|e| format!("albedo_f32 alloc failed: {e}"))?;
+    let normal_f32 =
+        DeviceBuffer::zeroed(&stream, n).map_err(|e| format!("normal_f32 alloc failed: {e}"))?;
+    let params_buf = DeviceBuffer::zeroed(&stream, std::mem::size_of::<LaunchParams>())
+        .map_err(|e| format!("LaunchParams buffer alloc failed: {e}"))?;
+    let bloom = FftBloomPass::new(cuda);
+    let gpu_profiler = match GpuPassProfiler::new(cuda) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            init_warnings.push(format!(
+                "GPU pass profiler unavailable ({e}); RT / Tensor / CUDA timings read 0 ms"
+            ));
+            None
+        }
+    };
+    stream
+        .synchronize()
+        .map_err(|e| format!("OptiX init stream sync failed: {e}"))?;
 
-    OptixRig {
+    Ok(OptixRig {
         stream,
         _optix_ctx: optix_ctx,
         _scratch: scratch,
@@ -2329,7 +2464,10 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         ser_supported,
         denoiser: None,
         denoiser_is_temporal: initial_settings.temporal_denoise,
+        denoiser_requested_temporal: initial_settings.temporal_denoise,
+        denoiser_failed: false,
         temporal_has_prev: false,
+        lazy_alloc_failed: false,
         color_f32,
         albedo_f32,
         diffuse_albedo_f32: None,
@@ -2345,6 +2483,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         tonemap,
         bloom,
         gpu_profiler,
+        init_warnings,
         csg_host,
         ias_instances_scratch,
         ias_dyn_scratch,
@@ -2361,23 +2500,155 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         cuda_crowd: None,
         crowd_slot_map_host: Vec::with_capacity(1024),
         crowd_gas_handles_host: Vec::with_capacity(256),
-    }
+    })
 }
 
 /// Lazily initializes `rig.cuda_crowd` once on first use, caching either the compiled NVRTC
 /// backend or the diagnostic failure string so failed builds are not retried every frame.
+///
+/// The error borrows the cached string: the `Auto` fallback calls this every moving frame, and
+/// cloning the message there would allocate per frame.
 fn ensure_cuda_crowd<'a>(
     rig: &'a mut OptixRig,
     cuda: &Arc<CudaContext>,
-) -> Result<&'a mut CudaCrowdBackend, String> {
+) -> Result<&'a mut CudaCrowdBackend, &'a str> {
     if rig.cuda_crowd.is_none() {
         rig.cuda_crowd = Some(CudaCrowdBackend::new(cuda));
     }
     match rig.cuda_crowd.as_mut() {
         Some(Ok(cc)) => Ok(cc),
-        Some(Err(e)) => Err(e.clone()),
-        None => Err("CUDA crowd backend uninitialized".to_string()),
+        Some(Err(e)) => Err(e.as_str()),
+        None => Err("CUDA crowd backend uninitialized"),
     }
+}
+
+/// Lazily allocated per-pixel buffers requested by this frame's features.
+#[derive(Clone, Copy, Debug, Default)]
+struct LazyAovNeeds {
+    motion: bool,
+    depth: bool,
+    rr_albedo: bool,
+    denoised: bool,
+    prev_denoised: bool,
+    sdg_ids: bool,
+}
+
+/// Allocates `slot` once with `n` zeroed elements, naming the buffer in the error.
+fn alloc_lazy<T: cuda_core::DeviceCopy>(
+    slot: &mut Option<DeviceBuffer<T>>,
+    stream: &Stream,
+    n: usize,
+    label: &str,
+) -> Result<(), String> {
+    if slot.is_none() {
+        *slot = Some(
+            DeviceBuffer::zeroed(stream, n)
+                .map_err(|e| format!("{label} allocation ({n} px) failed: {e}"))?,
+        );
+    }
+    Ok(())
+}
+
+/// Allocates every lazy AOV buffer `needs` asks for, stopping at the first failure.
+fn ensure_lazy_aovs(rig: &mut OptixRig, needs: LazyAovNeeds, n_px: usize) -> Result<(), String> {
+    if needs.motion {
+        alloc_lazy(&mut rig.motion_f32, &rig.stream, n_px, "motion_f32")?;
+    }
+    if needs.depth {
+        alloc_lazy(&mut rig.depth_f32, &rig.stream, n_px, "depth_f32")?;
+    }
+    if needs.rr_albedo {
+        let s = &rig.stream;
+        alloc_lazy(&mut rig.diffuse_albedo_f32, s, n_px, "diffuse_albedo_f32")?;
+        alloc_lazy(&mut rig.spec_albedo_f32, s, n_px, "spec_albedo_f32")?;
+    }
+    if needs.denoised {
+        alloc_lazy(&mut rig.denoised_f32, &rig.stream, n_px, "denoised_f32")?;
+    }
+    if needs.prev_denoised {
+        let s = &rig.stream;
+        alloc_lazy(&mut rig.prev_denoised_f32, s, n_px, "prev_denoised_f32")?;
+    }
+    if needs.sdg_ids {
+        alloc_lazy(&mut rig.semantic_u32, &rig.stream, n_px, "semantic_u32")?;
+        alloc_lazy(&mut rig.instance_u32, &rig.stream, n_px, "instance_u32")?;
+    }
+    Ok(())
+}
+
+/// Runs the OptiX denoiser from `rig.color_f32` into `rig.denoised_f32` on `rig.stream` and
+/// returns the denoised pointer, or `None` when no denoiser or output buffer exists.
+fn run_denoiser(rig: &mut OptixRig, width: u32, height: u32) -> Result<Option<u64>, String> {
+    let (Some(denoiser), Some(denoised_buf)) = (rig.denoiser.as_mut(), rig.denoised_f32.as_ref())
+    else {
+        return Ok(None);
+    };
+    let flow = if rig.denoiser_is_temporal {
+        let motion = rig
+            .motion_f32
+            .as_ref()
+            .ok_or_else(|| "temporal denoiser has no motion buffer".to_string())?;
+        Some(Image::new(motion, width, height).map_err(|e| format!("denoiser flow image: {e}"))?)
+    } else {
+        None
+    };
+    let guides = Guides {
+        albedo: Some(
+            Image::new(&rig.albedo_f32, width, height)
+                .map_err(|e| format!("denoiser albedo image: {e}"))?,
+        ),
+        normal: Some(
+            Image::new(&rig.normal_f32, width, height)
+                .map_err(|e| format!("denoiser normal image: {e}"))?,
+        ),
+        flow,
+        ..Default::default()
+    };
+    let previous = if rig.denoiser_is_temporal {
+        let prev_buf = if rig.temporal_has_prev
+            && let Some(ref prev_d) = rig.prev_denoised_f32
+        {
+            prev_d
+        } else {
+            &rig.color_f32
+        };
+        Some(
+            Image::new(prev_buf, width, height)
+                .map_err(|e| format!("denoiser previous image: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let layer = Layer {
+        input: Image::new(&rig.color_f32, width, height)
+            .map_err(|e| format!("denoiser input image: {e}"))?,
+        output: Image::new(denoised_buf, width, height)
+            .map_err(|e| format!("denoiser output image: {e}"))?,
+        previous,
+        aov: AovType::Beauty,
+    };
+    // SAFETY: all denoiser input/output/guide images outlive the end-of-frame fence.
+    unsafe { denoiser.invoke(&rig.stream, &guides, &[layer], DenoiserParams::default()) }
+        .map_err(|e| format!("denoiser invoke failed: {e}"))?;
+    if rig.denoiser_is_temporal
+        && let Some(ref prev_d) = rig.prev_denoised_f32
+    {
+        // SAFETY: `denoised_buf` and `prev_d` have identical byte size on `rig.stream`.
+        let cp_res = unsafe {
+            cu::cuMemcpyDtoDAsync_v2(
+                prev_d.cu_deviceptr(),
+                denoised_buf.cu_deviceptr(),
+                denoised_buf.num_bytes(),
+                rig.stream.cu_stream(),
+            )
+        };
+        if cp_res != cu::cudaError_enum_CUDA_SUCCESS {
+            rig.temporal_has_prev = false;
+            return Err(format!("temporal history copy failed ({cp_res:?})"));
+        }
+        rig.temporal_has_prev = true;
+    }
+    Ok(Some(denoised_buf.cu_deviceptr()))
 }
 
 /// Pulls GPU-stepped crowd poses (`states`, `bone_outs`, `prev_xforms`, `world_joints`) back into
@@ -2608,7 +2879,10 @@ fn score_views_on_rig(
     grid_h: u32,
 ) -> Result<Vec<ViewScore>, String> {
     sync_cuda_crowd_to_cpu(rig, true)?;
-    rig.csg_host.prepare_full_scene_for_probe(&rig.stream)?;
+    // Every backend scores the full CPU pack; only OptiX reads the device instance buffers.
+    let optix_probe = matches!(backend, ProbeBackendKind::Auto | ProbeBackendKind::Optix);
+    rig.csg_host
+        .prepare_full_scene_for_probe(&rig.stream, optix_probe)?;
     match backend {
         ProbeBackendKind::Auto | ProbeBackendKind::Optix => {
             // Build an omnidirectional CSG-only IAS for accurate city-wide OptiX probing.
@@ -2623,7 +2897,7 @@ fn score_views_on_rig(
                 &rig.stream,
                 &mut rig._scratch,
                 &rig.ias_instances_scratch,
-                BuildOptions::default(),
+                probe_ias_build_opts(),
             )
             .map_err(|e| format!("OptiX probe IAS build failed: {e}"))?;
             let csg_ptrs = rig.csg_host.device_pointers();
@@ -2728,6 +3002,15 @@ fn trace_sdg_occluder_optix(
         .map(|a| a.handle())
         .filter(|&h| h != 0)
         .ok_or_else(|| "OptiX IAS unavailable for hardware SDG keypoint occlusion".to_string())?;
+    // Blocker ids are indices into `csg_instances`; after a repack without an IAS rebuild (for
+    // example Smart View earlier in the same command batch) they would name the wrong instances.
+    if !rig.csg_host.instances_match_ias() {
+        return Err(
+            "CSG instances were repacked after the last IAS build; OptiX occlusion is available \
+             again after the next rendered frame"
+                .to_string(),
+        );
+    }
     let crowd = rig
         .csg_host
         .active_crowd()
@@ -2892,67 +3175,66 @@ fn trace_sdg_occluder_optix(
     ))
 }
 
+/// Result of one SDG JSON export: actor count, the occluder that ran, and why `Auto` fell back
+/// to the CPU occluder (`None` when it did not).
+struct SdgExportOutcome {
+    actors: usize,
+    occluder: ActiveSdgOccluder,
+    fallback_reason: Option<String>,
+}
+
+impl SdgExportOutcome {
+    /// Occluder label for status messages, including the reason of an `Auto` CPU fallback.
+    fn occluder_label(&self) -> String {
+        match &self.fallback_reason {
+            Some(reason) => format!("{} (OptiX failed: {reason})", self.occluder.label()),
+            None => self.occluder.label().to_string(),
+        }
+    }
+}
+
 /// Exports exact SDG keypoints & tight BBoxes honoring strict backend semantics:
 /// explicit [`SdgOccluderBackend::Optix`] never silently downgrades to CPU on failure, while
-/// [`SdgOccluderBackend::Auto`] tries OptiX first and reports which concrete backend ran.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "forwards output path, camera, projection, viewport dims, frame metadata, and backend selector cleanly"
-)]
+/// [`SdgOccluderBackend::Auto`] tries OptiX first and reports which concrete backend ran and why
+/// it fell back.
 fn export_sdg_json_with_backend(
     rig: &mut OptixRig,
     path: &std::path::Path,
-    cam: &CameraFrame,
-    projection: CameraProjection,
-    width: u32,
-    height: u32,
+    sdg_cam: SdgCamera,
     frame_index: u32,
     time_s: f32,
     backend: SdgOccluderBackend,
-) -> Result<(usize, ActiveSdgOccluder), String> {
+) -> Result<SdgExportOutcome, String> {
     sync_cuda_crowd_to_cpu(rig, true)?;
-    match backend {
-        SdgOccluderBackend::Cpu => {
-            let count = rig
-                .csg_host
-                .export_sdg_json(path, cam, projection, width, height, frame_index, time_s)?;
-            Ok((count, ActiveSdgOccluder::Cpu))
-        }
-        SdgOccluderBackend::Optix => {
-            let sdg_cam = CsgGpuHost::build_sdg_camera(cam, projection, width, height);
-            let occluder = trace_sdg_occluder_optix(rig, &sdg_cam)?;
-            let count = rig.csg_host.export_sdg_json_with_occluder(
+    let optix_result = match backend {
+        SdgOccluderBackend::Cpu => None,
+        SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, &sdg_cam)?)),
+        SdgOccluderBackend::Auto => Some(trace_sdg_occluder_optix(rig, &sdg_cam)),
+    };
+    match optix_result {
+        Some(Ok(occluder)) => {
+            let actors = rig.csg_host.export_sdg_json_with_occluder(
                 path,
                 sdg_cam,
                 frame_index,
                 time_s,
                 &occluder,
             )?;
-            Ok((count, ActiveSdgOccluder::Optix))
+            Ok(SdgExportOutcome {
+                actors,
+                occluder: ActiveSdgOccluder::Optix,
+                fallback_reason: None,
+            })
         }
-        SdgOccluderBackend::Auto => {
-            let sdg_cam = CsgGpuHost::build_sdg_camera(cam, projection, width, height);
-            if let Ok(occluder) = trace_sdg_occluder_optix(rig, &sdg_cam) {
-                let count = rig.csg_host.export_sdg_json_with_occluder(
-                    path,
-                    sdg_cam,
-                    frame_index,
-                    time_s,
-                    &occluder,
-                )?;
-                Ok((count, ActiveSdgOccluder::Optix))
-            } else {
-                let count = rig.csg_host.export_sdg_json(
-                    path,
-                    cam,
-                    projection,
-                    width,
-                    height,
-                    frame_index,
-                    time_s,
-                )?;
-                Ok((count, ActiveSdgOccluder::Cpu))
-            }
+        cpu => {
+            let actors = rig
+                .csg_host
+                .export_sdg_json(path, sdg_cam, frame_index, time_s)?;
+            Ok(SdgExportOutcome {
+                actors,
+                occluder: ActiveSdgOccluder::Cpu,
+                fallback_reason: cpu.and_then(Result::err),
+            })
         }
     }
 }
@@ -3123,12 +3405,17 @@ fn emit_possess_status(bus: &AppBus, info: &PossessInfo) {
     )));
 }
 
-fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
-    rig.stream.synchronize().expect("pre-resize sync");
-    let n = (width * height) as usize;
-    rig.color_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("color_f32 resize");
-    rig.albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("albedo_f32 resize");
-    rig.normal_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("normal_f32 resize");
+fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) -> Result<(), String> {
+    rig.stream
+        .synchronize()
+        .map_err(|e| format!("pre-resize sync failed: {e}"))?;
+    let n = (width as usize) * (height as usize);
+    rig.color_f32 = DeviceBuffer::zeroed(&rig.stream, n)
+        .map_err(|e| format!("color_f32 resize to {width}x{height} failed: {e}"))?;
+    rig.albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n)
+        .map_err(|e| format!("albedo_f32 resize to {width}x{height} failed: {e}"))?;
+    rig.normal_f32 = DeviceBuffer::zeroed(&rig.stream, n)
+        .map_err(|e| format!("normal_f32 resize to {width}x{height} failed: {e}"))?;
     // Drop lazy auxiliary buffers and denoiser; they reallocate on-demand only when enabled.
     rig.diffuse_albedo_f32 = None;
     rig.spec_albedo_f32 = None;
@@ -3140,8 +3427,13 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     rig.instance_u32 = None;
     rig.denoiser = None;
     rig.denoiser_is_temporal = temporal;
+    rig.denoiser_requested_temporal = temporal;
+    rig.denoiser_failed = false;
     rig.temporal_has_prev = false;
-    rig.stream.synchronize().expect("resize sync");
+    rig.lazy_alloc_failed = false;
+    rig.stream
+        .synchronize()
+        .map_err(|e| format!("post-resize sync failed: {e}"))
 }
 
 fn halton(mut index: u32, base: u32) -> f32 {
@@ -3180,8 +3472,12 @@ pub fn spawn_render_thread(
         .name("optix-render".to_string())
         .spawn(move || {
             crate::nvtx::name_current_thread(c"optix-render");
-            cuda.bind_to_thread()
-                .expect("cuda bind_to_thread on render thread");
+            if let Err(e) = cuda.bind_to_thread() {
+                bus.emit_render_event(RenderEvent::Fatal(format!(
+                    "CUDA bind_to_thread on the render thread failed: {e}"
+                )));
+                return;
+            }
             let init_snap = bus.state.load();
             let mut last_state_rev = bus.state.revision();
             let mut last_reset_seq = init_snap.reset_seq;
@@ -3199,8 +3495,17 @@ pub fn spawn_render_thread(
             let mut last_rendered_camera = camera;
             let mut was_possessing = false;
             bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::CompilingOptix));
-            let mut rig = init_optix(&cuda, &settings);
+            let mut rig = match init_optix(&cuda, &settings) {
+                Ok(rig) => rig,
+                Err(e) => {
+                    bus.emit_render_event(RenderEvent::Fatal(format!("OptiX init failed: {e}")));
+                    return;
+                }
+            };
             bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
+            for warning in rig.init_warnings.drain(..) {
+                bus.emit_render_event(RenderEvent::StatusMessage(warning));
+            }
             if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                 bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
             }
@@ -3234,8 +3539,15 @@ pub fn spawn_render_thread(
             let mut rec_shutter_subframes: u32 = 1;
             let mut shutter_queue: VecDeque<QueuedShutterSubframe> = VecDeque::with_capacity(8);
             let mut cmd_scratch: Vec<appbus::BoxedEvent> = Vec::with_capacity(32);
+            // Set by hard cuts (scene switch, explicit reset, possess, Smart View); kept across
+            // skipped iterations until the next denoised frame drops the temporal history.
+            let mut temporal_history_cut = false;
+            let mut prev_will_run_bloom = false;
+            let mut last_csg_sync_err: Option<String> = None;
 
-            loop {
+            // Unrecoverable errors emit `RenderEvent::Fatal` once and `break 'render`, so the
+            // thread ends and drops `rig` in its normal order.
+            'render: loop {
                 let mut should_exit = false;
                 bus.poll_render_controls(&mut cmd_scratch);
                 for boxed in &cmd_scratch {
@@ -3254,7 +3566,12 @@ pub fn spawn_render_thread(
                             gen_id,
                         } => {
                             if *width != cur_w || *height != cur_h {
-                                resize_rig(&mut rig, *width, *height, settings.temporal_denoise);
+                                if let Err(e) =
+                                    resize_rig(&mut rig, *width, *height, settings.temporal_denoise)
+                                {
+                                    bus.emit_render_event(RenderEvent::Fatal(e));
+                                    break 'render;
+                                }
                                 cur_w = *width;
                                 cur_h = *height;
                                 if active_burst.take().is_some() {
@@ -3286,21 +3603,25 @@ pub fn spawn_render_thread(
                             accum_count = clamp_accum_for_jpeg(accum_count, settings.max_accum);
                         }
                         RenderControl::ExportSdgJson { path, occluder } => {
-                            match export_sdg_json_with_backend(
-                                &mut rig,
-                                path,
+                            let sdg_cam = CsgGpuHost::build_sdg_camera(
                                 &last_rendered_camera,
                                 settings.camera_projection,
                                 cur_w,
                                 cur_h,
+                            );
+                            match export_sdg_json_with_backend(
+                                &mut rig,
+                                path,
+                                sdg_cam,
                                 frame_index,
                                 traffic_time,
                                 *occluder,
                             ) {
-                                Ok((actor_count, active_occ)) => {
+                                Ok(outcome) => {
                                     bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                        "Saved SDG JSON ({actor_count} actors, {}) -> {}",
-                                        active_occ.label(),
+                                        "Saved SDG JSON ({} actors, {}) -> {}",
+                                        outcome.actors,
+                                        outcome.occluder_label(),
                                         path.display()
                                     )));
                                 }
@@ -3341,6 +3662,18 @@ pub fn spawn_render_thread(
                                     dir.display()
                                 )));
                             }
+                        }
+                        RenderControl::CancelSdgBurst => {
+                            let msg = match active_burst.take() {
+                                Some(burst) => format!(
+                                    "SDG Burst cancelled after {}/{} frames (no manifest written) -> {}",
+                                    burst.current_frame,
+                                    burst.total_frames,
+                                    burst.dir.display()
+                                ),
+                                None => "No SDG Burst is running".to_string(),
+                            };
+                            bus.emit_render_event(RenderEvent::StatusMessage(msg));
                         }
                         RenderControl::PokeCrowd {
                             origin,
@@ -3463,6 +3796,7 @@ pub fn spawn_render_thread(
                                     possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
                                     possess_blend_rem = 0.9;
                                     accum_count = 0;
+                                    temporal_history_cut = true;
                                     emit_possess_status(&bus, &info);
                                     bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
                                 }
@@ -3482,6 +3816,7 @@ pub fn spawn_render_thread(
                                     possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
                                     possess_blend_rem = 0.9;
                                     accum_count = 0;
+                                    temporal_history_cut = true;
                                     emit_possess_status(&bus, &info);
                                     bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
                                 }
@@ -3495,6 +3830,7 @@ pub fn spawn_render_thread(
                                 possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
                                 possess_blend_rem = 0.6;
                                 accum_count = 0;
+                                temporal_history_cut = true;
                                 emit_possess_status(&bus, &info);
                                 bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
                             }
@@ -3503,6 +3839,7 @@ pub fn spawn_render_thread(
                             if rig.csg_host.eject_possess() {
                                 possess_blend_rem = 0.0;
                                 accum_count = 0;
+                                temporal_history_cut = true;
                                 bus.emit_render_event(RenderEvent::PossessChanged(None));
                                 bus.emit_render_event(RenderEvent::StatusMessage(
                                     "Ejected to free camera".to_string(),
@@ -3570,6 +3907,7 @@ pub fn spawn_render_thread(
                                                     res,
                                                 ));
                                                 accum_count = 0;
+                                                temporal_history_cut = true;
                                             }
                                         }
                                         Err(e) => {
@@ -3666,7 +4004,7 @@ pub fn spawn_render_thread(
                             }
                         }
                         RenderControl::ReloadShader => {
-                            let disk_path = PathBuf::from("crates/nv-demo/shaders/raytracer.cu");
+                            let disk_path = PathBuf::from(RAYTRACER_CU_PATH);
                             let res = std::fs::read_to_string(&disk_path)
                                 .map_err(|e| format!("Read {}: {e}", disk_path.display()))
                                 .and_then(|src| try_compile_ptx(&src, "raytracer.cu", true))
@@ -3716,6 +4054,7 @@ pub fn spawn_render_thread(
                     let c = snap.camera;
                     let reset_accum = snap.reset_seq != last_reset_seq;
                     last_reset_seq = snap.reset_seq;
+                    temporal_history_cut |= reset_accum;
 
                     let mut tmp = s;
                     tmp.exposure = settings.exposure;
@@ -3786,7 +4125,7 @@ pub fn spawn_render_thread(
                             .is_some_and(|q| q.sub_idx + 1 >= q.sub_count)
                             && free_bufs.is_empty()));
 
-                let show_classic_now = settings.csg_mode == 0 || settings.csg_show_fractal;
+                let (spin_now, orbit_now) = classic_animation(&settings, burst_active);
                 let csg_traffic_moving = !settings.csg_freeze_pose
                     && rig.csg_host.has_traffic()
                     && settings.csg_traffic_on
@@ -3797,11 +4136,8 @@ pub fn spawn_render_thread(
                 let csg_dynamic_moving = csg_traffic_moving || csg_crowd_moving;
                 let converged = !in_shutter_mode
                     && !burst_active
-                    && !(show_classic_now && settings.auto_rotate)
-                    && !(show_classic_now
-                        && settings.sat_on
-                        && settings.sat_orbit
-                        && settings.sat_count > 0)
+                    && !spin_now
+                    && !orbit_now
                     && !csg_dynamic_moving
                     && possess_blend_rem <= 0.0
                     && !rec_active
@@ -3874,13 +4210,15 @@ pub fn spawn_render_thread(
                 let csg_crowd_moving = !settings.csg_freeze_pose
                     && rig.csg_host.has_crowd()
                     && settings.csg_traffic_speed > 0.001;
-                if show_classic && settings.auto_rotate {
+                // Settings may have been replaced by a shutter subframe above; re-evaluate.
+                let (spin_now, orbit_now) = classic_animation(&settings, active_burst.is_some());
+                if spin_now {
                     spin_angle += dt * settings.spin_speed;
                     if !preserve_shutter_accum {
                         accum_count = 0;
                     }
                 }
-                if show_classic && settings.sat_on && settings.sat_orbit && settings.sat_count > 0 {
+                if orbit_now {
                     sat_angle += dt * settings.spin_speed;
                     if !preserve_shutter_accum {
                         accum_count = 0;
@@ -3978,11 +4316,11 @@ pub fn spawn_render_thread(
                                 Err(err) => {
                                     if settings.crowd_backend == CrowdBackend::Cuda {
                                         // Strict backend semantics: explicit CUDA never silently downgrades.
-                                        if last_cuda_crowd_err.as_deref() != Some(err.as_str()) {
+                                        if last_cuda_crowd_err.as_deref() != Some(err) {
                                             bus.emit_render_event(RenderEvent::StatusMessage(
                                                 format!("CUDA crowd error: {err}"),
                                             ));
-                                            last_cuda_crowd_err = Some(err);
+                                            last_cuda_crowd_err = Some(err.to_string());
                                         }
                                         last_crowd_step_ms = 0.0;
                                         last_crowd_backend = ActiveCrowdBackend::None;
@@ -4028,62 +4366,44 @@ pub fn spawn_render_thread(
                         last_crowd_step_ms = 0.0;
                         last_crowd_backend = ActiveCrowdBackend::None;
                     } else if crowd_lod_changed {
-                        match settings.crowd_backend {
-                            CrowdBackend::Cuda => {
-                                if freeze_now {
-                                    match ensure_cuda_crowd(&mut rig, &cuda) {
-                                        Ok(_) => {
-                                            run_cuda_crowd_after_sync = true;
-                                            last_cuda_crowd_err = None;
+                        let cuda_ready = if crowd_lod_refresh_on_cuda(settings.crowd_backend, freeze_now)
+                        {
+                            match ensure_cuda_crowd(&mut rig, &cuda) {
+                                Ok(_) => true,
+                                Err(err) => {
+                                    if settings.crowd_backend == CrowdBackend::Cuda {
+                                        // Strict backend semantics: explicit CUDA never silently downgrades.
+                                        if last_cuda_crowd_err.as_deref() != Some(err) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("CUDA crowd error: {err}"),
+                                            ));
+                                            last_cuda_crowd_err = Some(err.to_string());
                                         }
-                                        Err(err) => {
-                                            if last_cuda_crowd_err.as_deref() != Some(err.as_str())
-                                            {
-                                                bus.emit_render_event(RenderEvent::StatusMessage(
-                                                    format!("CUDA crowd error: {err}"),
-                                                ));
-                                                last_cuda_crowd_err = Some(err);
-                                            }
-                                            last_crowd_step_ms = 0.0;
-                                            last_crowd_backend = ActiveCrowdBackend::None;
-                                        }
+                                        last_crowd_step_ms = 0.0;
+                                        last_crowd_backend = ActiveCrowdBackend::None;
                                     }
+                                    false
                                 }
                             }
-                            CrowdBackend::Auto => {
-                                if freeze_now && ensure_cuda_crowd(&mut rig, &cuda).is_ok() {
-                                    run_cuda_crowd_after_sync = true;
-                                    last_cuda_crowd_err = None;
-                                } else {
-                                    if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
-                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                            "CUDA crowd LOD sync failed: {e}"
-                                        )));
-                                    }
-                                    if rig.csg_host.refresh_crowd_lod_cpu(
-                                        traffic_time,
-                                        last_rendered_camera.eye,
-                                        crowd_lod,
-                                    ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
-                                    {
-                                        cc.mark_scene_dirty();
-                                    }
-                                }
+                        } else {
+                            false
+                        };
+                        if cuda_ready {
+                            run_cuda_crowd_after_sync = true;
+                            last_cuda_crowd_err = None;
+                        } else if settings.crowd_backend != CrowdBackend::Cuda {
+                            if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA crowd LOD sync failed: {e}"
+                                )));
                             }
-                            CrowdBackend::Cpu => {
-                                if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                        "CUDA crowd LOD sync failed: {e}"
-                                    )));
-                                }
-                                if rig.csg_host.refresh_crowd_lod_cpu(
-                                    traffic_time,
-                                    last_rendered_camera.eye,
-                                    crowd_lod,
-                                ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
-                                {
-                                    cc.mark_scene_dirty();
-                                }
+                            if rig.csg_host.refresh_crowd_lod_cpu(
+                                traffic_time,
+                                last_rendered_camera.eye,
+                                crowd_lod,
+                            ) && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
+                            {
+                                cc.mark_scene_dirty();
                             }
                         }
                     }
@@ -4137,6 +4457,7 @@ pub fn spawn_render_thread(
                     road_mode: settings.csg_road_mode.min(3),
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
+                temporal_history_cut |= building_scene;
                 if building_scene {
                     if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
                         cc.mark_scene_dirty();
@@ -4154,16 +4475,10 @@ pub fn spawn_render_thread(
                     lod_config: settings.csg_lod_config(),
                     omnidirectional: settings.camera_projection.is_omnidirectional(),
                 };
-                let freeze_for_sync = settings.csg_freeze_pose || active_burst.is_some();
                 let need_crowd_sync_before_csg = !building_scene
                     && (rig.csg_host.will_camera_repack(csg_key, csg_cam_params)
                         || (!run_cuda_crowd_after_sync
-                            && rig.csg_host.will_upload_instances(
-                                csg_key,
-                                csg_cam_params,
-                                traffic_time,
-                                freeze_for_sync,
-                            )));
+                            && rig.csg_host.will_upload_instances(csg_key, csg_cam_params)));
                 if need_crowd_sync_before_csg
                     && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
                 {
@@ -4179,16 +4494,23 @@ pub fn spawn_render_thread(
                     settings.csg_wetness,
                     settings.csg_time_of_day,
                     csg_cam_params,
-                    traffic_time,
-                    freeze_for_sync,
                     run_cuda_crowd_after_sync,
                 ) {
-                    Ok(sync_res) => sync_res,
+                    Ok(sync_res) => {
+                        last_csg_sync_err = None;
+                        sync_res
+                    }
                     Err(e) => {
-                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                            "CSG sync error: {e}"
-                        )));
-                        CsgSyncResult::Unchanged
+                        if last_csg_sync_err.as_deref() != Some(e.as_str()) {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "CSG sync error: {e}"
+                            )));
+                            last_csg_sync_err = Some(e);
+                        }
+                        // The host may have dropped its scene or failed an instance upload;
+                        // rebuild the IAS from what the host now reports, so it never keeps
+                        // CSG instances whose device data is gone.
+                        CsgSyncResult::FullRepack
                     }
                 };
                 if (building_scene || matches!(csg_sync, CsgSyncResult::FullRepack))
@@ -4206,21 +4528,33 @@ pub fn spawn_render_thread(
                 }
 
                 if show_classic
+                    && settings.sat_on
                     && !settings.glass_analytic
                     && (settings.sat_u_segs, settings.sat_v_segs) != rig.glass_mesh_segs
                 {
-                    rig.glass_mesh_gas = build_sphere_mesh_gas(
+                    match build_sphere_mesh_gas(
                         &rig._optix_ctx,
                         &rig.stream,
                         &mut rig._scratch,
                         settings.sat_u_segs,
                         settings.sat_v_segs,
-                    );
+                    ) {
+                        Ok(gas) => rig.glass_mesh_gas = gas,
+                        Err(e) => {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "{e}; keeping the previous glass mesh"
+                            )));
+                        }
+                    }
+                    // Recorded on failure too, so a failing size is not rebuilt every frame.
                     rig.glass_mesh_segs = (settings.sat_u_segs, settings.sat_v_segs);
                 }
                 let (ias_state, fractal_transform) =
                     compute_ias_classic_state(&settings, spin_angle, sat_angle);
                 let classic_changed = ias_state != last_ias_state;
+                // The traffic prefix is in `d_optix_instances` but the refit was left to the
+                // CUDA crowd step; refit below if that step does not.
+                let mut ias_refit_pending = false;
                 match (classic_changed, csg_sync) {
                     (false, CsgSyncResult::Unchanged) => {}
                     (false, CsgSyncResult::TrafficOnly { dynamic_count })
@@ -4240,9 +4574,11 @@ pub fn spawn_render_thread(
                                 &rig.ias_dyn_scratch,
                             ) {
                                 Ok(()) => {
-                                    if !run_cuda_crowd_after_sync {
+                                    if run_cuda_crowd_after_sync {
+                                        ias_refit_pending = true;
+                                    } else {
                                         // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
-                                        let _ = unsafe {
+                                        let refit = unsafe {
                                             Accel::instances_into(
                                                 &rig._optix_ctx,
                                                 &rig.stream,
@@ -4252,8 +4588,13 @@ pub fn spawn_render_thread(
                                                 false,
                                                 &mut rig.ias,
                                             )
+                                        };
+                                        if let Err(e) = refit {
+                                            bus.emit_render_event(RenderEvent::Fatal(format!(
+                                                "IAS traffic update failed: {e}"
+                                            )));
+                                            break 'render;
                                         }
-                                        .expect("IAS traffic update");
                                     }
                                 }
                                 Err(e) => {
@@ -4270,7 +4611,7 @@ pub fn spawn_render_thread(
                                 EnginePhase::UpdatingIas,
                             ));
                         }
-                        rig.ias_classic_count = build_ias_into(
+                        let built = build_ias_into(
                             &rig._optix_ctx,
                             &rig.stream,
                             &mut rig._scratch,
@@ -4287,34 +4628,15 @@ pub fn spawn_render_thread(
                             },
                             &rig.csg_host,
                             &mut rig.ias_instances_scratch,
-                            SceneState {
-                                sat_angle,
-                                sat_count: settings.sat_count,
-                                sat_seed: settings.sat_seed,
-                                sat_size_range: [settings.sat_size_min, settings.sat_size_max],
-                                sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
-                                sat_height_range: [
-                                    settings.sat_height_min,
-                                    settings.sat_height_max,
-                                ],
-                                sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
-                                sat_bob_amp_range: [
-                                    settings.sat_bob_amp_min,
-                                    settings.sat_bob_amp_max,
-                                ],
-                                sat_bob_freq_range: [
-                                    settings.sat_bob_freq_min,
-                                    settings.sat_bob_freq_max,
-                                ],
-                                sat_hue_spread: settings.sat_hue_spread,
-                                sat_on: settings.sat_on,
-                                glass_analytic: settings.glass_analytic,
-                                neon_on: settings.neon_on,
-                                omm_mode: settings.omm_mode,
-                                show_classic,
-                                fractal_transform,
-                            },
+                            scene_state(&settings, sat_angle, fractal_transform),
                         );
+                        match built {
+                            Ok(classic_count) => rig.ias_classic_count = classic_count,
+                            Err(e) => {
+                                bus.emit_render_event(RenderEvent::Fatal(e));
+                                break 'render;
+                            }
+                        }
                         last_ias_state = ias_state;
                     }
                 }
@@ -4391,7 +4713,7 @@ pub fn spawn_render_thread(
                             if optix_ptr != 0 {
                                 // SAFETY: all launches on `rig.stream` are strictly stream-ordered
                                 // and `scatter_crowd_to_csg_and_optix` finished before this call.
-                                let _ = unsafe {
+                                let refit = unsafe {
                                     Accel::instances_into(
                                         &rig._optix_ctx,
                                         &rig.stream,
@@ -4401,8 +4723,14 @@ pub fn spawn_render_thread(
                                         report.needs_full_ias_rebuild,
                                         &mut rig.ias,
                                     )
+                                };
+                                if let Err(e) = refit {
+                                    bus.emit_render_event(RenderEvent::Fatal(format!(
+                                        "IAS CUDA crowd refit failed: {e}"
+                                    )));
+                                    break 'render;
                                 }
-                                .expect("IAS CUDA crowd refit");
+                                ias_refit_pending = false;
                             }
                             if possessing_crowd
                                 && let Some(csg_pose) = rig.csg_host.resolve_active_possess(
@@ -4437,6 +4765,28 @@ pub fn spawn_render_thread(
                         }
                     }
                 }
+                if ias_refit_pending {
+                    // The CUDA crowd step failed or had no OptiX scatter target, so nothing refit
+                    // the BVH over the traffic prefix uploaded above.
+                    // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
+                    let refit = unsafe {
+                        Accel::instances_into(
+                            &rig._optix_ctx,
+                            &rig.stream,
+                            &mut rig._scratch,
+                            &rig.d_optix_instances,
+                            ias_build_opts(),
+                            false,
+                            &mut rig.ias,
+                        )
+                    };
+                    if let Err(e) = refit {
+                        bus.emit_render_event(RenderEvent::Fatal(format!(
+                            "IAS traffic update failed: {e}"
+                        )));
+                        break 'render;
+                    }
+                }
                 if building_scene {
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
                 }
@@ -4445,47 +4795,79 @@ pub fn spawn_render_thread(
                 let dlss_any = settings.dlss_on || rr_export;
                 let will_run_denoiser = settings.denoiser_on && !dlss_any && settings.aov_mode == 0;
                 let will_run_bloom = settings.bloom_on && !rr_export && settings.aov_mode == 0;
+                if will_run_bloom
+                    && !prev_will_run_bloom
+                    && let Err(e) = &rig.bloom
+                {
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "Bloom requested but the cuFFT bloom pass is unavailable: {e}"
+                    )));
+                }
+                prev_will_run_bloom = will_run_bloom;
                 let n_px = (cur_w * cur_h) as usize;
 
                 // Lazily allocate / recreate OptiX AI denoiser only when enabled.
                 if will_run_denoiser
-                    && (rig.denoiser.is_none()
-                        || settings.temporal_denoise != rig.denoiser_is_temporal)
+                    && denoiser_needs_create(
+                        rig.denoiser.is_some(),
+                        rig.denoiser_failed,
+                        rig.denoiser_requested_temporal,
+                        settings.temporal_denoise,
+                    )
                 {
-                    let (d, is_t) = create_denoiser(
+                    // Release the old denoiser's VRAM before allocating its replacement.
+                    rig.denoiser = None;
+                    rig.denoiser_requested_temporal = settings.temporal_denoise;
+                    rig.temporal_has_prev = false;
+                    match create_denoiser(
                         &rig._optix_ctx,
                         &rig.stream,
                         cur_w,
                         cur_h,
                         settings.temporal_denoise,
-                    );
-                    rig.denoiser = Some(d);
-                    rig.denoiser_is_temporal = is_t;
+                    ) {
+                        Ok((d, is_t, downgrade)) => {
+                            rig.denoiser = Some(d);
+                            rig.denoiser_is_temporal = is_t;
+                            rig.denoiser_failed = false;
+                            if let Some(msg) = downgrade {
+                                bus.emit_render_event(RenderEvent::StatusMessage(msg));
+                            }
+                        }
+                        Err(e) => {
+                            rig.denoiser_is_temporal = false;
+                            rig.denoiser_failed = true;
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "OptiX denoiser unavailable: {e}"
+                            )));
+                        }
+                    }
+                }
+                if temporal_history_cut {
                     rig.temporal_has_prev = false;
+                    temporal_history_cut = false;
                 }
 
-                let need_motion_buf =
-                    dlss_any || (will_run_denoiser && rig.denoiser_is_temporal) || active_burst.is_some();
-                let need_depth_buf = dlss_any || active_burst.is_some();
-                if need_motion_buf && rig.motion_f32.is_none() {
-                    rig.motion_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                }
-                if need_depth_buf && rig.depth_f32.is_none() {
-                    rig.depth_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                }
-                if rr_export {
-                    if rig.diffuse_albedo_f32.is_none() {
-                        rig.diffuse_albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                    }
-                    if rig.spec_albedo_f32.is_none() {
-                        rig.spec_albedo_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                    }
-                }
-                if (will_run_denoiser || will_run_bloom) && rig.denoised_f32.is_none() {
-                    rig.denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                }
-                if will_run_denoiser && rig.denoiser_is_temporal && rig.prev_denoised_f32.is_none() {
-                    rig.prev_denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
+                let needs = LazyAovNeeds {
+                    motion: dlss_any
+                        || (will_run_denoiser && rig.denoiser_is_temporal)
+                        || active_burst.is_some(),
+                    depth: dlss_any || active_burst.is_some(),
+                    rr_albedo: rr_export,
+                    denoised: will_run_denoiser || will_run_bloom,
+                    prev_denoised: will_run_denoiser && rig.denoiser_is_temporal,
+                    sdg_ids: active_burst.is_some(),
+                };
+                if !rig.lazy_alloc_failed
+                    && let Err(e) = ensure_lazy_aovs(&mut rig, needs, n_px)
+                {
+                    // Not retried every frame: features needing the missing buffer stay off and
+                    // the next resize clears the flag.
+                    rig.lazy_alloc_failed = true;
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "{e}; motion/depth guides, denoiser, bloom, DLSS-RR AOVs and SDG IDs that \
+                         need it stay off until the next resize"
+                    )));
                 }
 
                 let (fractal_p0, fractal_p1, fractal_p2, fractal_p3) = match settings.fractal_kind {
@@ -4550,7 +4932,8 @@ pub fn spawn_render_thread(
                 let sun_y = el.sin();
                 let sun_z = el.cos() * az.cos();
 
-                let jitter = if dlss_any && settings.aov_mode == 0 {
+                let jitter = if dlss_jitter_active(dlss_any, settings.aov_mode, active_burst.is_some())
+                {
                     if !preserve_shutter_accum {
                         accum_count = 0;
                     }
@@ -4588,13 +4971,8 @@ pub fn spawn_render_thread(
                 }
 
                 let (out_semantic_u32_ptr, out_instance_u32_ptr) = if active_burst.is_some() {
-                    let n_px = (cur_w * cur_h) as usize;
-                    if rig.semantic_u32.is_none() {
-                        rig.semantic_u32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                    }
-                    if rig.instance_u32.is_none() {
-                        rig.instance_u32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
-                    }
+                    // Allocated by `ensure_lazy_aovs`; a missing buffer makes the burst readback
+                    // fail with a message instead of writing empty IDs.
                     (
                         rig.semantic_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
                         rig.instance_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
@@ -4712,7 +5090,11 @@ pub fn spawn_render_thread(
                     jitter_x: jitter[0],
                     jitter_y: jitter[1],
                     _pad1: 0,
-                    env_params: settings.env.pack(settings.sky_mode),
+                    env_params: settings.env.pack_crossfade(
+                        settings.sky_mode_from,
+                        settings.sky_mode,
+                        settings.sky_blend,
+                    ),
                     out_diffuse_albedo_f32: if rr_export {
                         rig.diffuse_albedo_f32
                             .as_ref()
@@ -4756,28 +5138,38 @@ pub fn spawn_render_thread(
                 if publish_frame && active_burst.is_none() {
                     prev_camera = active_camera;
                 }
-                rig.params_buf
+                if let Err(e) = rig
+                    .params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
-                    .expect("params upload");
+                {
+                    bus.emit_render_event(RenderEvent::Fatal(format!(
+                        "LaunchParams upload failed: {e}"
+                    )));
+                    break 'render;
+                }
                 if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
                     prof.mark_accel_end(slot, &rig.stream);
                 }
 
                 // Single uninterrupted GPU stream burst: [IAS/Traffic] -> [RT Cores] ->
                 // [Tensor Denoiser] -> [cuFFT Bloom] -> [Tonemap/Pack], with ONE end-of-frame fence.
-                let t_burst = Instant::now();
                 {
                     let _nvtx = crate::nvtx::NvtxRange::new(c"OptiX RT", crate::nvtx::COLOR_RT);
                     // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive the end-of-frame fence.
-                    unsafe {
+                    let launched = unsafe {
                         rig.pipeline.launch(
                             &rig.stream,
                             &rig.params_buf,
                             &rig.sbt,
                             [cur_w, cur_h, 1],
                         )
+                    };
+                    if let Err(e) = launched {
+                        bus.emit_render_event(RenderEvent::Fatal(format!(
+                            "OptiX launch failed: {e}"
+                        )));
+                        break 'render;
                     }
-                    .expect("optix launch");
                 }
                 if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
                     prof.mark_rt_end(slot, &rig.stream);
@@ -4791,79 +5183,41 @@ pub fn spawn_render_thread(
                     }
                     // Synchronize before looping to the next 180-degree shutter subframe so the
                     // next subframe's pinned H2D staging upload cannot race with this DMA.
-                    rig.stream.synchronize().expect("shutter subframe sync");
+                    if let Err(e) = rig.stream.synchronize() {
+                        bus.emit_render_event(RenderEvent::Fatal(format!(
+                            "shutter subframe sync failed: {e}"
+                        )));
+                        break 'render;
+                    }
                     accum_count = accum_count.saturating_add(1);
                     frame_index = frame_index.wrapping_add(1);
                     continue;
                 }
 
-                let mut final_f32_ptr = if will_run_denoiser
-                    && let (Some(denoiser), Some(denoised_buf)) =
-                        (rig.denoiser.as_mut(), rig.denoised_f32.as_ref())
-                {
+                let mut final_f32_ptr = rig.color_f32.cu_deviceptr();
+                // Bloom runs in place: only a frame that really wrote `denoised_f32` may hand it
+                // over directly, otherwise bloom must copy first so it never edits the
+                // accumulation buffer `color_f32`.
+                let mut denoiser_ran = false;
+                if will_run_denoiser {
                     let _nvtx =
                         crate::nvtx::NvtxRange::new(c"OptiX Denoise", crate::nvtx::COLOR_DENOISE);
-                    let flow_img = if rig.denoiser_is_temporal
-                        && let Some(ref motion_buf) = rig.motion_f32
-                    {
-                        Some(Image::new(motion_buf, cur_w, cur_h).expect("flow"))
-                    } else {
-                        None
-                    };
-                    let guides = Guides {
-                        albedo: Some(Image::new(&rig.albedo_f32, cur_w, cur_h).expect("albedo")),
-                        normal: Some(Image::new(&rig.normal_f32, cur_w, cur_h).expect("normal")),
-                        flow: flow_img,
-                        ..Default::default()
-                    };
-                    let prev_img = if rig.denoiser_is_temporal {
-                        let prev_buf = if rig.temporal_has_prev
-                            && let Some(ref prev_d) = rig.prev_denoised_f32
-                        {
-                            prev_d
-                        } else {
-                            &rig.color_f32
-                        };
-                        Some(Image::new(prev_buf, cur_w, cur_h).expect("prev"))
-                    } else {
-                        None
-                    };
-                    let layer = Layer {
-                        input: Image::new(&rig.color_f32, cur_w, cur_h).expect("in"),
-                        output: Image::new(denoised_buf, cur_w, cur_h).expect("out"),
-                        previous: prev_img,
-                        aov: AovType::Beauty,
-                    };
-                    // SAFETY: all denoiser input/output/guide images outlive the end-of-frame fence.
-                    unsafe {
-                        denoiser.invoke(
-                            &rig.stream,
-                            &guides,
-                            &[layer],
-                            DenoiserParams::default(),
-                        )
-                    }
-                    .expect("denoiser invoke");
-                    if rig.denoiser_is_temporal
-                        && let Some(ref prev_d) = rig.prev_denoised_f32
-                    {
-                        // SAFETY: `denoised_buf` and `prev_d` have identical byte size on `rig.stream`.
-                        let cp_res = unsafe {
-                            cu::cuMemcpyDtoDAsync_v2(
-                                prev_d.cu_deviceptr(),
-                                denoised_buf.cu_deviceptr(),
-                                denoised_buf.num_bytes(),
-                                rig.stream.cu_stream(),
-                            )
-                        };
-                        if cp_res == cu::cudaError_enum_CUDA_SUCCESS {
-                            rig.temporal_has_prev = true;
+                    match run_denoiser(&mut rig, cur_w, cur_h) {
+                        Ok(Some(ptr)) => {
+                            final_f32_ptr = ptr;
+                            denoiser_ran = true;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            rig.denoiser = None;
+                            rig.denoiser_failed = true;
+                            rig.temporal_has_prev = false;
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "OptiX denoiser disabled: {e}"
+                            )));
                         }
                     }
-                    denoised_buf.cu_deviceptr()
-                } else {
-                    rig.color_f32.cu_deviceptr()
-                };
+                }
                 if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
                     prof.mark_denoise_end(slot, &rig.stream);
                 }
@@ -4871,8 +5225,8 @@ pub fn spawn_render_thread(
                 if will_run_bloom {
                     let _nvtx =
                         crate::nvtx::NvtxRange::new(c"cuFFT Bloom", crate::nvtx::COLOR_BLOOM);
-                    if let Some(ref mut bloom) = rig.bloom {
-                        let bloom_ready = if will_run_denoiser {
+                    if let Ok(ref mut bloom) = rig.bloom {
+                        let bloom_ready = if denoiser_ran {
                             true
                         } else if let Some(ref denoised_buf) = rig.denoised_f32 {
                             // SAFETY: `color_f32` and `denoised_buf` have identical byte size on `rig.stream`.
@@ -4888,9 +5242,13 @@ pub fn spawn_render_thread(
                                 final_f32_ptr = denoised_buf.cu_deviceptr();
                                 true
                             } else {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "Bloom skipped: staging copy failed ({cp_res:?})"
+                                )));
                                 false
                             }
                         } else {
+                            // `denoised_f32` is missing only after a reported allocation failure.
                             false
                         };
                         if bloom_ready
@@ -4982,11 +5340,12 @@ pub fn spawn_render_thread(
                                 std::ptr::null_mut(),
                             )
                         };
-                        assert_eq!(
-                            res,
-                            cu::cudaError_enum_CUDA_SUCCESS,
-                            "tonemap cuLaunchKernel failed"
-                        );
+                        if res != cu::cudaError_enum_CUDA_SUCCESS {
+                            bus.emit_render_event(RenderEvent::Fatal(format!(
+                                "tonemap cuLaunchKernel failed ({res:?})"
+                            )));
+                            break 'render;
+                        }
                         if let Some(hdr_dsts) = hdr_ptrs {
                             let mut hdr_dst_ptr = hdr_dsts[buf_idx];
                             let mut hdr_args: [*mut c_void; 9] = [
@@ -5017,11 +5376,12 @@ pub fn spawn_render_thread(
                                     std::ptr::null_mut(),
                                 )
                             };
-                            assert_eq!(
-                                hdr_res,
-                                cu::cudaError_enum_CUDA_SUCCESS,
-                                "tonemap_f32_to_scrgb_f16 cuLaunchKernel failed"
-                            );
+                            if hdr_res != cu::cudaError_enum_CUDA_SUCCESS {
+                                bus.emit_render_event(RenderEvent::Fatal(format!(
+                                    "tonemap_f32_to_scrgb_f16 cuLaunchKernel failed ({hdr_res:?})"
+                                )));
+                                break 'render;
+                            }
                         }
                     }
                     if dlss_any
@@ -5109,8 +5469,15 @@ pub fn spawn_render_thread(
 
                 // Single end-of-frame fence ensuring shared RGBA8 / HDR / DLSS buffers are complete
                 // before handing `buf_idx` to the Vulkan/wgpu UI thread.
-                rig.stream.synchronize().expect("frame fence sync");
+                if let Err(e) = rig.stream.synchronize() {
+                    bus.emit_render_event(RenderEvent::Fatal(format!(
+                        "end-of-frame fence sync failed: {e}"
+                    )));
+                    break 'render;
+                }
 
+                // Without the profiler every engine reads 0 ms (reported once at init); a host
+                // wall-clock time would cover all passes and is not an RT Core time.
                 let (rt_ms, denoise_ms, bloom_ms, tonemap_ms, cuda_compute_ms) =
                     if let Some(prof) = rig.gpu_profiler.as_mut() {
                         let s = prof.poll_completed();
@@ -5122,7 +5489,7 @@ pub fn spawn_render_thread(
                             s.cuda_compute_ms(),
                         )
                     } else {
-                        (t_burst.elapsed().as_secs_f32() * 1000.0, 0.0, 0.0, 0.0, 0.0)
+                        (0.0, 0.0, 0.0, 0.0, 0.0)
                     };
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
@@ -5141,6 +5508,7 @@ pub fn spawn_render_thread(
                     bus.emit_render_event(RenderEvent::StatusMessage(msg));
                 }
 
+                let rendered_frame_index = frame_index;
                 accum_count = accum_count.saturating_add(1);
                 frame_index = frame_index.wrapping_add(1);
 
@@ -5159,29 +5527,38 @@ pub fn spawn_render_thread(
                             &exr_path,
                             &mut burst_exr_scratch,
                         );
+                        let sdg_cam = CsgGpuHost::build_sdg_camera(
+                            &active_camera,
+                            settings.camera_projection,
+                            cur_w,
+                            cur_h,
+                        );
                         let json_res = exr_res.and_then(|()| {
                             export_sdg_json_with_backend(
                                 &mut rig,
                                 &json_path,
-                                &active_camera,
-                                settings.camera_projection,
-                                cur_w,
-                                cur_h,
+                                sdg_cam,
                                 fidx,
                                 traffic_time,
                                 burst.occluder,
                             )
                         });
                         match json_res {
-                            Ok((actor_count, used_occ)) => {
+                            Ok(outcome) => {
+                                if let Some(reason) = &outcome.fallback_reason {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "SDG Burst frame {fidx}: OptiX occluder failed ({reason}); used CPU"
+                                    )));
+                                }
+                                let used_occ = outcome.occluder;
                                 burst.last_active_occluder = used_occ;
                                 burst.entries.push(SdgBurstFrameEntry {
                                     burst_index: fidx,
-                                    render_frame_index: frame_index,
+                                    render_frame_index: rendered_frame_index,
                                     time_s: traffic_time,
                                     exr_file: exr_name,
                                     json_file: json_name,
-                                    actor_count,
+                                    actor_count: outcome.actors,
                                     occluder_used: used_occ.label().to_string(),
                                 });
                                 burst.current_frame += 1;
@@ -5278,7 +5655,7 @@ mod tests {
     #[test]
     fn filigree_omm_bake_produces_valid_four_state_coverage() {
         let level = 5u32;
-        let bytes = bake_filigree_omm_bytes(level);
+        let bytes = bake_filigree_omm_bytes(level).expect("bake filigree OMM");
         // 2 shared micromaps * (4^5 = 1024 micro-tris) * 2 bits / 8 = 512 bytes
         assert_eq!(bytes.len(), 512);
         let mut counts = [0u32; 4];
@@ -5515,6 +5892,123 @@ mod tests {
         let (st_d, _) = compute_ias_classic_state(&s, 0.0, 1.5);
         assert_ne!(st_c, IasClassicState::Hidden);
         assert_ne!(st_c, st_d);
+    }
+
+    #[test]
+    fn denoiser_is_not_recreated_after_temporal_downgrade_or_failure() {
+        // Temporal requested, driver downgraded to Aov: the live denoiser is kept (the old check
+        // compared against the running model and rebuilt it every frame).
+        assert!(!denoiser_needs_create(true, false, true, true));
+        // A failed creation is not retried every frame for the same request.
+        assert!(!denoiser_needs_create(false, true, true, true));
+        // Changing the request retries, also after a failure.
+        assert!(denoiser_needs_create(true, false, true, false));
+        assert!(denoiser_needs_create(false, true, false, true));
+        // First use (and after a resize) creates.
+        assert!(denoiser_needs_create(false, false, false, false));
+    }
+
+    #[test]
+    fn sdg_burst_pauses_every_per_frame_accumulation_restart() {
+        let s = DemoSettings {
+            csg_mode: 0,
+            auto_rotate: true,
+            sat_on: true,
+            sat_orbit: true,
+            sat_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(classic_animation(&s, false), (true, true));
+        assert_eq!(classic_animation(&s, true), (false, false));
+        assert!(dlss_jitter_active(true, 0, false));
+        assert!(!dlss_jitter_active(true, 0, true));
+        assert!(!dlss_jitter_active(true, 1, false));
+        // Hidden classic stage never animates.
+        let hidden = DemoSettings {
+            csg_mode: 1,
+            csg_show_fractal: false,
+            ..s
+        };
+        assert_eq!(classic_animation(&hidden, false), (false, false));
+    }
+
+    #[test]
+    fn sky_crossfade_keeps_source_parameters_when_target_reads_none() {
+        let env = EnvSettings {
+            cloud_cover: 0.7,
+            cloud_density: 1.3,
+            ..Default::default()
+        };
+        let day = env.pack(0);
+        assert_ne!(day, [0.0; 8]);
+        // Day -> Coastal Night: Night reads no parameters, so the fading Day sky keeps its clouds.
+        assert_eq!(env.pack_crossfade(0, 8, 0.5), day);
+        // Night -> Day already carried the Day parameters.
+        assert_eq!(env.pack_crossfade(8, 0, 0.5), day);
+        // Outside the fade window only the target is evaluated.
+        assert_eq!(env.pack_crossfade(0, 8, 0.0), env.pack(8));
+        assert_eq!(env.pack_crossfade(0, 8, 1.0), env.pack(8));
+        assert_eq!(env.pack_crossfade(0, 8, f32::NAN), env.pack(8));
+        // Two parameterised modes cannot share the block: the target wins.
+        assert_eq!(env.pack_crossfade(3, 0, 0.5), day);
+    }
+
+    #[test]
+    fn ias_classic_state_ignores_mesh_segments_unless_mesh_glass_is_visible() {
+        let analytic = DemoSettings {
+            csg_mode: 0,
+            sat_on: true,
+            glass_analytic: true,
+            sat_u_segs: 24,
+            sat_v_segs: 36,
+            ..Default::default()
+        };
+        let dragged = DemoSettings {
+            sat_u_segs: 48,
+            sat_v_segs: 64,
+            ..analytic
+        };
+        assert_eq!(
+            compute_ias_classic_state(&analytic, 0.0, 0.0).0,
+            compute_ias_classic_state(&dragged, 0.0, 0.0).0,
+            "segment sliders must not rebuild the IAS while the glass is analytic"
+        );
+        let mesh = DemoSettings {
+            glass_analytic: false,
+            ..analytic
+        };
+        let mesh_dragged = DemoSettings {
+            glass_analytic: false,
+            ..dragged
+        };
+        assert_ne!(
+            compute_ias_classic_state(&mesh, 0.0, 0.0).0,
+            compute_ias_classic_state(&mesh_dragged, 0.0, 0.0).0,
+            "mesh glass must rebuild the IAS when its GAS changes"
+        );
+    }
+
+    #[test]
+    fn probe_ias_build_opts_disable_compaction() {
+        let opts = probe_ias_build_opts();
+        assert!(!opts.compact, "throwaway probe IAS must not pay for compaction");
+        assert!(opts.prefer_fast_trace);
+    }
+
+    #[test]
+    fn crowd_lod_change_uses_cuda_for_explicit_cuda_even_when_not_frozen() {
+        assert!(crowd_lod_refresh_on_cuda(CrowdBackend::Cuda, false));
+        assert!(crowd_lod_refresh_on_cuda(CrowdBackend::Cuda, true));
+        assert!(crowd_lod_refresh_on_cuda(CrowdBackend::Auto, true));
+        assert!(!crowd_lod_refresh_on_cuda(CrowdBackend::Auto, false));
+        assert!(!crowd_lod_refresh_on_cuda(CrowdBackend::Cpu, true));
+    }
+
+    #[test]
+    fn hot_reload_shader_path_does_not_depend_on_working_directory() {
+        let path = std::path::Path::new(RAYTRACER_CU_PATH);
+        assert!(path.is_absolute(), "{RAYTRACER_CU_PATH} must be absolute");
+        assert!(path.is_file(), "{RAYTRACER_CU_PATH} must exist");
     }
 
     #[test]

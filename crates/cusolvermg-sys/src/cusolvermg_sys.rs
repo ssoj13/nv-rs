@@ -6,13 +6,11 @@
 //! `cusolverStatus_t_CUSOLVER_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cusolvermg` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "cusolvermg",
     api: CusolverMgApi,
     loader: cusolvermg_api,
-    dll: DllSpec { lib: "cusolvermg", group: Group::Toolkit, windows: &["cusolverMg64_*"], linux: &["libcusolverMg.so.12", "libcusolverMg.so"] },
+    dll: nv_loader::catalog::CUSOLVERMG.spec,
 }
 
 #[cfg(test)]

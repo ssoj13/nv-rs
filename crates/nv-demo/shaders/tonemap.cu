@@ -205,7 +205,9 @@ static __forceinline__ __device__ ushort4 eval_scrgb_pixel(float4 c, float expos
             1.0f
         );
     }
-    // Exact same HDR10 203-nit paper-white + 750->1000-nit soft rolloff as `hdr_f32_to_p010_pq`.
+    // HDR10 grading lives here: 203-nit paper white + 750->1000-nit soft rolloff. The PQ10 video
+    // encoder (`scrgb_f16_to_p010_pq` in gpu_export.rs) consumes this scRGB output as-is and applies
+    // no rolloff of its own, so any other scRGB source would clip at 10,000 nits there.
     float rn = sanitize_range(c.x * exposure, 0.0f, 1000.0f) * 203.0f;
     float gn = sanitize_range(c.y * exposure, 0.0f, 1000.0f) * 203.0f;
     float bn = sanitize_range(c.z * exposure, 0.0f, 1000.0f) * 203.0f;

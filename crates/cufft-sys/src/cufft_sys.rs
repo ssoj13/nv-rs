@@ -6,13 +6,34 @@
 //! is missing. `cudaStream_t` is `cuda_bindings::CUstream_st`, so a `cuda-core` stream passes
 //! straight in. **Used by** a future safe `cufft` crate.
 
-use nv_loader::{DllSpec, Group};
+use nv_loader::Rejection;
 
 nv_loader::exports_sys! {
     lib: "cufft",
     api: CufftApi,
     loader: cufft_api,
-    dll: DllSpec { lib: "cufft", group: Group::Toolkit, windows: &["cufft64_*"], linux: &["libcufft.so.12", "libcufft.so"] },
+    dll: nv_loader::catalog::CUFFT.spec,
+    version: runtime_version,
+}
+
+/// Rejects a runtime whose major version is older than the `CUFFT_VER_MAJOR` of the headers these
+/// bindings were generated from: within a major, NVIDIA keeps struct layouts and enum values
+/// stable; across majors they may differ, which would be silent ABI mismatch.
+fn runtime_version(lib: &api::CufftApi) -> Result<(), Rejection> {
+    let get = *lib
+        .cufftGetProperty
+        .as_ref()
+        .map_err(|e| format!("cufftGetProperty is unavailable: {e}"))?;
+    let mut major = 0;
+    // SAFETY: `cufftGetProperty(libraryPropertyType, int*)` (cufft.h) needs no handle or initialisation and
+    // writes one int through the valid, exclusive pointer.
+    let status = unsafe { get(libraryPropertyType_t_MAJOR_VERSION, &mut major) };
+    if status != cufftResult_t_CUFFT_SUCCESS {
+        return Err(format!("cufftGetProperty(MAJOR_VERSION) returned {status}").into());
+    }
+    let found = u32::try_from(major)
+        .map_err(|_| format!("cufftGetProperty reported major version {major}"))?;
+    nv_loader::check_version(CUFFT_VER_MAJOR, found)
 }
 
 #[cfg(test)]

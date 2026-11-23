@@ -9,7 +9,7 @@
 //! both Rust crates and the Python API (`nv_rs.diag`).
 //!
 //! **How.** The active [`Level`] is stored in an [`AtomicU8`] initialized once from
-//! `NV_RS_DEBUG` (or `NV_RS_LOG`: `off`, `error`, `warn`, `info`, `trace`, `1`). When the
+//! `NV_RS_DEBUG` (else `NV_RS_LOG`; values in [`Level::parse`]: `1`/`true` mean `info`). When the
 //! level is [`Level::Off`], [`is_enabled`] is a single relaxed atomic load with zero
 //! allocations. Counters remain always-on via atomics so `stats()` is always accurate.
 
@@ -40,14 +40,16 @@ pub enum Level {
 }
 
 impl Level {
-    /// Parse a case-insensitive level string (`off`, `error`, `warn`, `info`, `trace`, `1`).
+    /// Parse a case-insensitive level: a name (`off`, `error`, `warn`, `info`, `trace`), a number
+    /// (`0` off, `2` warn, `3` info, `4` trace) or a switch: `1`/`true`/`on`/`yes` turn logging on
+    /// at [`Level::Info`] (library loads, warnings, errors), `false`/`no` turn it off.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "0" | "off" | "none" | "false" => Some(Self::Off),
-            "1" | "err" | "error" => Some(Self::Error),
+            "0" | "off" | "none" | "false" | "no" => Some(Self::Off),
+            "err" | "error" => Some(Self::Error),
             "2" | "warn" | "warning" => Some(Self::Warn),
-            "3" | "info" => Some(Self::Info),
-            "4" | "trace" | "debug" | "true" => Some(Self::Trace),
+            "1" | "true" | "on" | "yes" | "3" | "info" => Some(Self::Info),
+            "4" | "trace" | "debug" => Some(Self::Trace),
             _ => None,
         }
     }
@@ -147,13 +149,15 @@ struct State {
 fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| {
-        let env_val = std::env::var("NV_RS_DEBUG")
-            .or_else(|_| std::env::var("NV_RS_LOG"))
-            .ok();
-        let initial = env_val
-            .as_deref()
-            .and_then(Level::parse)
-            .unwrap_or(Level::Off);
+        let debug = std::env::var("NV_RS_DEBUG").ok();
+        let log = std::env::var("NV_RS_LOG").ok();
+        let (initial, unparsed) = initial_level(debug.as_deref(), log.as_deref());
+        if unparsed {
+            // Before the ring exists, stderr is the only channel; this runs once per process.
+            eprintln!(
+                "[nv-rs WARN diag] unrecognised NV_RS_DEBUG/NV_RS_LOG value ({debug:?}, {log:?}); expected off, error, warn, info, trace, 0-4, 1/true"
+            );
+        }
         State {
             level: AtomicU8::new(initial as u8),
             seq: AtomicU64::new(1),
@@ -169,6 +173,24 @@ fn state() -> &'static State {
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
         }
     })
+}
+
+/// The starting level from `NV_RS_DEBUG`, else `NV_RS_LOG` (an unparsable `NV_RS_DEBUG` falls
+/// through to `NV_RS_LOG`), else [`Level::Off`]; the flag reports that a set value was not
+/// understood.
+fn initial_level(debug: Option<&str>, log: Option<&str>) -> (Level, bool) {
+    let mut unparsed = false;
+    for raw in [debug, log]
+        .into_iter()
+        .flatten()
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        match Level::parse(raw) {
+            Some(level) => return (level, unparsed),
+            None => unparsed = true,
+        }
+    }
+    (Level::Off, unparsed)
 }
 
 /// Returns the current global diagnostic [`Level`].
@@ -390,130 +412,68 @@ pub fn probe_spec(spec: &DllSpec) -> ProbeResult {
     }
 }
 
-/// Probes all standard NVIDIA libraries known to `nv-rs` without loading them.
+/// Probes every library in [`crate::catalog::ALL`] that ships on this OS, without loading it.
+///
+/// SDK entries are probed without the sys crates' debug-build hint (nv-loader cannot know it), so
+/// in a debug build a library the loader finds only through that hint is reported as absent.
 pub fn probe_all() -> Vec<ProbeResult> {
-    use crate::Group;
-    const SPECS: &[DllSpec] = &[
-        DllSpec {
-            lib: "nvcuda",
-            group: Group::Driver,
-            windows: &["nvcuda.dll"],
-            linux: &["libcuda.so.1", "libcuda.so"],
-        },
-        DllSpec {
-            lib: "nvml",
-            group: Group::Driver,
-            windows: &["nvml.dll"],
-            linux: &["libnvidia-ml.so.1"],
-        },
-        DllSpec {
-            lib: "nvoptix",
-            group: Group::DriverStore,
-            windows: &["nvoptix.dll"],
-            linux: &["libnvoptix.so.1"],
-        },
-        DllSpec {
-            lib: "nvrtc",
-            group: Group::Toolkit,
-            windows: &["nvrtc64_*"],
-            linux: &["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"],
-        },
-        DllSpec {
-            lib: "cublas",
-            group: Group::Toolkit,
-            windows: &["cublas64_*"],
-            linux: &["libcublas.so.13", "libcublas.so.12", "libcublas.so"],
-        },
-        DllSpec {
-            lib: "cufft",
-            group: Group::Toolkit,
-            windows: &["cufft64_*"],
-            linux: &["libcufft.so.12", "libcufft.so.11", "libcufft.so"],
-        },
-        DllSpec {
-            lib: "curand",
-            group: Group::Toolkit,
-            windows: &["curand64_*"],
-            linux: &["libcurand.so.10", "libcurand.so"],
-        },
-        DllSpec {
-            lib: "cusolver",
-            group: Group::Toolkit,
-            windows: &["cusolver64_*"],
-            linux: &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
-        },
-        DllSpec {
-            lib: "cusparse",
-            group: Group::Toolkit,
-            windows: &["cusparse64_*"],
-            linux: &["libcusparse.so.12", "libcusparse.so"],
-        },
-        DllSpec {
-            lib: "nvjpeg",
-            group: Group::Toolkit,
-            windows: &["nvjpeg64_*"],
-            linux: &["libnvjpeg.so.13", "libnvjpeg.so.12", "libnvjpeg.so"],
-        },
-        DllSpec {
-            lib: "cudnn",
-            group: Group::Sdk {
-                root_var: "CUDNN_ROOT",
-                hint: None,
-            },
-            windows: &["cudnn64_9.dll", "cudnn64_*"],
-            linux: &["libcudnn.so.9", "libcudnn.so"],
-        },
-        DllSpec {
-            lib: "nvcomp",
-            group: Group::Sdk {
-                root_var: "NVCOMP_ROOT",
-                hint: None,
-            },
-            windows: &["nvcomp64_*", "nvcomp.dll"],
-            linux: &["libnvcomp.so.6", "libnvcomp.so"],
-        },
-        DllSpec {
-            lib: "nvcuvid",
-            group: Group::Driver,
-            windows: &["nvcuvid.dll"],
-            linux: &["libnvcuvid.so.1"],
-        },
-        DllSpec {
-            lib: "nvenc",
-            group: Group::Driver,
-            windows: &["nvEncodeAPI64.dll"],
-            linux: &["libnvidia-encode.so.1"],
-        },
-        DllSpec {
-            lib: "nvofapi",
-            group: Group::Driver,
-            windows: &["nvofapi64.dll"],
-            linux: &["libnvidia-opticalflow.so.1"],
-        },
-        #[cfg(target_os = "linux")]
-        DllSpec {
-            lib: "nccl",
-            group: Group::Sdk {
-                root_var: "NCCL_ROOT",
-                hint: None,
-            },
-            windows: &[],
-            linux: &["libnccl.so.2", "libnccl.so"],
-        },
-        #[cfg(target_os = "linux")]
-        DllSpec {
-            lib: "cufile",
-            group: Group::Toolkit,
-            windows: &[],
-            linux: &["libcufile.so.0", "libcufile.so"],
-        },
-        #[cfg(target_os = "windows")]
-        DllSpec {
-            lib: "nvapi",
-            group: Group::Driver,
-            windows: &["nvapi64.dll"],
-            linux: &[],
-        },
-    ];
-    SPECS.iter().map(probe_spec).collect()
+    crate::catalog::ALL
+        .iter()
+        .map(|entry| &entry.spec)
+        .filter(|spec| {
+            if cfg!(windows) {
+                !spec.windows.is_empty()
+            } else {
+                !spec.linux.is_empty()
+            }
+        })
+        .map(probe_spec)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_and_true_both_enable_load_events() {
+        // L-34: `1` meant `Error` while `true` meant `Trace`; both now mean "on" (`Info`).
+        for on in ["1", "true", "on", "yes", " TRUE "] {
+            assert_eq!(Level::parse(on), Some(Level::Info), "{on}");
+        }
+        for (raw, level) in [
+            ("0", Level::Off),
+            ("off", Level::Off),
+            ("error", Level::Error),
+            ("2", Level::Warn),
+            ("3", Level::Info),
+            ("4", Level::Trace),
+            ("trace", Level::Trace),
+        ] {
+            assert_eq!(Level::parse(raw), Some(level), "{raw}");
+        }
+        assert_eq!(Level::parse("loud"), None);
+    }
+
+    #[test]
+    fn an_unparsable_debug_value_falls_through_to_nv_rs_log_and_is_reported() {
+        assert_eq!(initial_level(Some("verbose"), Some("warn")), (Level::Warn, true));
+        assert_eq!(initial_level(Some("trace"), Some("off")), (Level::Trace, false));
+        assert_eq!(initial_level(None, Some("1")), (Level::Info, false));
+        assert_eq!(initial_level(Some("verbose"), None), (Level::Off, true));
+        assert_eq!(initial_level(None, None), (Level::Off, false));
+    }
+
+    #[test]
+    fn probe_all_covers_every_catalog_entry_for_this_os() {
+        let probed: Vec<&str> = probe_all().iter().map(|r| r.lib).collect();
+        for entry in crate::catalog::ALL {
+            let ships = if cfg!(windows) {
+                !entry.spec.windows.is_empty()
+            } else {
+                !entry.spec.linux.is_empty()
+            };
+            assert_eq!(probed.contains(&entry.name), ships, "{}", entry.name);
+        }
+    }
 }

@@ -139,6 +139,8 @@ pub enum UiCommand {
     SpawnCrowdStress { target_count: usize },
     /// Launch a multi-frame OpenEXR + SDG JSON + `manifest.json` dataset burst capture (`16 / 30 / 60` frames).
     StartSdgBurst { frames: u32 },
+    /// Abort a running SDG dataset burst (forwarded as [`RenderControl::CancelSdgBurst`]).
+    CancelSdgBurst,
     /// Switch CSG time-of-day (`0 = Day`, `1 = Sunset`, `2 = Night`), smoothly transitioning when enabled.
     SetTimeOfDay(u32),
 }
@@ -172,6 +174,8 @@ pub enum RenderControl {
         frames: u32,
         occluder: SdgOccluderBackend,
     },
+    /// Abort the running SDG dataset burst (no-op when none is running).
+    CancelSdgBurst,
     /// Apply a poke stumble/flinch impulse to the nearest actor along camera ray or all actors.
     PokeCrowd {
         origin: [f32; 3],
@@ -240,6 +244,12 @@ pub enum RenderEvent {
     PhaseChanged(EnginePhase),
     /// Human-readable status or diagnostic message for the UI status bar.
     StatusMessage(String),
+    /// Unrecoverable render worker error, emitted once right before the worker leaves its loop.
+    ///
+    /// The UI shows it persistently, finishes any recording, leaves lockstep and stops sending
+    /// render work. A worker that ends without this event (panic) is detected separately through
+    /// `JoinHandle::is_finished` and treated the same way.
+    Fatal(String),
 }
 
 /// Lock-free coalesced latest render state published by the UI loop and read by the OptiX worker.
@@ -534,6 +544,42 @@ mod tests {
         assert!(matches!(
             downcast_event::<RenderEvent>(&scratch[0]),
             Some(RenderEvent::StatusMessage(msg)) if msg == "ok"
+        ));
+    }
+
+    #[test]
+    fn fatal_event_and_sdg_burst_cancel_route_through_the_buses() {
+        let bus = AppBus::new(RenderStateSnapshot {
+            settings: DemoSettings::default(),
+            camera: sample_camera(0.0),
+            interacting_until: None,
+            reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
+            possess_zoom_offset: 0.0,
+        });
+        let mut scratch = Vec::with_capacity(4);
+
+        bus.emit_ui(UiCommand::CancelSdgBurst);
+        assert_eq!(bus.poll_ui_commands(&mut scratch), 1);
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[0]),
+            Some(&UiCommand::CancelSdgBurst)
+        );
+
+        bus.send_render(RenderControl::CancelSdgBurst);
+        assert_eq!(bus.poll_render_controls(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[0]),
+            Some(RenderControl::CancelSdgBurst)
+        ));
+
+        bus.emit_render_event(RenderEvent::Fatal("cuLaunchKernel failed".to_string()));
+        assert_eq!(bus.poll_render_events(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<RenderEvent>(&scratch[0]),
+            Some(RenderEvent::Fatal(msg)) if msg == "cuLaunchKernel failed"
         ));
     }
 

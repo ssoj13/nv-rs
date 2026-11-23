@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use nvenc::{
-    BufferFormat, Codec, EncodeFlags, EncodeInput, EncodeSession, OutputBitstream, Preset,
+    BufferFormat, Codec, EncodeFlags, EncodeInput, EncodeOutcome, EncodeSession, OutputBitstream,
+    Preset,
     RegisteredResource, SessionConfig, Tuning,
 };
 use nvjpeg::{
@@ -437,6 +438,8 @@ __device__ __forceinline__ float pq_oetf(float nits) {
 
 __device__ __forceinline__ float3 scrgb_to_pq2020(ushort4 px) {
     // scRGB linear Rec.709 (1.0 = 80 nits) -> nits -> Linear Rec.2020 -> SMPTE ST 2084 PQ.
+    // No highlight rolloff here: the source must already be graded by `tonemap_f32_to_scrgb_f16`
+    // (shaders/tonemap.cu, 750->1000-nit knee); anything brighter clips at 10,000 nits.
     float rn = fmaxf(0.0f, f16_to_f32(px.x) * 80.0f);
     float gn = fmaxf(0.0f, f16_to_f32(px.y) * 80.0f);
     float bn = fmaxf(0.0f, f16_to_f32(px.z) * 80.0f);
@@ -552,36 +555,25 @@ fn cached_cuda_driver_version() -> i32 {
     })
 }
 
-/// Compiles CUDA C++ source via NVRTC with a content-addressed on-disk PTX cache.
-///
-/// Cache keys hash `unit_name`, `arch`, CUDA driver version, `src`, and `extra_hash_blobs`
-/// (for included headers such as `csg_eval.cuh` or OptiX SDK version tags). Returns a
-/// NUL-terminated PTX byte buffer ready for `cuModuleLoadData` or `optix::Module`.
-pub(crate) fn compile_ptx_cached(
+/// Location and NVRTC options of one content-addressed PTX cache entry.
+struct PtxCacheEntry {
+    dir: PathBuf,
+    path: PathBuf,
+    tmp_path: PathBuf,
+    opts: nvrtc::CompileOptions,
+}
+
+/// Builds the NVRTC options for `unit_name` and the cache entry they key: the key covers
+/// `unit_name`, `arch`, the CUDA driver version, the NVRTC version, the full NVRTC option list
+/// (including include directories), `src`, and `extra_hash_blobs` (included header bytes such as
+/// `csg_eval.cuh`, or OptiX SDK version tags).
+fn ptx_cache_entry(
     src: &str,
     unit_name: &str,
     arch: &str,
     include_dirs: &[String],
     extra_hash_blobs: &[&[u8]],
-) -> Result<Vec<u8>, String> {
-    let driver_ver = cached_cuda_driver_version();
-    let (h0, h1) = ptx_cache_key_128(unit_name, arch, driver_ver, src, extra_hash_blobs);
-    let safe_stem: String = unit_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let cache_dir = nv_demo_cache_dir("ptx_cache_v1");
-    let cache_path = cache_dir.join(format!("{safe_stem}_{h0:016x}{h1:016x}.ptx"));
-
-    if let Ok(mut cached) = std::fs::read(&cache_path)
-        && !cached.is_empty()
-    {
-        if cached.last() != Some(&0) {
-            cached.push(0);
-        }
-        return Ok(cached);
-    }
-
+) -> Result<PtxCacheEntry, String> {
     let mut opts = nvrtc::CompileOptions::new()
         .arch(arch)
         .std("c++17")
@@ -589,9 +581,61 @@ pub(crate) fn compile_ptx_cached(
     for dir in include_dirs {
         opts = opts.include_dir(dir);
     }
+    let (nvrtc_major, nvrtc_minor) =
+        nvrtc::version().map_err(|e| format!("NVRTC unavailable for {unit_name}: {e}"))?;
+    let nvrtc_ver = [nvrtc_major.to_le_bytes(), nvrtc_minor.to_le_bytes()].concat();
+    let opts_blob = opts.args().join("\n");
+    let mut blobs: Vec<&[u8]> = Vec::with_capacity(extra_hash_blobs.len() + 2);
+    blobs.push(&nvrtc_ver);
+    blobs.push(opts_blob.as_bytes());
+    blobs.extend_from_slice(extra_hash_blobs);
+    let (h0, h1) = ptx_cache_key_128(
+        unit_name,
+        arch,
+        cached_cuda_driver_version(),
+        src,
+        &blobs,
+    );
+    let safe_stem: String = unit_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let dir = nv_demo_cache_dir("ptx_cache_v1");
+    let path = dir.join(format!("{safe_stem}_{h0:016x}{h1:016x}.ptx"));
+    let tmp_path = dir.join(format!(
+        "{safe_stem}_{h0:016x}{h1:016x}.tmp.{}",
+        std::process::id()
+    ));
+    Ok(PtxCacheEntry {
+        dir,
+        path,
+        tmp_path,
+        opts,
+    })
+}
+
+/// Reads a cached PTX image (NUL-terminated), or `None` when the entry is absent or empty.
+fn read_cached_ptx(entry: &PtxCacheEntry) -> Option<Vec<u8>> {
+    let mut cached = std::fs::read(&entry.path).ok()?;
+    if cached.is_empty() {
+        return None;
+    }
+    if cached.last() != Some(&0) {
+        cached.push(0);
+    }
+    Some(cached)
+}
+
+/// Compiles `src` with NVRTC and stores the PTX in the cache entry (best effort: a read-only cache
+/// directory never fails compilation).
+fn compile_and_store_ptx(
+    src: &str,
+    unit_name: &str,
+    entry: &PtxCacheEntry,
+) -> Result<Vec<u8>, String> {
     let mut prog = nvrtc::Program::new(src, Some(unit_name), &[])
         .map_err(|e| format!("NVRTC program creation failed for {unit_name}: {e}"))?;
-    prog.compile(&opts)
+    prog.compile(&entry.opts)
         .map_err(|e| format!("NVRTC compile failed for {unit_name}: {e}"))?;
     let mut ptx = prog
         .ptx()
@@ -600,23 +644,70 @@ pub(crate) fn compile_ptx_cached(
         ptx.push(0);
     }
 
-    // Best-effort atomic disk cache write (never fail compilation if cache dir is read-only).
-    if std::fs::create_dir_all(&cache_dir).is_ok() {
-        let tmp_path = cache_dir.join(format!(
-            "{safe_stem}_{h0:016x}{h1:016x}.tmp.{}",
-            std::process::id()
-        ));
-        if std::fs::write(&tmp_path, &ptx).is_ok()
-            && std::fs::rename(&tmp_path, &cache_path).is_err()
-            && let Err(rm_err) = std::fs::remove_file(&tmp_path)
-        {
-            eprintln!(
-                "nv-demo: failed to clean temp PTX cache '{}': {rm_err}",
-                tmp_path.display()
-            );
-        }
+    if std::fs::create_dir_all(&entry.dir).is_ok()
+        && std::fs::write(&entry.tmp_path, &ptx).is_ok()
+        && std::fs::rename(&entry.tmp_path, &entry.path).is_err()
+        && let Err(rm_err) = std::fs::remove_file(&entry.tmp_path)
+    {
+        eprintln!(
+            "nv-demo: failed to clean temp PTX cache '{}': {rm_err}",
+            entry.tmp_path.display()
+        );
     }
     Ok(ptx)
+}
+
+/// Compiles CUDA C++ source via NVRTC with a content-addressed on-disk PTX cache (see
+/// [`ptx_cache_entry`] for the key). Returns a NUL-terminated PTX byte buffer ready for
+/// `cuModuleLoadData` or `optix::Module`.
+///
+/// Prefer [`load_ptx_cached`] when the caller loads the PTX itself: it evicts a cached image the
+/// driver rejects instead of failing on every start.
+pub(crate) fn compile_ptx_cached(
+    src: &str,
+    unit_name: &str,
+    arch: &str,
+    include_dirs: &[String],
+    extra_hash_blobs: &[&[u8]],
+) -> Result<Vec<u8>, String> {
+    let entry = ptx_cache_entry(src, unit_name, arch, include_dirs, extra_hash_blobs)?;
+    if let Some(cached) = read_cached_ptx(&entry) {
+        return Ok(cached);
+    }
+    compile_and_store_ptx(src, unit_name, &entry)
+}
+
+/// Like [`compile_ptx_cached`], then hands the PTX to `load`. When a *cached* image fails to load
+/// (truncated or corrupt file, or PTX the current driver rejects), the entry is deleted, the source
+/// is recompiled and loaded once more; a freshly compiled image that fails returns `load`'s error.
+pub(crate) fn load_ptx_cached<T>(
+    src: &str,
+    unit_name: &str,
+    arch: &str,
+    include_dirs: &[String],
+    extra_hash_blobs: &[&[u8]],
+    mut load: impl FnMut(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    let entry = ptx_cache_entry(src, unit_name, arch, include_dirs, extra_hash_blobs)?;
+    if let Some(cached) = read_cached_ptx(&entry) {
+        match load(&cached) {
+            Ok(loaded) => return Ok(loaded),
+            Err(load_err) => {
+                eprintln!(
+                    "nv-demo: cached PTX '{}' failed to load ({load_err}); recompiling",
+                    entry.path.display()
+                );
+                std::fs::remove_file(&entry.path).map_err(|rm_err| {
+                    format!(
+                        "cached PTX '{}' failed to load ({load_err}) and could not be removed: {rm_err}",
+                        entry.path.display()
+                    )
+                })?;
+            }
+        }
+    }
+    let ptx = compile_and_store_ptx(src, unit_name, &entry)?;
+    load(&ptx)
 }
 
 /// RAII wrapper for a CUDA driver module and single entry-point function compiled via NVRTC.
@@ -640,16 +731,17 @@ impl CudaKernel {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed: {e}"))?;
 
-        let ptx = compile_ptx_cached(src, unit_name, "compute_75", &[], &[])?;
-
-        let mut module: cu::CUmodule = std::ptr::null_mut();
-        // SAFETY: `ptx` is a NUL-terminated PTX image and `cuda` is bound to the current thread.
-        let load_res = unsafe { cu::cuModuleLoadData(&mut module, ptx.as_ptr().cast()) };
-        if load_res != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!(
-                "cuModuleLoadData failed for {unit_name}: {load_res:?}"
-            ));
-        }
+        let module = load_ptx_cached(src, unit_name, "compute_75", &[], &[], |ptx| {
+            let mut module: cu::CUmodule = std::ptr::null_mut();
+            // SAFETY: `ptx` is a NUL-terminated PTX image and `cuda` is bound to the current thread.
+            let load_res = unsafe { cu::cuModuleLoadData(&mut module, ptx.as_ptr().cast()) };
+            if load_res != cu::cudaError_enum_CUDA_SUCCESS || module.is_null() {
+                return Err(format!(
+                    "cuModuleLoadData failed for {unit_name}: {load_res:?}"
+                ));
+            }
+            Ok(module)
+        })?;
 
         let c_fn_name = CString::new(fn_name)
             .map_err(|e| format!("invalid kernel function name {fn_name}: {e}"))?;
@@ -937,15 +1029,10 @@ pub fn save_jpeg_from_pitched(
         .synchronize()
         .map_err(|e| format!("CUDA stream synchronize failed: {e}"))?;
 
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create '{}': {e}", parent.display()))?;
-    }
-    std::fs::write(path, &cached.bitstream)
-        .map_err(|e| format!("failed to write JPEG '{}': {e}", path.display()))?;
-    Ok(())
+    // Same-directory temp file + flush + sync + rename (creates the parent directory), like the
+    // SDG sidecar written next to it: a crash never leaves a truncated `.jpg`.
+    crate::sdg_export::write_bytes_atomic(path, &cached.bitstream, "jpg.tmp")
+        .map_err(|e| format!("failed to write JPEG '{}': {e}", path.display()))
 }
 
 /// Hardware MP4 video recorder using `nvenc` and zero-copy GPU color conversion kernels.
@@ -1212,7 +1299,8 @@ impl VideoRecorder {
             output_sps_pps: self.frame_idx == 0,
             ..Default::default()
         };
-        self.session
+        let outcome = self
+            .session
             .encode_picture(
                 EncodeInput::Mapped(&mapped),
                 &mut self.bitstream,
@@ -1221,6 +1309,14 @@ impl VideoRecorder {
                 flags,
             )
             .map_err(|e| format!("NVENC encode_picture failed: {e}"))?;
+        // One output bitstream and one input surface: holding a reordered frame would need a ring
+        // of both. `frameIntervalP = 1` (no B-frames) means NVENC must emit every frame at once.
+        if outcome == EncodeOutcome::NeedMoreInput {
+            return Err(format!(
+                "NVENC buffered frame {} for reordering (NeedMoreInput) although B-frames are disabled",
+                self.frame_idx
+            ));
+        }
 
         let lock = self
             .bitstream
@@ -1236,6 +1332,9 @@ impl VideoRecorder {
     }
 
     /// Flushes the NVENC encoder and finalizes the MP4 container, returning total frames written.
+    ///
+    /// Every [`Self::push_frame`] locks and muxes its own packet (`NeedMoreInput` is rejected), so
+    /// EOS leaves no pending output bitstream to retrieve before the muxer closes.
     pub fn finish(self) -> Result<u64, String> {
         self.cuda
             .bind_to_thread()
@@ -1344,5 +1443,28 @@ mod tests {
             ptx_cache_key_128("test.cu", "compute_75", 12080, "void f(){}", &[b"hdr_v2"])
         );
         assert!(nv_demo_cache_dir("ptx_cache_v1").ends_with("ptx_cache_v1"));
+    }
+
+    #[test]
+    #[ignore = "needs the NVRTC runtime library"]
+    fn load_ptx_cached_evicts_and_recompiles_a_rejected_cache_entry() {
+        let src = "extern \"C\" __global__ void nv_demo_evict_probe() {}";
+        let unit = "nv_demo_evict_probe.cu";
+        let entry = ptx_cache_entry(src, unit, "compute_75", &[], &[]).expect("cache entry");
+        std::fs::create_dir_all(&entry.dir).expect("cache dir");
+        std::fs::write(&entry.path, b"corrupt").expect("seed a corrupt cache entry");
+
+        let has_ptx_header = |ptx: &[u8]| ptx.windows(8).any(|w| w == b".version");
+        let len = load_ptx_cached(src, unit, "compute_75", &[], &[], |ptx: &[u8]| {
+            if has_ptx_header(ptx) {
+                Ok(ptx.len())
+            } else {
+                Err("not a PTX image".to_string())
+            }
+        })
+        .expect("corrupt entry evicted and recompiled");
+        assert!(len > 0);
+        let stored = std::fs::read(&entry.path).expect("recompiled entry stored");
+        assert!(has_ptx_header(&stored));
     }
 }

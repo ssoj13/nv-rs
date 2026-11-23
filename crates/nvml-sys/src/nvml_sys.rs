@@ -7,13 +7,11 @@
 //! **Why.** The raw layer under a future safe `nvml` crate and under gpu-info-rs's GPU stats.
 //! **Used by** safe wrappers in nv-rs; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "nvml",
     api: NvmlApi,
     loader: nvml_api,
-    dll: DllSpec { lib: "nvml", group: Group::Driver, windows: &["nvml.dll"], linux: &["libnvidia-ml.so.1"] },
+    dll: nv_loader::catalog::NVML.spec,
 }
 
 #[cfg(test)]

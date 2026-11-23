@@ -2,14 +2,15 @@
 //!
 //! **What.** Types are generated at build time by `nv-bindgen` from `nvEncodeAPI.h` (located by
 //! vcv-rs; never committed). [`api`] opens the driver's `nvEncodeAPI64.dll` /
-//! `libnvidia-encode.so.1`, checks `NvEncodeAPIGetMaxSupportedVersion` against the header's
-//! [`NVENCAPI_MAJOR_VERSION`]/[`NVENCAPI_MINOR_VERSION`] (an older driver is a typed load error),
+//! `libnvidia-encode.so.1` through `nv_loader::open_library`, checks
+//! `NvEncodeAPIGetMaxSupportedVersion` against the header's
+//! [`NVENCAPI_MAJOR_VERSION`]/[`NVENCAPI_MINOR_VERSION`] (an older driver is
+//! `LoadError::RuntimeTooOld`),
 //! and fills [`NV_ENCODE_API_FUNCTION_LIST`] through `NvEncodeAPICreateInstance`.
 //! **Why.** NVENC exports only those two functions; every encoder call goes through the list.
 //! **Used by** a future safe `nvenc` crate and media encoders.
 
-use nv_loader::{DllSpec, Group, LoadError, Loaded, open_first};
-use std::sync::OnceLock;
+use nv_loader::{DllSpec, Rejection};
 
 // Generated code: lint levels differ per header.
 #[allow(
@@ -28,12 +29,7 @@ mod types {
 pub use types::*;
 
 /// Where NVENC ships: the display driver.
-pub const DLL: DllSpec = DllSpec {
-    lib: "nvenc",
-    group: Group::Driver,
-    windows: &["nvEncodeAPI64.dll"],
-    linux: &["libnvidia-encode.so.1"],
-};
+pub const DLL: DllSpec = nv_loader::catalog::NVENC.spec;
 
 /// Entry points (function-list fields) and header sha256 (coverage evidence).
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/nvenc_inventory.json"));
@@ -70,14 +66,16 @@ unsafe impl Sync for NvencApi {}
 type MaxVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 type CreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
 
-fn loaded() -> &'static Result<Loaded<NvencApi>, LoadError> {
-    static API: OnceLock<Result<Loaded<NvencApi>, LoadError>> = OnceLock::new();
-    API.get_or_init(|| open_first(&DLL, open))
+nv_loader::cached_loader! {
+    dll: DLL,
+    value: NvencApi,
+    open: open,
+    /// The NVENC function list for this process, loaded on first call.
+    pub fn api
 }
 
-fn open(path: &std::path::Path) -> Result<NvencApi, String> {
-    // SAFETY: loading the driver's encoder library runs only its initialisers.
-    let lib = unsafe { libloading::Library::new(path) }.map_err(|e| e.to_string())?;
+fn open(path: &std::path::Path) -> Result<NvencApi, Rejection> {
+    let lib = nv_loader::open_library(path).map_err(|e| e.to_string())?;
     // SAFETY: both exports have these signatures in nvEncodeAPI.h.
     let max_version: MaxVersionFn =
         unsafe { lib.get::<MaxVersionFn>(b"NvEncodeAPIGetMaxSupportedVersion\0") }
@@ -93,16 +91,13 @@ fn open(path: &std::path::Path) -> Result<NvencApi, String> {
     // SAFETY: valid out-pointer.
     let r = unsafe { max_version(&mut driver_max_version) };
     if r != _NVENCSTATUS_NV_ENC_SUCCESS {
-        return Err(format!("NvEncodeAPIGetMaxSupportedVersion returned {r}"));
+        return Err(format!("NvEncodeAPIGetMaxSupportedVersion returned {r}").into());
     }
-    let required = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
-    if driver_max_version < required {
-        return Err(format!(
-            "driver supports NVENC API {}.{}, these bindings need {NVENCAPI_MAJOR_VERSION}.{NVENCAPI_MINOR_VERSION}",
-            driver_max_version >> 4,
-            driver_max_version & 0xf
-        ));
-    }
+    // Both sides are `major << 4 | minor`; an older driver is `LoadError::RuntimeTooOld`.
+    nv_loader::check_version(
+        (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION,
+        driver_max_version,
+    )?;
 
     let mut list = NV_ENCODE_API_FUNCTION_LIST {
         version: FUNCTION_LIST_VERSION,
@@ -111,23 +106,13 @@ fn open(path: &std::path::Path) -> Result<NvencApi, String> {
     // SAFETY: `list` is a properly versioned, writable function list.
     let r = unsafe { create(&mut list) };
     if r != _NVENCSTATUS_NV_ENC_SUCCESS {
-        return Err(format!("NvEncodeAPICreateInstance returned {r}"));
+        return Err(format!("NvEncodeAPICreateInstance returned {r}").into());
     }
     Ok(NvencApi {
         _lib: lib,
         driver_max_version,
         list,
     })
-}
-
-/// The NVENC function list for this process, loaded on first call.
-pub fn api() -> Result<&'static NvencApi, &'static LoadError> {
-    loaded().as_ref().map(|l| &l.value)
-}
-
-/// Loads NVENC now and reports which file was used, or why loading failed.
-pub fn load() -> Result<&'static std::path::Path, &'static LoadError> {
-    loaded().as_ref().map(|l| l.path.as_path())
 }
 
 #[cfg(test)]
@@ -147,15 +132,6 @@ mod tests {
                 "{f} missing from the inventory"
             );
         }
-    }
-
-    #[test]
-    fn struct_version_matches_the_header_macro() {
-        // NVENCAPI_STRUCT_VERSION(2) for API 13.1: 13 | 1<<24 | 2<<16 | 7<<28.
-        assert_eq!(
-            struct_version(2),
-            NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24) | (2 << 16) | (7 << 28)
-        );
     }
 
     #[test]

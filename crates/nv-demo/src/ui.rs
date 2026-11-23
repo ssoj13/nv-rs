@@ -51,6 +51,10 @@ const AOV_HUD_TAGS: [&str; 11] = [
 
 const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
 
+/// Exposure multiplier range shared by the viewport-toolbar `EV` box and the Sky & Lighting
+/// slider. Both widgets clamp to their range every frame, so two ranges would fight (F06).
+pub(crate) const EXPOSURE_RANGE: RangeInclusive<f32> = 0.05..=8.0;
+
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
 const ANIM_BTN_W: f32 = 16.0;
@@ -75,6 +79,15 @@ pub fn scene_wgs84_origin(scene_id: &str) -> Option<(f64, f64)> {
         "sf_house_of_ai" => Some((37.7750, -122.4032)),
         _ => None,
     }
+}
+
+/// `true` for the `Inspector` variant `109` (4-archetype crowd showcase), where a poke hits every
+/// actor instead of the nearest one.
+fn is_inspector_crowd_showcase(descs: &[SceneDescriptor], csg_mode: u32, asset_idx: u32) -> bool {
+    csg_mode
+        .checked_sub(1)
+        .and_then(|i| descs.get(i as usize))
+        .is_some_and(|d| d.id == "inspector" && asset_idx == 109)
 }
 
 /// Resolves the `Home` camera pose and optional orbit pivot distance for the active mode.
@@ -112,8 +125,11 @@ pub fn resolve_home_pose(
     (classic_home, None)
 }
 
-/// Reusable per-frame UI text scratch buffers eliminating steady-state `format!`/`Vec` churn
-/// across 60 Hz HUD, telemetry, and inspector panels.
+/// Reusable per-frame UI text scratch buffers for the 60 Hz HUD, telemetry and inspector text.
+///
+/// They remove the formatting allocations of the strings built here; egui itself still allocates
+/// per widget text (`WidgetText` / galley jobs own a `String`), so the UI pass is not
+/// allocation-free.
 #[derive(Debug)]
 pub struct UiScratch {
     /// Reusable buffer for the bottom-left Viewport status HUD line.
@@ -915,12 +931,7 @@ impl UiContext<'_> {
                     ))
                     .width(94.0)
                     .show_ui(ui, |ui| {
-                        for proj in [
-                            CameraProjection::Pinhole,
-                            CameraProjection::Fisheye180,
-                            CameraProjection::Equirect360,
-                            CameraProjection::SlitCam,
-                        ] {
+                        for proj in CameraProjection::ALL {
                             ui.selectable_value(
                                 &mut self.settings.camera_projection,
                                 proj,
@@ -960,10 +971,11 @@ impl UiContext<'_> {
                         .on_hover_text("Poke nearest articulated actor (P)")
                         .clicked()
                 {
-                    let is_inspector_109 = self
-                        .scene_descriptors
-                        .get((self.settings.csg_mode as usize).saturating_sub(1))
-                        .is_some_and(|d| d.id == "inspector" && self.settings.csg_asset_idx == 109);
+                    let is_inspector_109 = is_inspector_crowd_showcase(
+                        self.scene_descriptors,
+                        self.settings.csg_mode,
+                        self.settings.csg_asset_idx,
+                    );
                     self.bus.emit_ui(UiCommand::PokeCrowd {
                         impulse: self.settings.poke_impulse,
                         all: is_inspector_109,
@@ -981,7 +993,7 @@ impl UiContext<'_> {
                 // 5. Compact Exposure EV & LOD Bias controls
                 ui.add(
                     egui::DragValue::new(&mut self.settings.exposure)
-                        .range(0.05..=8.0)
+                        .range(EXPOSURE_RANGE)
                         .speed(0.02)
                         .prefix("EV "),
                 )
@@ -1018,6 +1030,14 @@ impl UiContext<'_> {
                         frames: self.settings.sdg_burst_frames,
                     });
                 }
+                if self.settings.csg_mode > 0
+                    && ui
+                        .add(egui::Button::new(ic::STOP_CIRCLE).small())
+                        .on_hover_text("Cancel the running SDG burst")
+                        .clicked()
+                {
+                    self.bus.emit_ui(UiCommand::CancelSdgBurst);
+                }
             });
 
         let toolbar_blocking = toolbar_resp.contains_pointer;
@@ -1046,19 +1066,26 @@ impl UiContext<'_> {
         }
 
         let kb_free = !ui.ctx().egui_wants_keyboard_input();
+        // Viewport hotkey: gated on `viewport_focused` like `F` and `A` (F29).
         if kb_free
+            && *self.viewport_focused
             && self.settings.csg_mode > 0
             && ui.input(|i| i.key_pressed(egui::Key::P))
         {
-            let is_inspector_109 = self
-                .scene_descriptors
-                .get((self.settings.csg_mode as usize).saturating_sub(1))
-                .is_some_and(|d| d.id == "inspector" && self.settings.csg_asset_idx == 109);
+            let is_inspector_109 = is_inspector_crowd_showcase(
+                self.scene_descriptors,
+                self.settings.csg_mode,
+                self.settings.csg_asset_idx,
+            );
             self.bus.emit_ui(UiCommand::PokeCrowd {
                 impulse: self.settings.poke_impulse,
                 all: is_inspector_109,
             });
         }
+        // Lockstep subframes replay this input; the camera branch below refreshes it. When that
+        // branch is skipped (possessed, split drag, toolbar, pick) a stale copy would keep held
+        // keys alive in the recording (F08).
+        *self.last_cam_raw_input = None;
         if let Some(pinfo) = self.possess_info {
             if kb_free {
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1120,10 +1147,7 @@ impl UiContext<'_> {
                     }
                     frame
                 }
-                None => {
-                    *self.last_cam_raw_input = None;
-                    camera::egui::drive(ui, &resp, self.cam_driver, fly_scene_radius)
-                }
+                None => camera::egui::drive(ui, &resp, self.cam_driver, fly_scene_radius),
             };
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
             let f_pressed =
@@ -1443,7 +1467,7 @@ impl UiContext<'_> {
             }
         });
         ui.add_space(2.0);
-        collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", true, |ui| {
+        collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", |ui| {
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
                     if ui
@@ -1512,7 +1536,7 @@ impl UiContext<'_> {
             });
         });
 
-        collapsing_section(ui, "sec_formula", ic::CUBE, "Formula", true, |ui| {
+        collapsing_section(ui, "sec_formula", ic::CUBE, "Formula", |ui| {
             equal_grid(ui, 3, 3, |ui, idx, w| {
                 let (kind, label) = match idx {
                     0 => (0u32, "Mandelbulb"),
@@ -1760,7 +1784,6 @@ impl UiContext<'_> {
             "sec_transform",
             ic::ARROWS_OUT_CARDINAL,
             "Transform",
-            true,
             |ui| {
                 anim_vec3(
                     ui,
@@ -1835,7 +1858,6 @@ impl UiContext<'_> {
             "sec_detail",
             ic::SLIDERS_HORIZONTAL,
             "Detail & Shading",
-            true,
             |ui| {
                 anim_slider_f32(
                     ui,
@@ -1944,7 +1966,7 @@ impl UiContext<'_> {
             let descs = self.scene_descriptors;
             let viewpoints = self.scene_viewpoints;
 
-            collapsing_section(ui, "sec_csg", ic::BUILDINGS, "CSG World", true, |ui| {
+            collapsing_section(ui, "sec_csg", ic::BUILDINGS, "CSG World", |ui| {
                 let prev_mode = s.csg_mode;
                 let total_choices = descs.len() + 1;
 
@@ -1976,20 +1998,22 @@ impl UiContext<'_> {
                     descs.get((s.csg_mode as usize).saturating_sub(1))
                 };
 
-                if s.csg_mode != prev_mode
-                    && let Some(desc) = active_desc
-                {
-                    let tod_u32 = match desc.default_tod {
-                        TimeOfDay::Day => 0,
-                        TimeOfDay::Sunset => 1,
-                        TimeOfDay::Night => 2,
-                    };
-                    s.csg_wetness = desc.default_wetness.clamp(0.0, 1.0);
-                    apply_csg_time_of_day_preset(s, tod_u32);
-                    if !desc.variant_labels.is_empty() {
-                        s.csg_asset_idx =
-                            s.csg_asset_idx.min((desc.variant_labels.len() - 1) as u32);
+                if s.csg_mode != prev_mode {
+                    if let Some(desc) = active_desc {
+                        let tod_u32 = match desc.default_tod {
+                            TimeOfDay::Day => 0,
+                            TimeOfDay::Sunset => 1,
+                            TimeOfDay::Night => 2,
+                        };
+                        s.csg_wetness = desc.default_wetness.clamp(0.0, 1.0);
+                        apply_csg_time_of_day_preset(s, tod_u32);
+                        if !desc.variant_labels.is_empty() {
+                            s.csg_asset_idx =
+                                s.csg_asset_idx.min((desc.variant_labels.len() - 1) as u32);
+                        }
                     }
+                    // Every scene change, "Off" included, goes through `SelectScene` so main
+                    // pauses the rail and ejects a possessed body (F25).
                     request_auto_frame = true;
                 }
 
@@ -2286,7 +2310,7 @@ impl UiContext<'_> {
         let csg_stats = self.csg_stats;
         let label_buf = &mut self.scratch.label_buf;
 
-        collapsing_section(ui, "sec_lod", ic::STACK, "LOD & Culling", true, |ui| {
+        collapsing_section(ui, "sec_lod", ic::STACK, "LOD & Culling", |ui| {
             lod_telemetry_strip(ui, label_buf, csg_stats, s.csg_mode != 0);
             ui.add_space(2.0);
             prop_toggle(ui, "LOD Enabled", &mut s.csg_lod_enabled, "Distance & SSE LOD");
@@ -2359,7 +2383,7 @@ impl UiContext<'_> {
             }
         });
 
-        collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", true, |ui| {
+        collapsing_section(ui, "sec_sky", ic::SUN, "Sky & Lighting", |ui| {
             prop_row(ui, "Background", |ui| {
                 let gap = 4.0;
                 let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
@@ -2443,9 +2467,9 @@ impl UiContext<'_> {
                 "exposure",
                 "Exposure",
                 &mut s.exposure,
-                0.25..=2.0,
+                EXPOSURE_RANGE,
                 2,
-                false,
+                true,
             );
 
             match s.sky_mode {
@@ -2487,7 +2511,7 @@ impl UiContext<'_> {
             }
         });
 
-        collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", true, |ui| {
+        collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", |ui| {
             anim_slider_f32(
                 ui,
                 anim,
@@ -2515,7 +2539,6 @@ impl UiContext<'_> {
             "sec_floor",
             ic::SQUARES_FOUR,
             "Scratched Metal Floor",
-            true,
             |ui| {
                 anim_slider_f32(
                     ui,
@@ -2560,7 +2583,7 @@ impl UiContext<'_> {
             },
         );
 
-        collapsing_section(ui, "sec_scene", ic::GLOBE, "Scene", true, |ui| {
+        collapsing_section(ui, "sec_scene", ic::GLOBE, "Scene", |ui| {
             prop_toggle(ui, "Glass Sat", &mut s.sat_on, "Dielectric Sphere");
             if s.sat_on {
                 prop_toggle(
@@ -2769,7 +2792,6 @@ impl UiContext<'_> {
             "sec_bloom",
             ic::SUN_DIM,
             "FFT Bloom (cuFFT)",
-            true,
             |ui| {
                 prop_toggle(ui, "Bloom", &mut s.bloom_on, "Enable Diffraction Bloom");
                 if s.bloom_on {
@@ -2798,7 +2820,7 @@ impl UiContext<'_> {
             },
         );
 
-        collapsing_section(ui, "sec_split", ic::COLUMNS, "A/B Split", true, |ui| {
+        collapsing_section(ui, "sec_split", ic::COLUMNS, "A/B Split", |ui| {
             prop_toggle(ui, "Split View", &mut s.split_on, "Drag Handle in Viewport");
             if s.split_on {
                 anim_slider_f32(
@@ -2833,7 +2855,7 @@ impl UiContext<'_> {
             }
         });
 
-        collapsing_section(ui, "sec_pt", ic::LIGHTNING, "Path Tracer", true, |ui| {
+        collapsing_section(ui, "sec_pt", ic::LIGHTNING, "Path Tracer", |ui| {
             // Compact 3-toggle row replacing 13 separate buttons (Scale / AOV / AI mode)
             equal_grid(ui, 3, 3, |ui, idx, w| match idx {
                 0 => {
@@ -3131,7 +3153,7 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
-            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+            equal_grid(ui, 3, 3, |ui, idx, w| match idx {
                 0 => {
                     const BURST_PRESETS: [u32; 3] = [16, 30, 60];
                     let cur = BURST_PRESETS
@@ -3152,6 +3174,22 @@ impl UiContext<'_> {
                         let next =
                             (cur as i32 + step).rem_euclid(BURST_PRESETS.len() as i32) as usize;
                         s.sdg_burst_frames = BURST_PRESETS[next];
+                    }
+                }
+                2 => {
+                    static CANCEL_BURST_LABEL: LazyLock<String> =
+                        LazyLock::new(|| format!("{}  Cancel Burst", ic::STOP_CIRCLE));
+                    if ui
+                        .add_enabled(
+                            s.csg_mode > 0,
+                            egui::Button::new(CANCEL_BURST_LABEL.as_str())
+                                .truncate()
+                                .min_size(egui::vec2(w, ROW_H + 2.0)),
+                        )
+                        .on_hover_text("Stop the running SDG dataset burst.")
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::CancelSdgBurst);
                     }
                 }
                 _ => {
@@ -3329,7 +3367,6 @@ impl UiContext<'_> {
                 "sec_cinema",
                 ic::VIDEO_CAMERA,
                 "Cinema & Camera Rail",
-                true,
                 |ui| {
                     // 1. Toggleable Auto-Drive ON/OFF button (never erases custom keyframes).
                     {
@@ -3383,6 +3420,8 @@ impl UiContext<'_> {
                                     request_blend = true;
                                 }
                             } else if s.csg_mode == 0 && has_scenes {
+                                // Not routed through `SelectScene` (that pauses the rail this
+                                // starts), so apply its other effects here (F25).
                                 s.csg_mode = 1;
                                 if let Some(d) = self.scene_descriptors.first() {
                                     let tod_u32 = match d.default_tod {
@@ -3392,6 +3431,13 @@ impl UiContext<'_> {
                                     };
                                     s.csg_wetness = d.default_wetness.clamp(0.0, 1.0);
                                     apply_csg_time_of_day_preset(s, tod_u32);
+                                    s.csg_asset_idx = s.csg_asset_idx.min(
+                                        u32::try_from(d.variant_labels.len().saturating_sub(1))
+                                            .unwrap_or(0),
+                                    );
+                                }
+                                if self.possess_info.is_some() {
+                                    self.bus.emit_ui(UiCommand::EjectPossess);
                                 }
                                 rail.playing = true;
                                 request_blend = true;
@@ -3693,7 +3739,7 @@ impl UiContext<'_> {
             self.bus.emit_ui(UiCommand::SnapCamera);
         }
 
-        collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", true, |ui| {
+        collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", |ui| {
             let buf = &mut self.scratch.label_buf;
             stat_row(ui, "GPU", &self.telemetry.gpu_name);
             stat_row(
@@ -3858,7 +3904,7 @@ impl UiContext<'_> {
             }
         });
 
-        collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {
+        collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", |ui| {
             let buf = &mut self.scratch.label_buf;
             stat_row(
                 ui,
@@ -4168,7 +4214,6 @@ fn collapsing_section(
     id_salt: &str,
     icon: &str,
     title: &str,
-    _default_open: bool,
     add_body: impl FnOnce(&mut Ui),
 ) {
     let accent = section_accent(id_salt);
@@ -4472,7 +4517,10 @@ fn anim_toggle_btn_disabled(ui: &mut Ui) {
     resp.on_hover_text("This parameter cannot be animated");
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row helper behind every animatable slider; a parameter struct would only rename the arguments"
+)]
 fn anim_slider_f32(
     ui: &mut Ui,
     anim: &mut DemoAnimator,

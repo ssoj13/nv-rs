@@ -1,14 +1,22 @@
 //! `nv_rs.cupti`, `nv_rs.cuda_ext`, and `nv_rs.wgpu` — CUPTI profiling, CUDA driver extensions,
 //! and zero-copy CUDA <-> `wgpu` interop submodules.
+//!
+//! **GIL rules.** Every CUDA / CUPTI / `wgpu` call that can block runs with the GIL released
+//! (`py.detach`), including teardown in `Drop` ([`without_gil`]): a CUPTI callback that calls into
+//! Python takes the GIL on a driver thread, so holding the GIL while waiting for a driver lock, or
+//! while dropping a `Subscriber` (which waits for running callbacks), can deadlock. Mutexes of
+//! this module recover from poisoning (`PoisonError::into_inner`): they guard ownership of one
+//! native handle (`Option` take), which a panic cannot leave half-updated.
 
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Instant;
 
-use cuda_core::Context;
+use cuda_core::{Context, DriverError};
 use cuda_core_ext::{
     GreenContext, HostRegistration, ManagedBuffer, MemoryHandle, device_luid as ext_device_luid,
     device_uuid as ext_device_uuid, sparse_arrays_supported as ext_sparse_arrays_supported,
@@ -21,7 +29,7 @@ use cupti::{
 use nv_loader::diag::{self, Level};
 use nv_wgpu::{
     InteropBackend, InteropContext, InteropSemaphore, SharedBuffer, SharedBufferDescriptor,
-    aligned_row_pitch, aligned_staging_bytes, validate_buffer_descriptor,
+    aligned_row_pitch, aligned_staging_bytes,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -33,7 +41,25 @@ use crate::errors::{ErrorKind, record_and_err};
 // Shared helpers
 // ============================================================================
 
+/// Runs `f` with the GIL released when the calling thread holds it (a pyclass `Drop` runs under
+/// the GIL), or directly when the interpreter cannot be attached (shutdown). Used for teardown
+/// that can block on the driver or on CUPTI callbacks.
+pub(crate) fn without_gil(f: impl FnOnce() + Send) {
+    let mut f = Some(f);
+    Python::try_attach(|py| {
+        py.detach(|| {
+            if let Some(f) = f.take() {
+                f();
+            }
+        })
+    });
+    if let Some(f) = f {
+        f();
+    }
+}
+
 fn resolve_cuda_ctx(
+    py: Python<'_>,
     category: &str,
     op: &str,
     context: Option<&PyContext>,
@@ -41,7 +67,10 @@ fn resolve_cuda_ctx(
 ) -> PyResult<Arc<Context>> {
     match context {
         Some(ctx) => Ok(ctx.inner.clone()),
-        None => Context::new(device).map_err(|e| record_and_err(category, op, e, ErrorKind::Cuda)),
+        // `Context::new` takes driver locks: never under the GIL (see the module docs).
+        None => py
+            .detach(move || Context::new(device))
+            .map_err(|e| record_and_err(category, op, e, ErrorKind::Cuda)),
     }
 }
 
@@ -52,8 +81,36 @@ fn resolve_cuda_ctx(
 py_err_mapper!(map_cupti_err, "cupti", cupti::Error, {
     cupti::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
     cupti::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-    _ => ErrorKind::Cuda,
+    cupti::Error::Status { .. } | cupti::Error::Driver(_) => ErrorKind::Cuda,
+    cupti::Error::CallbackPanicked(_) => ErrorKind::Runtime,
 });
+
+/// Every kind `parse_activity_kind` accepts; `CuptiActivity.close` disables them explicitly so
+/// CUPTI failures are raised instead of parked on the context by `ActivityProfiler::drop`.
+const ACTIVITY_KINDS: [ActivityKind; 6] = [
+    ActivityKind::Memcpy,
+    ActivityKind::Memset,
+    ActivityKind::Kernel,
+    ActivityKind::ConcurrentKernel,
+    ActivityKind::Driver,
+    ActivityKind::Runtime,
+];
+
+/// Most `(domain, cbid)` events a `CuptiSubscriber` buffers between `drain_events` calls; older
+/// events are dropped first and counted.
+const MAX_BUFFERED_EVENTS: usize = 1 << 16;
+
+thread_local! {
+    /// Set on a thread while it runs a `CuptiSubscriber` Python callback: dropping a `Subscriber`
+    /// waits for its running callbacks, so it must not happen on such a thread.
+    static IN_CUPTI_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Callback events buffered by a `CuptiSubscriber`, bounded by [`MAX_BUFFERED_EVENTS`].
+struct EventQueue {
+    events: VecDeque<(&'static str, u32)>,
+    dropped: usize,
+}
 
 py_parse_enum!(parse_activity_kind, "cupti", "parse_activity_kind", ActivityKind, "CUPTI activity kind", {
     "memcpy" => ActivityKind::Memcpy,
@@ -159,9 +216,38 @@ fn callback_name(py: Python<'_>, domain: &str, cbid: u32) -> PyResult<String> {
 }
 
 /// CUPTI Activity API profiler (`cupti::ActivityProfiler`).
+///
+/// CUPTI activity collection is process-wide: an enabled kind records every context, all
+/// profilers share one record queue (so one profiler's `drain_records` also takes the records
+/// another profiler expects), and `context` / `device` only select the context CUPTI calls bind.
+/// Enabled kinds are reference-counted, so closing one profiler never disables a kind another
+/// profiler still uses.
 #[pyclass(name = "CuptiActivity", module = "nv_rs.cupti")]
 pub struct PyCuptiActivity {
     inner: Mutex<Option<ActivityProfiler>>,
+}
+
+impl Drop for PyCuptiActivity {
+    fn drop(&mut self) {
+        let profiler = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(profiler) = profiler {
+            // The teardown flush can wait on the driver (see the module docs).
+            without_gil(move || drop(profiler));
+        }
+    }
+}
+
+/// Disables every kind and flushes, returning the first CUPTI failure.
+fn teardown_activity(profiler: &mut ActivityProfiler) -> cupti::Result<()> {
+    let mut first = Ok(());
+    for kind in ACTIVITY_KINDS {
+        first = first.and(profiler.disable(kind));
+    }
+    first.and(profiler.flush(true))
 }
 
 #[pymethods]
@@ -171,7 +257,7 @@ impl PyCuptiActivity {
     #[pyo3(signature = (context=None, device=0))]
     fn new(py: Python<'_>, context: Option<&PyContext>, device: usize) -> PyResult<Self> {
         let t0 = Instant::now();
-        let ctx = resolve_cuda_ctx("cupti", "CuptiActivity::new", context, device)?;
+        let ctx = resolve_cuda_ctx(py, "cupti", "CuptiActivity::new", context, device)?;
         let profiler = py
             .detach(move || ActivityProfiler::new(&ctx))
             .map_err(|e| map_cupti_err("CuptiActivity::new", e))?;
@@ -258,13 +344,23 @@ impl PyCuptiActivity {
         Ok((out, dropped))
     }
 
-    /// Explicitly tears down the profiler and flushes remaining activity buffers.
+    /// Disables this profiler's kinds, flushes remaining activity buffers and releases the
+    /// profiler, raising the first CUPTI failure. Closing again is a no-op.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            drop(guard.take());
-        });
-        Ok(())
+            let taken = self
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(mut profiler) = taken else {
+                return Ok(());
+            };
+            let res = teardown_activity(&mut profiler);
+            drop(profiler);
+            res
+        })
+        .map_err(|e| map_cupti_err("close", e))
     }
 }
 
@@ -272,8 +368,45 @@ impl PyCuptiActivity {
 #[pyclass(name = "CuptiSubscriber", module = "nv_rs.cupti")]
 pub struct PyCuptiSubscriber {
     inner: Mutex<Option<Subscriber>>,
-    events: Arc<Mutex<Vec<(&'static str, u32)>>>,
+    events: Arc<Mutex<EventQueue>>,
     callback_err: Arc<Mutex<Option<String>>>,
+}
+
+impl Drop for PyCuptiSubscriber {
+    fn drop(&mut self) {
+        let sub = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(sub) = sub else {
+            return;
+        };
+        if !IN_CUPTI_CALLBACK.with(Cell::get) {
+            // Dropping waits for callbacks running on other threads, which may need the GIL.
+            without_gil(move || drop(sub));
+            return;
+        }
+        // Collected inside a callback: dropping here would wait for this very callback, so
+        // unsubscribe from another thread once it has returned.
+        let slot = Arc::new(Mutex::new(Some(sub)));
+        let moved = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("nv-rs-cupti-unsubscribe".to_owned())
+            .spawn(move || {
+                let sub = moved.lock().unwrap_or_else(PoisonError::into_inner).take();
+                drop(sub);
+            });
+        if let Err(e) = spawned {
+            // No thread to unsubscribe from: keep the subscription (leaked) rather than deadlock.
+            diag::record_error(
+                "cupti",
+                "CuptiSubscriber::drop",
+                &format!("cannot spawn the unsubscribe thread ({e}); subscriber leaked"),
+            );
+            std::mem::forget(slot.lock().unwrap_or_else(PoisonError::into_inner).take());
+        }
+    }
 }
 
 #[pymethods]
@@ -281,8 +414,9 @@ impl PyCuptiSubscriber {
     /// Subscribes to CUPTI callbacks on `context` (or `device`).
     ///
     /// If `callback` is provided, it is invoked as `callback(domain: str, cbid: int)` and errors
-    /// are captured for `check_errors()`. Observed `(domain, cbid)` pairs are also buffered for
-    /// `drain_events()`.
+    /// are captured for `check_errors()`; it must not close this subscriber. Observed
+    /// `(domain, cbid)` pairs are also buffered for `drain_events()`, at most 65536 between
+    /// drains (older events are dropped and reported in `nv_rs.diag` by `drain_events`).
     #[new]
     #[pyo3(signature = (context=None, device=0, callback=None))]
     fn new(
@@ -292,8 +426,11 @@ impl PyCuptiSubscriber {
         callback: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let t0 = Instant::now();
-        let ctx = resolve_cuda_ctx("cupti", "CuptiSubscriber::new", context, device)?;
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = resolve_cuda_ctx(py, "cupti", "CuptiSubscriber::new", context, device)?;
+        let events = Arc::new(Mutex::new(EventQueue {
+            events: VecDeque::new(),
+            dropped: 0,
+        }));
         let callback_err = Arc::new(Mutex::new(None));
 
         let events_cb = events.clone();
@@ -301,13 +438,21 @@ impl PyCuptiSubscriber {
         let cb: Box<cupti::CallbackFn> = Box::new(move |dom, cbid| {
             let dom_str = callback_domain_str(dom);
             {
-                let mut ev = events_cb.lock().unwrap_or_else(|e| e.into_inner());
-                ev.push((dom_str, cbid));
+                let mut q = events_cb.lock().unwrap_or_else(PoisonError::into_inner);
+                if q.events.len() >= MAX_BUFFERED_EVENTS {
+                    q.events.pop_front();
+                    q.dropped += 1;
+                }
+                q.events.push_back((dom_str, cbid));
             }
             if let Some(ref py_cb) = callback {
-                let res = Python::attach(|py| py_cb.call1(py, (dom_str, cbid)).map(|_| ()));
-                if let Err(err) = res {
-                    let mut slot = err_cb.lock().unwrap_or_else(|e| e.into_inner());
+                let outer = IN_CUPTI_CALLBACK.with(|f| f.replace(true));
+                // `try_attach` skips the call while the interpreter shuts down instead of
+                // blocking the driver thread that dispatched the callback.
+                let res = Python::try_attach(|py| py_cb.call1(py, (dom_str, cbid)).map(|_| ()));
+                IN_CUPTI_CALLBACK.with(|f| f.set(outer));
+                if let Some(Err(err)) = res {
+                    let mut slot = err_cb.lock().unwrap_or_else(PoisonError::into_inner);
                     slot.get_or_insert_with(|| err.to_string());
                 }
             }
@@ -365,10 +510,25 @@ impl PyCuptiSubscriber {
         .map_err(|e| map_cupti_err("enable_callback", e))
     }
 
-    /// Drains buffered `(domain, cbid)` callback events.
+    /// Drains buffered `(domain, cbid)` callback events (oldest first). Events dropped because
+    /// the buffer was full since the last drain are reported as one `nv_rs.diag` warning.
     fn drain_events(&self) -> Vec<(&'static str, u32)> {
-        let mut ev = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *ev)
+        let (events, dropped) = {
+            let mut q = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+            let events: Vec<_> = q.events.drain(..).collect();
+            (events, std::mem::take(&mut q.dropped))
+        };
+        if dropped > 0 {
+            diag::record_event(
+                Level::Warn,
+                "cupti",
+                "drain_events",
+                format!("{dropped} callback events dropped (buffer holds {MAX_BUFFERED_EVENTS})"),
+                0,
+                false,
+            );
+        }
+        events
     }
 
     /// Raises an error if any Rust panic or Python callback exception occurred inside CUPTI.
@@ -387,13 +547,33 @@ impl PyCuptiSubscriber {
         Ok(())
     }
 
-    /// Explicitly unsubscribes and releases the subscriber handle.
+    /// Unsubscribes and releases the subscriber handle, raising a panic of the Rust callback
+    /// trampoline that was not yet reported. Closing again is a no-op; closing from inside a
+    /// CUPTI callback raises `NvInvalidArgumentError` (unsubscribing waits for running callbacks).
     fn close(&self, py: Python<'_>) -> PyResult<()> {
+        if IN_CUPTI_CALLBACK.with(Cell::get) {
+            return Err(record_and_err(
+                "cupti",
+                "close",
+                "CuptiSubscriber cannot be closed from inside a CUPTI callback",
+                ErrorKind::InvalidArgument,
+            ));
+        }
         py.detach(|| {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            drop(guard.take());
-        });
-        Ok(())
+            // Released before dropping: `check_errors` must not wait behind a blocking drop.
+            let taken = self
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let Some(sub) = taken else {
+                return Ok(());
+            };
+            let panicked = sub.check_panic();
+            drop(sub);
+            panicked
+        })
+        .map_err(|e| map_cupti_err("close", e))
     }
 }
 
@@ -448,9 +628,17 @@ fn sparse_arrays_supported(py: Python<'_>, device: usize) -> PyResult<bool> {
 }
 
 /// Unified/managed memory buffer (`cuda_core_ext::ManagedBuffer<u8>`).
+///
+/// Host access synchronizes the buffer's CUDA context first: without concurrent managed access
+/// (every Windows device) touching managed memory from the host while any kernel of the context
+/// runs is an access violation. Work queued from other threads during the host access itself is
+/// not excluded.
 #[pyclass(name = "ManagedBuffer", module = "nv_rs.cuda_ext")]
 pub struct PyManagedBuffer {
     inner: Mutex<ManagedBuffer<u8>>,
+    ctx: Arc<Context>,
+    ptr: u64,
+    nbytes: usize,
 }
 
 #[pymethods]
@@ -465,9 +653,14 @@ impl PyManagedBuffer {
         device: usize,
     ) -> PyResult<Self> {
         let t0 = Instant::now();
-        let ctx = resolve_cuda_ctx("cuda_ext", "ManagedBuffer::zeroed", context, device)?;
+        let ctx = resolve_cuda_ctx(py, "cuda_ext", "ManagedBuffer::zeroed", context, device)?;
+        let alloc_ctx = ctx.clone();
         let buf = py
-            .detach(move || ManagedBuffer::<u8>::zeroed(&ctx, nbytes))
+            .detach(move || {
+                // `ManagedBuffer::zeroed` clears the new memory from the host.
+                alloc_ctx.synchronize()?;
+                ManagedBuffer::<u8>::zeroed(&alloc_ctx, nbytes)
+            })
             .map_err(|e| record_and_err("cuda_ext", "ManagedBuffer::zeroed", e, ErrorKind::Cuda))?;
         diag::record_event(
             Level::Trace,
@@ -478,80 +671,127 @@ impl PyManagedBuffer {
             true,
         );
         Ok(Self {
+            ptr: buf.cu_deviceptr(),
+            nbytes: buf.len(),
             inner: Mutex::new(buf),
+            ctx,
         })
     }
 
     #[getter]
     fn ptr(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cu_deviceptr()
+        self.ptr
     }
 
     #[getter]
     fn nbytes(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.nbytes
     }
 
-    /// Reads the entire managed buffer as host `bytes` (caller must synchronize GPU work first).
-    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        PyBytes::new(py, guard.as_slice())
+    /// Reads the entire managed buffer as host `bytes` after synchronizing its CUDA context.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let host = py.detach(|| -> PyResult<Vec<u8>> {
+            self.ctx.synchronize().map_err(|e| {
+                record_and_err("cuda_ext", "ManagedBuffer::to_bytes", e, ErrorKind::Cuda)
+            })?;
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            Ok(guard.as_slice().to_vec())
+        })?;
+        Ok(PyBytes::new(py, &host))
     }
 
-    /// Writes `data` into the managed buffer starting at `offset` (caller must synchronize first).
+    /// Writes `data` into the managed buffer starting at `offset` after synchronizing its CUDA
+    /// context.
     #[pyo3(signature = (data, offset=0))]
-    fn write_bytes(&self, data: &[u8], offset: usize) -> PyResult<()> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let slice = guard.as_mut_slice();
-        let slice_len = slice.len();
-        let end = offset.checked_add(data.len()).ok_or_else(|| {
+    fn write_bytes(&self, py: Python<'_>, data: &[u8], offset: usize) -> PyResult<()> {
+        let invalid = |msg: String| {
             record_and_err(
                 "cuda_ext",
                 "ManagedBuffer::write_bytes",
-                "offset + data length overflow",
+                msg,
                 ErrorKind::InvalidArgument,
             )
-        })?;
-        let dst = slice.get_mut(offset..end).ok_or_else(|| {
-            record_and_err(
-                "cuda_ext",
-                "ManagedBuffer::write_bytes",
-                format!("write range {offset}..{end} exceeds buffer size {slice_len}"),
-                ErrorKind::InvalidArgument,
-            )
-        })?;
-        dst.copy_from_slice(data);
-        Ok(())
+        };
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| invalid("offset + data length overflow".to_owned()))?;
+        let range_err = || {
+            invalid(format!(
+                "write range {offset}..{end} exceeds buffer size {}",
+                self.nbytes
+            ))
+        };
+        if end > self.nbytes {
+            return Err(range_err());
+        }
+        py.detach(|| {
+            self.ctx.synchronize().map_err(|e| {
+                record_and_err("cuda_ext", "ManagedBuffer::write_bytes", e, ErrorKind::Cuda)
+            })?;
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let dst = guard
+                .as_mut_slice()
+                .get_mut(offset..end)
+                .ok_or_else(range_err)?;
+            dst.copy_from_slice(data);
+            Ok(())
+        })
     }
 
     fn __repr__(&self) -> String {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         format!(
             "ManagedBuffer(ptr=0x{:x}, nbytes={})",
-            guard.cu_deviceptr(),
-            guard.len()
+            self.ptr, self.nbytes
         )
     }
 }
 
+/// The registered private copy of a `HostRegistration`.
 struct HostRegInner {
     reg: ManuallyDrop<HostRegistration<'static, u8>>,
-    // Dropped after `reg` so `cuMemHostUnregister` executes while the pinned slice is live.
-    _backing: Pin<Box<[u8]>>,
+    /// `Box::into_raw` of the registered bytes. Kept raw until [`Self::teardown`] frees it, so
+    /// moving `HostRegInner` never retags the allocation `reg` points into (a moved `Box` would).
+    backing: *mut [u8],
+    ctx: Arc<Context>,
+    released: bool,
 }
 
-// SAFETY: `HostRegInner` is guarded by a `Mutex` in `PyHostRegistration`; `_backing` is pinned
-// on the heap and never moved, and `HostRegistration` binds its owning `Context` on drop.
+// SAFETY: `backing` is owned exclusively by this value and only read through `reg` while the
+// value is borrowed (behind the `Mutex` of `PyHostRegistration`); `HostRegistration` binds its
+// owning `Context` itself, so unregistering and freeing may run on any thread.
 unsafe impl Send for HostRegInner {}
+
+impl HostRegInner {
+    /// Unregisters and frees the copy once no device work can access it. Idempotent.
+    ///
+    /// Any stream of the context may read the mapped device pointer, so the whole context is
+    /// synchronized first. If that fails, completion is unproven and both the registration and
+    /// the memory are leaked rather than freed under the GPU.
+    fn teardown(&mut self) -> Result<(), DriverError> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        self.ctx.synchronize()?;
+        // SAFETY: `reg` is dropped exactly once (guarded by `released`), before the memory it
+        // registers is freed below.
+        unsafe { ManuallyDrop::drop(&mut self.reg) };
+        // SAFETY: `backing` came from `Box::into_raw` in `PyHostRegistration::new`, is freed
+        // exactly once (guarded by `released`), and was unregistered just above.
+        drop(unsafe { Box::from_raw(self.backing) });
+        Ok(())
+    }
+}
 
 impl Drop for HostRegInner {
     fn drop(&mut self) {
-        // SAFETY: `self.reg` was created from `self._backing` and is unregistered here before
-        // `self._backing` is dropped.
-        unsafe { ManuallyDrop::drop(&mut self.reg) };
+        if let Err(e) = self.teardown() {
+            diag::record_error(
+                "cuda_ext",
+                "HostRegistration::drop",
+                &format!("{e}; registered memory leaked"),
+            );
+        }
     }
 }
 
@@ -559,6 +799,23 @@ impl Drop for HostRegInner {
 #[pyclass(name = "HostRegistration", module = "nv_rs.cuda_ext")]
 pub struct PyHostRegistration {
     inner: Mutex<Option<HostRegInner>>,
+    /// Synchronized without holding `inner`: a CUPTI callback dispatched during the wait may
+    /// need the GIL, which a getter blocked on `inner` would hold.
+    ctx: Arc<Context>,
+}
+
+impl Drop for PyHostRegistration {
+    fn drop(&mut self) {
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(inner) = inner {
+            // Teardown synchronizes the context.
+            without_gil(move || drop(inner));
+        }
+    }
 }
 
 #[pymethods]
@@ -581,27 +838,38 @@ impl PyHostRegistration {
                 ErrorKind::InvalidArgument,
             ));
         }
-        let ctx = resolve_cuda_ctx("cuda_ext", "HostRegistration::new", context, device)?;
-        let mut backing: Pin<Box<[u8]>> = Pin::new(data.to_vec().into_boxed_slice());
+        let ctx = resolve_cuda_ctx(py, "cuda_ext", "HostRegistration::new", context, device)?;
+        let copy = data.to_vec();
+        let reg_ctx = ctx.clone();
 
         let inner = py
             .detach(move || {
-                let ptr = backing.as_mut_ptr();
-                let len = backing.len();
-                // SAFETY: `backing` is a pinned heap allocation owned by `HostRegInner` and
-                // dropped strictly after `reg` in `HostRegInner::drop`.
-                let slice_static: &'static mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                let reg = HostRegistration::new(&ctx, slice_static, map_to_device)?;
-                Ok::<_, cuda_core::DriverError>(HostRegInner {
-                    reg: ManuallyDrop::new(reg),
-                    _backing: backing,
-                })
+                let ctx = reg_ctx;
+                let backing: *mut [u8] = Box::into_raw(copy.into_boxed_slice());
+                // SAFETY: `backing` is a live heap allocation that no other reference accesses;
+                // it is owned by the `HostRegInner` built below, which unregisters `reg` before
+                // freeing it (or freed right here if registration fails), so the `'static`
+                // borrow never outlives the memory.
+                let slice_static: &'static mut [u8] = unsafe { &mut *backing };
+                match HostRegistration::new(&ctx, slice_static, map_to_device) {
+                    Ok(reg) => Ok(HostRegInner {
+                        reg: ManuallyDrop::new(reg),
+                        backing,
+                        ctx,
+                        released: false,
+                    }),
+                    Err(e) => {
+                        // SAFETY: registration failed, so nothing refers to `backing` any more.
+                        drop(unsafe { Box::from_raw(backing) });
+                        Err(e)
+                    }
+                }
             })
             .map_err(|e| record_and_err("cuda_ext", "HostRegistration::new", e, ErrorKind::Cuda))?;
 
         Ok(Self {
             inner: Mutex::new(Some(inner)),
+            ctx,
         })
     }
 
@@ -623,26 +891,44 @@ impl PyHostRegistration {
             .map_or(0, |i| i.reg.as_slice().len())
     }
 
+    /// Reads the registered bytes after synchronizing the CUDA context (device work may write
+    /// them through `device_ptr`).
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let inner = guard.as_ref().ok_or_else(|| {
-            record_and_err(
-                "cuda_ext",
-                "HostRegistration::to_bytes",
-                "HostRegistration is closed",
-                ErrorKind::InvalidArgument,
-            )
+        let host = py.detach(|| -> PyResult<Vec<u8>> {
+            self.ctx.synchronize().map_err(|e| {
+                record_and_err("cuda_ext", "HostRegistration::to_bytes", e, ErrorKind::Cuda)
+            })?;
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let inner = guard.as_ref().ok_or_else(|| {
+                record_and_err(
+                    "cuda_ext",
+                    "HostRegistration::to_bytes",
+                    "HostRegistration is closed",
+                    ErrorKind::InvalidArgument,
+                )
+            })?;
+            Ok(inner.reg.as_slice().to_vec())
         })?;
-        Ok(PyBytes::new(py, inner.reg.as_slice()))
+        Ok(PyBytes::new(py, &host))
     }
 
-    /// Unregisters and frees the page-locked buffer.
+    /// Unregisters and frees the page-locked buffer once the CUDA context has finished all
+    /// queued work (any stream may read `device_ptr`). Raises if that synchronization fails; the
+    /// memory is then leaked instead of freed. Closing again is a no-op.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            drop(guard.take());
-        });
-        Ok(())
+            // Released before the teardown waits on the GPU.
+            let taken = self
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            match taken {
+                Some(mut inner) => inner.teardown(),
+                None => Ok(()),
+            }
+        })
+        .map_err(|e| record_and_err("cuda_ext", "HostRegistration::close", e, ErrorKind::Cuda))
     }
 }
 
@@ -695,7 +981,7 @@ fn split_sms(
     device: usize,
 ) -> PyResult<Vec<PyGreenContext>> {
     let t0 = Instant::now();
-    let ctx = resolve_cuda_ctx("cuda_ext", "split_sms", context, device)?;
+    let ctx = resolve_cuda_ctx(py, "cuda_ext", "split_sms", context, device)?;
     let dev_id = ctx.ordinal() as i32;
     let groups = py
         .detach(move || ext_split_sms(&ctx, min_sms))
@@ -726,24 +1012,40 @@ pub struct PyExternalMemoryDesc {
     dedicated: bool,
 }
 
+/// The `MemoryHandle` variant named by a normalized `handle_kind` (with a placeholder handle),
+/// so the accepted names and the dedicated rule below follow `cuda-core-ext`'s variants.
+fn memory_handle_kind(norm: &str) -> Option<MemoryHandle> {
+    let none = std::ptr::null_mut();
+    match norm {
+        "opaque_win32" => Some(MemoryHandle::OpaqueWin32(none)),
+        "opaque_fd" => Some(MemoryHandle::OpaqueFd(-1)),
+        "d3d12_resource" => Some(MemoryHandle::D3d12Resource(none)),
+        "d3d12_heap" => Some(MemoryHandle::D3d12Heap(none)),
+        _ => None,
+    }
+}
+
 #[pymethods]
 impl PyExternalMemoryDesc {
     #[new]
     #[pyo3(signature = (handle_kind, size, dedicated=false))]
     fn new(handle_kind: &str, size: u64, dedicated: bool) -> PyResult<Self> {
         let norm = handle_kind.trim().to_ascii_lowercase();
-        let valid = matches!(
-            norm.as_str(),
-            "opaque_win32" | "opaque_fd" | "d3d12_resource" | "d3d12_heap"
-        );
-        if !valid {
+        let Some(kind) = memory_handle_kind(&norm) else {
             return Err(record_and_err(
                 "cuda_ext",
                 "ExternalMemoryDesc::new",
                 format!("unknown external memory handle_kind `{handle_kind}`"),
                 ErrorKind::InvalidArgument,
             ));
-        }
+        };
+        // Exhaustive: a new `MemoryHandle` variant must decide its dedicated-allocation rule.
+        let needs_dedicated = match kind {
+            MemoryHandle::D3d12Resource(_) => true,
+            MemoryHandle::OpaqueWin32(_) | MemoryHandle::OpaqueFd(_) | MemoryHandle::D3d12Heap(_) => {
+                false
+            }
+        };
         if size == 0 {
             return Err(record_and_err(
                 "cuda_ext",
@@ -752,16 +1054,14 @@ impl PyExternalMemoryDesc {
                 ErrorKind::InvalidArgument,
             ));
         }
-        if norm == "d3d12_resource" && !dedicated {
+        if needs_dedicated && !dedicated {
             return Err(record_and_err(
                 "cuda_ext",
                 "ExternalMemoryDesc::new",
-                "d3d12_resource external memory requires dedicated=True",
+                format!("{norm} external memory requires dedicated=True"),
                 ErrorKind::InvalidArgument,
             ));
         }
-        // Reference `MemoryHandle` variants so the mapping stays aligned with `cuda-core-ext`.
-        let _ = std::mem::size_of::<MemoryHandle>();
         Ok(Self {
             handle_kind: norm,
             size,
@@ -833,14 +1133,39 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-py_err_mapper!(map_wgpu_err, "wgpu", nv_wgpu::Error, {
-    nv_wgpu::Error::InvalidInput(_) => ErrorKind::InvalidArgument,
-    nv_wgpu::Error::Unsupported { .. }
-    | nv_wgpu::Error::BackendMismatch { .. }
-    | nv_wgpu::Error::DeviceMismatch { .. }
-    | nv_wgpu::Error::NoMatchingCudaDevice { .. } => ErrorKind::InvalidArgument,
-    _ => ErrorKind::Cuda,
-});
+/// Exhaustive (a new `nv_wgpu::Error` variant must be classified here).
+fn wgpu_err_kind(err: &nv_wgpu::Error) -> ErrorKind {
+    match err {
+        nv_wgpu::Error::InvalidInput(_)
+        | nv_wgpu::Error::Unsupported { .. }
+        | nv_wgpu::Error::BackendMismatch { .. }
+        | nv_wgpu::Error::DeviceMismatch { .. }
+        | nv_wgpu::Error::NoMatchingCudaDevice { .. } => ErrorKind::InvalidArgument,
+        nv_wgpu::Error::Driver(_)
+        | nv_wgpu::Error::Vulkan { .. }
+        | nv_wgpu::Error::InvalidHandle { .. }
+        | nv_wgpu::Error::WgpuRequest(_)
+        | nv_wgpu::Error::Timeout { .. }
+        | nv_wgpu::Error::Poll(_) => ErrorKind::Cuda,
+        #[cfg(windows)]
+        nv_wgpu::Error::Dx12 { .. } => ErrorKind::Cuda,
+        nv_wgpu::Error::Poisoned(_) => ErrorKind::Runtime,
+    }
+}
+
+fn map_wgpu_err(op: &str, err: nv_wgpu::Error) -> PyErr {
+    let kind = wgpu_err_kind(&err);
+    record_and_err("wgpu", op, err, kind)
+}
+
+/// A `wgpu` error captured by an error scope (the default uncaptured handler panics).
+fn map_wgpu_scope_err(op: &str, err: wgpu::Error) -> PyErr {
+    let kind = match &err {
+        wgpu::Error::Validation { .. } => ErrorKind::InvalidArgument,
+        wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. } => ErrorKind::Cuda,
+    };
+    record_and_err("wgpu", op, err, kind)
+}
 
 py_parse_enum!(parse_texture_format, "wgpu", "parse_texture_format", wgpu::TextureFormat, "wgpu texture format", {
     "r8unorm" | "r8_unorm" => wgpu::TextureFormat::R8Unorm,
@@ -887,8 +1212,8 @@ fn parse_buffer_usage(usage: &str) -> PyResult<wgpu::BufferUsages> {
             "indirect" => flags |= wgpu::BufferUsages::INDIRECT,
             "copy_src" => flags |= wgpu::BufferUsages::COPY_SRC,
             "copy_dst" => flags |= wgpu::BufferUsages::COPY_DST,
-            "map_read" => flags |= wgpu::BufferUsages::MAP_READ,
-            "map_write" => flags |= wgpu::BufferUsages::MAP_WRITE,
+            // No `map_read` / `map_write`: an externally shared buffer cannot be host-mapped
+            // (`nv_wgpu::validate_buffer_descriptor` rejects both).
             _ => {
                 return Err(record_and_err(
                     "wgpu",
@@ -913,68 +1238,127 @@ struct AdapterProbe {
     error: Option<String>,
 }
 
-fn probe_wgpu_adapters() -> Vec<AdapterProbe> {
-    let backends = if cfg!(windows) {
+/// Backends that can share memory with CUDA on this OS.
+fn interop_backends() -> wgpu::Backends {
+    if cfg!(windows) {
         wgpu::Backends::VULKAN | wgpu::Backends::DX12
     } else {
         wgpu::Backends::VULKAN
-    };
+    }
+}
+
+/// Opens an interop device on `adapter` with the constructor of its `backend`.
+fn open_interop(
+    adapter: &wgpu::Adapter,
+    backend: wgpu::Backend,
+    label: Option<&str>,
+) -> nv_wgpu::Result<InteropContext> {
+    match backend {
+        wgpu::Backend::Vulkan => InteropContext::open_vulkan(
+            adapter,
+            wgpu::Features::empty(),
+            &wgpu::Limits::default(),
+            label,
+        ),
+        #[cfg(windows)]
+        wgpu::Backend::Dx12 => {
+            match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label,
+                ..Default::default()
+            })) {
+                Ok((device, queue)) => InteropContext::from_wgpu(adapter, device, queue),
+                Err(e) => Err(nv_wgpu::Error::WgpuRequest(e.to_string())),
+            }
+        }
+        other => Err(nv_wgpu::Error::Unsupported {
+            what: "wgpu backend",
+            required: "Vulkan or DX12",
+            found: format!("{other:?}"),
+        }),
+    }
+}
+
+/// The one adapter loop of `is_supported`, `probe_adapters` and `InteropContext()`: tries to
+/// open interop on every adapter of `backends` in enumeration order, hands each attempt to
+/// `visit`, and stops at the first `Some` it returns.
+fn find_interop_adapter<T>(
+    backends: wgpu::Backends,
+    label: Option<&str>,
+    mut visit: impl FnMut(wgpu::AdapterInfo, nv_wgpu::Result<InteropContext>) -> Option<T>,
+) -> Option<T> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    let adapters = block_on(instance.enumerate_adapters(backends));
-    let mut out = Vec::with_capacity(adapters.len());
-    for adapter in adapters {
+    for adapter in block_on(instance.enumerate_adapters(backends)) {
         let info = adapter.get_info();
-        let res = match info.backend {
-            wgpu::Backend::Vulkan => InteropContext::open_vulkan(
-                &adapter,
-                wgpu::Features::empty(),
-                &wgpu::Limits::default(),
-                Some("nv-rs-probe"),
-            ),
-            #[cfg(windows)]
-            wgpu::Backend::Dx12 => {
-                match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: Some("nv-rs-probe"),
-                    ..Default::default()
-                })) {
-                    Ok((device, queue)) => InteropContext::from_wgpu(&adapter, device, queue),
-                    Err(e) => Err(nv_wgpu::Error::WgpuRequest(e.to_string())),
-                }
-            }
-            other => Err(nv_wgpu::Error::Unsupported {
-                what: "wgpu backend",
-                required: "Vulkan or DX12",
-                found: format!("{other:?}"),
-            }),
-        };
-        let (cuda_interop_supported, error) = match res {
-            Ok(_) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
-        };
+        let opened = open_interop(&adapter, info.backend, label);
+        if let Some(found) = visit(info, opened) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn probe_wgpu_adapters() -> Vec<AdapterProbe> {
+    let mut out = Vec::new();
+    find_interop_adapter::<()>(interop_backends(), Some("nv-rs-probe"), |info, opened| {
+        let error = opened.err().map(|e| e.to_string());
         out.push(AdapterProbe {
             name: info.name,
             backend: format!("{:?}", info.backend),
             device_type: format!("{:?}", info.device_type),
             vendor: info.vendor,
             device: info.device,
-            cuda_interop_supported,
+            cuda_interop_supported: error.is_none(),
             error,
         });
-    }
+        None
+    });
     out
 }
 
-/// Returns `True` if at least one `wgpu` adapter can open CUDA <-> `wgpu` zero-copy interop.
+/// One error for a failed `InteropContext()` that names every adapter's failure, not only the
+/// last one's.
+fn open_failure(op: &str, mut failures: Vec<(String, wgpu::Backend, nv_wgpu::Error)>) -> PyErr {
+    if failures.len() <= 1 {
+        let err = failures.pop().map_or_else(
+            || nv_wgpu::Error::WgpuRequest("no interop-capable wgpu adapter found".to_owned()),
+            |(_, _, e)| e,
+        );
+        return map_wgpu_err(op, err);
+    }
+    let kind = if failures
+        .iter()
+        .all(|(_, _, e)| matches!(wgpu_err_kind(e), ErrorKind::InvalidArgument))
+    {
+        ErrorKind::InvalidArgument
+    } else {
+        ErrorKind::Cuda
+    };
+    let detail = failures
+        .iter()
+        .map(|(name, backend, e)| format!("{name} ({backend:?}): {e}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    record_and_err(
+        "wgpu",
+        op,
+        format!("no wgpu adapter could open CUDA interop: {detail}"),
+        kind,
+    )
+}
+
+/// Returns `True` if at least one `wgpu` adapter can open CUDA <-> `wgpu` zero-copy interop
+/// (stops at the first one that can).
 #[pyfunction]
 fn is_supported(py: Python<'_>) -> bool {
     let t0 = Instant::now();
     let ok = py.detach(|| {
-        probe_wgpu_adapters()
-            .into_iter()
-            .any(|p| p.cuda_interop_supported)
+        find_interop_adapter(interop_backends(), Some("nv-rs-probe"), |_, opened| {
+            opened.ok().map(drop)
+        })
+        .is_some()
     });
     diag::record_event(
         Level::Info,
@@ -1045,13 +1429,7 @@ impl PyInteropContext {
         let t0 = Instant::now();
         let norm = backend.trim().to_ascii_lowercase();
         let backends = match norm.as_str() {
-            "auto" => {
-                if cfg!(windows) {
-                    wgpu::Backends::VULKAN | wgpu::Backends::DX12
-                } else {
-                    wgpu::Backends::VULKAN
-                }
-            }
+            "auto" => interop_backends(),
             "vulkan" => wgpu::Backends::VULKAN,
             #[cfg(windows)]
             "dx12" => wgpu::Backends::DX12,
@@ -1066,47 +1444,19 @@ impl PyInteropContext {
         };
 
         let label_owned = label.map(str::to_owned);
-        let ctx = py
-            .detach(move || {
-                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                    backends,
-                    ..wgpu::InstanceDescriptor::new_without_display_handle()
-                });
-                let adapters = block_on(instance.enumerate_adapters(backends));
-                let mut last_err: Option<nv_wgpu::Error> = None;
-                for adapter in adapters {
-                    let info = adapter.get_info();
-                    let res = match info.backend {
-                        wgpu::Backend::Vulkan => InteropContext::open_vulkan(
-                            &adapter,
-                            wgpu::Features::empty(),
-                            &wgpu::Limits::default(),
-                            label_owned.as_deref(),
-                        ),
-                        #[cfg(windows)]
-                        wgpu::Backend::Dx12 => {
-                            match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                                label: label_owned.as_deref(),
-                                ..Default::default()
-                            })) {
-                                Ok((device, queue)) => {
-                                    InteropContext::from_wgpu(&adapter, device, queue)
-                                }
-                                Err(e) => Err(nv_wgpu::Error::WgpuRequest(e.to_string())),
-                            }
-                        }
-                        _ => continue,
-                    };
-                    match res {
-                        Ok(c) => return Ok(c),
-                        Err(e) => last_err = Some(e),
+        let (found, failures) = py.detach(move || {
+            let mut failures = Vec::new();
+            let found =
+                find_interop_adapter(backends, label_owned.as_deref(), |info, opened| match opened {
+                    Ok(ctx) => Some(ctx),
+                    Err(e) => {
+                        failures.push((info.name, info.backend, e));
+                        None
                     }
-                }
-                Err(last_err.unwrap_or_else(|| {
-                    nv_wgpu::Error::WgpuRequest("no interop-capable wgpu adapter found".to_owned())
-                }))
-            })
-            .map_err(|e| map_wgpu_err("InteropContext::new", e))?;
+                });
+            (found, failures)
+        });
+        let ctx = found.ok_or_else(|| open_failure("InteropContext::new", failures))?;
 
         diag::record_event(
             Level::Info,
@@ -1144,7 +1494,8 @@ impl PyInteropContext {
         })
     }
 
-    /// Creates a zero-copy shared GPU buffer (`SharedBuffer`).
+    /// Creates a zero-copy shared GPU buffer (`SharedBuffer`). A size above the device's
+    /// `max_buffer_size` or any `wgpu` validation error raises (never a panic).
     #[pyo3(signature = (size, usage="storage|copy_src|copy_dst", label=None))]
     fn create_buffer(
         &self,
@@ -1155,23 +1506,38 @@ impl PyInteropContext {
     ) -> PyResult<PySharedBuffer> {
         let flags = parse_buffer_usage(usage)?;
         let label_owned = label.map(str::to_owned);
-        let desc = SharedBufferDescriptor {
-            label: label_owned.as_deref(),
-            size,
-            usage: flags,
-        };
-        validate_buffer_descriptor(&desc).map_err(|e| map_wgpu_err("create_buffer", e))?;
         let ctx = self.inner.clone();
-        let buf = py
-            .detach(move || {
-                let d = SharedBufferDescriptor {
-                    label: label_owned.as_deref(),
-                    size,
-                    usage: flags,
-                };
-                ctx.create_buffer(&d)
-            })
-            .map_err(|e| map_wgpu_err("create_buffer", e))?;
+        let buf = py.detach(move || -> PyResult<SharedBuffer> {
+            let device = ctx.device();
+            let max = device.limits().max_buffer_size;
+            if size > max {
+                return Err(record_and_err(
+                    "wgpu",
+                    "create_buffer",
+                    format!("size {size} exceeds the device's max_buffer_size {max}"),
+                    ErrorKind::InvalidArgument,
+                ));
+            }
+            let desc = SharedBufferDescriptor {
+                label: label_owned.as_deref(),
+                size,
+                usage: flags,
+            };
+            // Without scopes a `wgpu` error goes to the default uncaptured handler, which panics.
+            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let created = ctx.create_buffer(&desc);
+            // Popped in reverse order of their pushes.
+            let internal_err = block_on(internal.pop());
+            let oom_err = block_on(oom.pop());
+            let validation_err = block_on(validation.pop());
+            let buf = created.map_err(|e| map_wgpu_err("create_buffer", e))?;
+            match validation_err.or(oom_err).or(internal_err) {
+                None => Ok(buf),
+                Some(e) => Err(map_wgpu_scope_err("create_buffer", e)),
+            }
+        })?;
         Ok(PySharedBuffer { inner: buf })
     }
 

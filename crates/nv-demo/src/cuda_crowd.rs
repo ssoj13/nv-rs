@@ -722,6 +722,39 @@ fn load_cuda_fn(module: cu::CUmodule, name: &str) -> Result<cu::CUfunction, Stri
     Ok(func)
 }
 
+/// `true` while the device crowd buffers hold the crowd `scene.crowd` currently describes: no
+/// pending scene re-upload and the same `(actors, bones)` shape as the last upload.
+#[inline]
+fn gpu_snapshot_matches_crowd(
+    scene_dirty: bool,
+    uploaded: (usize, usize),
+    current: (usize, usize),
+) -> bool {
+    !scene_dirty && uploaded == current
+}
+
+/// Checks that a GPU scatter may run: the bone -> slot map must have been uploaded for the current
+/// CSG/OptiX instance layout (not stale after a `FullRepack`) and cover every bone. Scattering with
+/// a stale map writes crowd transforms over unrelated CSG instances and OptiX slots.
+fn check_scatter_topology(
+    topology_dirty: bool,
+    slot_map_len: usize,
+    n_bones: usize,
+) -> Result<(), String> {
+    if topology_dirty {
+        return Err(
+            "CUDA crowd scatter topology is stale (upload_scatter_topology has not succeeded since the last repack)"
+                .to_string(),
+        );
+    }
+    if slot_map_len < n_bones {
+        return Err(format!(
+            "CUDA crowd bone slot map covers {slot_map_len} of {n_bones} bones"
+        ));
+    }
+    Ok(())
+}
+
 impl CudaCrowdBackend {
     /// Compile `csg_actors::ACTOR_SIM_CUH` + GPU steering/DEM/scatter/displacement kernels via
     /// NVRTC (backed by the content-addressed disk PTX cache) and load the CUDA module.
@@ -734,21 +767,23 @@ impl CudaCrowdBackend {
         full_src.push('\n');
         full_src.push_str(SCATTER_KERNEL_CU);
 
-        let ptx = crate::gpu_export::compile_ptx_cached(
+        let module = crate::gpu_export::load_ptx_cached(
             &full_src,
             "actor_sim_crowd.cu",
             "compute_75",
             &[],
             &[],
+            |ptx| {
+                let mut module: cu::CUmodule = std::ptr::null_mut();
+                // SAFETY: `ptx` is a NUL-terminated PTX byte buffer and `cuda` is current on the
+                // calling thread.
+                let load_res = unsafe { cu::cuModuleLoadData(&mut module, ptx.as_ptr().cast()) };
+                if load_res != cu::cudaError_enum_CUDA_SUCCESS || module.is_null() {
+                    return Err(format!("cuModuleLoadData(actor_sim) failed ({load_res:?})"));
+                }
+                Ok(module)
+            },
         )?;
-
-        let mut module: cu::CUmodule = std::ptr::null_mut();
-        // SAFETY: `ptx` is a NUL-terminated valid PTX byte buffer produced by NVRTC and `cuda`
-        // is current on the calling thread.
-        let load_res = unsafe { cu::cuModuleLoadData(&mut module, ptx.as_ptr().cast()) };
-        if load_res != cu::cudaError_enum_CUDA_SUCCESS || module.is_null() {
-            return Err(format!("cuModuleLoadData(actor_sim) failed ({load_res:?})"));
-        }
 
         let load_all = || -> Result<(cu::CUfunction, cu::CUfunction, cu::CUfunction, cu::CUfunction), String> {
             Ok((
@@ -887,7 +922,14 @@ impl CudaCrowdBackend {
         }
         let n_actors = scene.crowd.actor_count();
         let n_bones = scene.crowd.bone_count();
-        if self.d_states.len() >= n_actors && self.d_bone_outs.len() >= n_bones {
+        // The device state describes `scene.crowd` only while the crowd keeps the shape it was
+        // uploaded with. After a respawn or resize the CPU crowd is the authority (the next step
+        // re-uploads it); downloading then would overwrite it with another crowd's state.
+        if gpu_snapshot_matches_crowd(
+            self.scene_dirty,
+            (self.uploaded_actor_count, self.uploaded_bone_count),
+            (n_actors, n_bones),
+        ) {
             self.d_states.download_into(stream, &mut scene.crowd.states)?;
             if self.d_intents.len() >= n_actors {
                 self.d_intents
@@ -932,6 +974,11 @@ impl CudaCrowdBackend {
         let n_bones = scene.crowd.bone_count();
         if n_actors == 0 || n_bones == 0 {
             return Ok(CudaCrowdStepReport::default());
+        }
+        // Refuse before anything is queued, so a rejected step leaves every buffer untouched.
+        let scatter = scatter.filter(|t| t.csg_instances_ptr != 0);
+        if scatter.is_some() {
+            check_scatter_topology(self.topology_dirty, self.d_bone_slot_map.len(), n_bones)?;
         }
         let t0 = Instant::now();
 
@@ -1178,10 +1225,7 @@ impl CudaCrowdBackend {
         }
 
         // 5. Scatter GPU-directly into `csg_instances`, `csg_prev_xforms`, and `d_optix_instances`.
-        if let Some(target) = scatter
-            && target.csg_instances_ptr != 0
-            && self.d_bone_slot_map.len() >= n_bones
-        {
+        if let Some(target) = scatter {
             let mut p_src_bones = self.d_bone_outs.device_ptr();
             let mut p_src_prev = self.d_prev_xforms.device_ptr();
             let mut p_slot_map = self.d_bone_slot_map.device_ptr();
@@ -1922,6 +1966,23 @@ mod tests {
         assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, 99.0), (88.0, 300.0, 720.0));
         assert_eq!(scale_crowd_lod_dists(22.0, 75.0, 180.0, f32::NAN), (22.0, 75.0, 180.0));
         assert_eq!(scale_crowd_lod_dists(0.0, -1.0, f32::NAN, 2.0), (44.0, 150.0, 360.0));
+    }
+
+    #[test]
+    fn scatter_refused_while_topology_stale_or_slot_map_short() {
+        assert!(check_scatter_topology(true, 64, 32).is_err());
+        assert!(check_scatter_topology(false, 31, 32).is_err());
+        assert!(check_scatter_topology(false, 32, 32).is_ok());
+        assert!(check_scatter_topology(false, 40, 32).is_ok());
+    }
+
+    #[test]
+    fn gpu_snapshot_only_downloads_into_the_uploaded_crowd_shape() {
+        assert!(gpu_snapshot_matches_crowd(false, (4, 60), (4, 60)));
+        // Respawned smaller or larger crowd: the CPU crowd is authoritative.
+        assert!(!gpu_snapshot_matches_crowd(false, (4, 60), (3, 45)));
+        assert!(!gpu_snapshot_matches_crowd(false, (4, 60), (5, 75)));
+        assert!(!gpu_snapshot_matches_crowd(true, (4, 60), (4, 60)));
     }
 
     #[test]

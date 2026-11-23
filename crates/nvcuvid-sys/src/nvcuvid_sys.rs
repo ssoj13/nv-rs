@@ -8,13 +8,11 @@
 //! `cuda-core` context passes straight in.
 //! **Used by** a future safe `nvdec` crate and media decoders (ffmpeg-rs, media-rs).
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "nvcuvid",
     api: NvcuvidApi,
     loader: nvcuvid_api,
-    dll: DllSpec { lib: "nvcuvid", group: Group::Driver, windows: &["nvcuvid.dll"], linux: &["libnvcuvid.so.1"] },
+    dll: nv_loader::catalog::NVCUVID.spec,
 }
 
 #[cfg(test)]

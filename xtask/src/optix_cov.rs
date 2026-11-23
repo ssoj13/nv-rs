@@ -21,7 +21,7 @@
 //!
 //! **Used by** `xtask.rs` (`coverage optix`).
 
-use crate::{contains_word, read_tree};
+use crate::{contains_word, read_tree, strip_comments};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -42,16 +42,6 @@ const RAW_ONLY: &[(&str, &str)] = &[];
 
 fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
-}
-
-/// Source text with `//` line comments (doc comments included) removed, so prose never counts as use.
-fn strip_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.lines() {
-        out.push_str(line.find("//").map_or(line, |i| &line[..i]));
-        out.push('\n');
-    }
-    out
 }
 
 /// The trailing identifier of `s` (`"static void optixTrace"` -> `"optixTrace"`).
@@ -616,6 +606,21 @@ let x = entry!(t, optixAB);
 ";
         let got: Vec<String> = host_refs(src, &fields).into_iter().collect();
         assert_eq!(got, ["optixA", "optixAB", "optixB"]);
+    }
+
+    #[test]
+    fn host_refs_ignore_block_comments_and_see_code_after_slashes_in_strings() {
+        let fields: Vec<String> = ["optixE", "optixF", "optixG", "optixH"]
+            .map(String::from)
+            .to_vec();
+        let src = "\
+/* entry!(t, optixE) is only described here,
+   /* even in a nested */ block: entry!(t, optixH) */
+let url = \"http://x\"; let f = entry!(t, optixF);
+let q = '\"'; let g = entry!(t, optixG); // trailing prose
+";
+        let got: Vec<String> = host_refs(src, &fields).into_iter().collect();
+        assert_eq!(got, ["optixF", "optixG"]);
     }
 
     #[test]

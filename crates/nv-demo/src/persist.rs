@@ -1,9 +1,17 @@
 //! Persistent user preferences and window geometry stored in `~/.nv-rs/nv-demo.json`.
 //!
-//! What: serializes window position/size/maximized state, [`DemoSettings`], and camera
-//! navigation settings/pose to JSON using atomic write-and-rename.
-//! Why: preserves layout and scene tuning across sessions without losing defaults when new
-//! fields are added (`#[serde(default)]`).
+//! What: serializes window position/size/maximized state, [`DemoSettings`], camera navigation
+//! settings/pose, the selected scene (by descriptor id) and the viewport toolbar edge to JSON
+//! using atomic write-and-rename. The `egui_dock` layout is not persisted (the crate is built
+//! without its `serde` feature).
+//! Why: preserves scene tuning across sessions without losing defaults when new fields are
+//! added (`#[serde(default)]`).
+//! How: [`load_from`] reads the file section by section (one top-level key at a time), so one
+//! unreadable section (renamed enum variant, type change) only resets that section. When the file
+//! exists but cannot be read in full, [`LoadReport::problem`] says why and the caller must not
+//! overwrite it: `DemoApp` then runs a [`PersistWorker`] without a target path, which writes
+//! nowhere for the whole session, so the user's file stays byte-for-byte intact until they fix or
+//! delete it.
 //! Used by: `crate::main` (`Runner` and `DemoApp`).
 
 use std::io::Write;
@@ -19,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::demo_anim::DemoAnimator;
 use crate::renderer::DemoSettings;
 use crate::ui::UiTheme;
+use crate::viewport_toolbar::ToolbarEdge;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -155,6 +164,36 @@ impl CameraState {
     }
 }
 
+/// Selected CSG scene stored by stable descriptor id and variant label, so a registry reorder in
+/// `csg-scenes` does not open a different scene than the one saved (`settings.csg_mode` is only
+/// a 1-based registry index and is kept as the fallback for files written before this field).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedScene {
+    /// `SceneDescriptor::id` (`""` = Classic fractal, no CSG scene).
+    pub id: String,
+    /// Selected entry of `SceneDescriptor::variant_labels` (`""` when the scene has none).
+    pub variant: String,
+}
+
+/// Persisted part of `viewport_toolbar::ToolbarState` (the measured extents are runtime-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistedToolbar {
+    pub edge: ToolbarEdge,
+    pub expanded: bool,
+}
+
+impl Default for PersistedToolbar {
+    fn default() -> Self {
+        let d = crate::viewport_toolbar::ToolbarState::default();
+        Self {
+            edge: d.edge,
+            expanded: d.expanded,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedState {
@@ -164,6 +203,18 @@ pub struct PersistedState {
     pub demo_anim: DemoAnimator,
     pub camera: CameraState,
     pub camera_rail: crate::camera_rail::CameraRail,
+    pub scene: Option<SavedScene>,
+    pub viewport_toolbar: PersistedToolbar,
+}
+
+/// Result of reading the config file.
+#[derive(Debug)]
+pub struct LoadReport {
+    /// Everything that could be read; unreadable sections keep their defaults.
+    pub state: PersistedState,
+    /// `Some` when the file exists but could not be read in full. The caller must not overwrite
+    /// the file in this case (it would replace the unreadable sections with defaults).
+    pub problem: Option<String>,
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -171,25 +222,80 @@ pub fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".nv-rs").join("nv-demo.json"))
 }
 
-pub fn load() -> PersistedState {
+pub fn load() -> LoadReport {
     let Some(path) = config_path() else {
-        return PersistedState::default();
+        return LoadReport {
+            state: PersistedState::default(),
+            problem: None,
+        };
     };
     load_from(&path)
 }
 
-pub fn load_from(path: &Path) -> PersistedState {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return PersistedState::default();
+pub fn load_from(path: &Path) -> LoadReport {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return LoadReport {
+                state: PersistedState::default(),
+                problem: None,
+            };
+        }
+        Err(e) => {
+            return LoadReport {
+                state: PersistedState::default(),
+                problem: Some(format!("cannot read '{}': {e}", path.display())),
+            };
+        }
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    let (state, errors) = parse_sections(&text);
+    let problem = (!errors.is_empty()).then(|| {
+        format!(
+            "'{}' is not fully readable ({}); it is left untouched and settings are not saved this session",
+            path.display(),
+            errors.join("; ")
+        )
+    });
+    LoadReport { state, problem }
 }
 
-pub fn save(state: &PersistedState) -> std::io::Result<()> {
-    let Some(path) = config_path() else {
-        return Ok(());
+/// Deserializes every top-level section on its own so one bad section only resets itself.
+fn parse_sections(text: &str) -> (PersistedState, Vec<String>) {
+    let mut st = PersistedState::default();
+    let mut errors = Vec::new();
+    let root: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("invalid JSON: {e}"));
+            return (st, errors);
+        }
     };
-    save_to(&path, state)
+    let Some(obj) = root.as_object() else {
+        errors.push("top level is not a JSON object".to_string());
+        return (st, errors);
+    };
+    fn section<T: serde::de::DeserializeOwned>(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        slot: &mut T,
+        errors: &mut Vec<String>,
+    ) {
+        if let Some(v) = obj.get(key) {
+            match serde_json::from_value::<T>(v.clone()) {
+                Ok(parsed) => *slot = parsed,
+                Err(e) => errors.push(format!("section '{key}': {e}")),
+            }
+        }
+    }
+    section(obj, "window", &mut st.window, &mut errors);
+    section(obj, "theme", &mut st.theme, &mut errors);
+    section(obj, "settings", &mut st.settings, &mut errors);
+    section(obj, "demo_anim", &mut st.demo_anim, &mut errors);
+    section(obj, "camera", &mut st.camera, &mut errors);
+    section(obj, "camera_rail", &mut st.camera_rail, &mut errors);
+    section(obj, "scene", &mut st.scene, &mut errors);
+    section(obj, "viewport_toolbar", &mut st.viewport_toolbar, &mut errors);
+    (st, errors)
 }
 
 pub fn save_to(path: &Path, state: &PersistedState) -> std::io::Result<()> {
@@ -229,6 +335,8 @@ struct PersistSlot {
 pub struct PersistWorker {
     slot: Arc<(Mutex<PersistSlot>, Condvar)>,
     handle: Option<JoinHandle<()>>,
+    /// Same target as the thread's; used for synchronous saves when the thread failed to spawn.
+    target_path: Option<PathBuf>,
 }
 
 impl PersistWorker {
@@ -237,11 +345,12 @@ impl PersistWorker {
         Self::spawn_for_path(config_path())
     }
 
-    /// Spawns a background persistence thread writing to `target_path` (when `Some`).
+    /// Spawns a background persistence thread writing to `target_path` (`None` writes nowhere).
     pub fn spawn_for_path(target_path: Option<PathBuf>) -> Self {
         let slot = Arc::new((Mutex::new(PersistSlot::default()), Condvar::new()));
         let worker_slot = Arc::clone(&slot);
-        let handle = std::thread::Builder::new()
+        let thread_target = target_path.clone();
+        let spawned = std::thread::Builder::new()
             .name("nv-demo-persist".to_string())
             .spawn(move || {
                 let (lock, cvar) = &*worker_slot;
@@ -260,23 +369,40 @@ impl PersistWorker {
                     let Some(state) = next else {
                         break;
                     };
-                    if let Some(ref path) = target_path
+                    if let Some(ref path) = thread_target
                         && let Err(e) = save_to(path, &state)
                     {
                         eprintln!("nv-demo persist save failed ('{}'): {e}", path.display());
                     }
                 }
-            })
-            .ok();
-        Self { slot, handle }
+            });
+        let handle = match spawned {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("nv-demo persist thread spawn failed ({e}); saving synchronously");
+                None
+            }
+        };
+        Self {
+            slot,
+            handle,
+            target_path,
+        }
+    }
+
+    /// Synchronous save to `target_path` (only used when the worker thread is unavailable).
+    fn save_now(&self, state: &PersistedState) {
+        if let Some(ref path) = self.target_path
+            && let Err(e) = save_to(path, state)
+        {
+            eprintln!("nv-demo persist save failed ('{}'): {e}", path.display());
+        }
     }
 
     /// Coalesces `state` as the latest pending save and wakes the background worker (non-blocking).
     pub fn enqueue(&self, state: PersistedState) {
         if self.handle.is_none() {
-            if let Err(e) = save(&state) {
-                eprintln!("nv-demo persist fallback save failed: {e}");
-            }
+            self.save_now(&state);
             return;
         }
         let (lock, cvar) = &*self.slot;
@@ -287,6 +413,12 @@ impl PersistWorker {
 
     /// Enqueues an optional final state, signals shutdown, and waits for durable completion.
     pub fn flush_and_join(&mut self, final_state: Option<PersistedState>) {
+        if self.handle.is_none() {
+            if let Some(st) = final_state {
+                self.save_now(&st);
+            }
+            return;
+        }
         {
             let (lock, cvar) = &*self.slot;
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -437,10 +569,20 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("nv_demo_persist_{}", std::process::id()));
         let path = dir.join("nv-demo.json");
+        state.scene = Some(SavedScene {
+            id: "inspector".to_string(),
+            variant: "Robotaxi".to_string(),
+        });
+        state.viewport_toolbar = PersistedToolbar {
+            edge: ToolbarEdge::Left,
+            expanded: false,
+        };
         save_to(&path, &state).expect("save_to");
-        let loaded = load_from(&path);
+        let report = load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
 
+        assert_eq!(report.problem, None);
+        let loaded = report.state;
         assert_eq!(loaded, state);
         assert_eq!(loaded.camera_rail.selected_rail_id, "landmark_slalom");
         assert_eq!(loaded.camera_rail.keyframes.len(), 2);
@@ -462,9 +604,13 @@ mod tests {
         )
         .expect("write");
 
-        let loaded = load_from(&path);
+        let report = load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
 
+        assert_eq!(report.problem, None);
+        let loaded = report.state;
+        assert_eq!(loaded.scene, None);
+        assert_eq!(loaded.viewport_toolbar, PersistedToolbar::default());
         assert_eq!(loaded.window.width, 1440);
         assert_eq!(loaded.window.height, 720);
         assert_eq!(loaded.settings.sat_count, 9);
@@ -498,10 +644,106 @@ mod tests {
         final_st.settings.sat_count = 17;
         worker.flush_and_join(Some(final_st.clone()));
 
-        let loaded = load_from(&path);
+        let loaded = load_from(&path).state;
         if let Err(e) = std::fs::remove_dir_all(&dir) {
             eprintln!("test cleanup warning: {e}");
         }
         assert_eq!(loaded.settings.sat_count, 17);
+    }
+
+    /// F07: a corrupt file is reported, never overwritten, and a session without a target path
+    /// writes nowhere.
+    #[test]
+    fn corrupt_config_is_reported_and_left_untouched() {
+        let dir = std::env::temp_dir().join(format!("nv_demo_corrupt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("nv-demo.json");
+        let corrupt = r#"{"window":{"width":1440},"settings":{"sat_count":9"#;
+        std::fs::write(&path, corrupt).expect("write");
+
+        let report = load_from(&path);
+        assert!(report.problem.is_some());
+        assert_eq!(report.state, PersistedState::default());
+
+        // What `DemoApp` does when `problem` is `Some`: a worker without a target path.
+        let mut worker = PersistWorker::spawn_for_path(None);
+        worker.enqueue(PersistedState::default());
+        worker.flush_and_join(Some(PersistedState::default()));
+        let after = std::fs::read_to_string(&path).expect("read back");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(after, corrupt);
+    }
+
+    /// F07: one unreadable section (unknown enum variant) only resets itself; the rest (here the
+    /// Custom rail keyframes and the window) still loads, and the problem is reported.
+    #[test]
+    fn unreadable_section_keeps_the_other_sections() {
+        let dir = std::env::temp_dir().join(format!("nv_demo_section_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("nv-demo.json");
+        let mut good = PersistedState::default();
+        good.window.width = 1500;
+        good.camera_rail.keyframes = vec![
+            crate::camera_rail::CameraKeyframe::from_look_at([0.0, 2.0, -9.0], [0.0, 1.0, 0.0], 50.0),
+            crate::camera_rail::CameraKeyframe::from_look_at([5.0, 3.0, 4.0], [0.0, 1.0, 0.0], 50.0),
+        ];
+        let mut json: serde_json::Value = serde_json::to_value(&good).expect("to_value");
+        json["theme"] = serde_json::Value::String("NoSuchThemeVariant".to_string());
+        std::fs::write(&path, serde_json::to_string(&json).expect("to_string")).expect("write");
+
+        let report = load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let problem = report.problem.expect("problem reported");
+        assert!(problem.contains("theme"), "{problem}");
+        assert_eq!(report.state.window.width, 1500);
+        assert_eq!(report.state.camera_rail.keyframes.len(), 2);
+        assert_eq!(report.state.theme, UiTheme::default());
+    }
+
+    /// F07: an existing path that cannot be read (here: a directory) is a problem, not a default.
+    #[test]
+    fn unreadable_path_is_a_problem_but_missing_file_is_not() {
+        let dir = std::env::temp_dir().join(format!("nv_demo_unreadable_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nv-demo.json")).expect("mkdir");
+        let report = load_from(&dir.join("nv-demo.json"));
+        let missing = load_from(&dir.join("absent.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.problem.is_some());
+        assert_eq!(missing.problem, None);
+    }
+
+    /// F20: without a worker thread the final state is saved synchronously, not dropped.
+    #[test]
+    fn flush_without_worker_thread_saves_synchronously() {
+        let dir = std::env::temp_dir().join(format!("nv_demo_nothread_{}", std::process::id()));
+        let path = dir.join("nv-demo.json");
+        let mut worker = PersistWorker {
+            slot: Arc::new((Mutex::new(PersistSlot::default()), Condvar::new())),
+            handle: None,
+            target_path: Some(path.clone()),
+        };
+        let mut st = PersistedState::default();
+        st.settings.sat_count = 23;
+        worker.flush_and_join(Some(st));
+        let loaded = load_from(&path).state;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.settings.sat_count, 23);
+    }
+
+    /// F21: the on-disk names are PascalCase (`"FpsFly"`), while `camera`'s serde derives use
+    /// `rename_all = "snake_case"` (`"fps_fly"`), so the hand-written tables stay. This pins that
+    /// every variant round-trips through them.
+    #[test]
+    fn nav_name_tables_round_trip_every_variant() {
+        for m in NavMode::ALL {
+            assert_eq!(parse_nav_mode(nav_mode_name(m)), Some(m));
+        }
+        for s in NavScheme::ALL {
+            assert_eq!(parse_nav_scheme(nav_scheme_name(s)), Some(s));
+        }
+        for f in NavFeel::ALL {
+            assert_eq!(parse_nav_feel(nav_feel_name(f)), Some(f));
+        }
+        assert_eq!(nav_mode_name(NavMode::FpsFly), "FpsFly");
     }
 }

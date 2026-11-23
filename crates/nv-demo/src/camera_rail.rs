@@ -12,10 +12,19 @@
 //! evaluation allocation-free and deterministic.
 //! Used by: `crate::main`, `crate::ui`, `crate::persist`.
 
-use camera::CameraPose;
+use std::sync::Arc;
+
+use camera::{CameraPose, FOV_MAX, FOV_MIN};
 use csg_scene::{CompiledRail, RailSpec};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
+
+/// Clamps a vertical FOV (radians) to the camera controller's lens range
+/// ([`camera::FOV_MIN`]..=[`camera::FOV_MAX`]) so rail keyframes keep every reachable framing.
+#[inline]
+fn clamp_fov(fov_y: f32) -> f32 {
+    fov_y.clamp(FOV_MIN, FOV_MAX)
+}
 
 /// Fixed sample count for the inline zero-allocation `Custom` arc-length lookup table.
 const ARC_LUT_SAMPLES: usize = 256;
@@ -48,7 +57,7 @@ impl CameraKeyframe {
         Self {
             pos: pose.eye.to_array(),
             orientation: q.to_array(),
-            vfov_deg: pose.fov_y.to_degrees().clamp(10.0, 120.0),
+            vfov_deg: clamp_fov(pose.fov_y).to_degrees(),
         }
     }
 
@@ -67,7 +76,7 @@ impl CameraKeyframe {
             eye_v,
             fwd,
             Vec3::Y,
-            vfov_deg.clamp(10.0, 120.0).to_radians(),
+            clamp_fov(vfov_deg.to_radians()),
             0.05,
             2000.0,
         );
@@ -86,7 +95,7 @@ impl CameraKeyframe {
         CameraPose {
             eye: if eye.is_finite() { eye } else { Vec3::ZERO },
             orientation,
-            fov_y: self.vfov_deg.clamp(10.0, 120.0).to_radians(),
+            fov_y: clamp_fov(self.vfov_deg.to_radians()),
             znear: znear.max(1e-3),
             zfar: zfar.max(znear + 1.0),
         }
@@ -291,13 +300,6 @@ impl Default for CustomArcLut {
     }
 }
 
-/// Runtime caches always compare equal so `PersistedState` dirty tracking ignores them.
-impl PartialEq for CustomArcLut {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 impl CustomArcLut {
     fn build(signature: u64, kfs: &[CameraKeyframe], looping: bool) -> Self {
         let mut cum_len = [0.0f32; ARC_LUT_SAMPLES + 1];
@@ -361,23 +363,21 @@ fn custom_lut_signature(looping: bool, keyframes: &[CameraKeyframe]) -> u64 {
     h.max(1)
 }
 
-/// Wrapper for runtime-only scene rail cache that compares equal during `PersistedState` diffing.
+/// Runtime-only scene rail cache. `rails` is shared so the periodic `PersistedState` clone of
+/// [`CameraRail`] copies a pointer, not every compiled cassette.
 #[derive(Clone, Debug, Default)]
 struct RuntimeSceneRails {
-    rails: Vec<CompiledRail>,
+    rails: Arc<Vec<CompiledRail>>,
     base_count: usize,
     active_idx: usize,
 }
 
-impl PartialEq for RuntimeSceneRails {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
 /// Multi-cassette serializable camera rail supporting dynamic [`csg_scene::SceneModule`] cassettes,
 /// on-demand exact-CSG random rails, and an independent user `Custom` keyframe spline.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Equality compares only the persisted fields (see the `PartialEq` impl), so `PersistedState`
+/// dirty tracking ignores playback state and runtime caches.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraRail {
     /// Selected rail identifier (e.g. `"road_cruise"`, `"grand_tour"`, or `"custom"`).
@@ -421,6 +421,18 @@ impl Default for CameraRail {
     }
 }
 
+/// Compares the serialized fields only; `playing`, `time_s` and the runtime caches are skipped
+/// by serde, so including them would mark an unchanged config dirty on every save tick.
+impl PartialEq for CameraRail {
+    fn eq(&self, other: &Self) -> bool {
+        self.selected_rail_id == other.selected_rail_id
+            && self.keyframes == other.keyframes
+            && self.duration_s == other.duration_s
+            && self.looping == other.looping
+            && self.ease_io == other.ease_io
+    }
+}
+
 impl CameraRail {
     /// Installs compiled rails exported by a newly loaded [`csg_scene::SceneModule`].
     ///
@@ -433,7 +445,7 @@ impl CameraRail {
             .map(CompiledRail::compile)
             .collect();
         self.scene.base_count = compiled.len();
-        self.scene.rails = compiled;
+        self.scene.rails = Arc::new(compiled);
         self.scene.active_idx = 0;
 
         if self.selected_rail_id == CUSTOM_RAIL_ID {
@@ -468,14 +480,17 @@ impl CameraRail {
             return;
         }
         let max_total = self.scene.base_count + MAX_GENERATED_RAILS;
-        if self.scene.rails.len() >= max_total && self.scene.rails.len() > self.scene.base_count {
-            self.scene.rails.remove(self.scene.base_count);
+        let base_count = self.scene.base_count;
+        // Copy-on-write: clones the cassette list only if a persisted snapshot still shares it.
+        let rails = Arc::make_mut(&mut self.scene.rails);
+        if rails.len() >= max_total && rails.len() > base_count {
+            rails.remove(base_count);
         }
         let dur = spec.duration_s.max(2.0);
         let id = spec.id.clone();
         let looping = spec.looping;
-        self.scene.rails.push(CompiledRail::compile(spec));
-        self.scene.active_idx = self.scene.rails.len() - 1;
+        rails.push(CompiledRail::compile(spec));
+        self.scene.active_idx = rails.len() - 1;
         self.selected_rail_id = id;
         self.duration_s = dur;
         self.looping = looping;
@@ -653,7 +668,7 @@ impl CameraRail {
                 eye,
                 fwd,
                 up,
-                sample.vfov_deg.clamp(10.0, 120.0).to_radians(),
+                clamp_fov(sample.vfov_deg.to_radians()),
                 znear.max(1e-3),
                 zfar.max(znear + 1.0),
             ));
@@ -708,7 +723,7 @@ impl CameraRail {
         Some(CameraPose {
             eye,
             orientation,
-            fov_y: vfov_deg.clamp(10.0, 120.0).to_radians(),
+            fov_y: clamp_fov(vfov_deg.to_radians()),
             znear: znear.max(1e-3),
             zfar: zfar.max(znear + 1.0),
         })
@@ -748,9 +763,13 @@ impl CameraDamper {
         let fov_y = prev.fov_y + (target.fov_y - prev.fov_y) * alpha;
 
         // Snap once converged so path-tracing accumulation stops resetting on micro-residuals.
-        let pos_settled = (eye - target.eye).length_squared() < 1.0e-10;
-        let rot_settled = (1.0 - orientation.dot(target.orientation).abs()) < 1.0e-10;
-        let fov_settled = (fov_y - target.fov_y).abs() < 1.0e-6;
+        // A component that did not move this step is stuck at f32 resolution (far from the
+        // origin `alpha * residual` rounds to zero) and would repeat the same value forever, so
+        // it counts as settled too.
+        let pos_settled = eye == prev.eye || (eye - target.eye).length_squared() < 1.0e-10;
+        let rot_settled = orientation == prev.orientation
+            || (1.0 - orientation.dot(target.orientation).abs()) < 1.0e-10;
+        let fov_settled = fov_y == prev.fov_y || (fov_y - target.fov_y).abs() < 1.0e-6;
         let next = if pos_settled && rot_settled && fov_settled {
             target
         } else {
@@ -975,6 +994,70 @@ mod tests {
             prev_dist = d;
         }
         assert!(prev_dist < 1e-4, "expected convergence, dist={prev_dist}");
+    }
+
+    #[test]
+    fn keyframes_keep_the_full_lens_fov_range() {
+        // Dolly-zoom reaches 5 degrees; the keyframe must replay that framing, not 10 degrees.
+        let pose = CameraPose {
+            eye: Vec3::new(1.0, 2.0, 3.0),
+            orientation: Quat::IDENTITY,
+            fov_y: 5.0f32.to_radians(),
+            znear: 0.05,
+            zfar: 500.0,
+        };
+        let kf = CameraKeyframe::from_pose(pose);
+        assert!((kf.vfov_deg - 5.0).abs() < 1e-4, "stored {}", kf.vfov_deg);
+        assert!((kf.to_pose(0.05, 500.0).fov_y - pose.fov_y).abs() < 1e-6);
+
+        let narrow = CameraKeyframe::from_pose(CameraPose {
+            fov_y: 0.1f32.to_radians(),
+            ..pose
+        });
+        assert!((narrow.to_pose(0.05, 500.0).fov_y - FOV_MIN).abs() < 1e-6);
+        let wide = CameraKeyframe {
+            vfov_deg: 170.0,
+            ..kf
+        };
+        assert!((wide.to_pose(0.05, 500.0).fov_y - FOV_MAX).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equality_ignores_runtime_playback_state_and_clone_shares_rails() {
+        let reg = csg_scenes::default_scene_registry();
+        let module = reg.get("gundo").expect("scene registered");
+        let mut rail = CameraRail::default();
+        rail.set_scene_rails(module.build(&SceneBuildConfig::default()).rails);
+        assert!(!rail.scene_rails().is_empty());
+
+        let saved = rail.clone();
+        assert!(Arc::ptr_eq(&saved.scene.rails, &rail.scene.rails));
+        rail.set_playing(true);
+        rail.tick(0.5);
+        assert!(rail.time_s > 0.0);
+        assert_eq!(rail, saved, "playback state is not persisted, so it must not mark dirty");
+
+        rail.looping = !rail.looping;
+        assert_ne!(rail, saved);
+    }
+
+    #[test]
+    fn damper_settles_exactly_far_from_the_origin() {
+        let pose = |eye: Vec3| CameraPose {
+            eye,
+            orientation: Quat::IDENTITY,
+            fov_y: 1.0,
+            znear: 0.05,
+            zfar: 5000.0,
+        };
+        let target = pose(Vec3::new(1000.5, 50.0, 1000.25));
+        let mut damper = CameraDamper::default();
+        damper.snap(pose(Vec3::new(1000.0, 50.0, 1000.0)));
+        let mut cur = target;
+        for _ in 0..2000 {
+            cur = damper.step(target, 1.0 / 60.0, 0.25);
+        }
+        assert_eq!(cur.eye, target.eye, "damper must snap onto the exact target");
     }
 
     #[test]

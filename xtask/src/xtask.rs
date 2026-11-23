@@ -10,7 +10,8 @@
 //! overlay names a symbol the inventory lacks, or a test id cited as evidence does not exist in
 //! the tree. Statuses are derived, never typed by hand:
 //! - **bound** — the symbol is in the inventory;
-//! - **wrapped** — the overlay names a wrapper and the symbol is referenced in `crates/<lib>/src`;
+//! - **wrapped** — the overlay names a wrapper and the symbol is referenced in code (comments
+//!   stripped) under `crates/<lib>/src`;
 //! - **tested-on-gpu** — a passing GPU record exists for the overlay's test id.
 //!
 //! **Why.** The matrix is the evidence shown to NVIDIA; a table edited by hand drifts from the
@@ -25,7 +26,11 @@
 //! `cargo xtask py-stubs <generate|check>` (module `py_stubs`) parses `python/nv-py/src/*.rs` and
 //! `python/nv-py/python/nv_rs/__init__.py` to deterministically generate or verify
 //! `python/nv-py/python/nv_rs/__init__.pyi` and `docs/src/content/docs/python/04-modules-reference.md`.
+//!
+//! Every file xtask writes goes through `atomic_io` (temp file in the same directory, `sync_all`,
+//! rename), so an interrupted run never leaves a truncated artifact.
 
+mod atomic_io;
 mod optix_cov;
 mod prebuilt;
 mod py_stubs;
@@ -55,20 +60,42 @@ enum Error {
     PyStubs(String),
     #[error("{0}")]
     StageDlls(String),
-    #[error("{}", help())]
-    Usage,
+    #[error("{0}")]
+    Write(String),
+    /// A command or subcommand was missing or unknown; carries the help text to print.
+    #[error("{0}")]
+    Usage(&'static str),
 }
 
-fn help() -> &'static str {
-    "usage: cargo xtask <command>\n\
-     \n\
-     commands:\n\
-     \x20 coverage <collect|generate|check|optix>   Generate or verify API coverage matrices\n\
-     \x20 py-stubs <generate|check>                 Generate or verify Python .pyi stubs and docs\n\
-     \x20 prebuilt [--out <dir>] [--target <triple>] Package prebuilt sys bindings\n\
-     \x20 stage-prebuilt [--out <dir>] [--target <triple>] Alias for prebuilt\n\
-     \x20 stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run] Stage runtime DLLs"
-}
+const HELP: &str = "\
+usage: cargo xtask <command> [args]     (each command and subcommand: long name | 1-letter alias)
+
+commands:
+  coverage|c <collect|l, generate|g, check|c, optix|o>   Generate or verify API coverage matrices
+  py-stubs|y <generate|g, check|c>                       Generate or verify Python .pyi stubs and docs
+  prebuilt|p [--out <dir>] [--target <triple>]           Stage prebuilt sys bindings (alias: stage-prebuilt)
+  stage-dlls|d --out <dir> [--libs <csv>] [--include-driver] [--dry-run]   Stage runtime DLLs
+
+examples:
+  cargo xtask coverage check
+  cargo xtask c g
+  cargo xtask py-stubs generate
+  cargo xtask prebuilt --target x86_64-pc-windows-msvc
+  cargo xtask stage-dlls --out dist --libs cufft,nvrtc";
+
+const COVERAGE_HELP: &str = "\
+usage: cargo xtask coverage|c <subcommand>
+  collect|l    copy the newest <lib>_inventory.json of each built sys crate into coverage/evidence/
+  generate|g   write COVERAGE.md from coverage/
+  check|c      fail when COVERAGE.md is stale or the overlays are inconsistent
+  optix|o      prove the OptiX device, host and intrinsic APIs are fully covered
+example: cargo xtask coverage check";
+
+const PY_STUBS_HELP: &str = "\
+usage: cargo xtask py-stubs|y <subcommand>
+  generate|g   write python/nv-py/python/nv_rs/__init__.pyi and the Python reference page
+  check|c      fail when either file is stale
+example: cargo xtask py-stubs check";
 
 /// `coverage/<lib>.toml`.
 #[derive(Debug, Deserialize)]
@@ -135,23 +162,22 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["help" | "--help" | "-h"] => Ok(help().to_string()),
-        ["coverage", "generate"] => generate(&root),
-        ["coverage", "check"] => check(&root),
-        ["coverage", "collect"] => collect(&root),
-        ["coverage", "optix"] => optix_cov::run(&root).map_err(Error::Optix),
-        ["py-stubs", "generate"] => py_stubs::generate(&root).map_err(Error::PyStubs),
-        ["py-stubs", "check"] => py_stubs::check(&root).map_err(Error::PyStubs),
-        ["py-stubs", "--help" | "-h" | "help"] => Ok(help().to_string()),
-        ["prebuilt" | "stage-prebuilt", rest @ ..] => {
-            let refs: Vec<&str> = rest.to_vec();
-            prebuilt::run(&root, &refs).map_err(Error::Prebuilt)
+        ["help" | "--help" | "-h"] => Ok(HELP.to_string()),
+        ["coverage" | "c", "generate" | "g"] => generate(&root),
+        ["coverage" | "c", "check" | "c"] => check(&root),
+        ["coverage" | "c", "collect" | "l"] => collect(&root),
+        ["coverage" | "c", "optix" | "o"] => optix_cov::run(&root).map_err(Error::Optix),
+        ["coverage" | "c", "help" | "--help" | "-h"] => Ok(COVERAGE_HELP.to_string()),
+        ["coverage" | "c", ..] => Err(Error::Usage(COVERAGE_HELP)),
+        ["py-stubs" | "y", "generate" | "g"] => py_stubs::generate(&root).map_err(Error::PyStubs),
+        ["py-stubs" | "y", "check" | "c"] => py_stubs::check(&root).map_err(Error::PyStubs),
+        ["py-stubs" | "y", "help" | "--help" | "-h"] => Ok(PY_STUBS_HELP.to_string()),
+        ["py-stubs" | "y", ..] => Err(Error::Usage(PY_STUBS_HELP)),
+        ["prebuilt" | "stage-prebuilt" | "p", rest @ ..] => {
+            prebuilt::run(&root, rest).map_err(Error::Prebuilt)
         }
-        ["stage-dlls", rest @ ..] => {
-            let refs: Vec<&str> = rest.to_vec();
-            stage_dlls::run(&refs).map_err(Error::StageDlls)
-        }
-        _ => Err(Error::Usage),
+        ["stage-dlls" | "d", rest @ ..] => stage_dlls::run(rest).map_err(Error::StageDlls),
+        _ => Err(Error::Usage(HELP)),
     };
     match result {
         Ok(msg) => {
@@ -175,20 +201,22 @@ fn repo_root() -> PathBuf {
 fn generate(root: &Path) -> Result<String, Error> {
     let (text, _) = render(root)?;
     let path = root.join("COVERAGE.md");
-    std::fs::write(&path, &text).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
+    atomic_io::write(&path, text.as_bytes()).map_err(Error::Write)?;
     Ok(format!("wrote {}", path.display()))
 }
 
 /// Copies the newest `<lib>_inventory.json` each sys crate's build script wrote under
-/// `target/*/build/*/out/` into `coverage/evidence/<lib>/inventory.json`. Run after building the
-/// sys crates; the copied files are committed as evidence.
+/// `<target dir>/<profile>/build/*/out/` or `<target dir>/<triple>/<profile>/build/*/out/` (the
+/// target dir honours `CARGO_TARGET_DIR`) into `coverage/evidence/<lib>/inventory.json`. Run after
+/// building the sys crates; the copied files are committed as evidence.
 fn collect(root: &Path) -> Result<String, Error> {
+    collect_from(root, &prebuilt::resolve_target_dir(root))
+}
+
+fn collect_from(root: &Path, target_dir: &Path) -> Result<String, Error> {
     let mut newest: BTreeMap<String, (std::time::SystemTime, PathBuf)> = BTreeMap::new();
-    for profile in list(&root.join("target")) {
-        for build in list(&profile.join("build")) {
+    for build_dir in prebuilt::build_dirs(target_dir) {
+        for build in list(&build_dir) {
             // nv-bindgen-fixture's synthetic libraries are a test harness, not NVIDIA evidence.
             if build
                 .file_name()
@@ -206,7 +234,10 @@ fn collect(root: &Path) -> Result<String, Error> {
                 };
                 let modified = std::fs::metadata(&file)
                     .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
+                    .map_err(|source| Error::Io {
+                        path: file.clone(),
+                        source,
+                    })?;
                 if newest.get(lib).is_none_or(|(t, _)| modified > *t) {
                     newest.insert(lib.to_string(), (modified, file));
                 }
@@ -225,8 +256,7 @@ fn collect(root: &Path) -> Result<String, Error> {
             path: dir.clone(),
             source,
         })?;
-        let dst = dir.join("inventory.json");
-        std::fs::write(&dst, text).map_err(|source| Error::Io { path: dst, source })?;
+        atomic_io::write(&dir.join("inventory.json"), text.as_bytes()).map_err(Error::Write)?;
         copied.push(lib.as_str());
     }
     Ok(format!(
@@ -274,8 +304,10 @@ fn render(root: &Path) -> Result<(String, Vec<String>), Error> {
         "\n| Library | Symbols | Bound | Wrapped | Tested on GPU |\n|---|---:|---:|---:|---:|\n",
     );
     let mut sections = String::new();
+    // Read once for every library: test ids are looked up across the whole tree.
+    let all_src = strip_comments(&read_tree(&root.join("crates")));
     for lib in &libs {
-        let rows = rows(root, lib, &mut problems);
+        let rows = rows(root, lib, &all_src, &mut problems);
         let count = |f: fn(&Row) -> bool| rows.iter().filter(|r| f(r)).count();
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
@@ -327,7 +359,8 @@ fn mark(b: bool) -> &'static str {
     if b { "yes" } else { "" }
 }
 
-fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
+/// `all_src` is the comment-stripped source of every crate under `crates/`.
+fn rows(root: &Path, lib: &Lib, all_src: &str, problems: &mut Vec<String>) -> Vec<Row> {
     let symbols: Vec<String> = lib
         .inventory
         .as_ref()
@@ -357,8 +390,8 @@ fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
         }
     }
 
-    let safe_src = read_tree(&wrapper_src_dir(root, &lib.name));
-    let all_src = read_tree(&root.join("crates"));
+    // Comments are stripped: a wrapper that only mentions the C symbol in its docs does not wrap it.
+    let safe_src = strip_comments(&read_tree(&wrapper_src_dir(root, &lib.name)));
     let mut names: Vec<String> = symbols.clone();
     for n in overlay.keys() {
         if !names.iter().any(|s| s == n) {
@@ -375,7 +408,7 @@ fn rows(root: &Path, lib: &Lib, problems: &mut Vec<String>) -> Vec<Row> {
             let wrapped = wrapper.is_some() && contains_word(&safe_src, &name);
             let test = o.and_then(|f| f.test.clone());
             let tested = test.as_ref().and_then(|t| {
-                if !contains_word(&all_src, &format!("fn {t}")) {
+                if !contains_word(all_src, &format!("fn {t}")) {
                     problems.push(format!(
                         "{}: test `{t}` for `{name}` does not exist under crates/",
                         lib.name
@@ -503,6 +536,131 @@ fn read_tree(dir: &Path) -> String {
     out
 }
 
+/// Source text (Rust or C) with `//` line comments and `/* */` block comments removed, so prose
+/// never counts as use. Doc comments are line comments too. Block comments nest as in Rust; in C a
+/// nested `/*` is unusual, and over-stripping makes a gate fail loudly rather than pass silently.
+/// String, raw-string and char literals are copied verbatim, so `"http://..."` does not cut the
+/// line and `'"'` does not open a string. Newlines inside block comments are kept, so line-based
+/// scanners see the same line structure.
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push(b'\n');
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => {
+                let end = quoted_end(b, i + 1);
+                out.extend_from_slice(&b[i..end]);
+                i = end;
+            }
+            b'r' => match raw_string_end(b, i) {
+                Some(end) => {
+                    out.extend_from_slice(&b[i..end]);
+                    i = end;
+                }
+                None => {
+                    out.push(b'r');
+                    i += 1;
+                }
+            },
+            b'\'' => {
+                let end = char_literal_end(b, i).unwrap_or(i + 1);
+                out.extend_from_slice(&b[i..end]);
+                i = end;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // Cuts happen only at ASCII bytes, so the output is valid UTF-8 and nothing is substituted.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// End (exclusive) of a `"..."` literal whose body starts at `start`, honouring `\` escapes.
+fn quoted_end(b: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// End (exclusive) of a raw string literal (`r"…"`, `r#"…"#`, `br"…"`) whose `r` is at `b[i]`,
+/// or `None` when no raw string starts there (an identifier such as `for` or `r2`).
+fn raw_string_end(b: &[u8], i: usize) -> Option<usize> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let starts_token = match i.checked_sub(1).map(|p| b[p]) {
+        None => true,
+        Some(b'b') => i < 2 || !ident(b[i - 2]),
+        Some(c) => !ident(c),
+    };
+    if !starts_token {
+        return None;
+    }
+    let mut j = i + 1;
+    while b.get(j) == Some(&b'#') {
+        j += 1;
+    }
+    if b.get(j) != Some(&b'"') {
+        return None;
+    }
+    let hashes = j - i - 1;
+    j += 1;
+    while j < b.len() {
+        if b[j] == b'"'
+            && b
+                .get(j + 1..j + 1 + hashes)
+                .is_some_and(|h| h.iter().all(|&c| c == b'#'))
+        {
+            return Some(j + 1 + hashes);
+        }
+        j += 1;
+    }
+    Some(b.len())
+}
+
+/// End (exclusive) of a char literal starting at `b[i] == '\''` (`'x'`, `'"'`, `'\''`, `'\u{..}'`),
+/// or `None` for a lifetime / label (`'a`), which is copied as a plain character.
+fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i + 1) == Some(&b'\\') {
+        let close = b.get(i + 3..)?.iter().take(10).position(|&c| c == b'\'')?;
+        Some(i + 3 + close + 1)
+    } else if b.get(i + 2) == Some(&b'\'') {
+        Some(i + 3)
+    } else {
+        None
+    }
+}
+
 /// `needle` occurs with no identifier character on either side.
 fn contains_word(haystack: &str, needle: &str) -> bool {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
@@ -573,6 +731,80 @@ mod tests {
             ["demo: overlay names `demoZ`, which the inventory does not contain"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn unique_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "nv_rs_xtask_cov_{label}_{}_{id}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn a_symbol_mentioned_only_in_comments_is_not_wrapped() {
+        let dir = unique_dir("comments");
+        let ev = dir.join("coverage").join("evidence").join("demo");
+        std::fs::create_dir_all(&ev).expect("dirs");
+        std::fs::create_dir_all(dir.join("crates").join("demo").join("src")).expect("src");
+        std::fs::write(
+            ev.join("inventory.json"),
+            r#"{"lib":"demo","headers":[],"symbols":["demoA","demoB"]}"#,
+        )
+        .expect("inventory");
+        std::fs::write(
+            dir.join("coverage").join("demo.toml"),
+            "lib = \"demo\"\n[[fn]]\nname = \"demoA\"\nwrapper = \"Demo::a\"\n[[fn]]\nname = \"demoB\"\nwrapper = \"Demo::b\"\n",
+        )
+        .expect("overlay");
+        std::fs::write(
+            dir.join("crates").join("demo").join("src").join("lib.rs"),
+            "/// Wraps `demoB`.\nfn b() {}\n/* demoB */\nfn a() { sys::demoA() }\n",
+        )
+        .expect("lib");
+
+        let (text, problems) = render(&dir).expect("renders");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(text.contains("| demo | 2 | 2 | 1 | 0 |"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn collect_reads_triple_qualified_builds_and_writes_evidence() {
+        let dir = unique_dir("collect");
+        let target = dir.join("target");
+        let out = target
+            .join("aarch64-unknown-linux-gnu")
+            .join("release")
+            .join("build")
+            .join("demo-sys-0123abcd")
+            .join("out");
+        std::fs::create_dir_all(&out).expect("out dir");
+        let inv = r#"{"lib":"demo","headers":[],"symbols":["demoA"]}"#;
+        std::fs::write(out.join("demo_inventory.json"), inv).expect("inventory");
+
+        let msg = collect_from(&dir, &target).expect("collect");
+        assert_eq!(msg, "collected inventories: demo");
+        let evidence = dir
+            .join("coverage")
+            .join("evidence")
+            .join("demo")
+            .join("inventory.json");
+        assert_eq!(std::fs::read_to_string(evidence).expect("evidence"), inv);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn comments_are_stripped_but_literals_are_kept() {
+        let src = "a // x\nb /* y\n /* z */ w */ c\n\"//s\" '\"' r#\"/*\"# d // e\n'a: loop {}";
+        assert_eq!(
+            strip_comments(src),
+            "a \nb \n c\n\"//s\" '\"' r#\"/*\"# d \n'a: loop {}"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ struct Params {
     float fractal_p1[4];  // [fixed_radius/rot1, rot2, max_iter, 0]
     float fractal_p2[4];  // [c.x, c.y, c.z, 0] (julia_c or kifs offset)
     float fractal_p3[4];  // formula-specific extra coefficients
-    float fractal_xform[4]; // [obj_scale, rot_x_rad, rot_y_rad, rot_z_rad]
+    float fractal_xform[4]; // reserved: unread on device (fractal TRS lives in the TLAS instance transform)
     float fractal_r0[4];  // [detail_eps, fudge, normal_eps, march_steps]
     float fractal_r1[4];  // [metallic, trap_scale, palette_shift, sun_intensity]
     float time;
@@ -38,7 +38,7 @@ struct Params {
     float prev_cam_forward[4];
     float prev_cam_right[4];
     float prev_cam_up[4];
-    float sat_pos[4];      // [x, y, z, radius/enable]
+    float sat_pos[4];      // reserved: unread on device (orbiting spheres live in the TLAS)
     float glass_params[4]; // [ior, absorption, roughness, enable]
     unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId
     float jitter_x;
@@ -59,7 +59,7 @@ struct Params {
     unsigned int csg_instance_count;
     unsigned int csg_material_count;
     unsigned int csg_compound_count;
-    unsigned int csg_flags;      // bit0=enabled, bit1=night, bit2=wet_asphalt, bit3=sunset
+    unsigned int csg_flags;      // host-only: bit0=enabled, bit1=night, bit2=wet_asphalt, bit3=sunset (unread on device; sun tint follows the sky modes)
     float csg_wetness;           // 0..1 smooth asphalt wetness
     float csg_traffic_time;      // simulation clock for water waves / aviation beacons
     unsigned int camera_projection; // 0=Pinhole, 1=Fisheye180, 2=Equirect360, 3=SlitCam
@@ -1302,7 +1302,9 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                 float lane_off = fabsf(fmodf(abs_lat, 3.6f) - 1.8f);
                 float track_d = fabsf(lane_off - 0.78f);
                 float track_band = 1.0f - sky_smoothstep(0.14f, 0.48f, track_d);
-                float s_var = 0.85f + 0.15f * sinf(road_s * 0.35f + coarse * 3.0f);
+                // road_s wraps every 64 m (csg_pack_road_part_id): 4 periods per wrap
+                // (2*pi*4/64) keep the wear modulation continuous across the wrap seam.
+                float s_var = 0.85f + 0.15f * sinf(road_s * 0.39269908f + coarse * 3.0f);
                 tire_wear = track_band * s_var;
                 float edge_band = sky_smoothstep(0.0f, 0.55f, fmodf(abs_lat, 3.6f));
                 float curb_gutter = (1.0f - edge_band) * sky_smoothstep(2.2f, 3.6f, abs_lat);
@@ -1331,8 +1333,9 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
             // Tactile asphalt aggregate micro-normal relief (suppressed inside flat mirror puddles).
             float bump_k = 0.034f * (1.0f - puddle);
             if (bump_k > 0.002f) {
-                float gx = value_noise2((hit_pos.x + 0.018f) * 24.0f, hit_pos.z * 24.0f) - grain;
-                float gz = value_noise2(hit_pos.x * 24.0f, (hit_pos.z + 0.018f) * 24.0f) - grain;
+                // Forward difference against `grain`, so the offset taps use its frequency (22).
+                float gx = value_noise2((hit_pos.x + 0.018f) * 22.0f, hit_pos.z * 22.0f) - grain;
+                float gz = value_noise2(hit_pos.x * 22.0f, (hit_pos.z + 0.018f) * 22.0f) - grain;
                 n = f3_norm(make_float3(n.x - gx * bump_k, n.y, n.z - gz * bump_k));
             }
             break;
@@ -1429,9 +1432,10 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
             float micro = value_noise2(sx * 14.0f, sy * 14.0f);
             float fine = value_noise2(sx * 46.0f + 2.1f, sy * 46.0f - 3.7f);
             float vein = fbm2(sx * 1.4f + sy * 0.4f, sy * 2.8f - sx * 0.3f);
-            // Expansion-joint slab grid: 1.5 m curved sidewalk/curb slabs on RoadTerrainTile,
-            // 2.5 m horizontal pavement slabs, or 3.0x2.4 m architectural formwork.
-            float pitch_x = use_curved_uv ? 1.5f : (is_horiz ? 2.5f : 3.0f);
+            // Expansion-joint slab grid: ~1.5 m curved sidewalk/curb slabs on RoadTerrainTile,
+            // 2.5 m horizontal pavement slabs, or 3.0x2.4 m architectural formwork. The curved
+            // along-road pitch is 64/43 m so the 64 m road_s wrap falls exactly on a joint.
+            float pitch_x = use_curved_uv ? (64.0f / 43.0f) : (is_horiz ? 2.5f : 3.0f);
             float pitch_y = use_curved_uv ? 1.5f : (is_horiz ? 2.5f : 2.4f);
             float cell_x = floorf(sx / pitch_x);
             float cell_y = floorf(sy / pitch_y);
@@ -1753,13 +1757,12 @@ static __forceinline__ __device__ void trace_primary(
             0, 2, 0,
             p0, p1, p2, p3, p4, p5, p6, p7
         );
-        // 6-bit SER coherence hint: sky miss = 0, CSG material buckets = 1..63 (never collides
-        // with sky miss and never overflows 6 bits), classic geometry = 60..63.
+        // 6-bit SER coherence hint, three disjoint ranges: sky miss = 0, CSG material buckets
+        // = 1..59 (mat_id mod 59), classic geometry = 60..63.
         unsigned int hint = 0u;
         if (optixHitObjectIsHit()) {
             if (optixHitObjectGetHitKind() == 1u) {
-                unsigned int mat_bucket = optixHitObjectGetAttribute_3() & 0x3Fu;
-                hint = (mat_bucket == 0u) ? 63u : mat_bucket;
+                hint = 1u + (optixHitObjectGetAttribute_3() & 0xFFFFu) % 59u;
             } else {
                 hint = 60u + (optixHitObjectGetInstanceId() & 0x3u);
             }
@@ -1874,11 +1877,117 @@ static __forceinline__ __device__ float3 cryptomatte_aov_color(
     return make_float3(r, g, b);
 }
 
+// Classic (non-CSG) demo geometry: the low byte of optixGetInstanceId() is the slot (0 floor,
+// 1 fractal, 2 glass sphere, 3 neon, 4 OMM halo); bits 8..15 carry the per-sphere hue. The floor
+// is GROUND (16); the showcase objects have no class in `csg_core::ast::semantic`, so they are
+// UNKNOWN (0) instead of borrowing Cityscapes road/building classes.
+static __forceinline__ __device__ unsigned int classic_semantic_id(unsigned int p6) {
+    return ((p6 & 0xFFu) == 0u) ? 16u : 0u;
+}
+
+// Instance ID shared by the instance AOV and the SDG occlusion results:
+//   CSG hit, instance has a user_id  -> user_id
+//   CSG hit, user_id == 0            -> 0xFF000000 | instance index
+//   classic geometry                 -> 0xFFFFFF00 | slot (0..4)
+// No hit is 0 in the instance AOV and 0xFFFFFFFF in the SDG results; neither is produced here.
+static __forceinline__ __device__ unsigned int hit_instance_id(unsigned int p0, unsigned int p6) {
+    if (p0 == 2u) {
+        if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
+            unsigned int uid = load_csg_instance_meta(p6).y;
+            if (uid != 0u) return uid;
+        }
+        return 0xFF000000u | (p6 & 0x00FFFFFFu);
+    }
+    return 0xFFFFFF00u | (p6 & 0x7Fu);
+}
+
+// Direct-sun radiance tint, derived from the active sky mode(s) only, so the sun always matches
+// the sky it is drawn in (8 = night, 1 = sunset, otherwise day) and a finished crossfade does not
+// pop to another tint. Shared by the CSG and classic shading paths.
+static __forceinline__ __device__ float3 sun_tint_for_sky_mode(int m, float sun_i) {
+    if (m == 8) return make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f);
+    if (m == 1) return make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f);
+    return make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f);
+}
+
+static __forceinline__ __device__ float3 sun_radiance(float sun_i) {
+    int to_m = (int)(params.sky_params[3] + 0.5f);
+    float3 s1 = sun_tint_for_sky_mode(to_m, sun_i);
+    if (params.sky_blend > 1e-4f && params.sky_blend < 0.9999f && (int)params.sky_mode_from != to_m) {
+        float3 s0 = sun_tint_for_sky_mode((int)params.sky_mode_from, sun_i);
+        return f3_add(f3_mul(s0, 1.0f - params.sky_blend), f3_mul(s1, params.sky_blend));
+    }
+    return s1;
+}
+
+// Projects direction `d` (world space, seen from the previous camera centre) into previous-frame
+// pixel coordinates with the same sensor model `__raygen__render` uses to cast rays. Returns false
+// when `d` has no image in that model (behind a pinhole, on the SlitCam vertical axis).
+static __forceinline__ __device__ bool project_prev_pixel(
+    unsigned int proj, float3 d, float3 fwd, float3 rgt, float3 up,
+    float tan_fov, float aspect, float2& out
+) {
+    float x = f3_dot(d, rgt);
+    float y = f3_dot(d, up);
+    float z = f3_dot(d, fwd);
+    float w = (float)params.width;
+    float h = (float)params.height;
+    if (proj == 1u) {
+        // Fisheye180 (equidistant): r = theta / (pi/2), scaled by the inscribed circle radius.
+        float len = sqrtf(x * x + y * y + z * z);
+        if (len <= 1e-8f) return false;
+        float r = acosf(fmaxf(-1.0f, fminf(1.0f, z / len))) * 0.63661977f;
+        float phi = atan2f(y, x);
+        float half_min = fmaxf(1.0f, 0.5f * fminf(w, h));
+        out = make_float2(0.5f * w + r * cosf(phi) * half_min, 0.5f * h - r * sinf(phi) * half_min);
+        return true;
+    }
+    if (proj == 2u || proj == 3u) {
+        float yaw = atan2f(x, z);
+        float hl = sqrtf(x * x + z * z);
+        float v01;
+        if (proj == 2u) {
+            // Equirect360: pitch in [-pi/2, pi/2] maps to v01 in [1, 0].
+            v01 = 0.5f - atan2f(y, hl) * 0.31830989f;
+        } else {
+            // SlitCam: vertical offset on a unit-radius cylinder.
+            if (hl <= 1e-8f || tan_fov <= 1e-8f) return false;
+            v01 = 0.5f - (y / hl) / (2.0f * tan_fov);
+        }
+        out = make_float2((yaw * 0.15915494f + 0.5f) * w, v01 * h);
+        return true;
+    }
+    if (z <= 1e-4f) return false;
+    float px_ndc = x / (z * aspect * tan_fov);
+    float py_ndc = y / (z * tan_fov);
+    out = make_float2((px_ndc * 0.5f + 0.5f) * w, (0.5f - py_ndc * 0.5f) * h);
+    return true;
+}
+
+// Backward pixel motion (previous minus current position). Horizontal 360-degree sensors wrap at
+// the image seam, so their x motion takes the shorter way round.
+static __forceinline__ __device__ float2 prev_pixel_motion(
+    unsigned int proj, float2 prev_px, float cur_x, float cur_y
+) {
+    float mx = prev_px.x - cur_x;
+    if (proj == 2u || proj == 3u) {
+        float w = (float)params.width;
+        if (mx > 0.5f * w) {
+            mx -= w;
+        } else if (mx < -0.5f * w) {
+            mx += w;
+        }
+    }
+    return make_float2(mx, prev_px.y - cur_y);
+}
+
 extern "C" __global__ void __raygen__render() {
     const uint3 idx = optixGetLaunchIndex();
     if (idx.x >= params.width || idx.y >= params.height) return;
 
-    unsigned int seed = pcg_hash(idx.x + idx.y * 8192u + params.frame_index * 16777619u);
+    // Nested hashing keeps (x, y, frame) independent: a linear key such as x + 8192*y + k*frame
+    // replays another pixel's sequence from the previous frame and aliases rows above 8192 px.
+    unsigned int seed = pcg_hash(idx.x ^ pcg_hash(idx.y ^ pcg_hash(params.frame_index)));
 
     float3 cam_pos = make_f3(params.cam_pos);
     float3 cam_fwd = make_f3(params.cam_forward);
@@ -1911,24 +2020,27 @@ extern "C" __global__ void __raygen__render() {
     float3 prev_rgt = make_f3(params.prev_cam_right);
     float3 prev_up  = make_f3(params.prev_cam_up);
     float prev_tan_fov = params.prev_cam_up[3];
-    bool has_prev_cam = (prev_tan_fov > 1e-5f) && (proj == 0u);
+    // A valid previous camera is flagged by its tan_half_fov; every sensor projection reprojects.
+    bool has_prev_cam = (prev_tan_fov > 1e-5f);
 
     const bool aov_aa = (params.aov_mode != 0u);
     const bool aov_geom_only = aov_aa
         && (params.aov_mode != 1u && params.aov_mode != 2u && params.aov_mode != 9u);
-    const unsigned int loop_spp = aov_aa ? 4u : spp;
+    // AOV passes: 4 RGSS taps (s = 0..3) average into the displayed colour, plus one pixel-centre
+    // tap (s = 4) that feeds only the single-sample raw outputs (depth / motion / labels).
+    const unsigned int loop_spp = aov_aa ? 5u : spp;
     float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
     float aov_w_accum = 0.0f;
-    float2 s0_motion = make_float2(0.0f, 0.0f);
-    float s0_depth = 1e6f;
-    unsigned int s0_sem_id = 0u;
-    unsigned int s0_inst_id = 0u;
-    bool s0_has_hit = false;
-    float3 s0_albedo = make_float3(0.0f, 0.0f, 0.0f);
-    float3 s0_normal = make_float3(0.0f, 1.0f, 0.0f);
-    float s0_roughness = 0.5f;
-    float3 s0_diffuse = make_float3(0.0f, 0.0f, 0.0f);
-    float3 s0_specular = make_float3(0.0f, 0.0f, 0.0f);
+    float2 ctr_motion = make_float2(0.0f, 0.0f);
+    float ctr_depth = 1e6f;
+    unsigned int ctr_sem_id = 0u;
+    unsigned int ctr_inst_id = 0u;
+    bool ctr_has_hit = false;
+    float3 ctr_albedo = make_float3(0.0f, 0.0f, 0.0f);
+    float3 ctr_normal = make_float3(0.0f, 1.0f, 0.0f);
+    float ctr_roughness = 0.5f;
+    float3 ctr_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+    float3 ctr_specular = make_float3(0.0f, 0.0f, 0.0f);
 
     for (unsigned int s = 0; s < loop_spp; ++s) {
         if (aov_aa) {
@@ -1950,8 +2062,8 @@ extern "C" __global__ void __raygen__render() {
             // jitter and clean 4x anti-aliased edges on every non-Beauty AOV pass.
             const float rgss_x[4] = {-0.375f,  0.125f, -0.125f, 0.375f};
             const float rgss_y[4] = {-0.125f, -0.375f,  0.375f, 0.125f};
-            jx = rgss_x[s & 3u];
-            jy = rgss_y[s & 3u];
+            jx = (s < 4u) ? rgss_x[s] : 0.0f;
+            jy = (s < 4u) ? rgss_y[s] : 0.0f;
         } else {
             bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
             jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
@@ -2076,19 +2188,13 @@ extern "C" __global__ void __raygen__render() {
                         first_roughness = 1.0f;
                     }
                     first_depth = 1e6f;
-                    if (has_prev_cam) {
-                        float pz = f3_dot(dir, prev_fwd);
-                        if (pz > 1e-4f) {
-                            float px_ndc = f3_dot(dir, prev_rgt) / (pz * aspect * prev_tan_fov);
-                            float py_ndc = f3_dot(dir, prev_up)  / (pz * prev_tan_fov);
-                            float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
-                            float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
-                            // Subtract the subpixel jitter used to cast `dir` so static cameras produce 0 motion.
-                            first_motion = make_float2(
-                                prev_x - ((float)idx.x + 0.5f + jx),
-                                prev_y - ((float)idx.y + 0.5f + jy)
-                            );
-                        }
+                    float2 prev_px;
+                    if (has_prev_cam
+                        && project_prev_pixel(proj, dir, prev_fwd, prev_rgt, prev_up, prev_tan_fov, aspect, prev_px))
+                    {
+                        // Relative to the jittered sample position used to cast `dir`, so static
+                        // cameras produce 0 motion.
+                        first_motion = prev_pixel_motion(proj, prev_px, px, py);
                     }
                 }
                 break;
@@ -2111,15 +2217,18 @@ extern "C" __global__ void __raygen__render() {
                 first_has_hit = true;
                 first_world_pos = hit_pos;
                 first_range = f3_len(f3_sub(hit_pos, cam_pos));
-                first_depth = fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd));
+                // depth.Z: Pinhole exports planar camera-space Z along cam_fwd (the convention DLSS
+                // and the denoiser consume). Fisheye180 / Equirect360 / SlitCam have no image plane
+                // (planar Z is 0 or negative behind the camera), so they export Euclidean range.
+                first_depth = (proj == 0u)
+                    ? fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd))
+                    : first_range;
                 float3 prev_world_pos = hit_pos;
                 if (is_csg) {
                     first_sem_id = (p5 >> 16u) & 0xFFFFu;
                     first_part_id = p7;
-                    unsigned int uid = p6 + 1u;
                     if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
                         uint4 meta = load_csg_instance_meta(p6);
-                        if (meta.y != 0u) uid = meta.y;
                         if (has_prev_cam
                             && params.csg_prev_xforms != 0ull
                             && (meta.w & CSG_INST_FLAG_MOTION_BLUR) != 0u)
@@ -2133,26 +2242,20 @@ extern "C" __global__ void __raygen__render() {
                             }
                         }
                     }
-                    first_inst_id = uid;
                 } else {
-                    first_sem_id = (inst_id == 0u) ? 16u : (inst_id + 1u);
-                    first_inst_id = p6 + 1u;
+                    first_sem_id = classic_semantic_id(p6);
                     first_part_id = 0u;
                 }
-                if (has_prev_cam) {
-                    float3 rel = f3_sub(prev_world_pos, prev_pos);
-                    float pz = f3_dot(rel, prev_fwd);
-                    if (pz > 1e-4f) {
-                        float px_ndc = f3_dot(rel, prev_rgt) / (pz * aspect * prev_tan_fov);
-                        float py_ndc = f3_dot(rel, prev_up)  / (pz * prev_tan_fov);
-                        float prev_x = (px_ndc * 0.5f + 0.5f) * (float)params.width;
-                        float prev_y = (0.5f - py_ndc * 0.5f) * (float)params.height;
-                        // Subtract the subpixel jitter used to cast `dir` so static cameras produce 0 motion.
-                        first_motion = make_float2(
-                            prev_x - ((float)idx.x + 0.5f + jx),
-                            prev_y - ((float)idx.y + 0.5f + jy)
-                        );
-                    }
+                first_inst_id = hit_instance_id(p0, p6);
+                float2 prev_px;
+                if (has_prev_cam
+                    && project_prev_pixel(
+                        proj, f3_sub(prev_world_pos, prev_pos),
+                        prev_fwd, prev_rgt, prev_up, prev_tan_fov, aspect, prev_px))
+                {
+                    // Relative to the jittered sample position used to cast `dir`, so static
+                    // cameras produce 0 motion.
+                    first_motion = prev_pixel_motion(proj, prev_px, px, py);
                 }
                 if (aov_geom_only) {
                     // Geometry-only AOVs (Depth/Motion/Semantic/Instance/WorldPos/Range/Cryptomatte)
@@ -2281,25 +2384,7 @@ extern "C" __global__ void __raygen__render() {
                         occluded = trace_shadow(biased_origin, sdir, 1500.0f);
                     }
                     if (!occluded) {
-                        float sun_i = params.fractal_r1[3];
-                        auto sun_tint_for_mode = [&](int m) -> float3 {
-                            if (m == 8) return make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f);
-                            if (m == 1) return make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f);
-                            return make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f);
-                        };
-                        int to_m = (int)(params.sky_params[3] + 0.5f);
-                        float3 sun_rad;
-                        if (params.sky_blend > 1e-4f && params.sky_blend < 0.9999f && (int)params.sky_mode_from != to_m) {
-                            float3 s0 = sun_tint_for_mode((int)params.sky_mode_from);
-                            float3 s1 = sun_tint_for_mode(to_m);
-                            sun_rad = f3_add(f3_mul(s0, 1.0f - params.sky_blend), f3_mul(s1, params.sky_blend));
-                        } else {
-                            sun_rad = ((params.csg_flags & 2u) != 0u)
-                                ? make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f)
-                                : (((params.csg_flags & 8u) != 0u)
-                                    ? make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f)
-                                    : make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f));
-                        }
+                        float3 sun_rad = sun_radiance(params.fractal_r1[3]);
                         float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.85f));
                         float3 half_v = f3_norm(f3_sub(sun_dir, dir));
                         float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
@@ -2434,7 +2519,6 @@ extern "C" __global__ void __raygen__render() {
 
             float metallic = 0.0f;
             float rough = params.sun_dir[3];
-            float horizon_fade = 0.0f;
             if (inst_id == 0u) {
                 // Procedural scratched uneven metal floor (OptiX raytraced)
                 float f_rough = params.floor_params[0];
@@ -2480,12 +2564,6 @@ extern "C" __global__ void __raygen__render() {
                 metallic = params.fractal_r1[0];
             }
 
-            if (horizon_fade >= 0.995f) {
-                float3 sky = sky_color(dir, sun_dir, bounce == 0);
-                sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
-                break;
-            }
-
             if (bounce == 0 && (s == 0u || aov_aa)) {
                 float inv_m = 1.0f - metallic;
                 first_albedo = base_col;
@@ -2522,8 +2600,7 @@ extern "C" __global__ void __raygen__render() {
                     occluded = trace_shadow(biased_origin, sdir, 1000.0f);
                 }
                 if (!occluded) {
-                    float sun_i = params.fractal_r1[3];
-                    float3 sun_rad = make_float3(sun_i, sun_i * 0.93f, sun_i * 0.80f);
+                    float3 sun_rad = sun_radiance(params.fractal_r1[3]);
                     // Energy-balanced diffuse (1 / PI) + specular lobe
                     float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.75f));
                     float3 half_v = f3_norm(f3_sub(sun_dir, dir));
@@ -2534,16 +2611,8 @@ extern "C" __global__ void __raygen__render() {
                     float3 spec_tint = f3_add(make_float3(0.04f, 0.04f, 0.04f), f3_mul(base_col, metallic));
                     float3 spec_term = f3_mul(f3_mul3(spec_tint, sun_rad), spec_val * ndotl);
                     float3 direct = f3_add(diff_term, spec_term);
-                    if (horizon_fade > 0.0f) {
-                        float3 sky_h = sky_color(dir, sun_dir, bounce == 0);
-                        direct = f3_add(f3_mul(direct, 1.0f - horizon_fade), f3_mul(sky_h, horizon_fade));
-                    }
                     sample_col = f3_add(sample_col, f3_mul3(throughput, direct));
                 }
-            }
-            if (horizon_fade > 0.0f) {
-                float3 sky_h = sky_color(dir, sun_dir, bounce == 0);
-                sample_col = f3_add(sample_col, f3_mul3(throughput, f3_mul(sky_h, horizon_fade * 0.5f)));
             }
 
             float3 diff_dir = sample_cosine_hemisphere(n, seed);
@@ -2556,17 +2625,19 @@ extern "C" __global__ void __raygen__render() {
         }
 
         if (aov_aa) {
-            if (s == 0u) {
-                s0_motion = first_motion;
-                s0_depth = first_depth;
-                s0_sem_id = first_sem_id;
-                s0_inst_id = first_inst_id;
-                s0_has_hit = first_has_hit;
-                s0_albedo = first_albedo;
-                s0_normal = first_normal;
-                s0_roughness = first_roughness;
-                s0_diffuse = first_diffuse;
-                s0_specular = first_specular;
+            if (s == 4u) {
+                // Pixel-centre tap: raw outputs only, not part of the displayed RGSS average.
+                ctr_motion = first_motion;
+                ctr_depth = first_depth;
+                ctr_sem_id = first_sem_id;
+                ctr_inst_id = first_inst_id;
+                ctr_has_hit = first_has_hit;
+                ctr_albedo = first_albedo;
+                ctr_normal = first_normal;
+                ctr_roughness = first_roughness;
+                ctr_diffuse = first_diffuse;
+                ctr_specular = first_specular;
+                continue;
             }
             float3 sc = make_float3(0.0f, 0.0f, 0.0f);
             float sw = 1.0f;
@@ -2608,17 +2679,28 @@ extern "C" __global__ void __raygen__render() {
     float inv_spp = 1.0f / (float)spp;
     float3 final_col = aov_aa ? f3_mul(aov_accum, 0.25f) : f3_mul(accum_col, inv_spp);
     float final_w = aov_aa ? (aov_w_accum * 0.25f) : 1.0f;
+    if (aov_aa && params.aov_mode == 7u && aov_w_accum > 0.0f) {
+        // WorldPos: average only the taps that hit (sky taps carry no position); alpha keeps coverage.
+        final_col = f3_mul(aov_accum, 1.0f / aov_w_accum);
+    }
     if (aov_aa) {
-        first_motion = s0_motion;
-        first_depth = s0_depth;
-        first_sem_id = s0_sem_id;
-        first_inst_id = s0_inst_id;
-        first_has_hit = s0_has_hit;
-        first_albedo = s0_albedo;
-        first_normal = s0_normal;
-        first_roughness = s0_roughness;
-        first_diffuse = s0_diffuse;
-        first_specular = s0_specular;
+        first_motion = ctr_motion;
+        first_depth = ctr_depth;
+        first_sem_id = ctr_sem_id;
+        first_inst_id = ctr_inst_id;
+        first_has_hit = ctr_has_hit;
+        first_albedo = ctr_albedo;
+        first_normal = ctr_normal;
+        first_roughness = ctr_roughness;
+        first_diffuse = ctr_diffuse;
+        first_specular = ctr_specular;
+        // The Albedo / Normal AOVs are displayed from albedo_buf / normal_buf: store the RGSS
+        // average there instead of a single tap.
+        if (params.aov_mode == 1u) {
+            first_albedo = final_col;
+        } else if (params.aov_mode == 2u && f3_len(final_col) > 1e-8f) {
+            first_normal = f3_norm(final_col);
+        }
     }
 
     unsigned int out_idx = idx.y * params.width + idx.x;
@@ -2725,11 +2807,12 @@ extern "C" __global__ void __raygen__score_views() {
         out_s.inst_id = uid;
         out_s._pad1 = 0u;
     } else if (p0 != 0u) {
+        // CSG hits above keep the raw user_id for parity with CpuViewProber / WgpuViewProber;
+        // classic geometry uses the render AOV's classic ID and semantic mapping.
         out_s.t = __uint_as_float(p1);
-        unsigned int inst_id = p6 & 0xFFu;
-        out_s.sem_id = (unsigned short)((inst_id == 0u) ? 16u : (inst_id + 1u));
+        out_s.sem_id = (unsigned short)classic_semantic_id(p6);
         out_s._pad0 = 0u;
-        out_s.inst_id = p6;
+        out_s.inst_id = hit_instance_id(p0, p6);
         out_s._pad1 = 0u;
     } else {
         out_s.t = -1.0f;
@@ -2769,16 +2852,8 @@ extern "C" __global__ void __raygen__sdg_keypoints() {
         p0, p1, p2, p3, p4, p5, p6, p7
     );
 
-    unsigned int blocker_uid = 0xFFFFFFFFu;
-    if (p0 == 2u) {
-        if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
-            blocker_uid = load_csg_instance_meta(p6).y;
-        } else {
-            blocker_uid = p6;
-        }
-    } else if (p0 != 0u) {
-        blocker_uid = p6;
-    }
+    // Same IDs as the SDG EXR `instance.id` channel; 0xFFFFFFFF = unobstructed.
+    unsigned int blocker_uid = (p0 != 0u) ? hit_instance_id(p0, p6) : 0xFFFFFFFFu;
     ((unsigned int*)params.sdg_ray_results)[idx.x] = blocker_uid;
 }
 
@@ -2844,6 +2919,12 @@ extern "C" __global__ void __anyhit__omm() {
     }
 }
 
+// True for `__raygen__score_views` / `__raygen__sdg_keypoints` launches (their LaunchParams set the
+// probe or SDG buffers and leave the main-camera fields zeroed); the render launch sets neither.
+static __forceinline__ __device__ bool fractal_aux_launch() {
+    return params.probe_samples != 0ull || params.sdg_ray_results != 0ull;
+}
+
 extern "C" __global__ void __intersection__fractal() {
     float3 orig    = optixGetObjectRayOrigin();
     float3 raw_dir = optixGetObjectRayDirection();
@@ -2878,7 +2959,11 @@ extern "C" __global__ void __intersection__fractal() {
     int max_steps = (int)fmaxf(16.0f, fminf(512.0f, params.fractal_r0[3]));
 
     // Distance from camera to ray origin keeps secondary ray epsilon matched to screen-space scale.
-    float base_cam_dist = f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
+    // Probe / SDG launches start rays at probe eyes and keypoints with zeroed camera fields, so
+    // there the path length is measured from the ray origin itself.
+    float base_cam_dist = fractal_aux_launch()
+        ? 0.0f
+        : f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
     float pixel_angle = (2.0f * fmaxf(params.cam_up[3], 0.05f)) / fmaxf((float)params.height, 64.0f);
 
     float t = t0;
@@ -2966,7 +3051,9 @@ extern "C" __global__ void __intersection__fractal_shadow() {
     float formula_safety = (params.fractal_kind == 0u) ? 0.78f : ((params.fractal_kind == 1u) ? 0.85f : 0.90f);
     float step_fudge = fudge * formula_safety;
     int max_steps = (int)fmaxf(16.0f, fminf(512.0f, params.fractal_r0[3]));
-    float base_cam_dist = f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
+    float base_cam_dist = fractal_aux_launch()
+        ? 0.0f
+        : f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
 
     float t = t0;
     for (int step = 0; step < 512; ++step) {

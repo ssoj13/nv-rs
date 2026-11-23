@@ -6,13 +6,34 @@
 //! `nvjpegStatus_t_NVJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `nvjpeg` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
+use nv_loader::Rejection;
 
 nv_loader::exports_sys! {
     lib: "nvjpeg",
     api: NvjpegApi,
     loader: nvjpeg_api,
-    dll: DllSpec { lib: "nvjpeg", group: Group::Toolkit, windows: &["nvjpeg64_*"], linux: &["libnvjpeg.so.13", "libnvjpeg.so.12", "libnvjpeg.so"] },
+    dll: nv_loader::catalog::NVJPEG.spec,
+    version: runtime_version,
+}
+
+/// Rejects a runtime whose major version is older than the `NVJPEG_VER_MAJOR` of the headers these
+/// bindings were generated from: within a major, NVIDIA keeps struct layouts and enum values
+/// stable; across majors they may differ, which would be silent ABI mismatch.
+fn runtime_version(lib: &api::NvjpegApi) -> Result<(), Rejection> {
+    let get = *lib
+        .nvjpegGetProperty
+        .as_ref()
+        .map_err(|e| format!("nvjpegGetProperty is unavailable: {e}"))?;
+    let mut major = 0;
+    // SAFETY: `nvjpegGetProperty(libraryPropertyType, int*)` (nvjpeg.h) needs no handle or initialisation and
+    // writes one int through the valid, exclusive pointer.
+    let status = unsafe { get(libraryPropertyType_t_MAJOR_VERSION, &mut major) };
+    if status != nvjpegStatus_t_NVJPEG_STATUS_SUCCESS {
+        return Err(format!("nvjpegGetProperty(MAJOR_VERSION) returned {status}").into());
+    }
+    let found = u32::try_from(major)
+        .map_err(|_| format!("nvjpegGetProperty reported major version {major}"))?;
+    nv_loader::check_version(NVJPEG_VER_MAJOR, found)
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// `nvcc` from `CUDA_PATH` / `CUDA_HOME` / `CUDA_ROOT`, else from `PATH`; `None` when absent.
 fn find_nvcc() -> Option<PathBuf> {
     let exe = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
     for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
@@ -17,26 +18,50 @@ fn find_nvcc() -> Option<PathBuf> {
             }
         }
     }
-    Some(PathBuf::from(exe))
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(exe))
+        .find(|p| p.is_file())
 }
 
-fn find_optix_include() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(root) = env::var("OPTIX_ROOT") {
-        candidates.push(PathBuf::from(root).join("include"));
-    }
-    if let Ok(pd) = env::var("ProgramData") {
-        let base = PathBuf::from(pd).join("NVIDIA Corporation");
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("OptiX SDK") {
-                    candidates.push(entry.path().join("include"));
-                }
-            }
+/// `OPTIX_VERSION` (e.g. `90000`) declared by `<include>/optix.h`, if readable.
+fn optix_header_version(include: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(include.join("optix.h")).ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("#define")?.trim_start();
+        let value = rest.strip_prefix("OPTIX_VERSION")?;
+        // Reject longer macro names that merely start with `OPTIX_VERSION`.
+        if !value.starts_with(char::is_whitespace) {
+            return None;
         }
+        value.trim().parse().ok()
+    })
+}
+
+/// OptiX include directory: `OPTIX_ROOT` when it holds `optix.h` (explicit choice wins), else the
+/// `ProgramData/NVIDIA Corporation/OptiX SDK*` install with the highest `OPTIX_VERSION`.
+/// `raytracer.cu` needs the OptiX 8+/9 device API (`optixTraverse`, `optixReorder`), so directory
+/// order (oldest SDK first on NTFS) must not decide.
+fn find_optix_include() -> Option<PathBuf> {
+    if let Ok(root) = env::var("OPTIX_ROOT") {
+        let inc = PathBuf::from(root).join("include");
+        if inc.join("optix.h").is_file() {
+            return Some(inc);
+        }
+        println!(
+            "cargo:warning=OPTIX_ROOT is set but {} has no optix.h; searching installed SDKs",
+            inc.display()
+        );
     }
-    candidates.into_iter().find(|p| p.join("optix.h").is_file())
+    let base = PathBuf::from(env::var_os("ProgramData")?).join("NVIDIA Corporation");
+    std::fs::read_dir(&base)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("OptiX SDK"))
+        .map(|entry| entry.path().join("include"))
+        .filter_map(|inc| optix_header_version(&inc).map(|ver| (ver, inc)))
+        .max_by_key(|(ver, _)| *ver)
+        .map(|(_, inc)| inc)
 }
 
 fn compile_ptx(
@@ -140,14 +165,7 @@ fn stage_dlss_runtime(out_dir: &Path) {
         for dll in ["nvngx_dlss.dll", "nvngx_dlssd.dll"] {
             let src = rel_dir.join(dll);
             if src.is_file() {
-                let dst = target_dir.join(dll);
-                let needs_copy = std::fs::metadata(&dst)
-                    .and_then(|d| Ok((d.len(), std::fs::metadata(&src)?.len())))
-                    .map(|(a, b)| a != b)
-                    .unwrap_or(true);
-                if needs_copy {
-                    let _ = std::fs::copy(&src, &dst);
-                }
+                stage_if_changed(&src, &target_dir.join(dll));
             }
         }
     } else if cfg!(target_os = "linux") {
@@ -159,13 +177,32 @@ fn stage_dlss_runtime(out_dir: &Path) {
                 if name_str.starts_with("libnvidia-ngx-dlss.so")
                     || name_str.starts_with("libnvidia-ngx-dlssd.so")
                 {
-                    let dst = target_dir.join(&name);
-                    if !dst.exists() {
-                        let _ = std::fs::copy(entry.path(), &dst);
-                    }
+                    stage_if_changed(&entry.path(), &target_dir.join(&name));
                 }
             }
         }
+    }
+}
+
+/// Copies `src` over `dst` when `dst` is missing or differs in size or is older (an SDK update),
+/// reporting a failed copy as a cargo warning.
+fn stage_if_changed(src: &Path, dst: &Path) {
+    let up_to_date = match (std::fs::metadata(src), std::fs::metadata(dst)) {
+        (Ok(s), Ok(d)) => {
+            s.len() == d.len()
+                && matches!((s.modified(), d.modified()), (Ok(sm), Ok(dm)) if dm >= sm)
+        }
+        _ => false,
+    };
+    if up_to_date {
+        return;
+    }
+    if let Err(err) = std::fs::copy(src, dst) {
+        println!(
+            "cargo:warning=failed to stage {} -> {}: {err}",
+            src.display(),
+            dst.display()
+        );
     }
 }
 
@@ -186,9 +223,13 @@ fn main() {
     stage_dlss_runtime(&out_dir);
     build_nvtx_shim();
     let Some(nvcc) = find_nvcc() else {
+        println!("cargo:warning=nvcc not found; nv-demo shaders will be compiled at runtime by NVRTC");
         return;
     };
     let Some(optix_inc) = find_optix_include() else {
+        println!(
+            "cargo:warning=OptiX SDK headers not found (set OPTIX_ROOT); nv-demo shaders will be compiled at runtime by NVRTC"
+        );
         return;
     };
 

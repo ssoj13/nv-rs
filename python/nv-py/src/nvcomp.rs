@@ -1,4 +1,10 @@
 //! `nv_rs.nvcomp` — GPU batched compression/decompression over zero-copy `DeviceBuffer`.
+//!
+//! **How.** A `CompressionManager` runs on the stream it was created with: the wrapper's staging
+//! and scratch buffers belong to that stream, so per-call streams are not offered. `compress`
+//! reads a `DeviceBuffer` (`u8`, owned or DLPack import, validated by `buf_util::check_buf`)
+//! under a read lease; both directions block until the stream completes (the wrapper reads the
+//! per-chunk sizes back), and a decompressed buffer records the manager's stream as its producer.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -7,6 +13,8 @@ use nv_loader::diag::{self, Level};
 use nvcomp::{CompressedBuffer, CompressionManager, Format, FormatKind};
 use pyo3::prelude::*;
 
+use crate::buf_util::{Access, check_buf, enqueue_leased};
+use crate::compute::typed_view;
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -26,17 +34,33 @@ py_parse_enum!(
     }
 );
 
+/// Canonical Python name of `kind` (the inverse of [`parse_format_kind`]).
+fn format_kind_name(kind: FormatKind) -> &'static str {
+    match kind {
+        FormatKind::Lz4 => "lz4",
+        FormatKind::Snappy => "snappy",
+        FormatKind::Zstd => "zstd",
+        FormatKind::Cascaded => "cascaded",
+        FormatKind::Gdeflate => "gdeflate",
+        FormatKind::Bitcomp => "bitcomp",
+    }
+}
+
 py_err_mapper!(map_nvcomp_err, "nvcomp", nvcomp::Error, {
-    nvcomp::Error::Load(_) => ErrorKind::LibraryNotFound,
-    nvcomp::Error::Invalid(_) | nvcomp::Error::Unsupported(_) => ErrorKind::InvalidArgument,
-    _ => ErrorKind::Cuda,
+    nvcomp::Error::Load(_) | nvcomp::Error::Call(_) => ErrorKind::LibraryNotFound,
+    nvcomp::Error::Invalid(_) | nvcomp::Error::Unsupported(_) | nvcomp::Error::Budget { .. } => {
+        ErrorKind::InvalidArgument
+    },
+    nvcomp::Error::Driver(_) | nvcomp::Error::Status { .. } | nvcomp::Error::BitcompStatus { .. } => {
+        ErrorKind::Cuda
+    },
 });
 
 /// Self-describing GPU compressed payload produced by [`PyCompressionManager::compress`].
 #[pyclass(name = "CompressedBuffer", module = "nv_rs.nvcomp")]
 pub struct PyCompressedBuffer {
     pub inner: CompressedBuffer,
-    format_name: String,
+    format_name: &'static str,
     device_id: i32,
 }
 
@@ -76,7 +100,7 @@ impl PyCompressedBuffer {
 
     #[getter]
     fn format(&self) -> &str {
-        &self.format_name
+        self.format_name
     }
 
     #[getter]
@@ -100,14 +124,16 @@ impl PyCompressedBuffer {
 pub struct PyCompressionManager {
     inner: Arc<Mutex<CompressionManager>>,
     stream: PyStream,
-    format_name: String,
+    format_name: &'static str,
 }
 
 #[pymethods]
 impl PyCompressionManager {
+    /// Creates a manager for `format` on `stream` (every call runs there), GIL-free.
     #[new]
     #[pyo3(signature = (stream, format="lz4", chunk_size=65536, budget=None))]
     fn new(
+        py: Python<'_>,
         stream: &PyStream,
         format: &str,
         chunk_size: usize,
@@ -115,46 +141,58 @@ impl PyCompressionManager {
     ) -> PyResult<Self> {
         let kind = parse_format_kind(format)?;
         let fmt = Format::default_for(kind);
-        let mgr = CompressionManager::new(&stream.inner, fmt, chunk_size, budget)
+        let s = stream.inner.clone();
+        let mgr = py
+            .detach(move || CompressionManager::new(&s, fmt, chunk_size, budget))
             .map_err(|e| map_nvcomp_err("CompressionManager::new", e))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(mgr)),
             stream: stream.clone(),
-            format_name: format.to_ascii_lowercase(),
+            format_name: format_kind_name(kind),
         })
     }
 
-    /// Compresses a `DeviceBuffer` asynchronously on `stream` (or the manager's stream), GIL-free.
-    #[pyo3(signature = (input, stream=None))]
-    fn compress(
-        &self,
-        py: Python<'_>,
-        input: &PyDeviceBuffer,
-        stream: Option<&PyStream>,
-    ) -> PyResult<PyCompressedBuffer> {
-        let s = stream.unwrap_or(&self.stream).clone();
-        let dev_in = input
-            .owned_cuda_buf()
-            .ok_or_else(|| {
+    /// Compresses a `DeviceBuffer` (`u8`) on the manager's stream, GIL-free; returns when done.
+    fn compress(&self, py: Python<'_>, input: &PyDeviceBuffer) -> PyResult<PyCompressedBuffer> {
+        let s = self.stream.inner.clone();
+        check_buf(
+            "nvcomp",
+            "compress",
+            "input",
+            input,
+            &["u8"],
+            0,
+            s.context(),
+        )?;
+        let view = typed_view::<u8>("nvcomp", "compress", "input", input, input.byte_len())?;
+        let mgr_arc = self.inner.clone();
+        let t0 = Instant::now();
+        let compressed = py.detach(move || -> PyResult<CompressedBuffer> {
+            let mut mgr = mgr_arc.lock().map_err(|_| {
                 record_and_err(
                     "nvcomp",
                     "compress",
-                    "compress requires an nv_rs-owned DeviceBuffer (use DeviceBuffer.from_buffer)",
+                    "manager mutex poisoned",
                     ErrorKind::InvalidArgument,
                 )
-            })?
-            .clone();
-        let mgr_arc = self.inner.clone();
-        let fmt_name = self.format_name.clone();
-        let t0 = Instant::now();
-        let compressed = py
-            .detach(move || {
-                let mut mgr = mgr_arc
-                    .lock()
-                    .map_err(|_| nvcomp::Error::Invalid("manager mutex poisoned"))?;
-                mgr.compress_async(&s.inner, &dev_in)
+            })?;
+            let mut out = None;
+            enqueue_leased("nvcomp", "compress", &s, [(input, Access::Read)], || {
+                out = Some(
+                    mgr.compress_async(&s, &view)
+                        .map_err(|e| map_nvcomp_err("compress", e))?,
+                );
+                Ok(())
+            })?;
+            out.ok_or_else(|| {
+                record_and_err(
+                    "nvcomp",
+                    "compress",
+                    "compression produced no output",
+                    ErrorKind::Runtime,
+                )
             })
-            .map_err(|e| map_nvcomp_err("compress", e))?;
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -162,7 +200,7 @@ impl PyCompressionManager {
             "compress",
             format!(
                 "fmt={} {}->{} B",
-                fmt_name,
+                self.format_name,
                 compressed.layout.uncompressed_bytes,
                 compressed.data.len()
             ),
@@ -172,32 +210,30 @@ impl PyCompressionManager {
 
         Ok(PyCompressedBuffer {
             inner: compressed,
-            format_name: fmt_name,
-            device_id: s.device_id,
+            format_name: self.format_name,
+            device_id: self.stream.device_id,
         })
     }
 
-    /// Decompresses a `CompressedBuffer` into a new `DeviceBuffer` (supports DLPack), GIL-free.
-    #[pyo3(signature = (compressed, stream=None))]
+    /// Decompresses a `CompressedBuffer` into a new `DeviceBuffer` (`u8`, supports DLPack) on the
+    /// manager's stream, GIL-free; returns when done.
     fn decompress(
         &self,
         py: Python<'_>,
         compressed: &PyCompressedBuffer,
-        stream: Option<&PyStream>,
     ) -> PyResult<PyDeviceBuffer> {
-        let s = stream.unwrap_or(&self.stream).clone();
+        let s = self.stream.inner.clone();
         let mgr_arc = self.inner.clone();
         let t0 = Instant::now();
-        // Borrow `compressed.inner` across `py.detach` by cloning layout/stream? `decompress_to_buffer_async` takes `&CompressedBuffer`.
-        // Since `&PyCompressedBuffer` stays pinned under GIL while Python holds it, we can pass a reference inside `detach`?
-        // No: `detach` requires `Send + Sync` / `'static`? No, `py.detach` only requires `Ungil` (Send)!
+        // `py.detach` needs only `Send` captures: `&CompressedBuffer` is one, and the GIL-held
+        // borrow of `compressed` outlives the call.
         let comp_ref = &compressed.inner;
         let dev_out = py
             .detach(|| {
                 let mut mgr = mgr_arc
                     .lock()
                     .map_err(|_| nvcomp::Error::Invalid("manager mutex poisoned"))?;
-                mgr.decompress_to_buffer_async(&s.inner, comp_ref)
+                mgr.decompress_to_buffer_async(&s, comp_ref)
             })
             .map_err(|e| map_nvcomp_err("decompress", e))?;
 
@@ -211,12 +247,15 @@ impl PyCompressionManager {
             true,
         );
 
-        Ok(PyDeviceBuffer::from_owned_cuda(
-            dev_out,
-            s.device_id,
-            "u8",
-            vec![nbytes as i64],
-        ))
+        let len = i64::try_from(nbytes).map_err(|_| {
+            record_and_err(
+                "nvcomp",
+                "decompress",
+                format!("decompressed size {nbytes} does not fit i64"),
+                ErrorKind::InvalidArgument,
+            )
+        })?;
+        PyDeviceBuffer::from_owned_cuda(dev_out, "u8", vec![len], &s)
     }
 }
 
@@ -226,4 +265,18 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<PyCompressedBuffer>()?;
         m.add_class::<PyCompressionManager>()?;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_kind_name_round_trips_through_the_parser() {
+        for name in ["lz4", "snappy", "zstd", "cascaded", "gdeflate", "bitcomp"] {
+            let kind = parse_format_kind(&format!(" {} ", name.to_ascii_uppercase()))
+                .expect("known format");
+            assert_eq!(format_kind_name(kind), name);
+        }
+    }
 }

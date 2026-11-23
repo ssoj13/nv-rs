@@ -6,13 +6,11 @@
 //! `cublasStatus_t_CUBLAS_STATUS_NOT_SUPPORTED` when a symbol is missing — never a panic.
 //! **Used by** a future safe `cublaslt` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "cublaslt",
     api: CublasLtApi,
     loader: cublaslt_api,
-    dll: DllSpec { lib: "cublaslt", group: Group::Toolkit, windows: &["cublasLt64_*"], linux: &["libcublasLt.so.13", "libcublasLt.so"] },
+    dll: nv_loader::catalog::CUBLASLT.spec,
 }
 
 #[cfg(test)]

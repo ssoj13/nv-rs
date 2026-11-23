@@ -6,13 +6,11 @@
 //! `nvrtcResult_NVRTC_ERROR_INTERNAL_ERROR` when a symbol is missing — never a panic. NVRTC has no dedicated not-loaded or missing-symbol codes, so both report INTERNAL_ERROR; use load() to tell them apart.
 //! **Used by** a future safe `nvrtc` crate; call [`load`] for a diagnosable load error.
 
-use nv_loader::{DllSpec, Group};
-
 nv_loader::exports_sys! {
     lib: "nvrtc",
     api: NvrtcApi,
     loader: nvrtc_api,
-    dll: DllSpec { lib: "nvrtc", group: Group::Toolkit, windows: &["nvrtc64_*"], linux: &["libnvrtc.so.13", "libnvrtc.so"] },
+    dll: nv_loader::catalog::NVRTC.spec,
 }
 
 #[cfg(test)]

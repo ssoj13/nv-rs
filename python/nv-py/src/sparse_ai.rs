@@ -1,4 +1,13 @@
 //! `nv_rs.cusparse`, `nv_rs.cusolver`, and `nv_rs.cudnn` — GIL-free sparse/dense linear algebra and DNN bindings over zero-copy `DeviceBuffer`.
+//!
+//! **How.** Each call validates its buffers with `buf_util::check_buf` and runs the native work
+//! inside `buf_util::enqueue_leased`, so the Python buffers stay allocated until it completes.
+//! cuSPARSE SpMV and the cuSOLVER Dn calls go through the safe wrappers (`cusparse::spmv`,
+//! `cusolver::DnHandle::{getrf, getrs, potrf, potrs}`) on typed views (`compute::typed_view`).
+//! cuDNN activation/softmax stay raw calls: `cudnn::activation_forward` / `softmax_forward`
+//! compare the buffer's context with `Arc::ptr_eq`, which rejects DLPack imports and buffers made
+//! on another `Stream(0)` object (`cuda_core::Context::new` returns a new `Arc` per call), while
+//! `check_buf` compares contexts by value.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -10,17 +19,19 @@ use cudnn::{
     NanPropagation, SoftmaxAlgo, SoftmaxMode, TensorDescriptor, TensorFormat,
 };
 use cusolver::dn::{validate_getrf, validate_getrs, validate_potrf, validate_potrs};
-use cusolver::{DnFloat, DnHandle as CusolverDnInnerHandle, Scratch as CusolverScratch};
-use cusparse::descr::validate_csr;
-use cusparse::ops::validate_spmv_dims;
+use cusolver::{
+    DnHandle as CusolverDnInnerHandle, FillMode as CusolverFillMode, Op as CusolverOp,
+    Scratch as CusolverScratch,
+};
 use cusparse::{
-    DataType as CusparseDataType, Handle as CusparseInnerHandle, IndexType, Op as CusparseOp,
-    Scratch as CusparseScratch,
+    DataType as CusparseDataType, DnVecDescr, Handle as CusparseInnerHandle, IndexBase,
+    Op as CusparseOp, Scratch as CusparseScratch, SpMatDescr, SpMvAlg,
 };
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
-use crate::buf_util::{buf_ptr_and_bytes, validate_dev_buf};
+use crate::buf_util::{Access, check_buf, enqueue_leased};
+use crate::compute::{poisoned, typed_view};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -48,46 +59,26 @@ fn check_cusparse_status(
     }
 }
 
-/// RAII guard for a raw `cusparseSpMatDescr_t` created from `PyDeviceBuffer` pointers.
-struct RawSpMatGuard {
-    raw: cusparse::sys::cusparseSpMatDescr_t,
-}
-
-impl Drop for RawSpMatGuard {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            // SAFETY: `self.raw` was created by `cusparseCreateCsr` and is destroyed once.
-            let _ = unsafe { cusparse::sys::cusparseDestroySpMat(self.raw.cast_const()) };
-            self.raw = std::ptr::null_mut();
-        }
-    }
-}
-
-/// RAII guard for a raw `cusparseDnVecDescr_t` created from a `PyDeviceBuffer` pointer.
-struct RawDnVecGuard {
-    raw: cusparse::sys::cusparseDnVecDescr_t,
-}
-
-impl Drop for RawDnVecGuard {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            // SAFETY: `self.raw` was created by `cusparseCreateDnVec` and is destroyed once.
-            let _ = unsafe { cusparse::sys::cusparseDestroyDnVec(self.raw.cast_const()) };
-            self.raw = std::ptr::null_mut();
-        }
-    }
-}
-
 /// Returns the cuSPARSE library version (`major * 1000 + minor * 100 + patch`), GIL-free.
+///
+/// Uses `cusparseGetProperty`, so no CUDA context is created or made current.
 #[pyfunction]
 #[pyo3(name = "version")]
 fn cusparse_version(py: Python<'_>) -> PyResult<i32> {
     let t0 = Instant::now();
     let ver = py
         .detach(|| -> cusparse::Result<i32> {
-            let ctx = Context::new(0)?;
-            let handle = CusparseInnerHandle::new(&ctx)?;
-            handle.version()
+            cusparse::sys::load().map_err(|e| cusparse::Error::Unavailable(e.to_string()))?;
+            let property = |kind: cusparse::sys::libraryPropertyType| {
+                let mut value = 0;
+                // SAFETY: `value` is a valid out-pointer; the property query needs no handle.
+                let code = unsafe { cusparse::sys::cusparseGetProperty(kind, &mut value) };
+                check_cusparse_status("cusparseGetProperty", code).map(|()| value)
+            };
+            let major = property(cusparse::sys::libraryPropertyType_t_MAJOR_VERSION)?;
+            let minor = property(cusparse::sys::libraryPropertyType_t_MINOR_VERSION)?;
+            let patch = property(cusparse::sys::libraryPropertyType_t_PATCH_LEVEL)?;
+            Ok(major * 1000 + minor * 100 + patch)
         })
         .map_err(|e| map_cusparse_err("version", e))?;
 
@@ -112,6 +103,9 @@ struct CusparseState {
 #[pyclass(name = "CusparseHandle", module = "nv_rs.cusparse")]
 pub struct PyCusparseHandle {
     state: Arc<Mutex<CusparseState>>,
+    /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
+    ctx: Arc<Context>,
+    device_id: i32,
 }
 
 #[pymethods]
@@ -145,6 +139,8 @@ impl PyCusparseHandle {
 
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
+            ctx: stream.inner.context().clone(),
+            device_id: stream.device_id,
         })
     }
 
@@ -190,6 +186,9 @@ impl PyCusparseHandle {
     }
 
     /// Executes CSR single-precision SpMV: `y = alpha * op(A) * x + beta * y`, GIL-free.
+    ///
+    /// `row_offsets`/`col_ind` are `i32`, `values`/`x`/`y` are `f32`; `x` and `y` may be longer
+    /// than `op(A)` needs (only the leading elements are used).
     #[pyo3(signature = (row_offsets, col_ind, values, x, y, rows, cols, nnz, alpha=1.0, beta=0.0, transpose=false))]
     #[expect(
         clippy::too_many_arguments,
@@ -198,11 +197,11 @@ impl PyCusparseHandle {
     fn spmv_f32(
         &self,
         py: Python<'_>,
-        row_offsets: &Bound<'_, PyDeviceBuffer>,
-        col_ind: &Bound<'_, PyDeviceBuffer>,
-        values: &Bound<'_, PyDeviceBuffer>,
-        x: &Bound<'_, PyDeviceBuffer>,
-        y: &Bound<'_, PyDeviceBuffer>,
+        row_offsets: &PyDeviceBuffer,
+        col_ind: &PyDeviceBuffer,
+        values: &PyDeviceBuffer,
+        x: &PyDeviceBuffer,
+        y: &PyDeviceBuffer,
         rows: i64,
         cols: i64,
         nnz: i64,
@@ -210,196 +209,110 @@ impl PyCusparseHandle {
         beta: f32,
         transpose: bool,
     ) -> PyResult<()> {
+        let invalid =
+            |msg: &str| record_and_err("cusparse", "spmv_f32", msg, ErrorKind::InvalidArgument);
         if !alpha.is_finite() || !beta.is_finite() {
-            return Err(record_and_err(
-                "cusparse",
-                "spmv_f32",
-                "alpha and beta must be finite",
-                ErrorKind::InvalidArgument,
-            ));
+            return Err(invalid("alpha and beta must be finite"));
         }
-
-        let (row_ptr, row_bytes) = buf_ptr_and_bytes(row_offsets);
-        let (col_ptr, col_bytes) = buf_ptr_and_bytes(col_ind);
-        let (val_ptr, val_bytes) = buf_ptr_and_bytes(values);
-        let (x_ptr, x_bytes) = buf_ptr_and_bytes(x);
-        let (y_ptr, y_bytes) = buf_ptr_and_bytes(y);
-
-        validate_csr(
-            rows,
-            cols,
-            nnz,
-            row_bytes,
-            col_bytes,
-            val_bytes,
-            IndexType::I32,
-            IndexType::I32,
-            CusparseDataType::F32,
-        )
-        .map_err(|e| map_cusparse_err("spmv_f32", e))?;
-
-        let op_enum = if transpose {
-            CusparseOp::Transpose
-        } else {
-            CusparseOp::NonTranspose
+        let to_len = |v: i64| {
+            usize::try_from(v).map_err(|_| invalid("CSR rows, cols, and nnz must be non-negative"))
         };
-        let x_elems = (x_bytes / size_of::<f32>()) as i64;
-        let y_elems = (y_bytes / size_of::<f32>()) as i64;
-        let (eff_rows, eff_cols) = if transpose {
-            (cols, rows)
+        let (n_rows, n_cols, n_nnz) = (to_len(rows)?, to_len(cols)?, to_len(nnz)?);
+        let row_len = n_rows
+            .checked_add(1)
+            .ok_or_else(|| invalid("CSR row count overflow"))?;
+        let (op, x_len, y_len) = if transpose {
+            (CusparseOp::Transpose, n_rows, n_cols)
         } else {
-            (rows, cols)
+            (CusparseOp::NonTranspose, n_cols, n_rows)
         };
 
-        validate_spmv_dims(op_enum, rows, cols, eff_cols, eff_rows)
-            .map_err(|e| map_cusparse_err("spmv_f32", e))?;
-        if x_elems < eff_cols || y_elems < eff_rows {
-            return Err(record_and_err(
-                "cusparse",
-                "spmv_f32",
-                format!(
-                    "vector buffer too small: x has {x_elems} f32s (need {eff_cols}), y has {y_elems} f32s (need {eff_rows})"
-                ),
-                ErrorKind::InvalidArgument,
-            ));
-        }
-
-        let req_row = (rows as usize + 1) * size_of::<i32>();
-        let req_col = (nnz as usize) * size_of::<i32>();
-        let req_val = (nnz as usize) * size_of::<f32>();
-        let req_x = (eff_cols as usize) * size_of::<f32>();
-        let req_y = (eff_rows as usize) * size_of::<f32>();
-
-        validate_dev_buf(
-            "cusparse",
-            "spmv_f32",
+        let ctx = &self.ctx;
+        let (cat, op_name) = ("cusparse", "spmv_f32");
+        check_buf(
+            cat,
+            op_name,
             "row_offsets",
-            row_ptr,
-            row_bytes,
-            req_row,
+            row_offsets,
+            &["i32"],
+            row_len,
+            ctx,
         )?;
-        validate_dev_buf(
-            "cusparse", "spmv_f32", "col_ind", col_ptr, col_bytes, req_col,
-        )?;
-        validate_dev_buf(
-            "cusparse", "spmv_f32", "values", val_ptr, val_bytes, req_val,
-        )?;
-        validate_dev_buf("cusparse", "spmv_f32", "x", x_ptr, x_bytes, req_x)?;
-        validate_dev_buf("cusparse", "spmv_f32", "y", y_ptr, y_bytes, req_y)?;
-
-        let op_sys = if transpose {
-            cusparse::sys::cusparseOperation_t_CUSPARSE_OPERATION_TRANSPOSE
-        } else {
-            cusparse::sys::cusparseOperation_t_CUSPARSE_OPERATION_NON_TRANSPOSE
-        };
+        check_buf(cat, op_name, "col_ind", col_ind, &["i32"], n_nnz, ctx)?;
+        check_buf(cat, op_name, "values", values, &["f32"], n_nnz, ctx)?;
+        check_buf(cat, op_name, "x", x, &["f32"], x_len, ctx)?;
+        check_buf(cat, op_name, "y", y, &["f32"], y_len, ctx)?;
+        let row_v = typed_view::<i32>(cat, op_name, "row_offsets", row_offsets, row_len)?;
+        let col_v = typed_view::<i32>(cat, op_name, "col_ind", col_ind, n_nnz)?;
+        let val_v = typed_view::<f32>(cat, op_name, "values", values, n_nnz)?;
+        // Exactly the lengths `op(A)` needs: the wrapper requires vector length == op(A) extent.
+        let x_v = typed_view::<f32>(cat, op_name, "x", x, x_len)?;
+        let y_v = typed_view::<f32>(cat, op_name, "y", y, y_len)?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cusparse::Result<()> {
+        py.detach(move || -> PyResult<()> {
+            let map = |e| map_cusparse_err("spmv_f32", e);
             let mut guard = state_arc
                 .lock()
-                .map_err(|_| cusparse::Error::InvalidInput("cusparse handle mutex poisoned"))?;
-            guard.handle.cuda().bind_to_thread()?;
-            guard.handle.set_stream(&guard.stream.inner)?;
-
-            let mut mat_raw: cusparse::sys::cusparseSpMatDescr_t = std::ptr::null_mut();
-            // SAFETY: CSR buffer sizes and pointers were validated above on the active context.
-            check_cusparse_status("cusparseCreateCsr", unsafe {
-                cusparse::sys::cusparseCreateCsr(
-                    &mut mat_raw,
+                .map_err(|_| poisoned("cusparse", "spmv_f32"))?;
+            let CusparseState {
+                handle,
+                scratch,
+                stream,
+            } = &mut *guard;
+            let stream = &stream.inner;
+            let cuda = handle.cuda().clone();
+            // SAFETY: the views share the Python buffers' storage; the descriptors are used only
+            // by the SpMV below, whose leases keep that storage allocated until it completes, and
+            // are dropped at the end of this closure.
+            let mat = unsafe {
+                SpMatDescr::csr(
+                    &cuda,
                     rows,
                     cols,
                     nnz,
-                    row_ptr as usize as *mut c_void,
-                    col_ptr as usize as *mut c_void,
-                    val_ptr as usize as *mut c_void,
-                    cusparse::sys::cusparseIndexType_t_CUSPARSE_INDEX_32I,
-                    cusparse::sys::cusparseIndexType_t_CUSPARSE_INDEX_32I,
-                    cusparse::sys::cusparseIndexBase_t_CUSPARSE_INDEX_BASE_ZERO,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
+                    &row_v,
+                    &col_v,
+                    &val_v,
+                    IndexBase::Zero,
                 )
-            })?;
-            let mat_guard = RawSpMatGuard { raw: mat_raw };
-
-            let mut x_raw: cusparse::sys::cusparseDnVecDescr_t = std::ptr::null_mut();
-            // SAFETY: `x_ptr` is validated for `eff_cols` `f32` elements.
-            check_cusparse_status("cusparseCreateDnVec", unsafe {
-                cusparse::sys::cusparseCreateDnVec(
-                    &mut x_raw,
-                    eff_cols,
-                    x_ptr as usize as *mut c_void,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
-                )
-            })?;
-            let x_guard = RawDnVecGuard { raw: x_raw };
-
-            let mut y_raw: cusparse::sys::cusparseDnVecDescr_t = std::ptr::null_mut();
-            // SAFETY: `y_ptr` is validated for `eff_rows` `f32` elements.
-            check_cusparse_status("cusparseCreateDnVec", unsafe {
-                cusparse::sys::cusparseCreateDnVec(
-                    &mut y_raw,
-                    eff_rows,
-                    y_ptr as usize as *mut c_void,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
-                )
-            })?;
-            let y_guard = RawDnVecGuard { raw: y_raw };
-
-            let mut ws_size = 0usize;
-            // SAFETY: Descriptors and host scalars `alpha`/`beta` are valid for this call.
-            check_cusparse_status("cusparseSpMV_bufferSize", unsafe {
-                cusparse::sys::cusparseSpMV_bufferSize(
-                    guard.handle.raw(),
-                    op_sys,
-                    std::ptr::from_ref(&alpha).cast::<c_void>(),
-                    mat_guard.raw.cast_const(),
-                    x_guard.raw.cast_const(),
-                    std::ptr::from_ref(&beta).cast::<c_void>(),
-                    y_guard.raw,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
-                    cusparse::sys::cusparseSpMVAlg_t_CUSPARSE_SPMV_ALG_DEFAULT,
-                    &mut ws_size,
-                )
-            })?;
-
-            let stream = guard.stream.inner.clone();
-            let (ws_ptr, _) = guard
-                .scratch
-                .reserve_with_budget(&stream, ws_size, usize::MAX)?;
-
-            // SAFETY: `ws_ptr` spans at least `ws_size` bytes on `stream`; descriptors are live.
-            check_cusparse_status("cusparseSpMV_preprocess", unsafe {
-                cusparse::sys::cusparseSpMV_preprocess(
-                    guard.handle.raw(),
-                    op_sys,
-                    std::ptr::from_ref(&alpha).cast::<c_void>(),
-                    mat_guard.raw.cast_const(),
-                    x_guard.raw.cast_const(),
-                    std::ptr::from_ref(&beta).cast::<c_void>(),
-                    y_guard.raw,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
-                    cusparse::sys::cusparseSpMVAlg_t_CUSPARSE_SPMV_ALG_DEFAULT,
-                    ws_ptr,
-                )
-            })?;
-
-            // SAFETY: `ws_ptr` spans at least `ws_size` bytes on `stream`; descriptors are live.
-            check_cusparse_status("cusparseSpMV", unsafe {
-                cusparse::sys::cusparseSpMV(
-                    guard.handle.raw(),
-                    op_sys,
-                    std::ptr::from_ref(&alpha).cast::<c_void>(),
-                    mat_guard.raw.cast_const(),
-                    x_guard.raw.cast_const(),
-                    std::ptr::from_ref(&beta).cast::<c_void>(),
-                    y_guard.raw,
-                    cusparse::sys::cudaDataType_t_CUDA_R_32F,
-                    cusparse::sys::cusparseSpMVAlg_t_CUSPARSE_SPMV_ALG_DEFAULT,
-                    ws_ptr,
-                )
-            })
-        })
-        .map_err(|e| map_cusparse_err("spmv_f32", e))?;
+            }
+            .map_err(map)?;
+            // SAFETY: as for `mat`.
+            let vec_x = unsafe { DnVecDescr::new(&cuda, &x_v) }.map_err(map)?;
+            // SAFETY: as for `mat`.
+            let mut vec_y = unsafe { DnVecDescr::new(&cuda, &y_v) }.map_err(map)?;
+            enqueue_leased(
+                "cusparse",
+                "spmv_f32",
+                stream,
+                [
+                    (row_offsets, Access::Read),
+                    (col_ind, Access::Read),
+                    (values, Access::Read),
+                    (x, Access::Read),
+                    (y, Access::Write),
+                ],
+                || {
+                    cusparse::spmv(
+                        handle,
+                        stream,
+                        op,
+                        &alpha,
+                        &mat,
+                        &vec_x,
+                        &beta,
+                        &mut vec_y,
+                        CusparseDataType::F32,
+                        SpMvAlg::Default,
+                        scratch,
+                        usize::MAX,
+                    )
+                    .map_err(map)
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -413,10 +326,7 @@ impl PyCusparseHandle {
     }
 
     fn __repr__(&self) -> String {
-        match self.state.lock() {
-            Ok(g) => format!("CusparseHandle(device_id={})", g.stream.device_id),
-            Err(_) => "CusparseHandle(<poisoned>)".to_owned(),
-        }
+        format!("CusparseHandle(device_id={})", self.device_id)
     }
 }
 
@@ -442,6 +352,9 @@ struct CusolverDnState {
 #[pyclass(name = "CusolverDnHandle", module = "nv_rs.cusolver")]
 pub struct PyCusolverDnHandle {
     state: Arc<Mutex<CusolverDnState>>,
+    /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
+    ctx: Arc<Context>,
+    device_id: i32,
 }
 
 #[pymethods]
@@ -475,6 +388,8 @@ impl PyCusolverDnHandle {
 
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
+            ctx: stream.inner.context().clone(),
+            device_id: stream.device_id,
         })
     }
 
@@ -508,6 +423,8 @@ impl PyCusolverDnHandle {
     }
 
     /// Computes in-place single-precision LU factorization `P * A = L * U` (column-major), GIL-free.
+    ///
+    /// `a` is `f32`; `ipiv` and `dev_info` are `i32`.
     #[pyo3(signature = (a, ipiv, dev_info, m, n, lda=None))]
     #[expect(
         clippy::too_many_arguments,
@@ -516,85 +433,60 @@ impl PyCusolverDnHandle {
     fn getrf_f32(
         &self,
         py: Python<'_>,
-        a: &Bound<'_, PyDeviceBuffer>,
-        ipiv: &Bound<'_, PyDeviceBuffer>,
-        dev_info: &Bound<'_, PyDeviceBuffer>,
+        a: &PyDeviceBuffer,
+        ipiv: &PyDeviceBuffer,
+        dev_info: &PyDeviceBuffer,
         m: i32,
         n: i32,
         lda: Option<i32>,
     ) -> PyResult<()> {
         let lda = lda.unwrap_or_else(|| m.max(1));
-        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a);
-        let (ipiv_ptr, ipiv_bytes) = buf_ptr_and_bytes(ipiv);
-        let (info_ptr, info_bytes) = buf_ptr_and_bytes(dev_info);
-
-        validate_getrf(
-            m,
-            n,
-            lda,
-            a_bytes / size_of::<f32>(),
-            ipiv_bytes / size_of::<i32>(),
-            info_bytes / size_of::<i32>(),
-        )
-        .map_err(|e| map_cusolver_err("getrf_f32", e))?;
-
-        let req_a = if n > 0 {
-            (lda as usize) * (n as usize) * size_of::<f32>()
-        } else {
-            0
-        };
-        let req_ipiv = (m.min(n).max(0) as usize) * size_of::<i32>();
-        validate_dev_buf("cusolver", "getrf_f32", "a", a_ptr, a_bytes, req_a)?;
-        validate_dev_buf(
-            "cusolver",
-            "getrf_f32",
-            "ipiv",
-            ipiv_ptr,
-            ipiv_bytes,
-            req_ipiv,
-        )?;
-        validate_dev_buf(
-            "cusolver",
-            "getrf_f32",
-            "dev_info",
-            info_ptr,
-            info_bytes,
-            size_of::<i32>(),
-        )?;
+        let (cat, op) = ("cusolver", "getrf_f32");
+        check_buf(cat, op, "a", a, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "ipiv", ipiv, &["i32"], 0, &self.ctx)?;
+        check_buf(cat, op, "dev_info", dev_info, &["i32"], 0, &self.ctx)?;
+        validate_getrf(m, n, lda, a.numel(), ipiv.numel(), dev_info.numel())
+            .map_err(|e| map_cusolver_err(op, e))?;
+        let mut a_v = typed_view::<f32>(cat, op, "a", a, a.numel())?;
+        let mut ipiv_v = typed_view::<i32>(cat, op, "ipiv", ipiv, ipiv.numel())?;
+        let mut info_v = typed_view::<i32>(cat, op, "dev_info", dev_info, dev_info.numel())?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cusolver::Result<()> {
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| cusolver::Error::InvalidInput("cusolver handle mutex poisoned"))?;
-            guard.handle.cuda().bind_to_thread()?;
-            guard.handle.set_stream(&guard.stream.inner)?;
-
-            let a_dev = a_ptr as usize as *mut f32;
-            // SAFETY: `guard.handle` is bound to `guard.stream` and `a_dev` spans `lda * n` `f32`s.
-            let lwork = unsafe {
-                <f32 as DnFloat>::getrf_buffer_size(guard.handle.raw(), m, n, a_dev, lda)
-            }?;
-            let stream = guard.stream.inner.clone();
-            let (ws, _) = guard
-                .scratch
-                .reserve_elements::<f32>(&stream, lwork, usize::MAX)?;
-            // SAFETY: All device pointers and workspace `ws` were validated for `getrf`.
-            unsafe {
-                <f32 as DnFloat>::getrf(
-                    guard.handle.raw(),
-                    m,
-                    n,
-                    a_dev,
-                    lda,
-                    ws,
-                    ipiv_ptr as usize as *mut i32,
-                    info_ptr as usize as *mut i32,
-                )
-            }
-        })
-        .map_err(|e| map_cusolver_err("getrf_f32", e))?;
+        py.detach(move || -> PyResult<()> {
+            let mut guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let CusolverDnState {
+                handle,
+                scratch,
+                stream,
+            } = &mut *guard;
+            let stream = &stream.inner;
+            enqueue_leased(
+                cat,
+                op,
+                stream,
+                [
+                    (a, Access::Write),
+                    (ipiv, Access::Write),
+                    (dev_info, Access::Write),
+                ],
+                || {
+                    handle
+                        .getrf(
+                            stream,
+                            m,
+                            n,
+                            &mut a_v,
+                            lda,
+                            &mut ipiv_v,
+                            &mut info_v,
+                            scratch,
+                            usize::MAX,
+                        )
+                        .map_err(|e| map_cusolver_err(op, e))
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -616,10 +508,10 @@ impl PyCusolverDnHandle {
     fn getrs_f32(
         &self,
         py: Python<'_>,
-        a: &Bound<'_, PyDeviceBuffer>,
-        ipiv: &Bound<'_, PyDeviceBuffer>,
-        b: &Bound<'_, PyDeviceBuffer>,
-        dev_info: &Bound<'_, PyDeviceBuffer>,
+        a: &PyDeviceBuffer,
+        ipiv: &PyDeviceBuffer,
+        b: &PyDeviceBuffer,
+        dev_info: &PyDeviceBuffer,
         n: i32,
         nrhs: i32,
         lda: Option<i32>,
@@ -628,84 +520,66 @@ impl PyCusolverDnHandle {
     ) -> PyResult<()> {
         let lda = lda.unwrap_or_else(|| n.max(1));
         let ldb = ldb.unwrap_or_else(|| n.max(1));
-        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a);
-        let (ipiv_ptr, ipiv_bytes) = buf_ptr_and_bytes(ipiv);
-        let (b_ptr, b_bytes) = buf_ptr_and_bytes(b);
-        let (info_ptr, info_bytes) = buf_ptr_and_bytes(dev_info);
-
+        let (cat, op) = ("cusolver", "getrs_f32");
+        check_buf(cat, op, "a", a, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "ipiv", ipiv, &["i32"], 0, &self.ctx)?;
+        check_buf(cat, op, "b", b, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "dev_info", dev_info, &["i32"], 0, &self.ctx)?;
         validate_getrs(
             n,
             nrhs,
             lda,
             ldb,
-            a_bytes / size_of::<f32>(),
-            ipiv_bytes / size_of::<i32>(),
-            b_bytes / size_of::<f32>(),
-            info_bytes / size_of::<i32>(),
+            a.numel(),
+            ipiv.numel(),
+            b.numel(),
+            dev_info.numel(),
         )
-        .map_err(|e| map_cusolver_err("getrs_f32", e))?;
-
-        let req_a = if n > 0 {
-            (lda as usize) * (n as usize) * size_of::<f32>()
+        .map_err(|e| map_cusolver_err(op, e))?;
+        let a_v = typed_view::<f32>(cat, op, "a", a, a.numel())?;
+        let ipiv_v = typed_view::<i32>(cat, op, "ipiv", ipiv, ipiv.numel())?;
+        let mut b_v = typed_view::<f32>(cat, op, "b", b, b.numel())?;
+        let mut info_v = typed_view::<i32>(cat, op, "dev_info", dev_info, dev_info.numel())?;
+        let trans_op = if trans {
+            CusolverOp::Transpose
         } else {
-            0
-        };
-        let req_b = if nrhs > 0 {
-            (ldb as usize) * (nrhs as usize) * size_of::<f32>()
-        } else {
-            0
-        };
-        let req_ipiv = (n.max(0) as usize) * size_of::<i32>();
-        validate_dev_buf("cusolver", "getrs_f32", "a", a_ptr, a_bytes, req_a)?;
-        validate_dev_buf(
-            "cusolver",
-            "getrs_f32",
-            "ipiv",
-            ipiv_ptr,
-            ipiv_bytes,
-            req_ipiv,
-        )?;
-        validate_dev_buf("cusolver", "getrs_f32", "b", b_ptr, b_bytes, req_b)?;
-        validate_dev_buf(
-            "cusolver",
-            "getrs_f32",
-            "dev_info",
-            info_ptr,
-            info_bytes,
-            size_of::<i32>(),
-        )?;
-
-        let op_sys = if trans {
-            cusolver::sys::cublasOperation_t_CUBLAS_OP_T
-        } else {
-            cusolver::sys::cublasOperation_t_CUBLAS_OP_N
+            CusolverOp::NonTranspose
         };
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cusolver::Result<()> {
-            let guard = state_arc
-                .lock()
-                .map_err(|_| cusolver::Error::InvalidInput("cusolver handle mutex poisoned"))?;
-            guard.handle.cuda().bind_to_thread()?;
-            guard.handle.set_stream(&guard.stream.inner)?;
-            // SAFETY: All device pointers and dimensions were validated above.
-            unsafe {
-                <f32 as DnFloat>::getrs(
-                    guard.handle.raw(),
-                    op_sys,
-                    n,
-                    nrhs,
-                    a_ptr as usize as *const f32,
-                    lda,
-                    ipiv_ptr as usize as *const i32,
-                    b_ptr as usize as *mut f32,
-                    ldb,
-                    info_ptr as usize as *mut i32,
-                )
-            }
-        })
-        .map_err(|e| map_cusolver_err("getrs_f32", e))?;
+        py.detach(move || -> PyResult<()> {
+            let guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let stream = &guard.stream.inner;
+            enqueue_leased(
+                cat,
+                op,
+                stream,
+                [
+                    (a, Access::Read),
+                    (ipiv, Access::Read),
+                    (b, Access::Write),
+                    (dev_info, Access::Write),
+                ],
+                || {
+                    guard
+                        .handle
+                        .getrs(
+                            stream,
+                            trans_op,
+                            n,
+                            nrhs,
+                            &a_v,
+                            lda,
+                            &ipiv_v,
+                            &mut b_v,
+                            ldb,
+                            &mut info_v,
+                        )
+                        .map_err(|e| map_cusolver_err(op, e))
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -723,78 +597,56 @@ impl PyCusolverDnHandle {
     fn potrf_f32(
         &self,
         py: Python<'_>,
-        a: &Bound<'_, PyDeviceBuffer>,
-        dev_info: &Bound<'_, PyDeviceBuffer>,
+        a: &PyDeviceBuffer,
+        dev_info: &PyDeviceBuffer,
         n: i32,
         lda: Option<i32>,
         upper: bool,
     ) -> PyResult<()> {
         let lda = lda.unwrap_or_else(|| n.max(1));
-        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a);
-        let (info_ptr, info_bytes) = buf_ptr_and_bytes(dev_info);
-
-        validate_potrf(
-            n,
-            lda,
-            a_bytes / size_of::<f32>(),
-            info_bytes / size_of::<i32>(),
-        )
-        .map_err(|e| map_cusolver_err("potrf_f32", e))?;
-
-        let req_a = if n > 0 {
-            (lda as usize) * (n as usize) * size_of::<f32>()
+        let (cat, op) = ("cusolver", "potrf_f32");
+        check_buf(cat, op, "a", a, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "dev_info", dev_info, &["i32"], 0, &self.ctx)?;
+        validate_potrf(n, lda, a.numel(), dev_info.numel()).map_err(|e| map_cusolver_err(op, e))?;
+        let mut a_v = typed_view::<f32>(cat, op, "a", a, a.numel())?;
+        let mut info_v = typed_view::<i32>(cat, op, "dev_info", dev_info, dev_info.numel())?;
+        let uplo = if upper {
+            CusolverFillMode::Upper
         } else {
-            0
-        };
-        validate_dev_buf("cusolver", "potrf_f32", "a", a_ptr, a_bytes, req_a)?;
-        validate_dev_buf(
-            "cusolver",
-            "potrf_f32",
-            "dev_info",
-            info_ptr,
-            info_bytes,
-            size_of::<i32>(),
-        )?;
-
-        let uplo_sys = if upper {
-            cusolver::sys::cublasFillMode_t_CUBLAS_FILL_MODE_UPPER
-        } else {
-            cusolver::sys::cublasFillMode_t_CUBLAS_FILL_MODE_LOWER
+            CusolverFillMode::Lower
         };
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cusolver::Result<()> {
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| cusolver::Error::InvalidInput("cusolver handle mutex poisoned"))?;
-            guard.handle.cuda().bind_to_thread()?;
-            guard.handle.set_stream(&guard.stream.inner)?;
-
-            let a_dev = a_ptr as usize as *mut f32;
-            // SAFETY: `guard.handle` is bound to `guard.stream` and `a_dev` spans `lda * n` `f32`s.
-            let lwork = unsafe {
-                <f32 as DnFloat>::potrf_buffer_size(guard.handle.raw(), uplo_sys, n, a_dev, lda)
-            }?;
-            let stream = guard.stream.inner.clone();
-            let (ws, lwork) = guard
-                .scratch
-                .reserve_elements::<f32>(&stream, lwork, usize::MAX)?;
-            // SAFETY: All device pointers and workspace `ws` were validated for `potrf`.
-            unsafe {
-                <f32 as DnFloat>::potrf(
-                    guard.handle.raw(),
-                    uplo_sys,
-                    n,
-                    a_dev,
-                    lda,
-                    ws,
-                    lwork,
-                    info_ptr as usize as *mut i32,
-                )
-            }
-        })
-        .map_err(|e| map_cusolver_err("potrf_f32", e))?;
+        py.detach(move || -> PyResult<()> {
+            let mut guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let CusolverDnState {
+                handle,
+                scratch,
+                stream,
+            } = &mut *guard;
+            let stream = &stream.inner;
+            enqueue_leased(
+                cat,
+                op,
+                stream,
+                [(a, Access::Write), (dev_info, Access::Write)],
+                || {
+                    handle
+                        .potrf(
+                            stream,
+                            uplo,
+                            n,
+                            &mut a_v,
+                            lda,
+                            &mut info_v,
+                            scratch,
+                            usize::MAX,
+                        )
+                        .map_err(|e| map_cusolver_err(op, e))
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -816,9 +668,9 @@ impl PyCusolverDnHandle {
     fn potrs_f32(
         &self,
         py: Python<'_>,
-        a: &Bound<'_, PyDeviceBuffer>,
-        b: &Bound<'_, PyDeviceBuffer>,
-        dev_info: &Bound<'_, PyDeviceBuffer>,
+        a: &PyDeviceBuffer,
+        b: &PyDeviceBuffer,
+        dev_info: &PyDeviceBuffer,
         n: i32,
         nrhs: i32,
         lda: Option<i32>,
@@ -827,72 +679,43 @@ impl PyCusolverDnHandle {
     ) -> PyResult<()> {
         let lda = lda.unwrap_or_else(|| n.max(1));
         let ldb = ldb.unwrap_or_else(|| n.max(1));
-        let (a_ptr, a_bytes) = buf_ptr_and_bytes(a);
-        let (b_ptr, b_bytes) = buf_ptr_and_bytes(b);
-        let (info_ptr, info_bytes) = buf_ptr_and_bytes(dev_info);
-
-        validate_potrs(
-            n,
-            nrhs,
-            lda,
-            ldb,
-            a_bytes / size_of::<f32>(),
-            b_bytes / size_of::<f32>(),
-            info_bytes / size_of::<i32>(),
-        )
-        .map_err(|e| map_cusolver_err("potrs_f32", e))?;
-
-        let req_a = if n > 0 {
-            (lda as usize) * (n as usize) * size_of::<f32>()
+        let (cat, op) = ("cusolver", "potrs_f32");
+        check_buf(cat, op, "a", a, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "b", b, &["f32"], 0, &self.ctx)?;
+        check_buf(cat, op, "dev_info", dev_info, &["i32"], 0, &self.ctx)?;
+        validate_potrs(n, nrhs, lda, ldb, a.numel(), b.numel(), dev_info.numel())
+            .map_err(|e| map_cusolver_err(op, e))?;
+        let a_v = typed_view::<f32>(cat, op, "a", a, a.numel())?;
+        let mut b_v = typed_view::<f32>(cat, op, "b", b, b.numel())?;
+        let mut info_v = typed_view::<i32>(cat, op, "dev_info", dev_info, dev_info.numel())?;
+        let uplo = if upper {
+            CusolverFillMode::Upper
         } else {
-            0
-        };
-        let req_b = if nrhs > 0 {
-            (ldb as usize) * (nrhs as usize) * size_of::<f32>()
-        } else {
-            0
-        };
-        validate_dev_buf("cusolver", "potrs_f32", "a", a_ptr, a_bytes, req_a)?;
-        validate_dev_buf("cusolver", "potrs_f32", "b", b_ptr, b_bytes, req_b)?;
-        validate_dev_buf(
-            "cusolver",
-            "potrs_f32",
-            "dev_info",
-            info_ptr,
-            info_bytes,
-            size_of::<i32>(),
-        )?;
-
-        let uplo_sys = if upper {
-            cusolver::sys::cublasFillMode_t_CUBLAS_FILL_MODE_UPPER
-        } else {
-            cusolver::sys::cublasFillMode_t_CUBLAS_FILL_MODE_LOWER
+            CusolverFillMode::Lower
         };
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cusolver::Result<()> {
-            let guard = state_arc
-                .lock()
-                .map_err(|_| cusolver::Error::InvalidInput("cusolver handle mutex poisoned"))?;
-            guard.handle.cuda().bind_to_thread()?;
-            guard.handle.set_stream(&guard.stream.inner)?;
-            // SAFETY: All device pointers and dimensions were validated above.
-            unsafe {
-                <f32 as DnFloat>::potrs(
-                    guard.handle.raw(),
-                    uplo_sys,
-                    n,
-                    nrhs,
-                    a_ptr as usize as *const f32,
-                    lda,
-                    b_ptr as usize as *mut f32,
-                    ldb,
-                    info_ptr as usize as *mut i32,
-                )
-            }
-        })
-        .map_err(|e| map_cusolver_err("potrs_f32", e))?;
+        py.detach(move || -> PyResult<()> {
+            let guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let stream = &guard.stream.inner;
+            enqueue_leased(
+                cat,
+                op,
+                stream,
+                [
+                    (a, Access::Read),
+                    (b, Access::Write),
+                    (dev_info, Access::Write),
+                ],
+                || {
+                    guard
+                        .handle
+                        .potrs(stream, uplo, n, nrhs, &a_v, lda, &mut b_v, ldb, &mut info_v)
+                        .map_err(|e| map_cusolver_err(op, e))
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -906,10 +729,7 @@ impl PyCusolverDnHandle {
     }
 
     fn __repr__(&self) -> String {
-        match self.state.lock() {
-            Ok(g) => format!("CusolverDnHandle(device_id={})", g.stream.device_id),
-            Err(_) => "CusolverDnHandle(<poisoned>)".to_owned(),
-        }
+        format!("CusolverDnHandle(device_id={})", self.device_id)
     }
 }
 
@@ -946,7 +766,29 @@ py_parse_enum!(parse_softmax_mode, "cudnn", "softmax_forward_f32", SoftmaxMode, 
     "channel" => SoftmaxMode::Channel,
 });
 
-fn validate_4d_f32_bytes(op: &str, shape: [usize; 4]) -> PyResult<usize> {
+/// Resolves the `coef` of `cudnnSetActivationDescriptor` for `mode`.
+///
+/// `coef` is the clipping threshold of `clipped_relu` (no neutral default: `0` would clip every
+/// output to zero, so it is required) and the `alpha` of `elu` (default `1.0`, standard ELU); the
+/// other modes ignore it.
+fn activation_coef(mode: ActivationMode, coef: Option<f64>) -> Result<f64, &'static str> {
+    let coef = match (mode, coef) {
+        (ActivationMode::ClippedRelu, None) => {
+            return Err("clipped_relu requires coef (the clipping threshold)");
+        }
+        (ActivationMode::Elu, None) => 1.0,
+        (_, Some(c)) => c,
+        (_, None) => 0.0,
+    };
+    if coef.is_finite() {
+        Ok(coef)
+    } else {
+        Err("coef must be finite")
+    }
+}
+
+/// Element count of a non-empty 4D NCHW tensor.
+fn tensor_4d_elems(op: &str, shape: [usize; 4]) -> PyResult<usize> {
     if shape.contains(&0) {
         return Err(record_and_err(
             "cudnn",
@@ -957,12 +799,12 @@ fn validate_4d_f32_bytes(op: &str, shape: [usize; 4]) -> PyResult<usize> {
     }
     shape
         .iter()
-        .try_fold(size_of::<f32>(), |acc, &dim| acc.checked_mul(dim))
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
         .ok_or_else(|| {
             record_and_err(
                 "cudnn",
                 op,
-                "tensor byte size overflow",
+                "tensor element count overflow",
                 ErrorKind::InvalidArgument,
             )
         })
@@ -997,6 +839,9 @@ struct CudnnState {
 #[pyclass(name = "CudnnHandle", module = "nv_rs.cudnn")]
 pub struct PyCudnnHandle {
     state: Arc<Mutex<CudnnState>>,
+    /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
+    ctx: Arc<Context>,
+    device_id: i32,
 }
 
 #[pymethods]
@@ -1025,6 +870,8 @@ impl PyCudnnHandle {
 
         Ok(Self {
             state: Arc::new(Mutex::new(state)),
+            ctx: stream.inner.context().clone(),
+            device_id: stream.device_id,
         })
     }
 
@@ -1055,7 +902,10 @@ impl PyCudnnHandle {
     }
 
     /// Executes 4D NCHW `f32` activation forward: `y = alpha * act(x) + beta * y`, GIL-free.
-    #[pyo3(signature = (x, y, shape, mode="relu", alpha=1.0, beta=0.0, coef=0.0))]
+    ///
+    /// `coef` is the clipping threshold of `clipped_relu` (required) and the `alpha` of `elu`
+    /// (default `1.0`); the other modes ignore it.
+    #[pyo3(signature = (x, y, shape, mode="relu", alpha=1.0, beta=0.0, coef=None))]
     #[expect(
         clippy::too_many_arguments,
         reason = "cuDNN activation forward requires x/y buffers, NCHW shape, mode, alpha/beta, and coef"
@@ -1063,80 +913,76 @@ impl PyCudnnHandle {
     fn activation_forward_f32(
         &self,
         py: Python<'_>,
-        x: &Bound<'_, PyDeviceBuffer>,
-        y: &Bound<'_, PyDeviceBuffer>,
+        x: &PyDeviceBuffer,
+        y: &PyDeviceBuffer,
         shape: [usize; 4],
         mode: &str,
         alpha: f32,
         beta: f32,
-        coef: f64,
+        coef: Option<f64>,
     ) -> PyResult<()> {
-        if !alpha.is_finite() || !beta.is_finite() || !coef.is_finite() {
+        let op = "activation_forward_f32";
+        if !alpha.is_finite() || !beta.is_finite() {
             return Err(record_and_err(
                 "cudnn",
-                "activation_forward_f32",
-                "alpha, beta, and coef must be finite",
+                op,
+                "alpha and beta must be finite",
                 ErrorKind::InvalidArgument,
             ));
         }
         let act_mode = parse_activation_mode(mode)?;
-        let req_bytes = validate_4d_f32_bytes("activation_forward_f32", shape)?;
-        let (x_ptr, x_bytes) = buf_ptr_and_bytes(x);
-        let (y_ptr, y_bytes) = buf_ptr_and_bytes(y);
-        validate_dev_buf(
-            "cudnn",
-            "activation_forward_f32",
-            "x",
-            x_ptr,
-            x_bytes,
-            req_bytes,
-        )?;
-        validate_dev_buf(
-            "cudnn",
-            "activation_forward_f32",
-            "y",
-            y_ptr,
-            y_bytes,
-            req_bytes,
-        )?;
+        let coef = activation_coef(act_mode, coef)
+            .map_err(|msg| record_and_err("cudnn", op, msg, ErrorKind::InvalidArgument))?;
+        let elems = tensor_4d_elems(op, shape)?;
+        let (x_ptr, x_bytes) = check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
+        let (y_ptr, y_bytes) = check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cudnn::Result<()> {
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| cudnn::Error::Invalid("cudnn handle mutex poisoned"))?;
+        py.detach(move || -> PyResult<()> {
+            let map = |e| map_cudnn_err(op, e);
+            let mut guard = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
             let ctx = guard.handle.context().clone();
             let stream = guard.stream.inner.clone();
-            guard.handle.set_stream(&stream)?;
+            guard.handle.set_stream(&stream).map_err(map)?;
 
             let desc =
-                TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, CudnnDataType::F32, shape)?;
+                TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, CudnnDataType::F32, shape)
+                    .map_err(map)?;
             let act_desc =
-                ActivationDescriptor::new(&ctx, act_mode, NanPropagation::NotPropagate, coef)?;
+                ActivationDescriptor::new(&ctx, act_mode, NanPropagation::NotPropagate, coef)
+                    .map_err(map)?;
             if x_bytes < desc.size_in_bytes() || y_bytes < desc.size_in_bytes() {
-                return Err(cudnn::Error::Invalid(
+                return Err(map(cudnn::Error::Invalid(
                     "tensor buffer smaller than cuDNN descriptor size_in_bytes",
-                ));
+                )));
             }
 
-            // SAFETY: Context is bound, stream is set, tensor/activation descriptors are valid,
-            // and `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes.
-            let status = unsafe {
-                cudnn_sys::cudnnActivationForward(
-                    guard.handle.as_raw(),
-                    act_desc.as_raw(),
-                    std::ptr::from_ref(&alpha).cast::<c_void>(),
-                    desc.as_raw(),
-                    x_ptr as usize as *const c_void,
-                    std::ptr::from_ref(&beta).cast::<c_void>(),
-                    desc.as_raw(),
-                    y_ptr as usize as *mut c_void,
-                )
-            };
-            cudnn::check("cudnnActivationForward", status)
-        })
-        .map_err(|e| map_cudnn_err("activation_forward_f32", e))?;
+            enqueue_leased(
+                "cudnn",
+                op,
+                &stream,
+                [(x, Access::Read), (y, Access::Write)],
+                || {
+                    // SAFETY: the context is bound and `stream` set on the handle, the descriptors
+                    // are live, `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes
+                    // (checked above) and the leases keep them allocated until the work completes.
+                    let status = unsafe {
+                        cudnn_sys::cudnnActivationForward(
+                            guard.handle.as_raw(),
+                            act_desc.as_raw(),
+                            std::ptr::from_ref(&alpha).cast::<c_void>(),
+                            desc.as_raw(),
+                            x_ptr as usize as *const c_void,
+                            std::ptr::from_ref(&beta).cast::<c_void>(),
+                            desc.as_raw(),
+                            y_ptr as usize as *mut c_void,
+                        )
+                    };
+                    cudnn::check("cudnnActivationForward", status).map_err(map)
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -1158,80 +1004,73 @@ impl PyCudnnHandle {
     fn softmax_forward_f32(
         &self,
         py: Python<'_>,
-        x: &Bound<'_, PyDeviceBuffer>,
-        y: &Bound<'_, PyDeviceBuffer>,
+        x: &PyDeviceBuffer,
+        y: &PyDeviceBuffer,
         shape: [usize; 4],
         algo: &str,
         mode: &str,
         alpha: f32,
         beta: f32,
     ) -> PyResult<()> {
+        let op = "softmax_forward_f32";
         if !alpha.is_finite() || !beta.is_finite() {
             return Err(record_and_err(
                 "cudnn",
-                "softmax_forward_f32",
+                op,
                 "alpha and beta must be finite",
                 ErrorKind::InvalidArgument,
             ));
         }
         let sm_algo = parse_softmax_algo(algo)?;
         let sm_mode = parse_softmax_mode(mode)?;
-        let req_bytes = validate_4d_f32_bytes("softmax_forward_f32", shape)?;
-        let (x_ptr, x_bytes) = buf_ptr_and_bytes(x);
-        let (y_ptr, y_bytes) = buf_ptr_and_bytes(y);
-        validate_dev_buf(
-            "cudnn",
-            "softmax_forward_f32",
-            "x",
-            x_ptr,
-            x_bytes,
-            req_bytes,
-        )?;
-        validate_dev_buf(
-            "cudnn",
-            "softmax_forward_f32",
-            "y",
-            y_ptr,
-            y_bytes,
-            req_bytes,
-        )?;
+        let elems = tensor_4d_elems(op, shape)?;
+        let (x_ptr, x_bytes) = check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
+        let (y_ptr, y_bytes) = check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
-        py.detach(move || -> cudnn::Result<()> {
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| cudnn::Error::Invalid("cudnn handle mutex poisoned"))?;
+        py.detach(move || -> PyResult<()> {
+            let map = |e| map_cudnn_err(op, e);
+            let mut guard = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
             let ctx = guard.handle.context().clone();
             let stream = guard.stream.inner.clone();
-            guard.handle.set_stream(&stream)?;
+            guard.handle.set_stream(&stream).map_err(map)?;
 
             let desc =
-                TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, CudnnDataType::F32, shape)?;
+                TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, CudnnDataType::F32, shape)
+                    .map_err(map)?;
             if x_bytes < desc.size_in_bytes() || y_bytes < desc.size_in_bytes() {
-                return Err(cudnn::Error::Invalid(
+                return Err(map(cudnn::Error::Invalid(
                     "tensor buffer smaller than cuDNN descriptor size_in_bytes",
-                ));
+                )));
             }
 
-            // SAFETY: Context is bound, stream is set, tensor descriptor is valid,
-            // and `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes.
-            let status = unsafe {
-                cudnn_sys::cudnnSoftmaxForward(
-                    guard.handle.as_raw(),
-                    sm_algo.to_sys(),
-                    sm_mode.to_sys(),
-                    std::ptr::from_ref(&alpha).cast::<c_void>(),
-                    desc.as_raw(),
-                    x_ptr as usize as *const c_void,
-                    std::ptr::from_ref(&beta).cast::<c_void>(),
-                    desc.as_raw(),
-                    y_ptr as usize as *mut c_void,
-                )
-            };
-            cudnn::check("cudnnSoftmaxForward", status)
-        })
-        .map_err(|e| map_cudnn_err("softmax_forward_f32", e))?;
+            enqueue_leased(
+                "cudnn",
+                op,
+                &stream,
+                [(x, Access::Read), (y, Access::Write)],
+                || {
+                    // SAFETY: the context is bound and `stream` set on the handle, the descriptor
+                    // is live, `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes (checked
+                    // above) and the leases keep them allocated until the work completes.
+                    let status = unsafe {
+                        cudnn_sys::cudnnSoftmaxForward(
+                            guard.handle.as_raw(),
+                            sm_algo.to_sys(),
+                            sm_mode.to_sys(),
+                            std::ptr::from_ref(&alpha).cast::<c_void>(),
+                            desc.as_raw(),
+                            x_ptr as usize as *const c_void,
+                            std::ptr::from_ref(&beta).cast::<c_void>(),
+                            desc.as_raw(),
+                            y_ptr as usize as *mut c_void,
+                        )
+                    };
+                    cudnn::check("cudnnSoftmaxForward", status).map_err(map)
+                },
+            )
+        })?;
 
         diag::record_event(
             Level::Info,
@@ -1245,10 +1084,7 @@ impl PyCudnnHandle {
     }
 
     fn __repr__(&self) -> String {
-        match self.state.lock() {
-            Ok(g) => format!("CudnnHandle(device_id={})", g.stream.device_id),
-            Err(_) => "CudnnHandle(<poisoned>)".to_owned(),
-        }
+        format!("CudnnHandle(device_id={})", self.device_id)
     }
 }
 
@@ -1273,4 +1109,22 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_coef_defaults_per_mode() {
+        assert!(activation_coef(ActivationMode::ClippedRelu, None).is_err());
+        assert_eq!(
+            activation_coef(ActivationMode::ClippedRelu, Some(6.0)),
+            Ok(6.0)
+        );
+        assert_eq!(activation_coef(ActivationMode::Elu, None), Ok(1.0));
+        assert_eq!(activation_coef(ActivationMode::Elu, Some(0.5)), Ok(0.5));
+        assert_eq!(activation_coef(ActivationMode::Relu, None), Ok(0.0));
+        assert!(activation_coef(ActivationMode::Relu, Some(f64::NAN)).is_err());
+    }
 }

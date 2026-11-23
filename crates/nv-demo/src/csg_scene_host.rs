@@ -10,7 +10,7 @@
 //! while delivering smooth frame times across 10k-100k+ CSG instances.
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -64,16 +64,45 @@ const SCENE_LRU_MAX_ENTRIES: usize = 4;
 /// Maximum combined estimated CPU byte budget for the `SceneBuilt` LRU cache (`512 MiB`).
 const SCENE_LRU_MAX_BYTES: usize = 512 * 1024 * 1024;
 
-/// Routes single-primitive compounds to the register-lean SBT 10 hit group and general RPN
-/// compounds to SBT 8.
-#[cfg(test)]
+/// Half extent (m) of the local AABB given to an `UNBOUNDED` compound (ground, ocean). It must
+/// exceed any camera-to-compound-origin distance plus the `CSG_VIEW_FAR_M` view range on the
+/// largest maps; one oversized box costs nothing because every ray enters an unbounded
+/// primitive anyway.
+const UNBOUNDED_COMPOUND_HALF_EXTENT_M: f32 = 10_000.0;
+
+/// Far plane / omnidirectional radius (m) of the CSG packing view.
+const CSG_VIEW_FAR_M: f32 = 1500.0;
+
+/// Maps a packed CSG compound id to `(gas_index, visible)`. Every packed slot must yield exactly
+/// one OptiX instance, because the CUDA crowd scatter writes
+/// `d_optix_instances[classic_count + packed_slot]`; a compound without a GAS (a partially failed
+/// `spawn_crowd_stress`) becomes an invisible placeholder on GAS 0. `None` when no GAS exists.
 #[inline]
-pub const fn sbt_offset_for_compound(flags: u32) -> u32 {
-    if (flags & compound_flags::SINGLE_PRIM) != 0 {
-        CSG_SBT_PRIM_OFFSET
+const fn optix_slot_gas(cid: usize, gas_count: usize) -> Option<(usize, bool)> {
+    if cid < gas_count {
+        Some((cid, true))
+    } else if gas_count > 0 {
+        Some((0, false))
     } else {
-        CSG_SBT_OFFSET
+        None
     }
+}
+
+/// Maps a 1-based `scene_idx` (`csg_mode`) to a registry index, rejecting out-of-range values
+/// (for example a persisted index after the registry shrank) instead of loading another scene.
+fn registry_index_for_scene(scene_idx: u32, reg_count: usize) -> Result<usize, String> {
+    if reg_count == 0 {
+        return Err("CSG SceneRegistry is empty".to_string());
+    }
+    let idx = (scene_idx as usize).checked_sub(1).ok_or_else(|| {
+        "CSG scene index 0 is the classic stage, not a registry scene".to_string()
+    })?;
+    if idx >= reg_count {
+        return Err(format!(
+            "CSG scene index {scene_idx} is out of range (registry has {reg_count} scenes)"
+        ));
+    }
+    Ok(idx)
 }
 
 /// OptiX GAS build strategy chosen for a compiled CSG compound.
@@ -407,10 +436,11 @@ pub const fn time_of_day_from_u32(v: u32) -> TimeOfDay {
 
 /// Builds a non-degenerate, slightly padded OptiX custom-primitive AABB for a compiled compound.
 fn sanitized_compound_aabb(comp: &GpuCompound) -> Aabb {
-    if (comp.flags & 1) != 0 {
+    if (comp.flags & compound_flags::UNBOUNDED) != 0 {
+        let h = UNBOUNDED_COMPOUND_HALF_EXTENT_M;
         return Aabb {
-            min: [-1000.0, -1000.0, -1000.0],
-            max: [1000.0, 1000.0, 1000.0],
+            min: [-h, -h, -h],
+            max: [h, h, h],
         };
     }
     let mut bmin = comp.aabb_min;
@@ -446,7 +476,8 @@ pub enum CsgSyncResult {
     FullRepack,
 }
 
-/// Default pinned host staging capacity (`2 MiB` = 32,768 `GpuInstance` records or 43,690
+/// Default pinned host staging capacity of each of the two CSG staging buffers (`2 MiB`, not the
+/// `256 KiB` of `optix::InstanceBuffer`) = 32,768 `GpuInstance` records or 43,690
 /// `[f32; 12]` previous-frame transforms) for zero-stall async DMA updates of `dynamic_instances[0..D]`
 /// across 5x urban crowds (600-900+ actors / ~10k-15k+ bones).
 const CSG_PINNED_STAGING_BYTES: usize = 2 * 1024 * 1024;
@@ -523,6 +554,14 @@ impl Drop for PinnedStagingBuffer {
     }
 }
 
+/// Reusable staging for Multi-AABB compound GAS inputs: the host boxes of the compound being
+/// built plus one persistent device buffer per primitive count.
+#[derive(Default)]
+struct MultiAabbStaging {
+    host: Vec<Aabb>,
+    device: HashMap<usize, DeviceBuffer<Aabb>>,
+}
+
 /// Grow-only typed GPU buffer backed by 256-byte-aligned `DeviceBuffer<u8>`, avoiding
 /// steady-state CUDA allocations on per-frame updates and `RoadMode`/scene switches.
 struct GrowDeviceBuffer<T: Pod> {
@@ -544,8 +583,11 @@ impl<T: Pod> Default for GrowDeviceBuffer<T> {
 }
 
 impl<T: Pod> GrowDeviceBuffer<T> {
+    /// Uploads `items`. `len_elems` reaches `items.len()` only after the allocation and copy
+    /// were enqueued; on any failure it stays `0`, so `device_ptr()` returns `0` and no consumer
+    /// indexes past a smaller old allocation.
     fn upload(&mut self, stream: &Arc<Stream>, items: &[T]) -> Result<(), String> {
-        self.len_elems = items.len();
+        self.len_elems = 0;
         if items.is_empty() {
             return Ok(());
         }
@@ -575,6 +617,7 @@ impl<T: Pod> GrowDeviceBuffer<T> {
             if res != cu::cudaError_enum_CUDA_SUCCESS {
                 return Err(format!("CSG cuMemcpyHtoDAsync_v2 failed ({res:?})"));
             }
+            self.len_elems = items.len();
         }
         Ok(())
     }
@@ -878,6 +921,10 @@ fn pack_dynamic_prefix_only(
         }
         if let Some(lod) = recorded_lod {
             *prev_lod_slot = u8::try_from(lod).unwrap_or(PREV_LOD_NONE - 1);
+        } else if !lod_cfg.enabled || lod_cfg.force_lod.is_some() {
+            // Same as upstream `emit_assembly_instance`: disabled or forced LODs drop the
+            // hysteresis history so re-enabling auto LOD starts fresh.
+            *prev_lod_slot = PREV_LOD_NONE;
         }
     }
 }
@@ -886,12 +933,16 @@ fn pack_dynamic_prefix_only(
 /// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible `PURE_UNION`
 /// compounds, `primitive_offset = prim_idx` for `SINGLE_PRIM` compounds, and a 1-AABB GAS for
 /// general RPN compounds, with `compact: false` and `GeometryFlags::DISABLE_ANYHIT`.
+///
+/// Multi-AABB boxes go through `multi`, one persistent device buffer per primitive count (the
+/// GAS input length is the buffer length), so scene and road-mode switches reuse them instead of
+/// allocating, synchronizing and freeing one buffer per compound.
 fn build_compound_gas(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Arc<Stream>,
     scratch: &mut Scratch,
     aabb_staging: &DeviceBuffer<Aabb>,
-    multi_aabb_host: &mut Vec<Aabb>,
+    multi: &mut MultiAabbStaging,
     lib: &CompiledLibrary,
     comp: &GpuCompound,
 ) -> Result<(Arc<Accel>, u32), String> {
@@ -900,16 +951,44 @@ fn build_compound_gas(
     let sbt_off = plan.sbt_offset();
     let gas = match plan {
         CompoundGasPlan::MultiAabbUnion { first_prim, count } => {
+            let MultiAabbStaging {
+                host: multi_aabb_host,
+                device: multi_aabb_staging,
+            } = multi;
             multi_aabb_host.clear();
             multi_aabb_host.reserve(count);
             let p0 = first_prim as usize;
             for prim in &lib.prims[p0..p0 + count] {
                 multi_aabb_host.push(sanitized_prim_aabb(prim));
             }
-            let multi_buf = DeviceBuffer::<Aabb>::from_host(stream, multi_aabb_host)
-                .map_err(|e| format!("CSG multi-AABB upload ({count} prims) failed: {e}"))?;
+            let multi_buf: &DeviceBuffer<Aabb> = match multi_aabb_staging.entry(count) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(DeviceBuffer::<Aabb>::zeroed(stream, count).map_err(|e| {
+                        format!("CSG multi-AABB staging alloc ({count} prims) failed: {e}")
+                    })?)
+                }
+            };
+            let box_bytes = count * std::mem::size_of::<Aabb>();
+            // SAFETY: `multi_buf` holds exactly `count` `Aabb`s (`box_bytes` bytes) on `stream` and
+            // `multi_aabb_host` holds `count` initialized `Aabb`s; CUDA stages the pageable host
+            // copy before returning, and the previous GAS build reading `multi_buf` is ordered
+            // before this copy on the same stream.
+            let h2d = unsafe {
+                cu::cuMemcpyHtoDAsync_v2(
+                    multi_buf.cu_deviceptr(),
+                    multi_aabb_host.as_ptr().cast(),
+                    box_bytes,
+                    stream.cu_stream(),
+                )
+            };
+            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+                return Err(format!(
+                    "CSG multi-AABB H2D copy ({count} prims) failed ({h2d:?})"
+                ));
+            }
             let input = CustomPrimitives {
-                aabbs: Keys::One(&multi_buf),
+                aabbs: Keys::One(multi_buf),
                 flags: &[GeometryFlags::DISABLE_ANYHIT],
                 sbt_offsets: None,
                 primitive_offset: first_prim,
@@ -1007,7 +1086,7 @@ pub struct CsgGpuHost {
     guard_aabbs_buf: GrowDeviceBuffer<GpuAabb>,
     repeats_buf: GrowDeviceBuffer<GpuRepeat>,
     aabb_staging_buf: Option<DeviceBuffer<Aabb>>,
-    multi_aabb_host_scratch: Vec<Aabb>,
+    multi_aabb: MultiAabbStaging,
     materials_buf: GrowDeviceBuffer<GpuMaterial>,
     instances_buf: GrowDeviceBuffer<GpuInstance>,
     prev_xforms_buf: GrowDeviceBuffer<[f32; 12]>,
@@ -1063,7 +1142,10 @@ impl CsgGpuHost {
             guard_aabbs_buf: GrowDeviceBuffer::default(),
             repeats_buf: GrowDeviceBuffer::default(),
             aabb_staging_buf: None,
-            multi_aabb_host_scratch: Vec::with_capacity(64),
+            multi_aabb: MultiAabbStaging {
+                host: Vec::with_capacity(64),
+                device: HashMap::new(),
+            },
             materials_buf: GrowDeviceBuffer::default(),
             instances_buf: GrowDeviceBuffer::default(),
             prev_xforms_buf: GrowDeviceBuffer::default(),
@@ -1198,7 +1280,8 @@ impl CsgGpuHost {
         }
     }
 
-    /// Returns the cached SBT hit-group offset (`4` or `5`) for every compiled compound.
+    /// Returns the cached SBT hit-group offset (`CSG_SBT_PRIM_OFFSET` = 10 or `CSG_SBT_OFFSET`
+    /// = 8) for every compound that has a GAS.
     pub fn compound_sbt_offsets(&self) -> &[u32] {
         &self.compound_sbt_offsets
     }
@@ -1260,11 +1343,22 @@ impl CsgGpuHost {
     /// Returns `true` if calling [`Self::sync`] with `(key, cam)` will trigger a full frustum
     /// repack (`camera_repack_needed` or scene rebuild).
     pub fn will_camera_repack(&self, key: CsgSceneKey, cam: CsgCameraParams) -> bool {
-        if key != self.scene_key || self.ias_dirty {
+        if key != self.scene_key {
             return true;
         }
-        if key.scene_idx == 0 {
-            return false;
+        if key.scene_idx == 0 || self.scene.is_none() {
+            return self.ias_dirty;
+        }
+        self.camera_repack_needed(cam)
+    }
+
+    /// The repack predicate shared by [`Self::will_camera_repack`] and [`Self::sync`]: a pending
+    /// `ias_dirty`, a viewport / FOV / LOD / projection change, `> 1 m` of camera travel or
+    /// `> ~3.1°` of rotation (perspective only). It stays inside the `1.35x` padded frustum margin
+    /// so objects near viewport edges never pop out prematurely.
+    fn camera_repack_needed(&self, cam: CsgCameraParams) -> bool {
+        if self.ias_dirty {
+            return true;
         }
         let cam_dist_sq = (cam.eye[0] - self.last_pack_cam[0]).powi(2)
             + (cam.eye[1] - self.last_pack_cam[1]).powi(2)
@@ -1286,29 +1380,20 @@ impl CsgGpuHost {
             || (!cam.omnidirectional && (!fwd_dot.is_finite() || fwd_dot < 0.9985))
     }
 
-    /// Returns `true` if calling [`Self::sync`] with `(key, cam, traffic_time_s, freeze_pose)`
-    /// will pack and upload instance buffers from CPU (`FullRepack` or `TrafficOnly`).
-    pub fn will_upload_instances(
-        &self,
-        key: CsgSceneKey,
-        cam: CsgCameraParams,
-        traffic_time_s: f32,
-        freeze_pose: bool,
-    ) -> bool {
+    /// Returns `true` if calling [`Self::sync`] with `(key, cam)` will pack and upload instance
+    /// buffers from CPU (`FullRepack` or `TrafficOnly`). Traffic moves only through
+    /// [`Self::step_dynamic`], which sets `traffic_dirty`, so it must run first in the frame.
+    pub fn will_upload_instances(&self, key: CsgSceneKey, cam: CsgCameraParams) -> bool {
         if self.will_camera_repack(key, cam) {
             return true;
         }
-        if key.scene_idx == 0 {
-            return false;
-        }
-        let traffic_moved = !freeze_pose
-            && self.has_traffic()
-            && traffic_time_s.to_bits() != self.last_traffic_bits;
-        self.traffic_dirty || traffic_moved
+        key.scene_idx != 0 && self.scene.is_some() && self.traffic_dirty
     }
 
     /// Applies `freeze_pose` transitions to `scene.crowd` and dynamic traffic motion history.
     /// Returns `true` if crowd freeze intents changed and must be re-uploaded to CUDA.
+    ///
+    /// The single implementation of the freeze transition; [`Self::step_dynamic`] calls it too.
     pub fn sync_freeze_pose(&mut self, freeze_pose: bool) -> bool {
         let Some(ref mut scene) = self.scene else {
             return false;
@@ -1388,7 +1473,13 @@ impl CsgGpuHost {
             .map_err(|e| format!("Crowd stress spawn failed (GAS budget): {e}"))?;
 
         let new_compound_count = scene.world.library.compounds.len();
-        if new_compound_count > old_compound_count {
+        // The scene is mutated from here on, so the bookkeeping below runs even when this GPU
+        // part fails. New GASes are committed only all together; compounds left without one
+        // become invisible placeholders that keep packed and OptiX slots aligned.
+        let gpu_res = (|| -> Result<(), String> {
+            if new_compound_count <= old_compound_count {
+                return Ok(());
+            }
             // Re-upload compiled library tables and build GASes only for newly added actor compounds.
             let lib = &scene.world.library;
             self.compounds_buf.upload(stream, &lib.compounds)?;
@@ -1416,23 +1507,29 @@ impl CsgGpuHost {
                 .as_ref()
                 .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
 
+            let new_count = new_compound_count - old_compound_count;
+            let mut new_gases = Vec::with_capacity(new_count);
+            let mut new_sbt_offsets = Vec::with_capacity(new_count);
             for c in &lib.compounds[old_compound_count..new_compound_count] {
                 let (gas, sbt_off) = build_compound_gas(
                     optix_ctx,
                     stream,
                     scratch,
                     aabb_staging,
-                    &mut self.multi_aabb_host_scratch,
+                    &mut self.multi_aabb,
                     lib,
                     c,
                 )?;
-                self.compound_gases.push(gas);
-                self.compound_sbt_offsets.push(sbt_off);
+                new_gases.push(gas);
+                new_sbt_offsets.push(sbt_off);
             }
             stream
                 .synchronize()
                 .map_err(|e| format!("CSG stress GAS sync failed: {e}"))?;
-        }
+            self.compound_gases.extend(new_gases);
+            self.compound_sbt_offsets.extend(new_sbt_offsets);
+            Ok(())
+        })();
 
         if added > 0 {
             self.scene_mutated_stress = true;
@@ -1441,7 +1538,7 @@ impl CsgGpuHost {
             .reserve_instances(scene.world.total_instance_count().max(256));
         self.ias_dirty = true;
         self.traffic_dirty = true;
-        Ok(added)
+        gpu_res.map(|()| added)
     }
 
     /// Returns the active registered scene identifier (`"gundo_osm"`, `"inspector"`, `"classic"`, etc.).
@@ -1470,9 +1567,23 @@ impl CsgGpuHost {
         &self.packed
     }
 
-    /// Packs the full scene omnidirectionally into `self.packed` and uploads `self.instances_buf`
-    /// for city-wide view scoring, marking `ias_dirty` so the next render frame restores frustum culling.
-    pub fn prepare_full_scene_for_probe(&mut self, stream: &Arc<Stream>) -> Result<(), String> {
+    /// Returns `true` while `self.packed` (and the instance buffers uploaded from it) describes
+    /// the same instances as the last IAS the renderer built. A repack outside the frame loop
+    /// ([`Self::prepare_full_scene_for_probe`], scene rebuild, crowd stress spawn) sets
+    /// `ias_dirty` until the next [`Self::sync`] and IAS rebuild.
+    pub fn instances_match_ias(&self) -> bool {
+        !self.ias_dirty
+    }
+
+    /// Packs the full scene omnidirectionally into `self.packed` for city-wide view scoring and,
+    /// when `upload_gpu` is set (OptiX probing), uploads `self.instances_buf` from it; the CPU
+    /// and WGPU probers read only the CPU pack. Marks `ias_dirty` so the next render frame
+    /// restores frustum culling.
+    pub fn prepare_full_scene_for_probe(
+        &mut self,
+        stream: &Arc<Stream>,
+        upload_gpu: bool,
+    ) -> Result<(), String> {
         let Some(ref mut scene) = self.scene else {
             return Err("Load a CSG scene before running Smart View".to_string());
         };
@@ -1486,11 +1597,13 @@ impl CsgGpuHost {
             Vec3::ZERO
         };
         scene.world.pack_all(cam_pos, &mut self.packed);
-        self.instances_buf
-            .upload(stream, self.packed.instances_slice())?;
-        self.prev_xforms_buf
-            .upload(stream, self.packed.motion_prev_xforms_slice())?;
         self.ias_dirty = true;
+        if upload_gpu {
+            self.instances_buf
+                .upload(stream, self.packed.instances_slice())?;
+            self.prev_xforms_buf
+                .upload(stream, self.packed.motion_prev_xforms_slice())?;
+        }
         Ok(())
     }
 
@@ -1631,7 +1744,8 @@ impl CsgGpuHost {
             materials: self.materials_buf.device_ptr(),
             instances: self.instances_buf.device_ptr(),
             prev_xforms: self.prev_xforms_buf.device_ptr(),
-            instance_count: self.packed.len() as u32,
+            // Never more than were uploaded: after a failed upload the buffer reports 0.
+            instance_count: self.packed.len().min(self.instances_buf.len_elems) as u32,
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
         }
@@ -1653,20 +1767,12 @@ impl CsgGpuHost {
         freeze_pose: bool,
         step_traffic: bool,
     ) -> bool {
+        // Its "intents changed" result drives the CUDA re-upload; the renderer reads it from its
+        // own `sync_freeze_pose` call earlier in the frame, which makes this one a no-op there.
+        self.sync_freeze_pose(freeze_pose);
         let Some(ref mut scene) = self.scene else {
             return false;
         };
-        if freeze_pose != self.crowd_frozen {
-            scene.set_crowd_frozen(freeze_pose);
-            self.crowd_frozen = freeze_pose;
-            if freeze_pose {
-                scene.reset_crowd_motion_history();
-                for inst in scene.world.dynamic_instances_mut() {
-                    inst.prev_xform = Some(inst.xform);
-                }
-                self.traffic_dirty = true;
-            }
-        }
         if freeze_pose {
             return false;
         }
@@ -1798,25 +1904,18 @@ impl CsgGpuHost {
 
     /// Extracts exact 2D/3D actor keypoints, tight bone-OBB bounding boxes, and analytical CPU
     /// CSG ray-occluded visibility labels via [`csg_actors::extract_sdg_frame`] and writes them
-    /// atomically to `path` as pretty-printed JSON.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "forwards camera basis, projection, viewport dimensions, and frame metadata cleanly"
-    )]
+    /// atomically to `path` as pretty-printed JSON. `sdg_cam` comes from
+    /// [`Self::build_sdg_camera`], the single source of the export camera.
     pub fn export_sdg_json(
         &self,
         path: &Path,
-        cam: &CameraFrame,
-        projection: CameraProjection,
-        width: u32,
-        height: u32,
+        sdg_cam: SdgCamera,
         frame_index: u32,
         time_s: f32,
     ) -> Result<usize, String> {
         let Some(ref scene) = self.scene else {
             return Err("Load a CSG scene before exporting SDG JSON".to_string());
         };
-        let sdg_cam = Self::build_sdg_camera(cam, projection, width, height);
         let visible_slice = self.packed.instances_slice();
         if visible_slice.is_empty() {
             let occluder = CsgRayOccluder::new(&scene.world.library, &scene.crowd.bone_outs);
@@ -1832,14 +1931,17 @@ impl CsgGpuHost {
     }
 
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
-    /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes,
-    /// steps 3D Frenet dynamic traffic (unless `freeze_pose` is enabled), and either streams only
-    /// `dynamic_instances[0..D]` (or just non-crowd traffic vehicles when `gpu_crowd_active` is
-    /// true) via the growable pinned staging buffers (`CsgSyncResult::TrafficOnly`) or repacks
-    /// visible instances with live frustum + small-detail culling (`CsgSyncResult::FullRepack`).
+    /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes, and either
+    /// streams only `dynamic_instances[0..D]` (or just non-crowd traffic vehicles when
+    /// `gpu_crowd_active` is true) via the growable pinned staging buffers
+    /// (`CsgSyncResult::TrafficOnly`) or repacks visible instances with live frustum +
+    /// small-detail culling (`CsgSyncResult::FullRepack`).
+    ///
+    /// Traffic is not stepped here: [`Self::step_dynamic`] is the only traffic step, so the
+    /// Traffic toggle holds even while the crowd keeps the shared simulation clock moving.
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates scene key, material params, camera frustum, freeze/GPU-crowd flags, and OptiX resources cleanly"
+        reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, and OptiX resources cleanly"
     )]
     pub fn sync(
         &mut self,
@@ -1850,8 +1952,6 @@ impl CsgGpuHost {
         wetness: f32,
         time_of_day: u32,
         cam: CsgCameraParams,
-        traffic_time_s: f32,
-        freeze_pose: bool,
         gpu_crowd_active: bool,
     ) -> Result<CsgSyncResult, String> {
         if self.pinned_staging.is_none() {
@@ -1869,7 +1969,9 @@ impl CsgGpuHost {
             rebuilt_scene = true;
         }
 
-        if key.scene_idx == 0 {
+        // Classic stage, or a scene whose rebuild failed: no CSG instances. One `FullRepack`
+        // makes the renderer drop the old scene's instances from the IAS.
+        if self.scene.is_none() {
             let dirty = self.ias_dirty || rebuilt_scene;
             self.ias_dirty = false;
             self.traffic_dirty = false;
@@ -1893,43 +1995,9 @@ impl CsgGpuHost {
             self.last_mat_state = mat_state;
         }
 
-        // Fallback animated 3D Frenet traffic step (zero heap allocations, skipped when frozen).
-        let traffic_bits = traffic_time_s.to_bits();
-        let traffic_moved_now =
-            !freeze_pose && self.has_traffic() && traffic_bits != self.last_traffic_bits;
-        if traffic_moved_now
-            && let (Some(reg_idx), Some(scene)) = (self.active_reg_idx, self.scene.as_mut())
-            && let Some(module) = self.registry.get_by_index(reg_idx)
-        {
-            module.step_dynamic(&mut scene.world, &scene.traffic, traffic_time_s);
-            self.last_traffic_bits = traffic_bits;
-            self.traffic_dirty = true;
-        }
-
         // Distinguish camera/topology repacks from traffic-only frames.
-        // Repack threshold (`1.0 m` translation or `~3.1°` rotation, plus viewport/FOV changes)
-        // stays strictly inside the `1.35x` padded frustum margin so objects near viewport edges
-        // never pop out prematurely.
-        let cam_dist_sq = (cam.eye[0] - self.last_pack_cam[0]).powi(2)
-            + (cam.eye[1] - self.last_pack_cam[1]).powi(2)
-            + (cam.eye[2] - self.last_pack_cam[2]).powi(2);
-        let fwd_dot = cam.fwd[0] * self.last_pack_fwd[0]
-            + cam.fwd[1] * self.last_pack_fwd[1]
-            + cam.fwd[2] * self.last_pack_fwd[2];
         let lod_key = LodConfigKey::from_config(cam.lod_config);
-        let viewport_or_fov_changed = self.last_pack_cam_params.is_none_or(|prev| {
-            prev.viewport_w != cam.viewport_w
-                || prev.viewport_h != cam.viewport_h
-                || prev.vfov_rad.to_bits() != cam.vfov_rad.to_bits()
-        });
-        let camera_repack_needed = rebuilt_scene
-            || self.ias_dirty
-            || viewport_or_fov_changed
-            || self.last_pack_lod_key != Some(lod_key)
-            || cam.omnidirectional != self.last_pack_omni
-            || !cam_dist_sq.is_finite()
-            || cam_dist_sq > 1.0
-            || (!cam.omnidirectional && (!fwd_dot.is_finite() || fwd_dot < 0.9985));
+        let camera_repack_needed = rebuilt_scene || self.camera_repack_needed(cam);
         let traffic_dirty = self.traffic_dirty;
 
         if (camera_repack_needed || traffic_dirty)
@@ -1947,7 +2015,7 @@ impl CsgGpuHost {
             let cam_view = if pack_cam.omnidirectional {
                 CameraView::omnidirectional(
                     Vec3::new(pack_cam.eye[0], pack_cam.eye[1], pack_cam.eye[2]),
-                    1500.0,
+                    CSG_VIEW_FAR_M,
                     pack_cam.vfov_rad.clamp(0.15, 2.7),
                     (pack_cam.viewport_h.max(144)) as f32,
                 )
@@ -1964,7 +2032,7 @@ impl CsgGpuHost {
                     Vec3::new(pack_cam.up[0], pack_cam.up[1], pack_cam.up[2]),
                     padded_vfov,
                     aspect,
-                    [0.05, 1500.0],
+                    [0.05, CSG_VIEW_FAR_M],
                     (pack_cam.viewport_h.max(144)) as f32,
                 )
             }
@@ -2117,14 +2185,20 @@ impl CsgGpuHost {
         }
         let gas_count = self.compound_gases.len();
         let slice = self.packed.instances_slice();
-        let count = dynamic_count.min(slice.len()).min(1 << 24);
+        let count = dynamic_count
+            .min(slice.len())
+            .min(self.instances_buf.len_elems)
+            .min(1 << 24);
         out_instances.reserve(count);
         for (idx, gpu_inst) in slice[..count].iter().enumerate() {
             let cid = gpu_inst.compound_id as usize;
-            if cid >= gas_count {
-                continue;
+            let Some((gas_idx, visible)) = optix_slot_gas(cid, gas_count) else {
+                break;
+            };
+            let mut inst = Instance::new(&self.compound_gases[gas_idx]);
+            if !visible {
+                inst.mask = 0;
             }
-            let mut inst = Instance::new(&self.compound_gases[cid]);
             inst.id = idx as u32;
             inst.sbt_offset = self
                 .compound_sbt_offsets
@@ -2142,23 +2216,28 @@ impl CsgGpuHost {
     /// Each OptiX instance receives `id = csg_instance_index` (matching `params.csg_instances[id]`),
     /// `OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT` for opaque RT traversal, and routes single-primitive &
     /// Multi-AABB `PURE_UNION` compounds to `CSG_SBT_PRIM_OFFSET` (`10`) and general RPN compounds
-    /// to `CSG_SBT_OFFSET` (`8`).
+    /// to `CSG_SBT_OFFSET` (`8`). Only instances present in `instances_buf` are appended, so a
+    /// failed upload never leaves IAS instances indexing missing `csg_instances` entries.
     pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>) {
         if !self.is_active() {
             return;
         }
         let gas_count = self.compound_gases.len();
-        out_instances.reserve(self.packed.len());
-        for (idx, gpu_inst) in self.packed.instances_slice().iter().enumerate() {
+        let uploaded = self.packed.len().min(self.instances_buf.len_elems);
+        out_instances.reserve(uploaded);
+        for (idx, gpu_inst) in self.packed.instances_slice()[..uploaded].iter().enumerate() {
             // OptiX `instanceId` is 24 bits (max 16,777,215).
             if idx >= (1 << 24) {
                 break;
             }
             let cid = gpu_inst.compound_id as usize;
-            if cid >= gas_count {
-                continue;
+            let Some((gas_idx, visible)) = optix_slot_gas(cid, gas_count) else {
+                break;
+            };
+            let mut inst = Instance::new(&self.compound_gases[gas_idx]);
+            if !visible {
+                inst.mask = 0;
             }
-            let mut inst = Instance::new(&self.compound_gases[cid]);
             inst.id = idx as u32;
             inst.sbt_offset = self
                 .compound_sbt_offsets
@@ -2267,11 +2346,11 @@ impl CsgGpuHost {
             return Ok(());
         }
 
-        let reg_count = self.registry.len();
-        if reg_count == 0 {
-            return Err("CSG SceneRegistry is empty".to_string());
-        }
-        let reg_idx = ((key.scene_idx as usize).saturating_sub(1)).min(reg_count - 1);
+        // From here on a failure leaves `scene = None` with `scene_key = key` committed: `sync`
+        // then reports one `FullRepack` (dropping the old CSG instances from the IAS) and does
+        // not retry every frame; selecting another scene and back retries, from the LRU cache
+        // when the CPU build itself succeeded.
+        let reg_idx = registry_index_for_scene(key.scene_idx, self.registry.len())?;
         let tod = time_of_day_from_u32(time_of_day);
         let road_mode = match key.road_mode {
             0 => csg_scene::RoadMode::Watertight3D,
@@ -2303,6 +2382,35 @@ impl CsgGpuHost {
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
+        if let Err(e) = self.upload_scene_gpu(optix_ctx, stream, scratch, &built) {
+            // Keep the CPU build for a cheap retry; `compound_gases` is still empty from above.
+            self.cache_insert_scene(key, built);
+            return Err(e);
+        }
+
+        self.packed
+            .reserve_instances(built.world.total_instance_count().max(256));
+        built.reset_crowd_motion_history();
+        self.active_reg_idx = Some(reg_idx);
+        self.pending_metadata = Some(SceneLoadedMetadata {
+            scene_idx: key.scene_idx,
+            variant_idx: key.variant_idx,
+            viewpoints: built.viewpoints.clone(),
+            rails: built.rails.clone(),
+        });
+        self.scene = Some(built);
+        Ok(())
+    }
+
+    /// Uploads `built`'s compiled library and materials and builds its per-compound GASes,
+    /// committing `compound_gases` / `compound_sbt_offsets` only when every build succeeded.
+    fn upload_scene_gpu(
+        &mut self,
+        optix_ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        built: &SceneBuilt,
+    ) -> Result<(), String> {
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
         let lib = &built.world.library;
@@ -2344,7 +2452,7 @@ impl CsgGpuHost {
                     stream,
                     scratch,
                     aabb_staging,
-                    &mut self.multi_aabb_host_scratch,
+                    &mut self.multi_aabb,
                     lib,
                     c,
                 )?;
@@ -2358,17 +2466,6 @@ impl CsgGpuHost {
 
         self.compound_gases = gases;
         self.compound_sbt_offsets = sbt_offsets;
-        self.packed
-            .reserve_instances(built.world.total_instance_count().max(256));
-        built.reset_crowd_motion_history();
-        self.active_reg_idx = Some(reg_idx);
-        self.pending_metadata = Some(SceneLoadedMetadata {
-            scene_idx: key.scene_idx,
-            variant_idx: key.variant_idx,
-            viewpoints: built.viewpoints.clone(),
-            rails: built.rails.clone(),
-        });
-        self.scene = Some(built);
         Ok(())
     }
 }
@@ -2434,14 +2531,17 @@ mod tests {
         assert!(a.min[1] < 0.0 && a.max[1] > 0.0);
 
         let unbounded = GpuCompound {
-            flags: 1,
+            flags: compound_flags::UNBOUNDED,
             aabb_min: [f32::NEG_INFINITY; 3],
             aabb_max: [f32::INFINITY; 3],
             ..Default::default()
         };
         let u = sanitized_compound_aabb(&unbounded);
-        assert_eq!(u.min, [-1000.0; 3]);
-        assert_eq!(u.max, [1000.0; 3]);
+        assert_eq!(u.min, [-UNBOUNDED_COMPOUND_HALF_EXTENT_M; 3]);
+        assert_eq!(u.max, [UNBOUNDED_COMPOUND_HALF_EXTENT_M; 3]);
+        // An unbounded ground must still cover a camera at the far end of the packing view from
+        // a compound origin 1 km away (the old box ended at 1000 m).
+        assert!(u.max[0] > 1000.0 + CSG_VIEW_FAR_M);
 
         let broken = GpuCompound {
             aabb_min: [f32::NAN, 5.0, 0.0],
@@ -2498,19 +2598,122 @@ mod tests {
 
     #[test]
     fn sbt_routing_splits_single_prim_and_rpn_compounds() {
-        assert_eq!(sbt_offset_for_compound(0), CSG_SBT_OFFSET);
+        // Production routing (`CompoundGasPlan::sbt_offset`), not a test-only copy of it.
         assert_eq!(
-            sbt_offset_for_compound(compound_flags::UNBOUNDED),
-            CSG_SBT_OFFSET
-        );
-        assert_eq!(
-            sbt_offset_for_compound(compound_flags::SINGLE_PRIM),
+            CompoundGasPlan::SinglePrim { prim_idx: 3 }.sbt_offset(),
             CSG_SBT_PRIM_OFFSET
         );
         assert_eq!(
-            sbt_offset_for_compound(compound_flags::SINGLE_PRIM | compound_flags::BOX_ONLY),
+            CompoundGasPlan::MultiAabbUnion {
+                first_prim: 0,
+                count: 2
+            }
+            .sbt_offset(),
             CSG_SBT_PRIM_OFFSET
         );
+        assert_eq!(CompoundGasPlan::GeneralRpn.sbt_offset(), CSG_SBT_OFFSET);
+    }
+
+    #[test]
+    fn optix_slots_stay_aligned_when_a_compound_has_no_gas() {
+        assert_eq!(optix_slot_gas(3, 5), Some((3, true)));
+        // Missing GAS: invisible placeholder keeps `packed slot == OptiX slot` for the scatter.
+        assert_eq!(optix_slot_gas(7, 5), Some((0, false)));
+        assert_eq!(optix_slot_gas(0, 0), None);
+    }
+
+    #[test]
+    fn out_of_range_scene_index_is_rejected_not_clamped() {
+        assert_eq!(registry_index_for_scene(1, 5), Ok(0));
+        assert_eq!(registry_index_for_scene(5, 5), Ok(4));
+        assert!(registry_index_for_scene(6, 5).is_err());
+        assert!(registry_index_for_scene(9, 5).is_err());
+        assert!(registry_index_for_scene(0, 5).is_err());
+        assert!(registry_index_for_scene(1, 0).is_err());
+    }
+
+    #[test]
+    fn dynamic_prefix_packer_drops_lod_history_when_lod_is_disabled() {
+        let reg = csg_scenes::default_scene_registry();
+        let module = reg.get("gundo_osm").expect("gundo_osm registered");
+        let built = module.build(&SceneBuildConfig::default());
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+        let view = CameraView::perspective(
+            vp.eye,
+            fwd,
+            Vec3::Y,
+            (vp.vfov_deg.to_radians() * 1.35).clamp(0.15, 2.7),
+            16.0 / 9.0,
+            [0.05, CSG_VIEW_FAR_M],
+            720.0,
+        )
+        .with_lod_config(LodConfig {
+            enabled: false,
+            ..LodConfig::default()
+        });
+        let mut lods = vec![0u8; built.world.dynamic_instance_count()];
+        let mut insts = Vec::new();
+        let mut prev = Vec::new();
+        pack_dynamic_prefix_only(&built.world, &view, false, &mut lods, &mut insts, &mut prev);
+        assert!(!insts.is_empty(), "the viewpoint must see dynamic instances");
+        assert!(
+            lods.contains(&PREV_LOD_NONE),
+            "emitted instances must reset their LOD history like upstream emit_assembly_instance"
+        );
+    }
+
+    #[test]
+    fn traffic_clock_alone_does_not_schedule_an_instance_upload() {
+        let mut host = CsgGpuHost::new();
+        let gundo_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo")
+            .expect("gundo registered");
+        let module = host
+            .registry
+            .get_by_index(gundo_idx)
+            .expect("gundo module");
+        let built = module.build(&SceneBuildConfig::default());
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+        let key = CsgSceneKey {
+            scene_idx: (gundo_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+        host.scene_key = key;
+        host.active_reg_idx = Some(gundo_idx);
+        host.scene = Some(built);
+        assert!(host.has_traffic());
+        let cam = CsgCameraParams {
+            eye: [vp.eye.x, vp.eye.y, vp.eye.z],
+            fwd: [fwd.x, fwd.y, fwd.z],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: vp.vfov_deg.to_radians(),
+            lod_config: LodConfig::default(),
+            omnidirectional: false,
+        };
+        host.last_pack_cam = cam.eye;
+        host.last_pack_fwd = cam.fwd;
+        host.last_pack_cam_params = Some(cam);
+        host.last_pack_lod_key = Some(LodConfigKey::from_config(cam.lod_config));
+        host.ias_dirty = false;
+        host.traffic_dirty = false;
+
+        // Traffic toggled off while the crowd advances the shared clock: `step_dynamic` skips
+        // traffic, so nothing schedules an upload (the old predicate compared the clock bits and
+        // `sync` then stepped the vehicles anyway).
+        assert!(!host.step_dynamic(0.0, 4.25, cam.eye, CrowdLodParams::default(), false, false));
+        assert!(!host.will_upload_instances(key, cam));
+        // A real traffic step does.
+        assert!(host.step_dynamic(0.0, 4.5, cam.eye, CrowdLodParams::default(), false, true));
+        assert!(host.will_upload_instances(key, cam));
     }
 
     #[test]
@@ -2541,7 +2744,7 @@ mod tests {
         );
         assert!(
             packed.stats.single_prim_instances > 0,
-            "city scenes must route single-prim instances to the lean SBT 5 hit group"
+            "city scenes must route single-prim instances to the lean SBT 10 hit group"
         );
     }
 
@@ -2646,16 +2849,10 @@ mod tests {
         );
 
         let out_path = std::env::temp_dir().join("nv_demo_sdg_export_test.json");
+        let sdg_cam =
+            CsgGpuHost::build_sdg_camera(&cam_frame, CameraProjection::Pinhole, 1280, 720);
         let count = host
-            .export_sdg_json(
-                &out_path,
-                &cam_frame,
-                CameraProjection::Pinhole,
-                1280,
-                720,
-                7,
-                0.15,
-            )
+            .export_sdg_json(&out_path, sdg_cam, 7, 0.15)
             .expect("SDG JSON export");
         assert_eq!(count, 4, "all 4 showcase actors must be exported");
         let raw = std::fs::read_to_string(&out_path).expect("read exported SDG JSON");
@@ -3284,7 +3481,7 @@ mod tests {
         let unmapped = slot_map.iter().filter(|&&s| s == u32::MAX).count();
         assert_eq!(
             unmapped, 0,
-            "every crowd bone must stay mapped after ensure_all_crowd_bones_slotted so GPU scatter can revive culled actors"
+            "every crowd bone must stay mapped after mark_crowd_bones_visible so GPU scatter can revive culled actors"
         );
     }
 

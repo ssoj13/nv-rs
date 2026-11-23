@@ -4,7 +4,13 @@
 //! manager is C++-only, [`CompressionManager`] provides single-buffer and preallocated
 //! destination manager semantics cleanly over [`compress_batched_async`] and
 //! [`decompress_batched_async`], reusing internal staging tables across calls so repeated
-//! compress/decompress cycles perform zero steady-state allocations.
+//! compress/decompress cycles perform zero steady-state device staging allocations. Every manager
+//! call blocks until `stream` completes because it reads chunk sizes and statuses back to the
+//! host, and each returned [`CompressedLayout`] owns two host `Vec`s.
+//!
+//! Decompression decodes with the payload's own [`CompressedLayout::format`] (codec options such
+//! as LZ4 bitshuffle are not stored in the chunk stream) and first checks that the layout's
+//! uncompressed ranges tile `0..uncompressed_bytes` exactly, because the layout is public data.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -66,6 +72,7 @@ impl CompressionManager {
         if chunk_size == 0 {
             return Err(Error::Invalid("chunk_size must be non-zero"));
         }
+        format.check_compress_chunk(chunk_size)?;
         Ok(Self {
             ctx: stream.context().clone(),
             format,
@@ -138,8 +145,11 @@ impl CompressionManager {
             .ok_or(Error::Invalid("compressed output capacity overflow"))
     }
 
-    /// Compresses `input` asynchronously into a newly allocated [`CompressedBuffer`], enforcing
-    /// `budget` against combined output + staging + temp workspace growth.
+    /// Compresses `input` into a newly allocated [`CompressedBuffer`], enforcing `budget` against
+    /// combined output + staging + temp workspace growth.
+    ///
+    /// Despite the `_async` suffix this blocks: it synchronizes `stream` to read back the
+    /// compressed chunk sizes.
     pub fn compress_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -180,6 +190,8 @@ impl CompressionManager {
 
     /// Compresses `input` into a caller-owned `output` buffer (zero device allocations once
     /// `self` and `output` are sized).
+    ///
+    /// Blocks until `stream` completes, like [`Self::compress_async`].
     pub fn compress_into_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -230,6 +242,8 @@ impl CompressionManager {
 
     /// Decompresses `compressed` into a caller-provided `output` buffer (zero output allocation),
     /// returning the number of uncompressed bytes written.
+    ///
+    /// Blocks until `stream` completes (per-chunk statuses are read back to the host).
     pub fn decompress_into_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -252,6 +266,7 @@ impl CompressionManager {
                 "compressed payload format does not match manager format",
             ));
         }
+        validate_layout(&compressed.layout)?;
         if output.num_bytes() < compressed.layout.uncompressed_bytes {
             return Err(Error::Invalid(
                 "decompression output buffer smaller than uncompressed_bytes",
@@ -260,7 +275,7 @@ impl CompressionManager {
         let receipt = decompress_batched_async(
             stream,
             &mut self.staging,
-            self.format,
+            compressed.layout.format,
             self.backend,
             &compressed.data,
             &compressed.layout.compressed_ranges,
@@ -273,6 +288,8 @@ impl CompressionManager {
     }
 
     /// Allocates an exact-sized output buffer (respecting `budget`) and decompresses `compressed`.
+    ///
+    /// Blocks until `stream` completes, like [`Self::decompress_into_async`].
     pub fn decompress_to_buffer_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -284,6 +301,8 @@ impl CompressionManager {
                 "compressed payload format does not match manager format",
             ));
         }
+        // Validate before sizing the allocation from caller-supplied layout fields.
+        validate_layout(&compressed.layout)?;
         let num_chunks = compressed.layout.compressed_ranges.len();
         let max_chunk = compressed
             .layout
@@ -292,7 +311,7 @@ impl CompressionManager {
             .map(|r| r.end - r.start)
             .max()
             .unwrap_or(0);
-        let temp_bytes = self.format.decompress_temp_bytes(
+        let temp_bytes = compressed.layout.format.decompress_temp_bytes(
             num_chunks,
             max_chunk,
             compressed.layout.uncompressed_bytes,
@@ -319,9 +338,62 @@ impl CompressionManager {
     }
 }
 
+/// Checks that `layout` pairs one compressed range with each uncompressed range and that the
+/// uncompressed ranges tile `0..uncompressed_bytes` contiguously in ascending order, so a
+/// successful decompression writes every output byte exactly once.
+fn validate_layout(layout: &CompressedLayout) -> Result<()> {
+    if layout.uncompressed_ranges.len() != layout.compressed_ranges.len() {
+        return Err(Error::Invalid(
+            "layout compressed and uncompressed range counts differ",
+        ));
+    }
+    let mut expected = 0usize;
+    for r in &layout.uncompressed_ranges {
+        if r.start != expected || r.end <= r.start {
+            return Err(Error::Invalid(
+                "layout uncompressed ranges must tile 0..uncompressed_bytes in ascending order",
+            ));
+        }
+        expected = r.end;
+    }
+    if expected == 0 || expected != layout.uncompressed_bytes {
+        return Err(Error::Invalid(
+            "layout uncompressed ranges do not cover uncompressed_bytes",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::FormatKind;
+
+    fn layout(uncompressed_bytes: usize, ranges: Vec<Range<usize>>) -> CompressedLayout {
+        CompressedLayout {
+            format: Format::default_for(FormatKind::Lz4),
+            uncompressed_bytes,
+            slot_stride: 64,
+            compressed_ranges: (0..ranges.len()).map(|i| i * 64..i * 64 + 8).collect(),
+            uncompressed_ranges: ranges,
+        }
+    }
+
+    #[test]
+    fn t0_layout_must_tile_uncompressed_range() {
+        assert!(validate_layout(&layout(20, vec![0..10, 10..20])).is_ok());
+        // Overlap leaves bytes 10..20 never written (CMP-7).
+        assert!(validate_layout(&layout(20, vec![0..10, 0..10])).is_err());
+        // Gap.
+        assert!(validate_layout(&layout(25, vec![0..10, 15..25])).is_err());
+        // Short of uncompressed_bytes.
+        assert!(validate_layout(&layout(1 << 40, std::iter::once(0..10).collect())).is_err());
+        // Count mismatch.
+        let mut bad = layout(20, vec![0..10, 10..20]);
+        bad.compressed_ranges.pop();
+        assert!(validate_layout(&bad).is_err());
+        assert!(validate_layout(&layout(0, Vec::new())).is_err());
+    }
 
     #[test]
     fn t0_chunk_planning_and_alignment() {

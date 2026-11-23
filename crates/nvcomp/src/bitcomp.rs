@@ -1,5 +1,9 @@
 //! Safe RAII wrapper over the native Bitcomp plan C API (`bitcompCreatePlan`,
 //! `bitcompCompressLossless`, `bitcompUncompress`, `bitcompMaxBuflen`).
+//!
+//! Only lossless compression is exposed: a plan created with a lossy [`BitcompMode`] can be used
+//! for `bitcompUncompress`, but [`BitcompPlan::compress_lossless_async`] rejects it with
+//! [`Error::Unsupported`] instead of mixing a lossy plan with the lossless entry point.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -91,6 +95,7 @@ pub struct BitcompPlan {
     raw: sys::bitcompHandle_t,
     ctx: Arc<Context>,
     uncompressed_bytes: usize,
+    mode: BitcompMode,
     stream: Option<Arc<Stream>>,
 }
 
@@ -138,6 +143,7 @@ impl BitcompPlan {
             raw,
             ctx: ctx.clone(),
             uncompressed_bytes,
+            mode,
             stream: None,
         })
     }
@@ -168,6 +174,8 @@ impl BitcompPlan {
 
     /// Compresses `input` losslessly into `output` on `stream`, checking `budget` against
     /// required output capacity.
+    ///
+    /// Fails with [`Error::Unsupported`] for a plan created with a lossy [`BitcompMode`].
     pub fn compress_lossless_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -176,6 +184,11 @@ impl BitcompPlan {
         budget: Option<usize>,
     ) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
+        if self.mode != BitcompMode::Lossless {
+            return Err(Error::Unsupported(
+                "lossy Bitcomp plans need the lossy compression entry points, which are not exposed",
+            ));
+        }
         if !Arc::ptr_eq(input.context(), &self.ctx) || !Arc::ptr_eq(output.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "bitcomp input/output belongs to another context",

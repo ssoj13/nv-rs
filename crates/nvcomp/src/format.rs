@@ -262,7 +262,9 @@ pub struct CascadedOpts {
     pub data_type: DataType,
     /// Asymmetric vs symmetric coding mode.
     pub mode: CascadedMode,
-    /// Compression effort level (`0..=7`, default `3`).
+    /// Compression effort level (default `3`). nvCOMP's highest useful asymmetric level is `7`
+    /// (`3` when only Delta is enabled); larger values select the highest supported level and
+    /// symmetric mode ignores it (`cascaded.h`, `nvcompBatchedCascadedCompressOpts_t`).
     pub compression_level: u8,
 }
 
@@ -474,6 +476,29 @@ impl Format {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Largest uncompressed chunk nvCOMP accepts for compression with this format
+    /// (`nvcomp*CompressionMaxAllowedChunkSize`).
+    pub(crate) const fn max_compress_chunk_bytes(&self) -> usize {
+        match self {
+            Self::Lz4(_) => sys::nvcompLZ4CompressionMaxAllowedChunkSize,
+            Self::Snappy(_) => sys::nvcompSnappyCompressionMaxAllowedChunkSize,
+            Self::Zstd(_) => sys::nvcompZstdCompressionMaxAllowedChunkSize,
+            Self::Cascaded(_) => sys::nvcompCascadedCompressionMaxAllowedChunkSize,
+            Self::Gdeflate(_) => sys::nvcompGdeflateCompressionMaxAllowedChunkSize,
+            Self::Bitcomp(_) => sys::nvcompBitcompCompressionMaxAllowedChunkSize,
+        }
+    }
+
+    /// Rejects an uncompressed chunk larger than this format's compression limit before FFI.
+    pub(crate) fn check_compress_chunk(&self, chunk_bytes: usize) -> Result<()> {
+        if chunk_bytes > self.max_compress_chunk_bytes() {
+            return Err(Error::Invalid(
+                "chunk size exceeds the format's nvCOMP compression chunk limit",
+            ));
+        }
+        Ok(())
     }
 
     /// Queries compression input/output/temp alignment requirements.
@@ -1197,6 +1222,14 @@ mod tests {
             ..Default::default()
         });
         assert!(bad_bitcomp.validate().is_err());
+
+        let lz4 = Format::default_for(FormatKind::Lz4);
+        assert_eq!(lz4.max_compress_chunk_bytes(), 1 << 24);
+        assert!(lz4.check_compress_chunk(1 << 24).is_ok());
+        assert!(lz4.check_compress_chunk((1 << 24) + 1).is_err());
+        let gdeflate = Format::default_for(FormatKind::Gdeflate);
+        assert!(gdeflate.check_compress_chunk(1 << 20).is_ok());
+        assert!(gdeflate.check_compress_chunk((1 << 31) + 1).is_err());
 
         let cascaded = CascadedOpts::default().to_compress_sys();
         assert_eq!(cascaded.compression_level, 3);

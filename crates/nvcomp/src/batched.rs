@@ -4,6 +4,10 @@
 //! 1. Query required temporary size + alignments + worst-case output chunk capacity;
 //! 2. Verify combined device growth against the caller's byte budget, reserve [`BatchStaging`],
 //!    upload chunk pointer/size tables, and enqueue the nvCOMP kernel on `stream`.
+//!
+//! A receipt reads its results from the staging tables, so it is valid only until the next batch
+//! is prepared on the same [`BatchStaging`]; a stale receipt is rejected, never answered with
+//! another batch's results.
 
 use std::ffi::c_void;
 use std::ops::Range;
@@ -28,12 +32,16 @@ pub struct BatchedCompressReceipt {
     pub slot_stride: usize,
     /// Byte lengths of the original uncompressed chunks.
     pub uncompressed_chunk_bytes: Vec<usize>,
+    /// Staging batch generation whose result tables this receipt reads.
+    generation: u64,
 }
 
 impl BatchedCompressReceipt {
     /// Synchronizes `stream`, checks per-chunk compression statuses, and reads back the actual
     /// compressed byte lengths for each chunk using `staging`'s pinned buffer (zero allocation on
     /// repeated calls if `out_sizes` is reused).
+    ///
+    /// Fails with [`Error::Invalid`] when another batch was prepared on `staging` after this one.
     pub fn collect_sizes(
         &self,
         stream: &Arc<Stream>,
@@ -41,6 +49,7 @@ impl BatchedCompressReceipt {
         out_sizes: &mut Vec<usize>,
     ) -> Result<()> {
         same_stream(stream, staging.stream())?;
+        check_generation(self.generation, staging)?;
         if self.num_chunks == 0 {
             out_sizes.clear();
             return Ok(());
@@ -78,11 +87,15 @@ pub struct BatchedDecompressReceipt {
     pub format: Format,
     /// Number of chunks decompressed.
     pub num_chunks: usize,
+    /// Staging batch generation whose result tables this receipt reads.
+    generation: u64,
 }
 
 impl BatchedDecompressReceipt {
     /// Synchronizes `stream` and verifies every chunk reported `nvcompSuccess`, filling `out_sizes`
     /// with the actual decompressed byte lengths written per chunk.
+    ///
+    /// Fails with [`Error::Invalid`] when another batch was prepared on `staging` after this one.
     pub fn collect_sizes(
         &self,
         stream: &Arc<Stream>,
@@ -90,6 +103,7 @@ impl BatchedDecompressReceipt {
         out_sizes: &mut Vec<usize>,
     ) -> Result<()> {
         same_stream(stream, staging.stream())?;
+        check_generation(self.generation, staging)?;
         if self.num_chunks == 0 {
             out_sizes.clear();
             return Ok(());
@@ -116,6 +130,15 @@ impl BatchedDecompressReceipt {
         out_sizes.extend_from_slice(&tables.host_out_bytes.as_slice()[..self.num_chunks]);
         Ok(())
     }
+}
+
+fn check_generation(receipt: u64, staging: &BatchStaging) -> Result<()> {
+    if receipt != staging.generation() {
+        return Err(Error::Invalid(
+            "receipt does not belong to the latest batch prepared on this staging",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn aligned_stride(bytes: usize, align: usize) -> Result<usize> {
@@ -151,6 +174,22 @@ fn validate_chunk_ranges(ranges: &[Range<usize>], total_bytes: usize) -> Result<
     Ok((max_chunk, total))
 }
 
+/// Whether no two `ranges` share a byte. O(n) for ascending ranges (the layout produced by
+/// [`crate::CompressionManager`]); other orders are sorted on a temporary index.
+fn ranges_disjoint(ranges: &[Range<usize>]) -> bool {
+    if ranges
+        .windows(2)
+        .all(|pair| matches!(pair, [a, b] if a.end <= b.start))
+    {
+        return true;
+    }
+    let mut sorted: Vec<&Range<usize>> = ranges.iter().collect();
+    sorted.sort_unstable_by_key(|r| r.start);
+    sorted
+        .windows(2)
+        .all(|pair| matches!(pair, [a, b] if a.end <= b.start))
+}
+
 /// Launches batched stream-ordered compression of `input_ranges` inside `input` into packed,
 /// alignment-padded slots inside `output`.
 ///
@@ -174,6 +213,7 @@ pub fn compress_batched_async(
         ));
     }
     let (max_chunk, total_bytes) = validate_chunk_ranges(input_ranges, input.num_bytes())?;
+    format.check_compress_chunk(max_chunk)?;
     let alignments = format.compress_alignments()?;
     let max_out_chunk = format.max_output_chunk_bytes(max_chunk)?;
     let slot_stride = aligned_stride(max_out_chunk, alignments.output)?;
@@ -216,6 +256,7 @@ pub fn compress_batched_async(
         alignments.temp,
         budget,
     )?;
+    let generation = staging.generation();
 
     let num_chunks = input_ranges.len();
     let mut uncomp_sizes = Vec::with_capacity(num_chunks);
@@ -241,6 +282,7 @@ pub fn compress_batched_async(
         num_chunks,
         slot_stride,
         uncompressed_chunk_bytes: uncomp_sizes,
+        generation,
     })
 }
 
@@ -267,31 +309,28 @@ fn upload_compress_tables_and_launch(
         BatchStaging::upload_prefix(host_in_bytes, dev_in_bytes, num_chunks, cu_stream)?;
         BatchStaging::upload_prefix(host_out_ptrs, dev_out_ptrs, num_chunks, cu_stream)?;
     }
+    // Only the uploads read the pinned host tables. Device tables and scratch are reused and
+    // freed in stream order on `stream` (the staging's own stream), so the kernel needs no fence.
     staging.arm_dma_fence(stream)?;
 
-    let res = {
-        let (tables, scratch) = staging.tables_mut()?;
-        let (temp_ptr, temp_bytes) = scratch.as_raw_parts();
-        // SAFETY: all device pointer/size/status tables hold `>= num_chunks` entries and scratch holds
-        // `>= temp_bytes` aligned workspace.
-        unsafe {
-            format.launch_compress_async(
-                tables.dev_in_ptrs.cu_deviceptr() as *const *const c_void,
-                tables.dev_in_bytes.cu_deviceptr() as *const usize,
-                max_chunk,
-                num_chunks,
-                temp_ptr as *mut c_void,
-                temp_bytes,
-                tables.dev_out_ptrs.cu_deviceptr() as *const *mut c_void,
-                tables.dev_out_bytes.cu_deviceptr() as *mut usize,
-                tables.dev_statuses.cu_deviceptr() as *mut sys::nvcompStatus_t,
-                stream.cu_stream(),
-            )
-        }
-    };
-    // Advance fence past kernel completion (tables + scratch remain protected until done).
-    staging.arm_dma_fence(stream)?;
-    res
+    let (tables, scratch) = staging.tables_mut()?;
+    let (temp_ptr, temp_bytes) = scratch.as_raw_parts();
+    // SAFETY: all device pointer/size/status tables hold `>= num_chunks` entries and scratch holds
+    // `>= temp_bytes` aligned workspace.
+    unsafe {
+        format.launch_compress_async(
+            tables.dev_in_ptrs.cu_deviceptr() as *const *const c_void,
+            tables.dev_in_bytes.cu_deviceptr() as *const usize,
+            max_chunk,
+            num_chunks,
+            temp_ptr as *mut c_void,
+            temp_bytes,
+            tables.dev_out_ptrs.cu_deviceptr() as *const *mut c_void,
+            tables.dev_out_bytes.cu_deviceptr() as *mut usize,
+            tables.dev_statuses.cu_deviceptr() as *mut sys::nvcompStatus_t,
+            stream.cu_stream(),
+        )
+    }
 }
 
 /// Queries the uncompressed byte sizes stored inside compressed chunks asynchronously on `stream`,
@@ -403,6 +442,10 @@ pub fn decompress_batched_async(
     let _ = validate_chunk_ranges(compressed_ranges, compressed.num_bytes())?;
     let (max_uncomp_chunk, total_uncomp_bytes) =
         validate_chunk_ranges(output_ranges, output.num_bytes())?;
+    // Overlapping destinations would make two chunks race on the same output bytes.
+    if !ranges_disjoint(output_ranges) {
+        return Err(Error::Invalid("output chunk ranges overlap"));
+    }
 
     let alignments = format.decompress_alignments(backend)?;
     let in_align = u64::try_from(alignments.input).unwrap_or(u64::MAX);
@@ -440,6 +483,7 @@ pub fn decompress_batched_async(
         stream,
     )?;
     staging.prepare(stream, num_chunks, temp_bytes, alignments.temp, budget)?;
+    let generation = staging.generation();
 
     {
         let (tables, _) = staging.tables_mut()?;
@@ -474,9 +518,11 @@ pub fn decompress_batched_async(
         BatchStaging::upload_prefix(host_out_ptrs, dev_out_ptrs, num_chunks, stream)?;
         BatchStaging::upload_prefix(host_buf_bytes, dev_buf_bytes, num_chunks, stream)?;
     }
+    // Only the uploads read the pinned host tables. Device tables and scratch are reused and
+    // freed in stream order on `stream` (the staging's own stream), so the kernel needs no fence.
     staging.arm_dma_fence(stream)?;
 
-    let launch_res = {
+    {
         let (tables, scratch) = staging.tables_mut()?;
         let (temp_ptr, cap_bytes) = scratch.as_raw_parts();
         // SAFETY: all tables hold `>= num_chunks` items, output chunks satisfy alignment and
@@ -495,13 +541,14 @@ pub fn decompress_batched_async(
                 tables.dev_statuses.cu_deviceptr() as *mut sys::nvcompStatus_t,
                 stream.cu_stream(),
             )
-        }
-    };
-    // Advance fence past kernel completion (tables + scratch remain protected until done).
-    staging.arm_dma_fence(stream)?;
-    launch_res?;
+        }?;
+    }
 
-    Ok(BatchedDecompressReceipt { format, num_chunks })
+    Ok(BatchedDecompressReceipt {
+        format,
+        num_chunks,
+        generation,
+    })
 }
 
 #[cfg(test)]
@@ -521,5 +568,15 @@ mod tests {
         assert!(validate_chunk_ranges(std::slice::from_ref(&(512..1025)), 1024).is_err());
         let (max_c, tot) = validate_chunk_ranges(&[0..512, 512..768], 1024).unwrap();
         assert_eq!((max_c, tot), (512, 768));
+    }
+
+    #[test]
+    fn t0_output_range_overlap_detection() {
+        assert!(ranges_disjoint(std::slice::from_ref(&(0..4096))));
+        assert!(ranges_disjoint(&[0..4096, 4096..8192]));
+        assert!(ranges_disjoint(&[4096..8192, 0..4096]));
+        assert!(!ranges_disjoint(&[0..4096, 2048..6144]));
+        assert!(!ranges_disjoint(&[2048..6144, 8192..9000, 0..4096]));
+        assert!(!ranges_disjoint(&[0..10, 0..10]));
     }
 }

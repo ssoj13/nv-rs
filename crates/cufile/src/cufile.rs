@@ -373,17 +373,28 @@ pub trait DeviceSpan: sealed::Sealed {
     fn num_bytes(&self) -> usize;
 }
 
-/// Mutable device span accepted by cuFile read operations (`DeviceBuffer<T>`,
-/// `DeviceBufferView<'_, T>`, or [`RegisteredBuffer`]).
+/// Mutable device span accepted by cuFile read operations (`DeviceBuffer<T>`, `&mut` of a
+/// mutable span, or [`RegisteredBuffer`] over one).
 ///
 /// # Safety Invariant & Obligations
 /// This trait extends [`DeviceSpan`] and is sealed via the internal [`sealed::Sealed`] supertrait.
 /// External crates cannot implement this trait, preventing untrusted code from manufacturing
 /// destination buffers for cuFile read operations.
 ///
-/// Implementors represent valid, writable device memory. When using [`Arc<T>`] where
-/// `T: DeviceSpanMut`, the caller guarantees that concurrent operations on the same or other
-/// streams do not cause data races on the underlying GPU memory.
+/// Implementors represent valid, writable device memory that the holder owns exclusively.
+/// Shared handles are deliberately excluded: a `DeviceBufferView` borrows its parent through `&`
+/// and an [`Arc`] can be cloned, so a cuFile DMA write through either would race with readers
+/// that cuda-core's access tracker cannot see.
+///
+/// ```compile_fail
+/// fn assert_mut<T: cufile::DeviceSpanMut>() {}
+/// assert_mut::<cuda_core::DeviceBufferView<'static, u8>>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_mut<T: cufile::DeviceSpanMut>() {}
+/// assert_mut::<std::sync::Arc<cuda_core::DeviceBuffer<u8>>>();
+/// ```
 ///
 /// Downstream code cannot fabricate untrusted mutable device spans:
 /// ```compile_fail
@@ -427,8 +438,6 @@ impl<T> DeviceSpan for DeviceBufferView<'_, T> {
     }
 }
 
-impl<T> DeviceSpanMut for DeviceBufferView<'_, T> {}
-
 impl<T: DeviceSpan + ?Sized> DeviceSpan for &mut T {
     fn context(&self) -> &Arc<Context> {
         (**self).context()
@@ -458,8 +467,6 @@ impl<T: DeviceSpan + ?Sized> DeviceSpan for Arc<T> {
         (**self).num_bytes()
     }
 }
-
-impl<T: DeviceSpanMut + ?Sized> DeviceSpanMut for Arc<T> {}
 
 /// Returns the loaded `libcufile` library version integer.
 pub fn version() -> Result<i32> {
@@ -533,10 +540,10 @@ mod tests {
         assert_device_span::<Arc<DeviceBuffer<u8>>>();
         assert_device_span::<RegisteredBuffer<DeviceBuffer<u8>>>();
 
+        // Shared handles (`DeviceBufferView`, `Arc<T>`) are not `DeviceSpanMut` (CUF-1); see the
+        // `compile_fail` examples on the trait.
         assert_device_span_mut::<DeviceBuffer<u8>>();
-        assert_device_span_mut::<DeviceBufferView<'_, u8>>();
         assert_device_span_mut::<&mut DeviceBuffer<u8>>();
-        assert_device_span_mut::<Arc<DeviceBuffer<u8>>>();
         assert_device_span_mut::<RegisteredBuffer<DeviceBuffer<u8>>>();
     }
 
@@ -561,12 +568,12 @@ mod tests {
         let fh = FileHandle::register(&ctx, file, IoMode::PosixFallback).unwrap();
 
         let src_dev = Arc::new(DeviceBuffer::from_host(&stream, &payload).unwrap());
-        let dst_dev = Arc::new(DeviceBuffer::<u8>::zeroed(&stream, payload.len()).unwrap());
+        let mut dst_dev = DeviceBuffer::<u8>::zeroed(&stream, payload.len()).unwrap();
         stream.synchronize().unwrap();
 
         let wrote = fh.write(0, &src_dev, 0, payload.len()).unwrap();
         assert_eq!(wrote, payload.len());
-        let read = fh.read(0, &dst_dev, 0, payload.len()).unwrap();
+        let read = fh.read(0, &mut dst_dev, 0, payload.len()).unwrap();
         assert_eq!(read, payload.len());
 
         let host = dst_dev.to_host_vec(&stream).unwrap();
@@ -610,19 +617,56 @@ mod tests {
         stream.synchronize().unwrap();
 
         let reg_src = RegisteredBuffer::register(src, BufRegisterFlags::NONE).unwrap();
-        let reg_dst = RegisteredBuffer::register(dst, BufRegisterFlags::NONE).unwrap();
+        let mut reg_dst = RegisteredBuffer::register(dst, BufRegisterFlags::NONE).unwrap();
         let _reg_stream = RegisteredStream::register(&stream, StreamFlags::NONE).unwrap();
         let fh = FileHandle::register(&ctx, file, IoMode::GdsOnly).unwrap();
 
         let wrote = fh.write(0, &reg_src, 0, payload.len()).unwrap();
         assert_eq!(wrote, payload.len());
-        let read = fh.read(0, &reg_dst, 0, payload.len()).unwrap();
+        let read = fh
+            .read(0, Arc::get_mut(&mut reg_dst).unwrap(), 0, payload.len())
+            .unwrap();
         assert_eq!(read, payload.len());
 
         let dst_inner = RegisteredBuffer::deregister(reg_dst).unwrap();
         assert_eq!(dst_inner.to_host_vec(&stream).unwrap(), payload);
         drop(reg_src);
         drop(FileHandle::deregister(fh).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Decides CUF-5 on a Linux GDS host (run under `compute-sanitizer --tool memcheck` as well):
+    /// registrations do not keep the [`DriverSession`] alive, so this uses a handle and a buffer
+    /// registration after `cuFileDriverClose_v2`. Passing requires a typed result (success or
+    /// `Error::Status`) and a clean teardown; a crash or memcheck report confirms CUF-5.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux GPUDirect Storage / libcufile"]
+    fn t2_gds_registrations_used_after_session_close() {
+        let ctx = Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let session = DriverSession::open(&ctx).unwrap();
+        let path = std::env::temp_dir().join("nv_rs_cufile_gds_after_close.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fh = FileHandle::register(&ctx, file, IoMode::GdsOnly).unwrap();
+        let src = DeviceBuffer::<u8>::zeroed(&stream, 4096).unwrap();
+        let reg_src = RegisteredBuffer::register(src, BufRegisterFlags::NONE).unwrap();
+        stream.synchronize().unwrap();
+
+        assert!(matches!(session.close(), Ok(()) | Err(Error::Status { .. })));
+        let wrote = fh.write(0, &reg_src, 0, 4096);
+        assert!(matches!(wrote, Ok(_) | Err(Error::Status { .. })));
+        let mut dst = DeviceBuffer::<u8>::zeroed(&stream, 4096).unwrap();
+        let read = fh.read(0, &mut dst, 0, 4096);
+        assert!(matches!(read, Ok(_) | Err(Error::Status { .. })));
+        drop(RegisteredBuffer::deregister(reg_src));
+        drop(FileHandle::deregister(fh));
         let _ = std::fs::remove_file(path);
     }
 }

@@ -1,12 +1,17 @@
 //! Reusable GPU workspace (`Scratch`) and pre-allocated host/device pointer/size tables
 //! (`BatchStaging`) for zero-allocation steady-state nvCOMP batched launches.
 //!
-//! `BatchStaging` uses a CUDA event (`dma_fence`) around pinned host table copies so
-//! consecutive async launches on a stream never race over pinned staging memory and never stall
-//! unnecessarily when previous work has already finished.
+//! `BatchStaging` uses a CUDA event (`dma_fence`) recorded after the pinned host table uploads so
+//! consecutive async launches on a stream never race over pinned staging memory, while the host
+//! only waits for those uploads, never for the previous kernel. Device tables and scratch are
+//! allocated stream-ordered on the bound stream and every launch, readback, and release uses that
+//! same stream, so reuse and stream-ordered frees are ordered after queued kernels without a host
+//! wait. Each batch takes a fresh generation number so a receipt can only collect the results of
+//! the latest batch launched on its staging.
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Event, PinnedHostBuffer, Stream};
 use nvcomp_sys as sys;
@@ -48,9 +53,14 @@ impl Scratch {
         self.buf.as_ref().map_or(0, DeviceBuffer::num_bytes)
     }
 
-    /// Additional bytes needed beyond [`Self::capacity`] to fit `needed` bytes.
+    /// Device bytes a [`Self::reserve`] of `needed` bytes allocates: all of `needed` when the
+    /// workspace must grow, else `0`.
+    ///
+    /// Growth allocates a fresh buffer of `needed` bytes; the old buffer's stream-ordered free is
+    /// retired on a cuda-core completion worker and may still be pending, so the full new size
+    /// (not the difference to [`Self::capacity`]) is charged against byte budgets.
     pub fn growth(&self, needed: usize) -> usize {
-        needed.saturating_sub(self.capacity())
+        growth_bytes(self.capacity(), needed)
     }
 
     /// Ensures the workspace holds at least `needed` bytes and satisfies `align` byte alignment,
@@ -69,6 +79,9 @@ impl Scratch {
         let grow = self.growth(needed);
         if grow > 0 {
             within(budget, grow)?;
+            // Release the old workspace first: its free is stream-ordered on `self.stream`, the
+            // stream of every kernel that used it (checked above), so it cannot race queued work.
+            self.buf = None;
             // SAFETY: nvCOMP temporary workspace is overwritten by device kernels before read.
             let fresh = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, needed) }?;
             let req_align = u64::try_from(align.max(1)).unwrap_or(u64::MAX);
@@ -101,6 +114,14 @@ impl Scratch {
         }
     }
 }
+
+/// Bytes a workspace of `capacity` bytes allocates to hold `needed` bytes (see [`Scratch::growth`]).
+const fn growth_bytes(capacity: usize, needed: usize) -> usize {
+    if needed > capacity { needed } else { 0 }
+}
+
+/// Source of batch generation numbers, unique across every [`BatchStaging`] in the process.
+static NEXT_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct TableSet {
     pub(crate) host_in_ptrs: PinnedHostBuffer<u64>,
@@ -157,6 +178,7 @@ pub struct BatchStaging {
     scratch: Scratch,
     dma_fence: Event,
     fence_armed: bool,
+    generation: u64,
 }
 
 impl BatchStaging {
@@ -172,6 +194,7 @@ impl BatchStaging {
             scratch: Scratch::new(stream),
             dma_fence,
             fence_armed: false,
+            generation: 0,
         })
     }
 
@@ -206,6 +229,11 @@ impl BatchStaging {
         table_grow.saturating_add(self.scratch.growth(temp_bytes))
     }
 
+    /// Generation of the latest batch prepared on this staging; receipts compare against it.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Waits for any previous table DMA using `dma_fence` to complete so pinned host buffers can
     /// be safely mutated without overwriting an in-flight transfer.
     pub(crate) fn sync_host_tables(&mut self) -> Result<()> {
@@ -216,7 +244,8 @@ impl BatchStaging {
         Ok(())
     }
 
-    /// Marks that the pinned host tables are currently referenced by async DMA on `stream`.
+    /// Marks that the pinned host tables are currently referenced by async HtoD uploads on `stream`.
+    /// Recorded right after the uploads, so [`Self::sync_host_tables`] waits for the uploads only.
     pub(crate) fn arm_dma_fence(&mut self, stream: &Stream) -> Result<()> {
         self.dma_fence.record(stream)?;
         self.fence_armed = true;
@@ -225,7 +254,8 @@ impl BatchStaging {
 
     /// Ensures staging tables hold at least `chunks` entries and scratch workspace holds
     /// `temp_bytes` aligned to `temp_align`, enforcing `budget` against combined device growth
-    /// before any allocation occurs.
+    /// before any allocation occurs. Starts a new batch generation, which invalidates receipts of
+    /// earlier batches because their result tables may be overwritten or reallocated from here on.
     pub(crate) fn prepare(
         &mut self,
         stream: &Arc<Stream>,
@@ -238,6 +268,7 @@ impl BatchStaging {
         self.sync_host_tables()?;
         let total_grow = self.growth(chunks, temp_bytes);
         within(budget, total_grow)?;
+        self.generation = NEXT_BATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
 
         if chunks > self.capacity {
             let cap = chunks.max(self.capacity.saturating_mul(2)).max(16);
@@ -344,5 +375,15 @@ mod tests {
         let single = TableSet::device_bytes_for(1);
         assert_eq!(single, 2 * 8 + 3 * size_of::<usize>() + 4);
         assert!(TableSet::device_bytes_for(64) >= 64 * single);
+    }
+
+    #[test]
+    fn t0_scratch_growth_charges_full_allocation() {
+        // Growing 600 -> 900 allocates a fresh 900-byte buffer while the old one may still be
+        // pending release, so the budget must see 900, not the 300-byte difference (CMP-6).
+        assert_eq!(growth_bytes(600, 900), 900);
+        assert_eq!(growth_bytes(900, 900), 0);
+        assert_eq!(growth_bytes(900, 600), 0);
+        assert_eq!(growth_bytes(0, 1), 1);
     }
 }

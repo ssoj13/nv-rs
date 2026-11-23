@@ -6,12 +6,21 @@
 //! ([`RegisteredBuffer`] or [`cuda_core::DeviceBuffer`]), and [`Stream`] until stream completion.
 //! Neither the handle nor the buffer can be deregistered or dropped while async DMA is in flight,
 //! and steady-state I/O performs zero heap allocations.
+//!
+//! The pins and the pending result are stored before the fence is recorded. If recording fails,
+//! the stream is drained before the error is returned; if completion cannot be established (a
+//! failed fence or stream wait), the slot never flushes staged POSIX bytes and leaks the pinned
+//! resources instead of releasing memory that queued DMA may still touch. A slot must be
+//! harvested ([`AsyncIoSlot::wait`] / [`AsyncIoSlot::try_complete`]) before it is reused.
+//!
+//! Windows note: [`IoMode::PosixFallback`] positional I/O uses `seek_read` / `seek_write`, which
+//! move the file cursor of [`FileHandle::file`] (unlike POSIX `pread` / `pwrite`), and synchronous
+//! fallback transfers on one handle serialize on its pinned staging mutex for the whole disk I/O.
 
 use std::ffi::c_void;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
-use cuda_core::{Context, DeviceBufferView, Event, PinnedHostBuffer, Stream};
+use cuda_core::{Context, Event, PinnedHostBuffer, Stream};
 
 #[cfg(target_os = "linux")]
 use crate::check_status;
@@ -439,6 +448,15 @@ struct AsyncParams {
     bytes_transferred: isize,
 }
 
+impl AsyncParams {
+    const IDLE: Self = Self {
+        size: 0,
+        file_offset: 0,
+        buf_offset: 0,
+        bytes_transferred: 0,
+    };
+}
+
 struct InFlightPins {
     fh: Arc<FileHandle>,
     _buf: Arc<dyn DeviceSpan + Send + Sync>,
@@ -474,12 +492,7 @@ impl AsyncIoSlot {
         let fence = ctx.new_event_with_flags(None)?;
         Ok(Self {
             ctx: ctx.clone(),
-            params: Box::new(AsyncParams {
-                size: 0,
-                file_offset: 0,
-                buf_offset: 0,
-                bytes_transferred: 0,
-            }),
+            params: Box::new(AsyncParams::IDLE),
             fence,
             fence_armed: false,
             pending_call: None,
@@ -498,10 +511,77 @@ impl AsyncIoSlot {
         Ok(())
     }
 
-    fn finish_prior_before_reuse(&mut self) -> Result<()> {
-        self.wait_fence_if_armed()?;
-        let _ = self.harvest_result()?;
+    /// Rejects a new submission while a previous operation is in flight or its result has not
+    /// been collected, so a prior byte count or error is never dropped or misattributed.
+    fn ensure_idle(&self) -> Result<()> {
+        if self.fence_armed
+            || self.pending_call.is_some()
+            || self.posix_bytes.is_some()
+            || self.pending_posix_write.is_some()
+            || self.in_flight.is_some()
+        {
+            return Err(Error::Invalid(
+                "previous async I/O result not collected; call AsyncIoSlot::wait or try_complete first",
+            ));
+        }
         Ok(())
+    }
+
+    /// Arms the completion fence after work referencing the pins was enqueued on `stream`.
+    fn arm_fence(&mut self, stream: &Stream) -> Result<()> {
+        self.arm_fence_with(stream, |fence, s| fence.record(s))
+    }
+
+    /// Arms the fence with `record`. The caller stores the pins and the pending result *before*
+    /// this call, so a failed record never releases them while DMA is queued: the stream is
+    /// drained first and the queued operation's result is discarded in favour of the record
+    /// error; if draining fails too, completion is unknown and [`Self::abandon_in_flight`] leaks
+    /// everything the DMA may still touch.
+    fn arm_fence_with(
+        &mut self,
+        stream: &Stream,
+        record: impl FnOnce(&Event, &Stream) -> std::result::Result<(), cuda_core::DriverError>,
+    ) -> Result<()> {
+        match record(&self.fence, stream) {
+            Ok(()) => {
+                self.fence_armed = true;
+                Ok(())
+            }
+            Err(err) => {
+                match stream.synchronize() {
+                    Ok(()) => self.clear_pending(),
+                    Err(sync_err) => {
+                        self.ctx.record_err(Err::<(), _>(sync_err));
+                        self.abandon_in_flight();
+                    }
+                }
+                Err(Error::Driver(err))
+            }
+        }
+    }
+
+    /// Drops the pending result and pins of an operation known to have completed.
+    fn clear_pending(&mut self) {
+        self.pending_call = None;
+        self.posix_bytes = None;
+        self.pending_posix_write = None;
+        self.in_flight = None;
+    }
+
+    /// Completion of the queued operation is unknown (a fence or stream wait failed): never flush
+    /// staged POSIX bytes, which may be partially copied, and leak the pins, the staging buffer,
+    /// and the parameter block, which in-flight DMA may still reference, instead of freeing them.
+    fn abandon_in_flight(&mut self) {
+        self.fence_armed = false;
+        self.pending_call = None;
+        self.posix_bytes = None;
+        self.pending_posix_write = None;
+        std::mem::forget(self.in_flight.take());
+        std::mem::forget(self.staging.take());
+        std::mem::forget(std::mem::replace(
+            &mut self.params,
+            Box::new(AsyncParams::IDLE),
+        ));
     }
 
     fn ensure_staging(&mut self, len: usize) -> Result<&mut PinnedHostBuffer<u8>> {
@@ -518,13 +598,17 @@ impl AsyncIoSlot {
         ))
     }
 
-    /// Non-blocking check for async operation completion; returns `Ok(None)` while still in flight.
+    /// Non-blocking check for async operation completion: `Ok(None)` while still in flight,
+    /// `Ok(Some(bytes))` once finished, and [`Error::Invalid`] when no operation is pending (like
+    /// [`Self::wait`]), so a polling loop on an idle slot terminates.
     pub fn try_complete(&mut self) -> Result<Option<usize>> {
         if self.fence_armed && !self.fence.query()? {
             return Ok(None);
         }
         self.fence_armed = false;
-        self.harvest_result()
+        self.harvest_result()?
+            .map(Some)
+            .ok_or(Error::Invalid("no async I/O operation pending in slot"))
     }
 
     /// Blocks until the pending async transfer finishes on its CUDA stream and returns the
@@ -566,6 +650,8 @@ impl Drop for AsyncIoSlot {
             // Wait for GPU stream completion before flushing pending writes or releasing pins/params.
             if let Err(err) = self.fence.synchronize() {
                 self.ctx.record_err(Err::<(), _>(err));
+                self.abandon_in_flight();
+                return;
             }
             self.fence_armed = false;
         }
@@ -592,7 +678,6 @@ pub struct FileHandle {
     raw: Option<cufile_sys::CUfileHandle_t>,
     file: std::fs::File,
     posix_staging: Mutex<Option<PinnedHostBuffer<u8>>>,
-    _no_sync_raw: PhantomData<*mut c_void>,
 }
 
 // SAFETY: `FileHandle` synchronizes `posix_staging` via `Mutex`, uses immutable file/GDS handles
@@ -630,7 +715,6 @@ impl FileHandle {
                         raw: Some(raw),
                         file,
                         posix_staging: Mutex::new(None),
-                        _no_sync_raw: PhantomData,
                     }))
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -648,7 +732,6 @@ impl FileHandle {
                 raw: None,
                 file,
                 posix_staging: Mutex::new(None),
-                _no_sync_raw: PhantomData,
             })),
         }
     }
@@ -659,6 +742,9 @@ impl FileHandle {
     }
 
     /// Underlying OS file handle.
+    ///
+    /// On Windows, [`IoMode::PosixFallback`] transfers move this file's cursor (`seek_read` /
+    /// `seek_write` semantics), so do not mix them with cursor-based `Read` / `Write` on it.
     pub const fn file(&self) -> &std::fs::File {
         &self.file
     }
@@ -739,14 +825,23 @@ impl FileHandle {
     }
 
     /// Synchronously reads up to `len` bytes from `file_offset` into `dst` at `buf_offset`.
+    ///
+    /// `dst` is borrowed exclusively: the DMA write bypasses cuda-core's access tracking, so no
+    /// shared reference may observe the buffer meanwhile.
+    ///
+    /// ```compile_fail
+    /// fn shared_dst(fh: &cufile::FileHandle, dst: &cuda_core::DeviceBuffer<u8>) {
+    ///     let _ = fh.read(0, dst, 0, 1);
+    /// }
+    /// ```
     pub fn read<D: DeviceSpanMut + ?Sized>(
         &self,
         file_offset: u64,
-        dst: &D,
+        dst: &mut D,
         buf_offset: usize,
         len: usize,
     ) -> Result<usize> {
-        let (file_off, buf_off) = self.validate_transfer(file_offset, dst, buf_offset, len)?;
+        let (file_off, buf_off) = self.validate_transfer(file_offset, &*dst, buf_offset, len)?;
         if len == 0 {
             return Ok(0);
         }
@@ -865,6 +960,10 @@ impl FileHandle {
     /// Enqueues a non-blocking, stream-ordered asynchronous read into `dst`, retaining strong
     /// `Arc` pins on `self`, `dst`, and `stream` inside `slot` until [`AsyncIoSlot::wait`] or
     /// [`AsyncIoSlot::try_complete`] finishes.
+    ///
+    /// The pin keeps `dst` alive but does not make it exclusive: the DMA write is not registered
+    /// with cuda-core's access tracker, so the caller must not read or write `dst` through other
+    /// clones of the `Arc` until the slot has been harvested.
     pub fn read_async<D: DeviceSpanMut + Send + Sync + 'static>(
         self: &Arc<Self>,
         stream: &Arc<Stream>,
@@ -884,7 +983,7 @@ impl FileHandle {
         }
         let (file_off, buf_off) =
             self.validate_transfer(file_offset, dst.as_ref(), buf_offset, len)?;
-        slot.finish_prior_before_reuse()?;
+        slot.ensure_idle()?;
 
         if len == 0 {
             slot.posix_bytes = Some(0);
@@ -918,15 +1017,13 @@ impl FileHandle {
                         )
                     };
                     check_status("cuFileReadAsync", status)?;
-                    slot.fence.record(stream)?;
-                    slot.fence_armed = true;
                     slot.pending_call = Some("cuFileReadAsync");
                     slot.in_flight = Some(InFlightPins {
                         fh: self.clone(),
                         _buf: dst.clone(),
                         _stream: stream.clone(),
                     });
-                    Ok(())
+                    slot.arm_fence(stream)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -941,27 +1038,27 @@ impl FileHandle {
                     .ok_or(Error::Invalid("device pointer offset overflow"))?;
                 let staging = slot.ensure_staging(len)?;
                 let n = posix_read_at(&self.file, file_offset, &mut staging.as_mut_slice()[..len])?;
-                if n > 0 {
-                    // SAFETY: `dst_ptr..dst_ptr+n` is valid and `slot.fence` + `slot.in_flight`
-                    // keep `dst`, `stream`, and `staging` alive until async HtoD DMA completes.
-                    unsafe {
-                        cuda_core::memory::memcpy_htod_async(
-                            dst_ptr,
-                            staging.as_ptr(),
-                            n,
-                            stream.cu_stream(),
-                        )?;
-                    }
-                    slot.fence.record(stream)?;
-                    slot.fence_armed = true;
-                    slot.in_flight = Some(InFlightPins {
-                        fh: self.clone(),
-                        _buf: dst.clone(),
-                        _stream: stream.clone(),
-                    });
+                if n == 0 {
+                    slot.posix_bytes = Some(0);
+                    return Ok(());
+                }
+                // SAFETY: `dst_ptr..dst_ptr+n` is valid and `slot.fence` + `slot.in_flight`
+                // keep `dst`, `stream`, and `staging` alive until async HtoD DMA completes.
+                unsafe {
+                    cuda_core::memory::memcpy_htod_async(
+                        dst_ptr,
+                        staging.as_ptr(),
+                        n,
+                        stream.cu_stream(),
+                    )?;
                 }
                 slot.posix_bytes = Some(n);
-                Ok(())
+                slot.in_flight = Some(InFlightPins {
+                    fh: self.clone(),
+                    _buf: dst.clone(),
+                    _stream: stream.clone(),
+                });
+                slot.arm_fence(stream)
             }
         }
     }
@@ -992,7 +1089,7 @@ impl FileHandle {
         }
         let (file_off, buf_off) =
             self.validate_transfer(file_offset, src.as_ref(), buf_offset, len)?;
-        slot.finish_prior_before_reuse()?;
+        slot.ensure_idle()?;
 
         if len == 0 {
             slot.posix_bytes = Some(0);
@@ -1026,15 +1123,13 @@ impl FileHandle {
                         )
                     };
                     check_status("cuFileWriteAsync", status)?;
-                    slot.fence.record(stream)?;
-                    slot.fence_armed = true;
                     slot.pending_call = Some("cuFileWriteAsync");
                     slot.in_flight = Some(InFlightPins {
                         fh: self.clone(),
                         _buf: src.clone(),
                         _stream: stream.clone(),
                     });
-                    Ok(())
+                    slot.arm_fence(stream)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -1058,15 +1153,13 @@ impl FileHandle {
                         stream.cu_stream(),
                     )?;
                 }
-                slot.fence.record(stream)?;
-                slot.fence_armed = true;
                 slot.pending_posix_write = Some(PendingPosixWrite { file_offset, len });
                 slot.in_flight = Some(InFlightPins {
                     fh: self.clone(),
                     _buf: src.clone(),
                     _stream: stream.clone(),
                 });
-                Ok(())
+                slot.arm_fence(stream)
             }
         }
     }
@@ -1089,12 +1182,6 @@ impl Drop for FileHandle {
             }
         }
     }
-}
-
-/// Extension wrapper over a raw [`DeviceBufferView`] allowing `RegisteredBuffer` construction on a
-/// subslice without transferring ownership.
-pub fn as_device_view<'a, T>(view: &'a DeviceBufferView<'a, T>) -> &'a DeviceBufferView<'a, T> {
-    view
 }
 
 fn posix_read_at(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::Result<usize> {
@@ -1159,5 +1246,157 @@ mod tests {
 
         drop(file);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn t0_windows_positional_io_moves_file_cursor() {
+        use std::io::Seek;
+        let path = std::env::temp_dir().join("nv_rs_cufile_t0_cursor.bin");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Documented on `FileHandle::file` (CUF-8): unlike `pwrite`, `seek_write` moves the cursor.
+        let wrote = posix_write_at(&file, 16, b"cursor").unwrap();
+        assert_eq!(file.stream_position().unwrap(), 16 + wrote as u64);
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct PosixFixture {
+        ctx: Arc<Context>,
+        stream: Arc<Stream>,
+        fh: Arc<FileHandle>,
+        src: Arc<cuda_core::DeviceBuffer<u8>>,
+        path: std::path::PathBuf,
+    }
+
+    fn posix_fixture(name: &str) -> PosixFixture {
+        let ctx = Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let path = std::env::temp_dir().join(name);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fh = FileHandle::register(&ctx, file, IoMode::PosixFallback).unwrap();
+        let payload: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let src = Arc::new(cuda_core::DeviceBuffer::from_host(&stream, &payload).unwrap());
+        stream.synchronize().unwrap();
+        PosixFixture {
+            ctx,
+            stream,
+            fh,
+            src,
+            path,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU (IoMode::PosixFallback, with or without nvidia-fs driver)"]
+    fn t2_slot_reuse_requires_harvest() {
+        let fx = posix_fixture("nv_rs_cufile_t2_reuse.bin");
+        let mut slot = AsyncIoSlot::new(&fx.ctx).unwrap();
+        fx.fh
+            .write_async(&fx.stream, 0, &fx.src, 0, 64, &mut slot)
+            .unwrap();
+        // CUF-4: the first result is still uncollected, so reuse must not discard it.
+        assert!(matches!(
+            fx.fh.write_async(&fx.stream, 64, &fx.src, 0, 64, &mut slot),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(slot.wait().unwrap(), 64);
+        fx.fh
+            .write_async(&fx.stream, 64, &fx.src, 0, 64, &mut slot)
+            .unwrap();
+        assert_eq!(slot.wait().unwrap(), 64);
+        drop(slot);
+        drop(FileHandle::deregister(fx.fh).unwrap());
+        let _ = std::fs::remove_file(fx.path);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU (IoMode::PosixFallback, with or without nvidia-fs driver)"]
+    fn t2_try_complete_on_idle_slot_is_error() {
+        let fx = posix_fixture("nv_rs_cufile_t2_idle.bin");
+        let mut slot = AsyncIoSlot::new(&fx.ctx).unwrap();
+        // CUF-7: an idle slot must not look like "still in flight".
+        assert!(matches!(slot.try_complete(), Err(Error::Invalid(_))));
+        fx.fh
+            .write_async(&fx.stream, 0, &fx.src, 0, 32, &mut slot)
+            .unwrap();
+        let done = loop {
+            if let Some(n) = slot.try_complete().unwrap() {
+                break n;
+            }
+        };
+        assert_eq!(done, 32);
+        assert!(matches!(slot.try_complete(), Err(Error::Invalid(_))));
+        drop(slot);
+        drop(FileHandle::deregister(fx.fh).unwrap());
+        let _ = std::fs::remove_file(fx.path);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU (IoMode::PosixFallback, with or without nvidia-fs driver)"]
+    fn t2_failed_fence_record_drains_and_keeps_pins_until_then() {
+        let fx = posix_fixture("nv_rs_cufile_t2_record_fail.bin");
+        let mut slot = AsyncIoSlot::new(&fx.ctx).unwrap();
+        // State a submission leaves behind right after enqueueing DMA (CUF-2): pins and the
+        // pending result are stored before the fence is recorded.
+        slot.ensure_staging(64).unwrap();
+        slot.pending_posix_write = Some(PendingPosixWrite {
+            file_offset: 0,
+            len: 64,
+        });
+        slot.in_flight = Some(InFlightPins {
+            fh: fx.fh.clone(),
+            _buf: fx.src.clone(),
+            _stream: fx.stream.clone(),
+        });
+        let injected = slot.arm_fence_with(&fx.stream, |_, _| {
+            Err(cuda_core::DriverError(
+                cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
+            ))
+        });
+        assert!(matches!(injected, Err(Error::Driver(_))));
+        // The stream was drained, so the pins were released and nothing remains pending.
+        assert!(slot.in_flight.is_none());
+        assert!(slot.pending_posix_write.is_none());
+        assert!(!slot.fence_armed);
+        assert!(slot.ensure_idle().is_ok());
+        drop(slot);
+        drop(FileHandle::deregister(fx.fh).unwrap());
+        let _ = std::fs::remove_file(fx.path);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU (IoMode::PosixFallback, with or without nvidia-fs driver)"]
+    fn t2_abandoned_slot_never_flushes_staging() {
+        let fx = posix_fixture("nv_rs_cufile_t2_abandon.bin");
+        let mut slot = AsyncIoSlot::new(&fx.ctx).unwrap();
+        slot.ensure_staging(64).unwrap().as_mut_slice()[..64].fill(0xAB);
+        slot.pending_posix_write = Some(PendingPosixWrite {
+            file_offset: 0,
+            len: 64,
+        });
+        slot.in_flight = Some(InFlightPins {
+            fh: fx.fh.clone(),
+            _buf: fx.src.clone(),
+            _stream: fx.stream.clone(),
+        });
+        // What `Drop` now does when the fence wait fails (CUF-3): completion is unknown.
+        slot.abandon_in_flight();
+        drop(slot);
+        // Before CUF-3, `Drop` flushed the staging bytes into the file after a failed fence wait.
+        assert_eq!(std::fs::metadata(&fx.path).unwrap().len(), 0);
+        // The leaked pin keeps `fx.fh` registered and open, so the file stays on disk.
     }
 }

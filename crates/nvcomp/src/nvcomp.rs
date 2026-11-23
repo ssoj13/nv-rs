@@ -6,7 +6,9 @@
 //! native Bitcomp C API (`bitcomp*`); the high-level `nvcompManager` API is C++-only. This crate
 //! exposes both the explicit batched async APIs and [`CompressionManager`] built cleanly on top of
 //! the C batched APIs with two-phase `temp_bytes` sizing, explicit byte budgets, reusable
-//! [`Scratch`]/[`BatchStaging`] buffers, and zero steady-state allocations.
+//! [`Scratch`]/[`BatchStaging`] buffers, and zero steady-state device staging allocations.
+//! [`CompressionManager`] calls block until their stream completes; the batched functions only
+//! enqueue, and their receipts collect results later.
 
 /// Stream-ordered batched compression, decompressed-size queries, and decompression.
 pub mod batched;
@@ -281,5 +283,202 @@ mod tests {
             let host_out = dev_out.to_host_vec(&stream).unwrap();
             assert_eq!(host_out, host_in, "roundtrip mismatch for {kind:?}");
         }
+    }
+
+    const CHUNK: usize = 16 * 1024;
+
+    fn gpu_fixture() -> (Arc<Context>, Arc<Stream>, Vec<u8>, DeviceBuffer<u8>) {
+        let ctx = Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let host: Vec<u8> = (0..4 * CHUNK).map(|i| ((i / 3) % 251) as u8).collect();
+        let dev = DeviceBuffer::from_host(&stream, &host).unwrap();
+        (ctx, stream, host, dev)
+    }
+
+    fn slot_stride(format: Format) -> usize {
+        let alignments = format.compress_alignments().unwrap();
+        batched::aligned_stride(
+            format.max_output_chunk_bytes(CHUNK).unwrap(),
+            alignments.output,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_stale_receipt_rejected_and_back_to_back_batches_roundtrip() {
+        let (_ctx, stream, host, input) = gpu_fixture();
+        let format = Format::default_for(FormatKind::Lz4);
+        let stride = slot_stride(format);
+        let mut staging = BatchStaging::new(&stream).unwrap();
+        let ranges_a = std::slice::from_ref(&(0..CHUNK));
+        let ranges_b = [0..CHUNK, CHUNK..2 * CHUNK];
+        let mut out_a = DeviceBuffer::<u8>::zeroed(&stream, stride).unwrap();
+        let mut out_b = DeviceBuffer::<u8>::zeroed(&stream, 2 * stride).unwrap();
+
+        // B is prepared while A's kernel may still run: only A's uploads are fenced (CMP-5).
+        let a = compress_batched_async(
+            &stream,
+            &mut staging,
+            format,
+            &input,
+            ranges_a,
+            &mut out_a,
+            None,
+        )
+        .unwrap();
+        let b = compress_batched_async(
+            &stream,
+            &mut staging,
+            format,
+            &input,
+            &ranges_b,
+            &mut out_b,
+            None,
+        )
+        .unwrap();
+
+        // A's result tables were overwritten by B: the stale receipt must not report them (CMP-1).
+        let mut sizes = Vec::new();
+        assert!(matches!(
+            a.collect_sizes(&stream, &mut staging, &mut sizes),
+            Err(Error::Invalid(_))
+        ));
+        b.collect_sizes(&stream, &mut staging, &mut sizes).unwrap();
+        assert_eq!(sizes.len(), 2);
+
+        let comp_ranges = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| i * stride..i * stride + len)
+            .collect::<Vec<_>>();
+        let mut dec = DeviceBuffer::<u8>::zeroed(&stream, 2 * CHUNK).unwrap();
+        let receipt = decompress_batched_async(
+            &stream,
+            &mut staging,
+            format,
+            DecompressBackend::Default,
+            &out_b,
+            &comp_ranges,
+            &mut dec,
+            &ranges_b,
+            None,
+        )
+        .unwrap();
+        receipt
+            .collect_sizes(&stream, &mut staging, &mut sizes)
+            .unwrap();
+        assert_eq!(
+            dec.to_host_vec(&stream).unwrap(),
+            host[..2 * CHUNK].to_vec()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_decompress_rejects_overlapping_output_ranges() {
+        let (_ctx, stream, _host, input) = gpu_fixture();
+        let format = Format::default_for(FormatKind::Lz4);
+        let mut staging = BatchStaging::new(&stream).unwrap();
+        let mut out = DeviceBuffer::<u8>::zeroed(&stream, 2 * CHUNK).unwrap();
+        let res = decompress_batched_async(
+            &stream,
+            &mut staging,
+            format,
+            DecompressBackend::Default,
+            &input,
+            &[0..256, 256..512],
+            &mut out,
+            &[0..CHUNK, CHUNK / 2..CHUNK + CHUNK / 2],
+            None,
+        );
+        assert!(matches!(res, Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_decompress_uses_payload_format_options() {
+        let (_ctx, stream, host, input) = gpu_fixture();
+        let shuffled = Format::Lz4(Lz4Opts {
+            data_type: DataType::UInt,
+            bitshuffle: BitshuffleMode::MsbFirst,
+            sort_before_hw_decompress: false,
+        });
+        let mut encoder = CompressionManager::new(&stream, shuffled, CHUNK, None).unwrap();
+        let mut decoder =
+            CompressionManager::new(&stream, Format::default_for(FormatKind::Lz4), CHUNK, None)
+                .unwrap();
+        let compressed = encoder.compress_async(&stream, &input).unwrap();
+        let out = decoder
+            .decompress_to_buffer_async(&stream, &compressed)
+            .unwrap();
+        assert_eq!(out.to_host_vec(&stream).unwrap(), host);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_manager_rejects_chunk_above_format_limit() {
+        let (_ctx, stream, _host, _input) = gpu_fixture();
+        let lz4 = Format::default_for(FormatKind::Lz4);
+        assert!(matches!(
+            CompressionManager::new(&stream, lz4, (1 << 24) + 1, None),
+            Err(Error::Invalid(_))
+        ));
+        assert!(CompressionManager::new(&stream, lz4, 1 << 24, None).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_bitcomp_lossy_plan_rejects_lossless_compress() {
+        let (ctx, stream, _host, _input) = gpu_fixture();
+        let n = 4 * CHUNK;
+        let mut plan = BitcompPlan::new(
+            &ctx,
+            n,
+            BitcompDataType::F32,
+            BitcompMode::LossyFpToSigned,
+            BitcompAlgo::Default,
+        )
+        .unwrap();
+        let input = DeviceBuffer::<u8>::zeroed(&stream, n).unwrap();
+        let mut output =
+            DeviceBuffer::<u8>::zeroed(&stream, BitcompPlan::max_buflen(n).unwrap()).unwrap();
+        assert!(matches!(
+            plan.compress_lossless_async(&stream, &input, &mut output, None),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    /// Decides CMP-4: run under `compute-sanitizer --tool memcheck`. Passes only if a truncated
+    /// Bitcomp stream is rejected (wrapper error, native status, or stream error); a failure or a
+    /// memcheck out-of-bounds report means `bitcompUncompress` trusts the stream header and the
+    /// wrapper must validate it before launch.
+    #[test]
+    #[ignore = "requires CUDA GPU and nvCOMP runtime"]
+    fn t2_bitcomp_uncompress_rejects_truncated_input() {
+        let (ctx, stream, host, input) = gpu_fixture();
+        let n = host.len();
+        let mut plan = BitcompPlan::new(
+            &ctx,
+            n,
+            BitcompDataType::U8,
+            BitcompMode::Lossless,
+            BitcompAlgo::Default,
+        )
+        .unwrap();
+        let mut packed =
+            DeviceBuffer::<u8>::zeroed(&stream, BitcompPlan::max_buflen(n).unwrap()).unwrap();
+        plan.compress_lossless_async(&stream, &input, &mut packed, None)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let packed_host = packed.to_host_vec(&stream).unwrap();
+        let truncated = DeviceBuffer::from_host(&stream, &packed_host[..8]).unwrap();
+        let mut out = DeviceBuffer::<u8>::zeroed(&stream, n).unwrap();
+        let launched = plan.uncompress_async(&stream, &truncated, &mut out);
+        let completed = stream.synchronize();
+        assert!(
+            launched.is_err() || completed.is_err(),
+            "truncated Bitcomp input was accepted"
+        );
     }
 }

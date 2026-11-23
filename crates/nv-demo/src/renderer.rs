@@ -98,7 +98,8 @@ struct LaunchParams {
     sky_params: [f32; 4],
     accum_count: u32,
     enable_ser: u32,
-    _pad0: [u32; 2],
+    sky_mode_from: u32,
+    sky_blend: f32,
     out_motion_f32: u64,
     out_depth_f32: u64,
     prev_cam_pos: [f32; 4],
@@ -487,6 +488,12 @@ pub struct DemoSettings {
     pub sun_elevation: f32,
     // Sky & Floor
     pub sky_mode: u32,
+    /// Transient source `sky_mode` during smooth `TodTransition` crossfade (not persisted).
+    #[serde(skip)]
+    pub sky_mode_from: u32,
+    /// Transient `[0, 1]` crossfade factor from `sky_mode_from` to `sky_mode` (0 = no blend).
+    #[serde(skip)]
+    pub sky_blend: f32,
     pub sky_intensity: f32,
     pub horizon_haze: f32,
     pub floor_roughness: f32,
@@ -653,6 +660,8 @@ impl Default for DemoSettings {
             sun_azimuth: 32.0,
             sun_elevation: 48.0,
             sky_mode: 0,
+            sky_mode_from: 0,
+            sky_blend: 0.0,
             sky_intensity: 0.78,
             horizon_haze: 1.0,
             floor_roughness: 0.22,
@@ -4453,7 +4462,8 @@ pub fn spawn_render_thread(
                     ],
                     accum_count,
                     enable_ser: u32::from(settings.ser_on),
-                    _pad0: [0; 2],
+                    sky_mode_from: settings.sky_mode_from,
+                    sky_blend: settings.sky_blend,
                     out_motion_f32: rig.motion_f32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
                     out_depth_f32: rig.depth_f32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
                     prev_cam_pos: [

@@ -30,7 +30,8 @@ struct Params {
     float sky_params[4];       // [sky_intensity, sun_size, horizon_haze, sky_mode]
     unsigned int accum_count;
     unsigned int enable_ser;
-    unsigned int _pad0[2];
+    unsigned int sky_mode_from; // source sky_mode during smooth TOD crossfade
+    float sky_blend;            // 0 = pure sky_mode, (0,1) = lerp(sky_mode_from, sky_mode, sky_blend)
     unsigned long long out_motion_f32;
     unsigned long long out_depth_f32;
     float prev_cam_pos[4];
@@ -878,10 +879,9 @@ static __noinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, b
     return f3_mul(col, sky_i);
 }
 
-static __noinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
-    int mode = (int)(params.sky_params[3] + 0.5f);
     if (mode == 5) return sky_elevated(dir, sun_dir, is_camera_ray);
     if (mode == 6) return sky_unprogress(dir, sun_dir, is_camera_ray);
     if (mode == 7) return sky_colonies(dir, sun_dir, is_camera_ray);
@@ -1074,6 +1074,18 @@ static __noinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool
     return f3_mul(col, sky_i);
 }
 
+static __noinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+    int to_mode = (int)(params.sky_params[3] + 0.5f);
+    float blend = params.sky_blend;
+    int from_mode = (int)params.sky_mode_from;
+    if (blend > 1e-4f && blend < 0.9999f && from_mode != to_mode) {
+        float3 c0 = sky_color_mode(from_mode, dir, sun_dir, is_camera_ray);
+        float3 c1 = sky_color_mode(to_mode, dir, sun_dir, is_camera_ray);
+        return f3_add(f3_mul(c0, 1.0f - blend), f3_mul(c1, blend));
+    }
+    return sky_color_mode(to_mode, dir, sun_dir, is_camera_ray);
+}
+
 // --- Render-Time Analytical CSG Helpers & Procedural Urban Shading ---
 
 static __forceinline__ __device__ CsgSceneView make_csg_view() {
@@ -1252,6 +1264,7 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     unsigned int mat_id,
     unsigned int sem_id,
     unsigned int part_id,
+    unsigned int inst_idx,
     float3 hit_pos,
     float3 n
 ) {
@@ -1380,8 +1393,38 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
             float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
             bool is_horiz = fabsf(n.y) > 0.5f;
             bool use_curved_uv = has_road_uv && is_horiz;
-            float sx = use_curved_uv ? road_s : (is_horiz ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz));
-            float sy = use_curved_uv ? road_lat : (is_horiz ? hit_pos.z : hit_pos.y);
+            // Align horizontal concrete/sidewalk paving joints parallel to the instance's own
+            // local XZ edges (instead of world X/Z) so rotated sidewalks never show diagonal seams.
+            float inst_ax_x = 1.0f;
+            float inst_ax_z = 0.0f;
+            float sx;
+            float sy;
+            if (use_curved_uv) {
+                sx = road_s;
+                sy = road_lat;
+            } else if (is_horiz) {
+                float ox = 0.0f;
+                float oz = 0.0f;
+                if (params.csg_instances != 0ull && inst_idx < params.csg_instance_count) {
+                    const float* xf = ((const CsgGpuInstance*)params.csg_instances)[inst_idx].xform;
+                    float m00 = __ldg(&xf[0]);
+                    float m20 = __ldg(&xf[8]);
+                    float len = sqrtf(m00 * m00 + m20 * m20);
+                    if (len > 1e-4f) {
+                        inst_ax_x = m00 / len;
+                        inst_ax_z = m20 / len;
+                    }
+                    ox = __ldg(&xf[3]);
+                    oz = __ldg(&xf[11]);
+                }
+                float dx = hit_pos.x - ox;
+                float dz = hit_pos.z - oz;
+                sx = dx * inst_ax_x + dz * inst_ax_z;
+                sy = -dx * inst_ax_z + dz * inst_ax_x;
+            } else {
+                sx = hit_pos.x * tx + hit_pos.z * tz;
+                sy = hit_pos.y;
+            }
             float grime = fbm2(sx * 0.35f + 4.1f, sy * 0.25f - 1.9f);
             float micro = value_noise2(sx * 14.0f, sy * 14.0f);
             float fine = value_noise2(sx * 46.0f + 2.1f, sy * 46.0f - 3.7f);
@@ -1414,7 +1457,9 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                 float bx = (fx < 0.032f) ? -1.0f : ((fx > 0.968f) ? 1.0f : 0.0f);
                 float bz = (fy < 0.032f) ? -1.0f : ((fy > 0.968f) ? 1.0f : 0.0f);
                 if (bx != 0.0f || bz != 0.0f) {
-                    n = f3_norm(make_float3(n.x + bx * 0.05f, n.y, n.z + bz * 0.05f));
+                    float wbx = bx * inst_ax_x - bz * inst_ax_z;
+                    float wbz = bx * inst_ax_z + bz * inst_ax_x;
+                    n = f3_norm(make_float3(n.x + wbx * 0.05f, n.y, n.z + wbz * 0.05f));
                 }
             }
             if (wet > 0.05f && is_horiz) {
@@ -2120,7 +2165,7 @@ extern "C" __global__ void __raygen__render() {
             if (is_csg) {
                 unsigned int mat_id = p5 & 0xFFFFu;
                 unsigned int sem_id = (p5 >> 16u) & 0xFFFFu;
-                CsgProcResult pr = eval_csg_procedural(mat_id, sem_id, p7, hit_pos, n);
+                CsgProcResult pr = eval_csg_procedural(mat_id, sem_id, p7, p6, hit_pos, n);
                 n = pr.n;
                 base_col = pr.base_col;
                 float rough = pr.rough;
@@ -2237,11 +2282,24 @@ extern "C" __global__ void __raygen__render() {
                     }
                     if (!occluded) {
                         float sun_i = params.fractal_r1[3];
-                        float3 sun_rad = ((params.csg_flags & 2u) != 0u)
-                            ? make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f)
-                            : (((params.csg_flags & 8u) != 0u)
-                                ? make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f)
-                                : make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f));
+                        auto sun_tint_for_mode = [&](int m) -> float3 {
+                            if (m == 8) return make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f);
+                            if (m == 1) return make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f);
+                            return make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f);
+                        };
+                        int to_m = (int)(params.sky_params[3] + 0.5f);
+                        float3 sun_rad;
+                        if (params.sky_blend > 1e-4f && params.sky_blend < 0.9999f && (int)params.sky_mode_from != to_m) {
+                            float3 s0 = sun_tint_for_mode((int)params.sky_mode_from);
+                            float3 s1 = sun_tint_for_mode(to_m);
+                            sun_rad = f3_add(f3_mul(s0, 1.0f - params.sky_blend), f3_mul(s1, params.sky_blend));
+                        } else {
+                            sun_rad = ((params.csg_flags & 2u) != 0u)
+                                ? make_float3(sun_i * 0.55f, sun_i * 0.65f, sun_i * 0.90f)
+                                : (((params.csg_flags & 8u) != 0u)
+                                    ? make_float3(sun_i * 1.15f, sun_i * 0.68f, sun_i * 0.36f)
+                                    : make_float3(sun_i, sun_i * 0.94f, sun_i * 0.84f));
+                        }
                         float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.85f));
                         float3 half_v = f3_norm(f3_sub(sun_dir, dir));
                         float ndoth = fmaxf(0.0f, f3_dot(n, half_v));

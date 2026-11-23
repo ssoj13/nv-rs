@@ -1776,6 +1776,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// Smooth time-of-day lighting interpolator (`Day` / `Sunset` / `Night`) driven over `duration_s`.
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct TodTransition {
+        from_sky_mode: u32,
         from_azimuth: f32,
         from_elevation: f32,
         from_sun_intensity: f32,
@@ -1798,6 +1799,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut target = *current;
             crate::ui::apply_csg_time_of_day_preset(&mut target, target_tod);
             Self {
+                from_sky_mode: current.sky_mode,
                 from_azimuth: current.sun_azimuth,
                 from_elevation: current.sun_elevation,
                 from_sun_intensity: current.sun_intensity,
@@ -1836,12 +1838,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.from_sky_intensity + (self.to_sky_intensity - self.from_sky_intensity) * u;
             s.exposure = self.from_exposure + (self.to_exposure - self.from_exposure) * u;
 
+            // Continuous shader sky crossfade across [0, 1] instead of a discrete 1-frame jump.
+            s.sky_mode_from = self.from_sky_mode;
+            s.sky_mode = self.to_sky_mode;
+            s.sky_blend = u;
+
             if t >= 0.5 {
                 s.csg_time_of_day = self.to_tod;
-                s.sky_mode = self.to_sky_mode;
             }
             if t >= 1.0 {
                 crate::ui::apply_csg_time_of_day_preset(s, self.to_tod);
+                s.sky_mode_from = s.sky_mode;
+                s.sky_blend = 0.0;
                 true
             } else {
                 false
@@ -3096,11 +3104,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
-            if let Some(tr) = self.tod_transition.as_mut() {
-                let done = tr.step(&mut self.settings, dt);
-                if done {
-                    self.tod_transition = None;
-                }
+            if !(self.is_recording && self.settings.record_fixed_fps)
+                && let Some(tr) = self.tod_transition.as_mut()
+                && tr.step(&mut self.settings, dt)
+            {
+                self.tod_transition = None;
             }
             if self.theme != prev_theme {
                 self.dock_style = self.theme.apply(&self.egui_ctx);
@@ -3940,6 +3948,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let sub_dt =
                             crate::camera_rail::shutter_subframe_dt(frame_dt, sub_idx, shutter_n);
                         self.demo_anim.tick(sub_dt);
+                        if let Some(tr) = self.tod_transition.as_mut()
+                            && tr.step(&mut self.settings, sub_dt)
+                        {
+                            self.tod_transition = None;
+                        }
                         if self.camera_rail.is_active() {
                             self.camera_rail.tick(sub_dt);
                             if let Some(rp) = self

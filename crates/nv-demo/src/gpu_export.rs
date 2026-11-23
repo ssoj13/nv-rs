@@ -12,8 +12,8 @@
 //! example when `nvjpeg` or `nvenc` is unavailable on the host system) and never panic.
 
 use std::ffi::{CString, c_void};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
@@ -227,66 +227,6 @@ pub fn unpack_pitched_to_rgba8(
         }
     }
     Ok(())
-}
-
-/// Reads a pitched CUDA device buffer in [`SourcePixelFormat`], converts to tightly packed `RGBA8`,
-/// and writes a lossless PNG file to `path`, reusing `readback_scratch` and `rgba_scratch`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "explicit CUDA context, pitched source descriptor, output path, and reusable scratch buffers"
-)]
-pub fn save_png_from_pitched(
-    cuda: &Arc<CudaContext>,
-    src_dev_ptr: u64,
-    w: u32,
-    h: u32,
-    src_pitch_px: u32,
-    fmt: SourcePixelFormat,
-    path: &Path,
-    readback_scratch: &mut Vec<u8>,
-    rgba_scratch: &mut Vec<u8>,
-) -> Result<(), String> {
-    if src_dev_ptr == 0 {
-        return Err("PNG source device pointer is null".to_string());
-    }
-    if w == 0 || h == 0 {
-        return Err("PNG image dimensions must be non-zero".to_string());
-    }
-    if src_pitch_px < w {
-        return Err(format!("PNG source pitch ({src_pitch_px}) < width ({w})"));
-    }
-    let byte_len = (src_pitch_px as usize)
-        .checked_mul(h as usize)
-        .and_then(|px| px.checked_mul(fmt.bytes_per_pixel() as usize))
-        .ok_or_else(|| "PNG readback buffer size overflow".to_string())?;
-    readback_scratch.resize(byte_len, 0);
-
-    cuda.bind_to_thread()
-        .map_err(|e| format!("CUDA bind failed: {e}"))?;
-    // SAFETY: `src_dev_ptr` points to a valid CUDA allocation of at least `byte_len` bytes on
-    // `cuda`, and `readback_scratch` has `byte_len` writable host bytes.
-    let res = unsafe { cu::cuMemcpyDtoH_v2(readback_scratch.as_mut_ptr().cast(), src_dev_ptr, byte_len) };
-    if res != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("CUDA PNG readback failed ({res:?})"));
-    }
-
-    unpack_pitched_to_rgba8(readback_scratch, rgba_scratch, w, h, src_pitch_px, fmt)?;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create '{}': {e}", parent.display()))?;
-    }
-    let file = std::fs::File::create(path)
-        .map_err(|e| format!("failed to create '{}': {e}", path.display()))?;
-    let writer = std::io::BufWriter::new(file);
-    let mut enc = png::Encoder::new(writer, w, h);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()
-        .and_then(|mut wtr| wtr.write_image_data(rgba_scratch))
-        .map_err(|e| format!("PNG encode failed: {e}"))
 }
 
 const RGBA8_TO_RGB8_CU: &str = r#"
@@ -543,12 +483,152 @@ extern "C" __global__ void scrgb_f16_to_p010_pq(
 }
 "#;
 
+/// Returns an isolated per-user cache directory `<cache_root>/nv-demo/<subdir>`.
+pub(crate) fn nv_demo_cache_dir(subdir: &str) -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("nv-demo").join(subdir)
+}
+
+/// Computes a deterministic 128-bit content hash for PTX disk cache keys.
+pub(crate) fn ptx_cache_key_128(
+    unit_name: &str,
+    arch: &str,
+    driver_ver: i32,
+    src: &str,
+    extra_hash_blobs: &[&[u8]],
+) -> (u64, u64) {
+    #[inline]
+    fn mix_bytes(mut h0: u64, mut h1: u64, bytes: &[u8]) -> (u64, u64) {
+        for &b in bytes {
+            h0 ^= u64::from(b);
+            h0 = h0.wrapping_mul(0x0100_0000_01b3);
+            h1 ^= u64::from(b).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            h1 = h1.rotate_left(13).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+        // Domain separator after each field to prevent concatenation collisions.
+        h0 ^= 0xff;
+        h0 = h0.wrapping_mul(0x0100_0000_01b3);
+        h1 ^= 0x55aa_55aa_55aa_55aa;
+        h1 = h1.rotate_left(7).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (h0, h1)
+    }
+    let (mut h0, mut h1) = (0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64);
+    (h0, h1) = mix_bytes(h0, h1, b"nv_demo_ptx_v1");
+    (h0, h1) = mix_bytes(h0, h1, unit_name.as_bytes());
+    (h0, h1) = mix_bytes(h0, h1, arch.as_bytes());
+    (h0, h1) = mix_bytes(h0, h1, &driver_ver.to_le_bytes());
+    (h0, h1) = mix_bytes(h0, h1, src.as_bytes());
+    for blob in extra_hash_blobs {
+        (h0, h1) = mix_bytes(h0, h1, blob);
+    }
+    (h0, h1)
+}
+
+/// Queries the installed CUDA driver version once for PTX cache key invalidation across driver upgrades.
+fn cached_cuda_driver_version() -> i32 {
+    static DRIVER_VER: OnceLock<i32> = OnceLock::new();
+    *DRIVER_VER.get_or_init(|| {
+        let mut ver: i32 = 0;
+        // SAFETY: `ver` is a valid writable `i32`; `cuDriverGetVersion` is thread-safe.
+        let rc = unsafe { cu::cuDriverGetVersion(&mut ver) };
+        if rc == cu::cudaError_enum_CUDA_SUCCESS {
+            ver
+        } else {
+            0
+        }
+    })
+}
+
+/// Compiles CUDA C++ source via NVRTC with a content-addressed on-disk PTX cache.
+///
+/// Cache keys hash `unit_name`, `arch`, CUDA driver version, `src`, and `extra_hash_blobs`
+/// (for included headers such as `csg_eval.cuh` or OptiX SDK version tags). Returns a
+/// NUL-terminated PTX byte buffer ready for `cuModuleLoadData` or `optix::Module`.
+pub(crate) fn compile_ptx_cached(
+    src: &str,
+    unit_name: &str,
+    arch: &str,
+    include_dirs: &[String],
+    extra_hash_blobs: &[&[u8]],
+) -> Result<Vec<u8>, String> {
+    let driver_ver = cached_cuda_driver_version();
+    let (h0, h1) = ptx_cache_key_128(unit_name, arch, driver_ver, src, extra_hash_blobs);
+    let safe_stem: String = unit_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let cache_dir = nv_demo_cache_dir("ptx_cache_v1");
+    let cache_path = cache_dir.join(format!("{safe_stem}_{h0:016x}{h1:016x}.ptx"));
+
+    if let Ok(mut cached) = std::fs::read(&cache_path)
+        && !cached.is_empty()
+    {
+        if cached.last() != Some(&0) {
+            cached.push(0);
+        }
+        return Ok(cached);
+    }
+
+    let mut opts = nvrtc::CompileOptions::new()
+        .arch(arch)
+        .std("c++17")
+        .fast_math();
+    for dir in include_dirs {
+        opts = opts.include_dir(dir);
+    }
+    let mut prog = nvrtc::Program::new(src, Some(unit_name), &[])
+        .map_err(|e| format!("NVRTC program creation failed for {unit_name}: {e}"))?;
+    prog.compile(&opts)
+        .map_err(|e| format!("NVRTC compile failed for {unit_name}: {e}"))?;
+    let mut ptx = prog
+        .ptx()
+        .map_err(|e| format!("NVRTC PTX retrieval failed for {unit_name}: {e}"))?;
+    if ptx.last() != Some(&0) {
+        ptx.push(0);
+    }
+
+    // Best-effort atomic disk cache write (never fail compilation if cache dir is read-only).
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        let tmp_path = cache_dir.join(format!(
+            "{safe_stem}_{h0:016x}{h1:016x}.tmp.{}",
+            std::process::id()
+        ));
+        if std::fs::write(&tmp_path, &ptx).is_ok()
+            && std::fs::rename(&tmp_path, &cache_path).is_err()
+            && let Err(rm_err) = std::fs::remove_file(&tmp_path)
+        {
+            eprintln!(
+                "nv-demo: failed to clean temp PTX cache '{}': {rm_err}",
+                tmp_path.display()
+            );
+        }
+    }
+    Ok(ptx)
+}
+
 /// RAII wrapper for a CUDA driver module and single entry-point function compiled via NVRTC.
 struct CudaKernel {
     module: cu::CUmodule,
     func: cu::CUfunction,
     cuda: Arc<CudaContext>,
 }
+
+// SAFETY: `CUmodule` and `CUfunction` are owned by `self.cuda` and safe to move across threads
+// provided `self.cuda.bind_to_thread()` is called before launching or unloading.
+unsafe impl Send for CudaKernel {}
 
 impl CudaKernel {
     fn compile(
@@ -560,20 +640,7 @@ impl CudaKernel {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed: {e}"))?;
 
-        let opts = nvrtc::CompileOptions::new()
-            .arch("compute_75")
-            .std("c++17")
-            .fast_math();
-        let mut prog = nvrtc::Program::new(src, Some(unit_name), &[])
-            .map_err(|e| format!("NVRTC program creation failed for {unit_name}: {e}"))?;
-        prog.compile(&opts)
-            .map_err(|e| format!("NVRTC compile failed for {unit_name}: {e}"))?;
-        let mut ptx = prog
-            .ptx()
-            .map_err(|e| format!("NVRTC PTX retrieval failed for {unit_name}: {e}"))?;
-        if ptx.last() != Some(&0) {
-            ptx.push(0);
-        }
+        let ptx = compile_ptx_cached(src, unit_name, "compute_75", &[], &[])?;
 
         let mut module: cu::CUmodule = std::ptr::null_mut();
         // SAFETY: `ptx` is a NUL-terminated PTX image and `cuda` is bound to the current thread.
@@ -591,7 +658,10 @@ impl CudaKernel {
         let fn_res = unsafe { cu::cuModuleGetFunction(&mut func, module, c_fn_name.as_ptr()) };
         if fn_res != cu::cudaError_enum_CUDA_SUCCESS {
             // SAFETY: `module` was loaded above and is not yet owned by `Self`.
-            unsafe { cu::cuModuleUnload(module) };
+            let unload_res = unsafe { cu::cuModuleUnload(module) };
+            if unload_res != cu::cudaError_enum_CUDA_SUCCESS {
+                eprintln!("nv-demo: cuModuleUnload failed on error path: {unload_res:?}");
+            }
             return Err(format!("cuModuleGetFunction({fn_name}) failed: {fn_res:?}"));
         }
 
@@ -607,10 +677,29 @@ impl Drop for CudaKernel {
     fn drop(&mut self) {
         if !self.module.is_null() && self.cuda.bind_to_thread().is_ok() {
             // SAFETY: `self.module` was loaded via `cuModuleLoadData` on `self.cuda`.
-            unsafe { cu::cuModuleUnload(self.module) };
+            let rc = unsafe { cu::cuModuleUnload(self.module) };
+            if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                eprintln!("nv-demo: CudaKernel cuModuleUnload failed: {rc:?}");
+            }
+            self.module = std::ptr::null_mut();
         }
     }
 }
+
+/// Persistent per-context nvJPEG handle, compiled RGB8 conversion kernels, and reusable staging.
+struct CachedJpegPipeline {
+    ctx_ptr: usize,
+    ctx_weak: Weak<CudaContext>,
+    handle: Arc<NvjpegHandle>,
+    alloc_stream: Arc<Stream>,
+    rgba8_kernel: Option<CudaKernel>,
+    scrgb_kernel: Option<CudaKernel>,
+    rgb_buf: Option<DeviceBuffer<u8>>,
+    rgb_cap_bytes: usize,
+    bitstream: Vec<u8>,
+}
+
+static JPEG_CACHE: OnceLock<Mutex<Option<CachedJpegPipeline>>> = OnceLock::new();
 
 /// Converts a tightly packed CUDA `RGBA8` device buffer (`w x h`) to JPEG using `nvjpeg`.
 ///
@@ -675,34 +764,111 @@ pub fn save_jpeg_from_pitched(
         .checked_mul(h as usize)
         .and_then(|px| px.checked_mul(3))
         .ok_or_else(|| "RGB8 buffer size overflow".to_string())?;
-    let alloc_stream = cuda
-        .new_stream()
-        .map_err(|e| format!("CUDA stream creation failed: {e}"))?;
-    let rgb_buf = DeviceBuffer::<u8>::zeroed(&alloc_stream, rgb_bytes)
-        .map_err(|e| format!("CUDA RGB8 allocation failed: {e}"))?;
-    alloc_stream
-        .synchronize()
-        .map_err(|e| format!("CUDA stream sync failed: {e}"))?;
 
-    let (kernel, mut swap_rb) = match fmt {
-        SourcePixelFormat::Rgba8 => (
-            CudaKernel::compile(cuda, RGBA8_TO_RGB8_CU, "rgba8_to_rgb8.cu", "rgba8_to_rgb8")?,
-            0u32,
-        ),
-        SourcePixelFormat::Bgra8 => (
-            CudaKernel::compile(cuda, RGBA8_TO_RGB8_CU, "rgba8_to_rgb8.cu", "rgba8_to_rgb8")?,
-            1u32,
-        ),
-        SourcePixelFormat::ScrgbF16 => (
-            CudaKernel::compile(
-                cuda,
-                SCRGB_F16_TO_RGB8_CU,
-                "scrgb_f16_to_rgb8.cu",
-                "scrgb_f16_to_rgb8",
-            )?,
-            0u32,
-        ),
+    let cache_mutex = JPEG_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache_mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ctx_ptr = cuda.cu_ctx() as usize;
+    let ctx_matches = guard
+        .as_ref()
+        .is_some_and(|c| c.ctx_ptr == ctx_ptr && c.ctx_weak.upgrade().is_some());
+    if !ctx_matches {
+        // Drop any stale pipeline from a destroyed context before creating a new handle.
+        *guard = None;
+        let handle = NvjpegHandle::new(cuda).map_err(|e| format!("nvJPEG init failed: {e}"))?;
+        let alloc_stream = cuda
+            .new_stream()
+            .map_err(|e| format!("CUDA stream creation failed: {e}"))?;
+        *guard = Some(CachedJpegPipeline {
+            ctx_ptr,
+            ctx_weak: Arc::downgrade(cuda),
+            handle,
+            alloc_stream,
+            rgba8_kernel: None,
+            scrgb_kernel: None,
+            rgb_buf: None,
+            rgb_cap_bytes: 0,
+            bitstream: Vec::new(),
+        });
+    }
+    let cached = guard
+        .as_mut()
+        .ok_or_else(|| "JPEG cache initialization failed".to_string())?;
+
+    if rgb_bytes > cached.rgb_cap_bytes || cached.rgb_buf.is_none() {
+        let alloc_bytes = rgb_bytes.max(4096);
+        let new_buf = DeviceBuffer::<u8>::zeroed(&cached.alloc_stream, alloc_bytes)
+            .map_err(|e| format!("CUDA RGB8 allocation failed: {e}"))?;
+        cached
+            .alloc_stream
+            .synchronize()
+            .map_err(|e| format!("CUDA alloc stream sync failed: {e}"))?;
+        cached.rgb_buf = Some(new_buf);
+        cached.rgb_cap_bytes = alloc_bytes;
+    }
+
+    let (kernel_func, mut swap_rb) = match fmt {
+        SourcePixelFormat::Rgba8 => {
+            if cached.rgba8_kernel.is_none() {
+                cached.rgba8_kernel = Some(CudaKernel::compile(
+                    cuda,
+                    RGBA8_TO_RGB8_CU,
+                    "rgba8_to_rgb8.cu",
+                    "rgba8_to_rgb8",
+                )?);
+            }
+            (
+                cached
+                    .rgba8_kernel
+                    .as_ref()
+                    .ok_or_else(|| "rgba8_to_rgb8 kernel missing".to_string())?
+                    .func,
+                0u32,
+            )
+        }
+        SourcePixelFormat::Bgra8 => {
+            if cached.rgba8_kernel.is_none() {
+                cached.rgba8_kernel = Some(CudaKernel::compile(
+                    cuda,
+                    RGBA8_TO_RGB8_CU,
+                    "rgba8_to_rgb8.cu",
+                    "rgba8_to_rgb8",
+                )?);
+            }
+            (
+                cached
+                    .rgba8_kernel
+                    .as_ref()
+                    .ok_or_else(|| "rgba8_to_rgb8 kernel missing".to_string())?
+                    .func,
+                1u32,
+            )
+        }
+        SourcePixelFormat::ScrgbF16 => {
+            if cached.scrgb_kernel.is_none() {
+                cached.scrgb_kernel = Some(CudaKernel::compile(
+                    cuda,
+                    SCRGB_F16_TO_RGB8_CU,
+                    "scrgb_f16_to_rgb8.cu",
+                    "scrgb_f16_to_rgb8",
+                )?);
+            }
+            (
+                cached
+                    .scrgb_kernel
+                    .as_ref()
+                    .ok_or_else(|| "scrgb_f16_to_rgb8 kernel missing".to_string())?
+                    .func,
+                0u32,
+            )
+        }
     };
+
+    let rgb_buf = cached
+        .rgb_buf
+        .as_ref()
+        .ok_or_else(|| "CUDA RGB8 staging buffer missing".to_string())?;
     let mut src_ptr = src_dev_ptr;
     let mut dst_ptr = rgb_buf.cu_deviceptr();
     let mut width = w;
@@ -724,7 +890,7 @@ pub fn save_jpeg_from_pitched(
     // `stream.synchronize()`.
     let launch_res = unsafe {
         cu::cuLaunchKernel(
-            kernel.func,
+            kernel_func,
             gx,
             gy,
             1,
@@ -741,8 +907,8 @@ pub fn save_jpeg_from_pitched(
         return Err(format!("RGB8 conversion cuLaunchKernel failed: {launch_res:?}"));
     }
 
-    let handle = NvjpegHandle::new(cuda).map_err(|e| format!("nvJPEG init failed: {e}"))?;
-    let mut params = EncoderParams::new(&handle, stream)
+    let handle = &cached.handle;
+    let mut params = EncoderParams::new(handle, stream)
         .map_err(|e| format!("nvJPEG encoder params failed: {e}"))?;
     params
         .set_quality(quality, stream)
@@ -751,26 +917,25 @@ pub fn save_jpeg_from_pitched(
         .set_sampling_factors(ChromaSubsampling::Yuv420, stream)
         .map_err(|e| format!("nvJPEG set_sampling_factors failed: {e}"))?;
 
-    let mut state = EncoderState::new(&handle, stream)
+    let mut state = EncoderState::new(handle, stream)
         .map_err(|e| format!("nvJPEG encoder state failed: {e}"))?;
     let pitch = (w as usize)
         .checked_mul(3)
         .ok_or_else(|| "RGB8 pitch overflow".to_string())?;
-    let planes = ImagePlanes::interleaved(&rgb_buf, w, h, 3, pitch)
+    let planes = ImagePlanes::interleaved(rgb_buf, w, h, 3, pitch)
         .map_err(|e| format!("nvJPEG ImagePlanes failed: {e}"))?;
     state
         .encode_image(&params, &planes, InputFormat::Rgbi, w, h, stream)
         .map_err(|e| format!("nvJPEG encode_image failed: {e}"))?;
 
-    let mut bitstream = Vec::new();
+    cached.bitstream.clear();
     state
-        .retrieve_bitstream_into(&mut bitstream, stream)
+        .retrieve_bitstream_into(&mut cached.bitstream, stream)
         .map_err(|e| format!("nvJPEG retrieve_bitstream failed: {e}"))?;
 
     stream
         .synchronize()
         .map_err(|e| format!("CUDA stream synchronize failed: {e}"))?;
-    drop(rgb_buf);
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -778,7 +943,7 @@ pub fn save_jpeg_from_pitched(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create '{}': {e}", parent.display()))?;
     }
-    std::fs::write(path, &bitstream)
+    std::fs::write(path, &cached.bitstream)
         .map_err(|e| format!("failed to write JPEG '{}': {e}", path.display()))?;
     Ok(())
 }
@@ -806,25 +971,6 @@ pub struct VideoRecorder {
 }
 
 impl VideoRecorder {
-    /// Opens an NVENC session (`H.264` SDR or `HEVC` Main10 PQ10) and creates an `.mp4` at `path`,
-    /// using the default source format (`Rgba8` for SDR H.264, `ScrgbF16` for HDR10 PQ).
-    ///
-    /// Both `w` and `h` must be non-zero and even (required by 4:2:0 chroma subsampling).
-    pub fn start(
-        cuda: &Arc<CudaContext>,
-        w: u32,
-        h: u32,
-        fps: u32,
-        profile: VideoProfile,
-        path: &Path,
-    ) -> Result<Self, String> {
-        let src_fmt = match profile {
-            VideoProfile::SdrH264 => SourcePixelFormat::Rgba8,
-            VideoProfile::Hdr10Pq => SourcePixelFormat::ScrgbF16,
-        };
-        Self::start_with_format(cuda, w, h, fps, profile, src_fmt, path)
-    }
-
     /// Opens an NVENC session with an explicit [`SourcePixelFormat`] (`Rgba8`, `Bgra8`, or
     /// `ScrgbF16`) for zero-copy GPU color conversion directly from viewport or full-window targets.
     pub fn start_with_format(
@@ -1172,5 +1318,31 @@ mod tests {
         assert!((184..=188).contains(&dst[1])); // 0.5^(1/2.2) * 255 ~= 186
         assert_eq!(dst[2], 0);
         assert_eq!(dst[3], 255);
+    }
+
+    #[test]
+    fn ptx_cache_key_changes_with_source_arch_driver_and_headers() {
+        let base = ptx_cache_key_128("test.cu", "compute_75", 12080, "void f(){}", &[b"hdr_v1"]);
+        assert_eq!(
+            base,
+            ptx_cache_key_128("test.cu", "compute_75", 12080, "void f(){}", &[b"hdr_v1"])
+        );
+        assert_ne!(
+            base,
+            ptx_cache_key_128("test.cu", "compute_89", 12080, "void f(){}", &[b"hdr_v1"])
+        );
+        assert_ne!(
+            base,
+            ptx_cache_key_128("test.cu", "compute_75", 12090, "void f(){}", &[b"hdr_v1"])
+        );
+        assert_ne!(
+            base,
+            ptx_cache_key_128("test.cu", "compute_75", 12080, "void g(){}", &[b"hdr_v1"])
+        );
+        assert_ne!(
+            base,
+            ptx_cache_key_128("test.cu", "compute_75", 12080, "void f(){}", &[b"hdr_v2"])
+        );
+        assert!(nv_demo_cache_dir("ptx_cache_v1").ends_with("ptx_cache_v1"));
     }
 }

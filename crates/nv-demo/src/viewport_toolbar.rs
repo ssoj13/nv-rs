@@ -65,9 +65,15 @@ pub struct ToolbarState {
     pub edge: ToolbarEdge,
     /// Whether the toolbar is currently expanded (`true`) or collapsed to its toggle handle.
     pub expanded: bool,
-    /// Last measured natural width when expanded (used for smooth collapse/expand animation).
+    /// Last measured natural width when expanded horizontally (`Top`/`Bottom`).
     #[serde(skip)]
     pub measured_extent: f32,
+    /// Last measured cross-axis width when expanded vertically (`Left`/`Right`).
+    #[serde(skip)]
+    pub measured_vertical_width: f32,
+    /// Last measured main-axis height when expanded vertically (`Left`/`Right`).
+    #[serde(skip)]
+    pub measured_vertical_height: f32,
 }
 
 impl Default for ToolbarState {
@@ -76,7 +82,56 @@ impl Default for ToolbarState {
             edge: ToolbarEdge::Top,
             expanded: true,
             measured_extent: 560.0,
+            measured_vertical_width: 118.0,
+            measured_vertical_height: 360.0,
         }
+    }
+}
+
+/// Computes the target `(width, height)` of the floating [`ViewportToolbar`] for the given
+/// `state` and `viewport` without clipping vertical (`Left`/`Right`) controls to `thickness`.
+pub fn compute_toolbar_target_size(
+    state: &ToolbarState,
+    thickness: f32,
+    toggle_size: f32,
+    viewport: Rect,
+) -> Vec2 {
+    let collapsed_extent = toggle_size + 8.0;
+    let max_horiz = (viewport.width() - 8.0).max(collapsed_extent);
+    let max_vert = (viewport.height() - 48.0).max(collapsed_extent);
+    if state.edge.is_horizontal() {
+        let w = if state.expanded {
+            let eff = if state.measured_extent > collapsed_extent {
+                state.measured_extent
+            } else {
+                560.0
+            };
+            eff.clamp(collapsed_extent, max_horiz)
+        } else {
+            collapsed_extent
+        };
+        Vec2::new(w.min(max_horiz), thickness)
+    } else {
+        let max_vert_w = (viewport.width() * 0.45).max(thickness);
+        let (w, h) = if state.expanded {
+            let eff_w = if state.measured_vertical_width > thickness {
+                state.measured_vertical_width
+            } else {
+                118.0
+            };
+            let eff_h = if state.measured_vertical_height > collapsed_extent {
+                state.measured_vertical_height
+            } else {
+                360.0
+            };
+            (
+                eff_w.clamp(thickness, max_vert_w),
+                eff_h.clamp(collapsed_extent, max_vert),
+            )
+        } else {
+            (thickness, collapsed_extent)
+        };
+        Vec2::new(w.min(max_vert_w), h.min(max_vert))
     }
 }
 
@@ -115,21 +170,23 @@ impl ViewportToolbar {
         let collapsed_extent = self.toggle_size + 8.0;
         let max_horiz = (viewport.width() - 8.0).max(collapsed_extent);
         let max_vert = (viewport.height() - 48.0).max(collapsed_extent);
-        let target_extent = if state.expanded {
-            if state.edge.is_horizontal() {
-                state.measured_extent.clamp(collapsed_extent, max_horiz)
-            } else {
-                state.measured_extent.clamp(collapsed_extent, max_vert)
-            }
-        } else {
-            collapsed_extent
-        };
+        let max_vert_w = (viewport.width() * 0.45).max(self.thickness);
+        let target = compute_toolbar_target_size(state, self.thickness, self.toggle_size, viewport);
 
-        let anim_extent = ctx.animate_value_with_time(self.id.with("extent"), target_extent, 0.16);
+        let (target_main, target_cross) = if state.edge.is_horizontal() {
+            (target.x, target.y)
+        } else {
+            (target.y, target.x)
+        };
+        let anim_extent = ctx.animate_value_with_time(self.id.with("extent"), target_main, 0.16);
+        let anim_cross = ctx.animate_value_with_time(self.id.with("cross"), target_cross, 0.16);
         let (w, h) = if state.edge.is_horizontal() {
             (anim_extent.min(max_horiz), self.thickness)
         } else {
-            (self.thickness, anim_extent.min(max_vert))
+            (
+                anim_cross.clamp(self.thickness, max_vert_w),
+                anim_extent.min(max_vert),
+            )
         };
 
         // Anchor flush against the chosen viewport edge (and aligned to the top-right / edge
@@ -192,10 +249,13 @@ impl ViewportToolbar {
                     .rect(rect, radius, fill, border, StrokeKind::Inside);
 
                 let inner = rect.shrink2(Vec2::new(4.0, 3.0));
-                let toggle_rect = Rect::from_min_size(
-                    inner.min,
-                    Vec2::splat(self.toggle_size.min(inner.width()).min(inner.height())),
-                );
+                let toggle_sz = self.toggle_size.min(inner.width()).min(inner.height());
+                let toggle_min = if state.edge.is_horizontal() {
+                    inner.min
+                } else {
+                    Pos2::new(inner.center().x - 0.5 * toggle_sz, inner.top())
+                };
+                let toggle_rect = Rect::from_min_size(toggle_min, Vec2::splat(toggle_sz));
 
                 // Toggle button doubles as a drag-to-edge handle.
                 let toggle_resp = ui.interact(
@@ -265,13 +325,26 @@ impl ViewportToolbar {
                     child_ui.spacing_mut().button_padding = Vec2::new(5.0, 2.0);
                     add_contents(&mut child_ui);
                     let used = child_ui.min_size();
-                    let desired = if state.edge.is_horizontal() {
-                        (self.toggle_size + 16.0 + used.x).max(collapsed_extent + 24.0)
+                    if state.edge.is_horizontal() {
+                        let desired =
+                            (self.toggle_size + 16.0 + used.x).max(collapsed_extent + 24.0);
+                        if desired.is_finite() && (desired - state.measured_extent).abs() > 1.0 {
+                            state.measured_extent = desired;
+                        }
                     } else {
-                        (self.toggle_size + 16.0 + used.y).max(collapsed_extent + 24.0)
-                    };
-                    if desired.is_finite() && (desired - state.measured_extent).abs() > 1.0 {
-                        state.measured_extent = desired;
+                        let desired_h =
+                            (self.toggle_size + 16.0 + used.y).max(collapsed_extent + 24.0);
+                        let desired_w = (used.x + 12.0).max(self.thickness);
+                        if desired_h.is_finite()
+                            && (desired_h - state.measured_vertical_height).abs() > 1.0
+                        {
+                            state.measured_vertical_height = desired_h;
+                        }
+                        if desired_w.is_finite()
+                            && (desired_w - state.measured_vertical_width).abs() > 1.0
+                        {
+                            state.measured_vertical_width = desired_w;
+                        }
                     }
                 }
 
@@ -308,5 +381,38 @@ mod tests {
             ToolbarEdge::nearest(vp, Pos2::new(980.0, 300.0)),
             ToolbarEdge::Right
         );
+    }
+
+    #[test]
+    fn vertical_left_right_toolbar_expands_cross_width_and_collapses_cleanly() {
+        let vp = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        for edge in [ToolbarEdge::Left, ToolbarEdge::Right] {
+            let mut st = ToolbarState {
+                edge,
+                expanded: true,
+                measured_extent: 560.0,
+                measured_vertical_width: 118.0,
+                measured_vertical_height: 360.0,
+            };
+            let expanded = compute_toolbar_target_size(&st, 30.0, 24.0, vp);
+            assert!(
+                expanded.x >= 110.0,
+                "{edge:?} expanded width must not clip to 30px, got {}",
+                expanded.x
+            );
+            assert!(expanded.y >= 300.0);
+
+            // Deserialized ToolbarState (`#[serde(skip)]` zeros) also gets a safe non-clipping width.
+            st.measured_vertical_width = 0.0;
+            st.measured_vertical_height = 0.0;
+            let fallback = compute_toolbar_target_size(&st, 30.0, 24.0, vp);
+            assert!(fallback.x >= 110.0, "fallback width={}", fallback.x);
+
+            // Collapsed vertical toolbar shrinks cleanly back to the 30px pill.
+            st.expanded = false;
+            let collapsed = compute_toolbar_target_size(&st, 30.0, 24.0, vp);
+            assert_eq!(collapsed.x, 30.0);
+            assert_eq!(collapsed.y, 32.0);
+        }
     }
 }

@@ -197,6 +197,11 @@ pub enum RenderControl {
         sim_dt: f32,
         sub_idx: u32,
         sub_count: u32,
+        reset_seq: u64,
+        possess_free_yaw: f32,
+        possess_free_pitch: f32,
+        possess_auto_level: bool,
+        possess_zoom_offset: f32,
     },
     /// Synthesize a deterministic exact-CSG random rail for the active scene on the worker thread.
     GenerateRandomRail { seed: u64 },

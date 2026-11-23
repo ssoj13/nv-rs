@@ -8,6 +8,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
@@ -203,10 +205,109 @@ pub fn save_to(path: &Path, state: &PersistedState) -> std::io::Result<()> {
         file.sync_all()?;
     }
     if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(rm_err) = std::fs::remove_file(&tmp) {
+            eprintln!(
+                "nv-demo persist cleanup failed for '{}': {rm_err}",
+                tmp.display()
+            );
+        }
         return Err(err);
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct PersistSlot {
+    pending: Option<PersistedState>,
+    shutdown: bool,
+}
+
+/// Asynchronous background persistence worker coalescing [`PersistedState`] saves off the UI thread.
+///
+/// Guarantees that `serde_json` formatting and `File::sync_all` (`FlushFileBuffers`) never stall
+/// the 60 Hz UI loop, while flushing the latest snapshot cleanly on shutdown.
+pub struct PersistWorker {
+    slot: Arc<(Mutex<PersistSlot>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PersistWorker {
+    /// Spawns a background persistence thread targeting the default [`config_path`].
+    pub fn spawn() -> Self {
+        Self::spawn_for_path(config_path())
+    }
+
+    /// Spawns a background persistence thread writing to `target_path` (when `Some`).
+    pub fn spawn_for_path(target_path: Option<PathBuf>) -> Self {
+        let slot = Arc::new((Mutex::new(PersistSlot::default()), Condvar::new()));
+        let worker_slot = Arc::clone(&slot);
+        let handle = std::thread::Builder::new()
+            .name("nv-demo-persist".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*worker_slot;
+                loop {
+                    let next = {
+                        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.pending.is_none() && !guard.shutdown {
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        match guard.pending.take() {
+                            Some(st) => Some(st),
+                            None if guard.shutdown => None,
+                            None => continue,
+                        }
+                    };
+                    let Some(state) = next else {
+                        break;
+                    };
+                    if let Some(ref path) = target_path
+                        && let Err(e) = save_to(path, &state)
+                    {
+                        eprintln!("nv-demo persist save failed ('{}'): {e}", path.display());
+                    }
+                }
+            })
+            .ok();
+        Self { slot, handle }
+    }
+
+    /// Coalesces `state` as the latest pending save and wakes the background worker (non-blocking).
+    pub fn enqueue(&self, state: PersistedState) {
+        if self.handle.is_none() {
+            if let Err(e) = save(&state) {
+                eprintln!("nv-demo persist fallback save failed: {e}");
+            }
+            return;
+        }
+        let (lock, cvar) = &*self.slot;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.pending = Some(state);
+        cvar.notify_one();
+    }
+
+    /// Enqueues an optional final state, signals shutdown, and waits for durable completion.
+    pub fn flush_and_join(&mut self, final_state: Option<PersistedState>) {
+        {
+            let (lock, cvar) = &*self.slot;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(st) = final_state {
+                guard.pending = Some(st);
+            }
+            guard.shutdown = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.handle.take()
+            && let Err(e) = handle.join()
+        {
+            eprintln!("nv-demo persist worker join error: {e:?}");
+        }
+    }
+}
+
+impl Drop for PersistWorker {
+    fn drop(&mut self) {
+        self.flush_and_join(None);
+    }
 }
 
 fn nav_mode_name(m: NavMode) -> &'static str {
@@ -376,5 +477,29 @@ mod tests {
         assert!(loaded.camera_rail.selected_rail_id.is_empty());
         assert!(loaded.camera_rail.keyframes.is_empty());
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::FpsFly);
+    }
+
+    #[test]
+    fn persist_worker_coalesces_and_flushes_latest_state_on_shutdown() {
+        let dir = std::env::temp_dir().join(format!(
+            "nv_demo_persist_worker_{}",
+            std::process::id()
+        ));
+        let path = dir.join("nv-demo.json");
+        let mut worker = PersistWorker::spawn_for_path(Some(path.clone()));
+        for i in 1..=5u32 {
+            let mut st = PersistedState::default();
+            st.settings.sat_count = i;
+            worker.enqueue(st);
+        }
+        let mut final_st = PersistedState::default();
+        final_st.settings.sat_count = 17;
+        worker.flush_and_join(Some(final_st.clone()));
+
+        let loaded = load_from(&path);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("test cleanup warning: {e}");
+        }
+        assert_eq!(loaded.settings.sat_count, 17);
     }
 }

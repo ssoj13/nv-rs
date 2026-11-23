@@ -10,6 +10,7 @@
 //! while delivering smooth frame times across 10k-100k+ CSG instances.
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -18,40 +19,189 @@ use std::sync::Arc;
 use bytemuck::Pod;
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
-use optix::{Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, Instance, Scratch};
+use optix::{
+    Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, GeometryFlags, Instance, Keys,
+    Scratch,
+};
 
 use csg_actors::{
     ArchetypeKind, CrowdSim, CsgRayOccluder, RayOccluder, SdgActorRecord, SdgCamera, SdgProjection,
     Vec3 as ActorVec3, extract_sdg_frame,
 };
-use csg_core::abi::compound_flags;
-use csg_core::math::{Mat3x4, Vec3};
-use csg_core::{CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
+use csg_core::abi::{compound_flags, opcode};
+use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
+use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
 use csg_scene::{
     CROWD_USER_ID_BASE, CameraPose as CsgCameraPose, CameraView, GpuInstance, GpuMaterial,
-    PackedGpuScene, RailGenConfig, RailSpec, SceneBuildConfig, SceneBuilt, SceneDescriptor,
-    SceneHints, SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
-    generate_random_rail, inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
-    lookup_instance_and_assembly, pick_possessable_instance_with_crowd,
-    resolve_possess_pose_with_crowd,
+    MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec, SHADOW_GUARD_MIN_DIAMETER,
+    SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints, SceneRegistry, SceneViewpoint,
+    TimeOfDay, WorldScene, find_crowd_actor_for_inst, generate_random_rail, inst_flags,
+    is_dynamic_inst_id, list_possess_targets_with_crowd, lookup_instance_and_assembly,
+    pick_possessable_instance_with_crowd, resolve_possess_pose_with_crowd,
 };
 
 use crate::app_events::PossessInfo;
 use crate::renderer::{CameraFrame, CameraProjection};
 
-/// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`).
-pub const CSG_SBT_OFFSET: u32 = 4;
+/// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
+/// paired with shadow hit group `CSG_SBT_OFFSET + 1` under `SBT_STRIDE = 2`).
+pub const CSG_SBT_OFFSET: u32 = 8;
 
-/// SBT hit-group offset for ultra-lean single-primitive CSG (`__intersection__csg_prim` + `__closesthit__csg`).
-pub const CSG_SBT_PRIM_OFFSET: u32 = 5;
+/// SBT hit-group offset for ultra-lean single-primitive & Multi-AABB `PURE_UNION` CSG
+/// (`__intersection__csg_prim` + `__closesthit__csg`, paired with shadow hit group
+/// `CSG_SBT_PRIM_OFFSET + 1` under `SBT_STRIDE = 2`).
+pub const CSG_SBT_PRIM_OFFSET: u32 = 10;
 
-/// Routes single-primitive compounds to the register-lean SBT 5 hit group and general RPN compounds to SBT 4.
+/// OptiX instance flag disabling any-hit programs on opaque CSG instances.
+const OPTIX_INST_DISABLE_ANYHIT: u32 =
+    optix::sys::OptixInstanceFlags_OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT as u32;
+
+/// Maximum cached `SceneBuilt` entries retained across scene/road-mode switches.
+const SCENE_LRU_MAX_ENTRIES: usize = 4;
+
+/// Maximum combined estimated CPU byte budget for the `SceneBuilt` LRU cache (`512 MiB`).
+const SCENE_LRU_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Routes single-primitive compounds to the register-lean SBT 10 hit group and general RPN
+/// compounds to SBT 8.
+#[cfg(test)]
 #[inline]
 pub const fn sbt_offset_for_compound(flags: u32) -> u32 {
     if (flags & compound_flags::SINGLE_PRIM) != 0 {
         CSG_SBT_PRIM_OFFSET
     } else {
         CSG_SBT_OFFSET
+    }
+}
+
+/// OptiX GAS build strategy chosen for a compiled CSG compound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompoundGasPlan {
+    /// Single primitive (`op_count == 1`, `PUSH_PRIM`) -> 1-AABB GAS with `primitive_offset = prim_idx`, SBT 10.
+    SinglePrim { prim_idx: u32 },
+    /// Pure union of `count >= 2` contiguous finite primitives (no `FINITE_REPEAT`) -> `count`-AABB
+    /// hardware BVH GAS with `primitive_offset = first_prim`, SBT 10.
+    MultiAabbUnion { first_prim: u32, count: usize },
+    /// General RPN / `SUBTRACT` / `INTERSECT` / `FINITE_REPEAT` -> 1-AABB GAS with `primitive_offset = 0`, SBT 8.
+    GeneralRpn,
+}
+
+impl CompoundGasPlan {
+    #[inline]
+    const fn sbt_offset(self) -> u32 {
+        match self {
+            Self::SinglePrim { .. } | Self::MultiAabbUnion { .. } => CSG_SBT_PRIM_OFFSET,
+            Self::GeneralRpn => CSG_SBT_OFFSET,
+        }
+    }
+}
+
+/// Inspects a compiled compound in `lib` and selects the fastest valid OptiX GAS strategy.
+///
+/// Eligible `PURE_UNION` compounds with `M >= 2` contiguous `PUSH_PRIM`s (no `FINITE_REPEAT`,
+/// bounded finite primitive AABBs) build an `M`-AABB custom-primitive GAS with
+/// `primitive_offset = first_prim` so hardware RT Cores traverse the compound's internal BVH
+/// and invoke `__intersection__csg_prim[_shadow]` with `optixGetPrimitiveIndex() == prim_idx`.
+fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPlan {
+    let op_start = comp.op_offset as usize;
+    let op_end = op_start.saturating_add(comp.op_count as usize);
+    let Some(ops) = lib.ops.get(op_start..op_end) else {
+        return CompoundGasPlan::GeneralRpn;
+    };
+
+    if (comp.flags & compound_flags::SINGLE_PRIM) != 0
+        && ops.len() == 1
+        && ops[0].opcode == opcode::PUSH_PRIM
+        && (ops[0].arg0 as usize) < lib.prims.len()
+    {
+        return CompoundGasPlan::SinglePrim {
+            prim_idx: ops[0].arg0,
+        };
+    }
+
+    if (comp.flags & compound_flags::PURE_UNION) != 0
+        && (comp.flags & compound_flags::UNBOUNDED) == 0
+    {
+        let mut first_prim: Option<u32> = None;
+        let mut count: usize = 0;
+        let mut eligible = true;
+        for op in ops {
+            match op.opcode {
+                opcode::PUSH_PRIM => {
+                    let pid = op.arg0;
+                    let expected = match first_prim {
+                        None => {
+                            first_prim = Some(pid);
+                            pid
+                        }
+                        Some(base) => base.wrapping_add(count as u32),
+                    };
+                    if pid != expected {
+                        eligible = false;
+                        break;
+                    }
+                    let Some(prim) = lib.prims.get(pid as usize) else {
+                        eligible = false;
+                        break;
+                    };
+                    let finite_aabb = (0..3).all(|j| {
+                        prim.aabb_min[j].is_finite()
+                            && prim.aabb_max[j].is_finite()
+                            && prim.aabb_min[j] <= prim.aabb_max[j]
+                    });
+                    if !finite_aabb {
+                        eligible = false;
+                        break;
+                    }
+                    count += 1;
+                }
+                opcode::UNION | opcode::GUARD_AABB | opcode::PUSH_EMPTY => {}
+                // `FINITE_REPEAT` or any non-union op stays on general RPN (`hit_csg`).
+                _ => {
+                    eligible = false;
+                    break;
+                }
+            }
+        }
+        if eligible && let Some(base) = first_prim && count >= 2 {
+            return CompoundGasPlan::MultiAabbUnion {
+                first_prim: base,
+                count,
+            };
+        }
+    }
+
+    CompoundGasPlan::GeneralRpn
+}
+
+/// OptiX `BuildOptions` for per-compound CSG custom-primitive GASes (`compact = false` eliminates
+/// ~246 synchronous GPU compaction stalls on every scene or road-mode switch).
+#[inline]
+fn csg_gas_build_opts() -> BuildOptions {
+    BuildOptions {
+        prefer_fast_trace: true,
+        compact: false,
+        ..Default::default()
+    }
+}
+
+/// Builds a non-degenerate, slightly padded OptiX custom-primitive AABB for a single `GpuPrim`.
+#[inline]
+fn sanitized_prim_aabb(prim: &GpuPrim) -> Aabb {
+    let mut bmin = prim.aabb_min;
+    let mut bmax = prim.aabb_max;
+    for i in 0..3 {
+        if !bmin[i].is_finite() || !bmax[i].is_finite() || bmin[i] > bmax[i] {
+            bmin[i] = -0.01;
+            bmax[i] = 0.01;
+        } else {
+            bmin[i] -= 1.0e-4;
+            bmax[i] += 1.0e-4;
+        }
+    }
+    Aabb {
+        min: bmin,
+        max: bmax,
     }
 }
 
@@ -242,8 +392,9 @@ impl Drop for PinnedStagingBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.ctx.bind_to_thread().is_ok() {
             // SAFETY: `self.ptr` was allocated via `cuMemAllocHost_v2` on `self.ctx`.
-            unsafe {
-                let _ = cu::cuMemFreeHost(self.ptr);
+            let rc = unsafe { cu::cuMemFreeHost(self.ptr) };
+            if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                eprintln!("nv-demo: PinnedStagingBuffer cuMemFreeHost failed ({rc:?})");
             }
             self.ptr = std::ptr::null_mut();
         }
@@ -399,18 +550,251 @@ pub struct SdgExportFrame {
     pub actors: Vec<SdgActorRecord>,
 }
 
-/// Fast deterministic FNV-1a signature over the packed static tail so `TrafficOnly` never runs
-/// if any static instance entered, exited, reordered, or switched LOD compound.
+/// Sentinel indicating a dynamic instance has no prior LOD history yet.
+const PREV_LOD_NONE: u8 = u8::MAX;
+
 #[inline]
-fn hash_static_topology(static_slice: &[GpuInstance]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for inst in static_slice {
-        h ^= u64::from(inst.compound_id) | (u64::from(inst.user_id) << 32);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-        h ^= u64::from(inst.mat_override);
-        h = h.wrapping_mul(0x0100_0000_01b3);
+fn csg_aabb_distance_sq(aabb: CsgAabb, p: Vec3) -> f32 {
+    if aabb.is_empty() || !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() {
+        return f32::INFINITY;
     }
-    h
+    if !aabb.is_finite() {
+        return 0.0;
+    }
+    let dx = (aabb.min.x - p.x).max(0.0).max(p.x - aabb.max.x);
+    let dy = (aabb.min.y - p.y).max(0.0).max(p.y - aabb.max.y);
+    let dz = (aabb.min.z - p.z).max(0.0).max(p.z - aabb.max.z);
+    dx * dx + dy * dy + dz * dz
+}
+
+#[inline]
+fn xform_max_scale(m: Mat3x4) -> f32 {
+    let a = &m.0;
+    let c0 = a[0] * a[0] + a[4] * a[4] + a[8] * a[8];
+    let c1 = a[1] * a[1] + a[5] * a[5] + a[9] * a[9];
+    let c2 = a[2] * a[2] + a[6] * a[6] + a[10] * a[10];
+    let max_sq = c0.max(c1).max(c2);
+    if max_sq.is_finite() && max_sq > 0.0 {
+        max_sq.sqrt()
+    } else {
+        1.0
+    }
+}
+
+/// Packs ONLY `world.dynamic_instances()` against `view` into `out_insts` & `out_prev` with zero
+/// iteration over static spatial chunks and zero static-tail topology hashing.
+///
+/// Mirrors `WorldScene::pack_visible` dynamic pass verbatim so `TrafficOnly` ticks run in
+/// O(`dynamic_instances.len()`) instead of O(`static_instances.len()`).
+fn pack_dynamic_prefix_only(
+    world: &WorldScene,
+    view: &CameraView,
+    dyn_prev_lods: &mut Vec<u8>,
+    out_insts: &mut Vec<GpuInstance>,
+    out_prev: &mut Vec<[f32; 12]>,
+) {
+    out_insts.clear();
+    out_prev.clear();
+    let dyn_slice = world.dynamic_instances();
+    if dyn_prev_lods.len() != dyn_slice.len() {
+        dyn_prev_lods.resize(dyn_slice.len(), PREV_LOD_NONE);
+    }
+
+    let fixed_bytes = world.fixed_gpu_bytes();
+    let max_emit = world.budget.instance_budget(fixed_bytes);
+    let max_radius = if view.max_radius.is_nan() {
+        0.0
+    } else {
+        view.max_radius.max(0.0)
+    };
+    let max_radius_sq = if max_radius.is_finite() {
+        max_radius * max_radius
+    } else {
+        f32::INFINITY
+    };
+    let shadow_radius = if view.shadow_guard_radius.is_finite() {
+        view.shadow_guard_radius.max(0.0).min(max_radius)
+    } else {
+        0.0
+    };
+    let shadow_radius_sq = shadow_radius * shadow_radius;
+
+    for (inst, prev_lod_slot) in dyn_slice.iter().zip(dyn_prev_lods.iter_mut()) {
+        if !inst.is_visible() {
+            continue;
+        }
+        let Some(assembly) = world.assembly(inst.assembly_id) else {
+            continue;
+        };
+        let is_crowd_bone = inst.user_id >= CROWD_USER_ID_BASE;
+        let world_aabb = inst.xform.xform_aabb(assembly.local_aabb);
+        let dist_sq = csg_aabb_distance_sq(world_aabb, view.position);
+        if !is_crowd_bone && max_radius_sq.is_finite() && dist_sq > max_radius_sq {
+            continue;
+        }
+        let world_diam = world_aabb.diameter();
+        let in_frustum = is_crowd_bone
+            || view
+                .frustum
+                .is_none_or(|frustum| frustum.intersects_aabb(world_aabb));
+        if !in_frustum {
+            let keep_shadow = (inst.flags & inst_flags::CAST_SHADOW) != 0
+                && shadow_radius_sq > 0.0
+                && dist_sq <= shadow_radius_sq
+                && (!world_diam.is_finite() || world_diam >= SHADOW_GUARD_MIN_DIAMETER);
+            if !keep_shadow {
+                continue;
+            }
+        }
+        let center = if assembly.local_aabb.is_empty() || !assembly.local_aabb.is_finite() {
+            inst.position()
+        } else {
+            inst.xform.xform_pt(assembly.local_aabb.center())
+        };
+        let dist = (center - view.position).len();
+        let part_end = assembly.visible_part_end(dist, view.small_detail_cull_factor);
+        if part_end == 0 {
+            continue;
+        }
+
+        let scale_max = xform_max_scale(inst.xform);
+        let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
+            None
+        } else {
+            Some(*prev_lod_slot as usize)
+        };
+        let mut recorded_lod: Option<usize> = None;
+        let visible_parts = assembly.parts.get(..part_end).unwrap_or(&assembly.parts);
+        for part in visible_parts {
+            let part_diam = if part.local_aabb.is_finite() && !part.local_aabb.is_empty() {
+                part.local_aabb.diameter() * scale_max * xform_max_scale(part.local_xform)
+            } else {
+                assembly.local_aabb.diameter() * scale_max
+            };
+            let proj_px = view.project_diameter_px(part_diam, dist);
+            let lod = part.lods.select_lod(dist, proj_px, prev_lod);
+            if recorded_lod.is_none() && part.lods.num_levels() > 1 {
+                recorded_lod = Some(lod);
+            }
+            let compounds = part.lods.compounds_for_lod(lod);
+            if compounds.is_empty() {
+                continue;
+            }
+            let part_world = inst.xform * part.local_xform;
+            let part_prev = inst
+                .prev_xform
+                .map_or(part_world, |prev| prev * part.local_xform);
+            let mat_ov = inst
+                .mat_override
+                .or(part.mat_override)
+                .map_or(MAT_OVERRIDE_NONE, |m| m.0 as u32);
+            for &cid in compounds {
+                if out_insts.len() >= max_emit {
+                    continue;
+                }
+                out_insts.push(GpuInstance {
+                    xform: part_world.0,
+                    compound_id: cid.0,
+                    user_id: inst.user_id,
+                    mat_override: mat_ov,
+                    flags: inst.flags,
+                });
+                out_prev.push(part_prev.0);
+            }
+        }
+        if let Some(lod) = recorded_lod {
+            *prev_lod_slot = u8::try_from(lod).unwrap_or(PREV_LOD_NONE - 1);
+        }
+    }
+}
+
+/// Builds a single cached OptiX custom-primitive GAS for `comp`, selecting Multi-AABB hardware BVH
+/// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible `PURE_UNION`
+/// compounds, `primitive_offset = prim_idx` for `SINGLE_PRIM` compounds, and a 1-AABB GAS for
+/// general RPN compounds, with `compact: false` and `GeometryFlags::DISABLE_ANYHIT`.
+fn build_compound_gas(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Arc<Stream>,
+    scratch: &mut Scratch,
+    aabb_staging: &DeviceBuffer<Aabb>,
+    multi_aabb_host: &mut Vec<Aabb>,
+    lib: &CompiledLibrary,
+    comp: &GpuCompound,
+) -> Result<(Arc<Accel>, u32), String> {
+    let build_opts = csg_gas_build_opts();
+    let plan = compound_gas_plan(lib, comp);
+    let sbt_off = plan.sbt_offset();
+    let gas = match plan {
+        CompoundGasPlan::MultiAabbUnion { first_prim, count } => {
+            multi_aabb_host.clear();
+            multi_aabb_host.reserve(count);
+            let p0 = first_prim as usize;
+            for prim in &lib.prims[p0..p0 + count] {
+                multi_aabb_host.push(sanitized_prim_aabb(prim));
+            }
+            let multi_buf = DeviceBuffer::<Aabb>::from_host(stream, multi_aabb_host)
+                .map_err(|e| format!("CSG multi-AABB upload ({count} prims) failed: {e}"))?;
+            let input = CustomPrimitives {
+                aabbs: Keys::One(&multi_buf),
+                flags: &[GeometryFlags::DISABLE_ANYHIT],
+                sbt_offsets: None,
+                primitive_offset: first_prim,
+            };
+            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
+                .map_err(|e| format!("CSG multi-AABB GAS build failed: {e}"))?
+        }
+        CompoundGasPlan::SinglePrim { prim_idx } => {
+            let aabb = sanitized_compound_aabb(comp);
+            let box_bytes = std::mem::size_of::<Aabb>();
+            // SAFETY: `aabb_staging` holds 1 `Aabb` (`24 B` plain `f32`) on `stream`; CUDA stages
+            // the pageable host copy before returning.
+            let h2d = unsafe {
+                cu::cuMemcpyHtoDAsync_v2(
+                    aabb_staging.cu_deviceptr(),
+                    (&raw const aabb).cast(),
+                    box_bytes,
+                    stream.cu_stream(),
+                )
+            };
+            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+                return Err(format!("CSG single-prim AABB H2D copy failed ({h2d:?})"));
+            }
+            let input = CustomPrimitives {
+                aabbs: Keys::One(aabb_staging),
+                flags: &[GeometryFlags::DISABLE_ANYHIT],
+                sbt_offsets: None,
+                primitive_offset: prim_idx,
+            };
+            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
+                .map_err(|e| format!("CSG single-prim GAS build failed: {e}"))?
+        }
+        CompoundGasPlan::GeneralRpn => {
+            let aabb = sanitized_compound_aabb(comp);
+            let box_bytes = std::mem::size_of::<Aabb>();
+            // SAFETY: `aabb_staging` holds 1 `Aabb` (`24 B` plain `f32`) on `stream`; CUDA stages
+            // the pageable host copy before returning.
+            let h2d = unsafe {
+                cu::cuMemcpyHtoDAsync_v2(
+                    aabb_staging.cu_deviceptr(),
+                    (&raw const aabb).cast(),
+                    box_bytes,
+                    stream.cu_stream(),
+                )
+            };
+            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+                return Err(format!("CSG compound AABB H2D copy failed ({h2d:?})"));
+            }
+            let input = CustomPrimitives {
+                aabbs: Keys::One(aabb_staging),
+                flags: &[GeometryFlags::DISABLE_ANYHIT],
+                sbt_offsets: None,
+                primitive_offset: 0,
+            };
+            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
+                .map_err(|e| format!("CSG compound GAS build failed: {e}"))?
+        }
+    };
+    Ok((gas, sbt_off))
 }
 
 /// Converts `nv-demo` [`CameraProjection`] to [`SdgProjection`].
@@ -425,18 +809,22 @@ pub const fn to_sdg_projection(proj: CameraProjection) -> SdgProjection {
 }
 
 /// Owns the active `SceneRegistry`, compiled `SceneBuilt` (world, traffic, crowd, hints),
-/// batched per-compound OptiX GAS cache, and flat GPU buffers.
+/// bounded `SceneBuilt` LRU cache, batched per-compound OptiX GAS cache, and flat GPU buffers.
 pub struct CsgGpuHost {
     registry: SceneRegistry,
     scene_key: CsgSceneKey,
     active_reg_idx: Option<usize>,
     scene: Option<SceneBuilt>,
+    /// Most-recently-used `SceneBuilt` cache for instant scene / road-mode switches.
+    scene_cache: VecDeque<(CsgSceneKey, SceneBuilt)>,
+    /// True if `spawn_crowd_stress` mutated `self.scene` (don't cache mutated stress grids).
+    scene_mutated_stress: bool,
     crowd_frozen: bool,
     pending_metadata: Option<SceneLoadedMetadata>,
     packed: PackedGpuScene,
     /// Per-compound cached OptiX custom-primitive GASes (indexed by `compound_id`).
     compound_gases: Vec<Arc<Accel>>,
-    /// Per-compound SBT hit-group offset (`CSG_SBT_PRIM_OFFSET` for single-prim, `CSG_SBT_OFFSET` for RPN).
+    /// Per-compound SBT hit-group offset (`CSG_SBT_PRIM_OFFSET` = 10 or `CSG_SBT_OFFSET` = 8).
     compound_sbt_offsets: Vec<u32>,
     compounds_buf: GrowDeviceBuffer<GpuCompound>,
     ops_buf: GrowDeviceBuffer<GpuOp>,
@@ -444,8 +832,8 @@ pub struct CsgGpuHost {
     aux_planes_buf: GrowDeviceBuffer<[f32; 4]>,
     guard_aabbs_buf: GrowDeviceBuffer<GpuAabb>,
     repeats_buf: GrowDeviceBuffer<GpuRepeat>,
-    batched_aabbs_buf: Option<DeviceBuffer<Aabb>>,
     aabb_staging_buf: Option<DeviceBuffer<Aabb>>,
+    multi_aabb_host_scratch: Vec<Aabb>,
     materials_buf: GrowDeviceBuffer<GpuMaterial>,
     instances_buf: GrowDeviceBuffer<GpuInstance>,
     prev_xforms_buf: GrowDeviceBuffer<[f32; 12]>,
@@ -453,7 +841,9 @@ pub struct CsgGpuHost {
     pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
     prev_dyn_sig: Vec<(u32, u32)>,
-    prev_static_sig: u64,
+    dyn_packed_scratch: Vec<GpuInstance>,
+    dyn_prev_scratch: Vec<[f32; 12]>,
+    dyn_prev_lods: Vec<u8>,
     static_gpu_bytes: usize,
     last_mat_state: (u32, u32),
     last_pack_cam: [f32; 3],
@@ -483,6 +873,8 @@ impl CsgGpuHost {
             scene_key: CsgSceneKey::default(),
             active_reg_idx: None,
             scene: None,
+            scene_cache: VecDeque::with_capacity(SCENE_LRU_MAX_ENTRIES),
+            scene_mutated_stress: false,
             crowd_frozen: false,
             pending_metadata: None,
             packed: PackedGpuScene::new(),
@@ -494,8 +886,8 @@ impl CsgGpuHost {
             aux_planes_buf: GrowDeviceBuffer::default(),
             guard_aabbs_buf: GrowDeviceBuffer::default(),
             repeats_buf: GrowDeviceBuffer::default(),
-            batched_aabbs_buf: None,
             aabb_staging_buf: None,
+            multi_aabb_host_scratch: Vec::with_capacity(64),
             materials_buf: GrowDeviceBuffer::default(),
             instances_buf: GrowDeviceBuffer::default(),
             prev_xforms_buf: GrowDeviceBuffer::default(),
@@ -503,7 +895,9 @@ impl CsgGpuHost {
             pinned_prev_staging: None,
             prev_packed_len: 0,
             prev_dyn_sig: Vec::new(),
-            prev_static_sig: 0,
+            dyn_packed_scratch: Vec::with_capacity(1024),
+            dyn_prev_scratch: Vec::with_capacity(1024),
+            dyn_prev_lods: Vec::with_capacity(1024),
             static_gpu_bytes: 0,
             last_mat_state: (u32::MAX, u32::MAX),
             last_pack_cam: [f32::NAN; 3],
@@ -676,6 +1070,27 @@ impl CsgGpuHost {
             || (!cam.omnidirectional && (!fwd_dot.is_finite() || fwd_dot < 0.9985))
     }
 
+    /// Returns `true` if calling [`Self::sync`] with `(key, cam, traffic_time_s, freeze_pose)`
+    /// will pack and upload instance buffers from CPU (`FullRepack` or `TrafficOnly`).
+    pub fn will_upload_instances(
+        &self,
+        key: CsgSceneKey,
+        cam: CsgCameraParams,
+        traffic_time_s: f32,
+        freeze_pose: bool,
+    ) -> bool {
+        if self.will_camera_repack(key, cam) {
+            return true;
+        }
+        if key.scene_idx == 0 {
+            return false;
+        }
+        let traffic_moved = !freeze_pose
+            && self.has_traffic()
+            && traffic_time_s.to_bits() != self.last_traffic_bits;
+        self.traffic_dirty || traffic_moved
+    }
+
     /// Applies `freeze_pose` transitions to `scene.crowd` and dynamic traffic motion history.
     /// Returns `true` if crowd freeze intents changed and must be re-uploaded to CUDA.
     pub fn sync_freeze_pose(&mut self, freeze_pose: bool) -> bool {
@@ -725,7 +1140,6 @@ impl CsgGpuHost {
             dir = dir.norm();
         }
         let impulse = Vec3::new(dir.x * mag, 0.15 * mag, dir.z * mag);
-        self.traffic_dirty = true;
         if all {
             scene.poke_crowd_all(impulse);
             Ok(format!("Poked all {count} crowd actors ({mag:.1} m/s)"))
@@ -776,10 +1190,6 @@ impl CsgGpuHost {
                 + self.guard_aabbs_buf.active_bytes()
                 + self.repeats_buf.active_bytes();
 
-            let build_opts = BuildOptions {
-                prefer_fast_trace: true,
-                ..Default::default()
-            };
             if self.aabb_staging_buf.is_none() {
                 let staging = DeviceBuffer::<Aabb>::zeroed(stream, 1)
                     .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
@@ -789,41 +1199,28 @@ impl CsgGpuHost {
                 .aabb_staging_buf
                 .as_ref()
                 .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
-            let dst_ptr = aabb_staging.cu_deviceptr();
-            let box_bytes = std::mem::size_of::<Aabb>();
 
             for c in &lib.compounds[old_compound_count..new_compound_count] {
-                let aabb = sanitized_compound_aabb(c);
-                // SAFETY: `aabb_staging` holds 1 `Aabb` (`24 B` plain `f32`) on `stream`;
-                // `stream.synchronize()` completes before returning.
-                let h2d = unsafe {
-                    cu::cuMemcpyHtoDAsync_v2(
-                        dst_ptr,
-                        (&raw const aabb).cast(),
-                        box_bytes,
-                        stream.cu_stream(),
-                    )
-                };
-                if h2d != cu::cudaError_enum_CUDA_SUCCESS {
-                    return Err(format!("CSG stress AABB H2D copy failed ({h2d:?})"));
-                }
-                let gas = Accel::custom(
+                let (gas, sbt_off) = build_compound_gas(
                     optix_ctx,
                     stream,
                     scratch,
-                    &[CustomPrimitives::new(aabb_staging)],
-                    build_opts,
-                )
-                .map_err(|e| format!("CSG stress GAS build failed: {e}"))?;
+                    aabb_staging,
+                    &mut self.multi_aabb_host_scratch,
+                    lib,
+                    c,
+                )?;
                 self.compound_gases.push(gas);
-                self.compound_sbt_offsets
-                    .push(sbt_offset_for_compound(c.flags));
+                self.compound_sbt_offsets.push(sbt_off);
             }
             stream
                 .synchronize()
                 .map_err(|e| format!("CSG stress GAS sync failed: {e}"))?;
         }
 
+        if added > 0 {
+            self.scene_mutated_stress = true;
+        }
         self.packed
             .reserve_instances(scene.world.total_instance_count().max(256));
         self.ias_dirty = true;
@@ -1301,51 +1698,76 @@ impl CsgGpuHost {
                 )
             };
             cam_view.lod_bias = pack_cam.lod_bias.clamp(0.25, 4.0);
-            world.pack_visible(&cam_view, &mut self.packed);
 
-            let slice = self.packed.instances_slice();
-            let prev_slice = self.packed.motion_prev_xforms_slice();
-            let dyn_count = slice
-                .iter()
-                .take_while(|inst| (inst.flags & inst_flags::DYNAMIC) != 0)
-                .count();
-            let static_sig = hash_static_topology(&slice[dyn_count..]);
-            let same_topology = !camera_repack_needed
-                && dyn_count > 0
-                && slice.len() == self.prev_packed_len
-                && prev_slice.len() == slice.len()
-                && self.prev_xforms_buf.len_elems == slice.len()
-                && dyn_count == self.prev_dyn_sig.len()
-                && static_sig == self.prev_static_sig
-                && slice[..dyn_count]
-                    .iter()
-                    .zip(&self.prev_dyn_sig)
-                    .all(|(inst, &(cid, uid))| inst.compound_id == cid && inst.user_id == uid);
+            // W3.1: Static-tail vs dynamic-prefix split!
+            // On `!camera_repack_needed` dynamic ticks, pack ONLY `world.dynamic_instances()`
+            // against the cached frustum camera, leaving the 10k-100k static tail untouched in
+            // `self.packed.instances[D..]` (zero static chunk scan, zero static-tail hashing).
+            let can_try_dyn_only = !camera_repack_needed
+                && !self.prev_dyn_sig.is_empty()
+                && self.prev_packed_len == self.packed.instances.len()
+                && self.packed.motion_prev_xforms.len() == self.packed.instances.len()
+                && self.prev_xforms_buf.len_elems == self.packed.instances.len()
+                && self.prev_dyn_sig.len() <= self.packed.instances.len();
 
-            let result = if same_topology {
-                self.instances_buf.upload_prefix_pinned(
-                    stream,
-                    self.pinned_staging.as_ref(),
-                    &slice[..dyn_count],
-                )?;
-                self.prev_xforms_buf.upload_prefix_pinned(
-                    stream,
-                    self.pinned_prev_staging.as_ref(),
-                    &prev_slice[..dyn_count],
-                )?;
-                CsgSyncResult::TrafficOnly {
-                    dynamic_count: dyn_count,
+            let mut handled_traffic_only = None;
+            if can_try_dyn_only {
+                pack_dynamic_prefix_only(
+                    world,
+                    &cam_view,
+                    &mut self.dyn_prev_lods,
+                    &mut self.dyn_packed_scratch,
+                    &mut self.dyn_prev_scratch,
+                );
+                let dyn_count = self.dyn_packed_scratch.len();
+                let same_dyn_topology = dyn_count == self.prev_dyn_sig.len()
+                    && self.dyn_prev_scratch.len() == dyn_count
+                    && self
+                        .dyn_packed_scratch
+                        .iter()
+                        .zip(&self.prev_dyn_sig)
+                        .all(|(inst, &(cid, uid))| inst.compound_id == cid && inst.user_id == uid);
+                if same_dyn_topology {
+                    self.packed.instances[..dyn_count].copy_from_slice(&self.dyn_packed_scratch);
+                    self.packed.motion_prev_xforms[..dyn_count]
+                        .copy_from_slice(&self.dyn_prev_scratch);
+                    self.instances_buf.upload_prefix_pinned(
+                        stream,
+                        self.pinned_staging.as_ref(),
+                        &self.dyn_packed_scratch,
+                    )?;
+                    self.prev_xforms_buf.upload_prefix_pinned(
+                        stream,
+                        self.pinned_prev_staging.as_ref(),
+                        &self.dyn_prev_scratch,
+                    )?;
+                    handled_traffic_only = Some(CsgSyncResult::TrafficOnly {
+                        dynamic_count: dyn_count,
+                    });
                 }
+            }
+
+            let result = if let Some(fast_res) = handled_traffic_only {
+                fast_res
             } else {
+                world.pack_visible(&cam_view, &mut self.packed);
+                let slice = self.packed.instances_slice();
+                let prev_slice = self.packed.motion_prev_xforms_slice();
+                let dyn_count = slice
+                    .iter()
+                    .take_while(|inst| (inst.flags & inst_flags::DYNAMIC) != 0)
+                    .count();
                 self.instances_buf.upload(stream, slice)?;
                 self.prev_xforms_buf.upload(stream, prev_slice)?;
                 self.prev_packed_len = slice.len();
-                self.prev_static_sig = static_sig;
                 self.prev_dyn_sig.clear();
                 self.prev_dyn_sig.reserve(dyn_count);
                 for inst in &slice[..dyn_count] {
                     self.prev_dyn_sig.push((inst.compound_id, inst.user_id));
                 }
+                self.dyn_prev_lods
+                    .resize(world.dynamic_instance_count(), PREV_LOD_NONE);
+                self.dyn_prev_lods.fill(PREV_LOD_NONE);
                 CsgSyncResult::FullRepack
             };
 
@@ -1403,6 +1825,7 @@ impl CsgGpuHost {
                 .get(cid)
                 .copied()
                 .unwrap_or(CSG_SBT_OFFSET);
+            inst.flags = OPTIX_INST_DISABLE_ANYHIT;
             inst.transform = gpu_inst.xform;
             out_instances.push(inst);
         }
@@ -1410,9 +1833,10 @@ impl CsgGpuHost {
 
     /// Appends all visible CSG instances into `out_instances` using cached per-compound GASes.
     ///
-    /// Each OptiX instance receives `id = csg_instance_index` (matching `params.csg_instances[id]`)
-    /// and routes single-primitive compounds to `CSG_SBT_PRIM_OFFSET` (`5`) and general RPN
-    /// compounds to `CSG_SBT_OFFSET` (`4`).
+    /// Each OptiX instance receives `id = csg_instance_index` (matching `params.csg_instances[id]`),
+    /// `OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT` for opaque RT traversal, and routes single-primitive &
+    /// Multi-AABB `PURE_UNION` compounds to `CSG_SBT_PRIM_OFFSET` (`10`) and general RPN compounds
+    /// to `CSG_SBT_OFFSET` (`8`).
     pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>) {
         if !self.is_active() {
             return;
@@ -1435,9 +1859,40 @@ impl CsgGpuHost {
                 .get(cid)
                 .copied()
                 .unwrap_or(CSG_SBT_OFFSET);
+            inst.flags = OPTIX_INST_DISABLE_ANYHIT;
             inst.transform = gpu_inst.xform;
             out_instances.push(inst);
         }
+    }
+
+    /// Inserts `scene` into the bounded LRU cache under `key`, evicting oldest entries when either
+    /// entry count or estimated CPU byte budget is exceeded.
+    fn cache_insert_scene(&mut self, key: CsgSceneKey, scene: SceneBuilt) {
+        if key.scene_idx == 0 {
+            return;
+        }
+        self.scene_cache.retain(|(k, _)| *k != key);
+        self.scene_cache.push_front((key, scene));
+        while self.scene_cache.len() > SCENE_LRU_MAX_ENTRIES {
+            let _evicted = self.scene_cache.pop_back();
+        }
+        while self.scene_cache.len() > 1 {
+            let total_bytes: usize = self
+                .scene_cache
+                .iter()
+                .map(|(_, s)| s.world.estimated_cpu_bytes())
+                .sum();
+            if total_bytes <= SCENE_LRU_MAX_BYTES {
+                break;
+            }
+            let _evicted = self.scene_cache.pop_back();
+        }
+    }
+
+    /// Pops a cached `SceneBuilt` matching `key` from the LRU cache if present.
+    fn cache_take_scene(&mut self, key: CsgSceneKey) -> Option<SceneBuilt> {
+        let pos = self.scene_cache.iter().position(|(k, _)| *k == key)?;
+        self.scene_cache.remove(pos).map(|(_, s)| s)
     }
 
     fn rebuild_scene(
@@ -1454,9 +1909,17 @@ impl CsgGpuHost {
             .synchronize()
             .map_err(|e| format!("CSG pre-rebuild sync failed: {e}"))?;
 
+        let old_key = self.scene_key;
+        if let Some(old_scene) = self.scene.take()
+            && old_key.scene_idx != 0
+            && !self.scene_mutated_stress
+        {
+            self.cache_insert_scene(old_key, old_scene);
+        }
+
         self.scene_key = key;
         self.active_reg_idx = None;
-        self.scene = None;
+        self.scene_mutated_stress = false;
         self.crowd_frozen = false;
         self.compound_gases.clear();
         self.compound_sbt_offsets.clear();
@@ -1471,7 +1934,7 @@ impl CsgGpuHost {
         self.prev_xforms_buf.clear();
         self.prev_packed_len = 0;
         self.prev_dyn_sig.clear();
-        self.prev_static_sig = 0;
+        self.dyn_prev_lods.clear();
         self.static_gpu_bytes = 0;
         self.stats = CsgStats::default();
         self.last_mat_state = (u32::MAX, u32::MAX);
@@ -1500,11 +1963,6 @@ impl CsgGpuHost {
             return Err("CSG SceneRegistry is empty".to_string());
         }
         let reg_idx = ((key.scene_idx as usize).saturating_sub(1)).min(reg_count - 1);
-        let module = self
-            .registry
-            .get_by_index(reg_idx)
-            .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
-
         let tod = time_of_day_from_u32(time_of_day);
         let road_mode = match key.road_mode {
             0 => csg_scene::RoadMode::Watertight3D,
@@ -1520,7 +1978,19 @@ impl CsgGpuHost {
             road_mode,
             ..SceneBuildConfig::default()
         };
-        let mut built = module.build(&build_cfg);
+
+        let cached_built = self.cache_take_scene(key);
+        let module = self
+            .registry
+            .get_by_index(reg_idx)
+            .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
+        let mut built = match cached_built {
+            Some(mut cached) => {
+                cached.set_crowd_frozen(false);
+                cached
+            }
+            None => module.build(&build_cfg),
+        };
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
@@ -1543,75 +2013,34 @@ impl CsgGpuHost {
             + self.guard_aabbs_buf.active_bytes()
             + self.repeats_buf.active_bytes();
 
-        // Upload ALL compound AABBs into a persistent grow-only `DeviceBuffer<Aabb>`, then build
-        // one cached custom-primitive GAS per compound via fast GPU D2D copy into a persistent
-        // 1-box staging slot.
-        let build_opts = BuildOptions {
-            prefer_fast_trace: true,
-            ..Default::default()
-        };
-        let aabb_host: Vec<Aabb> = lib.compounds.iter().map(sanitized_compound_aabb).collect();
-        let mut gases = Vec::with_capacity(aabb_host.len());
-        if !aabb_host.is_empty() {
-            let need_aabb_grow = self
-                .batched_aabbs_buf
-                .as_ref()
-                .is_none_or(|b| b.len() < aabb_host.len());
-            if need_aabb_grow {
-                let new_cap = aabb_host.len().max(256);
-                let buf = DeviceBuffer::<Aabb>::zeroed(stream, new_cap)
-                    .map_err(|e| format!("CSG batched AABB pool alloc failed: {e}"))?;
-                self.batched_aabbs_buf = Some(buf);
-            }
+        // Build one non-compacted (`compact: false`) OptiX custom-primitive GAS per compound:
+        // - `MultiAabbUnion` -> M tight primitive AABBs with `primitive_offset = first_prim` (SBT 10)
+        // - `SinglePrim` -> 1 compound AABB with `primitive_offset = prim_idx` (SBT 10)
+        // - `GeneralRpn` -> 1 compound AABB with `primitive_offset = 0` (SBT 8)
+        let mut gases = Vec::with_capacity(lib.compounds.len());
+        let mut sbt_offsets = Vec::with_capacity(lib.compounds.len());
+        if !lib.compounds.is_empty() {
             if self.aabb_staging_buf.is_none() {
                 let staging = DeviceBuffer::<Aabb>::zeroed(stream, 1)
                     .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
                 self.aabb_staging_buf = Some(staging);
             }
-            let batched_aabbs = self
-                .batched_aabbs_buf
-                .as_ref()
-                .ok_or_else(|| "CSG batched AABB buffer missing".to_string())?;
             let aabb_staging = self
                 .aabb_staging_buf
                 .as_ref()
                 .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
-            let box_bytes = std::mem::size_of::<Aabb>();
-            let total_aabb_bytes = aabb_host.len() * box_bytes;
-            let base_ptr = batched_aabbs.cu_deviceptr();
-            let dst_ptr = aabb_staging.cu_deviceptr();
-            // SAFETY: `batched_aabbs` holds `>= aabb_host.len()` `Aabb`s on `stream`; `Aabb` is
-            // 24-byte plain `f32` `DeviceCopy` with zero padding.
-            let h2d = unsafe {
-                cu::cuMemcpyHtoDAsync_v2(
-                    base_ptr,
-                    aabb_host.as_ptr().cast(),
-                    total_aabb_bytes,
-                    stream.cu_stream(),
-                )
-            };
-            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!("CSG batched AABB H2D copy failed ({h2d:?})"));
-            }
-            for i in 0..aabb_host.len() {
-                let src_ptr = base_ptr + (i * box_bytes) as u64;
-                // SAFETY: `batched_aabbs` owns `>= aabb_host.len()` contiguous `Aabb`s on `stream`
-                // and `aabb_staging` owns 1 `Aabb`; both remain alive through `stream.synchronize()`.
-                let cp = unsafe {
-                    cu::cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, box_bytes, stream.cu_stream())
-                };
-                if cp != cu::cudaError_enum_CUDA_SUCCESS {
-                    return Err(format!("CSG AABB D2D copy failed ({cp:?})"));
-                }
-                let gas = Accel::custom(
+            for c in &lib.compounds {
+                let (gas, sbt_off) = build_compound_gas(
                     optix_ctx,
                     stream,
                     scratch,
-                    &[CustomPrimitives::new(aabb_staging)],
-                    build_opts,
-                )
-                .map_err(|e| format!("CSG compound GAS build failed: {e}"))?;
+                    aabb_staging,
+                    &mut self.multi_aabb_host_scratch,
+                    lib,
+                    c,
+                )?;
                 gases.push(gas);
+                sbt_offsets.push(sbt_off);
             }
             stream
                 .synchronize()
@@ -1619,11 +2048,7 @@ impl CsgGpuHost {
         }
 
         self.compound_gases = gases;
-        self.compound_sbt_offsets = lib
-            .compounds
-            .iter()
-            .map(|c| sbt_offset_for_compound(c.flags))
-            .collect();
+        self.compound_sbt_offsets = sbt_offsets;
         self.packed
             .reserve_instances(built.world.total_instance_count().max(256));
         built.reset_crowd_motion_history();
@@ -1631,8 +2056,8 @@ impl CsgGpuHost {
         self.pending_metadata = Some(SceneLoadedMetadata {
             scene_idx: key.scene_idx,
             variant_idx: key.variant_idx,
-            viewpoints: std::mem::take(&mut built.viewpoints),
-            rails: std::mem::take(&mut built.rails),
+            viewpoints: built.viewpoints.clone(),
+            rails: built.rails.clone(),
         });
         self.scene = Some(built);
         Ok(())
@@ -2170,5 +2595,128 @@ mod tests {
             initial_compounds,
             "reusing existing 11-GAS ActorGasBank must add 0 compounds"
         );
+    }
+
+    #[test]
+    fn csg_gas_build_opts_disables_compaction_and_multi_aabb_plans_pure_union() {
+        let opts = csg_gas_build_opts();
+        assert!(!opts.compact, "CSG compound GAS builds must disable synchronous compaction");
+        assert!(opts.prefer_fast_trace);
+
+        let mut lib = CompiledLibrary::new();
+        let single_node = csg_core::CsgNode::box3(
+            [1.0, 1.0, 1.0],
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        );
+        let single_id = lib
+            .compile_single(&single_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("single");
+        assert!(matches!(
+            compound_gas_plan(&lib, &lib.compounds[single_id.0 as usize]),
+            CompoundGasPlan::SinglePrim { .. }
+        ));
+
+        let union_node = csg_core::CsgNode::box3(
+            [1.0, 1.0, 1.0],
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        )
+        .union(
+            csg_core::CsgNode::sphere(
+                0.75,
+                csg_core::MaterialId(2),
+                csg_core::semantic::BUILDING,
+            )
+            .translated(0.5, 0.0, 0.0),
+        )
+        .union(
+            csg_core::CsgNode::cylinder(
+                0.4,
+                1.2,
+                csg_core::MaterialId(3),
+                csg_core::semantic::BUILDING,
+            )
+            .translated(-0.5, 0.2, 0.0),
+        );
+        let union_id = lib
+            .compile_single(&union_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("pure union");
+        let plan = compound_gas_plan(&lib, &lib.compounds[union_id.0 as usize]);
+        assert!(
+            matches!(plan, CompoundGasPlan::MultiAabbUnion { count: 3, .. }),
+            "expected MultiAabbUnion with 3 prims, got {plan:?}"
+        );
+        assert_eq!(plan.sbt_offset(), CSG_SBT_PRIM_OFFSET);
+
+        let sub_node = single_node.subtract(
+            csg_core::CsgNode::sphere(0.5, csg_core::MaterialId(2), csg_core::semantic::WINDOW)
+                .translated(0.0, 0.0, 0.8),
+        );
+        let sub_id = lib
+            .compile_single(&sub_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("subtract");
+        let sub_plan = compound_gas_plan(&lib, &lib.compounds[sub_id.0 as usize]);
+        assert_eq!(sub_plan, CompoundGasPlan::GeneralRpn);
+        assert_eq!(sub_plan.sbt_offset(), CSG_SBT_OFFSET);
+    }
+
+    #[test]
+    fn dynamic_prefix_packer_matches_full_pack_and_lru_cache_evicts_bounded() {
+        let mut host = CsgGpuHost::new();
+        let osm_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo_osm")
+            .expect("gundo_osm registered");
+        let module = host
+            .registry
+            .get_by_index(osm_idx)
+            .expect("gundo_osm module");
+        let mut built = module.build(&SceneBuildConfig::default());
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+        let view = CameraView::perspective(
+            vp.eye,
+            fwd,
+            Vec3::Y,
+            (vp.vfov_deg.to_radians() * 1.35).clamp(0.15, 2.7),
+            16.0 / 9.0,
+            [0.05, 1500.0],
+            720.0,
+        );
+
+        let mut full_packed = PackedGpuScene::new();
+        built.world.pack_visible(&view, &mut full_packed);
+        let full_dyn_count = full_packed
+            .instances_slice()
+            .iter()
+            .take_while(|inst| (inst.flags & inst_flags::DYNAMIC) != 0)
+            .count();
+
+        let mut dyn_lods = Vec::new();
+        let mut dyn_insts = Vec::new();
+        let mut dyn_prev = Vec::new();
+        pack_dynamic_prefix_only(&built.world, &view, &mut dyn_lods, &mut dyn_insts, &mut dyn_prev);
+        assert_eq!(dyn_insts.len(), full_dyn_count);
+        assert_eq!(dyn_insts, full_packed.instances_slice()[..full_dyn_count]);
+        assert_eq!(
+            dyn_prev,
+            full_packed.motion_prev_xforms_slice()[..full_dyn_count]
+        );
+
+        // Verify LRU cache hit, metadata retention, and eviction bound.
+        let key_a = CsgSceneKey {
+            scene_idx: 1,
+            variant_idx: 0,
+            seed: 1,
+            road_mode: 2,
+        };
+        let vp_count = built.viewpoints.len();
+        host.cache_insert_scene(key_a, built);
+        let restored = host.cache_take_scene(key_a).expect("LRU cache hit");
+        assert_eq!(restored.viewpoints.len(), vp_count);
+        assert!(host.cache_take_scene(key_a).is_none());
     }
 }

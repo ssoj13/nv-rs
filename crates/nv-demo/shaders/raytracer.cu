@@ -425,7 +425,7 @@ static __forceinline__ __device__ float scratch_layer(float x, float y, float ca
     return streak * fmaxf(0.0f, (seg - 0.35f) * 1.54f);
 }
 
-static __forceinline__ __device__ float floor_height(float x, float z, float scale, float scratch_amt) {
+static __noinline__ __device__ float floor_height(float x, float z, float scale, float scratch_amt) {
     float sx = x * scale;
     float sz = z * scale;
     float macro = fbm2(sx * 0.55f, sz * 0.55f) - 0.5f;
@@ -624,7 +624,7 @@ static __forceinline__ __device__ float3 sky_starfield(
     return f3_mul(stars, brightness * expf(-dust_occ));
 }
 
-static __forceinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     float y = fmaxf(0.0f, dir.y);
@@ -740,7 +740,7 @@ static __forceinline__ __device__ float unprogress_map(float3 p, float* out_win)
     return fminf(d_obj, d_cell);
 }
 
-static __forceinline__ __device__ float3 sky_unprogress(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_unprogress(float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     float y = fmaxf(0.0f, dir.y);
@@ -828,7 +828,7 @@ static __forceinline__ __device__ float colonies_map(float3 p, float* out_emissi
     return fminf(d_ring, d_rib);
 }
 
-static __forceinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
 
@@ -878,7 +878,7 @@ static __forceinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir
     return f3_mul(col, sky_i);
 }
 
-static __forceinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     int mode = (int)(params.sky_params[3] + 0.5f);
@@ -1118,33 +1118,51 @@ static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id)
     }
 }
 
-// Exact inverse of a general row-major 3x4 affine object-to-world transform (handles non-uniform
-// bone/instance scale + rotation + translation without assuming orthonormality).
-static __forceinline__ __device__ bool csg_inv_xform_pt(const float m[12], float3 p_world, float3& p_obj) {
-    float a00 = m[0], a01 = m[1], a02 = m[2];
-    float a10 = m[4], a11 = m[5], a12 = m[6];
-    float a20 = m[8], a21 = m[9], a22 = m[10];
+static_assert(__builtin_offsetof(CsgGpuInstance, xform) == 0, "CsgGpuInstance::xform offset");
+static_assert(__builtin_offsetof(CsgGpuInstance, compound_id) == 48, "CsgGpuInstance::compound_id offset");
+static_assert(__builtin_offsetof(CsgGpuInstance, user_id) == 52, "CsgGpuInstance::user_id offset");
+static_assert(__builtin_offsetof(CsgGpuInstance, mat_override) == 56, "CsgGpuInstance::mat_override offset");
+static_assert(__builtin_offsetof(CsgGpuInstance, flags) == 60, "CsgGpuInstance::flags offset");
+static_assert(__builtin_offsetof(CsgGpuMaterial, roughness) == 12, "CsgGpuMaterial::roughness offset");
+static_assert(__builtin_offsetof(CsgGpuMaterial, metallic) == 28, "CsgGpuMaterial::metallic offset");
+static_assert(__builtin_offsetof(CsgGpuMaterial, ior) == 44, "CsgGpuMaterial::ior offset");
+static_assert(__builtin_offsetof(CsgGpuMaterial, procedural_kind) == 56, "CsgGpuMaterial::procedural_kind offset");
+static_assert(__builtin_offsetof(CsgGpuMaterial, flags) == 60, "CsgGpuMaterial::flags offset");
 
-    float c00 = a11 * a22 - a12 * a21;
-    float c01 = a12 * a20 - a10 * a22;
-    float c02 = a10 * a21 - a11 * a20;
-    float det = a00 * c00 + a01 * c01 + a02 * c02;
+// Loads (compound_id, user_id, mat_override, flags) in a single 16-byte read-only cache load.
+static __forceinline__ __device__ uint4 load_csg_instance_meta(unsigned int inst_idx) {
+    const uint4* base = reinterpret_cast<const uint4*>(params.csg_instances);
+    return __ldg(base + ((size_t)inst_idx * 4u + 3u));
+}
+
+// Exact inverse of a general row-major 3x4 affine object-to-world transform loaded via __ldg
+// (handles non-uniform bone/instance scale + rotation + translation without assuming orthonormality).
+static __forceinline__ __device__ bool csg_inv_xform_pt_ldg(const float* __restrict__ m, float3 p_world, float3& p_obj) {
+    const float4* rows = reinterpret_cast<const float4*>(m);
+    float4 r0 = __ldg(rows + 0);
+    float4 r1 = __ldg(rows + 1);
+    float4 r2 = __ldg(rows + 2);
+
+    float c00 = r1.y * r2.z - r1.z * r2.y;
+    float c01 = r1.z * r2.x - r1.x * r2.z;
+    float c02 = r1.x * r2.y - r1.y * r2.x;
+    float det = r0.x * c00 + r0.y * c01 + r0.z * c02;
     if (fabsf(det) <= 1e-12f) {
         return false;
     }
     float inv_det = 1.0f / det;
 
-    float c10 = a02 * a21 - a01 * a22;
-    float c11 = a00 * a22 - a02 * a20;
-    float c12 = a01 * a20 - a00 * a21;
+    float c10 = r0.z * r2.y - r0.y * r2.z;
+    float c11 = r0.x * r2.z - r0.z * r2.x;
+    float c12 = r0.y * r2.x - r0.x * r2.y;
 
-    float c20 = a01 * a12 - a02 * a11;
-    float c21 = a02 * a10 - a00 * a12;
-    float c22 = a00 * a11 - a01 * a10;
+    float c20 = r0.y * r1.z - r0.z * r1.y;
+    float c21 = r0.z * r1.x - r0.x * r1.z;
+    float c22 = r0.x * r1.y - r0.y * r1.x;
 
-    float qx = p_world.x - m[3];
-    float qy = p_world.y - m[7];
-    float qz = p_world.z - m[11];
+    float qx = p_world.x - r0.w;
+    float qy = p_world.y - r1.w;
+    float qz = p_world.z - r2.w;
 
     p_obj = make_float3(
         (c00 * qx + c10 * qy + c20 * qz) * inv_det,
@@ -1152,6 +1170,18 @@ static __forceinline__ __device__ bool csg_inv_xform_pt(const float m[12], float
         (c02 * qx + c12 * qy + c22 * qz) * inv_det
     );
     return true;
+}
+
+static __forceinline__ __device__ float3 csg_xform_pt_ldg(const float* __restrict__ m, float3 p) {
+    const float4* rows = reinterpret_cast<const float4*>(m);
+    float4 r0 = __ldg(rows + 0);
+    float4 r1 = __ldg(rows + 1);
+    float4 r2 = __ldg(rows + 2);
+    return make_float3(
+        r0.x * p.x + r0.y * p.y + r0.z * p.z + r0.w,
+        r1.x * p.x + r1.y * p.y + r1.z * p.z + r1.w,
+        r2.x * p.x + r2.y * p.y + r2.z * p.z + r2.w
+    );
 }
 
 static __forceinline__ __device__ float3 instance_aov_color(unsigned int inst_id) {
@@ -1172,43 +1202,66 @@ static __forceinline__ __device__ float3 instance_aov_color(unsigned int inst_id
 }
 
 static __forceinline__ __device__ CsgGpuMaterial load_csg_material(unsigned int mat_id) {
+    CsgGpuMaterial m;
     if (params.csg_materials != 0ull && mat_id < params.csg_material_count) {
-        return ((const CsgGpuMaterial*)params.csg_materials)[mat_id];
+        const float4* v = reinterpret_cast<const float4*>(params.csg_materials) + ((size_t)mat_id * 4u);
+        float4 v0 = __ldg(v + 0);
+        float4 v1 = __ldg(v + 1);
+        float4 v2 = __ldg(v + 2);
+        float4 v3 = __ldg(v + 3);
+        m.albedo[0] = v0.x; m.albedo[1] = v0.y; m.albedo[2] = v0.z;
+        m.roughness = v0.w;
+        m.emission[0] = v1.x; m.emission[1] = v1.y; m.emission[2] = v1.z;
+        m.metallic = v1.w;
+        m.absorption[0] = v2.x; m.absorption[1] = v2.y; m.absorption[2] = v2.z;
+        m.ior = v2.w;
+        m.clearcoat = v3.x;
+        m.clearcoat_roughness = v3.y;
+        m.procedural_kind = __float_as_uint(v3.z);
+        m.flags = __float_as_uint(v3.w);
+        return m;
     }
-    CsgGpuMaterial def;
-    def.albedo[0] = 0.45f; def.albedo[1] = 0.45f; def.albedo[2] = 0.45f;
-    def.roughness = 0.55f;
-    def.emission[0] = 0.0f; def.emission[1] = 0.0f; def.emission[2] = 0.0f;
-    def.metallic = 0.0f;
-    def.absorption[0] = 0.0f; def.absorption[1] = 0.0f; def.absorption[2] = 0.0f;
-    def.ior = 1.5f;
-    def.clearcoat = 0.0f;
-    def.clearcoat_roughness = 0.08f;
-    def.procedural_kind = CSG_PROC_NONE;
-    def.flags = 0u;
-    return def;
+    m.albedo[0] = 0.45f; m.albedo[1] = 0.45f; m.albedo[2] = 0.45f;
+    m.roughness = 0.55f;
+    m.emission[0] = 0.0f; m.emission[1] = 0.0f; m.emission[2] = 0.0f;
+    m.metallic = 0.0f;
+    m.absorption[0] = 0.0f; m.absorption[1] = 0.0f; m.absorption[2] = 0.0f;
+    m.ior = 1.5f;
+    m.clearcoat = 0.0f;
+    m.clearcoat_roughness = 0.08f;
+    m.procedural_kind = CSG_PROC_NONE;
+    m.flags = 0u;
+    return m;
 }
 
-static __forceinline__ __device__ void eval_csg_procedural(
-    const CsgGpuMaterial& mat,
+struct CsgProcResult {
+    float3 n;
+    float3 base_col;
+    float3 emission;
+    float3 absorption;
+    float rough;
+    float metallic;
+    float clearcoat;
+    float cc_rough;
+    float ior;
+    unsigned int mat_flags;
+    unsigned int proc_kind;
+};
+
+static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     unsigned int mat_id,
     unsigned int sem_id,
     unsigned int part_id,
     float3 hit_pos,
-    float3& n,
-    float3& base_col,
-    float& rough,
-    float& metallic,
-    float& clearcoat,
-    float& cc_rough,
-    float3& emission
+    float3 n
 ) {
-    base_col = make_float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
-    rough = fmaxf(0.02f, fminf(0.98f, mat.roughness));
-    metallic = fmaxf(0.0f, fminf(1.0f, mat.metallic));
-    clearcoat = fmaxf(0.0f, fminf(1.0f, mat.clearcoat));
-    cc_rough = fmaxf(0.02f, fminf(0.60f, mat.clearcoat_roughness));
-    emission = make_float3(mat.emission[0], mat.emission[1], mat.emission[2]);
+    CsgGpuMaterial mat = load_csg_material(mat_id);
+    float3 base_col = make_float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
+    float rough = fmaxf(0.02f, fminf(0.98f, mat.roughness));
+    float metallic = fmaxf(0.0f, fminf(1.0f, mat.metallic));
+    float clearcoat = fmaxf(0.0f, fminf(1.0f, mat.clearcoat));
+    float cc_rough = fmaxf(0.02f, fminf(0.60f, mat.clearcoat_roughness));
+    float3 emission = make_float3(mat.emission[0], mat.emission[1], mat.emission[2]);
 
     float wet = fmaxf(0.0f, fminf(1.0f, params.csg_wetness));
     if ((mat.flags & CSG_MAT_FLAG_WET) != 0u) {
@@ -1624,6 +1677,20 @@ static __forceinline__ __device__ void eval_csg_procedural(
         float pulse = 0.20f + 0.80f * ph * ph * ph;
         emission = f3_mul(emission, pulse);
     }
+
+    CsgProcResult res;
+    res.n = n;
+    res.base_col = base_col;
+    res.emission = emission;
+    res.absorption = make_float3(mat.absorption[0], mat.absorption[1], mat.absorption[2]);
+    res.rough = rough;
+    res.metallic = metallic;
+    res.clearcoat = clearcoat;
+    res.cc_rough = cc_rough;
+    res.ior = mat.ior;
+    res.mat_flags = mat.flags;
+    res.proc_kind = mat.procedural_kind;
+    return res;
 }
 
 static __forceinline__ __device__ void trace_primary(
@@ -1638,13 +1705,21 @@ static __forceinline__ __device__ void trace_primary(
             tmin, 1e16f, 0.0f,
             OptixVisibilityMask(255),
             OPTIX_RAY_FLAG_NONE,
-            0, 1, 0,
+            0, 2, 0,
             p0, p1, p2, p3, p4, p5, p6, p7
         );
-        unsigned int hint = optixHitObjectIsHit()
-            ? ((optixHitObjectGetInstanceId() & 0x7u) + 1u)
-            : 0u;
-        optixReorder(hint, 3u);
+        // 6-bit SER coherence hint: sky miss = 0, CSG material buckets = 1..63 (never collides
+        // with sky miss and never overflows 6 bits), classic geometry = 60..63.
+        unsigned int hint = 0u;
+        if (optixHitObjectIsHit()) {
+            if (optixHitObjectGetHitKind() == 1u) {
+                unsigned int mat_bucket = optixHitObjectGetAttribute_3() & 0x3Fu;
+                hint = (mat_bucket == 0u) ? 63u : mat_bucket;
+            } else {
+                hint = 60u + (optixHitObjectGetInstanceId() & 0x3u);
+            }
+        }
+        optixReorder(hint, 6u);
         optixInvoke(p0, p1, p2, p3, p4, p5, p6, p7);
     } else {
         optixTrace(
@@ -1653,7 +1728,7 @@ static __forceinline__ __device__ void trace_primary(
             tmin, 1e16f, 0.0f,
             OptixVisibilityMask(255),
             OPTIX_RAY_FLAG_NONE,
-            0, 1, 0,
+            0, 2, 0,
             p0, p1, p2, p3, p4, p5, p6, p7
         );
     }
@@ -1667,7 +1742,7 @@ static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, f
         1.0e-5f, max_t, 0.0f,
         OptixVisibilityMask(255),
         OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
-        0, 1, 1,
+        1, 2, 1,
         hit
     );
     return hit != 0u;
@@ -1794,6 +1869,8 @@ extern "C" __global__ void __raygen__render() {
     bool has_prev_cam = (prev_tan_fov > 1e-5f) && (proj == 0u);
 
     const bool aov_aa = (params.aov_mode != 0u);
+    const bool aov_geom_only = aov_aa
+        && (params.aov_mode != 1u && params.aov_mode != 2u && params.aov_mode != 9u);
     const unsigned int loop_spp = aov_aa ? 4u : spp;
     float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
     float aov_w_accum = 0.0f;
@@ -1914,7 +1991,7 @@ extern "C" __global__ void __raygen__render() {
         float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
         float3 sample_col = make_float3(0.0f, 0.0f, 0.0f);
 
-        int max_bounces = (int)params.bounces;
+        int max_bounces = aov_aa ? 1 : (int)params.bounces;
         for (int bounce = 0; bounce < 16; ++bounce) {
             if (bounce >= max_bounces) break;
             if (bounce >= 2) {
@@ -1929,14 +2006,18 @@ extern "C" __global__ void __raygen__render() {
             trace_primary(origin, dir, (bounce == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
 
             if (p0 == 0u) {
-                float3 sky = sky_color(dir, sun_dir, bounce == 0);
-                sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
+                if (!aov_geom_only) {
+                    float3 sky = sky_color(dir, sun_dir, bounce == 0);
+                    sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
+                    if (bounce == 0 && (s == 0u || aov_aa)) {
+                        first_albedo = make_float3(
+                            fmaxf(0.0f, fminf(1.0f, sky.x)),
+                            fmaxf(0.0f, fminf(1.0f, sky.y)),
+                            fmaxf(0.0f, fminf(1.0f, sky.z))
+                        );
+                    }
+                }
                 if (bounce == 0 && (s == 0u || aov_aa)) {
-                    first_albedo = make_float3(
-                        fmaxf(0.0f, fminf(1.0f, sky.x)),
-                        fmaxf(0.0f, fminf(1.0f, sky.y)),
-                        fmaxf(0.0f, fminf(1.0f, sky.z))
-                    );
                     if (params.out_diffuse_albedo_f32 != 0ull && params.aov_mode == 0u) {
                         // DLSS-RR Integration Guide §§3.4.1/3.4.3/3.4.4 sky defaults
                         first_diffuse = make_float3(0.5f, 0.5f, 0.5f);
@@ -1992,17 +2073,18 @@ extern "C" __global__ void __raygen__render() {
                     first_part_id = p7;
                     unsigned int uid = p6 + 1u;
                     if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
-                        const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[p6];
-                        if (inst.user_id != 0u) uid = inst.user_id;
+                        uint4 meta = load_csg_instance_meta(p6);
+                        if (meta.y != 0u) uid = meta.y;
                         if (has_prev_cam
                             && params.csg_prev_xforms != 0ull
-                            && (inst.flags & CSG_INST_FLAG_MOTION_BLUR) != 0u)
+                            && (meta.w & CSG_INST_FLAG_MOTION_BLUR) != 0u)
                         {
+                            const float* cur_m = ((const CsgGpuInstance*)params.csg_instances)[p6].xform;
                             float3 p_obj;
-                            if (csg_inv_xform_pt(inst.xform, hit_pos, p_obj)) {
+                            if (csg_inv_xform_pt_ldg(cur_m, hit_pos, p_obj)) {
                                 const float* prev_m = ((const float*)params.csg_prev_xforms)
                                     + ((unsigned long long)p6 * 12ull);
-                                prev_world_pos = csg_xform_pt(prev_m, p_obj);
+                                prev_world_pos = csg_xform_pt_ldg(prev_m, p_obj);
                             }
                         }
                     }
@@ -2027,18 +2109,25 @@ extern "C" __global__ void __raygen__render() {
                         );
                     }
                 }
+                if (aov_geom_only) {
+                    // Geometry-only AOVs (Depth/Motion/Semantic/Instance/WorldPos/Range/Cryptomatte)
+                    // skip all procedural micro-detail shading, shadow rays, Blinn-Phong, and bounces.
+                    first_normal = n;
+                    break;
+                }
             }
 
             if (is_csg) {
                 unsigned int mat_id = p5 & 0xFFFFu;
                 unsigned int sem_id = (p5 >> 16u) & 0xFFFFu;
-                CsgGpuMaterial cmat = load_csg_material(mat_id);
-                float rough = 0.5f;
-                float metallic = 0.0f;
-                float clearcoat = 0.0f;
-                float cc_rough = 0.08f;
-                float3 emission = make_float3(0.0f, 0.0f, 0.0f);
-                eval_csg_procedural(cmat, mat_id, sem_id, p7, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
+                CsgProcResult pr = eval_csg_procedural(mat_id, sem_id, p7, hit_pos, n);
+                n = pr.n;
+                base_col = pr.base_col;
+                float rough = pr.rough;
+                float metallic = pr.metallic;
+                float clearcoat = pr.clearcoat;
+                float cc_rough = pr.cc_rough;
+                float3 emission = pr.emission;
 
                 // Emissive contribution (streetlights, vehicle headlights/taillights, signals, aviation beacons, lit windows)
                 float max_em = fmaxf(emission.x, fmaxf(emission.y, emission.z));
@@ -2062,16 +2151,9 @@ extern "C" __global__ void __raygen__render() {
                 }
 
                 // Dielectric transmissive CSG glass (windshields, architectural glazing, bus shelters)
-                if ((cmat.flags & CSG_MAT_FLAG_TRANSMISSIVE) != 0u && cmat.procedural_kind == CSG_PROC_GLASS) {
-                    float ior = fmaxf(1.05f, cmat.ior);
+                if ((pr.mat_flags & CSG_MAT_FLAG_TRANSMISSIVE) != 0u && pr.proc_kind == CSG_PROC_GLASS) {
+                    float ior = fmaxf(1.05f, pr.ior);
                     float g_rough = fmaxf(0.0f, fminf(0.45f, rough));
-                    if (!entering) {
-                        throughput = f3_mul3(throughput, make_float3(
-                            expf(-fmaxf(0.0f, cmat.absorption[0]) * hit_t),
-                            expf(-fmaxf(0.0f, cmat.absorption[1]) * hit_t),
-                            expf(-fmaxf(0.0f, cmat.absorption[2]) * hit_t)
-                        ));
-                    }
                     float r0 = (1.0f - ior) / (1.0f + ior);
                     r0 = r0 * r0;
                     if (bounce == 0 && (s == 0u || aov_aa)) {
@@ -2081,6 +2163,16 @@ extern "C" __global__ void __raygen__render() {
                         first_normal = n;
                         first_roughness = g_rough;
                         first_mat_pbr = make_float3(g_rough, 0.0f, 1.0f);
+                    }
+                    if (aov_aa) {
+                        break;
+                    }
+                    if (!entering) {
+                        throughput = f3_mul3(throughput, make_float3(
+                            expf(-fmaxf(0.0f, pr.absorption.x) * hit_t),
+                            expf(-fmaxf(0.0f, pr.absorption.y) * hit_t),
+                            expf(-fmaxf(0.0f, pr.absorption.z) * hit_t)
+                        ));
                     }
                     float eta = entering ? (1.0f / ior) : ior;
                     float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
@@ -2128,6 +2220,10 @@ extern "C" __global__ void __raygen__render() {
                         (max_em > 0.05f) ? fminf(1.0f, max_em) : 0.0f
                     );
                 }
+                if (aov_aa) {
+                    // Shading AOVs (Albedo/Normal/Material) skip shadow rays, Blinn-Phong, and bounces.
+                    break;
+                }
 
                 float ray_bias = fmaxf(0.001f, hit_t * 0.0004f);
                 float3 biased_origin = f3_add(hit_pos, f3_mul(n, ray_bias));
@@ -2169,10 +2265,7 @@ extern "C" __global__ void __raygen__render() {
                 float p_coat = clearcoat * (0.12f + 0.78f * schlick);
                 float p_spec = (1.0f - p_coat) * (0.12f + 0.78f * metallic + (1.0f - rough) * 0.25f * schlick);
                 float u_lobe = rand01(seed);
-                if (aov_aa) {
-                break;
-            }
-            float3 diff_dir = sample_cosine_hemisphere(n, seed);
+                float3 diff_dir = sample_cosine_hemisphere(n, seed);
                 float3 refl_dir = f3_reflect(dir, n);
                 if (u_lobe < p_coat) {
                     dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, cc_rough)));
@@ -2202,6 +2295,19 @@ extern "C" __global__ void __raygen__render() {
                 float ior = fmaxf(1.05f, params.glass_params[0]);
                 float absorb = fmaxf(0.0f, params.glass_params[1]);
                 float g_rough = fmaxf(0.0f, fminf(0.5f, params.glass_params[2]));
+                float r0 = (1.0f - ior) / (1.0f + ior);
+                r0 = r0 * r0;
+                if (bounce == 0 && (s == 0u || aov_aa)) {
+                    first_albedo = make_float3(0.92f, 0.97f, 1.0f);
+                    first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+                    first_specular = make_float3(r0, r0, r0);
+                    first_normal = n;
+                    first_roughness = g_rough;
+                    first_mat_pbr = make_float3(g_rough, 0.0f, 1.0f);
+                }
+                if (aov_aa) {
+                    break;
+                }
                 if (!entering && absorb > 0.0f) {
                     float hue = (float)((p6 >> 8u) & 0xFFu) * (1.0f / 255.0f);
                     float h6 = fmodf(hue * 6.0f, 6.0f);
@@ -2218,16 +2324,6 @@ extern "C" __global__ void __raygen__render() {
                         expf(-sigma.y * hit_t),
                         expf(-sigma.z * hit_t)
                     ));
-                }
-                float r0 = (1.0f - ior) / (1.0f + ior);
-                r0 = r0 * r0;
-                if (bounce == 0 && (s == 0u || aov_aa)) {
-                    first_albedo = make_float3(0.92f, 0.97f, 1.0f);
-                    first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
-                    first_specular = make_float3(r0, r0, r0);
-                    first_normal = n;
-                    first_roughness = g_rough;
-                    first_mat_pbr = make_float3(g_rough, 0.0f, 1.0f);
                 }
                 float eta = entering ? (1.0f / ior) : ior;
                 float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
@@ -2343,6 +2439,9 @@ extern "C" __global__ void __raygen__render() {
                 first_normal = n;
                 first_roughness = fmaxf(0.0f, fminf(1.0f, rough));
                 first_mat_pbr = make_float3(first_roughness, fmaxf(0.0f, fminf(1.0f, metallic)), 0.0f);
+            }
+            if (aov_aa) {
+                break;
             }
 
             // Adaptive surface offset: scales down to micro-detail epsilon on fractals so
@@ -2552,7 +2651,7 @@ extern "C" __global__ void __raygen__score_views() {
         0.05f, 600.0f, 0.0f,
         OptixVisibilityMask(255),
         OPTIX_RAY_FLAG_NONE,
-        0, 1, 0,
+        0, 2, 0,
         p0, p1, p2, p3, p4, p5, p6, p7
     );
 
@@ -2563,7 +2662,7 @@ extern "C" __global__ void __raygen__score_views() {
         out_s._pad0 = 0u;
         unsigned int uid = p6;
         if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
-            uid = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
+            uid = load_csg_instance_meta(p6).y;
         }
         out_s.inst_id = uid;
         out_s._pad1 = 0u;
@@ -2608,14 +2707,14 @@ extern "C" __global__ void __raygen__sdg_keypoints() {
         tmin, tmax, 0.0f,
         OptixVisibilityMask(255),
         OPTIX_RAY_FLAG_NONE,
-        0, 1, 0,
+        0, 2, 0,
         p0, p1, p2, p3, p4, p5, p6, p7
     );
 
     unsigned int blocker_uid = 0xFFFFFFFFu;
     if (p0 == 2u) {
         if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
-            blocker_uid = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
+            blocker_uid = load_csg_instance_meta(p6).y;
         } else {
             blocker_uid = p6;
         }
@@ -2631,6 +2730,10 @@ extern "C" __global__ void __miss__miss() {
 
 extern "C" __global__ void __miss__shadow() {
     optixSetPayload_0(0u);
+}
+
+extern "C" __global__ void __closesthit__shadow() {
+    optixSetPayload_0(1u);
 }
 
 extern "C" __global__ void __closesthit__hit() {
@@ -2715,12 +2818,10 @@ extern "C" __global__ void __intersection__fractal() {
     float step_fudge = fudge * formula_safety;
     float norm_eps = fmaxf(0.00001f, params.fractal_r0[2]);
     int max_steps = (int)fmaxf(16.0f, fminf(512.0f, params.fractal_r0[3]));
-    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
 
-    // Distance from camera to ray origin keeps secondary/shadow ray epsilon matched to screen-space scale.
+    // Distance from camera to ray origin keeps secondary ray epsilon matched to screen-space scale.
     float base_cam_dist = f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
     float pixel_angle = (2.0f * fmaxf(params.cam_up[3], 0.05f)) / fmaxf((float)params.height, 64.0f);
-    float eps_scale = is_shadow ? 1.5f : 1.0f;
 
     float t = t0;
     float t_prev = t0;
@@ -2731,12 +2832,8 @@ extern "C" __global__ void __intersection__fractal() {
         float2 res = eval_fractal(p);
         float dist = res.x;
         float path_dist = base_cam_dist + t * inv_dir_len;
-        float eps = fractal_hit_eps(path_dist) * dir_len * eps_scale;
+        float eps = fractal_hit_eps(path_dist) * dir_len;
         if (dist < eps) {
-            if (is_shadow) {
-                optixReportIntersection(t * inv_dir_len, 0);
-                return;
-            }
             // Refine overstepped interior hits back to the exterior surface boundary via 4-step bisection
             float t_hit = t;
             float trap_hit = res.y;
@@ -2769,7 +2866,7 @@ extern "C" __global__ void __intersection__fractal() {
                 (((unsigned int)(fminf(1.0f, col.y) * 255.0f) & 0xFFu) << 8u) |
                 (((unsigned int)(fminf(1.0f, col.z) * 255.0f) & 0xFFu) << 16u);
             optixReportIntersection(
-                t_hit * inv_dir_len, 0,
+                t_hit * inv_dir_len, 0u,
                 __float_as_uint(obj_n.x),
                 __float_as_uint(obj_n.y),
                 __float_as_uint(obj_n.z),
@@ -2779,6 +2876,50 @@ extern "C" __global__ void __intersection__fractal() {
         }
         t_prev = t;
         trap_prev = res.y;
+        t += fmaxf(dist * step_fudge, eps * 0.25f);
+    }
+}
+
+extern "C" __global__ void __intersection__fractal_shadow() {
+    float3 orig    = optixGetObjectRayOrigin();
+    float3 raw_dir = optixGetObjectRayDirection();
+    float dir_len  = f3_len(raw_dir);
+    if (dir_len <= 1e-8f) return;
+    float inv_dir_len = 1.0f / dir_len;
+    float3 dir        = f3_mul(raw_dir, inv_dir_len);
+    float t0 = optixGetRayTmin() * dir_len;
+    float t1 = optixGetRayTmax() * dir_len;
+
+    float bmin = -1.85f;
+    float bmax = 1.85f;
+    float* o = &orig.x;
+    float* d = &dir.x;
+    for (int i = 0; i < 3; ++i) {
+        float invD = 1.0f / (fabsf(d[i]) > 1e-7f ? d[i] : 1e-7f);
+        float ta = (bmin - o[i]) * invD;
+        float tb = (bmax - o[i]) * invD;
+        if (invD < 0.0f) { float tmp = ta; ta = tb; tb = tmp; }
+        t0 = fmaxf(t0, ta);
+        t1 = fminf(t1, tb);
+        if (t0 > t1) return;
+    }
+
+    float fudge = fmaxf(0.2f, fminf(1.2f, params.fractal_r0[1]));
+    float formula_safety = (params.fractal_kind == 0u) ? 0.78f : ((params.fractal_kind == 1u) ? 0.85f : 0.90f);
+    float step_fudge = fudge * formula_safety;
+    int max_steps = (int)fmaxf(16.0f, fminf(512.0f, params.fractal_r0[3]));
+    float base_cam_dist = f3_len(f3_sub(optixGetWorldRayOrigin(), make_f3(params.cam_pos)));
+
+    float t = t0;
+    for (int step = 0; step < 512; ++step) {
+        if (step >= max_steps || t > t1) return;
+        float dist = eval_fractal(f3_add(orig, f3_mul(dir, t))).x;
+        float path_dist = base_cam_dist + t * inv_dir_len;
+        float eps = fractal_hit_eps(path_dist) * dir_len * 1.5f;
+        if (dist < eps) {
+            optixReportIntersection(t * inv_dir_len, 0u);
+            return;
+        }
         t += fmaxf(dist * step_fudge, eps * 0.25f);
     }
 }
@@ -2826,7 +2967,7 @@ extern "C" __global__ void __intersection__sphere() {
     float3 hit_obj = f3_add(orig, f3_mul(dir, t));
     float3 obj_n = f3_norm(hit_obj);
     optixReportIntersection(
-        t, 0,
+        t, 0u,
         __float_as_uint(obj_n.x),
         __float_as_uint(obj_n.y),
         __float_as_uint(obj_n.z),
@@ -2834,39 +2975,57 @@ extern "C" __global__ void __intersection__sphere() {
     );
 }
 
+extern "C" __global__ void __intersection__sphere_shadow() {
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    float a = f3_dot(dir, dir);
+    if (a <= 1e-12f) return;
+    float b = f3_dot(orig, dir);
+    float c = f3_dot(orig, orig) - 1.0f;
+    float disc = b * b - a * c;
+    if (disc < 0.0f) return;
+
+    float sq = sqrtf(disc);
+    float inv_a = 1.0f / a;
+    float t = (-b - sq) * inv_a;
+    if (t < tmin || t > tmax) {
+        t = (-b + sq) * inv_a;
+        if (t < tmin || t > tmax) return;
+    }
+    optixReportIntersection(t, 0u);
+}
+
 extern "C" __global__ void __intersection__csg() {
     if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
 
-    const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[inst_idx];
-    if ((inst.flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
-    if (inst.compound_id >= params.csg_compound_count) return;
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int compound_id  = meta.x;
+    unsigned int mat_override = meta.z;
+    unsigned int flags        = meta.w;
+    if ((flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
+    if (compound_id >= params.csg_compound_count) return;
 
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
-    CsgSceneView view = make_csg_view();
 
-    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
-    if (is_shadow) {
-        if ((inst.flags & CSG_INST_FLAG_CAST_SHADOW) == 0u) return;
-        if (csg_trace_shadow(view, inst.compound_id, orig, dir, tmin, tmax)) {
-            optixReportIntersection(tmin, 0u);
-        }
-        return;
-    }
-
-    CsgHit hit;
-    if (csg_trace_compound(view, inst.compound_id, orig, dir, tmin, tmax, &hit)) {
-        unsigned int mat_id = (inst.mat_override != CSG_MAT_OVERRIDE_NONE)
-            ? (inst.mat_override & 0xFFFFu)
+    // Pass CsgSceneView by value and return CsgHit by value (zero &view/&hit .local spills),
+    // skipping redundant compound AABB test already performed by OptiX BVH hardware.
+    CsgHit hit = csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, tmin, tmax, true);
+    if (hit.t >= 0.0f) {
+        unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
+            ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
-            0u,
+            1u,
             __float_as_uint(hit.normal.x),
             __float_as_uint(hit.normal.y),
             __float_as_uint(hit.normal.z),
@@ -2876,45 +3035,95 @@ extern "C" __global__ void __intersection__csg() {
     }
 }
 
-extern "C" __global__ void __intersection__csg_prim() {
+extern "C" __global__ void __intersection__csg_shadow() {
     if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
 
-    const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[inst_idx];
-    if ((inst.flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
-    if (inst.compound_id >= params.csg_compound_count) return;
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int compound_id = meta.x;
+    unsigned int flags       = meta.w;
+    if ((flags & (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW))
+        != (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW)) {
+        return;
+    }
+    if (compound_id >= params.csg_compound_count) return;
 
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
-    CsgSceneView view = make_csg_view();
 
-    bool is_shadow = (optixGetRayFlags() & OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT) != 0u;
-    if (is_shadow) {
-        if ((inst.flags & CSG_INST_FLAG_CAST_SHADOW) == 0u) return;
-        if (csg_trace_single_prim_shadow(view, inst.compound_id, orig, dir, tmin, tmax)) {
-            optixReportIntersection(tmin, 0u);
-        }
-        return;
+    if (csg_trace_shadow(make_csg_view(), compound_id, orig, dir, tmin, tmax, true)) {
+        optixReportIntersection(tmin, 0u);
     }
+}
 
-    CsgHit hit;
-    if (csg_trace_single_prim(view, inst.compound_id, orig, dir, tmin, tmax, &hit)) {
-        unsigned int mat_id = (inst.mat_override != CSG_MAT_OVERRIDE_NONE)
-            ? (inst.mat_override & 0xFFFFu)
+extern "C" __global__ void __intersection__csg_prim() {
+    if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int mat_override = meta.z;
+    unsigned int flags        = meta.w;
+    if ((flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
+
+    // Host sets CustomPrimitives::primitive_offset = first_prim_idx for both SINGLE_PRIM and
+    // Multi-AABB PURE_UNION GASes, so optixGetPrimitiveIndex() is the exact global prim_idx.
+    unsigned int prim_idx = optixGetPrimitiveIndex();
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    CsgHit hit = csg_intersect_prim_idx(
+        reinterpret_cast<const CsgGpuPrim*>(params.csg_prims),
+        reinterpret_cast<const float4*>(params.csg_aux_planes),
+        prim_idx,
+        orig, dir, tmin, tmax
+    );
+    if (hit.t >= 0.0f) {
+        unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
+            ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
-            0u,
+            1u,
             __float_as_uint(hit.normal.x),
             __float_as_uint(hit.normal.y),
             __float_as_uint(hit.normal.z),
             mat_sem,
             hit.part_id
         );
+    }
+}
+
+extern "C" __global__ void __intersection__csg_prim_shadow() {
+    if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int flags = meta.w;
+    if ((flags & (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW))
+        != (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW)) {
+        return;
+    }
+
+    unsigned int prim_idx = optixGetPrimitiveIndex();
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    if (csg_intersect_prim_idx_shadow(
+            reinterpret_cast<const CsgGpuPrim*>(params.csg_prims),
+            reinterpret_cast<const float4*>(params.csg_aux_planes),
+            prim_idx,
+            orig, dir, tmin, tmax)) {
+        optixReportIntersection(tmin, 0u);
     }
 }
 

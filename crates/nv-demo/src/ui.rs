@@ -1,6 +1,8 @@
 //! Docked egui UI with Phosphor icons and uniformly aligned property grids.
 
+use std::fmt::Write as _;
 use std::ops::RangeInclusive;
+use std::sync::LazyLock;
 
 use egui::{Align, Color32, FontDefinitions, Layout, RichText, Sense, Ui};
 use egui_dock::{DockState, NodeIndex, Style, TabViewer};
@@ -108,24 +110,126 @@ pub fn resolve_home_pose(
     (classic_home, None)
 }
 
+/// Reusable per-frame UI text scratch buffers eliminating steady-state `format!`/`Vec` churn
+/// across 60 Hz HUD, telemetry, and inspector panels.
+#[derive(Debug)]
+pub struct UiScratch {
+    /// Reusable buffer for the bottom-left Viewport status HUD line.
+    pub status_buf: String,
+    /// Reusable buffer for short telemetry/badge/toolbar formatted strings.
+    pub label_buf: String,
+}
+
+impl Default for UiScratch {
+    fn default() -> Self {
+        Self {
+            status_buf: String::with_capacity(192),
+            label_buf: String::with_capacity(96),
+        }
+    }
+}
+
+/// Formats `args` into `buf` in place (clearing previous contents with zero reallocation once warmed).
+#[inline]
+fn fmt_into<'a>(buf: &'a mut String, args: std::fmt::Arguments<'_>) -> &'a str {
+    buf.clear();
+    // `std::fmt::Write` for `String` is infallible.
+    let Ok(()) = std::fmt::write(buf, args) else {
+        unreachable!("formatting into String cannot fail");
+    };
+    buf.as_str()
+}
+
+/// Static display label for [`NavScheme`] without per-frame `format!("{s:?}")` allocations.
+#[inline]
+const fn nav_scheme_label(s: NavScheme) -> &'static str {
+    match s {
+        NavScheme::Default => "Default",
+        NavScheme::Maya => "Maya",
+        NavScheme::Houdini => "Houdini",
+        NavScheme::Blender => "Blender",
+        NavScheme::Unreal => "Unreal",
+    }
+}
+
+/// Static display label for [`NavFeel`] without per-frame `format!("{f:?}")` allocations.
+#[inline]
+const fn nav_feel_label(f: NavFeel) -> &'static str {
+    match f {
+        NavFeel::Sharp => "Sharp",
+        NavFeel::Smooth => "Smooth",
+    }
+}
+
+/// Synchronizes camera toolbar dropdown selections into both `CameraController` and `NavPrefs`
+/// so `CameraDriver::sync_prefs()` never reverts the selected orbit mode on the following frame.
+pub(crate) fn apply_camera_toolbar_prefs(
+    driver: &mut CameraDriver,
+    mode: NavMode,
+    fly_mode: NavMode,
+    feel: NavFeel,
+    scheme: NavScheme,
+    scheme_changed: bool,
+) {
+    driver.controller_mut().set_mode(mode);
+    let mut prefs = *driver.prefs();
+    prefs.mode = mode;
+    prefs.hold_fly_mode = fly_mode;
+    prefs.feel = feel;
+    driver.set_prefs(prefs);
+    if scheme_changed {
+        driver.set_scheme(scheme);
+        crate::enable_rmb_fly(driver);
+    }
+}
+
+/// Appends the human-readable engine phase prefix into `out` without intermediate allocations.
+fn write_engine_phase_label(
+    out: &mut String,
+    phase: EnginePhase,
+    accum_count: u32,
+    max_accum: u32,
+    anim_tags: &[&str],
+) {
+    if let Some(label) = phase.transient_label() {
+        out.push_str(label);
+        return;
+    }
+    if !anim_tags.is_empty() {
+        out.push_str("Live (");
+        for (i, tag) in anim_tags.iter().enumerate() {
+            if i > 0 {
+                out.push('+');
+            }
+            out.push_str(tag);
+        }
+        out.push(')');
+        return;
+    }
+    let cap = max_accum.max(1);
+    if accum_count >= cap {
+        out.push_str("Ready");
+    } else {
+        let Ok(()) = write!(out, "Accumulating ({accum_count}/{cap})") else {
+            unreachable!("writing to String cannot fail");
+        };
+    }
+}
+
 /// Formats the human-readable engine phase prefix for the bottom-left Viewport status bar.
+#[cfg(test)]
 pub fn format_engine_phase_label(
     phase: EnginePhase,
     accum_count: u32,
     max_accum: u32,
     anim_tag: Option<&str>,
 ) -> String {
-    if let Some(label) = phase.transient_label() {
-        return label.to_owned();
+    let mut out = String::with_capacity(32);
+    match anim_tag {
+        Some(tag) => write_engine_phase_label(&mut out, phase, accum_count, max_accum, &[tag]),
+        None => write_engine_phase_label(&mut out, phase, accum_count, max_accum, &[]),
     }
-    if let Some(tag) = anim_tag {
-        return format!("Live ({tag})");
-    }
-    if accum_count >= max_accum.max(1) {
-        "Ready".to_owned()
-    } else {
-        format!("Accumulating ({accum_count}/{})", max_accum.max(1))
-    }
+    out
 }
 
 /// Converts a right-handed world position `[x, y, z]` (`+X = East`, `+Y = Up` orthometric
@@ -161,13 +265,22 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub fn title(self) -> String {
-        match self {
-            Self::Viewport => format!("{}  Viewport", ic::APERTURE),
-            Self::Fractal => format!("{}  Fractal", ic::CUBE),
-            Self::RenderFloor => format!("{}  Render & Floor", ic::SUN),
-            Self::CameraStats => format!("{}  Camera & Stats", ic::GAUGE),
-        }
+    pub fn title(self) -> &'static str {
+        static TITLES: LazyLock<[String; 4]> = LazyLock::new(|| {
+            [
+                format!("{}  Viewport", ic::APERTURE),
+                format!("{}  Fractal", ic::CUBE),
+                format!("{}  Render & Floor", ic::SUN),
+                format!("{}  Camera & Stats", ic::GAUGE),
+            ]
+        });
+        let idx = match self {
+            Self::Viewport => 0,
+            Self::Fractal => 1,
+            Self::RenderFloor => 2,
+            Self::CameraStats => 3,
+        };
+        TITLES[idx].as_str()
     }
 }
 
@@ -355,6 +468,8 @@ pub struct UiContext<'a> {
     pub cam_pose: &'a mut CameraPose,
     pub camera_rail: &'a mut CameraRail,
     pub cam_fixed_dt: Option<f32>,
+    pub last_cam_raw_input: &'a mut Option<crate::camera_core::input::RawInput>,
+    pub scratch: &'a mut UiScratch,
     pub cam_mode: &'a mut NavMode,
     pub cam_fly_mode: &'a mut NavMode,
     pub cam_scheme: &'a mut NavScheme,
@@ -476,20 +591,20 @@ impl UiContext<'_> {
             ui.label(RichText::new("Scheme").small().weak());
             egui::ComboBox::from_id_salt("toolbar_cam_scheme")
                 .width(74.0)
-                .selected_text(format!("{:?}", *self.cam_scheme))
+                .selected_text(nav_scheme_label(*self.cam_scheme))
                 .show_ui(ui, |ui| {
                     for s in NavScheme::ALL {
-                        ui.selectable_value(self.cam_scheme, s, format!("{s:?}"));
+                        ui.selectable_value(self.cam_scheme, s, nav_scheme_label(s));
                     }
                 });
 
             ui.label(RichText::new("Feel").small().weak());
             egui::ComboBox::from_id_salt("toolbar_cam_feel")
                 .width(74.0)
-                .selected_text(format!("{:?}", *self.cam_feel))
+                .selected_text(nav_feel_label(*self.cam_feel))
                 .show_ui(ui, |ui| {
                     for f in NavFeel::ALL {
-                        ui.selectable_value(self.cam_feel, f, format!("{f:?}"));
+                        ui.selectable_value(self.cam_feel, f, nav_feel_label(f));
                     }
                 });
 
@@ -500,15 +615,14 @@ impl UiContext<'_> {
                 *self.cam_feel,
             ) != (prev_m, prev_fly, prev_s, prev_f)
             {
-                self.cam_driver.controller_mut().set_mode(*self.cam_mode);
-                let mut prefs = *self.cam_driver.prefs();
-                prefs.hold_fly_mode = *self.cam_fly_mode;
-                prefs.feel = *self.cam_feel;
-                self.cam_driver.set_prefs(prefs);
-                if *self.cam_scheme != prev_s {
-                    self.cam_driver.set_scheme(*self.cam_scheme);
-                    crate::enable_rmb_fly(self.cam_driver);
-                }
+                apply_camera_toolbar_prefs(
+                    self.cam_driver,
+                    *self.cam_mode,
+                    *self.cam_fly_mode,
+                    *self.cam_feel,
+                    *self.cam_scheme,
+                    *self.cam_scheme != prev_s,
+                );
             }
 
             if ui
@@ -976,14 +1090,23 @@ impl UiContext<'_> {
             }
             let fly_scene_radius = 2.0 * altitude_speed_multiplier(self.cam_pose.eye.y);
             let df = match self.cam_fixed_dt {
-                Some(fixed_dt) => crate::camera_egui::drive_with_dt(
-                    ui,
-                    &resp,
-                    self.cam_driver,
-                    fly_scene_radius,
-                    fixed_dt,
-                ),
-                None => crate::camera_egui::drive(ui, &resp, self.cam_driver, fly_scene_radius),
+                Some(fixed_dt) => {
+                    let raw = crate::camera_egui::read_input(ui, &resp, fixed_dt);
+                    *self.last_cam_raw_input = Some(raw);
+                    if raw.hovered {
+                        crate::camera_egui::consume_wheel(ui.ctx());
+                    }
+                    let frame = self.cam_driver.update(&raw, fly_scene_radius);
+                    crate::camera_egui::apply_cursor(ui.ctx(), resp.id, frame.cursor);
+                    if frame.wants_repaint {
+                        ui.ctx().request_repaint();
+                    }
+                    frame
+                }
+                None => {
+                    *self.last_cam_raw_input = None;
+                    crate::camera_egui::drive(ui, &resp, self.cam_driver, fly_scene_radius)
+                }
             };
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
             let f_pressed =
@@ -1094,22 +1217,12 @@ impl UiContext<'_> {
             });
         }
 
-        // Compact bottom-left status badge inside viewport
+        // Compact bottom-left status badge inside viewport (formatted into reusable scratch buffer).
         let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
         let aov_tag = AOV_HUD_TAGS
             .get(self.settings.aov_mode as usize)
             .copied()
             .unwrap_or("BEAUTY");
-        let lens_tag = if self.settings.camera_projection != CameraProjection::Pinhole {
-            format!("  |  {}", self.settings.camera_projection.label())
-        } else {
-            String::new()
-        };
-        let possess_tag = if self.possess_info.is_some() {
-            "  |  POSSESS"
-        } else {
-            ""
-        };
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let demo_running = self.demo_anim.is_running();
@@ -1122,78 +1235,94 @@ impl UiContext<'_> {
             && !self.settings.csg_freeze_pose
             && self.settings.csg_traffic_on
             && self.settings.csg_traffic_speed > 0.001;
-        let freeze_tag = if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
-            "  |  FROZEN"
-        } else {
-            ""
-        };
-        let preview_tag = if self.fast_preview { "  |  PREVIEW" } else { "" };
         let nav = self.cam_driver.navigator();
         let fly_mult = nav.fly_speed();
         let shift_ramp = nav.shift_fly_ramp();
         let alt_mult = altitude_speed_multiplier(self.cam_pose.eye.y);
         let in_fly_hud = self.cam_driver.is_hold_flying() || self.cam_driver.controller().is_fly();
-        let fly_tag = if in_fly_hud || (fly_mult - 1.0).abs() > 0.01 || shift_ramp > 1.05 {
-            let eff = fly_mult * alt_mult * shift_ramp;
-            if shift_ramp > 1.05 {
-                format!("  |  FLY {eff:.1}x (SHIFT {shift_ramp:.1}x)")
-            } else {
-                format!("  |  FLY {eff:.1}x")
-            }
-        } else {
-            String::new()
-        };
-        let anim_tag = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
-            let mut tags = Vec::with_capacity(4);
-            if demo_running {
-                tags.push("DEMO");
-            }
-            if self.settings.auto_rotate {
-                tags.push("SPIN");
-            }
-            if sat_orbiting {
-                tags.push("ORBIT");
-            }
-            if traffic_moving {
-                tags.push("TRAFFIC");
-            }
-            Some(tags.join("+"))
-        } else {
-            None
-        };
-        let phase_label = format_engine_phase_label(
-            self.engine_phase,
-            self.accum_count,
-            self.settings.max_accum,
-            anim_tag.as_deref(),
-        );
+
+        let mut anim_tags: [&str; 4] = [""; 4];
+        let mut anim_tag_len = 0usize;
+        if demo_running {
+            anim_tags[anim_tag_len] = "DEMO";
+            anim_tag_len += 1;
+        }
+        if self.settings.auto_rotate {
+            anim_tags[anim_tag_len] = "SPIN";
+            anim_tag_len += 1;
+        }
+        if sat_orbiting {
+            anim_tags[anim_tag_len] = "ORBIT";
+            anim_tag_len += 1;
+        }
+        if traffic_moving {
+            anim_tags[anim_tag_len] = "TRAFFIC";
+            anim_tag_len += 1;
+        }
+        let anim_slice = &anim_tags[..anim_tag_len];
         let phase_icon = if self.engine_phase.transient_label().is_some() {
             ic::SPINNER
-        } else if anim_tag.is_some() {
+        } else if !anim_slice.is_empty() {
             ic::ARROWS_CLOCKWISE
         } else if self.accum_count >= self.settings.max_accum.max(1) {
             ic::CHECK_CIRCLE
         } else {
             ic::STACK
         };
-        let status = format!(
-            "{} {}  |  {}x{}  |  {}{}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
-            phase_icon,
-            phase_label,
-            self.render_w,
-            self.render_h,
-            aov_tag,
-            lens_tag,
-            possess_tag,
-            freeze_tag,
-            fly_tag,
-            preview_tag,
+
+        let status_buf = &mut self.scratch.status_buf;
+        status_buf.clear();
+        status_buf.push_str(phase_icon);
+        status_buf.push(' ');
+        write_engine_phase_label(
+            status_buf,
+            self.engine_phase,
+            self.accum_count,
+            self.settings.max_accum,
+            anim_slice,
+        );
+        let Ok(()) = write!(
+            status_buf,
+            "  |  {}x{}  |  {}",
+            self.render_w, self.render_h, aov_tag
+        ) else {
+            unreachable!("writing to String cannot fail");
+        };
+        if self.settings.camera_projection != CameraProjection::Pinhole {
+            status_buf.push_str("  |  ");
+            status_buf.push_str(self.settings.camera_projection.label());
+        }
+        if self.possess_info.is_some() {
+            status_buf.push_str("  |  POSSESS");
+        }
+        if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
+            status_buf.push_str("  |  FROZEN");
+        }
+        if in_fly_hud || (fly_mult - 1.0).abs() > 0.01 || shift_ramp > 1.05 {
+            let eff = fly_mult * alt_mult * shift_ramp;
+            let res = if shift_ramp > 1.05 {
+                write!(status_buf, "  |  FLY {eff:.1}x (SHIFT {shift_ramp:.1}x)")
+            } else {
+                write!(status_buf, "  |  FLY {eff:.1}x")
+            };
+            let Ok(()) = res else {
+                unreachable!("writing to String cannot fail");
+            };
+        }
+        if self.fast_preview {
+            status_buf.push_str("  |  PREVIEW");
+        }
+        let Ok(()) = write!(
+            status_buf,
+            "  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
             self.ui_fps.round() as u32,
             self.rt_fps,
             self.rt_ms
-        );
+        ) else {
+            unreachable!("writing to String cannot fail");
+        };
         let galley = ui.painter().layout_no_wrap(
-            status,
+            status_buf.clone(),
             egui::FontId::monospace(11.0),
             Color32::from_rgb(225, 232, 240),
         );
@@ -2018,14 +2147,17 @@ impl UiContext<'_> {
                     }
                     ui.add_space(2.0);
                     let crowd_badge = if self.crowd_actor_count > 0 {
-                        format!(
-                            "Crowd Backend ({} {:.2} ms, {}a)",
-                            self.crowd_active_backend.label(),
-                            self.crowd_step_ms,
-                            self.crowd_actor_count
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!(
+                                "Crowd Backend ({} {:.2} ms, {}a)",
+                                self.crowd_active_backend.label(),
+                                self.crowd_step_ms,
+                                self.crowd_actor_count
+                            ),
                         )
                     } else {
-                        "Crowd Backend".to_string()
+                        "Crowd Backend"
                     };
                     ui.label(RichText::new(crowd_badge).small().weak());
                     equal_grid(ui, 3, 3, |ui, idx, w| {
@@ -2834,21 +2966,22 @@ impl UiContext<'_> {
                     } else {
                         format!("{}  Record MP4", ic::VIDEO_CAMERA)
                     };
-                    let target_desc = if is_full_win {
-                        "full window (viewport + UI)"
-                    } else {
-                        "3D viewport"
-                    };
-                    let rec_tip = if self.is_recording {
-                        "Stop recording and finalize the MP4 video file (Red = Recording).".to_string()
-                    } else if use_pq10 {
-                        format!(
-                            "Start recording the {target_desc} as a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
-                        )
-                    } else {
-                        format!(
-                            "Start recording the {target_desc} as an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
-                        )
+                    let rec_tip = match (self.is_recording, use_pq10, is_full_win) {
+                        (true, _, _) => {
+                            "Stop recording and finalize the MP4 video file (Red = Recording)."
+                        }
+                        (false, true, true) => {
+                            "Start recording the full window (viewport + UI) as a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
+                        }
+                        (false, true, false) => {
+                            "Start recording the 3D viewport as a 10-bit HDR10 PQ10 HEVC MP4 video (Green = Ready)."
+                        }
+                        (false, false, true) => {
+                            "Start recording the full window (viewport + UI) as an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
+                        }
+                        (false, false, false) => {
+                            "Start recording the 3D viewport as an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
+                        }
                     };
                     let dark = ui.visuals().dark_mode;
                     let rec_btn = if self.is_recording {
@@ -3350,8 +3483,9 @@ impl UiContext<'_> {
                                 });
                         });
                         if let Some(sv) = self.last_smart_view {
-                            ui.label(
-                                RichText::new(format!(
+                            let sv_txt = fmt_into(
+                                &mut self.scratch.label_buf,
+                                format_args!(
                                     "{}: {:.2} ({}v, ent {:.2}, depth {:.2}, {:.1} ms)",
                                     sv.score.backend.label(),
                                     sv.score.composite,
@@ -3359,10 +3493,9 @@ impl UiContext<'_> {
                                     sv.score.semantic_entropy,
                                     sv.score.depth_stratification,
                                     sv.elapsed_ms
-                                ))
-                                .size(10.5)
-                                .weak(),
+                                ),
                             );
+                            ui.label(RichText::new(sv_txt).size(10.5).weak());
                         }
                     }
                     prop_slider_f32(
@@ -3490,37 +3623,44 @@ impl UiContext<'_> {
         }
 
         collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", true, |ui| {
+            let buf = &mut self.scratch.label_buf;
             stat_row(ui, "GPU", &self.telemetry.gpu_name);
             stat_row(
                 ui,
                 "Resolution",
-                &format!("{} x {}", self.render_w, self.render_h),
+                fmt_into(buf, format_args!("{} x {}", self.render_w, self.render_h)),
             );
-            stat_row(ui, "UI FPS", &format!("{:.0} FPS", self.ui_fps));
+            stat_row(ui, "UI FPS", fmt_into(buf, format_args!("{:.0} FPS", self.ui_fps)));
             stat_row(
                 ui,
                 "RT FPS",
-                &format!(
-                    "{:.1} FPS ({:.1} ms{})",
-                    self.rt_fps,
-                    self.rt_ms,
-                    if self.fast_preview { " fast" } else { "" }
+                fmt_into(
+                    buf,
+                    format_args!(
+                        "{:.1} FPS ({:.1} ms{})",
+                        self.rt_fps,
+                        self.rt_ms,
+                        if self.fast_preview { " fast" } else { "" }
+                    ),
                 ),
             );
             stat_row(
                 ui,
                 "Bloom / TM",
-                &format!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms),
+                fmt_into(buf, format_args!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms)),
             );
             stat_row(
                 ui,
                 "Accum",
-                &format!(
-                    "{} / {} ({} spp)",
-                    self.accum_count, self.settings.max_accum, self.total_samples
+                fmt_into(
+                    buf,
+                    format_args!(
+                        "{} / {} ({} spp)",
+                        self.accum_count, self.settings.max_accum, self.total_samples
+                    ),
                 ),
             );
-            stat_row(ui, "Denoiser", &format!("{:.1} ms", self.denoise_ms));
+            stat_row(ui, "Denoiser", fmt_into(buf, format_args!("{:.1} ms", self.denoise_ms)));
             stat_row(
                 ui,
                 "OptiX SER",
@@ -3533,28 +3673,38 @@ impl UiContext<'_> {
             stat_row(
                 ui,
                 "VRAM",
-                &format!(
-                    "{} / {} MiB",
-                    self.telemetry.vram_used_mib, self.telemetry.vram_total_mib
+                fmt_into(
+                    buf,
+                    format_args!(
+                        "{} / {} MiB",
+                        self.telemetry.vram_used_mib, self.telemetry.vram_total_mib
+                    ),
                 ),
             );
             stat_row(
                 ui,
                 "Clocks",
-                &format!(
-                    "{} / {} MHz",
-                    self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
+                fmt_into(
+                    buf,
+                    format_args!(
+                        "{} / {} MHz",
+                        self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
+                    ),
                 ),
             );
             stat_row(
                 ui,
                 "Temp / Load",
-                &format!(
-                    "{} C / {} %",
-                    self.telemetry.temp_c, self.telemetry.util_gpu
+                fmt_into(
+                    buf,
+                    format_args!("{} C / {} %", self.telemetry.temp_c, self.telemetry.util_gpu),
                 ),
             );
-            stat_row(ui, "Power", &format!("{:.0} W", self.telemetry.power_w));
+            stat_row(
+                ui,
+                "Power",
+                fmt_into(buf, format_args!("{:.0} W", self.telemetry.power_w)),
+            );
             stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
             stat_row(ui, "NGX", &self.telemetry.ngx_status);
             stat_row(
@@ -3570,41 +3720,53 @@ impl UiContext<'_> {
                 stat_row(
                     ui,
                     "CSG Inst",
-                    &format!(
-                        "{} / {}",
-                        self.csg_stats.visible_instances, self.csg_stats.total_instances
+                    fmt_into(
+                        buf,
+                        format_args!(
+                            "{} / {}",
+                            self.csg_stats.visible_instances, self.csg_stats.total_instances
+                        ),
                     ),
                 );
                 stat_row(
                     ui,
                     "CSG DAG",
-                    &format!(
-                        "{} GAS / {} prm",
-                        self.csg_stats.compounds, self.csg_stats.primitives
+                    fmt_into(
+                        buf,
+                        format_args!(
+                            "{} GAS / {} prm",
+                            self.csg_stats.compounds, self.csg_stats.primitives
+                        ),
                     ),
                 );
                 stat_row(
                     ui,
                     "CSG Aux",
-                    &format!(
-                        "{:.1} KiB",
-                        self.csg_stats.aux_planes_bytes as f64 / 1024.0
+                    fmt_into(
+                        buf,
+                        format_args!("{:.1} KiB", self.csg_stats.aux_planes_bytes as f64 / 1024.0),
                     ),
                 );
                 stat_row(
                     ui,
                     "CSG VRAM",
-                    &format!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
+                    fmt_into(
+                        buf,
+                        format_args!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
+                    ),
                 );
                 if self.crowd_actor_count > 0 {
                     stat_row(
                         ui,
                         "Crowd Sim",
-                        &format!(
-                            "{} {:.2} ms ({})",
-                            self.crowd_active_backend.label(),
-                            self.crowd_step_ms,
-                            self.crowd_actor_count
+                        fmt_into(
+                            buf,
+                            format_args!(
+                                "{} {:.2} ms ({})",
+                                self.crowd_active_backend.label(),
+                                self.crowd_step_ms,
+                                self.crowd_actor_count
+                            ),
                         ),
                     );
                 }
@@ -3612,20 +3774,26 @@ impl UiContext<'_> {
         });
 
         collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {
-            stat_row(ui, "RT Cores", &format!("{:.2} ms (OptiX)", self.rt_ms));
+            let buf = &mut self.scratch.label_buf;
+            stat_row(
+                ui,
+                "RT Cores",
+                fmt_into(buf, format_args!("{:.2} ms (OptiX)", self.rt_ms)),
+            );
             stat_row(
                 ui,
                 "Tensor Cores",
-                &format!("{:.2} ms (Den/DLSS)", self.tensor_cores_ms),
+                fmt_into(buf, format_args!("{:.2} ms (Den/DLSS)", self.tensor_cores_ms)),
             );
             stat_row(
                 ui,
                 "CUDA Compute",
-                &format!("{:.2} ms (IAS/FFT/TM)", self.cuda_compute_ms),
+                fmt_into(buf, format_args!("{:.2} ms (IAS/FFT/TM)", self.cuda_compute_ms)),
             );
             ui.add_space(2.0);
             sparkline_row(
                 ui,
+                buf,
                 "RT Cores",
                 &self.timings.rt_cores_ms,
                 Color32::from_rgb(138, 173, 244),
@@ -3633,6 +3801,7 @@ impl UiContext<'_> {
             );
             sparkline_row(
                 ui,
+                buf,
                 "Tensor",
                 &self.timings.tensor_cores_ms,
                 Color32::from_rgb(166, 209, 137),
@@ -3640,6 +3809,7 @@ impl UiContext<'_> {
             );
             sparkline_row(
                 ui,
+                buf,
                 "CUDA SM",
                 &self.timings.cuda_compute_ms,
                 Color32::from_rgb(238, 212, 159),
@@ -3647,6 +3817,7 @@ impl UiContext<'_> {
             );
             sparkline_row(
                 ui,
+                buf,
                 "FPS",
                 &self.timings.fps,
                 Color32::from_rgb(198, 160, 246),
@@ -3892,9 +4063,10 @@ fn cycle_toggle_btn(
         if let Some(fill) = tint {
             btn = btn.fill(fill);
         }
-        let resp = ui
-            .add_sized([width, ROW_H + 2.0], btn)
-            .on_hover_text(format!("{tooltip}\nLMB: next | RMB: prev"));
+        let resp = ui.add_sized([width, ROW_H + 2.0], btn).on_hover_ui(|ui| {
+            ui.label(tooltip);
+            ui.label(RichText::new("LMB: next | RMB: prev").small().weak());
+        });
         if resp.clicked() {
             step = 1;
         } else if resp.secondary_clicked() {
@@ -4208,6 +4380,7 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
 
 fn sparkline_row(
     ui: &mut Ui,
+    label_buf: &mut String,
     label: &str,
     ring: &RingBuffer<HISTORY_LEN>,
     color: Color32,
@@ -4237,9 +4410,9 @@ fn sparkline_row(
         }
 
         let txt = if unit.is_empty() {
-            format!("{:.0}", ring.latest())
+            fmt_into(label_buf, format_args!("{:.0}", ring.latest()))
         } else {
-            format!("{:.1} {unit}", ring.latest())
+            fmt_into(label_buf, format_args!("{:.1} {unit}", ring.latest()))
         };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add(egui::Label::new(RichText::new(txt).size(11.5).color(color)).truncate());
@@ -4386,5 +4559,33 @@ mod tests {
         let json = serde_json::to_string(&s).expect("serialize");
         let back: DemoSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.csg_road_mode, 3);
+    }
+
+    #[test]
+    fn orbit_mode_dropdown_updates_prefs_mode_and_survives_driver_update() {
+        let mut driver = CameraDriver::default();
+        assert_eq!(driver.prefs().mode, NavMode::Turntable);
+
+        apply_camera_toolbar_prefs(
+            &mut driver,
+            NavMode::Trackball,
+            NavMode::FpsFly,
+            NavFeel::Sharp,
+            NavScheme::Default,
+            false,
+        );
+        assert_eq!(driver.prefs().mode, NavMode::Trackball);
+        assert_eq!(driver.controller().mode(), Some(NavMode::Trackball));
+
+        // Next frame's `CameraDriver::update` calls `sync_prefs()` and must NOT revert Trackball!
+        let raw = crate::camera_core::input::RawInput {
+            dt: 1.0 / 60.0,
+            viewport: glam::Vec2::new(1280.0, 720.0),
+            ..Default::default()
+        };
+        let df = driver.update(&raw, 2.0);
+        assert!(df.pose.eye.is_finite());
+        assert_eq!(driver.prefs().mode, NavMode::Trackball);
+        assert_eq!(driver.controller().mode(), Some(NavMode::Trackball));
     }
 }

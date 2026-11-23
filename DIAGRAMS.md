@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Source map verified on 2026-11-22 (`5b4fcf8`, `csg-rs` `7b8a085`). See [repository guidance](AGENTS.md) and [crate codepaths](crates/AGENTS.md).
+Source map verified on 2026-11-23 (`5a58bab`, `csg-rs` `539f244`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), and [bughunt & acceleration plan](plan1.md).
 
 ## Build architecture
 
@@ -79,7 +79,7 @@ flowchart TD
   Worker --> Step["CsgGpuHost::step_dynamic (TrafficStateSoA + SceneBuilt::crowd, Freeze Pose zero-motion snap)"]
   Step --> Sync["CsgGpuHost::sync (GrowDeviceBuffer + dual 256 KiB pinned DMA for instances & prev_xforms)"]
   Sync --> IAS["Persistent Uncompacted IAS (Accel::instances_into, compact=false, allow_update=true)"]
-  IAS --> RT["OptiX 9 RT Cores (608 B Params, SBT 0..5, 11-GAS Crowd SBT 5, SER, OMM, Motion AOV 3x3 inv)"]
+  IAS --> RT["OptiX 9 RT Cores (640 B Params, SBT 0..5, 11-GAS Crowd SBT 5, SER, OMM, Motion AOV 3x3 inv, 4x RGSS AA AOVs)"]
   RT --> Tensor["Tensor Cores (OptiX Aov/TemporalAov Denoiser or NGX DLSS SR/RR)"]
   Tensor --> Post["CUDA Compute (cuFFT Bloom -> Tonemap / HDR scRGB / DLSS-RR Pack)"]
   Post --> Fence["Single End-of-Frame stream.synchronize() + 3-slot cuEventQuery GpuPassProfiler"]
@@ -88,3 +88,24 @@ flowchart TD
 ```
 
 The render worker submits `[IAS/Traffic/Crowd] -> [RT] -> [Denoiser] -> [cuFFT] -> [Tonemap]` in one uninterrupted stream burst with a single end-of-frame fence while `Runner::about_to_wait` paces UI redraws to 60 Hz.
+
+## `nv-demo` audited hot-path bottlenecks vs target zero-stall architecture (`plan1.md`)
+
+```mermaid
+flowchart TD
+  subgraph Current["Current Hot-Path Bottlenecks (Audited 2026-11-23)"]
+    C1["TrafficOnly CPU Repack (10k-100k static + dynamic)"] --> C2["cuda_crowd Mid-Frame D2H + stream.synchronize()"]
+    C2 --> C3["Accidental 50k IAS Rebuild (sat_angle when !show_classic)"]
+    C3 --> C4["1 Giant AABB per PURE_UNION GAS -> SM Linear Scan + 4.2 KiB .local Spill"]
+    C4 --> C5["Full-Res PoT cuFFT Bloom (2048^2 / 4096^2, ~302 MiB @ 4K)"]
+    C5 --> C6["UI Thread Sync I/O (PNG/JPEG/MP4/persist) + FullWindow Poll Stall"]
+  end
+
+  subgraph Target["Target Zero-Stall Accelerated Pipeline (Waves 1-3)"]
+    T1["Static-Tail Split (Repack Only [0..D] Dynamic Prefix)"] --> T2["100% GPU Crowd Steering + 1-Word Async Atomic Flag"]
+    T2 --> T3["Guarded IAS State + Uncompacted Custom GAS (0 Compaction Stalls)"]
+    T3 --> T4["Multi-AABB PURE_UNION GAS (RT Core BVH) + 0-Spill Registers + Shadow SBT + SER mat_id"]
+    T4 --> T5["Half-Res 7-Smooth cuFFT Bloom + Pre-Normalized PSF + AOV Early-Out"]
+    T5 --> T6["Async Export Worker + Disk PTX / Nvjpeg / SceneBuilt LRU Caches"]
+  end
+```

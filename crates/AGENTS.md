@@ -43,4 +43,5 @@ OptiX objects retain dependencies through owned handles and `Arc` references. Pr
 - Read the actual target-specific handle ownership rules before closing exported handles.
 - For interop, match the physical CUDA and graphics device and enable required backend extensions.
 - Treat `let _ =` in cleanup separately from ignored operational failures; inspect how destruction errors are recorded.
+- cuDNN and another cuDNN 9 in one process (e.g. PyTorch's): if a `cudnn64_9.dll` is already loaded, `cudnn-sys` adopts exactly that copy (version-gated, reported as loader diag `cudnn`/`adopt`) instead of searching. The reverse order cannot be prevented from Rust: if nv-rs loads cuDNN first, a later `import torch` that brings a different cuDNN build can fail (`WinError 127`). Import torch first, or use one cuDNN build per process.
 - Use synthetic generator fixtures and loader probes for hardware-independent regression coverage; run ignored integration tests for driver-dependent changes.

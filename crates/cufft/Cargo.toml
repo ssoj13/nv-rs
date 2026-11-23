@@ -13,6 +13,7 @@ path = "src/cufft.rs"
 [dependencies]
 cufft-sys = { path = "../cufft-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

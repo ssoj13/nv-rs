@@ -237,7 +237,7 @@ impl Pipeline {
         if size == 0 {
             return Err(Error::Invalid("symbol copy of zero bytes"));
         }
-        if stream.context().cu_ctx() != self.ctx.cuda().cu_ctx() {
+        if !cuda_core_ext::same_context(stream.context(), self.ctx.cuda()) {
             return Err(Error::Invalid(
                 "stream belongs to another CUDA context than the pipeline",
             ));
@@ -383,7 +383,7 @@ impl Drop for Pipeline {
             cuda.record_err(cuda.bind_to_thread());
             // SAFETY: owned handle; launches must have completed (the `launch` contract).
             let code = unsafe { destroy(self.raw) };
-            self.ctx.record(code);
+            self.ctx.record("optixPipelineDestroy", code);
         }
     }
 }

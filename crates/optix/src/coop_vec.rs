@@ -324,8 +324,8 @@ pub unsafe fn convert<T: DeviceCopy, U: DeviceCopy>(
     dst: Batch<'_, &mut DeviceBuffer<U>>,
 ) -> Result<()> {
     same_ctx(stream, ctx)?;
-    if src.buffer.context().as_ref() != ctx.cuda().as_ref()
-        || dst.buffer.context().as_ref() != ctx.cuda().as_ref()
+    if !cuda_core_ext::same_context(src.buffer.context(), ctx.cuda())
+        || !cuda_core_ext::same_context(dst.buffer.context(), ctx.cuda())
     {
         return Err(Error::Invalid(
             "network buffer belongs to another CUDA context than the OptiX device context",

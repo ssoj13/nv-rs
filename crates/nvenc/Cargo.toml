@@ -13,6 +13,7 @@ path = "src/nvenc.rs"
 [dependencies]
 nvenc-sys = { path = "../nvenc-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

@@ -993,6 +993,7 @@ dependencies = [
  "cublas-sys",
  "cublaslt-sys",
  "cuda-core",
+ "cuda-core-ext",
  "thiserror 2.0.21",
 ]
 
@@ -1075,6 +1076,7 @@ version = "0.1.0"
 dependencies = [
  "cuda-bindings",
  "cuda-core",
+ "cuda-core-ext",
  "cudnn-sys",
  "nv-loader",
  "thiserror 2.0.21",
@@ -1095,6 +1097,7 @@ name = "cufft"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "cufft-sys",
  "thiserror 2.0.21",
 ]
@@ -1115,6 +1118,7 @@ version = "0.1.0"
 dependencies = [
  "cuda-bindings",
  "cuda-core",
+ "cuda-core-ext",
  "cufile-sys",
  "nv-loader",
  "thiserror 2.0.21",
@@ -1136,6 +1140,7 @@ name = "cupti"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "cupti-sys",
  "thiserror 2.0.21",
 ]
@@ -1171,6 +1176,7 @@ name = "cusolver"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "cusolver-sys",
  "cusolvermg-sys",
  "cusparse-sys",
@@ -1201,6 +1207,7 @@ name = "cusparse"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "cusparse-sys",
  "thiserror 2.0.21",
 ]
@@ -2393,6 +2400,7 @@ version = "0.1.0"
 dependencies = [
  "cuda-bindings",
  "cuda-core",
+ "cuda-core-ext",
  "nccl-sys",
  "nv-loader",
  "thiserror 2.0.21",
@@ -2444,6 +2452,7 @@ dependencies = [
 name = "ngx"
 version = "0.1.0"
 dependencies = [
+ "cuda-core-ext",
  "ngx-sys",
  "thiserror 2.0.21",
 ]
@@ -2670,8 +2679,8 @@ dependencies = [
 name = "nvcomp"
 version = "0.1.0"
 dependencies = [
- "cuda-bindings",
  "cuda-core",
+ "cuda-core-ext",
  "nv-loader",
  "nvcomp-sys",
  "thiserror 2.0.21",
@@ -2713,6 +2722,7 @@ name = "nvenc"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "nvenc-sys",
  "thiserror 2.0.21",
 ]
@@ -2731,6 +2741,7 @@ name = "nvjpeg"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "nvjpeg-sys",
  "thiserror 2.0.21",
 ]
@@ -2768,6 +2779,7 @@ name = "nvofa"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "nvofa-sys",
  "thiserror 2.0.21",
 ]
@@ -3146,6 +3158,7 @@ name = "optix"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "optix-sys",
  "thiserror 2.0.21",
 ]

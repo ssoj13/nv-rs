@@ -896,6 +896,54 @@ pub fn open_first_with<T, E: Into<Rejection>>(
     Err(err)
 }
 
+/// Opens `path`, a copy of `spec`'s library that is already loaded in this process, instead of
+/// searching for one ([`cached_loader!`] / [`exports_sys!`] `adopt:` hook).
+///
+/// Why: on Windows, a second copy of a library whose parts import each other by bare file name
+/// (cuDNN 9: `cudnn_graph64_9.dll`, ...) binds those imports to the copy already in the process,
+/// so loading our own next to it mixes two builds. Adopting the loaded copy avoids that. The
+/// adoption is recorded as an `Info` diagnostic event. `open` runs the same checks as for a
+/// searched candidate (version gate included); a rejection is final, because loading another copy
+/// next to the adopted one is exactly what adoption avoids.
+pub fn open_adopted<T, E: Into<Rejection>>(
+    spec: &DllSpec,
+    path: &Path,
+    mut open: impl FnMut(&Path) -> Result<T, E>,
+) -> Result<Loaded<T>, LoadError> {
+    LOAD_ATTEMPTED.store(true, Ordering::Release);
+    let t0 = Instant::now();
+    diag::record_event(
+        diag::Level::Info,
+        spec.lib,
+        "adopt",
+        format!(
+            "{} is already loaded in this process; adopting it instead of searching",
+            path.display()
+        ),
+        0,
+        true,
+    );
+    match open(path) {
+        Ok(value) => {
+            diag::record_lib_load(spec.lib, Some(path), None, t0.elapsed().as_nanos() as u64);
+            Ok(Loaded {
+                value,
+                path: path.to_path_buf(),
+            })
+        }
+        Err(reason) => {
+            let err = rejected(spec.lib, vec![(path.to_path_buf(), reason.into())]);
+            diag::record_lib_load(
+                spec.lib,
+                None,
+                Some(&err.to_string()),
+                t0.elapsed().as_nanos() as u64,
+            );
+            Err(err)
+        }
+    }
+}
+
 /// The error for a non-empty list of rejected candidates: [`LoadError::RuntimeTooOld`] when every
 /// candidate was rejected only for its version, otherwise [`LoadError::Rejected`] with every reason.
 fn rejected(lib: &'static str, failures: Vec<(PathBuf, Rejection)>) -> LoadError {
@@ -952,12 +1000,20 @@ pub struct Loaded<T> {
 /// crates (OptiX, NVENC, NVOFA), so every library goes through the same entry point.
 #[macro_export]
 macro_rules! cached_loader {
-    (dll: $dll:expr, value: $ty:ty, open: $open:expr, $(#[$meta:meta])* $vis:vis fn $accessor:ident $(,)?) => {
+    (dll: $dll:expr, value: $ty:ty, open: $open:expr,
+     $(#[$meta:meta])* $vis:vis fn $accessor:ident $(, adopt: $adopt:path)? $(,)?) => {
         fn loaded() -> &'static ::core::result::Result<$crate::Loaded<$ty>, $crate::LoadError> {
             static VALUE: ::std::sync::OnceLock<
                 ::core::result::Result<$crate::Loaded<$ty>, $crate::LoadError>,
             > = ::std::sync::OnceLock::new();
-            VALUE.get_or_init(|| $crate::open_first(&$dll, $open))
+            VALUE.get_or_init(|| {
+                $(
+                    if let ::core::option::Option::Some(path) = $adopt() {
+                        return $crate::open_adopted(&$dll, &path, $open);
+                    }
+                )?
+                $crate::open_first(&$dll, $open)
+            })
         }
 
         $(#[$meta])*
@@ -1013,13 +1069,15 @@ pub struct ExportsBundle<A> {
 /// Optional hooks, in this order: `preload: fn(&Path) -> Result<Vec<libloading::Library>, String>`
 /// maps libraries the main one needs first and keeps them loaded (cuDNN); `version:
 /// fn(&api::<Api>) -> Result<(), nv_loader::Rejection>` rejects a runtime older than the bound
-/// headers (see [`check_version`]).
+/// headers (see [`check_version`]); `adopt: fn() -> Option<PathBuf>` names a copy of the library
+/// that is already loaded in the process, which is then opened instead of searching (see
+/// [`open_adopted`]; cuDNN next to PyTorch's copy).
 ///
 /// [`Shape::Exports`]: https://docs.rs/nv-bindgen
 #[macro_export]
 macro_rules! exports_sys {
     (lib: $lib:literal, api: $api:ident, loader: $loader:ident, dll: $dll:expr
-     $(, preload: $preload:path)? $(, version: $version:path)? $(,)?) => {
+     $(, preload: $preload:path)? $(, version: $version:path)? $(, adopt: $adopt:path)? $(,)?) => {
         // Generated code: lint levels differ per header, so the generated modules opt out.
         #[allow(
             non_camel_case_types,
@@ -1081,6 +1139,7 @@ macro_rules! exports_sys {
             },
             /// The loaded library and the libraries it keeps mapped.
             fn bundle
+            $(, adopt: $adopt)?
         }
 
         /// The loaded library, for the shims.

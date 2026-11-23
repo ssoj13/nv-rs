@@ -4,12 +4,10 @@
 //! inside `buf_util::enqueue_leased`, so the Python buffers stay allocated until it completes.
 //! cuSPARSE SpMV and the cuSOLVER Dn calls go through the safe wrappers (`cusparse::spmv`,
 //! `cusolver::DnHandle::{getrf, getrs, potrf, potrs}`) on typed views (`compute::typed_view`).
-//! cuDNN activation/softmax stay raw calls: `cudnn::activation_forward` / `softmax_forward`
-//! compare the buffer's context with `Arc::ptr_eq`, which rejects DLPack imports and buffers made
-//! on another `Stream(0)` object (`cuda_core::Context::new` returns a new `Arc` per call), while
-//! `check_buf` compares contexts by value.
+//! cuDNN activation/softmax go through `cudnn::activation_forward` / `softmax_forward` on typed
+//! views; the wrapper compares contexts by value (`cuda_core_ext::same_context`), so DLPack
+//! imports and buffers of another `Arc<Context>` for the same CUDA context are accepted.
 
-use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -933,8 +931,10 @@ impl PyCudnnHandle {
         let coef = activation_coef(act_mode, coef)
             .map_err(|msg| record_and_err("cudnn", op, msg, ErrorKind::InvalidArgument))?;
         let elems = tensor_4d_elems(op, shape)?;
-        let (x_ptr, x_bytes) = check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
-        let (y_ptr, y_bytes) = check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
+        check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
+        check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
+        let xv = typed_view::<f32>("cudnn", op, "x", x, elems)?;
+        let mut yv = typed_view::<f32>("cudnn", op, "y", y, elems)?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
@@ -951,11 +951,6 @@ impl PyCudnnHandle {
             let act_desc =
                 ActivationDescriptor::new(&ctx, act_mode, NanPropagation::NotPropagate, coef)
                     .map_err(map)?;
-            if x_bytes < desc.size_in_bytes() || y_bytes < desc.size_in_bytes() {
-                return Err(map(cudnn::Error::Invalid(
-                    "tensor buffer smaller than cuDNN descriptor size_in_bytes",
-                )));
-            }
 
             enqueue_leased(
                 "cudnn",
@@ -963,22 +958,18 @@ impl PyCudnnHandle {
                 &stream,
                 [(x, Access::Read), (y, Access::Write)],
                 || {
-                    // SAFETY: the context is bound and `stream` set on the handle, the descriptors
-                    // are live, `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes
-                    // (checked above) and the leases keep them allocated until the work completes.
-                    let status = unsafe {
-                        cudnn_sys::cudnnActivationForward(
-                            guard.handle.as_raw(),
-                            act_desc.as_raw(),
-                            std::ptr::from_ref(&alpha).cast::<c_void>(),
-                            desc.as_raw(),
-                            x_ptr as usize as *const c_void,
-                            std::ptr::from_ref(&beta).cast::<c_void>(),
-                            desc.as_raw(),
-                            y_ptr as usize as *mut c_void,
-                        )
-                    };
-                    cudnn::check("cudnnActivationForward", status).map_err(map)
+                    cudnn::activation_forward(
+                        &mut guard.handle,
+                        &stream,
+                        &act_desc,
+                        f64::from(alpha),
+                        &desc,
+                        &xv,
+                        f64::from(beta),
+                        &desc,
+                        &mut yv,
+                    )
+                    .map_err(map)
                 },
             )
         })?;
@@ -1023,8 +1014,10 @@ impl PyCudnnHandle {
         let sm_algo = parse_softmax_algo(algo)?;
         let sm_mode = parse_softmax_mode(mode)?;
         let elems = tensor_4d_elems(op, shape)?;
-        let (x_ptr, x_bytes) = check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
-        let (y_ptr, y_bytes) = check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
+        check_buf("cudnn", op, "x", x, &["f32"], elems, &self.ctx)?;
+        check_buf("cudnn", op, "y", y, &["f32"], elems, &self.ctx)?;
+        let xv = typed_view::<f32>("cudnn", op, "x", x, elems)?;
+        let mut yv = typed_view::<f32>("cudnn", op, "y", y, elems)?;
 
         let state_arc = self.state.clone();
         let t0 = Instant::now();
@@ -1038,11 +1031,6 @@ impl PyCudnnHandle {
             let desc =
                 TensorDescriptor::new_4d(&ctx, TensorFormat::Nchw, CudnnDataType::F32, shape)
                     .map_err(map)?;
-            if x_bytes < desc.size_in_bytes() || y_bytes < desc.size_in_bytes() {
-                return Err(map(cudnn::Error::Invalid(
-                    "tensor buffer smaller than cuDNN descriptor size_in_bytes",
-                )));
-            }
 
             enqueue_leased(
                 "cudnn",
@@ -1050,23 +1038,19 @@ impl PyCudnnHandle {
                 &stream,
                 [(x, Access::Read), (y, Access::Write)],
                 || {
-                    // SAFETY: the context is bound and `stream` set on the handle, the descriptor
-                    // is live, `x_ptr`/`y_ptr` span at least `desc.size_in_bytes()` bytes (checked
-                    // above) and the leases keep them allocated until the work completes.
-                    let status = unsafe {
-                        cudnn_sys::cudnnSoftmaxForward(
-                            guard.handle.as_raw(),
-                            sm_algo.to_sys(),
-                            sm_mode.to_sys(),
-                            std::ptr::from_ref(&alpha).cast::<c_void>(),
-                            desc.as_raw(),
-                            x_ptr as usize as *const c_void,
-                            std::ptr::from_ref(&beta).cast::<c_void>(),
-                            desc.as_raw(),
-                            y_ptr as usize as *mut c_void,
-                        )
-                    };
-                    cudnn::check("cudnnSoftmaxForward", status).map_err(map)
+                    cudnn::softmax_forward(
+                        &mut guard.handle,
+                        &stream,
+                        sm_algo,
+                        sm_mode,
+                        f64::from(alpha),
+                        &desc,
+                        &xv,
+                        f64::from(beta),
+                        &desc,
+                        &mut yv,
+                    )
+                    .map_err(map)
                 },
             )
         })?;

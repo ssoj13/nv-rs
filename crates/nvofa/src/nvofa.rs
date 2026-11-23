@@ -15,12 +15,15 @@
 //! - [`RoiRect`] — Region-of-Interest rectangle with hardware alignment validation.
 //!
 //! **Conventions.** Every handle owns its NVOFA object, holds an `Arc` of its parent, and destroys
-//! it on `Drop`; teardown failures are recorded on `cuda_core::Context::record_err`.
+//! it on `Drop`. A failing NVOFA teardown call is kept with its real `NV_OF_STATUS` in
+//! `cuda_core_ext::teardown` (`Library::Nvofa`); a failed context bind stays on the CUDA context
+//! (`cuda_core::Context::record_err`).
 //! **Used by** motion-vector pipelines, frame interpolation, and the NVOFA T3 GPU tests.
 
 pub use nvofa_sys as sys;
 
 use cuda_core::{Context, DriverError, IntoResult, Stream};
+use cuda_core_ext::teardown::{self, Library};
 use std::ffi::CStr;
 use std::fmt;
 use std::mem::zeroed;
@@ -78,14 +81,6 @@ pub enum Error {
         required: u32,
         /// Reported value.
         found: u32,
-    },
-    /// Operation exceeds the caller's byte budget.
-    #[error("needs {requested} bytes, budget admits {available}")]
-    Budget {
-        /// Bytes requested.
-        requested: usize,
-        /// Bytes admitted by budget.
-        available: usize,
     },
     /// An argument was rejected before reaching NVOFA.
     #[error("invalid argument: {0}")]
@@ -773,18 +768,18 @@ impl Drop for OpticalFlowSession {
         if self.raw.is_null() {
             return;
         }
-        if let Err(e) = self.cuda.bind_to_thread() {
-            self.cuda.record_err(Err::<(), _>(e));
+        if !teardown::bind(&self.cuda) {
             return;
         }
         if let Some(destroy_fn) = self.list.nvOFDestroy {
             // SAFETY: `self.raw` is owned by this session and all child `OfBuffer`s have dropped.
             let status = unsafe { destroy_fn(self.raw) };
-            if status != sys::_NV_OF_STATUS_NV_OF_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvofa,
+                "nvOFDestroy",
+                i64::from(status),
+                i64::from(sys::_NV_OF_STATUS_NV_OF_SUCCESS),
+            );
         }
     }
 }
@@ -1030,11 +1025,12 @@ impl Drop for OfBuffer {
         if let Some(destroy_fn) = self.session.list.nvOFDestroyGPUBufferCuda {
             // SAFETY: `self.raw` was created on `self.session`.
             let status = unsafe { destroy_fn(self.raw) };
-            if status != sys::_NV_OF_STATUS_NV_OF_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvofa,
+                "nvOFDestroyGPUBufferCuda",
+                i64::from(status),
+                i64::from(sys::_NV_OF_STATUS_NV_OF_SUCCESS),
+            );
         }
     }
 }

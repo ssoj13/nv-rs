@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_core::{DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
 use nvcomp_sys as sys;
 
 use crate::format::{DecompressBackend, Format};
@@ -205,8 +206,8 @@ pub fn compress_batched_async(
     budget: Option<usize>,
 ) -> Result<BatchedCompressReceipt> {
     same_stream(stream, staging.stream())?;
-    if !Arc::ptr_eq(input.context(), staging.context())
-        || !Arc::ptr_eq(output.context(), staging.context())
+    if !same_context(input.context(), staging.context())
+        || !same_context(output.context(), staging.context())
     {
         return Err(Error::Invalid(
             "input/output buffer belongs to another CUDA context",
@@ -344,7 +345,7 @@ pub fn query_decompress_sizes_async(
     budget: Option<usize>,
 ) -> Result<Vec<usize>> {
     same_stream(stream, staging.stream())?;
-    if !Arc::ptr_eq(compressed.context(), staging.context()) {
+    if !same_context(compressed.context(), staging.context()) {
         return Err(Error::Invalid(
             "compressed buffer belongs to another CUDA context",
         ));
@@ -427,8 +428,8 @@ pub fn decompress_batched_async(
     budget: Option<usize>,
 ) -> Result<BatchedDecompressReceipt> {
     same_stream(stream, staging.stream())?;
-    if !Arc::ptr_eq(compressed.context(), staging.context())
-        || !Arc::ptr_eq(output.context(), staging.context())
+    if !same_context(compressed.context(), staging.context())
+        || !same_context(output.context(), staging.context())
     {
         return Err(Error::Invalid(
             "compressed/output buffer belongs to another CUDA context",

@@ -15,21 +15,28 @@
 //!   adapter.
 //! - [`green`] — green contexts: one GPU split into SM partitions with their own streams.
 //! - [`lease`] — keeps buffers allocated until work a native library queued on them completes.
+//! - [`identity`] — the one context / stream identity rule (by value, not by `Arc`).
+//! - [`scratch`] — the one reusable, budget-bounded, stream-ordered device workspace.
+//! - [`teardown`] — the process-wide sink for native teardown failures in `Drop`.
 //!
 //! **Conventions (shared with `cuda-core`).** Every handle owns its driver object and destroys it
-//! on drop; drop failures are recorded on the owning `Context` (`Context::record_err`) instead of
-//! panicking. Fallible calls return `DriverError`. Everything takes `&Arc<Context>`.
+//! on drop; driver failures in drop are recorded on the owning `Context` (`Context::record_err`)
+//! instead of panicking, and native library failures go to [`teardown`]. Fallible calls return
+//! `DriverError`. Everything takes `&Arc<Context>`.
 //!
-//! **Used by** `nv-wgpu` (interop), the safe `optix` crate (textures), `curand` (leases) and
-//! render-rs.
+//! **Used by** `nv-wgpu` (interop), `curand` (leases), every wrapper crate (identity, teardown;
+//! scratch for `cublas`, `cudnn`, `cufft`, `cusolver`, `cusparse`, `nvcomp`) and render-rs.
 
 pub mod array;
 pub mod device_id;
 pub mod external;
 pub mod green;
 pub mod host;
+pub mod identity;
 pub mod lease;
+pub mod scratch;
 pub mod sparse;
+pub mod teardown;
 pub mod texture;
 
 pub use array::{Array, ArrayDesc, ArrayFormat, MipmappedArray};
@@ -37,8 +44,11 @@ pub use device_id::{DeviceRef, Luid, device_luid, device_uuid};
 pub use external::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 pub use green::{GreenContext, split_sms};
 pub use host::{HostRegistration, ManagedBuffer};
+pub use identity::{same_context, same_stream};
 pub use lease::{Access, enqueue_leased};
+pub use scratch::{Scratch, ScratchError};
 pub use sparse::{SparseProperties, TilePool, sparse_arrays_supported};
+pub use teardown::{Drained, Library, TeardownError};
 pub use texture::{AddressMode, FilterMode, SurfaceObject, TextureDesc, TextureObject};
 
 use cuda_core::{Context, DriverError};

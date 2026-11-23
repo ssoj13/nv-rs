@@ -12,10 +12,11 @@
 //!   `Shutdown1`, `CreateFeature` / `EvaluateFeature_C` / `ReleaseFeature`).
 //!
 //! **Conventions.** Every native handle owns its NGX object, holds an `Arc` of the parent
-//! [`NgxVulkan`] session, and releases it on `Drop`; teardown failures are kept for
-//! [`take_teardown_error`]. NGX is documented as not thread-safe (`nvsdk_ngx.h:18-19`,
-//! `nvsdk_ngx_vk.h:16-17`), so every NGX entry point runs under one process-wide lock. Targets
-//! without the NGX SDK compile clean stubs returning [`Error::Unsupported`].
+//! [`NgxVulkan`] session, and releases it on `Drop`; teardown failures are kept with their raw
+//! status in `cuda_core_ext::teardown` and drained by [`take_teardown_errors`]. NGX is
+//! documented as not thread-safe (`nvsdk_ngx.h:18-19`, `nvsdk_ngx_vk.h:16-17`), so every NGX
+//! entry point runs under one process-wide lock. Targets without the NGX SDK compile clean stubs
+//! returning [`Error::Unsupported`].
 //! **Used by** renderers, upscalers, and NGX GPU smoke tests.
 
 pub mod error;
@@ -55,14 +56,11 @@ pub(crate) fn check_sys(call: &'static str, rc: sys::NVSDK_NGX_Result) -> Result
 pub(crate) struct NgxGlobal {
     /// `VkDevice` addresses that currently own a live [`NgxVulkan`] session.
     live_devices: Vec<usize>,
-    /// Most recent teardown failure not yet taken by [`take_teardown_error`].
-    teardown_error: Option<Error>,
 }
 
 #[cfg(has_ngx_sdk)]
 static NGX_GLOBAL: std::sync::Mutex<NgxGlobal> = std::sync::Mutex::new(NgxGlobal {
     live_devices: Vec::new(),
-    teardown_error: None,
 });
 
 #[cfg(has_ngx_sdk)]
@@ -87,10 +85,16 @@ impl NgxGlobal {
         self.live_devices.retain(|&d| d != device);
     }
 
-    /// Keeps a failed teardown status from a `Drop` impl for [`take_teardown_error`].
-    pub(crate) fn record_teardown(&mut self, call: &'static str, rc: sys::NVSDK_NGX_Result) {
-        if let Err(e) = check_sys(call, rc) {
-            self.teardown_error = Some(e);
+    /// Keeps a failed teardown status from a `Drop` impl in `cuda_core_ext::teardown`
+    /// (`Library::Ngx`, the raw `NVSDK_NGX_Result`) for [`take_teardown_errors`]. Records only
+    /// what [`check_sys`] reports as a failure.
+    pub(crate) fn record_teardown(call: &'static str, rc: sys::NVSDK_NGX_Result) {
+        if check_sys(call, rc).is_err() {
+            cuda_core_ext::teardown::record(
+                cuda_core_ext::teardown::Library::Ngx,
+                call,
+                i64::from(i32::from_ne_bytes(rc.to_ne_bytes())),
+            );
         }
     }
 }
@@ -115,21 +119,15 @@ pub(crate) fn ngx_call<R>(f: impl FnOnce() -> R) -> R {
     ngx_locked(|_| f())
 }
 
-/// Takes the most recent failure reported by a teardown call that ran in `Drop`
+/// Drains the failures reported by NGX teardown calls that ran in `Drop`
 /// (`NVSDK_NGX_VULKAN_DestroyParameters`, `NVSDK_NGX_VULKAN_ReleaseFeature`,
-/// `NVSDK_NGX_VULKAN_Shutdown1`) and clears it.
+/// `NVSDK_NGX_VULKAN_Shutdown1`), oldest first, each with its raw `NVSDK_NGX_Result`.
 ///
-/// `Drop` cannot return an error, so the status is kept here instead of being discarded. Always
-/// `None` on targets without the NGX SDK.
-pub fn take_teardown_error() -> Option<Error> {
-    #[cfg(has_ngx_sdk)]
-    {
-        ngx_locked(|g| g.teardown_error.take())
-    }
-    #[cfg(not(has_ngx_sdk))]
-    {
-        None
-    }
+/// `Drop` cannot return an error, so the statuses are kept in the process-wide
+/// `cuda_core_ext::teardown` sink; this is `cuda_core_ext::teardown::take(Some(Library::Ngx))`.
+/// Always empty on targets without the NGX SDK.
+pub fn take_teardown_errors() -> cuda_core_ext::teardown::Drained {
+    cuda_core_ext::teardown::take(Some(cuda_core_ext::teardown::Library::Ngx))
 }
 
 #[cfg(test)]
@@ -536,28 +534,28 @@ mod tests {
     #[cfg(has_ngx_sdk)]
     #[test]
     fn teardown_failure_is_recorded_not_dropped() {
-        take_teardown_error();
-        crate::ngx_locked(|g| {
-            g.record_teardown(
-                "NVSDK_NGX_VULKAN_ReleaseFeature",
-                sys::NVSDK_NGX_Result_NVSDK_NGX_Result_Success,
-            );
-        });
-        assert!(take_teardown_error().is_none());
-        crate::ngx_locked(|g| {
-            g.record_teardown(
-                "NVSDK_NGX_VULKAN_ReleaseFeature",
-                sys::NVSDK_NGX_Result_NVSDK_NGX_Result_FAIL_OutOfDate,
-            );
-        });
-        match take_teardown_error() {
-            Some(Error::Ngx { call, code }) => {
-                assert_eq!(call, "NVSDK_NGX_VULKAN_ReleaseFeature");
-                assert_eq!(code, ResultCode::OUT_OF_DATE);
-            }
-            other => panic!("expected recorded teardown error, got {other:?}"),
-        }
-        assert!(take_teardown_error().is_none());
+        // Only this test records `Library::Ngx` in this test binary, so the drains are exact.
+        take_teardown_errors();
+        NgxGlobal::record_teardown(
+            "NVSDK_NGX_VULKAN_ReleaseFeature",
+            sys::NVSDK_NGX_Result_NVSDK_NGX_Result_Success,
+        );
+        assert!(take_teardown_errors().is_empty());
+        NgxGlobal::record_teardown(
+            "NVSDK_NGX_VULKAN_ReleaseFeature",
+            sys::NVSDK_NGX_Result_NVSDK_NGX_Result_FAIL_OutOfDate,
+        );
+        let drained = take_teardown_errors();
+        assert_eq!(drained.lost, 0);
+        assert_eq!(
+            drained.errors,
+            vec![cuda_core_ext::teardown::TeardownError {
+                library: cuda_core_ext::teardown::Library::Ngx,
+                op: "NVSDK_NGX_VULKAN_ReleaseFeature",
+                status: i64::from(ResultCode::OUT_OF_DATE.0),
+            }]
+        );
+        assert!(take_teardown_errors().is_empty(), "drained exactly once");
     }
 
     #[cfg(has_ngx_sdk)]

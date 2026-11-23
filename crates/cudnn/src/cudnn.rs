@@ -2,10 +2,13 @@
 //! forward neural-network primitives (`Conv`, `Activation`, `Pooling`, `Softmax`, `BatchNorm`).
 //!
 //! Every native handle and descriptor is owned by a single RAII type holding an
-//! `Arc<cuda_core::Context>`; `Drop` destroys the C object and records any teardown error on
-//! `Context` rather than panicking. Forward operations size workspaces up front, reject a
-//! workspace larger than the caller's explicit byte budget before growing a caller-owned
-//! [`Scratch`] buffer, and execute on a bound CUDA stream with zero steady-state host allocations.
+//! `Arc<cuda_core::Context>`; `Drop` destroys the C object without panicking and keeps a failed
+//! destroy call, with its real `cudnnStatus_t`, in the `cuda_core_ext::teardown` sink
+//! (`Library::Cudnn`). Contexts and streams are compared by value (`cuda_core_ext::same_context`
+//! / `same_stream`), so buffers imported through DLPack are accepted. Forward operations size
+//! workspaces up front, reject a workspace larger than the caller's explicit byte budget before
+//! growing a caller-owned [`Scratch`] (the shared `cuda_core_ext::Scratch`) buffer, and execute
+//! on a bound CUDA stream with zero steady-state host allocations.
 //! The backend [`graph`] executor is the exception: it builds one variant-pack descriptor per call.
 
 /// Layer, tensor, filter, convolution, activation, and pooling descriptors.
@@ -16,14 +19,14 @@ pub mod graph;
 pub mod handle;
 /// Forward convolution, activation, pooling, softmax, and batch-normalization primitives.
 pub mod ops;
-/// Reusable device scratch workspace and byte-budget helpers.
-pub mod scratch;
 
 use std::ffi::CStr;
 use std::fmt;
 use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer, DeviceBufferView, Stream};
+use cuda_core_ext::ScratchError;
+use cuda_core_ext::teardown::{self, Library};
 use cudnn_sys as sys;
 use thiserror::Error;
 
@@ -47,7 +50,9 @@ pub use ops::{
     pooling_forward,
     softmax_forward,
 };
-pub use scratch::Scratch;
+/// The shared nv-rs device workspace (`cuda_core_ext::Scratch`); its errors convert into
+/// [`Error`].
+pub use cuda_core_ext::Scratch;
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -144,48 +149,46 @@ pub fn check(call: &'static str, raw: sys::cudnnStatus_t) -> Result<()> {
     }
 }
 
-/// Verifies `stream` belongs to `ctx`.
+impl From<ScratchError> for Error {
+    fn from(e: ScratchError) -> Self {
+        match e {
+            ScratchError::WrongStream => {
+                Error::Invalid("scratch used on a different stream than it was created for")
+            }
+            ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            ScratchError::Misaligned { .. } => {
+                Error::Invalid("scratch workspace below the required alignment")
+            }
+            ScratchError::Driver(e) => Error::Driver(e),
+        }
+    }
+}
+
+/// Verifies `stream` belongs to `ctx`, comparing contexts by value
+/// ([`cuda_core_ext::same_context`]): a DLPack import or a second `Context::new` on the same
+/// ordinal is a different `Arc` for the same `CUcontext`.
 pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
-    if !Arc::ptr_eq(stream.context(), ctx) {
+    if !cuda_core_ext::same_context(stream.context(), ctx) {
         return Err(Error::Invalid("stream belongs to a different CUDA context"));
     }
     Ok(())
 }
 
-/// Verifies `stream` is the same native stream as `expected`.
-///
-/// Compares the raw `CUstream` and the owning context rather than `Arc` identity:
-/// `Context::default_stream()` returns a fresh `Arc<Stream>` on every call for the same native
-/// stream.
-pub(crate) fn same_stream(stream: &Stream, expected: &Stream) -> Result<()> {
-    if stream.cu_stream() != expected.cu_stream()
-        || !Arc::ptr_eq(stream.context(), expected.context())
-    {
-        return Err(Error::Invalid(
-            "scratch workspace belongs to a different CUDA stream",
-        ));
-    }
-    Ok(())
-}
-
-/// Rejects a workspace byte count above `budget`.
-pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
-    match budget {
-        Some(available) if peak > available => Err(Error::Budget {
-            requested: peak,
-            available,
-        }),
-        _ => Ok(()),
-    }
-}
-
-/// Records a C teardown failure onto `ctx` without panicking.
-pub(crate) fn record_teardown(ctx: &Context, code: sys::cudnnStatus_t) {
-    if code != sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS {
-        ctx.record_err(Err::<(), _>(cuda_core::DriverError(
-            cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-        )));
-    }
+/// Keeps a failed cuDNN teardown call `op` (its real `cudnnStatus_t`) in the
+/// `cuda_core_ext::teardown` sink without panicking; callable from `Drop`.
+pub(crate) fn record_teardown(op: &'static str, code: sys::cudnnStatus_t) {
+    teardown::check(
+        Library::Cudnn,
+        op,
+        i64::from(code),
+        i64::from(sys::cudnnStatus_t_CUDNN_STATUS_SUCCESS),
+    );
 }
 
 /// Converts a `usize` count or dimension into `i32` for cuDNN C APIs.
@@ -438,16 +441,24 @@ mod tests {
     }
 
     #[test]
-    fn t0_budget_and_i32_bounds() {
-        assert!(within(None, usize::MAX).is_ok());
-        assert!(within(Some(1024), 1024).is_ok());
-        let err = within(Some(1024), 1025).unwrap_err();
+    fn t0_scratch_error_mapping_and_i32_bounds() {
         assert!(matches!(
-            err,
+            Error::from(ScratchError::Budget {
+                requested: 1025,
+                available: 1024
+            }),
             Error::Budget {
                 requested: 1025,
                 available: 1024
             }
+        ));
+        assert!(matches!(
+            Error::from(ScratchError::WrongStream),
+            Error::Invalid(_)
+        ));
+        assert!(matches!(
+            Error::from(ScratchError::Misaligned { align: 256 }),
+            Error::Invalid(_)
         ));
 
         assert_eq!(checked_i32(42, "dim").unwrap(), 42);

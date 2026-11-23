@@ -7,13 +7,16 @@
 //! - [`descr`] — [`SpMatDescr`] (CSR, CSC, COO, Blocked-ELL), [`DnVecDescr`], and
 //!   [`DnMatDescr`] with dimension/index validation and context-tracked teardown.
 //! - [`ops`] — [`spmv`], [`spmm`], [`SpGemm`], [`SpSv`], and [`SpSm`] with two-phase workspace
-//!   sizing, caller byte-budget enforcement, and reusable [`Scratch`] buffers. Buffers that a
-//!   native descriptor keeps referencing after the call (SpGEMM, SpSV/SpSM analysis) are owned
-//!   by that descriptor wrapper, not by the caller's [`Scratch`].
+//!   sizing, caller byte-budget enforcement, and reusable [`Scratch`] buffers (the shared
+//!   `cuda_core_ext::Scratch`, re-exported). Buffers that a native descriptor keeps referencing
+//!   after the call (SpGEMM, SpSV/SpSM analysis) are owned by that descriptor wrapper, so those
+//!   phases take no caller [`Scratch`].
 //!
 //! **Conventions.** Every handle and descriptor owns its native cuSPARSE object, holds an
-//! `Arc<cuda_core::Context>`, and destroys it on `Drop`; teardown failures are recorded on the
-//! `Context` (`Context::record_err`) rather than panicking. Status codes are wrapped in [`Status`],
+//! `Arc<cuda_core::Context>`, and destroys it on `Drop` without panicking: a failed destroy status
+//! is kept with its real code in `cuda_core_ext::teardown` (`Library::Cusparse`), a failed context
+//! bind stays on the `Context` (`Context::record_err`). Contexts and streams are compared with
+//! `cuda_core_ext::{same_context, same_stream}`. Status codes are wrapped in [`Status`],
 //! a `Copy` integer newtype so newer toolkit codes remain representable.
 //!
 //! **Used by** sparse linear algebra consumers and the nv-rs cuSPARSE tests.
@@ -31,10 +34,11 @@ pub use ops::{
 
 pub use cusparse_sys as sys;
 
-use cuda_core::{Context, DeviceBuffer, DriverError, Stream};
-use std::ffi::{CStr, c_void};
+pub use cuda_core_ext::{Scratch, ScratchError};
+
+use cuda_core::{Context, DriverError};
+use std::ffi::CStr;
 use std::fmt;
-use std::sync::Arc;
 
 /// Raw `cusparseStatus_t` code wrapped as a `Copy` integer newtype so newer toolkit codes
 /// remain representable without breaking exhaustive matches.
@@ -148,6 +152,27 @@ pub enum Error {
     InvalidInput(&'static str),
 }
 
+impl From<ScratchError> for Error {
+    fn from(e: ScratchError) -> Self {
+        match e {
+            ScratchError::WrongStream => {
+                Error::InvalidInput("scratch used on a different stream than it was created for")
+            }
+            ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            ScratchError::Misaligned { .. } => {
+                Error::InvalidInput("scratch workspace below the required alignment")
+            }
+            ScratchError::Driver(e) => Error::Driver(e),
+        }
+    }
+}
+
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -170,23 +195,21 @@ pub(crate) fn check(call: &'static str, code: sys::cusparseStatus_t) -> Result<(
     }
 }
 
-/// Runs a cuSPARSE teardown call with `ctx` current; failures are recorded on `ctx` instead of
-/// panicking in `Drop`.
+/// Runs a cuSPARSE teardown call with `ctx` current. A failed bind stays on `ctx`
+/// (`cuda_core_ext::teardown::bind`) and skips the call; a failed status goes to the shared
+/// teardown sink with its real code. Never panics; used from `Drop`.
 pub(crate) fn teardown(
     ctx: &Context,
     call: &'static str,
     f: impl FnOnce() -> sys::cusparseStatus_t,
 ) {
-    if let Err(e) = ctx.bind_to_thread() {
-        ctx.record_err(Err::<(), _>(e));
-        return;
-    }
-    if let Err(e) = check(call, f()) {
-        // Record teardown failure as a CUDA invalid-value marker on the context without panicking.
-        let _ = e;
-        ctx.record_err(Err::<(), _>(DriverError(
-            cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-        )));
+    if cuda_core_ext::teardown::bind(ctx) {
+        cuda_core_ext::teardown::check(
+            cuda_core_ext::teardown::Library::Cusparse,
+            call,
+            i64::from(f()),
+            i64::from(sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS),
+        );
     }
 }
 
@@ -386,82 +409,6 @@ impl PointerMode {
     }
 }
 
-/// Returns `true` if `a` and `b` name the same native stream in the same `Context`.
-pub(crate) fn same_stream(a: &Stream, b: &Stream) -> bool {
-    a.cu_stream() == b.cu_stream() && Arc::ptr_eq(a.context(), b.context())
-}
-
-/// Caller-owned reusable device scratch workspace bound to one [`Stream`].
-///
-/// Grows to the high-water mark of admitted requests and never shrinks, eliminating steady-state
-/// allocations across repeated sparse operations.
-pub struct Scratch {
-    stream: Arc<Stream>,
-    buffer: Option<DeviceBuffer<u8>>,
-}
-
-impl Scratch {
-    /// Creates an empty scratch workspace for operations on `stream`.
-    pub fn new(stream: &Arc<Stream>) -> Self {
-        Self {
-            stream: stream.clone(),
-            buffer: None,
-        }
-    }
-
-    /// Current capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.buffer.as_ref().map_or(0, |b| b.len())
-    }
-
-    /// Stream this scratch buffer is bound to.
-    pub fn stream(&self) -> &Arc<Stream> {
-        &self.stream
-    }
-
-    /// Ensures at least `required` bytes are available without exceeding `budget` total bytes.
-    ///
-    /// Verifies that `stream` matches the stream this scratch buffer was created for.
-    /// Returns a device pointer (null if `required == 0` and no buffer is allocated yet) and the
-    /// available byte capacity.
-    pub fn reserve_with_budget(
-        &mut self,
-        stream: &Stream,
-        required: usize,
-        budget: usize,
-    ) -> Result<(*mut c_void, usize)> {
-        if !same_stream(stream, &self.stream) {
-            return Err(Error::InvalidInput(
-                "scratch used on a different stream than it was created for",
-            ));
-        }
-        if required > budget {
-            return Err(Error::Budget {
-                requested: required,
-                available: budget,
-            });
-        }
-        if required == 0 {
-            let ptr = self
-                .buffer
-                .as_ref()
-                .map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
-            return Ok((ptr, self.capacity()));
-        }
-        if self.capacity() < required {
-            // Free previous buffer in stream order before allocating the larger one.
-            self.buffer = None;
-            // SAFETY: `required > 0`; `self.stream` matches `stream`; cuSPARSE writes scratch before reading it.
-            self.buffer =
-                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
-        }
-        let buf = self
-            .buffer
-            .as_ref()
-            .ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
-        Ok((buf.cu_deviceptr() as *mut c_void, buf.len()))
-    }
-}
 
 #[cfg(test)]
 mod tests {

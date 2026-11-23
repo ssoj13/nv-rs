@@ -16,7 +16,9 @@
 //! `cupti-sys`.
 //!
 //! **Teardown safety.** Both [`ActivityProfiler`] and [`Subscriber`] hold `Arc<cuda_core::Context>`
-//! and record any `Drop` teardown error on `Context::record_err` instead of panicking.
+//! and never panic in `Drop`: a failed CUPTI teardown call is kept with its real `CUptiResult` in
+//! `cuda_core_ext::teardown` (`Library::Cupti`); a failed context bind stays on
+//! `Context::record_err`.
 //! **Used by** `cupti` GPU tests and profiling tools.
 
 pub mod activity;

@@ -21,14 +21,14 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use cuda_core::{Context, Event, PinnedHostBuffer, Stream};
+use cuda_core_ext::same_context;
+use cuda_core_ext::teardown::{self, Library};
 
 #[cfg(target_os = "linux")]
 use crate::check_status;
 #[cfg(target_os = "linux")]
 use crate::record_teardown_cufile;
-use crate::{
-    DeviceSpan, DeviceSpanMut, Error, IoMode, Result, decode_io_ret, record_teardown_driver_err,
-};
+use crate::{DeviceSpan, DeviceSpanMut, Error, IoMode, Result, TEARDOWN_NO_STATUS, decode_io_ret};
 
 /// Properties returned by `cuFileDriverGetProperties` (`CUfileDrvProps_t`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -221,15 +221,13 @@ impl Drop for DriverSession {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
-            match self.ctx.bind_to_thread() {
-                Err(err) => self.ctx.record_err(Err::<(), _>(err)),
-                Ok(()) => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // SAFETY: closes the session opened by `DriverSession::open` on bound context.
-                        let status = unsafe { cufile_sys::cuFileDriverClose_v2() };
-                        record_teardown_cufile(&self.ctx, status);
-                    }
+            // A failed bind puts the driver error back on the context; skip the native call.
+            if teardown::bind(&self.ctx) {
+                #[cfg(target_os = "linux")]
+                {
+                    // SAFETY: closes the session opened by `DriverSession::open` on bound context.
+                    let status = unsafe { cufile_sys::cuFileDriverClose_v2() };
+                    record_teardown_cufile(&self.ctx, "cuFileDriverClose_v2", status);
                 }
             }
         }
@@ -352,17 +350,15 @@ impl<B: DeviceSpan> Drop for RegisteredBuffer<B> {
     fn drop(&mut self) {
         if self.registered {
             self.registered = false;
-            match self.ctx.bind_to_thread() {
-                Err(err) => self.ctx.record_err(Err::<(), _>(err)),
-                Ok(()) => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // SAFETY: `self.inner` drops after `Drop::drop` returns, so `self.ptr` is still valid.
-                        let status = unsafe {
-                            cufile_sys::cuFileBufDeregister((self.ptr as usize) as *const c_void)
-                        };
-                        record_teardown_cufile(&self.ctx, status);
-                    }
+            // A failed bind puts the driver error back on the context; skip the native call.
+            if teardown::bind(&self.ctx) {
+                #[cfg(target_os = "linux")]
+                {
+                    // SAFETY: `self.inner` drops after `Drop::drop` returns, so `self.ptr` is still valid.
+                    let status = unsafe {
+                        cufile_sys::cuFileBufDeregister((self.ptr as usize) as *const c_void)
+                    };
+                    record_teardown_cufile(&self.ctx, "cuFileBufDeregister", status);
                 }
             }
         }
@@ -424,16 +420,14 @@ impl Drop for RegisteredStream {
     fn drop(&mut self) {
         if self.registered {
             self.registered = false;
-            match self.stream.context().bind_to_thread() {
-                Err(err) => self.stream.context().record_err(Err::<(), _>(err)),
-                Ok(()) => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // SAFETY: `self.stream` remains alive for the duration of this teardown call.
-                        let status =
-                            unsafe { cufile_sys::cuFileStreamDeregister(self.stream.cu_stream()) };
-                        record_teardown_cufile(self.stream.context(), status);
-                    }
+            // A failed bind puts the driver error back on the context; skip the native call.
+            if teardown::bind(self.stream.context()) {
+                #[cfg(target_os = "linux")]
+                {
+                    // SAFETY: `self.stream` remains alive for the duration of this teardown call.
+                    let status =
+                        unsafe { cufile_sys::cuFileStreamDeregister(self.stream.cu_stream()) };
+                    record_teardown_cufile(self.stream.context(), "cuFileStreamDeregister", status);
                 }
             }
         }
@@ -657,10 +651,12 @@ impl Drop for AsyncIoSlot {
         }
         if let Some(pw) = self.pending_posix_write.take()
             && let (Some(pins), Some(staging)) = (&self.in_flight, &self.staging)
-            && let Err(_io_err) =
+            && let Err(io_err) =
                 posix_write_at(&pins.fh.file, pw.file_offset, &staging.as_slice()[..pw.len])
         {
-            record_teardown_driver_err(&self.ctx, cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN);
+            // The deferred flush is an OS write, not a CUDA call: keep its OS error code.
+            let status = io_err.raw_os_error().map_or(TEARDOWN_NO_STATUS, i64::from);
+            teardown::record(Library::Cufile, POSIX_WRITE_OP, status);
         }
         self.in_flight = None;
     }
@@ -783,7 +779,7 @@ impl FileHandle {
         buf_offset: usize,
         len: usize,
     ) -> Result<(i64, i64)> {
-        if !Arc::ptr_eq(buf.context(), &self.ctx) {
+        if !same_context(buf.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "device buffer belongs to a different CUDA context",
             ));
@@ -973,10 +969,10 @@ impl FileHandle {
         len: usize,
         slot: &mut AsyncIoSlot,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.ctx) {
+        if !same_context(stream.context(), &self.ctx) {
             return Err(Error::Invalid("stream belongs to a different CUDA context"));
         }
-        if !Arc::ptr_eq(&slot.ctx, &self.ctx) {
+        if !same_context(&slot.ctx, &self.ctx) {
             return Err(Error::Invalid(
                 "AsyncIoSlot belongs to a different CUDA context",
             ));
@@ -1079,10 +1075,10 @@ impl FileHandle {
         len: usize,
         slot: &mut AsyncIoSlot,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.ctx) {
+        if !same_context(stream.context(), &self.ctx) {
             return Err(Error::Invalid("stream belongs to a different CUDA context"));
         }
-        if !Arc::ptr_eq(&slot.ctx, &self.ctx) {
+        if !same_context(&slot.ctx, &self.ctx) {
             return Err(Error::Invalid(
                 "AsyncIoSlot belongs to a different CUDA context",
             ));
@@ -1169,16 +1165,15 @@ impl Drop for FileHandle {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(raw) = self.raw.take() {
-            if let Err(err) = self.ctx.bind_to_thread() {
-                self.ctx.record_err(Err::<(), _>(err));
+            // A failed bind puts the driver error back on the context; skip the native call.
+            if !teardown::bind(&self.ctx) {
                 return;
             }
+            // `cuFileHandleDeregister` returns `void`; the only failure is that its entry point
+            // could not be resolved, so the call never ran and no cuFile status exists.
             // SAFETY: `raw` was opened via `cuFileHandleRegister` and `self.file` is still live.
-            if let Err(_err) = unsafe { cufile_sys::cuFileHandleDeregister(raw) } {
-                record_teardown_driver_err(
-                    &self.ctx,
-                    cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                );
+            if unsafe { cufile_sys::cuFileHandleDeregister(raw) }.is_err() {
+                teardown::record(Library::Cufile, "cuFileHandleDeregister", TEARDOWN_NO_STATUS);
             }
         }
     }
@@ -1196,6 +1191,13 @@ fn posix_read_at(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::
         file.seek_read(dst, offset)
     }
 }
+
+/// Native call behind [`posix_write_at`], named when a deferred flush fails in `Drop`.
+#[cfg(unix)]
+const POSIX_WRITE_OP: &str = "pwrite";
+/// Native call behind [`posix_write_at`], named when a deferred flush fails in `Drop`.
+#[cfg(windows)]
+const POSIX_WRITE_OP: &str = "WriteFile";
 
 fn posix_write_at(file: &std::fs::File, offset: u64, src: &[u8]) -> std::io::Result<usize> {
     #[cfg(unix)]

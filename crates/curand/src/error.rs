@@ -1,12 +1,14 @@
 //! Error types and status-code wrappers for `curand`.
 //!
 //! **What.** Defines [`CurandStatus`] (a `Copy` integer newtype over `curandStatus_t`), [`Error`]
-//! (`thiserror`), [`Result`], and internal status-checking / context-teardown helpers.
+//! (`thiserror`), [`Result`], and internal status-checking / teardown helpers.
 //! **Why.** Preserves raw cuRAND status codes without closed enums, surfaces `cuda-bindings`
-//! dynamic-load failures clearly, and records `Drop` failures on the owning `cuda_core::Context`.
+//! dynamic-load failures clearly, and keeps `Drop` failures with their real status in the
+//! `cuda_core_ext::teardown` sink (a failed context bind stays on the owning
+//! `cuda_core::Context`).
 //! **Used by** every module in `curand`.
 
-use cuda_core::{Context, DriverError};
+use cuda_core::DriverError;
 use std::fmt;
 
 /// Raw `curandStatus_t` status code.
@@ -151,12 +153,14 @@ pub(crate) fn check(call: &'static str, code: cuda_bindings::curandStatus_t) -> 
     }
 }
 
-/// Records a failed teardown call on the owning CUDA context.
+/// Keeps a failed `Drop` teardown call `op` in the process-wide `cuda_core_ext::teardown` sink,
+/// with its real cuRAND status.
 #[inline]
-pub(crate) fn teardown(ctx: &Context, code: cuda_bindings::curandStatus_t) {
-    if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(
-            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-        )));
-    }
+pub(crate) fn teardown(code: cuda_bindings::curandStatus_t, op: &'static str) {
+    cuda_core_ext::teardown::check(
+        cuda_core_ext::teardown::Library::Curand,
+        op,
+        i64::from(code),
+        i64::from(cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS),
+    );
 }

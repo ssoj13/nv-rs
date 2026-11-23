@@ -282,7 +282,7 @@ impl Array {
 
     fn copy(&self, stream: &Stream, c: &sys::CUDA_MEMCPY3D) -> Result<(), DriverError> {
         // A stream of another context (another GPU, a green context) cannot address this array.
-        if stream.context().cu_ctx() != self.ctx.cu_ctx() {
+        if !crate::same_context(stream.context(), &self.ctx) {
             return Err(invalid_value());
         }
         self.ctx.bind_to_thread()?;

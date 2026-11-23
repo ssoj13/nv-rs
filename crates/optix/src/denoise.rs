@@ -22,9 +22,10 @@
 //! stream and every call goes on that stream, so reuse across frames is ordered without
 //! synchronization. **Used by** render-rs and the nv-rs OptiX GPU tests.
 
-use crate::accel::{same_ctx, same_stream};
+use crate::accel::same_ctx;
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, Stream};
+use cuda_core_ext::same_stream;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -1217,7 +1218,7 @@ impl Drop for Denoiser {
             // SAFETY: owned handle; invocations must have completed (the `invoke` and `compute_*`
             // contracts).
             let code = unsafe { destroy(self.raw) };
-            self.ctx.record(code);
+            self.ctx.record("optixDenoiserDestroy", code);
         }
     }
 }
@@ -1241,7 +1242,7 @@ impl Drop for Guard<'_> {
         if let Some(destroy) = self.ctx.table().optixDenoiserDestroy {
             // SAFETY: the handle was created above and is not owned by anything else yet.
             let code = unsafe { destroy(self.raw) };
-            self.ctx.record(code);
+            self.ctx.record("optixDenoiserDestroy", code);
         }
     }
 }

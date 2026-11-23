@@ -52,17 +52,13 @@ use crate::errors::{ErrorKind, record_and_err};
 
 py_err_mapper!(map_nvenc_err, "nvenc", nvenc::Error, {
     nvenc::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-    nvenc::Error::Invalid(_)
-    | nvenc::Error::Unsupported { .. }
-    | nvenc::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvenc::Error::Invalid(_) => ErrorKind::InvalidArgument,
     nvenc::Error::Driver(_) | nvenc::Error::Status { .. } => ErrorKind::Cuda,
 });
 
 py_err_mapper!(map_nvdec_err, "nvdec", nvdec::Error, {
     nvdec::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-    nvdec::Error::Invalid(_)
-    | nvdec::Error::Unsupported { .. }
-    | nvdec::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvdec::Error::Invalid(_) => ErrorKind::InvalidArgument,
     nvdec::Error::Driver(_) | nvdec::Error::Status { .. } => ErrorKind::Cuda,
     // A panic inside a parser callback is a bug in this binding, not a CUDA failure.
     nvdec::Error::CallbackPanic(_) => ErrorKind::Runtime,
@@ -70,9 +66,7 @@ py_err_mapper!(map_nvdec_err, "nvdec", nvdec::Error, {
 
 py_err_mapper!(map_nvofa_err, "nvofa", nvofa::Error, {
     nvofa::Error::Unavailable(_) => ErrorKind::LibraryNotFound,
-    nvofa::Error::Invalid(_)
-    | nvofa::Error::Unsupported { .. }
-    | nvofa::Error::Budget { .. } => ErrorKind::InvalidArgument,
+    nvofa::Error::Invalid(_) | nvofa::Error::Unsupported { .. } => ErrorKind::InvalidArgument,
     nvofa::Error::Driver(_) | nvofa::Error::Status { .. } => ErrorKind::Cuda,
 });
 

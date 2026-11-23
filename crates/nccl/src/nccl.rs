@@ -125,20 +125,23 @@ pub fn check(call: &'static str, raw: u32) -> Result<()> {
     }
 }
 
-pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
-    if !Arc::ptr_eq(stream.context(), ctx) {
+pub(crate) fn same_ctx(stream: &Stream, ctx: &Context) -> Result<()> {
+    if !cuda_core_ext::same_context(stream.context(), ctx) {
         return Err(Error::Invalid("stream belongs to a different CUDA context"));
     }
     Ok(())
 }
 
+/// Keeps a failed NCCL teardown call (`op` returned `raw != ncclSuccess`) in the process-wide
+/// teardown sink with its real `ncclResult_t`.
 #[cfg(target_os = "linux")]
-pub(crate) fn record_teardown(ctx: &Context, raw: u32) {
-    if raw != 0 {
-        ctx.record_err(Err::<(), _>(cuda_core::DriverError(
-            cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-        )));
-    }
+pub(crate) fn record_teardown(op: &'static str, raw: u32) {
+    cuda_core_ext::teardown::check(
+        cuda_core_ext::teardown::Library::Nccl,
+        op,
+        i64::from(raw),
+        i64::from(NcclStatus::SUCCESS.0),
+    );
 }
 
 /// Element data types supported by NCCL collectives (`ncclDataType_t`).

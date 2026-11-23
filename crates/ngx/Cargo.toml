@@ -11,6 +11,7 @@ publish.workspace = true
 path = "src/ngx.rs"
 
 [dependencies]
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(any(target_os = "windows", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]

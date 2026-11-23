@@ -13,6 +13,8 @@ use std::ptr;
 use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
+use cuda_core_ext::teardown::{self, Library};
 use nvcomp_sys as sys;
 
 use crate::{BitcompMode, Error, Result, check_bitcomp, same_ctx, within};
@@ -167,7 +169,7 @@ impl BitcompPlan {
         if self
             .stream
             .as_ref()
-            .is_some_and(|bound| bound.cu_stream() == stream.cu_stream())
+            .is_some_and(|bound| cuda_core_ext::same_stream(bound, stream))
         {
             self.ctx.bind_to_thread()?;
             return Ok(());
@@ -192,7 +194,7 @@ impl BitcompPlan {
                 "lossy Bitcomp plans need the lossy compression entry points, which are not exposed",
             ));
         }
-        if !Arc::ptr_eq(input.context(), &self.ctx) || !Arc::ptr_eq(output.context(), &self.ctx) {
+        if !same_context(input.context(), &self.ctx) || !same_context(output.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "bitcomp input/output belongs to another context",
             ));
@@ -243,7 +245,7 @@ impl BitcompPlan {
         output: &mut DeviceBuffer<u8>,
     ) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
-        if !Arc::ptr_eq(input.context(), &self.ctx) || !Arc::ptr_eq(output.context(), &self.ctx) {
+        if !same_context(input.context(), &self.ctx) || !same_context(output.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "bitcomp input/output belongs to another context",
             ));
@@ -340,17 +342,18 @@ pub const BITCOMP_HEADER_BYTES: usize = 32;
 
 impl Drop for BitcompPlan {
     fn drop(&mut self) {
-        if let Err(err) = self.ctx.bind_to_thread() {
-            self.ctx.record_err(Err::<(), _>(err));
+        // A failed bind is put back on the context by `teardown::bind`; the plan then leaks.
+        if !teardown::bind(&self.ctx) {
             return;
         }
         // SAFETY: `self.raw` was initialized by `bitcompCreatePlan` and is destroyed once.
         let status = unsafe { sys::bitcompDestroyPlan(self.raw) };
-        if status != sys::bitcompResult_t_BITCOMP_SUCCESS {
-            self.ctx.record_err(Err::<(), _>(cuda_core::DriverError(
-                cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-            )));
-        }
+        teardown::check(
+            Library::Nvcomp,
+            "bitcompDestroyPlan",
+            i64::from(status),
+            i64::from(sys::bitcompResult_t_BITCOMP_SUCCESS),
+        );
     }
 }
 

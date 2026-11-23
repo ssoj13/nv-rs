@@ -123,7 +123,7 @@ impl Drop for EncoderParams {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegEncoderParamsDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegEncoderParamsDestroy", code);
         }
     }
 }
@@ -304,7 +304,7 @@ impl Drop for EncoderState {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegEncoderStateDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegEncoderStateDestroy", code);
         }
     }
 }

@@ -1,7 +1,9 @@
 //! [`Handle`], [`JpegState`], [`JpegStream`], [`PinnedBuffer`], and [`NvjpegDeviceBuffer`].
 //!
 //! **Ownership.** `Handle` holds `Arc<cuda_core::Context>` and destroys `nvjpegHandle_t` on
-//! `Drop`, recording any teardown error on `Context::record_err`. All child handles hold
+//! `Drop`; a failed nvJPEG destroy call is kept with its real `nvjpegStatus_t` in
+//! `cuda_core_ext::teardown` (`Library::Nvjpeg`), a failed context bind stays on
+//! `Context::record_err`. All child handles hold
 //! `Arc<Handle>` so the library handle always outlives them. Every constructor and `Drop` binds
 //! the handle's CUDA context first.
 //!
@@ -13,7 +15,8 @@ use crate::{
     Backend, ChromaSubsampling, DecodeGeometry, Error, ExifOrientation, ImageInfo, ImagePlanesMut,
     JpegEncoding, OutputFormat, Result, check, ensure_loaded, sys,
 };
-use cuda_core::{Context, DriverError, Stream};
+use cuda_core::{Context, Stream};
+use cuda_core_ext::teardown::{self, Library};
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -145,13 +148,15 @@ impl Handle {
         }
     }
 
-    /// Records a teardown error on the CUDA context during `Drop`.
-    pub(crate) fn record_drop_err(&self, code: sys::nvjpegStatus_t) {
-        if code != sys::nvjpegStatus_t_NVJPEG_STATUS_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(DriverError(
-                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-            )));
-        }
+    /// Keeps a failed nvJPEG teardown call `op` with its real status in the process-wide
+    /// teardown sink (`cuda_core_ext::teardown`, `Library::Nvjpeg`) during `Drop`.
+    pub(crate) fn record_drop_err(&self, op: &'static str, code: sys::nvjpegStatus_t) {
+        teardown::check(
+            Library::Nvjpeg,
+            op,
+            i64::from(code),
+            i64::from(sys::nvjpegStatus_t_NVJPEG_STATUS_SUCCESS),
+        );
     }
 }
 
@@ -161,7 +166,7 @@ impl Drop for Handle {
             self.bind_for_drop();
             // SAFETY: `self.raw` was created by `nvjpegCreate*` and is destroyed once here.
             let code = unsafe { sys::nvjpegDestroy(self.raw) };
-            self.record_drop_err(code);
+            self.record_drop_err("nvjpegDestroy", code);
         }
     }
 }
@@ -254,7 +259,7 @@ impl Drop for PinnedBuffer {
             self.handle.bind_for_drop();
             // SAFETY: `raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegBufferPinnedDestroy(raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegBufferPinnedDestroy", code);
         }
     }
 }
@@ -333,7 +338,7 @@ impl Drop for NvjpegDeviceBuffer {
             self.handle.bind_for_drop();
             // SAFETY: `raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegBufferDeviceDestroy(raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegBufferDeviceDestroy", code);
         }
     }
 }
@@ -379,7 +384,7 @@ impl Drop for JpegDecoder {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegDecoderDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegDecoderDestroy", code);
         }
     }
 }
@@ -431,7 +436,7 @@ impl Drop for DecodeParams {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegDecodeParamsDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegDecodeParamsDestroy", code);
         }
     }
 }
@@ -620,7 +625,7 @@ impl Drop for JpegState {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegJpegStateDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegJpegStateDestroy", code);
         }
         if let Some(p) = &self._pinned {
             p.release();
@@ -795,7 +800,7 @@ impl Drop for JpegStream {
             self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegJpegStreamDestroy(self.raw) };
-            self.handle.record_drop_err(code);
+            self.handle.record_drop_err("nvjpegJpegStreamDestroy", code);
         }
     }
 }

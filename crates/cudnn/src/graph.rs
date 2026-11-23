@@ -115,7 +115,8 @@ impl GraphConvSpec {
 /// RAII wrapper around a `cudnnBackendDescriptor_t`.
 struct BackendDesc {
     raw: sys::cudnnBackendDescriptor_t,
-    ctx: Arc<Context>,
+    /// Keeps the owning context alive until `Drop` has destroyed `raw`; never read.
+    _ctx: Arc<Context>,
 }
 
 impl BackendDesc {
@@ -125,7 +126,7 @@ impl BackendDesc {
         // descriptor destroyed in `Drop`.
         let status = unsafe { sys::cudnnBackendCreateDescriptor(desc_type, &mut raw) };
         check("cudnnBackendCreateDescriptor", status)?;
-        Ok(Self { raw, ctx: Arc::clone(ctx) })
+        Ok(Self { raw, _ctx: Arc::clone(ctx) })
     }
 
     fn set_attr_raw(
@@ -299,7 +300,7 @@ impl Drop for BackendDesc {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cudnnBackendCreateDescriptor` and is destroyed once.
             let status = unsafe { sys::cudnnBackendDestroyDescriptor(self.raw) };
-            record_teardown(&self.ctx, status);
+            record_teardown("cudnnBackendDestroyDescriptor", status);
             self.raw = ptr::null_mut();
         }
     }
@@ -755,7 +756,7 @@ impl GraphConvPlan {
 
     /// Verifies `handle` shares the plan's context and makes that context current on this thread.
     fn bind(&self, handle: &Handle) -> Result<()> {
-        if !Arc::ptr_eq(handle.context(), &self.ctx) {
+        if !cuda_core_ext::same_context(handle.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "cuDNN handle belongs to a different CUDA context than the graph plan",
             ));
@@ -831,10 +832,10 @@ mod tests {
             vec![12.0, 16.0, 24.0, 28.0]
         );
 
-        let other_ctx = Context::new(0).unwrap();
-        let mut foreign = Handle::new(&other_ctx).unwrap();
-        // SAFETY: the context check rejects the call before any pointer reaches cuDNN.
-        let res = unsafe { plan.execute_on_bound_stream(&mut foreign, 0, 0, 0, 0) };
-        assert!(matches!(res, Err(Error::Invalid(_))));
+        // `Context::new(0)` retains the same primary `CUcontext` through a different `Arc`: the
+        // plan's context check compares contexts by value and must accept its handle.
+        let same_ctx_other_arc = Context::new(0).unwrap();
+        let other_handle = Handle::new(&same_ctx_other_arc).unwrap();
+        plan.bind(&other_handle).unwrap();
     }
 }

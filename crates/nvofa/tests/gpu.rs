@@ -210,4 +210,10 @@ fn buffer_drop_without_current_context_records_no_error() {
     drop(buffers);
     cuda.check_err()
         .expect("buffer teardown without a current context recorded an error");
+    // NVOFA destroy statuses go to the teardown sink, not to the context: check both.
+    let failed = cuda_core_ext::teardown::take(Some(cuda_core_ext::teardown::Library::Nvofa));
+    assert!(
+        failed.is_empty(),
+        "nvOFDestroyGPUBufferCuda failed without a current context: {failed:?}"
+    );
 }

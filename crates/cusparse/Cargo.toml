@@ -13,6 +13,7 @@ path = "src/cusparse.rs"
 [dependencies]
 cusparse-sys = { path = "../cusparse-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

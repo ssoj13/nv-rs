@@ -170,7 +170,10 @@ fn encode_with_b_frames_reports_need_more_input() {
 
 /// ENC-6: a sticky CUDA error on the context made `EncodeSession::drop` return before
 /// `nvEncDestroyEncoder`, leaking the hardware session. GeForce boards cap concurrent sessions
-/// (8 on current drivers), so leaked sessions make a later `open` fail inside this loop.
+/// (8 on current drivers), so leaked sessions make a later `open` fail inside this loop. The
+/// injected `CUDA_ERROR_UNKNOWN` stands for any sticky driver error: the drop must put it back on
+/// the context (failed bind) and the destroy itself must not fail (nothing in the NVENC teardown
+/// sink).
 #[test]
 #[ignore = "GPU: needs NVIDIA driver with NVENC; run with --ignored"]
 fn drop_with_sticky_context_error_still_destroys_session() {
@@ -185,6 +188,11 @@ fn drop_with_sticky_context_error_still_destroys_session() {
         assert!(
             cuda.check_err().is_err(),
             "the sticky error must still be reported after the drop"
+        );
+        let failed = cuda_core_ext::teardown::take(Some(cuda_core_ext::teardown::Library::Nvenc));
+        assert!(
+            failed.is_empty(),
+            "nvEncDestroyEncoder failed during drop #{i}: {failed:?}"
         );
     }
 }

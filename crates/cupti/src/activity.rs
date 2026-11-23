@@ -18,11 +18,13 @@
 //! version. The fields read have the same offsets in every version (asserted at compile time).
 //!
 //! **Teardown safety.** `Drop` releases every [`ActivityKind`] this profiler enabled, forces a
-//! flush, and records any failure on the owning `cuda_core::Context::record_err`. When the last
-//! live profiler drops, undrained records are discarded so the next session starts empty.
+//! flush, and keeps any CUPTI failure with its real `CUptiResult` in `cuda_core_ext::teardown`
+//! (`Library::Cupti`); a failed context bind stays on `cuda_core::Context::record_err`. When the
+//! last live profiler drops, undrained records are discarded so the next session starts empty.
 
 use crate::{Error, Result, check, ensure_loaded, panic_payload_to_string, sys};
-use cuda_core::{Context, DriverError};
+use cuda_core::Context;
+use cuda_core_ext::teardown::{self, Library};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -588,7 +590,10 @@ impl ActivityProfiler {
 
 impl Drop for ActivityProfiler {
     fn drop(&mut self) {
-        let _ = self.cuda.bind_to_thread();
+        // The CUPTI activity calls below are process-global and must run (they keep the shared
+        // kind reference counts consistent) even when the bind fails; `bind` then keeps the
+        // driver error on the context.
+        teardown::bind(&self.cuda);
         let mut refs = kind_refs();
         for kind in self.enabled.drain(..) {
             if !refs.release(kind) {
@@ -597,19 +602,21 @@ impl Drop for ActivityProfiler {
             }
             // SAFETY: `kind` was enabled through this profiler and no other profiler holds it.
             let rc = unsafe { sys::cuptiActivityDisable(kind.to_sys()) };
-            if rc != sys::CUptiResult_CUPTI_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Cupti,
+                "cuptiActivityDisable",
+                rc as i64,
+                sys::CUptiResult_CUPTI_SUCCESS as i64,
+            );
         }
         // SAFETY: forced flush on teardown ensures CUPTI returns all in-flight buffers to the pool.
         let rc = unsafe { sys::cuptiActivityFlushAll(FLUSH_FORCED) };
-        if rc != sys::CUptiResult_CUPTI_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(DriverError(
-                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-            )));
-        }
+        teardown::check(
+            Library::Cupti,
+            "cuptiActivityFlushAll",
+            rc as i64,
+            sys::CUptiResult_CUPTI_SUCCESS as i64,
+        );
         refs.live = refs.live.saturating_sub(1);
         if refs.live == 0 {
             // No profiler is left to drain what the flush above delivered; discard it so the next

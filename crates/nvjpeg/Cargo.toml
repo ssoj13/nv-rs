@@ -13,6 +13,7 @@ path = "src/nvjpeg.rs"
 [dependencies]
 nvjpeg-sys = { path = "../nvjpeg-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

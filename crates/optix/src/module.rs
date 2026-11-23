@@ -624,7 +624,7 @@ impl Drop for Module {
             // SAFETY: owned handle; program groups and modules specialised from it hold an `Arc`
             // of `self`, and task-based compiles hold one until their tasks are gone.
             let code = unsafe { destroy(self.raw) };
-            self.ctx.record(code);
+            self.ctx.record("optixModuleDestroy", code);
         }
     }
 }
@@ -942,7 +942,7 @@ impl Drop for ProgramGroup {
             cuda.record_err(cuda.bind_to_thread());
             // SAFETY: owned handle; pipelines using it hold an `Arc` of `self`.
             let code = unsafe { destroy(self.raw) };
-            self.ctx.record(code);
+            self.ctx.record("optixProgramGroupDestroy", code);
         }
     }
 }

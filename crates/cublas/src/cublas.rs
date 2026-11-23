@@ -7,19 +7,21 @@
 //!   `dgemm_strided_batched`, and `gemm_ex` / `gemm_strided_batched_ex`.
 //! - [`lt`] — [`LtHandle`], [`MatmulDesc`], [`MatrixLayout`], [`Preference`], [`HeuristicResult`],
 //!   [`Order`], and [`Epilogue`].
-//! - [`scratch`] — [`Scratch`] caller-owned reusable device workspace with byte-budget checks.
+//! - [`Scratch`] — caller-owned reusable device workspace with byte-budget checks, re-exported
+//!   from `cuda_core_ext` (the one nv-rs workspace implementation).
 //! - [`error`] — [`Status`] (`Copy` integer newtype) and [`Error`].
 //!
 //! **Conventions.** Every handle owns its native cuBLAS/cuBLASLt object, holds `Arc<Context>`, and
-//! destroys it on `Drop` while recording any teardown error on the CUDA context. Enqueueing calls
-//! take `&Stream` and perform zero heap allocations.
+//! destroys it on `Drop`; a failed destroy is kept, with its real status, in the
+//! `cuda_core_ext::teardown` sink (`Library::Cublas` / `Library::CublasLt`). cuBLASLt descriptors
+//! (`MatmulDesc`, `MatrixLayout`, `Preference`, `MatrixTransformDesc`, `EmulationDesc`) are host
+//! objects and take no context. Enqueueing calls take `&Stream` and perform zero heap allocations.
 //! **Used by** dense linear algebra workloads and the nv-rs T0/T3 test suite.
 
 pub mod error;
 pub mod gemm;
 pub mod handle;
 pub mod lt;
-pub mod scratch;
 
 pub use error::{Error, Result, Status};
 pub use handle::{ComputeType, DataType, GemmAlgo, Handle, MathMode, Operation, PointerMode};
@@ -29,7 +31,7 @@ pub use lt::{
     MatmulDescAttr, MatrixLayout, MatrixLayoutAttr, MatrixTransformDesc, MatrixTransformDescAttr,
     Order, Preference, PreferenceAttr, ReductionScheme, SearchMode,
 };
-pub use scratch::Scratch;
+pub use cuda_core_ext::Scratch;
 
 pub use cublas_sys as sys;
 pub use cublaslt_sys as lt_sys;
@@ -393,12 +395,12 @@ mod tests {
         let c_dev = cuda_core::DeviceBuffer::from_host(&stream, &c_host).unwrap();
         let mut d_dev = cuda_core::DeviceBuffer::zeroed(&stream, 16).unwrap();
 
-        let desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).unwrap();
-        let a_layout = MatrixLayout::new(&ctx, DataType::F32, m, k, m as i64).unwrap();
-        let b_layout = MatrixLayout::new(&ctx, DataType::F32, k, n, k as i64).unwrap();
-        let c_layout = MatrixLayout::new(&ctx, DataType::F32, m, n, m as i64).unwrap();
-        let d_layout = MatrixLayout::new(&ctx, DataType::F32, m, n, m as i64).unwrap();
-        let mut pref = Preference::new(&ctx).unwrap();
+        let desc = MatmulDesc::new(ComputeType::F32, DataType::F32).unwrap();
+        let a_layout = MatrixLayout::new(DataType::F32, m, k, m as i64).unwrap();
+        let b_layout = MatrixLayout::new(DataType::F32, k, n, k as i64).unwrap();
+        let c_layout = MatrixLayout::new(DataType::F32, m, n, m as i64).unwrap();
+        let d_layout = MatrixLayout::new(DataType::F32, m, n, m as i64).unwrap();
+        let mut pref = Preference::new().unwrap();
         pref.set_max_workspace_bytes(1024 * 1024).unwrap();
 
         let heuristic = lt

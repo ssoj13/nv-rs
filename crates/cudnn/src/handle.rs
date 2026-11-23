@@ -1,4 +1,5 @@
-//! RAII ownership of `cudnnHandle_t` with explicit stream binding and context-recorded teardown.
+//! RAII ownership of `cudnnHandle_t` with explicit stream binding; a failed `cudnnDestroy` is kept
+//! in the `cuda_core_ext::teardown` sink with its real status.
 
 use std::ptr;
 use std::sync::Arc;
@@ -11,8 +12,9 @@ use crate::{Result, check, record_teardown, same_ctx};
 /// Owned cuDNN library handle tied to one [`Context`].
 ///
 /// The handle stores the most recently bound [`Arc<Stream>`] so stream lifetime outlives any
-/// queued cuDNN work. Dropping `Handle` binds the context and destroys the handle, recording any
-/// teardown error onto [`Context`] without panicking.
+/// queued cuDNN work. Dropping `Handle` binds the context and destroys the handle without
+/// panicking: a failed bind stays on [`Context`], a failed `cudnnDestroy` goes to
+/// `cuda_core_ext::teardown` (`Library::Cudnn`).
 pub struct Handle {
     raw: sys::cudnnHandle_t,
     ctx: Arc<Context>,
@@ -97,7 +99,7 @@ impl Handle {
         if self
             .stream
             .as_ref()
-            .is_some_and(|bound| bound.cu_stream() == stream.cu_stream())
+            .is_some_and(|bound| cuda_core_ext::same_stream(bound, stream))
         {
             self.ctx.bind_to_thread()?;
             return Ok(());
@@ -108,12 +110,12 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if let Err(err) = self.ctx.bind_to_thread() {
-            self.ctx.record_err(Err::<(), _>(err));
+        // A failed bind is put back on the context by `teardown::bind`; the handle then leaks.
+        if !cuda_core_ext::teardown::bind(&self.ctx) {
             return;
         }
         // SAFETY: `self.raw` was initialized by `cudnnCreate` and has not been destroyed.
         let code = unsafe { sys::cudnnDestroy(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroy", code);
     }
 }

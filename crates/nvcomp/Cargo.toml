@@ -10,8 +10,8 @@ publish = false
 path = "src/nvcomp.rs"
 
 [dependencies]
-cuda-bindings.workspace = true
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 nv-loader.workspace = true
 nvcomp-sys = { path = "../nvcomp-sys" }
 thiserror.workspace = true

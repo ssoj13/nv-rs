@@ -14,8 +14,11 @@
 //!   (the larger of the `device_select` count and the descriptor's grid size) before the call;
 //!   pointer validity and `lwork` sizing remain the caller's `unsafe` contract.
 
-use crate::{EigMode, Error, FillMode, Op, Result, check_mg, ensure_mg_loaded, mg_sys};
-use cuda_core::{Context, DriverError};
+use crate::{
+    EigMode, Error, FillMode, Op, Result, check_mg, ensure_mg_loaded, mg_sys, teardown_check_mg,
+};
+use cuda_core::Context;
+use cuda_core_ext::teardown;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -756,18 +759,10 @@ impl Drop for MgHandle {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            if let Err(e) = self.cuda.bind_to_thread() {
-                self.cuda.record_err(Err::<(), _>(e));
-                return;
-            }
-            // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroy", unsafe {
-                mg_sys::cusolverMgDestroy(raw)
-            }) {
-                let _ = e;
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
+            if teardown::bind(&self.cuda) {
+                // SAFETY: `raw` is owned by `self` and destroyed once.
+                let status = unsafe { mg_sys::cusolverMgDestroy(raw) };
+                teardown_check_mg("cusolverMgDestroy", status);
             }
         }
     }
@@ -828,18 +823,10 @@ impl Drop for MgGrid {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            if let Err(e) = self.cuda.bind_to_thread() {
-                self.cuda.record_err(Err::<(), _>(e));
-                return;
-            }
-            // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroyGrid", unsafe {
-                mg_sys::cusolverMgDestroyGrid(raw)
-            }) {
-                let _ = e;
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
+            if teardown::bind(&self.cuda) {
+                // SAFETY: `raw` is owned by `self` and destroyed once.
+                let status = unsafe { mg_sys::cusolverMgDestroyGrid(raw) };
+                teardown_check_mg("cusolverMgDestroyGrid", status);
             }
         }
     }
@@ -898,18 +885,10 @@ impl Drop for MgMatrixDesc {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            if let Err(e) = self.grid.cuda.bind_to_thread() {
-                self.grid.cuda.record_err(Err::<(), _>(e));
-                return;
-            }
-            // SAFETY: `raw` is owned by `self` and destroyed once.
-            if let Err(e) = check_mg("cusolverMgDestroyMatrixDesc", unsafe {
-                mg_sys::cusolverMgDestroyMatrixDesc(raw)
-            }) {
-                let _ = e;
-                self.grid.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
+            if teardown::bind(&self.grid.cuda) {
+                // SAFETY: `raw` is owned by `self` and destroyed once.
+                let status = unsafe { mg_sys::cusolverMgDestroyMatrixDesc(raw) };
+                teardown_check_mg("cusolverMgDestroyMatrixDesc", status);
             }
         }
     }

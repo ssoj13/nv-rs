@@ -31,7 +31,6 @@ nvofa = { path = "../../crates/nvofa" }
 cusparse = { path = "../../crates/cusparse" }
 cusolver = { path = "../../crates/cusolver" }
 cudnn = { path = "../../crates/cudnn" }
-cudnn-sys = { path = "../../crates/cudnn-sys" }
 optix = { path = "../../crates/optix" }
 npp = { path = "../../crates/npp" }
 ngx = { path = "../../crates/ngx" }

@@ -16,8 +16,9 @@
 //! - [`guid`] — authoritative H.264, HEVC, AV1, profile, and `P1`–`P7` preset GUIDs.
 //!
 //! **Conventions.** Every handle owns its NVENC object, holds an `Arc` of its parent
-//! (`EncodeSession` / `cuda_core::Context`), and destroys it on `Drop`; teardown failures are
-//! recorded on the CUDA context (`Context::record_err`) rather than panicking.
+//! (`EncodeSession` / `cuda_core::Context`), and destroys it on `Drop`. A failing NVENC teardown
+//! call is kept with its real `NVENCSTATUS` in `cuda_core_ext::teardown` (`Library::Nvenc`); a
+//! failed context bind stays on the CUDA context (`Context::record_err`). `Drop` never panics.
 //! **Used by** media pipelines and the `nvdec` round-trip PSNR tests.
 
 pub mod guid;
@@ -25,6 +26,7 @@ pub mod guid;
 pub use nvenc_sys as sys;
 
 use cuda_core::{Context, DriverError, Stream};
+use cuda_core_ext::teardown::{self, Library};
 use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::marker::PhantomData;
@@ -77,24 +79,6 @@ pub enum Error {
     /// A CUDA driver call failed.
     #[error("CUDA: {0}")]
     Driver(#[from] DriverError),
-    /// The device or driver does not support the requested codec, profile, or capability.
-    #[error("unsupported {what}: required {required}, found {found}")]
-    Unsupported {
-        /// What was requested.
-        what: &'static str,
-        /// Minimum required value or identifier.
-        required: u32,
-        /// Reported capability value.
-        found: u32,
-    },
-    /// Operation exceeds the caller's byte budget.
-    #[error("needs {requested} bytes, budget admits {available}")]
-    Budget {
-        /// Bytes requested.
-        requested: usize,
-        /// Bytes admitted by budget.
-        available: usize,
-    },
     /// An argument was rejected before reaching NVENC.
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
@@ -681,9 +665,7 @@ impl EncodeSession {
                 // SAFETY: `raw` was returned by `nvEncOpenEncodeSessionEx`.
                 let d_status = unsafe { destroy_fn(raw) };
                 if d_status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                    cuda.record_err(Err::<(), _>(DriverError(
-                        cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                    )));
+                    teardown::record(Library::Nvenc, "nvEncDestroyEncoder", i64::from(d_status));
                 }
             }
             return check("nvEncOpenEncodeSessionEx", status, None, list).map(|()| unreachable!());
@@ -953,11 +935,12 @@ impl Drop for EncodeSession {
             let _guard = self.lock_session();
             // SAFETY: `self.raw` is owned by this `EncodeSession` and no child handles remain (they hold `Arc<EncodeSession>`).
             let status = unsafe { destroy_fn(self.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncDestroyEncoder",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1063,11 +1046,12 @@ impl Drop for InputBuffer {
             let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was created by `nvEncCreateInputBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncDestroyInputBuffer",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1116,11 +1100,12 @@ impl Drop for InputLock<'_> {
             let _guard = self.buf.session.lock_session();
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncUnlockInputBuffer",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1301,11 +1286,12 @@ impl Drop for RegisteredResource {
             let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was registered on `self.session` and all `MappedResource` guards have dropped.
             let status = unsafe { unreg_fn(self.session.raw, self.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncUnregisterResource",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1329,11 +1315,12 @@ impl Drop for MappedResource<'_> {
             let _guard = self.res.session.lock_session();
             // SAFETY: `self.mapped` was returned by `nvEncMapInputResource`.
             let status = unsafe { unmap_fn(self.res.session.raw, self.mapped) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.res.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncUnmapInputResource",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1443,11 +1430,12 @@ impl Drop for OutputBitstream {
             let _guard = self.session.lock_session();
             // SAFETY: `self.raw` was created by `nvEncCreateBitstreamBuffer` on `self.session`.
             let status = unsafe { destroy_fn(self.session.raw, self.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncDestroyBitstreamBuffer",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }
@@ -1484,11 +1472,12 @@ impl Drop for BitstreamLock<'_> {
             let _guard = self.buf.session.lock_session();
             // SAFETY: `self.buf.raw` is currently locked by this guard.
             let status = unsafe { unlock_fn(self.buf.session.raw, self.buf.raw) };
-            if status != sys::_NVENCSTATUS_NV_ENC_SUCCESS {
-                self.buf.session.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Nvenc,
+                "nvEncUnlockBitstream",
+                i64::from(status),
+                i64::from(sys::_NVENCSTATUS_NV_ENC_SUCCESS),
+            );
         }
     }
 }

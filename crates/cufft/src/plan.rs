@@ -12,9 +12,10 @@
 //! **Used by** `cufft` callers and T0/T3 tests.
 
 use crate::error::{check, teardown};
-use crate::scratch::{ScratchInner, ScratchState};
+use crate::scratch::Shared;
 use crate::{Error, Result, Scratch, sys};
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Stream};
+use cuda_core_ext::{same_context, same_stream};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -395,12 +396,11 @@ impl RawHandle {
 impl Drop for RawHandle {
     fn drop(&mut self) {
         if self.handle != 0 {
-            if self.cuda.bind_to_thread().is_ok() {
+            // A failed bind leaves its driver error on `self.cuda` and skips the native call.
+            if cuda_core_ext::teardown::bind(&self.cuda) {
                 // SAFETY: `self.handle` was created by `cufftCreate` and has not been transferred.
                 let code = unsafe { sys::cufftDestroy(self.handle) };
-                teardown(&self.cuda, code);
-            } else {
-                teardown(&self.cuda, sys::cufftResult_t_CUFFT_SETUP_FAILED);
+                teardown(code, "cufftDestroy");
             }
             self.handle = 0;
         }
@@ -415,7 +415,7 @@ pub struct Plan {
     work_size: usize,
     min_input_elems: usize,
     min_output_elems: usize,
-    workspace: Option<Arc<ScratchInner>>,
+    workspace: Option<Arc<Shared>>,
     last_generation: AtomicU64,
     last_ws_ptr: AtomicUsize,
     /// Makes `Plan` `!Sync`: cuFFT allows concurrent use only of different plans, and each exec
@@ -486,24 +486,23 @@ impl Plan {
         scratch: &mut Scratch,
     ) -> Result<Self> {
         let stream = scratch.stream().clone();
-        if !Arc::ptr_eq(stream.context(), &guard.cuda) {
+        if !same_context(stream.context(), &guard.cuda) {
             return Err(Error::Invalid(
                 "scratch stream belongs to a different CUDA context than the plan",
             ));
         }
-        let ws_ptr = scratch.reserve(&stream, work_size, budget)?;
+        let (ws_ptr, ws_gen) = scratch.reserve(&stream, work_size, budget)?;
         let handle = guard.handle;
         if work_size > 0 {
             guard.cuda.bind_to_thread()?;
             // SAFETY: `handle` is live with auto-allocation disabled; `ws_ptr` has `work_size` bytes.
             check("cufftSetWorkArea", unsafe {
-                sys::cufftSetWorkArea(handle, ws_ptr)
+                sys::cufftSetWorkArea(handle, ws_ptr as usize as *mut c_void)
             })?;
         }
         let cuda = guard.cuda.clone();
         let handle = guard.into_handle();
         let (workspace, ws_gen, ptr) = if work_size > 0 {
-            let ws_gen = scratch.generation();
             (Some(scratch.inner.clone()), ws_gen, ws_ptr as usize)
         } else {
             (None, 0, 0)
@@ -666,21 +665,20 @@ impl Plan {
     /// Rebinds this plan's workspace to `scratch` (admitting `self.work_size()` against `budget`).
     pub fn set_work_area(&mut self, scratch: &mut Scratch, budget: usize) -> Result<()> {
         let stream = scratch.stream().clone();
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "scratch stream belongs to a different CUDA context than the plan",
             ));
         }
-        let ws_ptr = scratch.reserve(&stream, self.work_size, budget)?;
+        let (ws_ptr, ws_gen) = scratch.reserve(&stream, self.work_size, budget)?;
         if self.work_size > 0 {
             self.cuda.bind_to_thread()?;
             // SAFETY: `self.handle` is live and `ws_ptr` has `self.work_size` device bytes.
             check("cufftSetWorkArea", unsafe {
-                sys::cufftSetWorkArea(self.handle, ws_ptr)
+                sys::cufftSetWorkArea(self.handle, ws_ptr as usize as *mut c_void)
             })?;
             self.workspace = Some(scratch.inner.clone());
-            self.last_generation
-                .store(scratch.generation(), Ordering::Release);
+            self.last_generation.store(ws_gen, Ordering::Release);
             self.last_ws_ptr.store(ws_ptr as usize, Ordering::Release);
         } else {
             self.workspace = None;
@@ -695,13 +693,13 @@ impl Plan {
     /// If the plan requires workspace (`work_size > 0`), `stream` must belong to the same CUDA
     /// context and share the same native stream as the workspace allocation.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than the cuFFT plan",
             ));
         }
         if let Some(ws) = &self.workspace
-            && stream.cu_stream() != ws.stream.cu_stream()
+            && !same_stream(stream, &ws.stream)
         {
             return Err(Error::Invalid(
                 "stream does not match cuFFT plan workspace stream",
@@ -720,32 +718,35 @@ impl Plan {
     /// held no clone of the [`Scratch`] can `reserve` (and so drop) the buffer bound to this plan.
     /// Once the exec is queued on the scratch stream, a later drop frees the buffer with
     /// `cuMemFreeAsync` on that same stream, ordered after the exec.
-    fn ensure_workspace(&self, stream: &Stream) -> Result<Option<MutexGuard<'_, ScratchState>>> {
+    fn ensure_workspace(
+        &self,
+        stream: &Stream,
+    ) -> Result<Option<MutexGuard<'_, cuda_core_ext::Scratch>>> {
         if self.work_size == 0 {
             return Ok(None);
         }
         let ws = self.workspace.as_ref().ok_or(Error::Invalid(
             "cuFFT plan requires workspace but none is retained",
         ))?;
-        if stream.cu_stream() != ws.stream.cu_stream() {
+        if !same_stream(stream, &ws.stream) {
             return Err(Error::Invalid(
                 "execution stream does not match cuFFT plan workspace stream",
             ));
         }
-        let state = ws.state.lock().unwrap_or_else(|p| p.into_inner());
-        let current_gen = state.generation;
+        let state = ws.lock();
+        let current_gen = state.generation();
         let last_gen = self.last_generation.load(Ordering::Acquire);
         let last_ptr = self.last_ws_ptr.load(Ordering::Acquire);
-        let buf = state
-            .buffer
-            .as_ref()
-            .ok_or(Error::Invalid("scratch buffer missing after allocation"))?;
-        if buf.len() < self.work_size {
+        let (dptr, cap) = state.as_raw_parts();
+        if cap == 0 {
+            return Err(Error::Invalid("scratch buffer missing after allocation"));
+        }
+        if cap < self.work_size {
             return Err(Error::Invalid(
                 "scratch buffer capacity smaller than required cuFFT work area",
             ));
         }
-        let current_ptr = (buf.cu_deviceptr() as usize) as *mut c_void;
+        let current_ptr = (dptr as usize) as *mut c_void;
         if current_gen != last_gen || current_ptr as usize != last_ptr {
             self.cuda.bind_to_thread()?;
             // SAFETY: `self.handle` is live and `current_ptr` has at least `self.work_size` device bytes.
@@ -923,12 +924,11 @@ impl Plan {
 impl Drop for Plan {
     fn drop(&mut self) {
         if self.handle != 0 {
-            if self.cuda.bind_to_thread().is_ok() {
+            // A failed bind leaves its driver error on `self.cuda` and skips the native call.
+            if cuda_core_ext::teardown::bind(&self.cuda) {
                 // SAFETY: `self.handle` was created by `cufftCreate` and is destroyed once.
                 let code = unsafe { sys::cufftDestroy(self.handle) };
-                teardown(&self.cuda, code);
-            } else {
-                teardown(&self.cuda, sys::cufftResult_t_CUFFT_SETUP_FAILED);
+                teardown(code, "cufftDestroy");
             }
             self.handle = 0;
         }

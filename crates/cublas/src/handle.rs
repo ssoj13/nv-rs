@@ -2,7 +2,7 @@
 //!
 //! **What.** Wraps `cublasHandle_t` bound to a `cuda_core::Context`, configures stream ordering,
 //! host/device pointer mode, math mode, and caller-owned [`Scratch`] workspace, and destroys the
-//! handle on `Drop` (recording any teardown error on the owning CUDA context).
+//! handle on `Drop` (keeping a failed `cublasDestroy_v2` in the `cuda_core_ext::teardown` sink).
 //!
 //! **Workspace rule.** [`Handle::set_workspace`] retains the scratch allocation it hands to
 //! `cublasSetWorkspace_v2` until the workspace is replaced, cleared, or the handle is dropped, and
@@ -18,6 +18,7 @@
 use crate::error::{check, teardown};
 use crate::{Error, Result, Scratch, lt_sys, sys};
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
@@ -324,7 +325,7 @@ impl Handle {
     /// Fails if `stream` belongs to a different CUDA context, or if a workspace bound with
     /// [`Self::set_workspace`] belongs to another stream (call [`Self::clear_workspace`] first).
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than the cuBLAS handle",
             ));
@@ -431,12 +432,14 @@ impl Handle {
     /// `bytes == 0` installs an empty workspace (cuBLAS then uses no workspace at all).
     pub fn set_workspace(&self, scratch: &mut Scratch, bytes: usize, budget: usize) -> Result<()> {
         let stream = scratch.stream().clone();
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "scratch stream belongs to a different CUDA context than the cuBLAS handle",
             ));
         }
-        let (ptr, cap) = scratch.reserve(&stream, bytes, budget)?;
+        let (ptr, cap) = scratch.reserve(&stream, bytes, Some(budget))?;
+        // `reserve(0)` reports the current buffer; `bytes == 0` asks for no workspace at all.
+        let (ptr, cap) = if bytes == 0 { (0, 0) } else { (ptr, cap) };
         let buf = if cap == 0 {
             None
         } else {
@@ -456,7 +459,7 @@ impl Handle {
         // SAFETY: `self.raw` is live; `ptr` is valid for `cap` device bytes on `stream` (or null/0)
         // and `buf` keeps that allocation alive for as long as it stays installed.
         let set = check("cublasSetWorkspace_v2", unsafe {
-            sys::cublasSetWorkspace_v2(self.raw, ptr, cap)
+            sys::cublasSetWorkspace_v2(self.raw, ptr as usize as *mut std::ffi::c_void, cap)
         });
         if set.is_ok() {
             *self.workspace.borrow_mut() = Some(BoundWorkspace { _buf: buf, stream });
@@ -503,15 +506,11 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            if self.cuda.bind_to_thread().is_ok() {
+            // A failed bind leaves its driver error on `self.cuda` and skips the native call.
+            if cuda_core_ext::teardown::bind(&self.cuda) {
                 // SAFETY: `self.raw` was created by `cublasCreate_v2` and is destroyed once.
                 let code = unsafe { sys::cublasDestroy_v2(self.raw) };
-                teardown(&self.cuda, code);
-            } else {
-                teardown(
-                    &self.cuda,
-                    sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED,
-                );
+                teardown(code, "cublasDestroy_v2");
             }
             self.raw = std::ptr::null_mut();
         }

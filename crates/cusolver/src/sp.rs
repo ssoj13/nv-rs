@@ -3,12 +3,14 @@
 //!
 //! **What.**
 //! - [`SpHandle`] — owns `cusolverSpHandle_t`, binds a `cuda_core::Stream`, and destroys on
-//!   `Drop` (recording teardown errors on `cuda_core::Context`).
+//!   `Drop` (failed native destroy statuses go to `cuda_core_ext::teardown`; a failed context bind
+//!   stays on `cuda_core::Context`).
 //! - [`MatDescr`] — owns `cusparseMatDescr_t` for `cusolverSp` routines.
 //! - [`SpFloat`] — sealed trait for `f32` and `f64` dispatching `S*` / `D*` sparse solvers.
 
-use crate::{Error, Result, check, ensure_loaded, sys, teardown};
-use cuda_core::{Context, DeviceBuffer, DriverError, Stream};
+use crate::{Error, Result, check, ensure_loaded, sys, teardown_cusolver};
+use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::{same_context, teardown};
 use std::sync::Arc;
 
 /// Validates CSR sparse solver dimensions and buffer lengths.
@@ -71,6 +73,17 @@ fn check_cusparse(call: &'static str, code: cusparse_sys::cusparseStatus_t) -> R
     Err(Error::Cusparse { call, code, name })
 }
 
+/// Keeps a failed cuSPARSE teardown status (the descriptor is a cuSPARSE object) in the shared
+/// teardown sink with its real code.
+fn teardown_check_cusparse(op: &'static str, status: cusparse_sys::cusparseStatus_t) {
+    teardown::check(
+        teardown::Library::Cusparse,
+        op,
+        i64::from(status),
+        i64::from(cusparse_sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS),
+    );
+}
+
 impl MatDescr {
     /// Creates a general, zero-based `cusparseMatDescr_t` on `cuda`.
     pub fn new(cuda: &Arc<Context>) -> Result<Self> {
@@ -88,16 +101,10 @@ impl MatDescr {
                 cusparse_sys::cusparseMatrixType_t_CUSPARSE_MATRIX_TYPE_GENERAL,
             )
         }) {
-            // SAFETY: clean up `raw` before returning error; record destroy failure on context.
-            if check_cusparse("cusparseDestroyMatDescr", unsafe {
-                cusparse_sys::cusparseDestroyMatDescr(raw)
-            })
-            .is_err()
-            {
-                cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
-            }
+            // SAFETY: clean up `raw` before returning the setter error; a destroy failure goes to
+            // the teardown sink so it cannot replace `err`.
+            let status = unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) };
+            teardown_check_cusparse("cusparseDestroyMatDescr", status);
             return Err(err);
         }
         // SAFETY: `raw` is valid.
@@ -107,16 +114,10 @@ impl MatDescr {
                 cusparse_sys::cusparseIndexBase_t_CUSPARSE_INDEX_BASE_ZERO,
             )
         }) {
-            // SAFETY: clean up `raw` before returning error; record destroy failure on context.
-            if check_cusparse("cusparseDestroyMatDescr", unsafe {
-                cusparse_sys::cusparseDestroyMatDescr(raw)
-            })
-            .is_err()
-            {
-                cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
-            }
+            // SAFETY: clean up `raw` before returning the setter error; a destroy failure goes to
+            // the teardown sink so it cannot replace `err`.
+            let status = unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) };
+            teardown_check_cusparse("cusparseDestroyMatDescr", status);
             return Err(err);
         }
         Ok(Self {
@@ -136,16 +137,10 @@ impl Drop for MatDescr {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            if let Err(e) = self.cuda.bind_to_thread() {
-                self.cuda.record_err(Err::<(), _>(e));
-                return;
-            }
-            // SAFETY: `raw` is owned by `self` and destroyed once.
-            let code = unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) };
-            if code != cusparse_sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-                )));
+            if teardown::bind(&self.cuda) {
+                // SAFETY: `raw` is owned by `self` and destroyed once.
+                let status = unsafe { cusparse_sys::cusparseDestroyMatDescr(raw) };
+                teardown_check_cusparse("cusparseDestroyMatDescr", status);
             }
         }
     }
@@ -427,7 +422,7 @@ impl SpHandle {
     /// Binds `stream` to this handle and makes the handle's context current on the calling
     /// thread (the handle is `Send`; every operation calls this before reaching the library).
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
-        if !Arc::ptr_eq(&self.cuda, stream.context()) {
+        if !same_context(&self.cuda, stream.context()) {
             return Err(Error::InvalidInput(
                 "stream belongs to a different CUDA context than SpHandle",
             ));
@@ -554,7 +549,7 @@ impl Drop for SpHandle {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            teardown(&self.cuda, "cusolverSpDestroy", || {
+            teardown_cusolver(&self.cuda, "cusolverSpDestroy", || {
                 // SAFETY: `raw` is owned by `self` and destroyed once.
                 unsafe { sys::cusolverSpDestroy(raw) }
             });

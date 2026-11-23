@@ -7,6 +7,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use cuda_core::Context;
+use cuda_core_ext::same_context;
 use cudnn_sys as sys;
 
 use crate::{
@@ -377,7 +378,10 @@ impl TensorDescriptor {
         if let Err(err) = check("cudnnSetTensor4dDescriptor", status) {
             // SAFETY: `raw` is valid and unowned on error.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyTensorDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyTensorDescriptor",
+                    sys::cudnnDestroyTensorDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -417,7 +421,10 @@ impl TensorDescriptor {
         if let Err(err) = check("cudnnSetTensorNdDescriptor", status) {
             // SAFETY: `raw` is valid and unowned on error.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyTensorDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyTensorDescriptor",
+                    sys::cudnnDestroyTensorDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -435,7 +442,10 @@ impl TensorDescriptor {
         if let Err(err) = check("cudnnGetTensorSizeInBytes", status) {
             // SAFETY: `raw` is valid and unowned on error.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyTensorDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyTensorDescriptor",
+                    sys::cudnnDestroyTensorDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -472,7 +482,7 @@ impl Drop for TensorDescriptor {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was created by `cudnnCreateTensorDescriptor` and is dropped once.
         let code = unsafe { sys::cudnnDestroyTensorDescriptor(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroyTensorDescriptor", code);
     }
 }
 
@@ -518,7 +528,10 @@ impl FilterDescriptor {
         if let Err(err) = check("cudnnSetFilter4dDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyFilterDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyFilterDescriptor",
+                    sys::cudnnDestroyFilterDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -528,7 +541,10 @@ impl FilterDescriptor {
         if let Err(err) = check("cudnnGetFilterSizeInBytes", sz_status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyFilterDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyFilterDescriptor",
+                    sys::cudnnDestroyFilterDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -571,7 +587,10 @@ impl FilterDescriptor {
         if let Err(err) = check("cudnnSetFilterNdDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyFilterDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyFilterDescriptor",
+                    sys::cudnnDestroyFilterDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -581,7 +600,10 @@ impl FilterDescriptor {
         if let Err(err) = check("cudnnGetFilterSizeInBytes", sz_status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyFilterDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyFilterDescriptor",
+                    sys::cudnnDestroyFilterDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -618,7 +640,7 @@ impl Drop for FilterDescriptor {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was created by `cudnnCreateFilterDescriptor` and is dropped once.
         let code = unsafe { sys::cudnnDestroyFilterDescriptor(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroyFilterDescriptor", code);
     }
 }
 
@@ -678,7 +700,10 @@ impl ConvolutionDescriptor {
         if let Err(err) = check("cudnnSetConvolution2dDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyConvolutionDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyConvolutionDescriptor",
+                    sys::cudnnDestroyConvolutionDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -735,7 +760,10 @@ impl ConvolutionDescriptor {
         if let Err(err) = check("cudnnSetConvolutionNdDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyConvolutionDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyConvolutionDescriptor",
+                    sys::cudnnDestroyConvolutionDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -771,7 +799,7 @@ impl ConvolutionDescriptor {
         input: &TensorDescriptor,
         filter: &FilterDescriptor,
     ) -> Result<[usize; 4]> {
-        if !Arc::ptr_eq(&self.ctx, input.context()) || !Arc::ptr_eq(&self.ctx, filter.context()) {
+        if !same_context(&self.ctx, input.context()) || !same_context(&self.ctx, filter.context()) {
             return Err(Error::Invalid(
                 "descriptors belong to different CUDA contexts",
             ));
@@ -825,7 +853,7 @@ impl Drop for ConvolutionDescriptor {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was created by `cudnnCreateConvolutionDescriptor` and dropped once.
         let code = unsafe { sys::cudnnDestroyConvolutionDescriptor(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroyConvolutionDescriptor", code);
     }
 }
 
@@ -862,7 +890,10 @@ impl ActivationDescriptor {
         if let Err(err) = check("cudnnSetActivationDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyActivationDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyActivationDescriptor",
+                    sys::cudnnDestroyActivationDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -887,7 +918,7 @@ impl Drop for ActivationDescriptor {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was created by `cudnnCreateActivationDescriptor` and dropped once.
         let code = unsafe { sys::cudnnDestroyActivationDescriptor(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroyActivationDescriptor", code);
     }
 }
 
@@ -945,7 +976,10 @@ impl PoolingDescriptor {
         if let Err(err) = check("cudnnSetPooling2dDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyPoolingDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyPoolingDescriptor",
+                    sys::cudnnDestroyPoolingDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -1000,7 +1034,10 @@ impl PoolingDescriptor {
         if let Err(err) = check("cudnnSetPoolingNdDescriptor", status) {
             // SAFETY: clean up descriptor on failure.
             unsafe {
-                record_teardown(ctx, sys::cudnnDestroyPoolingDescriptor(raw));
+                record_teardown(
+                    "cudnnDestroyPoolingDescriptor",
+                    sys::cudnnDestroyPoolingDescriptor(raw),
+                );
             }
             return Err(err);
         }
@@ -1012,7 +1049,7 @@ impl PoolingDescriptor {
 
     /// Computes output `[N, C, H, W]` dimensions for a 2D pooling operation.
     pub fn output_dim_4d(&self, input: &TensorDescriptor) -> Result<[usize; 4]> {
-        if !Arc::ptr_eq(&self.ctx, input.context()) {
+        if !same_context(&self.ctx, input.context()) {
             return Err(Error::Invalid(
                 "pooling and input descriptors belong to different contexts",
             ));
@@ -1053,7 +1090,7 @@ impl Drop for PoolingDescriptor {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was created by `cudnnCreatePoolingDescriptor` and dropped once.
         let code = unsafe { sys::cudnnDestroyPoolingDescriptor(self.raw) };
-        record_teardown(&self.ctx, code);
+        record_teardown("cudnnDestroyPoolingDescriptor", code);
     }
 }
 

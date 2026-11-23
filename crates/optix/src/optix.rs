@@ -15,8 +15,11 @@
 //!
 //! **Conventions.** Every handle owns its OptiX object, holds an `Arc` of what it depends on
 //! (a pipeline holds its program groups, a program group its modules, everything the
-//! [`DeviceContext`]) and destroys it on drop; drop failures are recorded on the CUDA context, as
-//! in `cuda-core`. Work is stream-ordered. Build outputs, scratch, instance and argument arrays,
+//! [`DeviceContext`]) and destroys it on drop; a failed OptiX destroy keeps its real
+//! `OptixResult` in `cuda_core_ext::teardown` (`Library::Optix`), while CUDA driver failures in a
+//! drop (bind, sync, free) are recorded on the CUDA context, as in `cuda-core`. Contexts and
+//! streams are compared by value (`cuda_core_ext::same_context` / `same_stream`). Work is
+//! stream-ordered. Build outputs, scratch, instance and argument arrays,
 //! compaction and relocation buffers and denoiser state are stream-ordered allocations on the
 //! stream of the call that creates them, freed with `cuMemFreeAsync` on that stream: ordered
 //! after the work queued there, not after work on other streams (the `unsafe` contracts make

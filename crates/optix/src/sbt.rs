@@ -133,6 +133,8 @@ impl ShaderBindingTable {
 
     /// Every record buffer lives in `cuda`, so a launch on it reads valid addresses.
     pub(crate) fn on_context(&self, cuda: &Context) -> bool {
-        self.buffers.iter().all(|b| b.context().as_ref() == cuda)
+        self.buffers
+            .iter()
+            .all(|b| cuda_core_ext::same_context(b.context(), cuda))
     }
 }

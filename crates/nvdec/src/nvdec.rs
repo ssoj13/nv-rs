@@ -66,24 +66,6 @@ pub enum Error {
     /// A CUDA driver call failed.
     #[error("CUDA: {0}")]
     Driver(#[from] DriverError),
-    /// The hardware decoder does not support the requested codec, chroma, or dimensions.
-    #[error("unsupported {what}: required {required}, found {found}")]
-    Unsupported {
-        /// What was requested.
-        what: &'static str,
-        /// Required value.
-        required: u32,
-        /// Reported value.
-        found: u32,
-    },
-    /// Operation exceeds the caller's byte budget.
-    #[error("needs {requested} bytes, budget admits {available}")]
-    Budget {
-        /// Bytes requested.
-        requested: usize,
-        /// Bytes admitted by budget.
-        available: usize,
-    },
     /// An argument was rejected before reaching NVDEC.
     #[error("invalid argument: {0}")]
     Invalid(&'static str),

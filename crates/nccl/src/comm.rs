@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
 
 #[cfg(target_os = "linux")]
 use std::ffi::c_void;
@@ -176,7 +177,9 @@ pub fn group<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 ///
 /// On `Drop`, `Comm` queries `ncclCommGetAsyncError`: if it reports an async error or an
 /// in-progress non-blocking operation, it calls `ncclCommAbort`; otherwise it calls
-/// `ncclCommDestroy`. Any teardown error is recorded onto [`Context`].
+/// `ncclCommDestroy`. Any NCCL teardown failure (including the async state that forced the
+/// abort) is kept with its real `ncclResult_t` in `cuda_core_ext::teardown` under
+/// `Library::Nccl`; a failed context bind stays on [`Context`] and skips the native calls.
 ///
 /// `ncclCommDestroy` finalizes the communicator implicitly, which waits for every operation
 /// already enqueued on it, so **`Drop` can block** while a peer has not posted matching work
@@ -243,11 +246,11 @@ impl Comm {
                 nccl_sys::ncclCommInitAll(raw_comms.as_mut_ptr(), ndev as i32, devs.as_ptr())
             };
             if let Err(err) = check("ncclCommInitAll", status) {
-                for (raw, ctx) in raw_comms.into_iter().zip(contexts.iter()) {
+                for raw in raw_comms {
                     if !raw.is_null() {
                         // SAFETY: abort any partially initialized communicator on failure.
                         let abort_status = unsafe { nccl_sys::ncclCommAbort(raw) };
-                        record_teardown(ctx, abort_status);
+                        record_teardown("ncclCommAbort", abort_status);
                     }
                 }
                 return Err(err);
@@ -264,11 +267,11 @@ impl Comm {
                 let rank = match Self::query_rank(raw) {
                     Ok(r) => r,
                     Err(err) => {
-                        for (&rem, rem_ctx) in raw_comms[idx..].iter().zip(contexts[idx..].iter()) {
+                        for &rem in &raw_comms[idx..] {
                             if !rem.is_null() {
                                 // SAFETY: abort remaining raw handles not yet wrapped in `Comm`.
                                 let abort_status = unsafe { nccl_sys::ncclCommAbort(rem) };
-                                record_teardown(rem_ctx, abort_status);
+                                record_teardown("ncclCommAbort", abort_status);
                             }
                         }
                         drop(out);
@@ -470,7 +473,7 @@ impl Comm {
             }
             // SAFETY: abort failed communicator rather than blocking in destroy.
             let abort_status = unsafe { nccl_sys::ncclCommAbort(raw) };
-            record_teardown(&self.ctx, abort_status);
+            record_teardown("ncclCommAbort", abort_status);
             check("ncclCommFinalize", async_err)
         }
         #[cfg(not(target_os = "linux"))]
@@ -516,7 +519,7 @@ impl Comm {
         R: Sized,
     {
         same_ctx(stream, &self.ctx)?;
-        if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
+        if !same_context(send.context(), &self.ctx) || !same_context(recv.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "all_reduce buffers belong to another CUDA context",
             ));
@@ -573,7 +576,7 @@ impl Comm {
         stream: &Stream,
     ) -> Result<()> {
         same_ctx(stream, &self.ctx)?;
-        if !Arc::ptr_eq(buf.context(), &self.ctx) {
+        if !same_context(buf.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "all_reduce_in_place buffer belongs to another CUDA context",
             ));
@@ -634,7 +637,7 @@ impl Comm {
         if root >= self.nranks {
             return Err(Error::Invalid("broadcast root out of range"));
         }
-        if !Arc::ptr_eq(recv.context(), &self.ctx) {
+        if !same_context(recv.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "recv buffer belongs to another CUDA context",
             ));
@@ -648,7 +651,7 @@ impl Comm {
 
         let send_ptr = match send {
             Some(s) => {
-                if !Arc::ptr_eq(s.context(), &self.ctx) {
+                if !same_context(s.context(), &self.ctx) {
                     return Err(Error::Invalid(
                         "send buffer belongs to another CUDA context",
                     ));
@@ -722,7 +725,7 @@ impl Comm {
         if root >= self.nranks {
             return Err(Error::Invalid("reduce root out of range"));
         }
-        if !Arc::ptr_eq(send.context(), &self.ctx) {
+        if !same_context(send.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "send buffer belongs to another CUDA context",
             ));
@@ -736,7 +739,7 @@ impl Comm {
 
         let recv_ptr = match recv {
             Some(r) => {
-                if !Arc::ptr_eq(r.context(), &self.ctx) {
+                if !same_context(r.context(), &self.ctx) {
                     return Err(Error::Invalid(
                         "recv buffer belongs to another CUDA context",
                     ));
@@ -798,7 +801,7 @@ impl Comm {
         R: Sized,
     {
         same_ctx(stream, &self.ctx)?;
-        if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
+        if !same_context(send.context(), &self.ctx) || !same_context(recv.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "all_gather buffers belong to another CUDA context",
             ));
@@ -859,7 +862,7 @@ impl Comm {
         R: Sized,
     {
         same_ctx(stream, &self.ctx)?;
-        if !Arc::ptr_eq(send.context(), &self.ctx) || !Arc::ptr_eq(recv.context(), &self.ctx) {
+        if !same_context(send.context(), &self.ctx) || !same_context(recv.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "reduce_scatter buffers belong to another CUDA context",
             ));
@@ -923,7 +926,7 @@ impl Comm {
         if peer >= self.nranks {
             return Err(Error::Invalid("send peer rank out of range"));
         }
-        if !Arc::ptr_eq(send.context(), &self.ctx) {
+        if !same_context(send.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "send buffer belongs to another CUDA context",
             ));
@@ -977,7 +980,7 @@ impl Comm {
         if peer >= self.nranks {
             return Err(Error::Invalid("recv peer rank out of range"));
         }
-        if !Arc::ptr_eq(recv.context(), &self.ctx) {
+        if !same_context(recv.context(), &self.ctx) {
             return Err(Error::Invalid(
                 "recv buffer belongs to another CUDA context",
             ));
@@ -1020,26 +1023,29 @@ impl Drop for Comm {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(raw) = self.raw.take() {
-            if let Err(err) = self.ctx.bind_to_thread() {
-                self.ctx.record_err(Err::<(), _>(err));
+            // A failed bind puts the driver error back on the context; skip the native calls.
+            if !cuda_core_ext::teardown::bind(&self.ctx) {
                 return;
             }
             let mut async_err: nccl_sys::ncclResult_t = 0;
             // SAFETY: inspect async error state before deciding between `ncclCommDestroy` and
             // `ncclCommAbort` so Drop never blocks on a faulted communicator.
             let query = unsafe { nccl_sys::ncclCommGetAsyncError(raw, &mut async_err) };
-            let teardown = if query == 0 && async_err == 0 {
+            // A failed query, or a successful query reporting an async fault or an in-progress
+            // operation (which the abort below cancels), is kept with its real status.
+            record_teardown("ncclCommGetAsyncError", query);
+            if query == 0 {
+                record_teardown("ncclCommGetAsyncError", async_err);
+            }
+            if query == 0 && async_err == 0 {
                 // SAFETY: communicator reported no async error or in-progress operation. `raw` is
                 // not used after this call, whatever it returns (see the type docs).
-                unsafe { nccl_sys::ncclCommDestroy(raw) }
+                let status = unsafe { nccl_sys::ncclCommDestroy(raw) };
+                record_teardown("ncclCommDestroy", status);
             } else {
                 // SAFETY: async fault or in-progress state; abort immediately to prevent deadlock.
-                unsafe { nccl_sys::ncclCommAbort(raw) }
-            };
-            if teardown != 0 || async_err != 0 {
-                self.ctx.record_err(Err::<(), _>(cuda_core::DriverError(
-                    cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
+                let status = unsafe { nccl_sys::ncclCommAbort(raw) };
+                record_teardown("ncclCommAbort", status);
             }
         }
     }

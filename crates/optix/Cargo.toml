@@ -13,6 +13,7 @@ path = "src/optix.rs"
 [dependencies]
 optix-sys = { path = "../optix-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

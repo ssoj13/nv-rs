@@ -8,7 +8,8 @@
 //!   validation.
 //!
 //! **Safety.** Descriptors hold an `Arc<Context>` and destroy their native handle on `Drop`,
-//! recording any teardown error on `Context`. Callers must ensure the backing device buffers
+//! keeping a failed destroy status in `cuda_core_ext::teardown` (a failed context bind stays on
+//! `Context`). Callers must ensure the backing device buffers
 //! remain alive for as long as the descriptor is used in cuSPARSE operations.
 //!
 //! **Used by** [`crate::ops`].

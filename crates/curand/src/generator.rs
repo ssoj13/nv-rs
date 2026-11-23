@@ -169,7 +169,7 @@ impl PoissonDistribution {
     /// the calling thread (or the CUDA runtime's primary context of the current device when none
     /// is), and `Drop` frees it in whatever context is current on the dropping thread, writing a
     /// failure to stderr. Prefer [`Self::new_on`], which binds `cuda` for creation and destruction
-    /// and records teardown failures on it.
+    /// and keeps a teardown failure in the `cuda_core_ext::teardown` sink.
     pub fn new(lambda: f64) -> Result<Self> {
         validate_poisson_lambda(lambda)?;
         ensure_loaded()?;
@@ -181,8 +181,8 @@ impl PoissonDistribution {
         Ok(Self { raw, cuda: None })
     }
 
-    /// Precomputes a Poisson distribution histogram associated with `cuda` so any teardown
-    /// failure on `Drop` is recorded onto `cuda`.
+    /// Precomputes a Poisson distribution histogram on `cuda`; `Drop` binds `cuda` and keeps a
+    /// failed `curandDestroyDistribution` in the `cuda_core_ext::teardown` sink.
     pub fn new_on(cuda: &Arc<Context>, lambda: f64) -> Result<Self> {
         validate_poisson_lambda(lambda)?;
         ensure_loaded()?;
@@ -225,25 +225,16 @@ impl Drop for PoissonDistribution {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             if let Some(ctx) = &self.cuda {
-                if ctx.bind_to_thread().is_ok() {
+                // A failed bind leaves its driver error on `ctx` and skips the native call.
+                if cuda_core_ext::teardown::bind(ctx) {
                     // SAFETY: `self.raw` was created by `curandCreatePoissonDistribution` and is destroyed once.
                     let code = unsafe { cuda_bindings::curandDestroyDistribution(self.raw) };
-                    teardown(ctx, code);
-                } else {
-                    teardown(
-                        ctx,
-                        cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED,
-                    );
+                    teardown(code, "curandDestroyDistribution");
                 }
             } else {
                 // SAFETY: `self.raw` was created by `curandCreatePoissonDistribution` and is destroyed once.
                 let code = unsafe { cuda_bindings::curandDestroyDistribution(self.raw) };
-                if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-                    eprintln!(
-                        "curandDestroyDistribution failed during Drop: {}",
-                        crate::CurandStatus(code)
-                    );
-                }
+                teardown(code, "curandDestroyDistribution");
             }
             self.raw = std::ptr::null_mut();
         }
@@ -317,7 +308,7 @@ impl Generator {
                 "cannot bind a CUDA stream to a host cuRAND generator",
             ));
         };
-        if !Arc::ptr_eq(stream.context(), ctx) {
+        if !cuda_core_ext::same_context(stream.context(), ctx) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than the cuRAND generator",
             ));
@@ -801,25 +792,16 @@ impl Drop for Generator {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             if let Some(ctx) = &self.cuda {
-                if ctx.bind_to_thread().is_ok() {
+                // A failed bind leaves its driver error on `ctx` and skips the native call.
+                if cuda_core_ext::teardown::bind(ctx) {
                     // SAFETY: `self.raw` was created by `curandCreateGenerator` and is destroyed once.
                     let code = unsafe { cuda_bindings::curandDestroyGenerator(self.raw) };
-                    teardown(ctx, code);
-                } else {
-                    teardown(
-                        ctx,
-                        cuda_bindings::curandStatus_CURAND_STATUS_INITIALIZATION_FAILED,
-                    );
+                    teardown(code, "curandDestroyGenerator");
                 }
             } else {
                 // SAFETY: `self.raw` was created by `curandCreateGeneratorHost` and is destroyed once.
                 let code = unsafe { cuda_bindings::curandDestroyGenerator(self.raw) };
-                if code != cuda_bindings::curandStatus_CURAND_STATUS_SUCCESS {
-                    eprintln!(
-                        "curandDestroyGenerator(host) failed during Drop: {}",
-                        crate::CurandStatus(code)
-                    );
-                }
+                teardown(code, "curandDestroyGenerator");
             }
             self.raw = std::ptr::null_mut();
         }

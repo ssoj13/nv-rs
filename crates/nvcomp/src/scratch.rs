@@ -1,5 +1,6 @@
-//! Reusable GPU workspace (`Scratch`) and pre-allocated host/device pointer/size tables
-//! (`BatchStaging`) for zero-allocation steady-state nvCOMP batched launches.
+//! Pre-allocated host/device pointer/size tables (`BatchStaging`) around the shared temporary
+//! workspace ([`Scratch`], `cuda_core_ext::Scratch`) for zero-allocation steady-state nvCOMP
+//! batched launches.
 //!
 //! `BatchStaging` uses a CUDA event (`dma_fence`) recorded after the pinned host table uploads so
 //! consecutive async launches on a stream never race over pinned staging memory, while the host
@@ -8,6 +9,10 @@
 //! same stream, so reuse and stream-ordered frees are ordered after queued kernels without a host
 //! wait. Each batch takes a fresh generation number so a receipt can only collect the results of
 //! the latest batch launched on its staging.
+//!
+//! The scratch growth charged by [`BatchStaging::growth`] is the full new workspace size
+//! ([`Scratch::growth`]): the old buffer's stream-ordered free may still be pending. The shared
+//! `Scratch` also bounds `temp_bytes` itself by the budget, even when its buffer is reused.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -16,109 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Event, PinnedHostBuffer, Stream};
 use nvcomp_sys as sys;
 
-use crate::{Error, Result, same_stream, within};
+use crate::{Error, Result, Scratch, same_stream, within};
 
 // C-ABI pointer and status arrays copied verbatim to/from device memory.
 const _: () = assert!(size_of::<u64>() == size_of::<*const c_void>());
 const _: () = assert!(size_of::<u32>() == size_of::<sys::nvcompStatus_t>());
-
-/// Reusable stream-ordered temporary workspace buffer for nvCOMP kernels, bound to a single
-/// [`Stream`].
-pub struct Scratch {
-    stream: Arc<Stream>,
-    buf: Option<DeviceBuffer<u8>>,
-}
-
-impl Scratch {
-    /// Creates an empty scratch workspace bound to `stream`.
-    pub fn new(stream: &Arc<Stream>) -> Self {
-        Self {
-            stream: stream.clone(),
-            buf: None,
-        }
-    }
-
-    /// Bound CUDA stream.
-    pub fn stream(&self) -> &Arc<Stream> {
-        &self.stream
-    }
-
-    /// Owning CUDA context.
-    pub fn context(&self) -> &Arc<Context> {
-        self.stream.context()
-    }
-
-    /// Current allocated capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.buf.as_ref().map_or(0, DeviceBuffer::num_bytes)
-    }
-
-    /// Device bytes a [`Self::reserve`] of `needed` bytes allocates: all of `needed` when the
-    /// workspace must grow, else `0`.
-    ///
-    /// Growth allocates a fresh buffer of `needed` bytes; the old buffer's stream-ordered free is
-    /// retired on a cuda-core completion worker and may still be pending, so the full new size
-    /// (not the difference to [`Self::capacity`]) is charged against byte budgets.
-    pub fn growth(&self, needed: usize) -> usize {
-        growth_bytes(self.capacity(), needed)
-    }
-
-    /// Ensures the workspace holds at least `needed` bytes and satisfies `align` byte alignment,
-    /// enforcing `budget` against any allocation growth.
-    pub fn reserve(
-        &mut self,
-        stream: &Arc<Stream>,
-        needed: usize,
-        align: usize,
-        budget: Option<usize>,
-    ) -> Result<(cuda_bindings::CUdeviceptr, usize)> {
-        same_stream(stream, &self.stream)?;
-        if needed == 0 {
-            return Ok(self.as_raw_parts());
-        }
-        let grow = self.growth(needed);
-        if grow > 0 {
-            within(budget, grow)?;
-            // Release the old workspace first: its free is stream-ordered on `self.stream`, the
-            // stream of every kernel that used it (checked above), so it cannot race queued work.
-            self.buf = None;
-            // SAFETY: nvCOMP temporary workspace is overwritten by device kernels before read.
-            let fresh = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, needed) }?;
-            let req_align = u64::try_from(align.max(1)).unwrap_or(u64::MAX);
-            if !fresh.cu_deviceptr().is_multiple_of(req_align) {
-                return Err(Error::Invalid(
-                    "CUDA allocator returned workspace below nvCOMP temp alignment",
-                ));
-            }
-            self.buf = Some(fresh);
-        } else if let Some(buf) = &self.buf {
-            let req_align = u64::try_from(align.max(1)).unwrap_or(u64::MAX);
-            if !buf.cu_deviceptr().is_multiple_of(req_align) {
-                return Err(Error::Invalid(
-                    "cached workspace below nvCOMP temp alignment",
-                ));
-            }
-        }
-        Ok(self.as_raw_parts())
-    }
-
-    /// Releases the GPU workspace buffer.
-    pub fn clear(&mut self) {
-        self.buf = None;
-    }
-
-    pub(crate) fn as_raw_parts(&self) -> (cuda_bindings::CUdeviceptr, usize) {
-        match self.buf.as_ref() {
-            Some(buf) => (buf.cu_deviceptr(), buf.num_bytes()),
-            None => (0, 0),
-        }
-    }
-}
-
-/// Bytes a workspace of `capacity` bytes allocates to hold `needed` bytes (see [`Scratch::growth`]).
-const fn growth_bytes(capacity: usize, needed: usize) -> usize {
-    if needed > capacity { needed } else { 0 }
-}
 
 /// Source of batch generation numbers, unique across every [`BatchStaging`] in the process.
 static NEXT_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -289,9 +196,11 @@ impl BatchStaging {
             self.tables = Some(TableSet::allocate(&self.ctx, stream, target_cap)?);
             self.capacity = target_cap;
         }
-        let _ = self
-            .scratch
-            .reserve(stream, temp_bytes, temp_align, budget)?;
+        // `budget` was already admitted above against the combined growth of tables and scratch
+        // (`Scratch::growth` charges the full new size); checking it again here would also reject
+        // reuse of an existing workspace that costs no new memory.
+        self.scratch
+            .reserve_aligned(stream, temp_bytes, temp_align, None)?;
         Ok(())
     }
 
@@ -375,15 +284,5 @@ mod tests {
         let single = TableSet::device_bytes_for(1);
         assert_eq!(single, 2 * 8 + 3 * size_of::<usize>() + 4);
         assert!(TableSet::device_bytes_for(64) >= 64 * single);
-    }
-
-    #[test]
-    fn t0_scratch_growth_charges_full_allocation() {
-        // Growing 600 -> 900 allocates a fresh 900-byte buffer while the old one may still be
-        // pending release, so the budget must see 900, not the 300-byte difference (CMP-6).
-        assert_eq!(growth_bytes(600, 900), 900);
-        assert_eq!(growth_bytes(900, 900), 0);
-        assert_eq!(growth_bytes(900, 600), 0);
-        assert_eq!(growth_bytes(0, 1), 1);
     }
 }

@@ -312,19 +312,30 @@ pub(crate) fn decode_io_ret_with(
     })
 }
 
-pub(crate) fn record_teardown_driver_err(ctx: &Context, err: cuda_bindings::CUresult) {
-    let cu = if err == cuda_bindings::cudaError_enum_CUDA_SUCCESS {
-        cuda_bindings::cudaError_enum_CUDA_ERROR_UNKNOWN
-    } else {
-        err
-    };
-    ctx.record_err(Err::<(), _>(cuda_core::DriverError(cu)));
-}
+/// Status kept in the teardown sink when a teardown step failed without producing any native
+/// status (the entry point could not be called, or the OS reported no error code). `-1` lies
+/// outside cuFile's `0` / `5000+` range and is not an OS error code.
+pub(crate) const TEARDOWN_NO_STATUS: i64 = -1;
 
+/// Keeps a failed cuFile teardown call (`op`) in `cuda_core_ext::teardown` with its real
+/// `CUfileOpError` under `Library::Cufile`. A real CUDA driver status the call reported in
+/// `cu_err` is driver state of `ctx` and goes to `Context::record_err` (cuda-core's convention).
 #[cfg(target_os = "linux")]
-pub(crate) fn record_teardown_cufile(ctx: &Context, raw: cufile_sys::CUfileError_t) {
-    if raw.err != 0 {
-        record_teardown_driver_err(ctx, raw.cu_err);
+pub(crate) fn record_teardown_cufile(
+    ctx: &Context,
+    op: &'static str,
+    raw: cufile_sys::CUfileError_t,
+) {
+    if CufileStatus(raw.err).is_success() {
+        return;
+    }
+    cuda_core_ext::teardown::record(
+        cuda_core_ext::teardown::Library::Cufile,
+        op,
+        i64::from(raw.err),
+    );
+    if raw.cu_err != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+        ctx.record_err(Err::<(), _>(cuda_core::DriverError(raw.cu_err)));
     }
 }
 

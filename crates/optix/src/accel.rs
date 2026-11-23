@@ -38,6 +38,7 @@ use crate::micromap::{MicromapUse, OpacityMicromapArray};
 use crate::xform::{Child, MotionOptions};
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
+use cuda_core_ext::same_stream;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -600,21 +601,14 @@ pub(crate) fn count(n: usize, what: &'static str) -> Result<u32> {
     u32::try_from(n).map_err(|_| Error::Invalid(what))
 }
 
-/// Rejects a stream of another CUDA context than `ctx`'s.
+/// Rejects a stream of another CUDA context than `ctx`'s (by value: `cuda_core_ext::same_context`).
 pub(crate) fn same_ctx(stream: &Stream, ctx: &DeviceContext) -> Result<()> {
-    if stream.context().as_ref() != ctx.cuda().as_ref() {
+    if !cuda_core_ext::same_context(stream.context(), ctx.cuda()) {
         return Err(Error::Invalid(
             "stream belongs to another CUDA context than the OptiX device context",
         ));
     }
     Ok(())
-}
-
-/// Whether `a` and `b` are the same CUDA stream: the same `CUstream` in the same context. The
-/// `Arc`s may differ (`Context::default_stream` returns a fresh one per call); a held `Arc`
-/// keeps its handle alive, so equal handles cannot belong to different live streams.
-pub(crate) fn same_stream(a: &Stream, b: &Stream) -> bool {
-    a.cu_stream() == b.cu_stream() && a.context().as_ref() == b.context().as_ref()
 }
 
 /// Rejects a peak allocation above the caller's budget.
@@ -695,7 +689,7 @@ pub(crate) unsafe fn copy_bytes(
         ));
     }
     stream.context().bind_to_thread()?;
-    if dst.context().as_ref() == src.context().as_ref() {
+    if cuda_core_ext::same_context(dst.context(), src.context()) {
         // SAFETY: both hold `len` bytes in one context; distinct allocations do not overlap;
         // ordering per the contract.
         unsafe {

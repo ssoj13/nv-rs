@@ -140,13 +140,15 @@ impl DeviceContext {
         self.t
     }
 
-    /// Records a failed destroy call on the CUDA context (drop paths cannot return errors).
-    pub(crate) fn record(&self, code: sys::OptixResult) {
-        if code != sys::OptixResult_OPTIX_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(cuda_core::DriverError(
-                cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-            )));
-        }
+    /// Keeps a failed destroy call `op` with its real `OptixResult` in the process-wide teardown
+    /// sink (`cuda_core_ext::teardown`, `Library::Optix`): drop paths cannot return errors.
+    pub(crate) fn record(&self, op: &'static str, code: sys::OptixResult) {
+        cuda_core_ext::teardown::check(
+            cuda_core_ext::teardown::Library::Optix,
+            op,
+            i64::from(code),
+            i64::from(sys::OptixResult_OPTIX_SUCCESS),
+        );
     }
 
     /// Replaces the log sink (`None` silences OptiX) and its level (0 = none ... 4 = print).
@@ -400,7 +402,7 @@ impl Drop for DeviceContext {
             // SAFETY: owned handle; every object created from it holds an `Arc` of `self`, so
             // none is alive any more. The sinks are dropped after this, when OptiX is done.
             let code = unsafe { destroy(self.raw) };
-            self.record(code);
+            self.record("optixDeviceContextDestroy", code);
         }
     }
 }

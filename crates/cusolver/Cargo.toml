@@ -15,6 +15,7 @@ cusolver-sys = { path = "../cusolver-sys" }
 cusolvermg-sys = { path = "../cusolvermg-sys" }
 cusparse-sys = { path = "../cusparse-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

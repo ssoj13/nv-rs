@@ -3,15 +3,18 @@
 //! **What.**
 //! - [`dn`] — [`DnHandle`]: dense linear algebra (`GETRF`/`GETRS`, `POTRF`/`POTRS`,
 //!   `GEQRF`/`ORGQR`, `GESVD`, `SYEVD`) for `f32` and `f64` with two-phase `bufferSize` ->
-//!   byte budget -> [`Scratch`].
+//!   byte budget -> [`Scratch`] (the shared `cuda_core_ext::Scratch`, re-exported).
 //! - [`sp`] — [`SpHandle`] and [`MatDescr`]: sparse QR linear solver (`csrlsvqr`) and
 //!   shift-invert eigensolver (`csreigvsi`).
 //! - [`mg`] — [`MgHandle`], [`MgGrid`], and [`MgMatrixDesc`]: multi-GPU dense `POTRF`/`POTRS`/
 //!   `POTRI`, `GETRF`/`GETRS`, and `SYEVD`.
 //!
 //! **Conventions.** Every handle owns its native cuSOLVER object, holds an
-//! `Arc<cuda_core::Context>`, and destroys it on `Drop`; teardown failures are recorded on the
-//! `Context` (`Context::record_err`) rather than panicking. Status codes are wrapped in [`Status`],
+//! `Arc<cuda_core::Context>`, and destroys it on `Drop` without panicking: a failed destroy status
+//! is kept with its real code in `cuda_core_ext::teardown` ([`teardown::Library::Cusolver`];
+//! `cusparseDestroyMatDescr` under `Library::Cusparse`), a failed context bind stays on the
+//! `Context` (`Context::record_err`). Contexts are compared with `cuda_core_ext::same_context`.
+//! Status codes are wrapped in [`Status`],
 //! a `Copy` integer newtype so newer toolkit codes remain representable.
 //!
 //! **Used by** dense/sparse solver consumers and the nv-rs cuSOLVER tests.
@@ -27,10 +30,11 @@ pub use sp::{MatDescr, SpFloat, SpHandle};
 pub use cusolver_sys as sys;
 pub use cusolvermg_sys as mg_sys;
 
-use cuda_core::{Context, DeviceBuffer, DriverError, Stream};
-use std::ffi::c_void;
+pub use cuda_core_ext::{Scratch, ScratchError};
+
+use cuda_core::{Context, DriverError, Stream};
+use cuda_core_ext::teardown;
 use std::fmt;
-use std::sync::Arc;
 
 /// Raw `cusolverStatus_t` code wrapped as a `Copy` integer newtype so newer toolkit codes
 /// remain representable without breaking exhaustive matches.
@@ -187,6 +191,27 @@ pub enum Error {
     InvalidInput(&'static str),
 }
 
+impl From<ScratchError> for Error {
+    fn from(e: ScratchError) -> Self {
+        match e {
+            ScratchError::WrongStream => {
+                Error::InvalidInput("scratch used on a different stream than it was created for")
+            }
+            ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            ScratchError::Misaligned { .. } => {
+                Error::InvalidInput("scratch workspace below the required alignment")
+            }
+            ScratchError::Driver(e) => Error::Driver(e),
+        }
+    }
+}
+
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -224,23 +249,32 @@ pub(crate) fn check_mg(call: &'static str, code: mg_sys::cusolverStatus_t) -> Re
     }
 }
 
-/// Runs a cuSOLVER teardown call with `ctx` current; failures are recorded on `ctx` instead of
-/// panicking in `Drop`.
-pub(crate) fn teardown(
+/// Runs a cuSOLVER teardown call with `ctx` current. A failed bind stays on `ctx`
+/// ([`teardown::bind`]) and skips the call; a failed status goes to the shared teardown sink with
+/// its real code. Never panics; used from `Drop`.
+pub(crate) fn teardown_cusolver(
     ctx: &Context,
     call: &'static str,
     f: impl FnOnce() -> sys::cusolverStatus_t,
 ) {
-    if let Err(e) = ctx.bind_to_thread() {
-        ctx.record_err(Err::<(), _>(e));
-        return;
+    if teardown::bind(ctx) {
+        teardown::check(
+            teardown::Library::Cusolver,
+            call,
+            i64::from(f()),
+            i64::from(sys::cusolverStatus_t_CUSOLVER_STATUS_SUCCESS),
+        );
     }
-    if let Err(e) = check(call, f()) {
-        let _ = e;
-        ctx.record_err(Err::<(), _>(DriverError(
-            cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE,
-        )));
-    }
+}
+
+/// Keeps a failed `cusolverMg` teardown status in the shared teardown sink with its real code.
+pub(crate) fn teardown_check_mg(call: &'static str, status: mg_sys::cusolverStatus_t) {
+    teardown::check(
+        teardown::Library::Cusolver,
+        call,
+        i64::from(status),
+        i64::from(mg_sys::cusolverStatus_t_CUSOLVER_STATUS_SUCCESS),
+    );
 }
 
 /// Triangular fill mode (`cublasFillMode_t`).
@@ -322,93 +356,23 @@ impl EigMode {
     }
 }
 
-/// Caller-owned reusable device scratch workspace bound to one [`Stream`].
-///
-/// Grows to the high-water mark of admitted requests and never shrinks.
-pub struct Scratch {
-    stream: Arc<Stream>,
-    buffer: Option<DeviceBuffer<u8>>,
-}
-
-impl Scratch {
-    /// Creates an empty scratch workspace for solver calls on `stream`.
-    pub fn new(stream: &Arc<Stream>) -> Self {
-        Self {
-            stream: stream.clone(),
-            buffer: None,
-        }
-    }
-
-    /// Current capacity in bytes.
-    pub fn capacity(&self) -> usize {
-        self.buffer.as_ref().map_or(0, |b| b.len())
-    }
-
-    /// Stream this scratch buffer is bound to.
-    pub fn stream(&self) -> &Arc<Stream> {
-        &self.stream
-    }
-
-    /// Reserves at least `required` bytes without exceeding `budget`.
-    ///
-    /// Verifies that `stream` matches the stream this scratch buffer was created for.
-    pub fn reserve_bytes(
-        &mut self,
-        stream: &Stream,
-        required: usize,
-        budget: usize,
-    ) -> Result<(*mut c_void, usize)> {
-        if stream.cu_stream() != self.stream.cu_stream()
-            || !Arc::ptr_eq(stream.context(), self.stream.context())
-        {
-            return Err(Error::InvalidInput(
-                "scratch used on a different stream than it was created for",
-            ));
-        }
-        if required > budget {
-            return Err(Error::Budget {
-                requested: required,
-                available: budget,
-            });
-        }
-        if required == 0 {
-            let ptr = self
-                .buffer
-                .as_ref()
-                .map_or(std::ptr::null_mut(), |b| b.cu_deviceptr() as *mut c_void);
-            return Ok((ptr, self.capacity()));
-        }
-        if self.capacity() < required {
-            self.buffer = None;
-            // SAFETY: `required > 0`; `self.stream` matches `stream`; cuSOLVER writes workspace before reading it.
-            self.buffer =
-                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, required) }?);
-        }
-        let buf = self
-            .buffer
-            .as_ref()
-            .ok_or(Error::InvalidInput("scratch buffer missing after reserve"))?;
-        Ok((buf.cu_deviceptr() as *mut c_void, buf.len()))
-    }
-
-    /// Reserves workspace for `lwork` elements of `T` without exceeding `budget` bytes.
-    pub fn reserve_elements<T>(
-        &mut self,
-        stream: &Stream,
-        lwork: i32,
-        budget: usize,
-    ) -> Result<(*mut T, i32)> {
-        if lwork < 0 {
-            return Err(Error::InvalidInput(
-                "cuSOLVER reported negative workspace element count",
-            ));
-        }
-        let bytes = (lwork as usize)
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or(Error::InvalidInput("workspace byte size overflow"))?;
-        let (ptr, _) = self.reserve_bytes(stream, bytes, budget)?;
-        Ok((ptr.cast::<T>(), lwork))
-    }
+/// Reserves `scratch` workspace for `lwork` elements of `T` on `stream` without exceeding
+/// `budget` bytes; returns the typed device pointer and `lwork` (null while `lwork == 0` and
+/// nothing is allocated).
+pub(crate) fn reserve_elements<T>(
+    scratch: &mut Scratch,
+    stream: &Stream,
+    lwork: i32,
+    budget: usize,
+) -> Result<(*mut T, i32)> {
+    let elems = usize::try_from(lwork).map_err(|_| {
+        Error::InvalidInput("cuSOLVER reported negative workspace element count")
+    })?;
+    let bytes = elems
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(Error::InvalidInput("workspace byte size overflow"))?;
+    let (ptr, _) = scratch.reserve(stream, bytes, Some(budget))?;
+    Ok((ptr as usize as *mut T, lwork))
 }
 
 #[cfg(test)]

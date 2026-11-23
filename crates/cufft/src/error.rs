@@ -1,13 +1,14 @@
 //! Error types and status-code wrappers for `cufft`.
 //!
 //! **What.** Defines [`FftResult`] (a `Copy` integer newtype over `cufftResult_t`), [`Error`]
-//! (`thiserror`), [`Result`], and internal status-checking / context-teardown helpers.
-//! **Why.** Keeps raw cuFFT status codes open-ended for future toolkits and records `Drop`
-//! failures on the owning `cuda_core::Context` without panicking.
+//! (`thiserror`), [`Result`], the `cuda_core_ext::ScratchError` conversion, and internal
+//! status-checking / teardown helpers.
+//! **Why.** Keeps raw cuFFT status codes open-ended for future toolkits and keeps `Drop` failures,
+//! with their real status, in the `cuda_core_ext::teardown` sink without panicking.
 //! **Used by** every module in `cufft`.
 
 use crate::sys;
-use cuda_core::{Context, DriverError};
+use cuda_core::DriverError;
 use std::fmt;
 
 /// Raw `cufftResult_t` status code.
@@ -127,12 +128,35 @@ pub(crate) fn check(call: &'static str, code: sys::cufftResult_t) -> Result<()> 
     }
 }
 
-/// Records a failed teardown call on the owning CUDA context.
-#[inline]
-pub(crate) fn teardown(ctx: &Context, code: sys::cufftResult_t) {
-    if code != sys::cufftResult_t_CUFFT_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(
-            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-        )));
+impl From<cuda_core_ext::ScratchError> for Error {
+    fn from(e: cuda_core_ext::ScratchError) -> Self {
+        match e {
+            cuda_core_ext::ScratchError::WrongStream => {
+                Error::Invalid("scratch used on a different stream than it was created for")
+            }
+            cuda_core_ext::ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            cuda_core_ext::ScratchError::Misaligned { .. } => {
+                Error::Invalid("scratch workspace below the required alignment")
+            }
+            cuda_core_ext::ScratchError::Driver(e) => Error::Driver(e),
+        }
     }
+}
+
+/// Keeps a failed `Drop` teardown call `op` in the process-wide `cuda_core_ext::teardown` sink,
+/// with its real cuFFT status.
+#[inline]
+pub(crate) fn teardown(code: sys::cufftResult_t, op: &'static str) {
+    cuda_core_ext::teardown::check(
+        cuda_core_ext::teardown::Library::Cufft,
+        op,
+        i64::from(code),
+        i64::from(sys::cufftResult_t_CUFFT_SUCCESS),
+    );
 }

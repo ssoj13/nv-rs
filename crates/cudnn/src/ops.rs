@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cuda_core::{DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
 use cudnn_sys as sys;
 
 use crate::descriptor::{
@@ -17,7 +18,7 @@ use crate::descriptor::{
     FilterDescriptor, PoolingDescriptor, TensorDescriptor,
 };
 use crate::handle::Handle;
-use crate::scratch::Scratch;
+use crate::Scratch;
 use crate::{DataType, DeviceSpan, Error, Result, check, record_teardown, same_ctx};
 
 /// Softmax algorithm selection (`cudnnSoftmaxAlgorithm_t`).
@@ -118,7 +119,7 @@ fn check_tensor_buf<B: DeviceSpan + ?Sized>(
     buf: &B,
     label: &'static str,
 ) -> Result<()> {
-    if !Arc::ptr_eq(desc.context(), ctx) || !Arc::ptr_eq(buf.context(), ctx) {
+    if !same_context(desc.context(), ctx) || !same_context(buf.context(), ctx) {
         return Err(Error::Invalid(
             "tensor descriptor or device buffer belongs to another context",
         ));
@@ -134,7 +135,7 @@ fn check_filter_buf<B: DeviceSpan + ?Sized>(
     desc: &FilterDescriptor,
     buf: &B,
 ) -> Result<()> {
-    if !Arc::ptr_eq(desc.context(), ctx) || !Arc::ptr_eq(buf.context(), ctx) {
+    if !same_context(desc.context(), ctx) || !same_context(buf.context(), ctx) {
         return Err(Error::Invalid(
             "filter descriptor or weight buffer belongs to another context",
         ));
@@ -170,10 +171,10 @@ pub fn conv_forward_workspace_size(
     algo: ConvFwdAlgo,
 ) -> Result<usize> {
     let ctx = handle.context();
-    if !Arc::ptr_eq(x_desc.context(), ctx)
-        || !Arc::ptr_eq(w_desc.context(), ctx)
-        || !Arc::ptr_eq(conv_desc.context(), ctx)
-        || !Arc::ptr_eq(y_desc.context(), ctx)
+    if !same_context(x_desc.context(), ctx)
+        || !same_context(w_desc.context(), ctx)
+        || !same_context(conv_desc.context(), ctx)
+        || !same_context(y_desc.context(), ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -226,7 +227,7 @@ where
 {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(conv_desc.context(), &ctx) {
+    if !same_context(conv_desc.context(), &ctx) {
         return Err(Error::Invalid(
             "convolution descriptor belongs to another context",
         ));
@@ -302,10 +303,10 @@ pub unsafe fn conv_forward_raw(
 ) -> Result<()> {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(x_desc.context(), &ctx)
-        || !Arc::ptr_eq(w_desc.context(), &ctx)
-        || !Arc::ptr_eq(conv_desc.context(), &ctx)
-        || !Arc::ptr_eq(y_desc.context(), &ctx)
+    if !same_context(x_desc.context(), &ctx)
+        || !same_context(w_desc.context(), &ctx)
+        || !same_context(conv_desc.context(), &ctx)
+        || !same_context(y_desc.context(), &ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -358,10 +359,10 @@ pub fn conv_backward_data_workspace_size(
     algo: ConvBwdDataAlgo,
 ) -> Result<usize> {
     let ctx = handle.context();
-    if !Arc::ptr_eq(w_desc.context(), ctx)
-        || !Arc::ptr_eq(dy_desc.context(), ctx)
-        || !Arc::ptr_eq(conv_desc.context(), ctx)
-        || !Arc::ptr_eq(dx_desc.context(), ctx)
+    if !same_context(w_desc.context(), ctx)
+        || !same_context(dy_desc.context(), ctx)
+        || !same_context(conv_desc.context(), ctx)
+        || !same_context(dx_desc.context(), ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -476,10 +477,10 @@ pub unsafe fn conv_backward_data_raw(
 ) -> Result<()> {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(w_desc.context(), &ctx)
-        || !Arc::ptr_eq(dy_desc.context(), &ctx)
-        || !Arc::ptr_eq(conv_desc.context(), &ctx)
-        || !Arc::ptr_eq(dx_desc.context(), &ctx)
+    if !same_context(w_desc.context(), &ctx)
+        || !same_context(dy_desc.context(), &ctx)
+        || !same_context(conv_desc.context(), &ctx)
+        || !same_context(dx_desc.context(), &ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -533,10 +534,10 @@ pub fn conv_backward_filter_workspace_size(
     algo: ConvBwdFilterAlgo,
 ) -> Result<usize> {
     let ctx = handle.context();
-    if !Arc::ptr_eq(x_desc.context(), ctx)
-        || !Arc::ptr_eq(dy_desc.context(), ctx)
-        || !Arc::ptr_eq(conv_desc.context(), ctx)
-        || !Arc::ptr_eq(dw_desc.context(), ctx)
+    if !same_context(x_desc.context(), ctx)
+        || !same_context(dy_desc.context(), ctx)
+        || !same_context(conv_desc.context(), ctx)
+        || !same_context(dw_desc.context(), ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -656,10 +657,10 @@ pub unsafe fn conv_backward_filter_raw(
 ) -> Result<()> {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(x_desc.context(), &ctx)
-        || !Arc::ptr_eq(dy_desc.context(), &ctx)
-        || !Arc::ptr_eq(conv_desc.context(), &ctx)
-        || !Arc::ptr_eq(dw_desc.context(), &ctx)
+    if !same_context(x_desc.context(), &ctx)
+        || !same_context(dy_desc.context(), &ctx)
+        || !same_context(conv_desc.context(), &ctx)
+        || !same_context(dw_desc.context(), &ctx)
     {
         return Err(Error::Invalid("convolution descriptor context mismatch"));
     }
@@ -1083,7 +1084,7 @@ where
 {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(act_desc.context(), &ctx) {
+    if !same_context(act_desc.context(), &ctx) {
         return Err(Error::Invalid(
             "activation descriptor belongs to another context",
         ));
@@ -1138,7 +1139,7 @@ where
 {
     let ctx = handle.context().clone();
     same_ctx(stream, &ctx)?;
-    if !Arc::ptr_eq(pool_desc.context(), &ctx) {
+    if !same_context(pool_desc.context(), &ctx) {
         return Err(Error::Invalid(
             "pooling descriptor belongs to another context",
         ));
@@ -1235,7 +1236,10 @@ pub fn derive_bn_tensor_desc(
     if let Err(err) = check("cudnnDeriveBNTensorDescriptor", status) {
         // SAFETY: clean up descriptor on failure.
         unsafe {
-            record_teardown(ctx, sys::cudnnDestroyTensorDescriptor(raw));
+            record_teardown(
+                "cudnnDestroyTensorDescriptor",
+                sys::cudnnDestroyTensorDescriptor(raw),
+            );
         }
         return Err(err);
     }

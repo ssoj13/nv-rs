@@ -426,7 +426,7 @@ impl Transform {
                 "transform child from another device context",
             ));
         }
-        if stream.context().cu_ctx() != ctx.cuda().cu_ctx() {
+        if !cuda_core_ext::same_context(stream.context(), ctx.cuda()) {
             return Err(Error::Invalid(
                 "stream belongs to another CUDA context than the device context",
             ));

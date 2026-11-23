@@ -4,13 +4,14 @@
 //! - [`plan`] — [`Plan`] (`plan_1d`, `plan_2d`, `plan_3d`, `plan_many`, `estimate_*`),
 //!   [`ManyDesc`], [`FftType`], [`Direction`], and typed execution (`exec_c2c`, `exec_r2c`,
 //!   `exec_c2r`, `exec_z2z`, `exec_d2z`, `exec_z2d`).
-//! - [`scratch`] — [`Scratch`] caller-owned reusable device workspace with byte-budget checks.
+//! - [`scratch`] — [`Scratch`] caller-owned reusable device workspace with byte-budget checks,
+//!   a shared handle to one `cuda_core_ext::Scratch`.
 //! - [`error`] — [`FftResult`] (`Copy` integer newtype) and [`Error`].
 //!
 //! **Conventions.** Every [`Plan`] disables cuFFT auto-allocation (`cufftSetAutoAllocation(0)`),
-//! sizes its workspace against a caller byte budget, and destroys its handle on `Drop` (recording
-//! any teardown failure on the owning `cuda_core::Context`). Enqueueing calls take `&Stream` and
-//! perform zero heap allocations.
+//! sizes its workspace against a caller byte budget, and destroys its handle on `Drop` (keeping a
+//! failed `cufftDestroy` in the `cuda_core_ext::teardown` sink). Enqueueing calls take `&Stream`
+//! and perform zero heap allocations.
 //! **Used by** signal/image processing workloads and the nv-rs T0/T3 test suite.
 
 pub mod error;

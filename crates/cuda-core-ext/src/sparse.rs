@@ -94,7 +94,7 @@ impl Array {
             || pool_offset
                 .checked_add(bytes)
                 .is_none_or(|end| end > pool.size as u64)
-            || !Arc::ptr_eq(&pool.ctx, self.context())
+            || !crate::same_context(&pool.ctx, self.context())
         {
             return Err(invalid_value());
         }
@@ -173,7 +173,7 @@ impl Array {
     fn map_call(&self, stream: &Stream, info: &mut sys::CUarrayMapInfo) -> Result<(), DriverError> {
         let ordinal = u32::try_from(self.context().ordinal()).map_err(|_| invalid_value())?;
         info.deviceBitMask = 1u32.checked_shl(ordinal).ok_or_else(invalid_value)?;
-        if stream.context().cu_ctx() != self.context().cu_ctx() {
+        if !crate::same_context(stream.context(), self.context()) {
             return Err(invalid_value());
         }
         self.context().bind_to_thread()?;

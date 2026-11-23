@@ -10,6 +10,7 @@
 //! heuristic workspace control.
 
 use crate::error::{check_lt, teardown_lt};
+use cuda_core_ext::{same_context, same_stream};
 use crate::gemm::batches_disjoint;
 use crate::{
     ComputeType, DataType, Error, Operation, PointerMode, Result, Scratch, Status, lt_sys,
@@ -438,12 +439,12 @@ impl LtHandle {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
         }
-        if !std::ptr::eq(stream, &**scratch.stream()) {
+        if !same_stream(stream, scratch.stream()) {
             return Err(Error::Invalid(
                 "scratch stream does not match matmul execution stream",
             ));
@@ -452,7 +453,7 @@ impl LtHandle {
             return Err(Error::Invalid("alpha and beta pointers must be non-null"));
         }
         let ws_bytes = heuristic.workspace_size();
-        let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, budget)?;
+        let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, Some(budget))?;
         self.cuda.bind_to_thread()?;
         // SAFETY: caller guarantees `alpha`/`beta` and matrix buffer extents match the descriptors;
         // `ws_ptr` has at least `ws_bytes` on `stream`.
@@ -471,7 +472,7 @@ impl LtHandle {
                 d.cu_deviceptr() as usize as *mut c_void,
                 d_desc.raw,
                 &heuristic.raw.algo,
-                ws_ptr,
+                ws_ptr as usize as *mut c_void,
                 ws_bytes,
                 stream.cu_stream(),
             )
@@ -501,12 +502,12 @@ impl LtHandle {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
         }
-        if !std::ptr::eq(stream, &**scratch.stream()) {
+        if !same_stream(stream, scratch.stream()) {
             return Err(Error::Invalid(
                 "scratch stream does not match matmul execution stream",
             ));
@@ -536,7 +537,7 @@ impl LtHandle {
         }
         d_desc.check_output_batch()?;
         let ws_bytes = heuristic.workspace_size();
-        let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, budget)?;
+        let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, Some(budget))?;
         self.cuda.bind_to_thread()?;
         // SAFETY: `alpha` and `beta` are valid host `f32` scalars; descriptors and `f32` device
         // buffers are owned and live on `stream`.
@@ -555,7 +556,7 @@ impl LtHandle {
                 d.cu_deviceptr() as usize as *mut c_void,
                 d_desc.raw,
                 &heuristic.raw.algo,
-                ws_ptr,
+                ws_ptr as usize as *mut c_void,
                 ws_bytes,
                 stream.cu_stream(),
             )
@@ -578,7 +579,7 @@ impl LtHandle {
         d: &MatrixLayout,
         pref: &Preference,
     ) -> Result<HeuristicResult> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
@@ -628,7 +629,7 @@ impl LtHandle {
         max_results: usize,
         out: &mut Vec<HeuristicResult>,
     ) -> Result<usize> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
@@ -793,7 +794,7 @@ impl LtHandle {
         d: &MatrixLayout,
         algo: &MatmulAlgo,
     ) -> Result<HeuristicResult> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
@@ -842,7 +843,7 @@ impl LtHandle {
         c: &mut DeviceBuffer<u8>,
         c_desc: &MatrixLayout,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
@@ -890,7 +891,7 @@ impl LtHandle {
         c: &mut DeviceBuffer<f32>,
         c_desc: &MatrixLayout,
     ) -> Result<()> {
-        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+        if !same_context(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than LtHandle",
             ));
@@ -951,15 +952,11 @@ impl LtHandle {
 impl Drop for LtHandle {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            if self.cuda.bind_to_thread().is_ok() {
+            // A failed bind leaves its driver error on `self.cuda` and skips the native call.
+            if cuda_core_ext::teardown::bind(&self.cuda) {
                 // SAFETY: `self.raw` was created by `cublasLtCreate` and is destroyed once.
                 let code = unsafe { lt_sys::cublasLtDestroy(self.raw) };
-                teardown_lt(&self.cuda, code);
-            } else {
-                teardown_lt(
-                    &self.cuda,
-                    lt_sys::cublasStatus_t_CUBLAS_STATUS_NOT_INITIALIZED,
-                );
+                teardown_lt(code, "cublasLtDestroy");
             }
             self.raw = std::ptr::null_mut();
         }
@@ -1152,7 +1149,6 @@ impl MatmulDescAttr {
 #[must_use]
 pub struct MatmulDesc {
     raw: lt_sys::cublasLtMatmulDesc_t,
-    cuda: Arc<Context>,
     scale: DataType,
     pointer_mode: PointerMode,
     /// Emulation descriptor installed by [`Self::set_emulation_desc`]. cuBLASLt stores only its
@@ -1165,7 +1161,7 @@ unsafe impl Send for MatmulDesc {}
 
 impl MatmulDesc {
     /// Creates a new matmul descriptor with `compute` precision and `scale` scalar data type.
-    pub fn new(cuda: &Arc<Context>, compute: ComputeType, scale: DataType) -> Result<Self> {
+    pub fn new(compute: ComputeType, scale: DataType) -> Result<Self> {
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
@@ -1174,7 +1170,6 @@ impl MatmulDesc {
         })?;
         Ok(Self {
             raw,
-            cuda: cuda.clone(),
             scale,
             pointer_mode: PointerMode::Host,
             emulation: None,
@@ -1383,7 +1378,7 @@ impl Drop for MatmulDesc {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtMatmulDescCreate` and is destroyed once.
             let code = unsafe { lt_sys::cublasLtMatmulDescDestroy(self.raw) };
-            teardown_lt(&self.cuda, code);
+            teardown_lt(code, "cublasLtMatmulDescDestroy");
             self.raw = std::ptr::null_mut();
         }
     }
@@ -1496,7 +1491,6 @@ impl MatrixLayoutAttr {
 #[must_use]
 pub struct MatrixLayout {
     raw: lt_sys::cublasLtMatrixLayout_t,
-    cuda: Arc<Context>,
     dtype: DataType,
     rows: u64,
     cols: u64,
@@ -1537,13 +1531,7 @@ unsafe impl Send for MatrixLayout {}
 
 impl MatrixLayout {
     /// Creates a matrix layout descriptor for `rows x cols` with leading dimension `ld`.
-    pub fn new(
-        cuda: &Arc<Context>,
-        dtype: DataType,
-        rows: u64,
-        cols: u64,
-        ld: i64,
-    ) -> Result<Self> {
+    pub fn new(dtype: DataType, rows: u64, cols: u64, ld: i64) -> Result<Self> {
         if rows == 0 || cols == 0 || ld <= 0 {
             return Err(Error::Invalid(
                 "matrix layout requires positive rows, cols, and ld",
@@ -1558,7 +1546,6 @@ impl MatrixLayout {
         })?;
         Ok(Self {
             raw,
-            cuda: cuda.clone(),
             dtype,
             rows,
             cols,
@@ -1578,7 +1565,6 @@ impl MatrixLayout {
     /// `rows_array`, `cols_array`, and `ld_array` must be valid pointers to `group_count`
     /// elements matching the configured integer width.
     pub unsafe fn new_grouped(
-        cuda: &Arc<Context>,
         dtype: DataType,
         group_count: i32,
         rows_array: *const c_void,
@@ -1610,7 +1596,6 @@ impl MatrixLayout {
         })?;
         Ok(Self {
             raw,
-            cuda: cuda.clone(),
             dtype,
             rows: 1,
             cols: 1,
@@ -1836,7 +1821,7 @@ impl Drop for MatrixLayout {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtMatrixLayoutCreate` and is destroyed once.
             let code = unsafe { lt_sys::cublasLtMatrixLayoutDestroy(self.raw) };
-            teardown_lt(&self.cuda, code);
+            teardown_lt(code, "cublasLtMatrixLayoutDestroy");
             self.raw = std::ptr::null_mut();
         }
     }
@@ -1986,7 +1971,6 @@ impl PreferenceAttr {
 #[must_use]
 pub struct Preference {
     raw: lt_sys::cublasLtMatmulPreference_t,
-    cuda: Arc<Context>,
 }
 
 // SAFETY: preference descriptor owns no thread-local state (`!Sync`).
@@ -1994,17 +1978,14 @@ unsafe impl Send for Preference {}
 
 impl Preference {
     /// Creates a new matmul preference descriptor.
-    pub fn new(cuda: &Arc<Context>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
         check_lt("cublasLtMatmulPreferenceCreate", unsafe {
             lt_sys::cublasLtMatmulPreferenceCreate(&mut raw)
         })?;
-        Ok(Self {
-            raw,
-            cuda: cuda.clone(),
-        })
+        Ok(Self { raw })
     }
 
     /// Writes raw attribute bytes (`cublasLtMatmulPreferenceSetAttribute`).
@@ -2088,7 +2069,7 @@ impl Drop for Preference {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtMatmulPreferenceCreate` and is destroyed once.
             let code = unsafe { lt_sys::cublasLtMatmulPreferenceDestroy(self.raw) };
-            teardown_lt(&self.cuda, code);
+            teardown_lt(code, "cublasLtMatmulPreferenceDestroy");
             self.raw = std::ptr::null_mut();
         }
     }
@@ -2135,7 +2116,6 @@ impl MatrixTransformDescAttr {
 #[must_use]
 pub struct MatrixTransformDesc {
     raw: lt_sys::cublasLtMatrixTransformDesc_t,
-    cuda: Arc<Context>,
     scale: DataType,
     pointer_mode: PointerMode,
 }
@@ -2146,7 +2126,7 @@ unsafe impl Send for MatrixTransformDesc {}
 impl MatrixTransformDesc {
     /// Creates a new matrix transform descriptor with `scale` scalar data type
     /// (`cublasLtMatrixTransformDescCreate`).
-    pub fn new(cuda: &Arc<Context>, scale: DataType) -> Result<Self> {
+    pub fn new(scale: DataType) -> Result<Self> {
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
@@ -2155,7 +2135,6 @@ impl MatrixTransformDesc {
         })?;
         Ok(Self {
             raw,
-            cuda: cuda.clone(),
             scale,
             pointer_mode: PointerMode::Host,
         })
@@ -2265,7 +2244,7 @@ impl Drop for MatrixTransformDesc {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtMatrixTransformDescCreate` and is destroyed once.
             let code = unsafe { lt_sys::cublasLtMatrixTransformDescDestroy(self.raw) };
-            teardown_lt(&self.cuda, code);
+            teardown_lt(code, "cublasLtMatrixTransformDescDestroy");
             self.raw = std::ptr::null_mut();
         }
     }
@@ -2330,7 +2309,6 @@ pub struct EmulationDesc {
 /// Owner of a native `cublasLtEmulationDesc_t`.
 struct EmulationRaw {
     raw: lt_sys::cublasLtEmulationDesc_t,
-    cuda: Arc<Context>,
 }
 
 // SAFETY: the descriptor owns no thread-local state. It is written only through
@@ -2343,7 +2321,7 @@ unsafe impl Sync for EmulationRaw {}
 
 impl EmulationDesc {
     /// Creates a new emulation descriptor (`cublasLtEmulationDescCreate`).
-    pub fn new(cuda: &Arc<Context>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
@@ -2351,10 +2329,7 @@ impl EmulationDesc {
             lt_sys::cublasLtEmulationDescCreate(&mut raw)
         })?;
         Ok(Self {
-            inner: Arc::new(EmulationRaw {
-                raw,
-                cuda: cuda.clone(),
-            }),
+            inner: Arc::new(EmulationRaw { raw }),
         })
     }
 
@@ -2451,7 +2426,7 @@ impl Drop for EmulationRaw {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtEmulationDescCreate` and is destroyed once.
             let code = unsafe { lt_sys::cublasLtEmulationDescDestroy(self.raw) };
-            teardown_lt(&self.cuda, code);
+            teardown_lt(code, "cublasLtEmulationDescDestroy");
             self.raw = std::ptr::null_mut();
         }
     }
@@ -3030,14 +3005,13 @@ mod tests {
     #[test]
     #[ignore = "GPU: needs CUDA driver + cublasLt64_13.dll; run via xtask gpu-test"]
     fn gpu_matmul_desc_retains_emulation_desc() {
-        let ctx = cuda_core::Context::new(0).expect("cuda context");
-        let mut emu = EmulationDesc::new(&ctx).expect("emulation desc");
+        let mut emu = EmulationDesc::new().expect("emulation desc");
         let strategy = emu
             .attribute_i32(EmulationDescAttr::Strategy)
             .expect("strategy");
         emu.set_attribute_i32(EmulationDescAttr::Strategy, strategy)
             .expect("set before attach");
-        let mut desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).expect("desc");
+        let mut desc = MatmulDesc::new(ComputeType::F32, DataType::F32).expect("desc");
         desc.set_emulation_desc(&emu).expect("attach");
         assert!(matches!(
             emu.set_attribute_i32(EmulationDescAttr::Strategy, strategy),
@@ -3056,7 +3030,7 @@ mod tests {
         assert_eq!(desc.emulation.as_ref().map(|e| e.raw), Some(raw));
 
         // Once no `MatmulDesc` holds it, the descriptor can change again.
-        let mut other = EmulationDesc::new(&ctx).expect("second emulation desc");
+        let mut other = EmulationDesc::new().expect("second emulation desc");
         desc.set_emulation_desc(&other).expect("attach second");
         drop(desc);
         other
@@ -3078,7 +3052,7 @@ mod tests {
         let stream = ctx.new_stream().expect("stream");
         let lt = LtHandle::new(&ctx).expect("lt handle");
 
-        let mut tdesc = MatrixTransformDesc::new(&ctx, DataType::F32).expect("transform desc");
+        let mut tdesc = MatrixTransformDesc::new(DataType::F32).expect("transform desc");
         tdesc.set_trans_a(Operation::T).expect("set trans_a");
         assert_eq!(tdesc.trans_a().expect("get trans_a"), Operation::T);
         assert_eq!(
@@ -3089,8 +3063,8 @@ mod tests {
         let a_host = vec![1.0f32, 2.0, 3.0, 4.0];
         let a_dev = cuda_core::DeviceBuffer::from_host(&stream, &a_host).unwrap();
         let mut c_dev = cuda_core::DeviceBuffer::zeroed(&stream, 4).unwrap();
-        let a_layout = MatrixLayout::new(&ctx, DataType::F32, 2, 2, 2).unwrap();
-        let c_layout = MatrixLayout::new(&ctx, DataType::F32, 2, 2, 2).unwrap();
+        let a_layout = MatrixLayout::new(DataType::F32, 2, 2, 2).unwrap();
+        let c_layout = MatrixLayout::new(DataType::F32, 2, 2, 2).unwrap();
 
         lt.matrix_transform_f32(
             &stream, &tdesc, 2.0, &a_dev, &a_layout, 0.0, None, &mut c_dev, &c_layout,
@@ -3139,12 +3113,12 @@ mod tests {
         assert_eq!(algo.id().unwrap(), ids[0]);
         let _ = algo.cap_i32(AlgoCapAttr::SplitkSupport).unwrap();
 
-        let desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).unwrap();
-        let a_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
-        let b_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
-        let c_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
-        let d_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
-        let pref = Preference::new(&ctx).unwrap();
+        let desc = MatmulDesc::new(ComputeType::F32, DataType::F32).unwrap();
+        let a_layout = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
+        let b_layout = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
+        let c_layout = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
+        let d_layout = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
+        let pref = Preference::new().unwrap();
 
         let heuristic = lt
             .matmul_heuristic_for_stream(
@@ -3194,12 +3168,12 @@ mod tests {
 
         // LT-06: ld < rows is rejected before reaching cuBLASLt.
         assert!(matches!(
-            MatrixLayout::new(&ctx, DataType::F32, 4, 4, 1),
+            MatrixLayout::new(DataType::F32, 4, 4, 1),
             Err(Error::Invalid(_))
         ));
 
         // LT-02: a pointer-array layout has no dense extent.
-        let mut ptr_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+        let mut ptr_layout = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
         assert_eq!(ptr_layout.min_elems().unwrap(), 16);
         ptr_layout.set_batch_mode(BatchMode::PointerArray).unwrap();
         assert!(matches!(ptr_layout.min_elems(), Err(Error::Invalid(_))));
@@ -3211,7 +3185,7 @@ mod tests {
         let dim_ptr = (dims.cu_deviceptr() as usize) as *const c_void;
         // SAFETY: `dims` holds `group_count = 1` i64 entries and outlives the layout's use here.
         let grouped = unsafe {
-            MatrixLayout::new_grouped(&ctx, DataType::F32, 1, dim_ptr, dim_ptr, dim_ptr)
+            MatrixLayout::new_grouped(DataType::F32, 1, dim_ptr, dim_ptr, dim_ptr)
         }
         .expect("grouped layout");
         assert!(matches!(grouped.min_elems(), Err(Error::Invalid(_))));
@@ -3221,14 +3195,14 @@ mod tests {
         let b = cuda_core::DeviceBuffer::from_host(&stream, &[1.0f32; 32]).unwrap();
         let c = cuda_core::DeviceBuffer::from_host(&stream, &[0.0f32; 32]).unwrap();
         let mut d = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 32).unwrap();
-        let desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).unwrap();
+        let desc = MatmulDesc::new(ComputeType::F32, DataType::F32).unwrap();
         let mut layouts = Vec::new();
         for _ in 0..4 {
-            let mut l = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+            let mut l = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
             l.set_batch(2, 16).unwrap();
             layouts.push(l);
         }
-        let mut d_overlap = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+        let mut d_overlap = MatrixLayout::new(DataType::F32, 4, 4, 4).unwrap();
         d_overlap.set_batch(2, 0).unwrap();
         let mut scratch = Scratch::new(&stream);
         let heuristic = HeuristicResult::from_algo(MatmulAlgo::zeroed(), 0);

@@ -24,10 +24,11 @@
 //! temp memory comes from a [`Scratch`] of the build stream.
 //! **Used by** render-rs (cluster geometry) and the nv-rs OptiX tests.
 
-use crate::accel::{Scratch, VertexFormat, alloc, count, same_ctx, same_stream, upload, within};
+use crate::accel::{Scratch, VertexFormat, alloc, count, same_ctx, upload, within};
 use crate::micromap::OpacityMicromapArray;
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
+use cuda_core_ext::same_stream;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -824,7 +825,7 @@ impl ClusterAccel {
         if index >= self.handles.len() {
             return Err(Error::Invalid("cluster GAS index out of range"));
         }
-        if stream.context().as_ref() != self.ctx.cuda().as_ref() {
+        if !cuda_core_ext::same_context(stream.context(), self.ctx.cuda()) {
             return Err(Error::Invalid(
                 "stream belongs to another CUDA context than the cluster GAS",
             ));

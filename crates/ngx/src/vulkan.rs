@@ -379,7 +379,7 @@ impl Drop for VulkanSession {
                 // `FeatureHandle` / `Parameters` children hold `Arc<VulkanSession>`, so this runs
                 // only after every child has been dropped.
                 let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_Shutdown1(device) };
-                g.record_teardown("NVSDK_NGX_VULKAN_Shutdown1", rc);
+                crate::NgxGlobal::record_teardown("NVSDK_NGX_VULKAN_Shutdown1", rc);
                 g.release_device(device.addr());
             });
             self.device = std::ptr::null_mut();
@@ -911,8 +911,8 @@ impl NgxVulkan {
 ///
 /// Released automatically on [`Drop`] via `NVSDK_NGX_VULKAN_ReleaseFeature`, which frees the
 /// feature's memory immediately (`nvsdk_ngx_vk.h:548-551`): drop it only after the GPU has
-/// finished every command buffer recorded by its `evaluate*` calls. A failed release is kept for
-/// [`crate::take_teardown_error`].
+/// finished every command buffer recorded by its `evaluate*` calls. A failed release is kept with
+/// its raw status for [`crate::take_teardown_errors`].
 pub struct FeatureHandle {
     #[cfg(has_ngx_sdk)]
     handle: *mut ngx_sys::NVSDK_NGX_Handle,
@@ -925,11 +925,11 @@ impl Drop for FeatureHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             let handle = self.handle;
-            crate::ngx_locked(|g| {
+            crate::ngx_call(|| {
                 // SAFETY: `handle` was created by `NVSDK_NGX_VULKAN_CreateFeature` and `_session`
                 // keeps the NGX Vulkan device alive.
                 let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_ReleaseFeature(handle) };
-                g.record_teardown("NVSDK_NGX_VULKAN_ReleaseFeature", rc);
+                crate::NgxGlobal::record_teardown("NVSDK_NGX_VULKAN_ReleaseFeature", rc);
             });
             self.handle = std::ptr::null_mut();
         }

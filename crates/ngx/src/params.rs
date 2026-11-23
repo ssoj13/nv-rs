@@ -162,11 +162,11 @@ impl Drop for Parameters {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             let ptr = self.ptr;
-            crate::ngx_locked(|g| {
+            crate::ngx_call(|| {
                 // SAFETY: `ptr` was allocated by `NVSDK_NGX_VULKAN_AllocateParameters` or
                 // `GetCapabilityParameters` and `_session` keeps the NGX Vulkan device alive.
                 let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_DestroyParameters(ptr) };
-                g.record_teardown("NVSDK_NGX_VULKAN_DestroyParameters", rc);
+                crate::NgxGlobal::record_teardown("NVSDK_NGX_VULKAN_DestroyParameters", rc);
             });
             self.ptr = std::ptr::null_mut();
         }

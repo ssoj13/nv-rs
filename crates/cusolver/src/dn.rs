@@ -3,17 +3,22 @@
 //!
 //! **What.**
 //! - [`DnHandle`] — owns `cusolverDnHandle_t`, binds a `cuda_core::Stream`, and destroys on
-//!   `Drop` (recording teardown errors on `cuda_core::Context`).
+//!   `Drop` (a failed `cusolverDnDestroy` goes to `cuda_core_ext::teardown`).
 //! - [`DnFloat`] — sealed trait implemented for `f32` and `f64`, dispatching to `S*` and `D*`
 //!   entry points.
 //! - Two-phase workspace sizing: every workspace-using routine queries `*_bufferSize`, checks
-//!   the caller's byte budget, and reserves into a caller-owned reusable [`Scratch`].
+//!   the caller's byte budget, and reserves into a caller-owned reusable [`Scratch`]
+//!   (`cuda_core_ext::Scratch`).
 //!
 //! **Column-major convention.** All `cusolverDn` routines operate on column-major matrices with
 //! leading dimension `lda >= rows`.
 
-use crate::{EigMode, Error, FillMode, Op, Result, Scratch, check, ensure_loaded, sys, teardown};
+use crate::{
+    EigMode, Error, FillMode, Op, Result, Scratch, check, ensure_loaded, reserve_elements, sys,
+    teardown_cusolver,
+};
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::same_context;
 use std::sync::Arc;
 
 /// Singular vector job mode for [`DnHandle::gesvd`].
@@ -787,7 +792,7 @@ impl DnHandle {
     /// Binds `stream` to this handle and makes the handle's context current on the calling
     /// thread (the handle is `Send`; every operation calls this before reaching the library).
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
-        if !Arc::ptr_eq(&self.cuda, stream.context()) {
+        if !same_context(&self.cuda, stream.context()) {
             return Err(Error::InvalidInput(
                 "stream belongs to a different CUDA context than DnHandle",
             ));
@@ -818,7 +823,7 @@ impl DnHandle {
         let a_ptr = a.cu_deviceptr() as *mut T;
         // SAFETY: dimensions and buffers were validated above.
         let lwork = unsafe { T::getrf_buffer_size(self.raw, m, n, a_ptr, lda) }?;
-        let (ws, _) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, _) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
             T::getrf(
@@ -895,7 +900,7 @@ impl DnHandle {
         let a_ptr = a.cu_deviceptr() as *mut T;
         // SAFETY: dimensions and buffers were validated above.
         let lwork = unsafe { T::potrf_buffer_size(self.raw, uplo.to_sys(), n, a_ptr, lda) }?;
-        let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, lwork) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
             T::potrf(
@@ -962,7 +967,7 @@ impl DnHandle {
         let a_ptr = a.cu_deviceptr() as *mut T;
         // SAFETY: dimensions and buffers were validated above.
         let lwork = unsafe { T::geqrf_buffer_size(self.raw, m, n, a_ptr, lda) }?;
-        let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, lwork) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
             T::geqrf(
@@ -1000,7 +1005,7 @@ impl DnHandle {
         let tau_ptr = tau.cu_deviceptr() as *const T;
         // SAFETY: dimensions and buffers were validated above.
         let lwork = unsafe { T::orgqr_buffer_size(self.raw, m, n, k, a_ptr, lda, tau_ptr) }?;
-        let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, lwork) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
             T::orgqr(
@@ -1061,7 +1066,7 @@ impl DnHandle {
         self.set_stream(stream)?;
         // SAFETY: `self.raw` is valid.
         let lwork = unsafe { T::gesvd_buffer_size(self.raw, m, n) }?;
-        let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, lwork) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: all pointers and workspace were validated above.
         unsafe {
             T::gesvd(
@@ -1108,7 +1113,7 @@ impl DnHandle {
         let lwork = unsafe {
             T::syevd_buffer_size(self.raw, jobz.to_sys(), uplo.to_sys(), n, a_ptr, lda, w_ptr)
         }?;
-        let (ws, lwork) = scratch.reserve_elements::<T>(stream, lwork, budget)?;
+        let (ws, lwork) = reserve_elements::<T>(scratch, stream, lwork, budget)?;
         // SAFETY: workspace `ws` has `lwork` elements of `T` on `stream`.
         unsafe {
             T::syevd(
@@ -1132,7 +1137,7 @@ impl Drop for DnHandle {
         if !self.raw.is_null() {
             let raw = self.raw;
             self.raw = std::ptr::null_mut();
-            teardown(&self.cuda, "cusolverDnDestroy", || {
+            teardown_cusolver(&self.cuda, "cusolverDnDestroy", || {
                 // SAFETY: `raw` is owned by `self` and destroyed once.
                 unsafe { sys::cusolverDnDestroy(raw) }
             });

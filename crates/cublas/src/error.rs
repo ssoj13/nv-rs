@@ -1,14 +1,14 @@
 //! Error types and status-code wrappers for `cublas` and `cublasLt`.
 //!
 //! **What.** Defines [`Status`] (a `Copy` integer newtype over `cublasStatus_t` so newer toolkit
-//! codes remain valid), [`Error`] (`thiserror`), [`Result`], and internal status-checking /
-//! context-teardown helpers.
-//! **Why.** Preserves raw toolkit codes without closed enums and records `Drop` failures on the
-//! owning `cuda_core::Context` instead of panicking.
+//! codes remain valid), [`Error`] (`thiserror`), [`Result`], the `cuda_core_ext::ScratchError`
+//! conversion, and internal status-checking / teardown helpers.
+//! **Why.** Preserves raw toolkit codes without closed enums and keeps `Drop` failures, with their
+//! real status, in the `cuda_core_ext::teardown` sink instead of panicking.
 //! **Used by** every module in `cublas`.
 
 use crate::{lt_sys, sys};
-use cuda_core::{Context, DriverError};
+use cuda_core::DriverError;
 use std::ffi::CStr;
 use std::fmt;
 
@@ -167,18 +167,46 @@ pub(crate) fn check_lt(call: &'static str, code: lt_sys::cublasStatus_t) -> Resu
     check(call, code as sys::cublasStatus_t)
 }
 
-/// Records a failed teardown call on the owning CUDA context (drop paths cannot return errors).
-#[inline]
-pub(crate) fn teardown(ctx: &Context, code: sys::cublasStatus_t) {
-    if code != sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS {
-        ctx.record_err(Err::<(), _>(DriverError(
-            cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-        )));
+impl From<cuda_core_ext::ScratchError> for Error {
+    fn from(e: cuda_core_ext::ScratchError) -> Self {
+        match e {
+            cuda_core_ext::ScratchError::WrongStream => {
+                Error::Invalid("scratch used on a different stream than it was created for")
+            }
+            cuda_core_ext::ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            cuda_core_ext::ScratchError::Misaligned { .. } => {
+                Error::Invalid("scratch workspace below the required alignment")
+            }
+            cuda_core_ext::ScratchError::Driver(e) => Error::Driver(e),
+        }
     }
 }
 
-/// Records a failed `cublasLt` teardown call on the owning CUDA context.
+/// Keeps a failed cuBLAS `Drop` teardown call `op` in the process-wide `cuda_core_ext::teardown`
+/// sink, with its real status (drop paths cannot return errors).
 #[inline]
-pub(crate) fn teardown_lt(ctx: &Context, code: lt_sys::cublasStatus_t) {
-    teardown(ctx, code as sys::cublasStatus_t);
+pub(crate) fn teardown(code: sys::cublasStatus_t, op: &'static str) {
+    cuda_core_ext::teardown::check(
+        cuda_core_ext::teardown::Library::Cublas,
+        op,
+        i64::from(code),
+        i64::from(sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS),
+    );
+}
+
+/// Keeps a failed cuBLASLt `Drop` teardown call `op` in the `cuda_core_ext::teardown` sink.
+#[inline]
+pub(crate) fn teardown_lt(code: lt_sys::cublasStatus_t, op: &'static str) {
+    cuda_core_ext::teardown::check(
+        cuda_core_ext::teardown::Library::CublasLt,
+        op,
+        i64::from(code),
+        i64::from(lt_sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS),
+    );
 }

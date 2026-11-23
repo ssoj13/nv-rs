@@ -7,7 +7,8 @@
 //! - [`error`] — [`CurandStatus`] (`Copy` integer newtype) and [`Error`].
 //!
 //! **Conventions.** Uses `cuda-bindings` directly (no `curand-sys` crate). Device generators hold
-//! `Arc<Context>` and record any `Drop` teardown failure on the owning CUDA context. Enqueueing
+//! `Arc<Context>`; a `Drop` teardown failure is kept, with its real status, in the
+//! `cuda_core_ext::teardown` sink (`Library::Curand`). Enqueueing
 //! calls take `&Stream` and perform zero heap allocations, except for the completion lease that
 //! every device `Generator::generate_*` takes on its output buffer.
 //! **Used by** Monte Carlo, rendering, and simulation workloads, and the nv-rs T0/T3 test suite.

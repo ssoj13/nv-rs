@@ -85,7 +85,7 @@ GPU device buffer supporting DLPack, `__cuda_array_interface__` v3, and Python B
 - `@staticmethod alloc(stream: core.Stream, shape: Sequence[int], dtype: str = "u8") -> core.DeviceBuffer`
 - `@staticmethod from_buffer(stream: core.Stream, data: Any, shape: Sequence[int] | None = None, dtype: str | None = None) -> core.DeviceBuffer`
 - `@staticmethod from_dlpack(obj: Any, stream: core.Stream | None = None) -> core.DeviceBuffer`
-- `__dlpack__(self, stream: Any = None) -> Any`
+- `__dlpack__(self, stream: Any = None, max_version: Any = None, dl_device: tuple[int, int] | None = None, copy: bool | None = None) -> Any`
 - `__dlpack_device__(self) -> tuple[int, int]`
 - `@property __cuda_array_interface__(self) -> dict[str, Any]`
 - `to_bytes(self, stream: core.Stream) -> bytes`
@@ -147,8 +147,8 @@ GIL-free runtime CUDA C++ compilation to PTX, CUBIN, LTO-IR, and OptiX-IR via NV
 
 Compiled NVRTC artifact bundle (PTX / CUBIN / LTO-IR / OptiX-IR + build log + lowered names).
 
-- `@property ptx(self) -> str`
-- `@property ptx_bytes(self) -> bytes`
+- `@property ptx(self) -> str | None`
+- `@property ptx_bytes(self) -> bytes | None`
 - `@property cubin(self) -> bytes | None`
 - `@property ltoir(self) -> bytes | None`
 - `@property optixir(self) -> bytes | None`
@@ -175,8 +175,8 @@ Self-describing GPU compressed payload produced by [`PyCompressionManager::compr
 Reusable GPU compression/decompression manager bound to a CUDA stream.
 
 - `__init__(self, stream: core.Stream, format: str = "lz4", chunk_size: int = 65536, budget: int | None = None) -> None`
-- `compress(self, input: core.DeviceBuffer, stream: core.Stream | None = None) -> nvcomp.CompressedBuffer`
-- `decompress(self, compressed: nvcomp.CompressedBuffer, stream: core.Stream | None = None) -> core.DeviceBuffer`
+- `compress(self, input: core.DeviceBuffer) -> nvcomp.CompressedBuffer`
+- `decompress(self, compressed: nvcomp.CompressedBuffer) -> core.DeviceBuffer`
 
 ### `nv_rs.nvjpeg`
 
@@ -306,7 +306,7 @@ Fast Fourier Transforms via cuFFT.
 1D cuFFT plan (`c2c`, `r2c`, or `c2r`) with caller-stream workspace management.
 
 - `__init__(self, stream: core.Stream, nx: int, kind: str = "c2c", batch: int = 1) -> None`
-- `execute(self, in_buf: core.DeviceBuffer, out_buf: core.DeviceBuffer, direction: str = "forward") -> None`
+- `execute(self, in_buf: core.DeviceBuffer, out_buf: core.DeviceBuffer, direction: str | None = None) -> None`
 
 ### `nv_rs.curand`
 
@@ -366,7 +366,7 @@ Owning cuDNN handle bound to a CUDA stream.
 
 - `__init__(self, stream: core.Stream) -> None`
 - `set_stream(self, stream: core.Stream) -> None`
-- `activation_forward_f32(self, x: core.DeviceBuffer, y: core.DeviceBuffer, shape: Sequence[int], mode: str = "relu", alpha: float = 1.0, beta: float = 0.0, coef: float = 0.0) -> None`
+- `activation_forward_f32(self, x: core.DeviceBuffer, y: core.DeviceBuffer, shape: Sequence[int], mode: str = "relu", alpha: float = 1.0, beta: float = 0.0, coef: float | None = None) -> None`
 - `softmax_forward_f32(self, x: core.DeviceBuffer, y: core.DeviceBuffer, shape: Sequence[int], algo: str = "accurate", mode: str = "channel", alpha: float = 1.0, beta: float = 0.0) -> None`
 
 ---
@@ -394,7 +394,7 @@ OptiX device context bound to a CUDA context (`optix::DeviceContext`).
 
 #### `optix.OptixModule`
 
-Compiled OptiX device module (`optix::Module`).
+Result of compiling an OptiX device module (`optixModuleCreate`): its compiler log.
 
 - `@property log(self) -> str`
 
@@ -434,21 +434,17 @@ NVIDIA NGX / DLSS capability queries and project validation.
 
 #### Static Methods
 
-- `is_dlss_supported() -> bool`
 - `required_extensions() -> dict[str, Any]`
 - `feature_requirements(feature: str = "super_sampling") -> dict[str, Any]`
 - `validate_project_id(guid: str, engine_name: str | None = None, engine_version: str | None = None) -> dict[str, Any]`
 
 #### `ngx.NgxCapabilities`
 
-NGX / DLSS runtime capabilities and Vulkan extension requirements.
+NGX Vulkan extension requirements and the NGX feature / DLSS preset identifiers.
 
 - `__init__(self) -> None`
-- `@property supported(self) -> bool`
 - `@property instance_extensions(self) -> list[str]`
 - `@property device_extensions(self) -> list[str]`
-- `@property status_message(self) -> str | None`
-- `is_dlss_supported(self) -> bool`
 - `required_extensions(self) -> tuple[list[str], list[str]]`
 - `supported_features(self) -> list[tuple[str, int]]`
 - `dlss_quality_presets(self) -> list[tuple[str, int]]`
@@ -636,11 +632,11 @@ RAII GPUDirect Storage driver session (`cuFileDriverOpen` / `cuFileDriverClose_v
 
 #### `cufile.CufileHandle`
 
-Registered cuFile handle for synchronous GPU direct reads/writes on `DeviceBuffer`.
+Registered cuFile handle for synchronous GPU direct reads/writes on `DeviceBuffer` (nv_rs-owned buffers and DLPack imports).
 
 - `__init__(self, context: core.Context, path: str, mode: str = "gds", create: bool = False, truncate: bool = False, read: bool = True, write: bool = True) -> None`
-- `read(self, dst: core.DeviceBuffer, file_offset: int = 0, buf_offset: int = 0, len: int | None = None) -> int`
-- `write(self, src: core.DeviceBuffer, file_offset: int = 0, buf_offset: int = 0, len: int | None = None) -> int`
+- `read(self, dst: core.DeviceBuffer, stream: core.Stream, file_offset: int = 0, buf_offset: int = 0, len: int | None = None) -> int`
+- `write(self, src: core.DeviceBuffer, stream: core.Stream, file_offset: int = 0, buf_offset: int = 0, len: int | None = None) -> int`
 - `close(self) -> None`
 - `@property mode(self) -> str`
 - `__enter__(self) -> cufile.CufileHandle`

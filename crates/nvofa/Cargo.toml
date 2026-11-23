@@ -13,6 +13,7 @@ path = "src/nvofa.rs"
 [dependencies]
 nvofa-sys = { path = "../nvofa-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

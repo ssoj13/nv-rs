@@ -5,12 +5,14 @@
 //! **Context.** The handle is `Send`, so every method that reaches the library first makes the
 //! handle's `Context` current on the calling thread (`Context::bind_to_thread`); operations reach
 //! the library through [`Handle::set_stream`] or [`Handle::pointer_mode`], which both bind.
-//! **Teardown.** `Drop` calls `cusparseDestroy` and records any error on the owning
-//! `cuda_core::Context` rather than panicking.
+//! A stream is accepted when its context is the handle's (`cuda_core_ext::same_context`).
+//! **Teardown.** `Drop` calls `cusparseDestroy` without panicking; a failed status goes to
+//! `cuda_core_ext::teardown`, a failed context bind stays on the owning `cuda_core::Context`.
 //! **Used by** [`crate::ops`] and external sparse linear algebra callers.
 
 use crate::{Error, PointerMode, Result, check, ensure_loaded, sys, teardown};
 use cuda_core::{Context, Stream};
+use cuda_core_ext::same_context;
 use std::sync::Arc;
 
 /// Owning handle to a cuSPARSE library context (`cusparseHandle_t`).
@@ -50,7 +52,7 @@ impl Handle {
     /// Binds `stream` to this handle so subsequent cuSPARSE calls execute on `stream`, and makes
     /// the handle's context current on the calling thread.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
-        if !Arc::ptr_eq(&self.cuda, stream.context()) {
+        if !same_context(&self.cuda, stream.context()) {
             return Err(Error::InvalidInput(
                 "stream belongs to a different CUDA context than the cuSPARSE handle",
             ));

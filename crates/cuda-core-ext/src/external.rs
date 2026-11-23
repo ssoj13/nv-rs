@@ -299,7 +299,7 @@ impl ExternalSemaphore {
 
     /// Rejects a stream of another context and records that work will reference the semaphore.
     fn prepare_enqueue(&self, stream: &Stream, value: u64) -> Result<(), DriverError> {
-        if (!self.valued && value != 0) || stream.context().cu_ctx() != self.ctx.cu_ctx() {
+        if (!self.valued && value != 0) || !crate::same_context(stream.context(), &self.ctx) {
             return Err(invalid_value());
         }
         self.enqueued.store(true, Ordering::Release);

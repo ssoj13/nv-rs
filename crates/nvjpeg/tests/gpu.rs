@@ -303,6 +303,8 @@ fn drops_without_current_context_record_no_error() {
     let enc_params = EncoderParams::new(&handle, &stream).expect("EncoderParams");
     let enc_state = EncoderState::new(&handle, &stream).expect("EncoderState");
     cuda.check_err().expect("no error before teardown");
+    let earlier = cuda_core_ext::teardown::take(Some(cuda_core_ext::teardown::Library::Nvjpeg));
+    assert!(earlier.is_empty(), "nvJPEG teardown failed before this test: {earlier:?}");
 
     // SAFETY: clearing the calling thread's current context is always valid.
     let rc = unsafe { cuda_core::sys::cuCtxSetCurrent(std::ptr::null_mut()) };
@@ -311,6 +313,12 @@ fn drops_without_current_context_record_no_error() {
     drop((pinned, device, decoder, handle));
     cuda.check_err()
         .expect("teardown without a current context recorded an error");
+    // nvJPEG destroy statuses go to the teardown sink, not to the context: check both.
+    let failed = cuda_core_ext::teardown::take(Some(cuda_core_ext::teardown::Library::Nvjpeg));
+    assert!(
+        failed.is_empty(),
+        "nvJPEG destroy failed without a current context: {failed:?}"
+    );
 }
 
 /// JPG-6: `retrieve_bitstream_into` reuses a stale, larger `Vec` and returns exactly the encoded

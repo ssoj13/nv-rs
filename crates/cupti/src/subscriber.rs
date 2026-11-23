@@ -6,10 +6,13 @@
 //!
 //! **Teardown.** `Drop` unsubscribes, waits for callbacks still running on other threads, drops
 //! the closure, and leaks the small shared state block CUPTI was given (one per subscriber),
-//! because CUPTI does not document that unsubscribe excludes callbacks already dispatched.
+//! because CUPTI does not document that unsubscribe excludes callbacks already dispatched. A
+//! failed `cuptiUnsubscribe` is kept with its real `CUptiResult` in `cuda_core_ext::teardown`
+//! (`Library::Cupti`).
 
 use crate::{Error, Result, check, ensure_loaded, panic_payload_to_string, sys};
-use cuda_core::{Context, DriverError};
+use cuda_core::Context;
+use cuda_core_ext::teardown::{self, Library};
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -121,7 +124,8 @@ unsafe extern "C" fn callback_trampoline(
 pub struct Subscriber {
     raw: sys::CUpti_SubscriberHandle,
     inner: *mut SubscriberInner,
-    cuda: Arc<Context>,
+    /// Keeps the context the subscription was created under alive until after unsubscribe.
+    _cuda: Arc<Context>,
 }
 
 // SAFETY: `SubscriberInner` is `Send + Sync` (`CallbackFn: Send + Sync`, `Mutex` for panic slot).
@@ -154,7 +158,7 @@ impl Subscriber {
         Ok(Self {
             raw,
             inner,
-            cuda: cuda.clone(),
+            _cuda: cuda.clone(),
         })
     }
 
@@ -193,11 +197,12 @@ impl Drop for Subscriber {
             // starts no new dispatch to it afterwards; dispatches already under way are handled
             // by the quiescence wait below.
             let rc = unsafe { sys::cuptiUnsubscribe(self.raw) };
-            if rc != sys::CUptiResult_CUPTI_SUCCESS {
-                self.cuda.record_err(Err::<(), _>(DriverError(
-                    cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
-                )));
-            }
+            teardown::check(
+                Library::Cupti,
+                "cuptiUnsubscribe",
+                rc as i64,
+                sys::CUptiResult_CUPTI_SUCCESS as i64,
+            );
         }
         if !self.inner.is_null() {
             // SAFETY: `self.inner` is never freed after a successful `new`, see `SubscriberInner`.

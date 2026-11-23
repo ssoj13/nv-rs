@@ -13,6 +13,7 @@ path = "src/cupti.rs"
 [dependencies]
 cupti-sys = { path = "../cupti-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [lints]

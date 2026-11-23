@@ -11,6 +11,19 @@
 //! matching `cudnn_*` siblings from the same directory first (through `nv_loader::open_library`), so
 //! those sub-libraries are already in the process. A runtime whose major version is older than the
 //! headers' `CUDNN_MAJOR` is a typed `LoadError::RuntimeTooOld`.
+//!
+//! **Another cuDNN already in the process (e.g. PyTorch's).** On Windows, two cuDNN 9 builds cannot
+//! share one process: each part imports its siblings by bare file name, and the loader binds such
+//! an import to a module of that name that is already loaded, so parts of two builds get mixed
+//! (`ERROR_PROC_NOT_FOUND`, 127). Therefore, when a `cudnn64_<major>.dll` is already loaded, the
+//! `adopt` hook ([`loaded_copy`]) makes the loader use exactly that module (its siblings are then
+//! mapped from its directory) instead of searching; the major-version gate still applies and the
+//! adoption is reported as a loader diagnostic event (`cudnn` / `adopt`). Only when no copy is
+//! loaded does the normal search run. The reverse order cannot be fixed from Rust: if nv-rs loads
+//! cuDNN first, a later `import torch` that brings a different cuDNN build binds torch's parts to
+//! ours and can fail (seen as `OSError: [WinError 127] ... cudnn_cnn64_9.dll`). Import torch (or
+//! any other cuDNN user) first, or use one cuDNN build for the whole process. On Linux the dynamic
+//! linker already shares one `libcudnn.so.<major>` per soname, so nothing is adopted there.
 //! **Used by** the safe `cudnn` crate; call [`load`] for a diagnosable load error.
 
 use std::path::Path;
@@ -24,6 +37,7 @@ nv_loader::exports_sys! {
     dll: nv_loader::catalog::CUDNN.spec.with_hint(env!("NV_RS_SDK_BIN")),
     preload: preload_siblings,
     version: runtime_version,
+    adopt: loaded_copy,
 }
 
 /// Orders and filters sibling cuDNN sub-library filenames (`cudnn_<part><suffix>`) for `main_name`
@@ -146,6 +160,78 @@ fn reject_foreign_copy(dir: &Path, name: &str) -> Result<(), String> {
     }
 }
 
+/// The full path of the `cudnn64_<CUDNN_MAJOR>.dll` already loaded in this process (for example
+/// by PyTorch), or `None` when there is none: the loader then adopts that module instead of
+/// searching (see the module docs).
+#[cfg(windows)]
+fn loaded_copy() -> Option<std::path::PathBuf> {
+    use libloading::os::windows::Library as WinLibrary;
+
+    let name = format!("cudnn64_{CUDNN_MAJOR}.dll");
+    // `GetModuleHandleExW` by bare name: finds a loaded module, never loads one. An error means
+    // no such module is loaded, which is the normal case.
+    let module = WinLibrary::open_already_loaded(&name).ok()?.into_raw();
+    let path = module_file_name(module);
+    // SAFETY: `module` came from `into_raw` just above and is re-owned exactly once, so dropping it
+    // releases the reference `GetModuleHandleExW` took; the module itself stays loaded by its
+    // original owner.
+    drop(unsafe { WinLibrary::from_raw(module) });
+    match path {
+        Ok(path) => Some(path),
+        Err(e) => {
+            // Without the path the copy cannot be adopted; the normal search then rejects every
+            // candidate next to it with a clear message (`reject_foreign_copy`).
+            nv_loader::diag::record_event(
+                nv_loader::diag::Level::Warn,
+                "cudnn",
+                "adopt",
+                format!("{name} is loaded but its path could not be read: {e}"),
+                0,
+                false,
+            );
+            None
+        }
+    }
+}
+
+/// `GetModuleFileNameW` for a module handle obtained from `libloading`.
+#[cfg(windows)]
+fn module_file_name(module: isize) -> Result<std::path::PathBuf, std::io::Error> {
+    use std::os::windows::ffi::OsStringExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleFileNameW(module: isize, filename: *mut u16, size: u32) -> u32;
+    }
+    /// Longest path Windows supports (extended-length paths).
+    const MAX_LEN: usize = 32_768;
+    let mut buf = vec![0u16; 260];
+    loop {
+        let size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `module` is a live module handle held by the caller; `buf` is writable for
+        // `size` UTF-16 units and the call writes at most that many.
+        let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), size) } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            buf.truncate(len);
+            return Ok(std::ffi::OsString::from_wide(&buf).into());
+        }
+        // Truncated: the result filled the whole buffer.
+        if buf.len() >= MAX_LEN {
+            return Err(std::io::Error::other("module path longer than 32768 characters"));
+        }
+        buf.resize((buf.len() * 2).min(MAX_LEN), 0);
+    }
+}
+
+/// Linux shares one loaded `libcudnn.so.<major>` per soname through the dynamic linker.
+#[cfg(not(windows))]
+fn loaded_copy() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// See the Windows variant: the dynamic linker resolves cuDNN's sub-libraries itself.
 #[cfg(not(windows))]
 fn preload_siblings(_main_path: &Path) -> Result<Vec<libloading::Library>, String> {
@@ -214,6 +300,19 @@ mod tests {
                 "cudnn_adv64_9.dll",
                 "cudnn_cnn64_9.dll",
             ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "GPU: needs the CUDA toolkit DLLs; run with --ignored"]
+    fn adopts_the_copy_already_loaded() {
+        let path = load().expect("cudnn loads");
+        // Now a `cudnn64_<major>.dll` is in the process: the adopt hook must name that same file.
+        let adopted = loaded_copy().expect("loaded copy found");
+        assert_eq!(
+            std::fs::canonicalize(&adopted).expect("adopted path exists"),
+            std::fs::canonicalize(path).expect("loaded path exists")
         );
     }
 

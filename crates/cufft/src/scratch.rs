@@ -1,27 +1,35 @@
 //! Caller-owned reusable workspace [`Scratch`] with byte-budget enforcement for cuFFT plans.
 //!
-//! **What.** Holds one stream-ordered `DeviceBuffer<u8>` wrapped in a thread-safe shared inner
-//! state that grows on demand up to a caller's byte budget and is shared across cuFFT plans on the
-//! same stream.
+//! **What.** A cheap-to-clone handle to one shared [`cuda_core_ext::Scratch`] (the nv-rs
+//! workspace: stream-ordered growth, whole-request budget, native stream identity, generation
+//! counter) behind a mutex, shared across cuFFT plans on the same stream.
 //! **Why.** Disabling cuFFT auto-allocation (`cufftSetAutoAllocation(plan, 0)`) and supplying a
-//! caller-owned [`Scratch`] keeps GPU memory bounded by an explicit byte budget. Retaining shared
-//! ownership in [`crate::Plan`] guarantees plans never execute with dangling or prematurely
-//! deallocated workspace buffers even if the original [`Scratch`] handle is dropped or reallocated.
+//! caller-owned [`Scratch`] keeps GPU memory bounded by an explicit byte budget. cuFFT keeps the
+//! work-area pointer inside the plan (`cufftSetWorkArea`), so several plans share one workspace:
+//! each [`crate::Plan`] retains the shared state, compares [`cuda_core_ext::Scratch::generation`]
+//! and the pointer before every exec to rebind after a growth, and holds the mutex from that check
+//! until the exec is queued, so no clone can replace the buffer in between.
+//! **How.** The stream is stored next to the mutex (not only inside the shared workspace) so
+//! [`Scratch::stream`] and [`crate::Plan::workspace_stream`] can hand out `&Arc<Stream>` without a
+//! lock. All allocation, budget and stream rules are `cuda_core_ext::Scratch`'s.
 //! **Used by** [`crate::Plan`] and cuFFT execution pipelines.
 
-use crate::{Error, Result};
-use cuda_core::{DeviceBuffer, Stream};
-use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use crate::Result;
+use cuda_core::Stream;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(crate) struct ScratchState {
-    pub(crate) buffer: Option<DeviceBuffer<u8>>,
-    pub(crate) generation: u64,
+/// State shared by every clone of a [`Scratch`] and retained by the plans bound to it.
+pub(crate) struct Shared {
+    pub(crate) stream: Arc<Stream>,
+    pub(crate) scratch: Mutex<cuda_core_ext::Scratch>,
 }
 
-pub(crate) struct ScratchInner {
-    pub(crate) stream: Arc<Stream>,
-    pub(crate) state: Mutex<ScratchState>,
+impl Shared {
+    /// Locks the workspace. Every update of `cuda_core_ext::Scratch` leaves it consistent, so a
+    /// poisoned lock is recovered instead of panicking.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, cuda_core_ext::Scratch> {
+        self.scratch.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Reusable device workspace bound to a single CUDA [`Stream`].
@@ -30,36 +38,33 @@ pub(crate) struct ScratchInner {
 /// of the workspace allocation and never execute with dangling device pointers.
 #[derive(Clone)]
 pub struct Scratch {
-    pub(crate) inner: Arc<ScratchInner>,
+    pub(crate) inner: Arc<Shared>,
 }
 
 impl Scratch {
     /// Creates an empty workspace for FFT plans on `stream`.
     pub fn new(stream: &Arc<Stream>) -> Self {
-        Self {
-            inner: Arc::new(ScratchInner {
-                stream: stream.clone(),
-                state: Mutex::new(ScratchState {
-                    buffer: None,
-                    generation: 0,
-                }),
-            }),
-        }
+        Self::from_scratch(stream, cuda_core_ext::Scratch::new(stream))
     }
 
     /// Creates a workspace pre-allocated to `bytes` if `bytes <= budget`.
     pub fn with_capacity(stream: &Arc<Stream>, bytes: usize, budget: usize) -> Result<Self> {
-        let mut scratch = Self::new(stream);
-        if bytes > 0 {
-            scratch.reserve(stream, bytes, budget)?;
+        let scratch = cuda_core_ext::Scratch::with_capacity(stream, bytes, Some(budget))?;
+        Ok(Self::from_scratch(stream, scratch))
+    }
+
+    fn from_scratch(stream: &Arc<Stream>, scratch: cuda_core_ext::Scratch) -> Self {
+        Self {
+            inner: Arc::new(Shared {
+                stream: stream.clone(),
+                scratch: Mutex::new(scratch),
+            }),
         }
-        Ok(scratch)
     }
 
     /// Bytes currently held by this workspace.
     pub fn capacity(&self) -> usize {
-        let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.buffer.as_ref().map_or(0, |b| b.len())
+        self.inner.lock().capacity()
     }
 
     /// Stream this workspace is bound to.
@@ -67,48 +72,21 @@ impl Scratch {
         &self.inner.stream
     }
 
-    /// Returns the current allocation generation counter.
-    #[inline]
-    pub(crate) fn generation(&self) -> u64 {
-        let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.generation
-    }
-
     /// Ensures at least `bytes` of workspace are available on `stream`, admitting the request
     /// against `budget`.
+    ///
+    /// Returns the device pointer (`0` while nothing is allocated) and the allocation generation,
+    /// read under one lock so a concurrent growth through another clone cannot pair a pointer with
+    /// another allocation's generation.
     pub(crate) fn reserve(
         &mut self,
-        stream: &Arc<Stream>,
+        stream: &Stream,
         bytes: usize,
         budget: usize,
-    ) -> Result<*mut c_void> {
-        if !Arc::ptr_eq(stream, &self.inner.stream) {
-            return Err(Error::Invalid(
-                "scratch used on a different stream than it was created for",
-            ));
-        }
-        if bytes > budget {
-            return Err(Error::Budget {
-                requested: bytes,
-                available: budget,
-            });
-        }
-        if bytes == 0 {
-            return Ok(std::ptr::null_mut());
-        }
-        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        let cur_cap = state.buffer.as_ref().map_or(0, |b| b.len());
-        if cur_cap < bytes {
-            state.buffer = None;
-            // SAFETY: cuFFT workspace is scratch memory written before being read on `stream`.
-            state.buffer = Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes)? });
-            state.generation = state.generation.wrapping_add(1);
-        }
-        let buf = state
-            .buffer
-            .as_ref()
-            .ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
-        Ok((buf.cu_deviceptr() as usize) as *mut c_void)
+    ) -> Result<(cuda_core::sys::CUdeviceptr, u64)> {
+        let mut scratch = self.inner.lock();
+        let (ptr, _) = scratch.reserve(stream, bytes, Some(budget))?;
+        Ok((ptr, scratch.generation()))
     }
 }
 

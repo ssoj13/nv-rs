@@ -4,7 +4,7 @@
 use cuda_core::{Context, DeviceBuffer, Stream};
 use cusparse::{
     DataType, DiagType, DnMatDescr, DnVecDescr, Error, FillMode, Handle, IndexBase, IndexType, Op,
-    Order, PointerMode, Scratch, SpGemm, SpGemmAlg, SpMatDescr, SpMmAlg, SpMvAlg, SpSm, SpSmAlg,
+    Order, PointerMode, Scratch, ScratchError, SpGemm, SpGemmAlg, SpMatDescr, SpMmAlg, SpMvAlg, SpSm, SpSmAlg,
     SpSv, SpSvAlg, spmm, spmv, spmv_buffer_size,
 };
 use std::sync::Arc;
@@ -129,7 +129,6 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
     let cuda = Context::new(0).expect("CUDA device 0");
     let stream = cuda.default_stream();
     let handle = Handle::new(&cuda).expect("cusparse handle");
-    let mut scratch = Scratch::new(&stream);
     let mut spgemm = SpGemm::new(&cuda).expect("spgemm descr");
 
     // A = [[1, 2], [0, 3]], B = [[4, 0], [5, 6]] -> C = [[14, 12], [15, 18]]
@@ -171,7 +170,6 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
             &mut mat_c,
             DataType::F32,
             SpGemmAlg::Default,
-            &mut scratch,
             budget,
         )
         .expect("work_estimation");
@@ -179,8 +177,8 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
     let mut probe = Scratch::new(&stream);
     assert!(
         matches!(
-            probe.reserve_with_budget(&stream, 1, 0),
-            Err(Error::Budget {
+            probe.reserve(&stream, 1, Some(0)),
+            Err(ScratchError::Budget {
                 requested: 1,
                 available: 0
             })
@@ -192,7 +190,6 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
             "note: SpGEMM work estimation reported 0 bytes; SpGEMM budget denial not exercised"
         );
     } else {
-        let mut tiny_scratch = Scratch::new(&stream);
         let denied = spgemm.work_estimation(
             &handle,
             &stream,
@@ -205,7 +202,6 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
             &mut mat_c,
             DataType::F32,
             SpGemmAlg::Default,
-            &mut tiny_scratch,
             0,
         );
         assert!(
@@ -227,7 +223,6 @@ fn spgemm_csr_f32_matches_reference_and_enforces_budget() {
             &mut mat_c,
             DataType::F32,
             SpGemmAlg::Default,
-            &mut scratch,
             budget,
         )
         .expect("compute");
@@ -277,7 +272,6 @@ fn spsv_and_spsm_lower_triangular_solve() {
     let cuda = Context::new(0).expect("CUDA device 0");
     let stream = cuda.default_stream();
     let handle = Handle::new(&cuda).expect("cusparse handle");
-    let mut scratch = Scratch::new(&stream);
 
     // L = [[2, 0, 0], [1, 3, 0], [0, 2, 4]]
     // x = [4, 8, 12] -> L * y = x => y = [2, 2, 2]
@@ -311,7 +305,6 @@ fn spsv_and_spsm_lower_triangular_solve() {
         &mut vec_y,
         DataType::F32,
         SpSvAlg::Default,
-        &mut scratch,
         64 * 1024 * 1024,
     )
     .expect("spsv prepare");
@@ -356,7 +349,6 @@ fn spsv_and_spsm_lower_triangular_solve() {
         &mut mat_c,
         DataType::F32,
         SpSmAlg::Default,
-        &mut scratch,
         64 * 1024 * 1024,
     )
     .expect("spsm prepare");
@@ -391,14 +383,12 @@ const GROW: usize = 16 << 20;
 
 /// Overwrites every byte the caller-owned `scratch` holds, in stream order on `stream`.
 fn clobber(scratch: &mut Scratch, stream: &Stream) {
-    let (ptr, cap) = scratch
-        .reserve_with_budget(stream, 0, 0)
-        .expect("scratch pointer");
+    let (ptr, cap) = scratch.reserve(stream, 0, Some(0)).expect("scratch pointer");
     assert!(cap > 0, "scratch was pre-grown, so it must own a buffer");
     // SAFETY: `ptr` is the start of `scratch`'s live allocation of `cap` bytes, used on `stream`.
     unsafe {
         cuda_core::memory::memset_d8_async(
-            ptr as cuda_core::sys::CUdeviceptr,
+            ptr,
             0xFF,
             cap,
             stream.cu_stream(),
@@ -444,10 +434,9 @@ fn gemm_inputs(cuda: &Arc<Context>, stream: &Stream) -> GemmInputs {
 fn estimate_and_compute(
     spgemm: &mut SpGemm,
     handle: &Handle,
-    stream: &Stream,
+    stream: &Arc<Stream>,
     inputs: &GemmInputs,
     mat_c: &mut SpMatDescr,
-    scratch: &mut Scratch,
     budget: usize,
 ) {
     spgemm
@@ -463,7 +452,6 @@ fn estimate_and_compute(
             mat_c,
             DataType::F32,
             SpGemmAlg::Default,
-            scratch,
             budget,
         )
         .expect("work_estimation");
@@ -480,7 +468,6 @@ fn estimate_and_compute(
             mat_c,
             DataType::F32,
             SpGemmAlg::Default,
-            scratch,
             budget,
         )
         .expect("compute");
@@ -531,7 +518,7 @@ fn spsv_solve_survives_reuse_of_caller_scratch() {
     let handle = Handle::new(&cuda).expect("cusparse handle");
     let mut scratch = Scratch::new(&stream);
     scratch
-        .reserve_with_budget(&stream, GROW, GROW)
+        .reserve(&stream, GROW, Some(GROW))
         .expect("pre-grow scratch");
 
     // L = [[2, 0, 0], [1, 3, 0], [0, 2, 4]], x = [4, 8, 12] -> y = [2, 2, 2]
@@ -564,7 +551,6 @@ fn spsv_solve_survives_reuse_of_caller_scratch() {
         &mut vec_y,
         DataType::F32,
         SpSvAlg::Default,
-        &mut scratch,
         GROW,
     )
     .expect("spsv prepare");
@@ -618,21 +604,13 @@ fn spgemm_copy_survives_reuse_of_caller_scratch() {
     let handle = Handle::new(&cuda).expect("cusparse handle");
     let mut scratch = Scratch::new(&stream);
     scratch
-        .reserve_with_budget(&stream, GROW, GROW)
+        .reserve(&stream, GROW, Some(GROW))
         .expect("pre-grow scratch");
     let inputs = gemm_inputs(&cuda, &stream);
     let mut mat_c = empty_c(&cuda);
     let mut spgemm = SpGemm::new(&cuda).expect("spgemm descr");
 
-    estimate_and_compute(
-        &mut spgemm,
-        &handle,
-        &stream,
-        &inputs,
-        &mut mat_c,
-        &mut scratch,
-        GROW,
-    );
+    estimate_and_compute(&mut spgemm, &handle, &stream, &inputs, &mut mat_c, GROW);
     clobber(&mut scratch, &stream);
 
     let (rows, _, nnz) = mat_c.query_size().expect("query_size");
@@ -694,15 +672,7 @@ fn spgemm_output_binding_is_validated() {
     );
 
     let mut spgemm = SpGemm::new(&cuda).expect("spgemm descr");
-    estimate_and_compute(
-        &mut spgemm,
-        &handle,
-        &stream,
-        &inputs,
-        &mut mat_c,
-        &mut scratch,
-        budget,
-    );
+    estimate_and_compute(&mut spgemm, &handle, &stream, &inputs, &mut mat_c, budget);
     let early = spgemm_copy(&mut spgemm, &handle, &stream, &inputs, &mut mat_c);
     assert!(
         matches!(early, Err(Error::InvalidInput(_))),
@@ -763,10 +733,13 @@ fn set_pointer_mode_rejects_device() {
         .expect("host pointer mode");
 }
 
-/// P10: descriptors created on another `Context` than the handle's are refused.
+/// P10 (Wave 1b identity rule): descriptors made through another `Arc<Context>` for the same CUDA
+/// context (`Context::new` retains the device's primary context, so both `Arc`s name one
+/// `CUcontext`) are accepted: contexts compare by value (`cuda_core_ext::same_context`), not by
+/// `Arc`. A genuinely different context is still refused by `ensure_handle_context`.
 #[test]
 #[ignore = "GPU: requires CUDA toolkit cusparse DLL and an NVIDIA GPU"]
-fn descriptors_from_another_context_are_rejected() {
+fn descriptors_from_another_arc_of_the_same_context_are_accepted() {
     let ctx_a = Context::new(0).expect("CUDA device 0 (a)");
     let ctx_b = Context::new(0).expect("CUDA device 0 (b)");
     let stream_a = ctx_a.default_stream();
@@ -803,9 +776,11 @@ fn descriptors_from_another_context_are_rejected() {
         64 * 1024 * 1024,
     );
     assert!(
-        matches!(res, Err(Error::InvalidInput(_))),
-        "descriptors from another Context must be refused, got {res:?}"
+        cuda_core_ext::same_context(&ctx_a, &ctx_b),
+        "two Context::new(0) share the primary context"
     );
+    res.expect("descriptors of the same CUDA context through another Arc are accepted");
+    stream_a.synchronize().expect("spmv completes");
 }
 
 /// Returns the context current on the calling thread (null if none).
@@ -934,8 +909,9 @@ fn spmv_per_call_preprocess_overhead_is_bounded() {
     )
     .expect("buffer size");
     let (ws, _) = scratch
-        .reserve_with_budget(&stream, req, budget)
+        .reserve(&stream, req, Some(budget))
         .expect("workspace");
+    let ws = ws as usize as *mut std::ffi::c_void;
     handle.set_stream(&stream).expect("set_stream");
     let raw_call = |vec_y: &mut DnVecDescr| {
         // SAFETY: descriptors and host scalars are live; `ws` holds `req` bytes on `stream`.

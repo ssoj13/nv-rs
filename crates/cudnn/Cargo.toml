@@ -12,6 +12,7 @@ path = "src/cudnn.rs"
 [dependencies]
 cuda-bindings.workspace = true
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 cudnn-sys = { path = "../cudnn-sys" }
 nv-loader.workspace = true
 thiserror.workspace = true

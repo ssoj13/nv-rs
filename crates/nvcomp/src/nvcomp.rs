@@ -18,7 +18,7 @@ pub mod bitcomp;
 pub mod format;
 /// Stateful [`CompressionManager`] and self-describing [`CompressedBuffer`].
 pub mod manager;
-/// Reusable temporary workspace (`Scratch`) and event-fenced staging tables (`BatchStaging`).
+/// Event-fenced staging tables (`BatchStaging`) around the shared temporary workspace (`Scratch`).
 pub mod scratch;
 
 use std::ffi::CStr;
@@ -26,6 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use cuda_core::{Context, Stream};
+use cuda_core_ext::ScratchError;
 use nvcomp_sys as sys;
 use thiserror::Error;
 
@@ -39,7 +40,10 @@ pub use format::{
     DecompressBackend, Format, FormatKind, GdeflateOpts, Lz4Opts, SnappyOpts, ZstdOpts,
 };
 pub use manager::{CompressedBuffer, CompressedLayout, CompressionManager};
-pub use scratch::{BatchStaging, Scratch};
+/// The shared nv-rs device workspace (`cuda_core_ext::Scratch`); its errors convert into
+/// [`Error`].
+pub use cuda_core_ext::Scratch;
+pub use scratch::BatchStaging;
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -181,15 +185,41 @@ pub fn check_bitcomp(call: &'static str, raw: sys::bitcompResult_t) -> Result<()
     }
 }
 
+impl From<ScratchError> for Error {
+    fn from(e: ScratchError) -> Self {
+        match e {
+            ScratchError::WrongStream => {
+                Error::Invalid("scratch used on a different stream than it was created for")
+            }
+            ScratchError::Budget {
+                requested,
+                available,
+            } => Error::Budget {
+                requested,
+                available,
+            },
+            ScratchError::Misaligned { .. } => {
+                Error::Invalid("scratch workspace below the required alignment")
+            }
+            ScratchError::Driver(e) => Error::Driver(e),
+        }
+    }
+}
+
+/// Verifies `stream` belongs to `ctx`, comparing contexts by value
+/// ([`cuda_core_ext::same_context`]): a DLPack import or a second `Context::new` on the same
+/// ordinal is a different `Arc` for the same `CUcontext`.
 pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
-    if !Arc::ptr_eq(stream.context(), ctx) {
+    if !cuda_core_ext::same_context(stream.context(), ctx) {
         return Err(Error::Invalid("stream belongs to a different CUDA context"));
     }
     Ok(())
 }
 
-pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Result<()> {
-    if !Arc::ptr_eq(stream, expected) {
+/// Verifies `stream` is the native stream `expected` ([`cuda_core_ext::same_stream`]: `CUstream`
+/// and context), not the same `Arc`: `Context::default_stream()` returns a fresh `Arc` per call.
+pub(crate) fn same_stream(stream: &Stream, expected: &Stream) -> Result<()> {
+    if !cuda_core_ext::same_stream(stream, expected) {
         return Err(Error::Invalid(
             "staging/scratch buffer belongs to a different CUDA stream",
         ));
@@ -247,6 +277,25 @@ mod tests {
                 requested: 8192,
                 available: 4096
             })
+        ));
+
+        assert!(matches!(
+            Error::from(ScratchError::Budget {
+                requested: 8192,
+                available: 4096
+            }),
+            Error::Budget {
+                requested: 8192,
+                available: 4096
+            }
+        ));
+        assert!(matches!(
+            Error::from(ScratchError::WrongStream),
+            Error::Invalid(_)
+        ));
+        assert!(matches!(
+            Error::from(ScratchError::Misaligned { align: 8 }),
+            Error::Invalid(_)
         ));
     }
 

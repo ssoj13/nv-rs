@@ -1,6 +1,7 @@
 //! NCCL communicator (`Comm`), unique rendezvous identifier (`UniqueId`), collective/P2P
 //! launches, async error inspection, group fusion, and abort-safe teardown.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer, Stream};
@@ -84,10 +85,18 @@ pub enum AsyncState {
 
 /// RAII guard for a fused NCCL group (`ncclGroupStart` / `ncclGroupEnd`).
 ///
-/// Dropping an unclosed guard automatically invokes `ncclGroupEnd` without panicking. Call
-/// [`GroupGuard::finish`] to observe any group-end error explicitly.
+/// Dropping an unclosed guard automatically invokes `ncclGroupEnd` without panicking; its status
+/// cannot be returned from `Drop` and is discarded. Call [`GroupGuard::finish`] to observe any
+/// group-end error explicitly. Ending the group launches every operation enqueued in it so far,
+/// so on an error path the peers must still post matching operations, or the communicators must
+/// be aborted.
+///
+/// NCCL group nesting is per thread, so the guard is `!Send` and `!Sync`: it must end the group
+/// on the thread that started it.
 pub struct GroupGuard {
     active: bool,
+    /// Pins the guard to the thread whose NCCL group state it owns.
+    _thread_bound: PhantomData<*const ()>,
 }
 
 impl GroupGuard {
@@ -95,7 +104,10 @@ impl GroupGuard {
     /// or `Drop`.
     pub fn start() -> Result<Self> {
         group_start()?;
-        Ok(Self { active: true })
+        Ok(Self {
+            active: true,
+            _thread_bound: PhantomData,
+        })
     }
 
     /// Explicitly ends the NCCL group (`ncclGroupEnd`) and returns its status.
@@ -109,6 +121,7 @@ impl Drop for GroupGuard {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
+            // `Drop` cannot report the status; `finish` is the observable path (documented above).
             let _ = group_end();
         }
     }
@@ -144,6 +157,11 @@ pub fn group_end() -> Result<()> {
 
 /// Executes `f` inside a `ncclGroupStart` / `ncclGroupEnd` scope, ensuring `ncclGroupEnd` always
 /// runs even if `f` returns an error.
+///
+/// NCCL has no way to discard a group: when `f` fails after enqueuing some operations, ending
+/// the group still launches them, and `f`'s error is returned (a group-end error is then not
+/// reported). Peers must post the matching operations, or the communicators must be aborted
+/// ([`Comm::abort`]) to avoid a hang.
 pub fn group<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let guard = GroupGuard::start()?;
     let result = f();
@@ -156,10 +174,15 @@ pub fn group<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 
 /// Owned NCCL communicator (`ncclComm_t`) bound to one [`Arc<Context>`].
 ///
-/// On `Drop`, `Comm` queries `ncclCommGetAsyncError`: if the communicator is healthy and idle, it
-/// calls `ncclCommDestroy` (falling back to `ncclCommAbort` if destroy fails); if an async error
-/// or in-progress work remains, it calls `ncclCommAbort` immediately so drop never stalls and
-/// records any teardown error onto [`Context`].
+/// On `Drop`, `Comm` queries `ncclCommGetAsyncError`: if it reports an async error or an
+/// in-progress non-blocking operation, it calls `ncclCommAbort`; otherwise it calls
+/// `ncclCommDestroy`. Any teardown error is recorded onto [`Context`].
+///
+/// `ncclCommDestroy` finalizes the communicator implicitly, which waits for every operation
+/// already enqueued on it, so **`Drop` can block** while a peer has not posted matching work
+/// (`ncclCommGetAsyncError` does not report outstanding collectives). Call [`Comm::abort`] for a
+/// teardown that never waits. A failed `ncclCommDestroy` is not followed by `ncclCommAbort`: the
+/// handle must not be used after destroy returns, whatever its status.
 pub struct Comm {
     #[cfg(target_os = "linux")]
     raw: Option<nccl_sys::ncclComm_t>,
@@ -172,6 +195,12 @@ pub struct Comm {
 // SAFETY: `Comm` exposes thread-safe send when moved between threads while callers uphold
 // CUDA context/stream rules (`bind_to_thread` is called prior to FFI).
 unsafe impl Send for Comm {}
+
+/// CUDA device ordinal of `ctx` as the C `int` NCCL expects. `Context::cu_device` is a driver
+/// handle, which the CUDA API does not promise to equal the ordinal.
+fn device_ordinal(ctx: &Context) -> Result<i32> {
+    i32::try_from(ctx.ordinal()).map_err(|_| Error::Invalid("CUDA device ordinal exceeds i32"))
+}
 
 fn check_elem_span(count: usize, dtype: DataType, bytes: usize, label: &'static str) -> Result<()> {
     let needed = count
@@ -201,7 +230,8 @@ impl Comm {
             nccl_sys::load()?;
             let mut devs = Vec::with_capacity(ndev);
             for ctx in contexts {
-                let dev = ctx.cu_device();
+                // `devlist` takes CUDA device ordinals, not driver `CUdevice` handles.
+                let dev = device_ordinal(ctx)?;
                 if devs.contains(&dev) {
                     return Err(Error::Invalid("init_all requires distinct CUDA devices"));
                 }
@@ -273,7 +303,7 @@ impl Comm {
         }
         let nranks_i = i32::try_from(nranks).map_err(|_| Error::Invalid("nranks exceeds i32"))?;
         let rank_i = i32::try_from(rank).map_err(|_| Error::Invalid("rank exceeds i32"))?;
-        let device = ctx.cu_device();
+        let device = device_ordinal(ctx)?;
 
         #[cfg(target_os = "linux")]
         {
@@ -433,14 +463,9 @@ impl Comm {
                 }
             }
             if async_err == 0 {
-                // SAFETY: `ncclCommFinalize` completed cleanly.
+                // SAFETY: `ncclCommFinalize` completed cleanly. `raw` is not used after this
+                // call, whatever it returns (no abort on a handle destroy may have freed).
                 let destroy = unsafe { nccl_sys::ncclCommDestroy(raw) };
-                if destroy == 0 {
-                    return Ok(());
-                }
-                // SAFETY: fallback abort if destroy failed.
-                let abort_status = unsafe { nccl_sys::ncclCommAbort(raw) };
-                record_teardown(&self.ctx, abort_status);
                 return check("ncclCommDestroy", destroy);
             }
             // SAFETY: abort failed communicator rather than blocking in destroy.
@@ -520,6 +545,59 @@ impl Comm {
                 nccl_sys::ncclAllReduce(
                     send.cu_deviceptr() as *const c_void,
                     recv.cu_deviceptr() as *mut c_void,
+                    count,
+                    dtype.to_sys(),
+                    op.to_sys(),
+                    raw,
+                    stream.cu_stream(),
+                )
+            };
+            check("ncclAllReduce", status)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = op;
+            Err(Error::Unsupported("ncclAllReduce requires Linux"))
+        }
+    }
+
+    /// Launches an in-place `ncclAllReduce` on `stream` (`sendbuff == recvbuff == buf`), which
+    /// [`Self::all_reduce`] cannot express because one buffer cannot be borrowed shared and
+    /// exclusive at once.
+    pub fn all_reduce_in_place<T>(
+        &self,
+        buf: &mut DeviceBuffer<T>,
+        count: usize,
+        dtype: DataType,
+        op: RedOp,
+        stream: &Stream,
+    ) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        if !Arc::ptr_eq(buf.context(), &self.ctx) {
+            return Err(Error::Invalid(
+                "all_reduce_in_place buffer belongs to another CUDA context",
+            ));
+        }
+        check_elem_span(
+            count,
+            dtype,
+            buf.num_bytes(),
+            "buffer smaller than count * dtype",
+        )?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let raw = self
+                .raw
+                .ok_or(Error::Invalid("communicator already destroyed"))?;
+            self.ctx.bind_to_thread()?;
+            let ptr = buf.cu_deviceptr();
+            // SAFETY: context is bound, `buf` spans `count * dtype` bytes and belongs to
+            // `self.ctx`; NCCL documents `sendbuff == recvbuff` as in-place operation.
+            let status = unsafe {
+                nccl_sys::ncclAllReduce(
+                    ptr as *const c_void,
+                    ptr as *mut c_void,
                     count,
                     dtype.to_sys(),
                     op.to_sys(),
@@ -951,14 +1029,9 @@ impl Drop for Comm {
             // `ncclCommAbort` so Drop never blocks on a faulted communicator.
             let query = unsafe { nccl_sys::ncclCommGetAsyncError(raw, &mut async_err) };
             let teardown = if query == 0 && async_err == 0 {
-                // SAFETY: communicator reported no pending or async errors.
-                let destroy = unsafe { nccl_sys::ncclCommDestroy(raw) };
-                if destroy == 0 {
-                    0
-                } else {
-                    // SAFETY: fallback abort if destroy failed.
-                    unsafe { nccl_sys::ncclCommAbort(raw) }
-                }
+                // SAFETY: communicator reported no async error or in-progress operation. `raw` is
+                // not used after this call, whatever it returns (see the type docs).
+                unsafe { nccl_sys::ncclCommDestroy(raw) }
             } else {
                 // SAFETY: async fault or in-progress state; abort immediately to prevent deadlock.
                 unsafe { nccl_sys::ncclCommAbort(raw) }
@@ -989,5 +1062,28 @@ mod tests {
         assert!(check_elem_span(16, DataType::F32, 64, "buf").is_ok());
         assert!(check_elem_span(16, DataType::F32, 63, "buf").is_err());
         assert!(check_elem_span(usize::MAX, DataType::F64, 64, "buf").is_err());
+    }
+
+    #[test]
+    fn group_guard_is_neither_send_nor_sync() {
+        // NCCL-1 compile-time proof: `ncclGroupStart`/`ncclGroupEnd` nest per thread, so a guard
+        // moved or shared across threads would end the group on the wrong thread. If
+        // `GroupGuard` were `Send` (or `Sync`), both impls below would apply, the `_` would be
+        // ambiguous and this test module would fail to compile.
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        struct IsSend;
+        impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+        <GroupGuard as AmbiguousIfSend<_>>::check();
+
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        <GroupGuard as AmbiguousIfSync<_>>::check();
     }
 }

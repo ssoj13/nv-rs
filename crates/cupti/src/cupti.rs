@@ -18,7 +18,6 @@
 //! **Teardown safety.** Both [`ActivityProfiler`] and [`Subscriber`] hold `Arc<cuda_core::Context>`
 //! and record any `Drop` teardown error on `Context::record_err` instead of panicking.
 //! **Used by** `cupti` GPU tests and profiling tools.
-#![cfg_attr(target_os = "linux", allow(clippy::unnecessary_cast))]
 
 pub mod activity;
 pub mod subscriber;

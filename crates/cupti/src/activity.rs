@@ -7,8 +7,19 @@
 //!   [`ActivityKind`]s, flushes records (`cuptiActivityFlushAll`), and drains typed
 //!   [`ActivityRecord`]s.
 //!
-//! **Teardown safety.** `Drop` disables every enabled [`ActivityKind`], forces a flush, and
-//! records any failure on the owning `cuda_core::Context::record_err`.
+//! **Process-global state.** `cuptiActivityEnable` acts on the whole process, and CUPTI delivers
+//! every record through one pair of buffer callbacks. Profilers therefore share one record queue
+//! (records of all contexts, drained by whichever profiler asks first) and reference-count each
+//! [`ActivityKind`]: CUPTI is asked to disable a kind only when the last profiler that enabled it
+//! disables it or drops.
+//!
+//! **Decoding.** Kernel records are read field by field through raw pointers, never as a reference
+//! to the whole `CUpti_ActivityKernelLatest`, because an older loaded CUPTI emits a smaller record
+//! version. The fields read have the same offsets in every version (asserted at compile time).
+//!
+//! **Teardown safety.** `Drop` releases every [`ActivityKind`] this profiler enabled, forces a
+//! flush, and records any failure on the owning `cuda_core::Context::record_err`. When the last
+//! live profiler drops, undrained records are discarded so the next session starts empty.
 
 use crate::{Error, Result, check, ensure_loaded, panic_payload_to_string, sys};
 use cuda_core::{Context, DriverError};
@@ -182,6 +193,127 @@ fn state() -> &'static Mutex<ActivityState> {
     })
 }
 
+/// Process-wide bookkeeping behind `cuptiActivityEnable` / `cuptiActivityDisable`, which act on the
+/// whole process rather than on one profiler.
+///
+/// Kept apart from [`ACTIVITY_STATE`]: CUPTI may run the buffer callbacks (which lock that state)
+/// from inside the enable/disable/flush calls made while this lock is held. Lock order is always
+/// `KIND_REFS` before `ACTIVITY_STATE`.
+struct KindRefs {
+    /// Live [`ActivityProfiler`] instances.
+    live: usize,
+    /// One entry per (profiler, kind) enablement; a kind is enabled in CUPTI while it appears here.
+    enabled: Vec<ActivityKind>,
+}
+
+impl KindRefs {
+    /// Records one more enablement of `kind`. Returns `true` when it is the first, so CUPTI must
+    /// be asked to enable the kind.
+    fn acquire(&mut self, kind: ActivityKind) -> bool {
+        let first = !self.enabled.contains(&kind);
+        self.enabled.push(kind);
+        first
+    }
+
+    /// Removes one enablement of `kind`. Returns `true` when it was the last, so CUPTI must be
+    /// asked to disable the kind; releasing a kind that is not held is a no-op returning `false`.
+    fn release(&mut self, kind: ActivityKind) -> bool {
+        match self.enabled.iter().position(|&k| k == kind) {
+            Some(pos) => {
+                self.enabled.swap_remove(pos);
+                !self.enabled.contains(&kind)
+            }
+            None => false,
+        }
+    }
+}
+
+static KIND_REFS: Mutex<KindRefs> = Mutex::new(KindRefs {
+    live: 0,
+    enabled: Vec::new(),
+});
+
+fn kind_refs() -> std::sync::MutexGuard<'static, KindRefs> {
+    KIND_REFS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED` as the `u32` taken by `cuptiActivityFlushAll`. The enum is
+/// `c_int` with MSVC and `c_uint` with GCC, so a byte copy converts it without a cast that would
+/// be redundant on Linux.
+const FLUSH_FORCED: u32 =
+    u32::from_ne_bytes(sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED.to_ne_bytes());
+
+// The decoder reads these fields of `CUpti_ActivityKernelLatest` from records that an older loaded
+// CUPTI may have emitted as a smaller version. `CUpti_ActivityKernel3` is the oldest layout still
+// bound; every field read must sit at the same offset and inside that smallest record.
+const _: () = {
+    use std::mem::offset_of;
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, start)
+            == offset_of!(sys::CUpti_ActivityKernel3, start)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, end)
+            == offset_of!(sys::CUpti_ActivityKernel3, end)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, deviceId)
+            == offset_of!(sys::CUpti_ActivityKernel3, deviceId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, contextId)
+            == offset_of!(sys::CUpti_ActivityKernel3, contextId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, streamId)
+            == offset_of!(sys::CUpti_ActivityKernel3, streamId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, correlationId)
+            == offset_of!(sys::CUpti_ActivityKernel3, correlationId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernelLatest, name)
+            == offset_of!(sys::CUpti_ActivityKernel3, name)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityKernel3, name) + size_of::<*const std::ffi::c_char>()
+            <= size_of::<sys::CUpti_ActivityKernel3>()
+    );
+    // Same rule for memcpy records: `CUpti_ActivityMemcpy` is the oldest (smallest) bound version.
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, copyKind)
+            == offset_of!(sys::CUpti_ActivityMemcpy, copyKind)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, bytes)
+            == offset_of!(sys::CUpti_ActivityMemcpy, bytes)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, start)
+            == offset_of!(sys::CUpti_ActivityMemcpy, start)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, end) == offset_of!(sys::CUpti_ActivityMemcpy, end)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, deviceId)
+            == offset_of!(sys::CUpti_ActivityMemcpy, deviceId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, contextId)
+            == offset_of!(sys::CUpti_ActivityMemcpy, contextId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy6, streamId)
+            == offset_of!(sys::CUpti_ActivityMemcpy, streamId)
+    );
+    assert!(
+        offset_of!(sys::CUpti_ActivityMemcpy, streamId) + size_of::<u32>()
+            <= size_of::<sys::CUpti_ActivityMemcpy>()
+    );
+};
+
 unsafe extern "C" fn buffer_requested(
     buffer: *mut *mut u8,
     size: *mut usize,
@@ -265,37 +397,56 @@ fn decode_record(
     match kind {
         sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_KERNEL
         | sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL => {
-            // SAFETY: `kind` guarantees the record is the latest `CUpti_ActivityKernel*` struct for the bound CUPTI version.
-            let k = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityKernelLatest>() };
-            let name = if k.name.is_null() {
+            let k = record_ptr.cast::<sys::CUpti_ActivityKernelLatest>();
+            // SAFETY: `kind` says the record is some `CUpti_ActivityKernelN`, possibly an older and
+            // smaller version than `CUpti_ActivityKernelLatest`. No reference to the whole struct
+            // is formed; each field is read through a raw place whose offset is identical in every
+            // bound version and lies inside the smallest one (compile-time asserts above), so all
+            // reads stay inside the record CUPTI wrote. `read_unaligned` makes no alignment claim.
+            let (start, end, device_id, context_id, stream_id, correlation_id, name_ptr) = unsafe {
+                (
+                    (&raw const (*k).start).read_unaligned(),
+                    (&raw const (*k).end).read_unaligned(),
+                    (&raw const (*k).deviceId).read_unaligned(),
+                    (&raw const (*k).contextId).read_unaligned(),
+                    (&raw const (*k).streamId).read_unaligned(),
+                    (&raw const (*k).correlationId).read_unaligned(),
+                    (&raw const (*k).name).read_unaligned(),
+                )
+            };
+            let name = if name_ptr.is_null() {
                 String::new()
             } else {
-                // SAFETY: `k.name` is a NUL-terminated static/interned string from CUPTI.
-                unsafe { CStr::from_ptr(k.name) }
+                // SAFETY: `name_ptr` is a non-null NUL-terminated static/interned string from CUPTI.
+                unsafe { CStr::from_ptr(name_ptr) }
                     .to_string_lossy()
                     .into_owned()
             };
             ActivityRecord::Kernel {
                 name,
-                start_ns: k.start,
-                end_ns: k.end,
-                device_id: k.deviceId,
-                context_id: k.contextId,
-                stream_id: k.streamId,
-                correlation_id: k.correlationId,
+                start_ns: start,
+                end_ns: end,
+                device_id,
+                context_id,
+                stream_id,
+                correlation_id,
             }
         }
         sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY => {
-            // SAFETY: `kind` guarantees the record is `CUpti_ActivityMemcpy6`.
-            let m = unsafe { &*record_ptr.cast::<sys::CUpti_ActivityMemcpy6>() };
-            ActivityRecord::Memcpy {
-                copy_kind: m.copyKind,
-                bytes: m.bytes,
-                start_ns: m.start,
-                end_ns: m.end,
-                device_id: m.deviceId,
-                context_id: m.contextId,
-                stream_id: m.streamId,
+            let m = record_ptr.cast::<sys::CUpti_ActivityMemcpy6>();
+            // SAFETY: as for kernels: the record is some `CUpti_ActivityMemcpyN`, possibly smaller
+            // than `CUpti_ActivityMemcpy6`; only fields with version-independent offsets inside the
+            // smallest version are read through raw places (compile-time asserts above).
+            unsafe {
+                ActivityRecord::Memcpy {
+                    copy_kind: (&raw const (*m).copyKind).read_unaligned(),
+                    bytes: (&raw const (*m).bytes).read_unaligned(),
+                    start_ns: (&raw const (*m).start).read_unaligned(),
+                    end_ns: (&raw const (*m).end).read_unaligned(),
+                    device_id: (&raw const (*m).deviceId).read_unaligned(),
+                    context_id: (&raw const (*m).contextId).read_unaligned(),
+                    stream_id: (&raw const (*m).streamId).read_unaligned(),
+                }
             }
         }
         sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER
@@ -309,11 +460,19 @@ fn decode_record(
                 return_value: a.returnValue,
             }
         }
-        other => ActivityRecord::Other { kind: other as u32 },
+        // Byte copy instead of `as`: the enum is `c_int` with MSVC and `c_uint` with GCC.
+        other => ActivityRecord::Other {
+            kind: u32::from_ne_bytes(other.to_ne_bytes()),
+        },
     }
 }
 
-/// Manages CUPTI activity collection for a `cuda_core::Context`.
+/// Manages CUPTI activity collection on behalf of a `cuda_core::Context`.
+///
+/// CUPTI activity collection is process-global: an enabled kind produces records for every
+/// context, and all profilers share one record queue, so [`Self::drain_records`] returns records
+/// of all contexts and of other live profilers. Enabled kinds are reference-counted across
+/// profilers; dropping one profiler never disables a kind another profiler still uses.
 pub struct ActivityProfiler {
     cuda: Arc<Context>,
     enabled: Vec<ActivityKind>,
@@ -321,57 +480,79 @@ pub struct ActivityProfiler {
 
 impl ActivityProfiler {
     /// Registers the global CUPTI activity buffer callbacks (idempotent across instances) and
-    /// returns an [`ActivityProfiler`] bound to `cuda`.
+    /// returns an [`ActivityProfiler`] whose CUPTI calls bind `cuda` first.
     pub fn new(cuda: &Arc<Context>) -> Result<Self> {
         ensure_loaded()?;
         cuda.bind_to_thread()?;
-        let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
-        if !st.registered {
-            // SAFETY: `buffer_requested` and `buffer_completed` are `extern "C"` trampolines
-            // guarded by `catch_unwind`.
-            check("cuptiActivityRegisterCallbacks", unsafe {
-                sys::cuptiActivityRegisterCallbacks(Some(buffer_requested), Some(buffer_completed))
-            })?;
-            st.registered = true;
+        {
+            let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+            if !st.registered {
+                // SAFETY: `buffer_requested` and `buffer_completed` are `extern "C"` trampolines
+                // guarded by `catch_unwind`.
+                check("cuptiActivityRegisterCallbacks", unsafe {
+                    sys::cuptiActivityRegisterCallbacks(
+                        Some(buffer_requested),
+                        Some(buffer_completed),
+                    )
+                })?;
+                st.registered = true;
+            }
         }
+        // Counted only once construction cannot fail, so every increment has a matching `Drop`.
+        kind_refs().live += 1;
         Ok(Self {
             cuda: cuda.clone(),
             enabled: Vec::new(),
         })
     }
 
-    /// Enables collection for `kind` (`cuptiActivityEnable`).
+    /// Enables collection for `kind`. CUPTI (`cuptiActivityEnable`) is called only when no other
+    /// live profiler has the kind enabled; enabling a kind twice on one profiler is a no-op.
     pub fn enable(&mut self, kind: ActivityKind) -> Result<()> {
-        self.cuda.bind_to_thread()?;
-        // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
-        check("cuptiActivityEnable", unsafe {
-            sys::cuptiActivityEnable(kind.to_sys())
-        })?;
-        if !self.enabled.contains(&kind) {
-            self.enabled.push(kind);
+        if self.enabled.contains(&kind) {
+            return Ok(());
         }
+        self.cuda.bind_to_thread()?;
+        let mut refs = kind_refs();
+        if refs.acquire(kind) {
+            // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
+            let rc = unsafe { sys::cuptiActivityEnable(kind.to_sys()) };
+            if let Err(err) = check("cuptiActivityEnable", rc) {
+                // Undo the reference taken above; CUPTI did not enable the kind.
+                refs.release(kind);
+                return Err(err);
+            }
+        }
+        self.enabled.push(kind);
         Ok(())
     }
 
-    /// Disables collection for `kind` (`cuptiActivityDisable`).
+    /// Disables collection for `kind` on this profiler. CUPTI (`cuptiActivityDisable`) is called
+    /// only when this was the last live profiler with the kind enabled; disabling a kind this
+    /// profiler did not enable is a no-op.
     pub fn disable(&mut self, kind: ActivityKind) -> Result<()> {
+        let Some(pos) = self.enabled.iter().position(|&k| k == kind) else {
+            return Ok(());
+        };
         self.cuda.bind_to_thread()?;
-        // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
-        check("cuptiActivityDisable", unsafe {
-            sys::cuptiActivityDisable(kind.to_sys())
-        })?;
-        self.enabled.retain(|&k| k != kind);
+        let mut refs = kind_refs();
+        if refs.release(kind) {
+            // SAFETY: `kind.to_sys()` is a valid `CUpti_ActivityKind`.
+            let rc = unsafe { sys::cuptiActivityDisable(kind.to_sys()) };
+            if let Err(err) = check("cuptiActivityDisable", rc) {
+                // CUPTI still collects the kind, so this profiler keeps its reference.
+                refs.acquire(kind);
+                return Err(err);
+            }
+        }
+        self.enabled.swap_remove(pos);
         Ok(())
     }
 
     /// Flushes all pending activity records (`cuptiActivityFlushAll`), surfacing any callback panic.
     pub fn flush(&self, forced: bool) -> Result<()> {
         self.cuda.bind_to_thread()?;
-        let flag = if forced {
-            sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32
-        } else {
-            0
-        };
+        let flag = if forced { FLUSH_FORCED } else { 0 };
         // SAFETY: `flag` is 0 or `CUPTI_ACTIVITY_FLAG_FLUSH_FORCED`.
         check("cuptiActivityFlushAll", unsafe {
             sys::cuptiActivityFlushAll(flag)
@@ -380,7 +561,8 @@ impl ActivityProfiler {
     }
 
     /// Drains all collected [`ActivityRecord`]s into `out` (reusing `out`'s capacity) and returns
-    /// the dropped record count.
+    /// the dropped record count. The queue is process-global: it holds records of every context
+    /// and is shared with any other live profiler.
     pub fn drain_records_into(&self, out: &mut Vec<ActivityRecord>) -> Result<usize> {
         self.check_callback_panic()?;
         let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -407,8 +589,13 @@ impl ActivityProfiler {
 impl Drop for ActivityProfiler {
     fn drop(&mut self) {
         let _ = self.cuda.bind_to_thread();
+        let mut refs = kind_refs();
         for kind in self.enabled.drain(..) {
-            // SAFETY: `kind` was previously enabled by this profiler.
+            if !refs.release(kind) {
+                // Another live profiler still collects this kind.
+                continue;
+            }
+            // SAFETY: `kind` was enabled through this profiler and no other profiler holds it.
             let rc = unsafe { sys::cuptiActivityDisable(kind.to_sys()) };
             if rc != sys::CUptiResult_CUPTI_SUCCESS {
                 self.cuda.record_err(Err::<(), _>(DriverError(
@@ -417,15 +604,19 @@ impl Drop for ActivityProfiler {
             }
         }
         // SAFETY: forced flush on teardown ensures CUPTI returns all in-flight buffers to the pool.
-        let rc = unsafe {
-            sys::cuptiActivityFlushAll(
-                sys::CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED as u32,
-            )
-        };
+        let rc = unsafe { sys::cuptiActivityFlushAll(FLUSH_FORCED) };
         if rc != sys::CUptiResult_CUPTI_SUCCESS {
             self.cuda.record_err(Err::<(), _>(DriverError(
                 cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN,
             )));
+        }
+        refs.live = refs.live.saturating_sub(1);
+        if refs.live == 0 {
+            // No profiler is left to drain what the flush above delivered; discard it so the next
+            // profiler does not report records and drop counts of a finished session.
+            let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+            st.records.clear();
+            st.dropped = 0;
         }
     }
 }
@@ -452,5 +643,59 @@ mod tests {
         assert_eq!(pool.free_count(), 0);
         assert!(pool.release(p2));
         assert!(!pool.release(p2), "double release must return false");
+    }
+
+    #[test]
+    fn kind_refs_enable_once_and_disable_only_on_last_release() {
+        // CUPTI-1: two profilers enabling the same kind must not let the first drop disable it.
+        let mut refs = KindRefs {
+            live: 0,
+            enabled: Vec::new(),
+        };
+        assert!(refs.acquire(ActivityKind::Memcpy), "first enable reaches CUPTI");
+        assert!(!refs.acquire(ActivityKind::Memcpy), "second enable is shared");
+        assert!(refs.acquire(ActivityKind::Kernel));
+        assert!(
+            !refs.release(ActivityKind::Memcpy),
+            "another profiler still holds Memcpy"
+        );
+        assert!(refs.release(ActivityKind::Memcpy), "last holder disables");
+        assert!(
+            !refs.release(ActivityKind::Memcpy),
+            "release without a holder is a no-op"
+        );
+        assert!(refs.release(ActivityKind::Kernel));
+        assert!(refs.enabled.is_empty());
+    }
+
+    #[test]
+    fn decode_reads_an_older_smaller_kernel_record_in_bounds() {
+        // CUPTI-3: an older CUPTI emits `CUpti_ActivityKernel3` (120 bytes), smaller than
+        // `CUpti_ActivityKernelLatest`. Decoding must read only that record's bytes (Miri flags a
+        // reference to the larger struct here).
+        // SAFETY: the record is plain C data (integers, an integer union, raw pointers), for which
+        // all-zero bytes are a valid value.
+        let mut rec: sys::CUpti_ActivityKernel3 = unsafe { std::mem::zeroed() };
+        rec.kind = sys::CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_KERNEL;
+        rec.start = 10;
+        rec.end = 25;
+        rec.deviceId = 1;
+        rec.contextId = 2;
+        rec.streamId = 3;
+        rec.correlationId = 4;
+        let kind = rec.kind;
+        let decoded = decode_record((&raw mut rec).cast::<sys::CUpti_Activity>(), kind);
+        assert_eq!(
+            decoded,
+            ActivityRecord::Kernel {
+                name: String::new(),
+                start_ns: 10,
+                end_ns: 25,
+                device_id: 1,
+                context_id: 2,
+                stream_id: 3,
+                correlation_id: 4,
+            }
+        );
     }
 }

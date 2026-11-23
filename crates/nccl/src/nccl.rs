@@ -2,9 +2,10 @@
 //!
 //! Provides RAII [`Comm`] communicators (`init_all`, `init_rank`), portable [`UniqueId`] tokens,
 //! explicit [`DataType`] / [`RedOp`] enums, [`group`] / [`group_start`] / [`group_end`] fusion,
-//! stream-ordered collectives (`all_reduce`, `broadcast`, `reduce`, `all_gather`,
-//! `reduce_scatter`, `send`, `recv`), and async-error-aware teardown (`async_error`, `finalize`,
-//! `abort`, and abort-on-fault in `Drop`).
+//! stream-ordered collectives (`all_reduce`, `all_reduce_in_place`, `broadcast`, `reduce`,
+//! `all_gather`, `reduce_scatter`, `send`, `recv`), and async-error-aware teardown
+//! (`async_error`, `finalize`, `abort`, and abort-on-fault in `Drop`; a healthy `Drop` can block,
+//! see [`Comm`]).
 //!
 //! Platform note: `nccl-sys` exists only on Linux. This crate compiles cleanly on both Windows and
 //! Linux; on non-Linux targets, runtime entry points return [`Error::Unsupported`] while types,
@@ -391,6 +392,8 @@ mod tests {
         let comm = &comms[0];
         assert_eq!(comm.count(), 1);
         assert_eq!(comm.user_rank(), 0);
+        // NCCL-6: the communicator reports the CUDA device ordinal, not the `CUdevice` handle.
+        assert_eq!(usize::try_from(comm.cu_device()).unwrap(), ctx.ordinal());
 
         let send = DeviceBuffer::from_host(&stream, &[1.5f32, 2.5, 3.5, 4.5]).unwrap();
         let mut recv = DeviceBuffer::<f32>::zeroed(&stream, 4).unwrap();
@@ -437,6 +440,71 @@ mod tests {
         s1.synchronize().unwrap();
         assert_eq!(rx0.to_host_vec(&s0).unwrap(), vec![11.0f32, 22.0]);
         assert_eq!(rx1.to_host_vec(&s1).unwrap(), vec![11.0f32, 22.0]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux CUDA GPU(s) and libnccl"]
+    fn t2_single_rank_all_reduce_in_place() {
+        // NCCL-7: in-place reduction (`sendbuff == recvbuff`) through one exclusive borrow.
+        let ctx = Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let comms = Comm::init_all(std::slice::from_ref(&ctx)).unwrap();
+        let mut buf = DeviceBuffer::from_host(&stream, &[1.0f32, 2.0, 3.0]).unwrap();
+        comms[0]
+            .all_reduce_in_place(&mut buf, 3, DataType::F32, RedOp::Sum, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(comms[0].async_error().unwrap(), AsyncState::Ok);
+        assert_eq!(buf.to_host_vec(&stream).unwrap(), vec![1.0f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[ignore = "requires 2+ Linux CUDA GPUs and libnccl"]
+    fn t3_drop_waits_for_unmatched_peer_work() {
+        // NCCL-2 (deciding test): `Comm::drop` calls `ncclCommDestroy` on a healthy communicator.
+        // Rank 0 enqueues a send that rank 1 has not matched; this asserts the documented claim
+        // that dropping rank 0 then blocks until the peer participates.
+        let count = Context::device_count().unwrap();
+        if count < 2 {
+            eprintln!("skipping t3_drop_waits_for_unmatched_peer_work: requires >= 2 GPUs");
+            return;
+        }
+        let ctx0 = Context::new(0).unwrap();
+        let ctx1 = Context::new(1).unwrap();
+        let s0 = ctx0.new_stream().unwrap();
+        let s1 = ctx1.new_stream().unwrap();
+        let mut comms = Comm::init_all(&[ctx0.clone(), ctx1.clone()])
+            .unwrap()
+            .into_iter();
+        let c0 = comms.next().unwrap();
+        let c1 = comms.next().unwrap();
+        let tx = DeviceBuffer::from_host(&s0, &[1.0f32, 2.0]).unwrap();
+        let mut rx = DeviceBuffer::<f32>::zeroed(&s1, 2).unwrap();
+        c0.send(&tx, 2, DataType::F32, 1, &s0).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(c0);
+            done_tx.send(()).unwrap();
+        });
+        let blocked = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_err();
+        if blocked {
+            // Match the send so rank 0's destroy can complete, then tear rank 1 down too.
+            c1.recv(&mut rx, 2, DataType::F32, 0, &s1).unwrap();
+            s1.synchronize().unwrap();
+            drop(c1);
+        } else {
+            // Rank 0 is gone; a matching recv could never complete.
+            c1.abort().unwrap();
+        }
+        dropper.join().unwrap();
+        assert!(
+            blocked,
+            "Comm::drop returned while a peer had not matched an enqueued send"
+        );
     }
 
     #[test]

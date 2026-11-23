@@ -17,7 +17,7 @@ __global__ void saxpy(T a, const T* x, const T* y, T* out, int n) {
 "#;
 
 #[test]
-#[ignore = "GPU"]
+#[ignore = "needs the CUDA toolkit NVRTC library (no GPU); run with --ignored"]
 fn version_and_supported_archs() {
     let (maj, min) = nvrtc::version().expect("nvrtcVersion");
     assert!(maj >= 12, "unexpected NVRTC major version {maj}.{min}");
@@ -116,7 +116,12 @@ fn compile_ptx_inspect_and_launch_kernel() {
     stream.synchronize().expect("sync");
 
     // SAFETY: `module` is no longer in use after `stream.synchronize()`.
-    unsafe { cu::cuModuleUnload(module) };
+    let res = unsafe { cu::cuModuleUnload(module) };
+    assert_eq!(
+        res,
+        cu::cudaError_enum_CUDA_SUCCESS,
+        "cuModuleUnload failed"
+    );
 
     let got = out_dev.to_host_vec(&stream).expect("readback");
     for (i, &val) in got.iter().enumerate() {

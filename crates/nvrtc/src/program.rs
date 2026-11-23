@@ -88,7 +88,9 @@ impl Program {
     /// Compiles the program with `options`.
     ///
     /// Returns the compiler build log on success (which may contain warnings). On failure, returns
-    /// [`Error::Compilation`] with the retrieved build log attached.
+    /// [`Error::Compilation`] with the retrieved build log attached. If compilation succeeds but the
+    /// log query fails, returns [`Error::Status`] naming `nvrtcGetProgramLogSize` or
+    /// `nvrtcGetProgramLog`; the program is still compiled and [`Self::ptx`] remains usable.
     pub fn compile(&mut self, options: &CompileOptions) -> Result<String> {
         let c_opts = options.to_cstrings()?;
         let ptrs: Vec<*const c_char> = c_opts.iter().map(|s| s.as_ptr()).collect();

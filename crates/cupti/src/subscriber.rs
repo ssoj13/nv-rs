@@ -3,10 +3,16 @@
 //!
 //! **What.** Wraps `cuptiSubscribe`, `cuptiUnsubscribe`, `cuptiEnableDomain`,
 //! `cuptiEnableCallback`, and `cuptiGetCallbackName`.
+//!
+//! **Teardown.** `Drop` unsubscribes, waits for callbacks still running on other threads, drops
+//! the closure, and leaks the small shared state block CUPTI was given (one per subscriber),
+//! because CUPTI does not document that unsubscribe excludes callbacks already dispatched.
 
 use crate::{Error, Result, check, ensure_loaded, panic_payload_to_string, sys};
 use cuda_core::{Context, DriverError};
+use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_void};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// CUPTI callback domains (`CUpti_CallbackDomain`).
@@ -51,13 +57,31 @@ impl CallbackDomain {
     }
 }
 
-/// Callback closure invoked by [`Subscriber`]: `(domain, cbid, raw_cbdata)`.
+/// Callback closure invoked by [`Subscriber`] with `(domain, cbid)`. The raw
+/// `CUpti_CallbackData` (API enter/exit site, correlation id, parameters) is not forwarded.
 pub type CallbackFn = dyn Fn(CallbackDomain, u32) + Send + Sync;
 
+/// Callback state shared with CUPTI through `userdata`.
+///
+/// CUPTI does not document that `cuptiUnsubscribe` waits for callbacks already dispatched on
+/// other threads, so this block is never freed: a late [`callback_trampoline`] can always
+/// dereference it, sees `active == false`, and returns without touching `cb`.
 struct SubscriberInner {
-    cb: Box<CallbackFn>,
+    /// Trampoline invocations currently between their `in_flight` increment and decrement.
+    in_flight: AtomicUsize,
+    /// Cleared by `Subscriber::drop` after `cuptiUnsubscribe`.
+    active: AtomicBool,
+    /// The user callback; taken (set to `None`) by `Subscriber::drop` once no call can use it.
+    cb: UnsafeCell<Option<Box<CallbackFn>>>,
     panic_msg: Mutex<Option<String>>,
 }
+
+// SAFETY: `cb` is the only field without its own synchronization. Trampolines read it only after
+// incrementing `in_flight` and then observing `active == true`; `Subscriber::drop` takes it only
+// after storing `active = false` and then observing `in_flight == 0`. With `SeqCst` on all four
+// operations, a trampoline that observed `active == true` is counted in every later `in_flight`
+// load of `drop`, so the read and the take never overlap. `CallbackFn` is `Send + Sync`.
+unsafe impl Sync for SubscriberInner {}
 
 unsafe extern "C" fn callback_trampoline(
     userdata: *mut c_void,
@@ -68,21 +92,32 @@ unsafe extern "C" fn callback_trampoline(
     if userdata.is_null() {
         return;
     }
-    // SAFETY: `userdata` is a `Box<SubscriberInner>` owned by `Subscriber`, alive until after
-    // `cuptiUnsubscribe` completes in `Subscriber::drop`.
+    // SAFETY: `userdata` is the `SubscriberInner` leaked by `Subscriber::new`; it is never freed
+    // once CUPTI holds it, so it is valid for any call CUPTI makes, even after unsubscribe.
     let inner = unsafe { &*userdata.cast::<SubscriberInner>() };
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some(dom) = CallbackDomain::from_sys(domain) {
-            (inner.cb)(dom, cbid);
+    inner.in_flight.fetch_add(1, Ordering::SeqCst);
+    if inner.active.load(Ordering::SeqCst) {
+        // SAFETY: `active` was observed after this call was counted in `in_flight`, so
+        // `Subscriber::drop` has not taken `cb` and will not until the decrement below.
+        if let Some(cb) = unsafe { &*inner.cb.get() } {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(dom) = CallbackDomain::from_sys(domain) {
+                    cb(dom, cbid);
+                }
+            }));
+            if let Err(payload) = res {
+                let mut slot = inner.panic_msg.lock().unwrap_or_else(|e| e.into_inner());
+                slot.get_or_insert_with(|| panic_payload_to_string(payload));
+            }
         }
-    }));
-    if let Err(payload) = res {
-        let mut slot = inner.panic_msg.lock().unwrap_or_else(|e| e.into_inner());
-        slot.get_or_insert_with(|| panic_payload_to_string(payload));
     }
+    inner.in_flight.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Owns a `CUpti_SubscriberHandle` and its boxed callback state.
+///
+/// `Drop` unsubscribes, then waits until no callback is executing before dropping the closure.
+/// Dropping a `Subscriber` from inside its own callback therefore never returns.
 pub struct Subscriber {
     raw: sys::CUpti_SubscriberHandle,
     inner: *mut SubscriberInner,
@@ -100,7 +135,9 @@ impl Subscriber {
         ensure_loaded()?;
         cuda.bind_to_thread()?;
         let inner = Box::into_raw(Box::new(SubscriberInner {
-            cb: callback,
+            in_flight: AtomicUsize::new(0),
+            active: AtomicBool::new(true),
+            cb: UnsafeCell::new(Some(callback)),
             panic_msg: Mutex::new(None),
         }));
         let mut raw: sys::CUpti_SubscriberHandle = std::ptr::null_mut();
@@ -139,7 +176,7 @@ impl Subscriber {
 
     /// Returns an error if the Rust callback panicked during an earlier CUPTI invocation.
     pub fn check_panic(&self) -> Result<()> {
-        // SAFETY: `self.inner` is alive for the lifetime of `self`.
+        // SAFETY: `self.inner` is never freed after a successful `new`, see `SubscriberInner`.
         let inner = unsafe { &*self.inner };
         let mut slot = inner.panic_msg.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(msg) = slot.take() {
@@ -152,8 +189,9 @@ impl Subscriber {
 impl Drop for Subscriber {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            // SAFETY: `self.raw` was created by `cuptiSubscribe`; unsubscribing first guarantees
-            // CUPTI will not invoke `callback_trampoline` after this call returns.
+            // SAFETY: `self.raw` was created by `cuptiSubscribe` and is unsubscribed once. CUPTI
+            // starts no new dispatch to it afterwards; dispatches already under way are handled
+            // by the quiescence wait below.
             let rc = unsafe { sys::cuptiUnsubscribe(self.raw) };
             if rc != sys::CUptiResult_CUPTI_SUCCESS {
                 self.cuda.record_err(Err::<(), _>(DriverError(
@@ -162,8 +200,17 @@ impl Drop for Subscriber {
             }
         }
         if !self.inner.is_null() {
-            // SAFETY: `cuptiUnsubscribe` has completed, so `self.inner` is no longer aliased.
-            drop(unsafe { Box::from_raw(self.inner) });
+            // SAFETY: `self.inner` is never freed after a successful `new`, see `SubscriberInner`.
+            let inner = unsafe { &*self.inner };
+            inner.active.store(false, Ordering::SeqCst);
+            while inner.in_flight.load(Ordering::SeqCst) != 0 {
+                std::thread::yield_now();
+            }
+            // SAFETY: `active` is false and no trampoline is counted in `in_flight`, so no
+            // trampoline reads `cb` now or later (see the `Sync` proof on `SubscriberInner`).
+            let cb = unsafe { (*inner.cb.get()).take() };
+            drop(cb);
+            // `SubscriberInner` itself is intentionally leaked; see its documentation.
         }
     }
 }

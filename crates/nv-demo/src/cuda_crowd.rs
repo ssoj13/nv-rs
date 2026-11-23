@@ -1,6 +1,6 @@
 //! CUDA/NVRTC GPU-direct articulated crowd simulation backend for `csg-actors`.
 //!
-//! What: compiles `csg_actors::ACTOR_SIM_CUH` (`step_and_emit_actors_cuda`) alongside a compact
+//! What: compiles `csg_actors::pod::actor_sim_cuh_source()` (`step_and_emit_actors_cuda`) alongside a compact
 //! bounds-checked scatter kernel (`scatter_crowd_to_csg_and_optix`) via NVRTC, steps `ActorStatePod`
 //! LIPM/PD balance + rigid FK + analytical 2-bone limb IK on the GPU, and writes resolved transforms
 //! directly into device `CsgGpuInstance`, `prev_xforms`, and OptiX `OptixInstance` VRAM buffers.
@@ -19,8 +19,8 @@ use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 
 use csg_actors::{
-    ACTOR_SIM_CUH, ActorDescPod, ActorStatePod, ArchetypeKind, ArchetypeMetaPod, BoneDescPod,
-    BoneOutPod, GroundSamplePod, IntentPod, SimUniformsPod, intent_flags,
+    ActorDescPod, ActorStatePod, ArchetypeKind, ArchetypeMetaPod, BoneDescPod, BoneOutPod,
+    GroundSamplePod, IntentPod, SimUniformsPod, intent_flags, pod::actor_sim_cuh_source,
 };
 use csg_scene::{CROWD_SIDEWALK_CLEARANCE_M, SceneBuilt, inst_flags};
 #[cfg(test)]
@@ -249,7 +249,8 @@ impl Drop for PinnedU32 {
 }
 
 /// GPU steering, DEM ground sampling, bounds-checked CSG/OptiX scatter, and amortized IAS
-/// displacement-flag kernels appended to `csg_actors::ACTOR_SIM_CUH` in the same NVRTC unit.
+/// displacement-flag kernels appended to `csg_actors::pod::actor_sim_cuh_source()` in the same
+/// NVRTC unit.
 const SCATTER_KERNEL_CU: &str = r#"
 #if defined(__CUDACC__) || defined(__CUDACC_RTC__)
 struct alignas(16) ActorDemUniformsPod {
@@ -755,15 +756,30 @@ fn check_scatter_topology(
     Ok(())
 }
 
+/// Parameter count of `step_and_emit_actors_cuda` (`csg-actors/shaders/actor_sim.cuh`).
+const STEP_KERNEL_ARG_COUNT: usize = 19;
+
+/// Kernel sentinel for "keep the root bone's own compound on a LOD2 pawn" (see the comment above
+/// `step_and_emit_actors_cuda`).
+const LOD2_PAWN_KEEP_ROOT: u32 = u32::MAX;
+
+/// Trailing `lod2_pawn_compound` kernel argument for `crowd`.
+#[inline]
+fn lod2_pawn_compound_arg(crowd: &csg_actors::CrowdSim) -> u32 {
+    crowd.lod2_pawn_compound.unwrap_or(LOD2_PAWN_KEEP_ROOT)
+}
+
 impl CudaCrowdBackend {
-    /// Compile `csg_actors::ACTOR_SIM_CUH` + GPU steering/DEM/scatter/displacement kernels via
+    /// Compile `csg_actors::pod::actor_sim_cuh_source()` + GPU steering/DEM/scatter/displacement kernels via
     /// NVRTC (backed by the content-addressed disk PTX cache) and load the CUDA module.
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed for CudaCrowdBackend: {e}"))?;
 
-        let mut full_src = String::with_capacity(ACTOR_SIM_CUH.len() + SCATTER_KERNEL_CU.len() + 2);
-        full_src.push_str(ACTOR_SIM_CUH);
+        // The header refuses to compile without the generated `#define` block that carries the
+        // Rust-side layout and gait constants, so the kernel can never drift from `csg_actors::pod`.
+        let mut full_src = actor_sim_cuh_source();
+        full_src.reserve(SCATTER_KERNEL_CU.len() + 1);
         full_src.push('\n');
         full_src.push_str(SCATTER_KERNEL_CU);
 
@@ -945,7 +961,9 @@ impl CudaCrowdBackend {
                 .synchronize()
                 .map_err(|e| format!("CUDA crowd CPU snapshot sync failed: {e}"))?;
             if sync_to_world {
-                scene.sync_crowd_to_world();
+                scene
+                    .sync_crowd_to_world()
+                    .map_err(|e| format!("CUDA crowd snapshot to world sync failed: {e:?}"))?;
             }
         }
         self.cpu_bones_stale = false;
@@ -1178,8 +1196,11 @@ impl CudaCrowdBackend {
         let mut p_sbt_null: u64 = 0;
         let mut optix_off_zero: u32 = 0;
         let (mut lod1, mut lod2, mut cull) = lod.resolve_dists();
+        // Same source as the CPU step (`CrowdSim::lod2_pawn_compound`, set by csg-scene from the
+        // actor GAS bank) so CPU and GPU agree on which compound a LOD2 pawn draws.
+        let mut lod2_pawn = lod2_pawn_compound_arg(&scene.crowd);
 
-        let mut step_args: [*mut c_void; 18] = [
+        let mut step_args: [*mut c_void; STEP_KERNEL_ARG_COUNT] = [
             (&raw mut p_u_sim).cast(),
             (&raw mut p_arch).cast(),
             (&raw mut p_descs).cast(),
@@ -1198,9 +1219,10 @@ impl CudaCrowdBackend {
             (&raw mut lod1).cast(),
             (&raw mut lod2).cast(),
             (&raw mut cull).cast(),
+            (&raw mut lod2_pawn).cast(),
         ];
 
-        // SAFETY: `self.step_fn` matches the 18-parameter ABI of `step_and_emit_actors_cuda`;
+        // SAFETY: `step_args` lists the 19 parameters of `step_and_emit_actors_cuda` in order;
         // every non-null device pointer has capacity for at least `n_actors`/`n_bones` elements
         // and outlives `stream` synchronization.
         let step_res = unsafe {
@@ -1438,7 +1460,8 @@ impl CudaCrowdBackend {
         let mut p_null: u64 = 0;
         let mut off_zero: u32 = 0;
         let (mut lod1, mut lod2, mut cull) = lod.resolve_dists();
-        let mut step_args: [*mut c_void; 18] = [
+        let mut lod2_pawn = lod2_pawn_compound_arg(crowd);
+        let mut step_args: [*mut c_void; STEP_KERNEL_ARG_COUNT] = [
             (&raw mut p_u_sim).cast(),
             (&raw mut p_arch).cast(),
             (&raw mut p_descs).cast(),
@@ -1457,10 +1480,11 @@ impl CudaCrowdBackend {
             (&raw mut lod1).cast(),
             (&raw mut lod2).cast(),
             (&raw mut cull).cast(),
+            (&raw mut lod2_pawn).cast(),
         ];
         let block_x = 128u32;
         let grid_x = (n_actors as u32).div_ceil(block_x).max(1);
-        // SAFETY: `self.step_fn` matches the 18-parameter ABI of `step_and_emit_actors_cuda`
+        // SAFETY: `step_args` lists the 19 parameters of `step_and_emit_actors_cuda` in order
         // and all non-null device buffers are allocated on `stream`.
         let res = unsafe {
             cu::cuLaunchKernel(

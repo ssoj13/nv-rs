@@ -788,8 +788,12 @@ fn pack_dynamic_prefix_only(
     };
     let shadow_radius_sq = shadow_radius * shadow_radius;
 
-    for (inst, prev_lod_slot) in dyn_slice.iter().zip(dyn_prev_lods.iter_mut()) {
-        let is_crowd_bone = inst.user_id >= CROWD_USER_ID_BASE;
+    for (dyn_idx, (inst, prev_lod_slot)) in
+        dyn_slice.iter().zip(dyn_prev_lods.iter_mut()).enumerate()
+    {
+        // The world's kind tag is the authority: `user_id` is an application id (some generators
+        // derive it from OSM ids) and its numeric range does not identify crowd bones.
+        let is_crowd_bone = world.crowd_actor_of_dynamic(dyn_idx).is_some();
         if skip_crowd_bones && is_crowd_bone {
             continue;
         }
@@ -2103,6 +2107,10 @@ impl CsgGpuHost {
                 if gpu_crowd_active {
                     mark_crowd_bones_visible(scene);
                 }
+                // GPU-direct scatter needs a packed slot for every bone wherever the camera
+                // looks, and the CPU-side actor bounds that per-actor culling tests are not
+                // advanced while the GPU steps the crowd. The CPU crowd path keeps culling.
+                scene.world.set_crowd_culling(!gpu_crowd_active);
                 scene.world.pack_visible(&cam_view, &mut self.packed);
                 let slice = self.packed.instances_slice();
                 let prev_slice = self.packed.motion_prev_xforms_slice();
@@ -2414,6 +2422,14 @@ impl CsgGpuHost {
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
         let lib = &built.world.library;
+        // A compound the compiler refused is absent from the library, so its object would
+        // otherwise vanish from the render without a trace.
+        for issue in &lib.issues {
+            eprintln!(
+                "nv-demo: CSG compiler rejected geometry: {:?} (required {}, limit {})",
+                issue.kind, issue.required, issue.limit
+            );
+        }
         self.compounds_buf.upload(stream, &lib.compounds)?;
         self.ops_buf.upload(stream, &lib.ops)?;
         self.prims_buf.upload(stream, &lib.prims)?;
@@ -2567,8 +2583,9 @@ mod tests {
                 "{scene_id}: expected rich instance count"
             );
             assert!(
-                built.world.library.compounds.len() <= 256,
-                "{scene_id}: exceeded 256 GPU GAS budget ({})",
+                built.world.library.compounds.len() <= csg_scene::gas_ledger::MAX_GPU_COMPOUNDS,
+                "{scene_id}: exceeded the {} GPU compound limit ({})",
+                csg_scene::gas_ledger::MAX_GPU_COMPOUNDS,
                 built.world.library.compounds.len()
             );
             assert!(!built.viewpoints.is_empty(), "{scene_id}: missing viewpoints");

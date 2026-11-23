@@ -3167,7 +3167,10 @@ extern "C" __global__ void __intersection__csg() {
         unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
             ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
-        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
+        // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
+        // shared actor bone compound drawn as a pedestrian or as an animal.
+        unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
             1u,
@@ -3232,7 +3235,10 @@ extern "C" __global__ void __intersection__csg_prim() {
         unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
             ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
-        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((hit.sem_id & 0xFFFFu) << 16u);
+        // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
+        // shared actor bone compound drawn as a pedestrian or as an animal.
+        unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
             1u,

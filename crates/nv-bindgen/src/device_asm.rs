@@ -137,11 +137,14 @@ pub fn names(text: &str) -> BTreeSet<String> {
 
 /// Scans every asm statement of `text` (`file` names it in errors).
 pub fn scan(file: &str, text: &str) -> Result<Scan, ScanError> {
-    let text = text.replace("\\\r\n", " ").replace("\\\n", " ");
+    let (text, joined) = join_continuations(text);
     let mut scan = Scan::default();
     let mut from = 0;
     while let Some((start, body_start, volatile)) = next_asm(&text, from) {
-        let line = text[..start].matches('\n').count() + 1;
+        // Lines of the original header: each joined continuation removed one line break.
+        let line = text[..start].matches('\n').count()
+            + joined.iter().take_while(|&&at| at <= start).count()
+            + 1;
         let err = |why: String| ScanError::Parse {
             file: file.to_owned(),
             line,
@@ -189,15 +192,6 @@ pub fn scan(file: &str, text: &str) -> Result<Scan, ScanError> {
                     scan.intrinsics.insert(name, new);
                 }
                 Some(old) => {
-                    let shape = |i: &Intrinsic| {
-                        format!(
-                            "{:?} -> {:?} volatile={} `{}`",
-                            i.inputs,
-                            i.outputs,
-                            i.volatile,
-                            normalize(&i.template)
-                        )
-                    };
                     if shape(old) != shape(&new) {
                         return Err(ScanError::Conflict {
                             name,
@@ -353,7 +347,7 @@ fn template_pieces(section: &str) -> Result<(Pieces, Option<String>), String> {
         } else {
             return Err(format!(
                 "unexpected `{}` in asm template",
-                &section[i..(i + 20).min(section.len())]
+                section[i..].chars().take(20).collect::<String>()
             ));
         }
     }
@@ -418,7 +412,50 @@ fn constraints(section: &str, outputs: bool) -> Result<Vec<Reg>, String> {
     Ok(out)
 }
 
-/// The arguments the `#define` enclosing `at` is invoked with (`MACRO( 3 )` -> `3`).
+/// Joins backslash line continuations into spaces; also returns, for each one, its offset in the
+/// joined text (so errors can report the header's own line numbers).
+fn join_continuations(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(text.len());
+    let mut joined = Vec::new();
+    let mut rest = text;
+    while let Some(p) = rest.find('\\') {
+        out.push_str(&rest[..p]);
+        let after = &rest[p + 1..];
+        let skip = if after.starts_with("\r\n") {
+            2
+        } else if after.starts_with('\n') {
+            1
+        } else {
+            out.push('\\');
+            rest = after;
+            continue;
+        };
+        joined.push(out.len());
+        out.push(' ');
+        rest = &after[skip..];
+    }
+    out.push_str(rest);
+    (out, joined)
+}
+
+/// The signature an intrinsic is identified by: operands, volatility and normalized template.
+/// Two definitions of one name must agree on it, within a header and across headers.
+fn shape(i: &Intrinsic) -> String {
+    format!(
+        "{:?} -> {:?} volatile={} `{}`",
+        i.inputs,
+        i.outputs,
+        i.volatile,
+        normalize(&i.template)
+    )
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The arguments the `#define` enclosing `at` is invoked with (`MACRO( 3 )` -> `3`): only whole
+/// identifiers named like the macro, up to its `#undef`, with the full (nested) argument span.
 fn macro_args(text: &str, at: usize, param: &str) -> Option<Vec<String>> {
     let def = text[..at].rfind("#define")?;
     let head = &text[def + "#define".len()..];
@@ -430,19 +467,27 @@ fn macro_args(text: &str, at: usize, param: &str) -> Option<Vec<String>> {
     if params.split(',').map(str::trim).collect::<Vec<_>>() != [param] {
         return None;
     }
+    let b = text.as_bytes();
     let mut args = Vec::new();
     let mut from = def + 1;
     while let Some(p) = text[from..].find(name) {
         let s = from + p;
         from = s + name.len();
-        let rest = text[from..].trim_start();
-        let Some(rest) = rest.strip_prefix('(') else {
+        if s > 0 && is_ident_byte(b[s - 1]) || from < b.len() && is_ident_byte(b[from]) {
+            continue;
+        }
+        // A later `#undef` ends this definition; invocations after it belong to another one.
+        if text[..s].trim_end().ends_with("#undef") {
+            break;
+        }
+        let open = skip_ws(text, from);
+        if b.get(open) != Some(&b'(') {
+            continue;
+        }
+        let Some(close) = matching_paren(text, open) else {
             continue;
         };
-        let Some(close) = rest.find(')') else {
-            continue;
-        };
-        let arg = rest[..close].trim();
+        let arg = text[open + 1..close].trim();
         if arg != param && !arg.is_empty() {
             args.push(arg.to_owned());
         }
@@ -547,6 +592,39 @@ pub fn emit(scan: &Scan, header: &str, ptx_asm: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macro_args_take_whole_names_nested_spans_and_stop_at_undef() {
+        // L-23: `XBODY(`/`BODY_EXT(` matched, `f(1)` was cut to `f(1`, and invocations after
+        // `#undef` were attributed to the earlier definition.
+        let text = "#define BODY( which ) asm( \"x\" #which );\n\
+                    XBODY( 9 ) BODY_EXT( 8 ) BODY( f(1) ) BODY( 2 )\n\
+                    #undef BODY\n\
+                    #define BODY( which ) other\n\
+                    BODY( 7 )\n";
+        let at = text.find("asm").expect("asm");
+        assert_eq!(
+            macro_args(text, at, "which"),
+            Some(vec!["f(1)".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_template_error_on_non_ascii_text_is_an_error_not_a_panic() {
+        // L-24: the 20-byte snippet could split a UTF-8 character and panic.
+        let header = "static void f() {\n    asm( \"call _optix_x;\" €€€€€€€€€€ : : );\n}\n";
+        assert!(matches!(scan("h", header), Err(ScanError::Parse { .. })));
+    }
+
+    #[test]
+    fn errors_report_the_header_line_across_continuations() {
+        // L-24: lines were counted after joining `\` continuations, so they drifted.
+        let header = "#define A \\\n  1 \\\n  2\nstatic void f() {\n    asm( \"call _optix_x;\" bad : : );\n}\n";
+        match scan("h", header) {
+            Err(ScanError::Parse { line, .. }) => assert_eq!(line, 5),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
 
     const HEADER: &str = r#"
 static __forceinline__ __device__ unsigned int optixGetLaunchIndexX()
@@ -679,12 +757,20 @@ pub fn scan_optix(include_dir: &std::path::Path) -> Result<(Scan, Vec<(String, S
         let s = scan(h, &text).map_err(|e| e.to_string())?;
         all.plain_ptx.extend(s.plain_ptx);
         for (name, i) in s.intrinsics {
-            if let Some(old) = all.intrinsics.get(&name)
-                && (old.inputs != i.inputs || old.outputs != i.outputs)
-            {
-                return Err(format!("{name}: headers disagree on its shape"));
+            match all.intrinsics.get_mut(&name) {
+                // Same rule as within one header: every definition must have the same shape.
+                Some(old) if shape(old) != shape(&i) => {
+                    return Err(format!(
+                        "{name}: headers disagree on its shape: {} vs {}",
+                        shape(old),
+                        shape(&i)
+                    ));
+                }
+                Some(old) => old.sites += i.sites,
+                None => {
+                    all.intrinsics.insert(name, i);
+                }
             }
-            all.intrinsics.entry(name).or_insert(i);
         }
     }
     let missing: Vec<&String> = universe

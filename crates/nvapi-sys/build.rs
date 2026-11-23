@@ -32,10 +32,11 @@ const SPEC: LibSpec = LibSpec {
 };
 
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-    if let Err(e) = nv_bindgen::generate(&SPEC) {
+    let result = nv_bindgen::target_os(SPEC.name).and_then(|os| match os.as_str() {
+        "windows" => nv_bindgen::generate(&SPEC).map(drop),
+        _ => Ok(()),
+    });
+    if let Err(e) = result {
         println!("cargo::error={e}");
         std::process::exit(1);
     }

@@ -38,14 +38,15 @@ fn spec_for_shape(shape: Shape, sdks: &'static [Sdk]) -> LibSpec {
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_ngx_sdk)");
 
-    let target_os = match std::env::var("CARGO_CFG_TARGET_OS") {
-        Ok(target_os) => target_os,
+    let target = nv_bindgen::target_os("ngx")
+        .and_then(|os| nv_bindgen::target_arch("ngx").map(|arch| (os, arch)));
+    let (target_os, target_arch) = match target {
+        Ok(target) => target,
         Err(e) => {
-            println!("cargo::error=CARGO_CFG_TARGET_OS is unavailable: {e}");
+            println!("cargo::error={e}");
             std::process::exit(1);
         }
     };
-    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
     match (target_os.as_str(), target_arch.as_str()) {
         ("windows", _) => {
@@ -82,15 +83,22 @@ fn main() {
                     println!("cargo::rustc-cfg=has_ngx_sdk");
                     println!("cargo::metadata=has_ngx_sdk=1");
                 }
-                Err(e) => {
+                // Only an absent SDK degrades; a found SDK that fails to bind is a real error.
+                Err(e @ nv_bindgen::Error::SdkNotFound { .. }) => {
                     println!("cargo::rerun-if-env-changed=NGX_SDK_ROOT");
                     println!("cargo::rerun-if-env-changed=NV_SDK_DIRS");
                     println!(
                         "cargo::warning=NGX SDK not found for Linux x86_64 ({e}); building ngx-sys without bindings"
                     );
                 }
+                Err(e) => {
+                    println!("cargo::error={e}");
+                    std::process::exit(1);
+                }
             }
         }
-        _ => {}
+        (os, arch) => println!(
+            "cargo::warning=NGX ships no SDK for {os}/{arch}; building ngx-sys without bindings"
+        ),
     }
 }

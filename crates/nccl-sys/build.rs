@@ -49,36 +49,34 @@ const SPEC: LibSpec = LibSpec {
     },
 };
 
+/// The device API header NCCL >= 2.28 ships; its presence, not an error message, decides.
+const DEVICE_MARKER: &str = "nccl_device/core.h";
+
 fn main() {
-    let target_os = match std::env::var("CARGO_CFG_TARGET_OS") {
-        Ok(target_os) => target_os,
-        Err(error) => {
-            println!("cargo::error=CARGO_CFG_TARGET_OS is unavailable: {error}");
-            std::process::exit(1);
-        }
-    };
-    if target_os != "linux" {
-        return;
+    if let Err(error) = run() {
+        println!("cargo::error={error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), nv_bindgen::Error> {
+    if nv_bindgen::target_os(SPEC.name)? != "linux" {
+        return Ok(());
     }
     println!("cargo::rustc-check-cfg=cfg(nccl_has_device)");
-    match nv_bindgen::generate(&SPEC) {
-        Ok(_) => println!("cargo::rustc-cfg=nccl_has_device"),
-        Err(error) => {
-            let msg = error.to_string();
-            if msg.contains("nccl_device/") {
-                // NCCL < 2.28 (e.g. distro system packages) ships only `nccl.h` without `nccl_device/`.
-                let host_only = LibSpec {
-                    headers: &["nccl.h"],
-                    ..SPEC
-                };
-                if let Err(host_err) = nv_bindgen::generate(&host_only) {
-                    println!("cargo::error={host_err}");
-                    std::process::exit(1);
-                }
-                return;
-            }
-            println!("cargo::error={error}");
-            std::process::exit(1);
-        }
+    if nv_bindgen::has_header(&SPEC, DEVICE_MARKER)? {
+        // Device headers present: any failure to bind them is a real error, never a downgrade.
+        nv_bindgen::generate(&SPEC)?;
+        println!("cargo::rustc-cfg=nccl_has_device");
+    } else {
+        // NCCL < 2.28 (e.g. distro packages) ships only `nccl.h`.
+        println!(
+            "cargo::warning=NCCL without {DEVICE_MARKER} (older than 2.28): binding the host API only; the device API and its tests are compiled out"
+        );
+        nv_bindgen::generate(&LibSpec {
+            headers: &["nccl.h"],
+            ..SPEC
+        })?;
     }
+    Ok(())
 }

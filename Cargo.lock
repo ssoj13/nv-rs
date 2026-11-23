@@ -1156,6 +1156,7 @@ version = "0.1.0"
 dependencies = [
  "cuda-bindings",
  "cuda-core",
+ "cuda-core-ext",
  "thiserror 2.0.21",
 ]
 

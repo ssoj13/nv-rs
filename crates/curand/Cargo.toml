@@ -13,6 +13,7 @@ path = "src/curand.rs"
 [dependencies]
 cuda-bindings.workspace = true
 cuda-core.workspace = true
+cuda-core-ext = { path = "../cuda-core-ext" }
 thiserror.workspace = true
 
 [lints]

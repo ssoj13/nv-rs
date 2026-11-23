@@ -6,12 +6,14 @@
 //! `Mt19937`, `Philox4_32_10`) and quasi-random (`Sobol32`, `ScrambledSobol32`, `Sobol64`,
 //! `ScrambledSobol64`) algorithms.
 //! **Why.** Enforces host-vs-device, pseudo-vs-quasi, and distribution parameter invariants
-//! before calling cuRAND, binds streams on device generators, and performs zero heap allocations.
+//! before calling cuRAND, binds streams on device generators, and performs zero heap allocations
+//! except for the completion lease `generate_u32` takes on its output (`cuda_core_ext::lease`).
 //! **Used by** `curand` callers and T0/T3 tests.
 
 use crate::error::{check, ensure_loaded, teardown};
 use crate::{Error, Result};
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::{Access, enqueue_leased};
 use std::sync::Arc;
 
 /// Random number generator algorithm (`curandRngType_t`).
@@ -403,15 +405,22 @@ impl Generator {
     // ---- Device generation ----
 
     /// Generates `out.len()` uniformly distributed 32-bit unsigned integers on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_u32(&self, stream: &Stream, out: &mut DeviceBuffer<u32>) -> Result<()> {
         self.prepare_device(stream)?;
-        // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` u32s.
-        check("curandGenerate", unsafe {
-            cuda_bindings::curandGenerate(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut u32,
-                out.len(),
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of
+            // `out.len()` u32s in the stream's context (checked by the lease), and the write
+            // lease keeps it allocated until the generation queued on `stream` completes.
+            check("curandGenerate", unsafe {
+                cuda_bindings::curandGenerate(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut u32,
+                    out.len(),
+                )
+            })
         })
     }
 

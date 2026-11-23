@@ -14,18 +14,21 @@
 //! - [`device_id`] — device UUID and Windows LUID, to pair a CUDA device with a Vulkan or DXGI
 //!   adapter.
 //! - [`green`] — green contexts: one GPU split into SM partitions with their own streams.
+//! - [`lease`] — keeps buffers allocated until work a native library queued on them completes.
 //!
 //! **Conventions (shared with `cuda-core`).** Every handle owns its driver object and destroys it
 //! on drop; drop failures are recorded on the owning `Context` (`Context::record_err`) instead of
 //! panicking. Fallible calls return `DriverError`. Everything takes `&Arc<Context>`.
 //!
-//! **Used by** `nv-wgpu` (interop), the safe `optix` crate (textures) and render-rs.
+//! **Used by** `nv-wgpu` (interop), the safe `optix` crate (textures), `curand` (leases) and
+//! render-rs.
 
 pub mod array;
 pub mod device_id;
 pub mod external;
 pub mod green;
 pub mod host;
+pub mod lease;
 pub mod sparse;
 pub mod texture;
 
@@ -34,6 +37,7 @@ pub use device_id::{Luid, device_luid, device_uuid};
 pub use external::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 pub use green::{GreenContext, split_sms};
 pub use host::{HostRegistration, ManagedBuffer};
+pub use lease::{Access, enqueue_leased};
 pub use sparse::{SparseProperties, TilePool, sparse_arrays_supported};
 pub use texture::{AddressMode, FilterMode, SurfaceObject, TextureDesc, TextureObject};
 

@@ -11,24 +11,31 @@ Legend: `[ ]` open, `[~]` in progress (workers running or gate pending), `[x]` v
 
 ## Wave 1 - wrapper crates (repair workers launched 2026-11-23, edit-only, disjoint crates)
 Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before changing code and adds a failing-before test.
-- [~] `cublas`: BL-01..05, LT-01..08, LT-10, CB-01, CB-02
-- [~] `cufft` + `curand`: FFT-01..06, RNG-01..03, lease the remaining `curand` device `generate_*`
-- [~] `cusparse` + `cusolver`: P1..P11, S1..S4, S6, S7, X2 (context bind), scratch stream analysis
-- [~] `cudnn`: N1..N4, N6..N13, workspace ownership check, scratch stream analysis
-- [~] `nvjpeg` + `npp` + `nvofa`: JPG-1..6, NPP-1..4, OFA-1..4
-- [~] `nvenc` + `nvdec`: ENC-1..4, ENC-6..11, DEC-1..9
-- [~] `nvcomp` + `cufile`: CMP-1..12, CUF-1..5, CUF-7..10, `ssize_t` handling
-- [~] `ngx` + `nvapi` + `nvml`: NGX-1..14, NVAPI-1..3, NVML-1..2
-- [~] `cupti` + `nccl` + `nvrtc`: CUPTI-1..4, 6, 7, NVRTC-1..2, NCCL-1..4, 6..8, null `CStr` checks
-- [ ] Gate W1: one serial pass - `cargo clippy` + tests for every touched crate, then `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` once
+- [x] `cublas`: BL-01..05, LT-01..08, LT-10, CB-01, CB-02
+- [x] `cufft` + `curand`: FFT-01..06, RNG-01..03, lease the remaining `curand` device `generate_*`
+- [x] `cusparse` + `cusolver`: P1..P11, S1..S4, S6, S7, X2 (context bind), scratch stream analysis
+- [x] `cudnn`: N1..N4, N6..N13, workspace ownership check, scratch stream analysis
+- [x] `nvjpeg` + `npp` + `nvofa`: JPG-1..6, NPP-1..4, OFA-1..4
+- [x] `nvenc` + `nvdec`: ENC-1..4, ENC-6..11, DEC-1..9
+- [~] `nvcomp` + `cufile` (CMP-4 confirmed on hardware and still open; `cufile` GDS paths unverified, no Linux host): CMP-1..12, CUF-1..5, CUF-7..10, `ssize_t` handling
+- [x] `ngx` + `nvapi` + `nvml`: NGX-1..14, NVAPI-1..3, NVML-1..2
+- [x] `cupti` + `nccl` + `nvrtc` (`nccl` compiled only; no Linux host): CUPTI-1..4, 6, 7, NVRTC-1..2, NCCL-1..4, 6..8, null `CStr` checks
+- [x] Gate W1+W2 (clippy clean, 379 passed / 0 failed, GPU tests per crate; results in `plan2.md` "Gate result"): one serial pass - `cargo clippy` + tests for every touched crate, then `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` once
 - [ ] Lead review W1: read the diffs of every P0 fix and check each new test analytically (does its assertion depend on the fixed line?); no revert-and-rerun mutation runs (operator decision 2026-11-23)
 - [ ] Callers outside the wrapper crates reported by workers (`nv-demo`, `python/nv-py`): apply in one follow-up pass
 
 ## Wave 2 - OptiX and graphics interop (repair workers launched with Wave 1)
-- [~] `optix`: A1..A10, D1..D3, C1, P1, X2, L1..L3, M1, PF1, PF2, DOC1, T1..T3, stream analysis
-- [~] `nv-wgpu` + `cuda-core-ext`: CE-01..08, CE-10, CE-11, NW-01..19, NW-21..24
-- [ ] Gate W2 (with Gate W1) + GPU tests marked `#[ignore]` run explicitly on this machine
-- [ ] Lead review W2
+- [x] `optix`: A1..A10, D1..D3, C1, P1, X2, L1..L3, M1, PF1, PF2, DOC1, T1..T3, stream analysis
+- [x] `nv-wgpu` + `cuda-core-ext`: CE-01..08, CE-10, CE-11, NW-01..19, NW-21..24
+- [x] Gate W2 (with Gate W1) + GPU tests marked `#[ignore]` run explicitly on this machine
+- [ ] Lead review W2: `nv-wgpu` encoder-based submit diff
+
+## Wave 1-2 follow-up (in progress)
+- [~] `nvcomp` CMP-4: validate the bitcomp input before launching the kernel; the truncated-input test must be rejected before any GPU work
+- [~] `nvjpeg`: a second `retrieve_bitstream` for the same encode returns a typed error instead of zeros
+- [~] Deciding tests turned into regression tests of the observed behaviour or removed: `cufft` mixed NULL embed, `nvdec` DEC-3, `nv-wgpu` CE-06
+- [~] `nvapi` `live_rtx_3080_ti_nvapi_queries` failure: establish cause
+- [~] Out-of-manifest items: `cublas` `set_emulation_desc` retention, `gemm_*_on_bound_stream` and `cudnn` `GraphConvPlan::build*` context bind, `optix` one-stream check for IAS children
 
 ## Wave 1b - cross-crate items (must not run in parallel with Wave 1)
 - [ ] W1.6a Typed teardown error sink replacing the `CUDA_ERROR_UNKNOWN` mapping (BLA:ERR-01, SOL:X4, MED:ENC-5, MED:CUF-6, SYS:CUPTI-5, SYS:NCCL-5, OPX:X1)

@@ -3743,8 +3743,10 @@ fn instance_buffer_growth_failure_leaves_it_empty() {
     s.synchronize().expect("sync");
     {
         let _cap = CappedPool::new(rig.ctx.cuda(), 2 << 20);
-        // 60 000 instances need 4.8 MB, over the 2 MiB cap.
-        let grown = buf.upload_all(&s, &numbered(&gas, 0, 60_000));
+        // 1 000 000 instances need 80 MB. The driver enforces a 2 MiB `maxSize` only at a coarse
+        // granularity (on sm_86 / CUDA 13 a 4.8 MB allocation still succeeds, 64 MiB fails), so
+        // the request must be well past that, not just past 2 MiB.
+        let grown = buf.upload_all(&s, &numbered(&gas, 0, 1_000_000));
         assert!(
             matches!(grown, Err(Error::Driver(_))),
             "growth past the pool cap fails: {grown:?}"

@@ -197,7 +197,23 @@ Every fix starts with a test that reproduces the defect. Items rated PLAUSIBLE a
 
 ## Execution record - Waves 1 and 2 (2026-11-23)
 
-Eleven edit-only workers re-verified every finding in their crates before changing code. Status of the code: edits committed as pre-gate work in progress; the single gate (workspace check, clippy, tests, then ignored GPU tests per crate) decides what is verified. Until the gate result is recorded here, nothing in this section is "verified".
+Eleven edit-only workers re-verified every finding in their crates before changing code; one serial gate then built and tested everything.
+
+### Gate result (RTX 3080 Ti, CUDA 13.3)
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean. `cargo test --workspace`: 379 passed, 0 failed, 197 ignored (110 binaries). `nv-demo` and `xtask` build without call-site changes.
+- The commits `e1eed4c..d32d90f` are labelled "pre-gate" but already contain most of the gate's compile and test fixes, because they were committed while the gate was running; the label is inaccurate for them.
+- Ignored GPU tests (`--ignored --test-threads=1`) pass for `cuda-core-ext`, `curand`, `cublas`, `cusolver`, `cusparse`, `cudnn`, `npp`, `nvjpeg`, `nvofa`, `nvrtc`, `cupti`, `nvenc`, `ngx` (smoke only), `optix`, except the deciding tests listed below.
+- Fixes confirmed on hardware: buffer lease in `curand`; cubemap mip levels (`IOP:CE-01`); mip-count and foreign-stream rejection; B-frames give `NeedMoreInput` (`MED:ENC-1`); cropped 200x120 round trip (`MED:DEC-2`, `MED:ENC-3`); back-to-back instance uploads do not tear (`OPX:A1`); in-place denoise only untiled (`OPX:D1`); `InstanceBuffer` growth failure; `IOP:NW-01`, `NW-06`, `NW-07`; `SYS:CUPTI-1`, `CUPTI-2`; context binding in `cublas` / `cusolver` / `cusparse`; `MED:JPG-1`, `JPG-3`, `JPG-4`, `JPG-5`.
+- A worker fix that was wrong and was reverted by the gate: `MED:JPG-6` replaced `resize(len, 0)` with `reserve` + `unsafe set_len`; a second `nvjpegEncodeRetrieveBitstream` for the same encode succeeds without writing, so safe code returned uninitialised heap. `resize` + `truncate` restored.
+- Decided by hardware:
+  - `MED:CMP-4` CONFIRMED and still open: `BitcompPlan::uncompress_async` accepts a truncated 8-byte input and the kernel faults with CUDA error 700, which then poisons the context for later tests in the process.
+  - `IOP:CE-06` REFUTED: the driver accepts the DEDICATED flag for a D3D12 heap import.
+  - `MED:DEC-3` not reproduced: 24 frames decoded with min PSNR 57.55 dB with the parser default DPB larger than the decoder's.
+  - `OPX:D2`: destroying a denoiser or pipeline with queued work showed no corruption on this driver; still outside the documented OptiX contract.
+  - `BLA:FFT-03`: cuFFT itself rejects `inembed = NULL` with `onembed` set (`CUFFT_INVALID_VALUE`), so the wrapper's rejection matches native behaviour.
+  - nvJPEG hands out an encoded bitstream exactly once.
+- Not run: `nccl` (Linux, 2+ GPUs), `cufile` GDS (Linux), `nvml`, the loader tests in `*-sys`; the probabilistic scratch-race tests in `cufft` and `cusparse` pass but were not run under `compute-sanitizer`, so they do not prove the absence of a use-after-free.
+- Environment: `nvcomp` GPU tests need `NVCOMP_ROOT`; the loader does not look in `.sdk/nvcomp` by itself (`LDR` scope, Wave 5). The pre-existing `nvapi` hardware test `live_rtx_3080_ti_nvapi_queries` fails in `GetDisplayIdByDisplayName` (`EXPECTED_PHYSICAL_GPU_HANDLE`); cause not yet established.
 
 ### Findings refuted on re-verification (no code change)
 - `BLA:LT-10` `HeuristicResult::from_algo`: `cublasLtMatmul` itself rejects an undersized workspace (`cublasLt.h:1017-1019`).

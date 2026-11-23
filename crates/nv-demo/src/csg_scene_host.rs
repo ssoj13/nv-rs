@@ -94,6 +94,8 @@ pub struct CsgStats {
     pub primitives: u32,
     /// Combined GPU memory footprint of the 8 CSG device buffers in bytes.
     pub gpu_bytes: u64,
+    /// Active GPU memory footprint of the `aux_planes` buffer (DEM / road tiles / convex planes) in bytes.
+    pub aux_planes_bytes: u64,
 }
 
 /// Scene metadata delivered once to the UI thread whenever a new CSG scene finishes building.
@@ -134,6 +136,8 @@ pub struct CsgSceneKey {
     pub variant_idx: u32,
     /// Deterministic world / asset seed.
     pub seed: u32,
+    /// Active road surface representation (`0=Watertight 3D, 1=C1 Tangent, 2=Hybrid C1+SDF, 3=F-Rep Tile`).
+    pub road_mode: u8,
 }
 
 /// Returns descriptors for all registered pure-CSG scene modules in deterministic order.
@@ -461,6 +465,11 @@ impl CsgGpuHost {
     /// Returns `true` when any registered CSG scene is loaded and active.
     pub fn is_active(&self) -> bool {
         self.scene_key.scene_idx != 0 && self.world.is_some()
+    }
+
+    /// Returns the currently loaded [`CsgSceneKey`].
+    pub fn scene_key(&self) -> CsgSceneKey {
+        self.scene_key
     }
 
     /// Returns `true` when the active scene has dynamic moving traffic actors.
@@ -827,6 +836,7 @@ impl CsgGpuHost {
                 compounds: world.library.compounds.len() as u32,
                 primitives: world.library.prims.len() as u32,
                 gpu_bytes: gpu_bytes as u64,
+                aux_planes_bytes: self.aux_planes_buf.active_bytes() as u64,
             };
             if camera_repack_needed {
                 self.last_pack_cam = cam.eye;
@@ -970,6 +980,10 @@ impl CsgGpuHost {
             .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
 
         let tod = time_of_day_from_u32(time_of_day);
+        // `key.road_mode` (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`) is stored in `CsgSceneKey` to trigger
+        // clean scene rebuilds and will pass directly into `SceneBuildConfig::road_mode` once
+        // `Cargo.lock` syncs to Wave 8 `csg-rs`.
+        let _road_mode = key.road_mode.min(3);
         let build_cfg = SceneBuildConfig {
             seed: u64::from(key.seed).max(1),
             wetness: wetness.clamp(0.0, 1.0),

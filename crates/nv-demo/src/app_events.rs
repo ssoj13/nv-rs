@@ -66,6 +66,33 @@ pub enum StillFormat {
     Jpeg,
 }
 
+/// High-level render worker execution phase surfaced in the bottom-left Viewport status bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnginePhase {
+    /// Compiling OptiX pipelines and NVRTC modules at startup or hot-reload.
+    #[default]
+    CompilingOptix,
+    /// Building or rebuilding a procedural/OSM CSG world and per-compound GAS cache.
+    BuildingCsgScene,
+    /// Uploading instance transforms and building/updating the top-level OptiX IAS.
+    UpdatingIas,
+    /// Steady-state path tracing (UI resolves live `Accumulating (N/M)` vs `Ready`).
+    Rendering,
+}
+
+impl EnginePhase {
+    /// Human-readable phase label for transient build/compile states, or `None` when rendering.
+    #[inline]
+    pub const fn transient_label(self) -> Option<&'static str> {
+        match self {
+            Self::CompilingOptix => Some("Compiling OptiX..."),
+            Self::BuildingCsgScene => Some("Building CSG Scene..."),
+            Self::UpdatingIas => Some("Updating IAS..."),
+            Self::Rendering => None,
+        }
+    }
+}
+
 /// Typed UI commands emitted by `ui.rs` and consumed cleanly by the main application loop.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
@@ -79,6 +106,8 @@ pub enum UiCommand {
     ReloadShader,
     /// User selected a new CSG scene or variant (pauses rail and requests auto-framing on load).
     SelectScene { scene_idx: u32, variant_idx: u32 },
+    /// User switched the live 4-way CSG road geometry mode (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`).
+    SetRoadMode(u8),
     /// Synthesize a fresh exact-CSG collision-verified random camera rail with `seed`.
     GenerateRandomRail { seed: u64 },
     /// Snap `CameraDamper` immediately onto the current camera pose (teleport / preset / scrub).
@@ -166,6 +195,8 @@ pub enum RenderEvent {
     PossessChanged(Option<PossessInfo>),
     /// A `Smart View` scoring run selected a top viewpoint.
     SmartViewReady(SmartViewResult),
+    /// Render worker transitioned between compile/build/IAS/rendering phases.
+    PhaseChanged(EnginePhase),
     /// Human-readable status or diagnostic message for the UI status bar.
     StatusMessage(String),
 }

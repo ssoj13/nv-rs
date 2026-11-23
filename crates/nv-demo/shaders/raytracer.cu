@@ -1136,6 +1136,7 @@ static __forceinline__ __device__ void eval_csg_procedural(
     const CsgGpuMaterial& mat,
     unsigned int mat_id,
     unsigned int sem_id,
+    unsigned int part_id,
     float3 hit_pos,
     float3& n,
     float3& base_col,
@@ -1157,20 +1158,43 @@ static __forceinline__ __device__ void eval_csg_procedural(
         wet = fmaxf(wet, 0.35f);
     }
 
+    // RoadTerrainTile packs analytical curve-aligned (s, lat) into part_id:
+    //   s   = (part_id & 0xFFFFu) / 1024.0f              (meters along road centerline)
+    //   lat = ((part_id >> 16u) & 0xFFFFu) / 1024.0f - 32.0f  (signed lateral offset in meters)
+    bool has_road_uv = (part_id != 0u) && (sem_id == 1u || sem_id == 2u || sem_id == 3u);
+    float road_s = (float)(part_id & 0xFFFFu) * (1.0f / 1024.0f);
+    float road_lat = (float)((part_id >> 16u) & 0xFFFFu) * (1.0f / 1024.0f) - 32.0f;
+
     switch (mat.procedural_kind) {
         case CSG_PROC_ASPHALT: {
             float grain = value_noise2(hit_pos.x * 22.0f, hit_pos.z * 22.0f);
             float fine_chip = value_noise2(hit_pos.x * 68.0f + 5.7f, hit_pos.z * 68.0f - 2.3f);
             float coarse = fbm2(hit_pos.x * 0.45f, hit_pos.z * 0.45f);
-            // Dual-wheel tire-track wear darkening & slight rubber polish along lanes.
-            float wheel_pair = 0.5f + 0.5f * cosf(hit_pos.x * 3.4f);
-            float lane_band = 0.5f + 0.5f * cosf(hit_pos.x * 1.70f);
-            float tire_wear = lane_band * (0.45f + 0.55f * wheel_pair);
+            float tire_wear = 0.0f;
+            float gutter_dark = 0.0f;
+            if (has_road_uv) {
+                // Curve-aligned dual wheel-track darkening (+/-0.78 m from 3.6 m lane centers)
+                // and subtle gutter grime/moisture darkening along curb edges.
+                float abs_lat = fabsf(road_lat);
+                float lane_off = fabsf(fmodf(abs_lat, 3.6f) - 1.8f);
+                float track_d = fabsf(lane_off - 0.78f);
+                float track_band = 1.0f - sky_smoothstep(0.14f, 0.48f, track_d);
+                float s_var = 0.85f + 0.15f * sinf(road_s * 0.35f + coarse * 3.0f);
+                tire_wear = track_band * s_var;
+                float edge_band = sky_smoothstep(0.0f, 0.55f, fmodf(abs_lat, 3.6f));
+                float curb_gutter = (1.0f - edge_band) * sky_smoothstep(2.2f, 3.6f, abs_lat);
+                gutter_dark = 0.22f * curb_gutter;
+            } else {
+                // Fallback world-aligned dual-wheel tire-track wear darkening for mesh/prism roads.
+                float wheel_pair = 0.5f + 0.5f * cosf(hit_pos.x * 3.4f);
+                float lane_band = 0.5f + 0.5f * cosf(hit_pos.x * 1.70f);
+                tire_wear = lane_band * (0.45f + 0.55f * wheel_pair);
+            }
             float tar_crack = sky_smoothstep(0.76f, 0.84f, fbm2(hit_pos.x * 0.25f + 7.1f, hit_pos.z * 0.25f - 3.4f));
             float agg = 0.78f + 0.22f * grain + 0.14f * fine_chip;
-            float shade = agg * (0.86f + 0.24f * coarse) * (1.0f - 0.20f * tire_wear);
+            float shade = agg * (0.86f + 0.24f * coarse) * (1.0f - 0.22f * tire_wear) * (1.0f - gutter_dark);
             base_col = f3_mul(base_col, shade * (1.0f - 0.38f * tar_crack));
-            rough = fmaxf(0.04f, fminf(0.95f, rough + (grain - 0.5f) * 0.16f + (fine_chip - 0.5f) * 0.08f - 0.10f * tire_wear));
+            rough = fmaxf(0.04f, fminf(0.95f, rough + (grain - 0.5f) * 0.16f + (fine_chip - 0.5f) * 0.08f - 0.12f * tire_wear - 0.08f * gutter_dark));
             float puddle = 0.0f;
             if (wet > 0.01f) {
                 float p_noise = fbm2(hit_pos.x * 0.14f + 2.3f, hit_pos.z * 0.14f - 5.1f);
@@ -1245,22 +1269,26 @@ static __forceinline__ __device__ void eval_csg_procedural(
             float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
             float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
             bool is_horiz = fabsf(n.y) > 0.5f;
-            float sx = is_horiz ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz);
-            float sy = is_horiz ? hit_pos.z : hit_pos.y;
+            bool use_curved_uv = has_road_uv && is_horiz;
+            float sx = use_curved_uv ? road_s : (is_horiz ? hit_pos.x : (hit_pos.x * tx + hit_pos.z * tz));
+            float sy = use_curved_uv ? road_lat : (is_horiz ? hit_pos.z : hit_pos.y);
             float grime = fbm2(sx * 0.35f + 4.1f, sy * 0.25f - 1.9f);
             float micro = value_noise2(sx * 14.0f, sy * 14.0f);
             float fine = value_noise2(sx * 46.0f + 2.1f, sy * 46.0f - 3.7f);
             float vein = fbm2(sx * 1.4f + sy * 0.4f, sy * 2.8f - sx * 0.3f);
-            // Expansion-joint slab grid: 2.5 m horizontal pavement slabs / 3.0x2.4 m architectural formwork.
-            float pitch_x = is_horiz ? 2.5f : 3.0f;
-            float pitch_y = is_horiz ? 2.5f : 2.4f;
+            // Expansion-joint slab grid: 1.5 m curved sidewalk/curb slabs on RoadTerrainTile,
+            // 2.5 m horizontal pavement slabs, or 3.0x2.4 m architectural formwork.
+            float pitch_x = use_curved_uv ? 1.5f : (is_horiz ? 2.5f : 3.0f);
+            float pitch_y = use_curved_uv ? 1.5f : (is_horiz ? 2.5f : 2.4f);
             float cell_x = floorf(sx / pitch_x);
             float cell_y = floorf(sy / pitch_y);
             float fx = (sx / pitch_x) - cell_x;
             float fy = (sy / pitch_y) - cell_y;
             float slab_hash = hash21(cell_x, cell_y);
-            bool in_joint = (fx < 0.014f || fx > 0.986f || fy < 0.014f || fy > 0.986f);
-            float seam = in_joint ? 0.68f : (0.95f + 0.10f * slab_hash);
+            float joint_w = use_curved_uv ? 0.008f : 0.014f;
+            bool in_joint = (fx < joint_w || fx > (1.0f - joint_w) || fy < joint_w || fy > (1.0f - joint_w));
+            float curb_darken = (has_road_uv && sem_id == 3u) ? 0.88f : 1.0f;
+            float seam = (in_joint ? 0.64f : (0.95f + 0.10f * slab_hash)) * curb_darken;
             // Light travertine/Marina stucco keeps crisp veining; dark concrete gains weathering.
             float grime_amp = (lum > 0.55f) ? 0.14f : 0.28f;
             base_col = f3_mul(
@@ -1892,7 +1920,7 @@ extern "C" __global__ void __raygen__render() {
                 float clearcoat = 0.0f;
                 float cc_rough = 0.08f;
                 float3 emission = make_float3(0.0f, 0.0f, 0.0f);
-                eval_csg_procedural(cmat, mat_id, sem_id, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
+                eval_csg_procedural(cmat, mat_id, sem_id, p7, hit_pos, n, base_col, rough, metallic, clearcoat, cc_rough, emission);
 
                 // Emissive contribution (streetlights, vehicle headlights/taillights, signals, aviation beacons, lit windows)
                 float max_em = fmaxf(emission.x, fmaxf(emission.y, emission.z));

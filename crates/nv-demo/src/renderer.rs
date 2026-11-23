@@ -21,7 +21,8 @@ use optix::{
 };
 
 use crate::app_events::{
-    AppBus, PossessInfo, RenderControl, RenderEvent, SmartViewResult, fast_preview_budget,
+    AppBus, EnginePhase, PossessInfo, RenderControl, RenderEvent, SmartViewResult,
+    fast_preview_budget,
 };
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
@@ -389,6 +390,10 @@ pub enum CaptureSource {
     FullWindow,
 }
 
+fn default_csg_road_mode() -> u8 {
+    2
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DemoSettings {
@@ -541,6 +546,9 @@ pub struct DemoSettings {
     pub csg_show_fractal: bool,
     /// Distance/SSE LOD detail multiplier (`0.25..=4.0`).
     pub csg_lod_bias: f32,
+    /// Road geometry representation (`0 = Watertight 3D`, `1 = C1 Tangent`, `2 = Hybrid C1+SDF`, `3 = F-Rep Tile`).
+    #[serde(default = "default_csg_road_mode")]
+    pub csg_road_mode: u8,
     /// Active optical sensor projection (`Pinhole`, `Fisheye180`, `Equirect360`, `SlitCam`).
     pub camera_projection: CameraProjection,
     /// Active primary-ray view scoring backend (`Auto`, `Optix`, `Wgpu`, `Cpu`).
@@ -666,6 +674,7 @@ impl Default for DemoSettings {
             csg_traffic_speed: 1.0,
             csg_show_fractal: false,
             csg_lod_bias: 1.0,
+            csg_road_mode: default_csg_road_mode(),
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
         }
@@ -1650,6 +1659,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         scene_idx: initial_settings.csg_mode,
         variant_idx: initial_settings.csg_asset_idx,
         seed: initial_settings.csg_seed,
+        road_mode: initial_settings.csg_road_mode.min(3),
     };
     if let Err(err) = csg_host.sync(
         &optix_ctx,
@@ -2209,7 +2219,9 @@ pub fn spawn_render_thread(
             let mut possess_blend_rem: f32 = 0.0;
             let mut last_rendered_camera = camera;
             let mut was_possessing = false;
+            bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::CompilingOptix));
             let mut rig = init_optix(&cuda, &settings);
+            bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
             if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                 bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
             }
@@ -2775,7 +2787,12 @@ pub fn spawn_render_thread(
                     scene_idx: settings.csg_mode,
                     variant_idx: settings.csg_asset_idx,
                     seed: settings.csg_seed,
+                    road_mode: settings.csg_road_mode.min(3),
                 };
+                let building_scene = csg_key != rig.csg_host.scene_key();
+                if building_scene {
+                    bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::BuildingCsgScene));
+                }
                 let vfov_rad = 2.0 * active_camera.tan_half_fov.max(0.05).atan();
                 let csg_sync = match rig.csg_host.sync(
                     &rig._optix_ctx,
@@ -2901,6 +2918,11 @@ pub fn spawn_render_thread(
                         }
                     }
                     _ => {
+                        if building_scene {
+                            bus.emit_render_event(RenderEvent::PhaseChanged(
+                                EnginePhase::UpdatingIas,
+                            ));
+                        }
                         rig.ias_classic_count = build_ias_into(
                             &rig._optix_ctx,
                             &rig.stream,
@@ -2948,6 +2970,9 @@ pub fn spawn_render_thread(
                         );
                         last_ias_state = ias_state;
                     }
+                }
+                if building_scene {
+                    bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
                 }
 
                 if settings.temporal_denoise != rig.denoiser_is_temporal {

@@ -1132,6 +1132,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         tonemap_ms: f32,
         cuda_compute_ms: f32,
         dlss_ms: f32,
+        engine_phase: crate::app_events::EnginePhase,
         ui_fps: f32,
         rt_fps: f32,
         fast_preview: bool,
@@ -1523,6 +1524,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 tonemap_ms: 0.0,
                 cuda_compute_ms: 0.0,
                 dlss_ms: 0.0,
+                engine_phase: crate::app_events::EnginePhase::CompilingOptix,
                 ui_fps: 60.0,
                 rt_fps: 0.0,
                 fast_preview: false,
@@ -1704,6 +1706,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
                         self.fast_preview = msg.fast_preview;
+                        self.engine_phase = crate::app_events::EnginePhase::Rendering;
                         self.last_possess_camera = msg.possess_camera;
                         let tensor_cores_ms = msg.denoise_ms + self.dlss_ms;
                         let total_gpu_ms =
@@ -1809,6 +1812,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.cam_pose = self.cam_driver.controller().pose();
                         self.rail_blend_remaining = 1.0;
                     }
+                    RenderEvent::PhaseChanged(phase) => {
+                        self.engine_phase = *phase;
+                    }
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
                     }
@@ -1857,6 +1863,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 tonemap_ms: self.tonemap_ms,
                 tensor_cores_ms: self.denoise_ms + self.dlss_ms,
                 cuda_compute_ms: self.cuda_compute_ms,
+                engine_phase: self.engine_phase,
                 ui_fps: self.ui_fps,
                 rt_fps: self.rt_fps,
                 fast_preview: self.fast_preview,
@@ -1923,6 +1930,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         variant_idx,
                     } => {
                         select_scene_target = Some((scene_idx, variant_idx));
+                    }
+                    UiCommand::SetRoadMode(mode) => {
+                        self.settings.csg_road_mode = mode.min(3);
+                        reset_accum_requested = true;
                     }
                     UiCommand::GenerateRandomRail { seed } => {
                         generate_random_rail_seed = Some(seed);

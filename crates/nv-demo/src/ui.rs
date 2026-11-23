@@ -6,7 +6,9 @@ use egui::{Align, Color32, FontDefinitions, Layout, RichText, Sense, Ui};
 use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
-use crate::app_events::{AppBus, PossessInfo, SmartViewResult, StillFormat, UiCommand};
+use crate::app_events::{
+    AppBus, EnginePhase, PossessInfo, SmartViewResult, StillFormat, UiCommand,
+};
 use crate::camera_core::input::{NavScheme, altitude_speed_multiplier};
 use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use crate::camera_rail::CameraRail;
@@ -67,6 +69,61 @@ pub fn scene_wgs84_origin(scene_id: &str) -> Option<(f64, f64)> {
         "marina" => Some((33.9846, -118.4534)),
         "sf_house_of_ai" => Some((37.7750, -122.4032)),
         _ => None,
+    }
+}
+
+/// Resolves the `Home` camera pose and optional orbit pivot distance for the active mode.
+///
+/// When a CSG scene is active (`csg_mode != 0`) and exports at least one curated viewpoint,
+/// returns viewpoint `[0]` (guaranteed above DEM terrain) and its eye-to-target distance.
+/// Otherwise (Classic Fractal mode or empty viewpoints) returns `classic_home`.
+pub fn resolve_home_pose(
+    csg_mode: u32,
+    viewpoints: &[SceneViewpoint],
+    classic_home: CameraPose,
+) -> (CameraPose, Option<f32>) {
+    if csg_mode != 0
+        && let Some(vp) = viewpoints.first()
+    {
+        let eye = glam::Vec3::new(vp.eye.x, vp.eye.y, vp.eye.z);
+        let target = glam::Vec3::new(vp.target.x, vp.target.y, vp.target.z);
+        let delta = target - eye;
+        let dist = delta.length().max(0.25);
+        let fwd = if delta.length_squared() > 1e-6 {
+            delta / dist
+        } else {
+            -glam::Vec3::Z
+        };
+        let pose = CameraPose::from_eye_forward_up(
+            eye,
+            fwd,
+            glam::Vec3::Y,
+            vp.vfov_deg.clamp(15.0, 110.0).to_radians(),
+            classic_home.znear,
+            classic_home.zfar.max(2000.0),
+        );
+        return (pose, Some(dist));
+    }
+    (classic_home, None)
+}
+
+/// Formats the human-readable engine phase prefix for the bottom-left Viewport status bar.
+pub fn format_engine_phase_label(
+    phase: EnginePhase,
+    accum_count: u32,
+    max_accum: u32,
+    anim_tag: Option<&str>,
+) -> String {
+    if let Some(label) = phase.transient_label() {
+        return label.to_owned();
+    }
+    if let Some(tag) = anim_tag {
+        return format!("Live ({tag})");
+    }
+    if accum_count >= max_accum.max(1) {
+        "Ready".to_owned()
+    } else {
+        format!("Accumulating ({accum_count}/{})", max_accum.max(1))
     }
 }
 
@@ -314,6 +371,8 @@ pub struct UiContext<'a> {
     pub tensor_cores_ms: f32,
     /// Hardware **CUDA Compute (IAS / cuFFT / Tonemap)** execution time in milliseconds.
     pub cuda_compute_ms: f32,
+    /// Active engine execution phase (`CompilingOptix`, `BuildingCsgScene`, `UpdatingIas`, `Rendering`).
+    pub engine_phase: EnginePhase,
     pub ui_fps: f32,
     pub rt_fps: f32,
     pub fast_preview: bool,
@@ -448,12 +507,17 @@ impl UiContext<'_> {
 
             if ui
                 .button(format!("{} Home", ic::HOUSE))
-                .on_hover_text("Reset the camera back to its starting viewpoint.")
+                .on_hover_text("Reset the camera back to the active scene's default viewpoint (above terrain).")
                 .clicked()
             {
                 self.camera_rail.playing = false;
-                self.cam_driver.controller_mut().set_pose(self.cam_home);
-                *self.cam_pose = self.cam_home;
+                let (home_pose, orbit_dist) =
+                    resolve_home_pose(self.settings.csg_mode, self.scene_viewpoints, self.cam_home);
+                self.cam_driver.controller_mut().set_pose(home_pose);
+                if let Some(d) = orbit_dist {
+                    self.cam_driver.controller_mut().set_orbit_distance(d);
+                }
+                *self.cam_pose = self.cam_driver.controller().pose();
                 self.bus.emit_ui(UiCommand::SnapCamera);
             }
             if ui
@@ -790,8 +854,13 @@ impl UiContext<'_> {
                 self.bus.emit_ui(UiCommand::SnapCamera);
             } else if df.requests.home {
                 self.camera_rail.playing = false;
-                self.cam_driver.controller_mut().set_pose(self.cam_home);
-                *self.cam_pose = self.cam_home;
+                let (home_pose, orbit_dist) =
+                    resolve_home_pose(self.settings.csg_mode, self.scene_viewpoints, self.cam_home);
+                self.cam_driver.controller_mut().set_pose(home_pose);
+                if let Some(d) = orbit_dist {
+                    self.cam_driver.controller_mut().set_orbit_distance(d);
+                }
+                *self.cam_pose = self.cam_driver.controller().pose();
                 self.bus.emit_ui(UiCommand::SnapCamera);
             } else if !self.camera_rail.is_active() {
                 *self.cam_pose = df.pose;
@@ -891,7 +960,7 @@ impl UiContext<'_> {
         } else {
             String::new()
         };
-        let status = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
+        let anim_tag = if self.settings.auto_rotate || sat_orbiting || demo_running || traffic_moving {
             let mut tags = Vec::with_capacity(4);
             if demo_running {
                 tags.push("DEMO");
@@ -905,40 +974,40 @@ impl UiContext<'_> {
             if traffic_moving {
                 tags.push("TRAFFIC");
             }
-            let anim_tag = tags.join("+");
-            format!(
-                "{} {}  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
-                ic::ARROWS_CLOCKWISE,
-                anim_tag,
-                self.render_w,
-                self.render_h,
-                aov_tag,
-                lens_tag,
-                possess_tag,
-                fly_tag,
-                preview_tag,
-                self.ui_fps.round() as u32,
-                self.rt_fps,
-                self.rt_ms
-            )
+            Some(tags.join("+"))
         } else {
-            format!(
-                "{} {}/{} spp  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
-                ic::STACK,
-                self.total_samples,
-                self.settings.max_accum.saturating_mul(self.settings.spp),
-                self.render_w,
-                self.render_h,
-                aov_tag,
-                lens_tag,
-                possess_tag,
-                fly_tag,
-                preview_tag,
-                self.ui_fps.round() as u32,
-                self.rt_fps,
-                self.rt_ms
-            )
+            None
         };
+        let phase_label = format_engine_phase_label(
+            self.engine_phase,
+            self.accum_count,
+            self.settings.max_accum,
+            anim_tag.as_deref(),
+        );
+        let phase_icon = if self.engine_phase.transient_label().is_some() {
+            ic::SPINNER
+        } else if anim_tag.is_some() {
+            ic::ARROWS_CLOCKWISE
+        } else if self.accum_count >= self.settings.max_accum.max(1) {
+            ic::CHECK_CIRCLE
+        } else {
+            ic::STACK
+        };
+        let status = format!(
+            "{} {}  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+            phase_icon,
+            phase_label,
+            self.render_w,
+            self.render_h,
+            aov_tag,
+            lens_tag,
+            possess_tag,
+            fly_tag,
+            preview_tag,
+            self.ui_fps.round() as u32,
+            self.rt_fps,
+            self.rt_ms
+        );
         let galley = ui.painter().layout_no_wrap(
             status,
             egui::FontId::monospace(11.0),
@@ -1673,6 +1742,45 @@ impl UiContext<'_> {
                             .clicked()
                         {
                             apply_csg_time_of_day_preset(s, tod);
+                        }
+                    });
+                    // 4-way Road Mode selector (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`)
+                    let prev_road_mode = s.csg_road_mode.min(3);
+                    ui.label(RichText::new("Road Mode").small().weak());
+                    equal_grid(ui, 4, 4, |ui, idx, w| {
+                        let (mode, label, tip) = match idx {
+                            0 => (
+                                0u8,
+                                "3D",
+                                "Watertight 3D triangular prism road ribbons and junction decks",
+                            ),
+                            1 => (
+                                1u8,
+                                "C1",
+                                "C1 tangent-plane junction blending with continuous vertical slope",
+                            ),
+                            2 => (
+                                2u8,
+                                "Hybrid",
+                                "Hybrid C1 + analytical SDF roadbed with grounded sidewalk aprons (default)",
+                            ),
+                            _ => (
+                                3u8,
+                                "F-Rep",
+                                "Analytical RoadTerrainTile F-Rep (single-prim SBT 5 tiles with exact curved markings, ~55k -> <15k instances)",
+                            ),
+                        };
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::selectable(prev_road_mode == mode, label),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                            && prev_road_mode != mode
+                        {
+                            s.csg_road_mode = mode;
+                            self.bus.emit_ui(UiCommand::SetRoadMode(mode));
                         }
                     });
                     anim_slider_f32(
@@ -3080,8 +3188,16 @@ impl UiContext<'_> {
                     ui,
                     "CSG DAG",
                     &format!(
-                        "{} cmp / {} prm",
+                        "{} GAS / {} prm",
                         self.csg_stats.compounds, self.csg_stats.primitives
+                    ),
+                );
+                stat_row(
+                    ui,
+                    "CSG Aux",
+                    &format!(
+                        "{:.1} KiB",
+                        self.csg_stats.aux_planes_bytes as f64 / 1024.0
                     ),
                 );
                 stat_row(
@@ -3794,5 +3910,78 @@ mod tests {
         assert_eq!(label_w, LABEL_W);
         assert_eq!(val_w, VAL_W);
         assert!((track_w - 150.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn home_pose_selects_csg_viewpoint_0_above_dem_when_csg_active() {
+        let classic_home = CameraPose::from_eye_forward_up(
+            glam::Vec3::new(0.0, 4.6, 5.0),
+            -glam::Vec3::Z,
+            glam::Vec3::Y,
+            std::f32::consts::FRAC_PI_3,
+            0.05,
+            500.0,
+        );
+        let vp0 = SceneViewpoint {
+            id: "el_segundo_bluff".to_string(),
+            label: "El Segundo Bluff Overview".to_string(),
+            eye: csg_core::math::Vec3::new(10.0, 65.0, -40.0),
+            target: csg_core::math::Vec3::new(0.0, 41.1, 0.0),
+            vfov_deg: 55.0,
+        };
+        let viewpoints = [vp0];
+
+        // Classic mode (`csg_mode == 0`) preserves classic fractal home.
+        let (pose_classic, dist_classic) = resolve_home_pose(0, &viewpoints, classic_home);
+        assert_eq!(pose_classic.eye, classic_home.eye);
+        assert!(dist_classic.is_none());
+
+        // Active CSG scene (`csg_mode != 0`) resets to viewpoint `[0]` above DEM terrain!
+        let (pose_csg, dist_csg) = resolve_home_pose(2, &viewpoints, classic_home);
+        assert!(
+            (pose_csg.eye.y - 65.0).abs() < 1e-4,
+            "CSG Home must use viewpoint[0] above DEM (y=65.0), got {}",
+            pose_csg.eye.y
+        );
+        assert!(pose_csg.zfar >= 2000.0);
+        assert!(dist_csg.is_some_and(|d| d > 40.0));
+
+        // Phase label reflects transient compile/build/IAS and live accumulation/ready states.
+        assert_eq!(
+            format_engine_phase_label(EnginePhase::CompilingOptix, 0, 256, None),
+            "Compiling OptiX..."
+        );
+        assert_eq!(
+            format_engine_phase_label(EnginePhase::BuildingCsgScene, 0, 256, None),
+            "Building CSG Scene..."
+        );
+        assert_eq!(
+            format_engine_phase_label(EnginePhase::UpdatingIas, 0, 256, None),
+            "Updating IAS..."
+        );
+        assert_eq!(
+            format_engine_phase_label(EnginePhase::Rendering, 12, 256, None),
+            "Accumulating (12/256)"
+        );
+        assert_eq!(
+            format_engine_phase_label(EnginePhase::Rendering, 256, 256, None),
+            "Ready"
+        );
+    }
+
+    #[test]
+    fn road_mode_serde_defaults_to_hybrid_and_roundtrips() {
+        // Legacy JSON missing `csg_road_mode` deserializes to Hybrid (`2`).
+        let legacy: DemoSettings = serde_json::from_str("{}").expect("legacy json");
+        assert_eq!(legacy.csg_road_mode, 2);
+
+        // Explicit F-Rep Tile (`3`) round-trips cleanly.
+        let s = DemoSettings {
+            csg_road_mode: 3,
+            ..DemoSettings::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: DemoSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.csg_road_mode, 3);
     }
 }

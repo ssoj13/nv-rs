@@ -47,7 +47,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
     `device/optix-device`, `device/cuda-tex-device` (`cuda-oxide` device workspaces), `python/nv-py` (`nv_rs` with DLPack &amp; `__cuda_array_interface__`), `xtask` (`coverage collect|generate|check`, `prebuilt`, `stage-dlls`), and `bootstrap.py` for SDK provisioning and verification.
   </Card>
   <Card title="nv-demo Full-Stack Showcase" icon="star">
-    Interactive **OptiX 9** multi-instance path tracer (`floor`, fractal AABB, glass sphere, neon accent) with `TemporalAov` denoising, 5 AOVs, A/B split, `nvrtc` shader hot-reload, `cufft` FFT bloom, `nvjpeg`/`nvenc` export, and `nvml`/`cupti`/`ngx` telemetry.
+    Interactive **OptiX 9** pure-CSG world &amp; fractal path tracer (`csg-rs` 23-crate worlds + `csg-actors` 11-GAS crowds + 110-variant `Inspector`) with **11 SDG AOVs** (dynamic `Motion` optical flow, `PEDESTRIAN`/`ANIMAL` semantics, `Cryptomatte`), `Freeze Pose` &amp; atomic SDG JSON export, **60 Hz paced UI**, DLSS SR/RR, `TemporalAov` denoising, `nvrtc` hot-reload, `cufft` bloom, `nvjpeg`/`nvenc` MP4 export, and 3-slot `GpuPassProfiler` telemetry.
   </Card>
 </CardGrid>
 

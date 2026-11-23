@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Source map verified on 2026-11-15. See [repository guidance](AGENTS.md) and [crate codepaths](crates/AGENTS.md).
+Source map verified on 2026-11-22 (`5b4fcf8`, `csg-rs` `7b8a085`). See [repository guidance](AGENTS.md) and [crate codepaths](crates/AGENTS.md).
 
 ## Build architecture
 
@@ -69,3 +69,22 @@ flowchart LR
 ```
 
 External memory shares storage. Timeline synchronization controls when either API may access it; sharing alone does not order work.
+
+## `nv-demo` decoupled 60 Hz UI, RTX burst & SDG pipeline
+
+```mermaid
+flowchart TD
+  UI["60 Hz winit + egui UI (PresentMode::Fifo + WaitUntil 16.667ms)"] --> Bus["appbus::AppBus (StateSlot + UiCommand / RenderControl / RenderEvent)"]
+  Bus --> Worker["Async OptiX Worker (renderer.rs, live optix::LogFn)"]
+  Worker --> Step["CsgGpuHost::step_dynamic (TrafficStateSoA + SceneBuilt::crowd, Freeze Pose zero-motion snap)"]
+  Step --> Sync["CsgGpuHost::sync (GrowDeviceBuffer + dual 256 KiB pinned DMA for instances & prev_xforms)"]
+  Sync --> IAS["Persistent Uncompacted IAS (Accel::instances_into, compact=false, allow_update=true)"]
+  IAS --> RT["OptiX 9 RT Cores (608 B Params, SBT 0..5, 11-GAS Crowd SBT 5, SER, OMM, Motion AOV 3x3 inv)"]
+  RT --> Tensor["Tensor Cores (OptiX Aov/TemporalAov Denoiser or NGX DLSS SR/RR)"]
+  Tensor --> Post["CUDA Compute (cuFFT Bloom -> Tonemap / HDR scRGB / DLSS-RR Pack)"]
+  Post --> Fence["Single End-of-Frame stream.synchronize() + 3-slot cuEventQuery GpuPassProfiler"]
+  Fence --> Present["Zero-Copy nv-wgpu SharedBuffer -> wgpu Display / MP4 NVENC / nvJPEG"]
+  Worker --> SDG["ExportSdgJson (csg_actors::extract_sdg_frame + CsgRayOccluder -> atomic JSON)"]
+```
+
+The render worker submits `[IAS/Traffic/Crowd] -> [RT] -> [Denoiser] -> [cuFFT] -> [Tonemap]` in one uninterrupted stream burst with a single end-of-frame fence while `Runner::about_to_wait` paces UI redraws to 60 Hz.

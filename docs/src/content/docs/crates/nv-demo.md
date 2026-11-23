@@ -1,11 +1,11 @@
 ---
 title: nv-demo (Interactive RTX Showcase)
-description: Full-stack interactive OptiX 9 path tracer with SER, Opacity Micro-Maps, DLSS SR/RR, TemporalAov/Aov denoising, cuFFT bloom, NVRTC hot-reload, NVTX3 markers, NVENC/nvJPEG export, and NVML/CUPTI/NGX telemetry.
+description: Full-stack interactive OptiX 9 path tracer with pure-CSG worlds, articulated csg-actors crowds, 11 SDG AOVs + dynamic Motion optical flow + JSON export, SER, OMM, DLSS SR/RR, 60 Hz paced UI, cuFFT bloom, NVRTC hot-reload, NVTX3 markers, NVENC/nvJPEG export, and NVML/CUPTI/NGX telemetry.
 sidebar:
   order: 4
 ---
 
-`nv-demo` (`crates/nv-demo/`) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, and `nv-wgpu` into a docked `egui-wgpu` desktop application with zero-copy CUDA ↔ `wgpu` presentation.
+`nv-demo` (`crates/nv-demo/`, **284 unit tests**) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, `nv-wgpu`, `appbus-rs`, and `csg-rs` (`csg-core`, `csg-actors`, `csg-scene`, `csg-device`, `csg-scenes` at `7b8a085`) into a decoupled **60 Hz paced** `egui-wgpu` docked desktop studio with zero-copy CUDA ↔ `wgpu` presentation.
 
 ## Building & Running
 
@@ -15,73 +15,60 @@ python bootstrap.py b -p nv-demo
 cargo run -p nv-demo --release
 ```
 
-On Windows, `ngx` (`ngx-sys`) is enabled by default (`default = ["ngx"]`) and automatically probes `NV_SDK_DIRS`, `NGX_SDK_ROOT`, or `C:\Program Files\NVIDIA\Streamline\external\ngx-sdk`.
+On Windows, `ngx` (`ngx-sys`) is enabled by default (`default = ["ngx"]`) and automatically probes `NV_SDK_DIRS`, `NGX_SDK_ROOT`, or `C:\Program Files\NVIDIA\Streamline\external\ngx-sdk`. `init_optix` attaches a live `optix::LogFn` callback (`log_level = 3`, overridable via `NV_DEMO_OPTIX_LOG_LEVEL`) and reports an explicit `%LOCALAPPDATA%\NVIDIA\OptixCache` / `OPTIX_CACHE_MAXSIZE=0` hint if `OPTIX_ERROR_INTERNAL_ERROR (7999)` occurs.
 
 ---
 
-## Scene & OptiX 9 Pipeline
+## Pure-CSG Worlds, Articulated Crowds & OptiX 9 Pipeline
 
-### Multi-Instance IAS
+### Scene-Agnostic `csg-rs` World Host (`CsgGpuHost`)
 
-The scene builds separate Geometry Acceleration Structures (GAS) combined into a multi-instance Top-Level Instance Acceleration Structure (`Accel::instances`):
+`CsgGpuHost` (`src/csg_scene_host.rs`) owns `Option<SceneBuilt>` directly from `csg_scenes::default_scene_registry()` (backed by the **23-crate** `csg-rs` workspace at `7b8a085` with **13** analytical primitives `0..12`, an **84-slot** `MaterialPalette`, and a **15-class** `GasLedger` capped at **`246 / 256`** GASes):
 
-- **Checkerboard Floor** (`TriangleMesh`): analytical PBR floor with configurable roughness, micro-scratch, scale, and metallic response.
-- **Fractal Hero** (`CustomPrimitives` AABB `[-1.85, 1.85]^3`): pixel-cone ray-marched signed distance field supporting **Mandelbulb**, **Mandelbox**, and **KIFS Octahedron** with 4-tap tetrahedral normals, 3-tap micro-AO, Lipschitz step safety, 4-step interior bisection, and adaptive secondary/shadow ray bias.
-- **Dielectric Glass Spheres** (`CustomPrimitives` analytic or `TriangleMesh`): orbiting refractive satellites with configurable radius, orbit radius, height, IOR, and Beer–Lambert absorption.
-- **Emissive Neon Accent** (`TriangleMesh`): orbiting emissive ring illuminating the fractal and floor.
-- **Perforated Filigree Halo (`OMM Halo`)** (`TriangleMesh` + `OpacityMicromapArray`): optional 48-triangle halo band backed by 2 shared level-5 `FourState` opacity micromaps, built into dual GASes (`omm_gas` and `omm_anyhit_gas`) so you can benchmark **`Off | OMM | Any-Hit`** live in the Scene panel.
+- **Gundo & GundoOSM**: coastal El Segundo refinery, 3-tier `RivetedPipeBridge`, catenary power lines, Road Work zones, `TrafficStateSoA` arterial traffic, Seawall Promenade & sidewalk biome crowds, and Vista Del Mar beach.
+- **Marina del Rey**: procedurally instanced 16-story Marina City Club crescent towers, furnished `4316 Marina City Dr — 3F Balcony` (`csg-kit-marina-furniture`), yacht harbor, and promenade crowds.
+- **San Francisco House of AI**: 40 Boardman Pl interior/exterior SoMa block with transmissive glazing and urban pedestrian crowds.
+- **Studio Asset Inspector (`110` variants)**: variants `0..108` (`VehicleKit`, `Robotaxi`, `RivetedPipeBridge`, Road Work, Marina furniture, foliage) plus variant **`109` — `Actors: 4-Archetype Crowd Showcase`** featuring Urban Human, comedic `RoadSignStickman`, `QuadrupedDog`, and 5-finger `SdgMannequin` compiled onto a shared **11-GAS `SINGLE_PRIM | IDENTITY`** SBT 5 actor bank.
+- **Live 4-Way `Road Mode`**: switch `Watertight3D`, `TangentPlaneC1`, `HybridC1Sdf`, and `FRepTile` (`PrimKind::RoadTerrainTile = 12`) live in `CSG World` with quantized `(s, lat)` road micro-shading.
 
-### Shader Execution Reordering (OptiX SER)
+### Zero-Churn Persistent IAS & Split CSG SBT Hit Groups
 
-- `trace_primary` supports native OptiX 9 **SER** (`optixTraverse` → 3-bit hit/instance coherence hint `optixReorder(hint, 3)` → `optixInvoke`), reducing warp divergence across fractal raymarching, dielectric refraction, procedural metal floor, filigree OMM, and sky misses.
-- Hardware SER capability is queried via `DeviceContext::shader_reordering()` and surfaced in the Path Tracer panel (`OptiX SER` toggle) and Telemetry (`HW Active` / `HW Off` / `Unsupported`).
-
-### Fractal Transform & Coefficients
-
-- **Presets**: `Golden Bulb`, `Chrome Box`, `Obsidian KIFS`, and `Julia Coral`.
-- **Formulas**:
-  - **Mandelbulb**: `Power`, `Bailout`, `Iterations` (`4..=32`), `Theta Mult`, `Phi Mult`, `Theta Ph`, `Phi Ph`, and `Julia Mode` (`Julia C`).
-  - **Mandelbox**: `Scale`, `Fold`, `Fold Mult`, `Min R`, `Fixed R`, `Iter Rot`, `Iterations` (`4..=32`), and `Bailout` (`4..=128`).
-  - **KIFS Octahedron**: `Scale` (`1.3..=3.5`, default Menger `3.0`), `Rot Y`, `Rot X`, `Offset`, `Thickness`, `Z Bias`, `Iterations` (`4..=32`), and `Bailout`.
-- **Transform & Detail**: `Obj Scale`, `Rot X/Y/Z`, `Detail Eps` (`0.00002..=0.005`), `Normal Eps`, `Fudge`, and `March Steps` (`32..=512`).
+- **Split CSG SBT 4 / SBT 5**: multi-op RPN compounds dispatch to `hit_csg` (SBT 4), while `compound_flags::SINGLE_PRIM` compounds (including all 11 actor bone GASes and F-Rep road tiles) dispatch to `hit_csg_prim` (SBT 5, 26 registers / `48 B` stack — a **679× stack reduction**, zero FP64 across all 13 analytical primitives, `SKIP_IF_EMPTY`, `PRIM_FLAG_IDENTITY`).
+- **Persistent Uncompacted IAS (`Accel::instances_into`)**: `ias_build_opts()` explicitly sets `allow_update: true` and `compact: false` (locked by unit test), enabling in-place `OPTIX_BUILD_OPERATION_UPDATE` on dynamic-only frames via dual reusable `256 KiB` pinned `cuMemAllocHost` staging buffers (`instances` and `prev_xforms`) and grow-only `GrowDeviceBuffer<T>` VRAM pools (**0 steady-state `cuMemAlloc`/`cuMemFree` per frame**).
+- **Classic Multi-Instance Stage**: optional scratched metal floor (`TriangleMesh` with `random_vertex_access: true`), full **TRS** pixel-cone SDF fractals (**Mandelbulb**, **Mandelbox**, **KIFS Octahedron** with 4-tap tetrahedral normals, 3-tap micro-AO, 4-step interior bisection), orbiting dielectric glass satellites, emissive neon accent ring, and dual-GAS **Opacity Micro-Map (`OMM Halo`)** (`Off | OMM | Any-Hit`).
+- **Shader Execution Reordering (OptiX SER) & Russian Roulette**: `trace_primary` uses `optixTraverse` → 3-bit hit/instance coherence hint `optixReorder(hint, 3)` → `optixInvoke` alongside unbiased Russian Roulette (`bounce >= 2`) and live `CameraView::perspective` / omnidirectional culling (`120 m` shadow-caster guard).
 
 ---
 
-## Denoising, DLSS SR / Ray Reconstruction, AOVs & A/B Split
+## Synthetic Data Generation (SDG), Optical Flow & Sensors
 
-- **4-Way `Upscale / AI` Selector**: switch live between **`Off`**, **`OptiX AI`** (`DenoiserModel::Aov` or `DenoiserModel::TemporalAov` with albedo, 3D world-space normal, and motion guides), **`DLSS SR`** (NGX Vulkan Super Resolution with 16-phase Halton jitter), and **`DLSS RR`** (NGX Vulkan Ray Reconstruction / DLSSD).
-- **DLSS Ray Reconstruction (`DLSS RR`)**: replaces OptiX Denoiser + DLSS SR with a single neural pass fed by `pack_dlss_rr_aovs_f16` (linear HDR noisy beauty, diffuse/specular albedo, normal + packed roughness, view-space linear depth, motion vectors, and 64-phase Halton jitter), followed by a WGSL ACES `HdrTonemapPipeline` with live exposure control. `build.rs` automatically stages both `nvngx_dlss.dll` and `nvngx_dlssd.dll`.
-- **Native HDR Viewport (`View: SDR | HDR`)**: when Windows HDR is enabled (`Rgba16Float` surface capability), switches the swapchain live to scRGB linear HDR (`203`-nit paper white, `750 -> 1000`-nit soft highlight rolloff) for both OptiX (`tonemap_f32_to_scrgb_f16`) and DLSS-RR (`HDR_SCRGB_WGSL`) while keeping `egui` responsive via a dual renderer.
-- **5 AOV Modes**: switchable live in the Render panel (including while DLSS-RR is active) and reflected in the viewport HUD badge: `Beauty`, `Albedo`, `Normal`, `Depth`, and `Motion`.
-- **Interactive A/B Split**: toggle `Split View` to drag a vertical divider handle directly in the viewport (or scrub `Split X`) comparing the active output on the left against `Raw`, `Albedo`, or `Normal` on the right.
+- **Strict `608 B` C ABI (`LaunchParams` / `Params`)**: compile-time locked on both Rust (`renderer.rs`) and CUDA (`raytracer.cu`) with `csg_prev_xforms` at offset **`592`** (`_pad2` tail alignment) and `0 double` tokens.
+- **True Dynamic Object Optical Flow (`Motion` AOV)**: uploads `PackedGpuScene::motion_prev_xforms` every dynamic frame and computes exact 3x3 affine inverse (`csg_inv_xform_pt`) → `prev_world_pos` in `__raygen__render` for moving `TrafficStateSoA` vehicles and walking crowd limbs.
+- **11 Ground-Truth SDG AOVs**: `Beauty`, `Albedo`, `Normal`, `Depth`, `Motion`, `SemanticId` (`0..19` incl. `PEDESTRIAN = 18` Cityscapes crimson and `ANIMAL = 19` amber), `InstanceId`, `WorldPos`, Euclidean LiDAR `Range`, `Material` PBR, and canonical MurmurHash3-32 Psyop `Cryptomatte`.
+- **`Freeze Pose` & Atomic SDG JSON Export (`ExportSdgJson`)**: toggling **`Freeze Pose`** pauses traffic and `SceneBuilt::crowd` stepping, snaps `prev_xform = xform` + `reset_crowd_motion_history()` + `traffic_dirty = true` for zero stale optical flow during clean multi-spp accumulation, and enables 1-click **`Save SDG JSON`** (plus automatic companion `.json` sidecar export on frozen PNG/JPEG captures) via `csg_actors::extract_sdg_frame` + `CsgRayOccluder` written atomically (temp file + `flush`/`sync_all` + rename).
+- **Possess Body, 4 Optical Projections & Hardware `ViewScorer`**: `Ctrl + Left Click` Pick-to-Possess and 1-click `Possess Car` (0-lag moving `Robotaxi` lockstep with `[`/`]` mount cycling), **4 sensor projections** (`Pinhole`, `Fisheye 180°`, `360° Equirect`, `360° Slit Cam`), and OptiX 9 (`__raygen__score_views`) / WGPU / CPU `ViewProbeBackend` driving `Smart View` and `Smart Rail`.
 
 ---
 
-## Post-Processing, Hot-Reload & Export
+## Denoising, DLSS SR / Ray Reconstruction, 60 Hz UI & Export
 
-- **`nvrtc` Live Shader Hot-Reload**: clicking **Hot-Reload Shader (NVRTC)** reads `crates/nv-demo/shaders/raytracer.cu` from disk, compiles it to PTX via `nvrtc`, rebuilds the OptiX `Pipeline` and `ShaderBindingTable`, and resets accumulation without restarting the app.
-- **`cufft` FFT Optical Bloom**: `FftBloomPass` binds its `Scratch` workspace to the active render stream, extracts bright pixels above a soft-knee luminance threshold into a power-of-two padded 3-channel planar buffer, runs a batched 2D `R2C` plan (`cufft`), multiplies by a cached procedural N-blade (`3..=12`) aperture diffraction PSF spectrum, runs `C2R` (`&mut` destructive input), and additively composites halation and starbursts back onto the `float4` color buffer.
-- **Triangle GAS & Resize Resilience**: triangle GAS builders enable `random_vertex_access: true` for `optixGetTriangleVertexData`, and runtime viewport resize / PNG export paths propagate `nv_wgpu` and CUDA context errors cleanly without panicking on OOM.
-- **`nvjpeg` & `nvenc` Zero-Copy Export**:
-  - **JPEG Snapshot**: converts the device `RGBA8` frame to `RGB8` via an NVRTC kernel and encodes on the GPU with `nvjpeg`.
-  - **MP4 Video Recording (`Video: Match | SDR | PQ10` + `Timing: Live RT | Smooth 60`)**: captures the final post-DLSS-RR / post-DLSS-SR / post-OptiX output at full viewport resolution via zero-copy GPU color conversion (`RGBA8 -> NV12` BT.709 for **SDR** H.264 `avc1`, or scRGB `Rgba16Float -> P010` BT.2020 SMPTE ST 2084 PQ for **PQ10** HEVC Main10 `hvc1` with `colr`/`mdcv`/`clli` metadata), encodes with `nvenc`, and muxes directly into an iPhone/QuickTime-compatible `.mp4` container (`mp4_muxer.rs`). **`Match`** automatically matches the active `View` (`SDR` or `HDR`), while **Live RT** writes per-frame 90 kHz `stts` timestamps (no speedup on FPS dips) and **Smooth 60** steps animations by an exact `1/60s` per rendered frame.
+- **Decoupled 60 Hz UI (`appbus-rs`)**: `main.rs` locks UI redraws to **60 Hz** (`wgpu::PresentMode::Fifo` + `Runner::about_to_wait` `ControlFlow::WaitUntil(16.667 ms)` via `compute_next_ui_tick`), communicating with the async OptiX worker over typed `AppBus` queues (`UiCommand`, `RenderControl`, `RenderEvent`) and lock-free `StateSlot` coalescing, with automatic `1 spp` / `<= 2` bounce interactive fast-preview (`150 ms` settle window), clickable Apple Maps WGS84 coordinates, and live `EnginePhase` / `FROZEN` HUD badges.
+- **4-Way `Upscale / AI` Selector**: switch live between **`Off`**, **`OptiX AI`** (`DenoiserModel::Aov` / `TemporalAov`), **`DLSS SR`** (NGX Vulkan Super Resolution), and **`DLSS RR`** (NGX Vulkan Ray Reconstruction / DLSSD via `pack_dlss_rr_aovs_f16` + WGSL ACES `HdrTonemapPipeline`), plus native **`Rgba16Float` scRGB HDR** viewport mode and interactive A/B split.
+- **`nvrtc` Hot-Reload & `cufft` FFT Diffraction Bloom**: live `raytracer.cu` → PTX reload without restarting, and stream-bound batched 2D `R2C`/`C2R` N-blade aperture diffraction bloom.
+- **`nvjpeg` & `nvenc` Zero-Copy Export (`Viewport` or `FullWindow`)**: GPU `nvjpeg` stills, lossless PNGs, and iPhone-compatible MP4 (`SDR` H.264 `avc1` BT.709 or `PQ10` HEVC Main10 `hvc1` BT.2020 SMPTE ST 2084 with `Live RT` 90 kHz `stts` or `Smooth 60` `time_scale` + `180°` subframe shutter motion blur) paired with scene-driven multi-cassette **`CameraRail`** & exact-CSG **`Random Rail`**.
 
 ---
 
 ## Telemetry & Profiler
 
-`Profiler` tracks per-stage timings (`rt_ms`, `denoise_ms`, `bloom_ms`, `tonemap_ms`, `fps`) in stack-allocated `[f32; 120]` `RingBuffer`s with zero per-frame heap allocations, alongside:
-
-- **`nvml`**: GPU thermals, utilization, VRAM usage, power draw, and graphics/memory clocks.
-- **`cupti`**: graceful `ActivityProfiler` and `Subscriber` probing for kernel execution time without panicking on non-admin Windows hosts.
-- **`ngx`**: graceful `NgxVulkan::required_extensions`, DLSS Super Resolution, and DLSS Ray Reconstruction (`is_dlss_rr_available`) probing.
-- **Nsight Systems / NVTX3 (`nvtx_shim.c`, `src/nvtx.rs`)**: optional header-only NVTX3 ranges (`cfg(has_nvtx3)`) naming `nv-demo-main` and `optix-render` threads and annotating `OptiX RT`, `OptiX Denoise`, `cuFFT Bloom`, `Tonemap`, and `DLSS` / `DLSS-RR` stages (compiles to inline no-ops when CUDA NVTX3 headers are absent).
+- **Non-Stalling 3-Slot `GpuPassProfiler`**: uses `cuEventQuery` (zero mid-frame stalls, single end-of-frame `stream.synchronize()`) to measure hardware **RT Cores (OptiX)**, **Tensor Cores (Denoiser / DLSS)**, and **CUDA Compute (IAS / cuFFT / Tonemap)** durations inside stack-allocated `[f32; 120]` `RingBuffer`s.
+- **`nvml` / `cupti` / `ngx` / `NVTX3`**: live thermals, utilization, VRAM, power, clocks, graceful CUPTI activity/subscriber probing, NGX capability probing, and optional header-only NVTX3 ranges (`nvtx_shim.c`, `cfg(has_nvtx3)`).
 
 ---
 
 ## Camera Controls
 
-- **`RMB` (Hold + Drag / WASD)**: free-fly `SpaceSim` navigation while holding the right mouse button.
-- **`F`**: aim camera at the scene origin while preserving current eye position and updating orbit distance.
-- **`A`**: fit all (`FrameBounds`) around the scaled fractal bounds.
-- **Orbit / Pan / Zoom**: standard viewport drag and scroll controls via `camera_core`.
+- **`RMB` (Hold + Drag / WASD / QE)**: free-fly `FpsFly` navigation with progressive `Shift` ramp (`<= 2 s` flat, doubling every `5 s` up to `64×`), altitude-aware base speed (`1×..=25×`), and `RMB + Wheel` speed multiplier (`0.1×..=64×`).
+- **`Home`**: frames CSG viewpoint `[0]` above DEM (or classic home bounds).
+- **`F` / `A`**: aim at origin (`F`) or fit bounds (`A`).
+- **`Ctrl + Left Click` / `[` / `]`**: Pick-to-Possess and cycle camera mounts on vehicles or landmarks.

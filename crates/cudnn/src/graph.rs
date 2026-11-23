@@ -22,6 +22,8 @@ use crate::{ConvMode, CudnnStatus, DataType, Error, Handle, Result, check, recor
 const UID_X: i64 = 1;
 const UID_W: i64 = 2;
 const UID_Y: i64 = 3;
+const UID_SCALE: i64 = 4;
+const UID_VIRTUAL_CONV: i64 = 5;
 
 /// Convolution direction for [`GraphConvSpec`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +153,28 @@ impl BackendDesc {
             sys::cudnnBackendAttributeType_t_CUDNN_TYPE_INT64,
             vals.len() as i64,
             vals.as_ptr().cast(),
+        )
+    }
+
+    fn set_bool(&mut self, attr: sys::cudnnBackendAttributeName_t, val: bool) -> Result<()> {
+        self.set_attr_raw(
+            attr,
+            sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BOOLEAN,
+            1,
+            (&val as *const bool).cast(),
+        )
+    }
+
+    fn set_pointwise_mode(
+        &mut self,
+        attr: sys::cudnnBackendAttributeName_t,
+        mode: sys::cudnnPointwiseMode_t,
+    ) -> Result<()> {
+        self.set_attr_raw(
+            attr,
+            sys::cudnnBackendAttributeType_t_CUDNN_TYPE_POINTWISE_MODE,
+            1,
+            (&mode as *const sys::cudnnPointwiseMode_t).cast(),
         )
     }
 
@@ -290,6 +314,25 @@ fn make_tensor_desc(
     d.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_STRIDES, strides)?;
     d.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_UNIQUE_ID, uid)?;
     d.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, alignment)?;
+    d.finalize()?;
+    Ok(d)
+}
+
+fn make_virtual_tensor_desc(
+    ctx: &Arc<Context>,
+    uid: i64,
+    dtype: DataType,
+    dims: &[i64; 4],
+    strides: &[i64; 4],
+    alignment: i64,
+) -> Result<BackendDesc> {
+    let mut d = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_TENSOR_DESCRIPTOR)?;
+    d.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_DATA_TYPE, dtype)?;
+    d.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_DIMENSIONS, dims)?;
+    d.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_STRIDES, strides)?;
+    d.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_UNIQUE_ID, uid)?;
+    d.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT, alignment)?;
+    d.set_bool(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_TENSOR_IS_VIRTUAL, true)?;
     d.finalize()?;
     Ok(d)
 }
@@ -436,6 +479,163 @@ impl GraphConvPlan {
         }))
     }
 
+    /// Builds a fused 2-op cuDNN 9 Backend Execution Plan (`Conv -> PointwiseMul(scale_f32)`) for
+    /// delayed-scaling FP8 (`E4M3`/`E5M2`) convolutions on `SM89+` (RTX 4090 / H100 / RTX 5090).
+    ///
+    /// The convolution accumulates into a virtual `F32` tensor and fuses multiplication by a
+    /// `[1, 1, 1, 1]` `F32` device descale tensor (`s_a * s_b`) directly into the epilogue before
+    /// writing the output (`BF16`/`F16`/`F32`), requiring zero extra HBM passes.
+    pub fn build_scaled(handle: &Handle, spec: &GraphConvSpec, max_workspace_bytes: usize) -> Result<Self> {
+        let ctx = handle.context();
+        let x_desc = make_tensor_desc(ctx, UID_X, spec.x_dtype, &spec.x_dims, &spec.x_strides, spec.alignment_bytes)?;
+        let w_desc = make_tensor_desc(ctx, UID_W, spec.w_dtype, &spec.w_dims, &spec.w_strides, spec.alignment_bytes)?;
+        let y_desc = make_tensor_desc(ctx, UID_Y, spec.y_dtype, &spec.y_dims, &spec.y_strides, spec.alignment_bytes)?;
+        let scale_desc = make_tensor_desc(ctx, UID_SCALE, DataType::F32, &[1, 1, 1, 1], &[1, 1, 1, 1], 4)?;
+
+        let (v_dims, v_strides) = match spec.direction {
+            GraphConvDirection::Forward => (&spec.y_dims, &spec.y_strides),
+            GraphConvDirection::BackwardData => (&spec.x_dims, &spec.x_strides),
+            GraphConvDirection::BackwardFilter => (&spec.w_dims, &spec.w_strides),
+        };
+        let v_out = make_virtual_tensor_desc(ctx, UID_VIRTUAL_CONV, DataType::F32, v_dims, v_strides, spec.alignment_bytes)?;
+
+        let mut conv_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR)?;
+        conv_desc.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_COMP_TYPE, spec.compute_dtype)?;
+        conv_desc.set_conv_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_CONV_MODE, ConvMode::CrossCorrelation)?;
+        conv_desc.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, 2)?;
+        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, &spec.pad)?;
+        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, &spec.pad)?;
+        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_DILATIONS, &spec.dilation)?;
+        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, &spec.stride)?;
+        conv_desc.finalize()?;
+
+        let (mut op_conv, real_out_desc) = match spec.direction {
+            GraphConvDirection::Forward => {
+                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &v_out)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &conv_desc)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0)?;
+                (o, &y_desc)
+            }
+            GraphConvDirection::BackwardData => {
+                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &v_out)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &y_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &conv_desc)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0)?;
+                (o, &x_desc)
+            }
+            GraphConvDirection::BackwardFilter => {
+                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X, &x_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW, &v_out)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY, &y_desc)?;
+                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC, &conv_desc)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0)?;
+                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0)?;
+                (o, &w_desc)
+            }
+        };
+        op_conv.finalize()?;
+
+        let mut pw_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_POINTWISE_DESCRIPTOR)?;
+        pw_desc.set_pointwise_mode(
+            sys::cudnnBackendAttributeName_t_CUDNN_ATTR_POINTWISE_MODE,
+            sys::cudnnPointwiseMode_t_CUDNN_POINTWISE_MUL,
+        )?;
+        pw_desc.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_POINTWISE_MATH_PREC, DataType::F32)?;
+        pw_desc.finalize()?;
+
+        let mut op_mul = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)?;
+        op_mul.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_POINTWISE_PW_DESCRIPTOR, &pw_desc)?;
+        op_mul.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_POINTWISE_XDESC, &v_out)?;
+        op_mul.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_POINTWISE_BDESC, &scale_desc)?;
+        op_mul.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_POINTWISE_YDESC, real_out_desc)?;
+        op_mul.finalize()?;
+
+        let mut op_graph = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR)?;
+        op_graph.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_HANDLE, handle)?;
+        op_graph.set_descs(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_OPS, &[op_conv.raw, op_mul.raw])?;
+        op_graph.finalize()?;
+
+        let mut last_err: Option<Error> = None;
+        for mode in [HeurMode::ModeA, HeurMode::ModeB, HeurMode::Fallback] {
+            let mut heur = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR)?;
+            heur.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, &op_graph)?;
+            heur.set_heur_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_MODE, mode)?;
+            if let Err(e) = heur.finalize() {
+                last_err = Some(e);
+                continue;
+            }
+            let mut total_cfgs: i64 = 0;
+            // SAFETY: querying count with `max_elements = 0` and null output buffer is standard cuDNN API.
+            let st_cnt = unsafe {
+                sys::cudnnBackendGetAttribute(
+                    heur.raw,
+                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                    0,
+                    &mut total_cfgs,
+                    ptr::null_mut(),
+                )
+            };
+            if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
+                continue;
+            }
+            let want = (total_cfgs as usize).min(16);
+            let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
+            let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
+            for _ in 0..want {
+                let d = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINECFG_DESCRIPTOR)?;
+                raw_cfgs.push(d.raw);
+                cfgs.push(d);
+            }
+            let mut returned: i64 = 0;
+            // SAFETY: `raw_cfgs` holds `want` valid unfinalized ENGINECFG descriptors.
+            let st_get = unsafe {
+                sys::cudnnBackendGetAttribute(
+                    heur.raw,
+                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                    want as i64,
+                    &mut returned,
+                    raw_cfgs.as_mut_ptr().cast(),
+                )
+            };
+            if let Err(e) = check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS)", st_get) {
+                last_err = Some(e);
+                continue;
+            }
+            for cfg in cfgs.iter().take(returned.max(0) as usize) {
+                let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
+                plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
+                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, cfg)?;
+                if let Err(e) = plan.finalize() {
+                    last_err = Some(e);
+                    continue;
+                }
+                let ws_i64 = plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE)?;
+                let ws = ws_i64.max(0) as usize;
+                if ws <= max_workspace_bytes {
+                    return Ok(Self {
+                        plan,
+                        workspace_size: ws,
+                        ctx: Arc::clone(ctx),
+                    });
+                }
+            }
+        }
+        Err(last_err.unwrap_or(Error::Status {
+            call: "cudnn::graph::GraphConvPlan::build_scaled",
+            code: CudnnStatus::NOT_SUPPORTED,
+        }))
+    }
+
     /// Required device workspace size in bytes for [`Self::execute_on_bound_stream`].
     #[must_use]
     pub const fn workspace_size(&self) -> usize {
@@ -473,5 +673,40 @@ impl GraphConvPlan {
         // valid device pointers for the duration of stream execution.
         let status = unsafe { sys::cudnnBackendExecute(handle.as_raw(), self.plan.raw, vpack.raw) };
         check("cudnnBackendExecute", status)
+    }
+
+    /// Executes a plan built with [`Self::build_scaled`] on the stream currently bound to `handle`,
+    /// binding `scale_ptr` (`[1]` `F32` device scalar) to the fused descale epilogue.
+    ///
+    /// # Safety
+    /// All device pointers (`x_ptr`, `w_ptr`, `y_ptr`, `scale_ptr`, and `ws_ptr` when
+    /// `workspace_size() > 0`) must be valid on `handle`'s context and match the plan's spec.
+    pub unsafe fn execute_scaled_on_bound_stream(
+        &self,
+        handle: &mut Handle,
+        x_ptr: u64,
+        w_ptr: u64,
+        y_ptr: u64,
+        scale_ptr: u64,
+        ws_ptr: u64,
+    ) -> Result<()> {
+        let mut vpack = BackendDesc::new(&self.ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR)?;
+        let uids = [UID_X, UID_W, UID_Y, UID_SCALE];
+        let ptrs = [
+            x_ptr as *mut c_void,
+            w_ptr as *mut c_void,
+            y_ptr as *mut c_void,
+            scale_ptr as *mut c_void,
+        ];
+        vpack.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, &uids)?;
+        vpack.set_void_ptrs(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, &ptrs)?;
+        if self.workspace_size > 0 {
+            vpack.set_void_ptr(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_VARIANT_PACK_WORKSPACE, ws_ptr as *mut c_void)?;
+        }
+        vpack.finalize()?;
+        // SAFETY: `handle.as_raw()`, `self.plan.raw`, and `vpack.raw` are finalized; caller guarantees
+        // valid device pointers for the duration of stream execution.
+        let status = unsafe { sys::cudnnBackendExecute(handle.as_raw(), self.plan.raw, vpack.raw) };
+        check("cudnnBackendExecute(scaled)", status)
     }
 }

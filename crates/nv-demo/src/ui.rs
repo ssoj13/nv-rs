@@ -756,6 +756,15 @@ impl UiContext<'_> {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         let ctrl_down = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let pick_active = self.settings.csg_mode != 0
+            && (*self.pick_possess_mode
+                || (ctrl_down
+                    && (resp.hovered()
+                        || ui.input(|i| {
+                            i.pointer.primary_down()
+                                || i.pointer.primary_pressed()
+                                || i.pointer.primary_released()
+                        }))));
         let pick_clicked = !split_dragging
             && self.settings.csg_mode != 0
             && resp.clicked_by(egui::PointerButton::Primary)
@@ -810,7 +819,7 @@ impl UiContext<'_> {
                         .clamp(-1.35, 1.35);
                 }
             }
-        } else if !split_dragging && !pick_clicked {
+        } else if !split_dragging && !pick_clicked && !pick_active {
             if resp.dragged() && self.camera_rail.playing {
                 self.camera_rail.playing = false;
             }

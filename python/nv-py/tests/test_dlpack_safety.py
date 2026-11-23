@@ -265,36 +265,113 @@ def test_py3_strides_and_cuda_array_interface():
     assert cai["typestr"] == "<f4"
 
 
-def test_py3_non_contiguous_dlpack_import_and_to_bytes_rejection():
-    """PY-3: Transposed non-contiguous DLPack tensor retains strides and rejects to_bytes."""
-    stream = _get_cuda_stream()
-
-    # Synthetic CUDA DLPack tensor with transposed layout:
-    # shape [3, 2], strides [1, 3] (column-major / transposed)
-    producer = SyntheticProducer(
+def _strided_producer(stream, shape, strides, on_delete=None):
+    return SyntheticProducer(
         device_type=2,  # kDLCUDA
         device_id=stream.device_id,
         dtype_code=2,  # float
         dtype_bits=32,  # f32
-        ndim=2,
-        shape_list=[3, 2],
-        strides_list=[1, 3],  # non-contiguous / transposed element strides
+        ndim=len(shape),
+        shape_list=shape,
+        strides_list=strides,
         data_ptr=0x2000,
+        on_delete=on_delete,
     )
 
+
+@pytest.mark.parametrize(
+    "shape,strides",
+    [
+        ([3, 2], [1, 3]),  # transposed view
+        ([1000], [0]),  # torch.zeros(1).expand(1000): 4-byte allocation, 4000-byte span
+        ([4], [-1]),  # reversed view
+        ([2, 3], [6, 2]),  # every other column
+    ],
+)
+def test_p1_non_contiguous_dlpack_import_rejected(shape, strides):
+    """P1: every binding treats (ptr, nbytes) as a dense span, so strided imports are refused."""
+    stream = _get_cuda_stream()
+    deleted = [0]
+
+    def on_delete():
+        deleted[0] += 1
+
+    with pytest.raises(nv_rs.errors.NvInvalidArgumentError, match="non-contiguous"):
+        nv_rs.core.DeviceBuffer.from_dlpack(
+            _strided_producer(stream, shape, strides, on_delete), stream=stream
+        )
+    assert deleted[0] == 1, "producer deleter must run exactly once on rejection"
+
+
+def test_p1_size_one_dimension_strides_are_wildcards():
+    """P1: size-1 dimensions may carry any stride (torch `unsqueeze`); strides are normalized."""
+    stream = _get_cuda_stream()
+    deleted = [0]
+
+    def on_delete():
+        deleted[0] += 1
+
+    buf = nv_rs.core.DeviceBuffer.from_dlpack(
+        _strided_producer(stream, [3, 1], [1, 7], on_delete), stream=stream
+    )
+    assert buf.shape == [3, 1]
+    assert buf.strides == [1, 1]
+    assert buf.is_contiguous is True
+    assert buf.nbytes == 12
+    assert buf.__cuda_array_interface__["strides"] == (4, 4)
+    del buf
+    assert deleted[0] == 1
+
+
+def test_p2_stream_is_passed_as_keyword_to_dlpack_producer():
+    """P2: `stream` is keyword-only in the Array API `__dlpack__` signature."""
+    stream = _get_cuda_stream()
+    seen = {}
+
+    class KeywordOnlyProducer(SyntheticProducer):
+        def __dlpack__(self, *, stream=None, max_version=None, dl_device=None, copy=None):
+            seen["stream"] = stream
+            return make_synthetic_dltensor_capsule(**self.kwargs)
+
+    producer = KeywordOnlyProducer(
+        device_type=2, device_id=stream.device_id, shape_list=[16], data_ptr=0x3000
+    )
     buf = nv_rs.core.DeviceBuffer.from_dlpack(producer, stream=stream)
-    assert buf.shape == [3, 2]
-    assert buf.strides == [1, 3]
-    assert buf.is_contiguous is False
+    assert seen["stream"] == stream.raw_ptr
+    assert buf.nbytes == 16
 
-    # CAI should export byte strides: [1 * 4, 3 * 4] = (4, 12)
-    cai = buf.__cuda_array_interface__
-    assert cai["strides"] == (4, 12)
 
-    # to_bytes must reject non-contiguous buffers
-    with pytest.raises(Exception) as exc_info:
-        buf.to_bytes(stream)
-    assert "contiguous" in str(exc_info.value).lower()
+def test_p5_dlpack_import_on_other_device_than_stream_rejected():
+    """P5: a tensor on another GPU than the consumer stream is refused at import."""
+    stream = _get_cuda_stream()
+    deleted = [0]
+
+    def on_delete():
+        deleted[0] += 1
+
+    producer = SyntheticProducer(
+        device_type=2,
+        device_id=stream.device_id + 1,
+        shape_list=[16],
+        data_ptr=0x4000,
+        on_delete=on_delete,
+    )
+    with pytest.raises(nv_rs.errors.NvInvalidArgumentError, match="device"):
+        nv_rs.core.DeviceBuffer.from_dlpack(producer, stream=stream)
+    assert deleted[0] == 1
+
+
+def test_p14_dlpack_export_accepts_array_api_keywords():
+    """P14: `max_version`, `dl_device` and `copy` are accepted (no TypeError round-trip)."""
+    stream = _get_cuda_stream()
+    buf = nv_rs.core.DeviceBuffer.alloc(stream, [8], dtype="f32")
+    dev = buf.__dlpack_device__()
+    cap = buf.__dlpack__(stream=None, max_version=(1, 0), dl_device=dev, copy=False)
+    assert cap is not None
+    with pytest.raises(BufferError):
+        buf.__dlpack__(dl_device=(1, 0))
+    with pytest.raises(BufferError):
+        buf.__dlpack__(copy=True)
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +406,28 @@ def test_py4_dlpack_stream_synchronization():
     cai = buf.__cuda_array_interface__
     assert "stream" in cai
     assert cai["stream"] == stream.raw_ptr
+
+
+def test_p16_dlpack_export_with_stream_none_waits_for_pending_producer_work():
+    """P16: `__dlpack__(stream=None)` must synchronize the producer stream before handing out
+    the pointer: a consumer that reads right away sees the finished data."""
+    stream = _get_cuda_stream()
+    try:
+        gen = nv_rs.curand.CurandGenerator(stream, seed=3)
+    except nv_rs.errors.NvLibraryNotFoundError as exc:
+        pytest.skip(f"cuRAND unavailable: {exc}")
+    np = pytest.importorskip("numpy")
+    n = 1 << 22
+    busy = nv_rs.core.DeviceBuffer.alloc(stream, [1 << 27], dtype="f32")
+    buf = nv_rs.core.DeviceBuffer.from_buffer(stream, bytes(4 * n), dtype="f32")
+    for _ in range(40):  # keep `stream` busy for tens of milliseconds
+        gen.fill_uniform_f32(busy)
+    gen.fill_uniform_f32(buf)
+
+    cap = buf.__dlpack__(stream=None)
+    # The re-import records no producer stream, so reading it on another stream relies only on
+    # the synchronization `__dlpack__` performed.
+    view = nv_rs.core.DeviceBuffer.from_dlpack(cap)
+    other = nv_rs.core.Context(stream.device_id).new_stream()
+    data = np.frombuffer(view.to_bytes(other), dtype=np.float32)
+    assert data.min() > 0.0 and data.max() <= 1.0

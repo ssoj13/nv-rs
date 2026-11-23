@@ -5,18 +5,8 @@ import nv_rs
 
 
 def _skip_if_missing_runtime(exc: Exception, component: str) -> None:
-    """Skip only when the host lacks the required NVIDIA runtime DLL or GPU capability."""
-    msg = str(exc).lower()
-    if isinstance(exc, nv_rs.errors.NvLibraryNotFoundError) or any(
-        needle in msg
-        for needle in (
-            "not found",
-            "failed to load",
-            "could not load",
-            "unsupported",
-            "not supported",
-        )
-    ):
+    """Skip only when the host lacks the required NVIDIA runtime DLL (typed error, P15)."""
+    if isinstance(exc, nv_rs.errors.NvLibraryNotFoundError):
         pytest.skip(f"{component} runtime unavailable on host: {exc}")
     raise exc
 

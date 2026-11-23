@@ -32,7 +32,8 @@ fn supported_archs() -> PyResult<Vec<i32>> {
 /// Compiled NVRTC artifact bundle (PTX / CUBIN / LTO-IR / OptiX-IR + build log + lowered names).
 #[pyclass(name = "CompileResult", module = "nv_rs.nvrtc")]
 pub struct PyCompileResult {
-    ptx: String,
+    /// `None` exactly when NVRTC produced LTO-IR (`-dlto`), which replaces PTX output.
+    ptx: Option<String>,
     cubin: Option<Vec<u8>>,
     ltoir: Option<Vec<u8>>,
     optixir: Option<Vec<u8>>,
@@ -42,14 +43,16 @@ pub struct PyCompileResult {
 
 #[pymethods]
 impl PyCompileResult {
+    /// PTX text, or `None` for an LTO-IR (`-dlto`) compile.
     #[getter]
-    fn ptx(&self) -> &str {
-        &self.ptx
+    fn ptx(&self) -> Option<&str> {
+        self.ptx.as_deref()
     }
 
+    /// PTX text as bytes, or `None` for an LTO-IR (`-dlto`) compile.
     #[getter]
-    fn ptx_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, self.ptx.as_bytes())
+    fn ptx_bytes<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.ptx.as_deref().map(|p| PyBytes::new(py, p.as_bytes()))
     }
 
     #[getter]
@@ -86,7 +89,7 @@ impl PyCompileResult {
     fn __repr__(&self) -> String {
         format!(
             "CompileResult(ptx_bytes={}, has_cubin={}, has_ltoir={}, has_optixir={})",
-            self.ptx.len(),
+            self.ptx.as_ref().map_or(0, String::len),
             self.cubin.is_some(),
             self.ltoir.is_some(),
             self.optixir.is_some()
@@ -186,9 +189,14 @@ fn compile(
         }
 
         let log = prog.compile(&opts)?;
-        let ptx = prog.ptx_string().unwrap_or_default();
-        let cubin = prog.cubin()?;
         let ltoir = prog.ltoir()?;
+        // LTO-IR output replaces PTX; decided by what NVRTC produced, not by the flags (an
+        // `-dlto` can also arrive through `extra_args`). Any other PTX retrieval error propagates.
+        let ptx = match ltoir {
+            Some(_) => None,
+            None => Some(prog.ptx_string()?),
+        };
+        let cubin = prog.cubin()?;
         let optixir = prog.optixir()?;
         let mut lowered = HashMap::with_capacity(exprs.len());
         for expr in exprs {
@@ -210,7 +218,7 @@ fn compile(
                 Level::Info,
                 "nvrtc",
                 "compile",
-                format!("ptx={} B", out.ptx.len()),
+                format!("ptx={} B", out.ptx.as_ref().map_or(0, String::len)),
                 t0.elapsed().as_nanos() as u64,
                 true,
             );

@@ -333,6 +333,55 @@ class TestStubSync(unittest.TestCase):
         self.assertTrue(PY_TYPED.is_file(), f"Missing {PY_TYPED}")
         self.assertTrue(INIT_PYI.is_file(), f"Missing {INIT_PYI}")
 
+    def test_requires_python_matches_abi3_floor(self) -> None:
+        """P11: the wheel is tagged by PyO3's `abi3-pyXY` feature; metadata must not promise less."""
+        cargo = (NV_PY_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        m = re.search(r'"abi3-py3(\d+)"', cargo)
+        self.assertIsNotNone(m, "pyo3 `abi3-py3XY` feature not found in Cargo.toml")
+        minor = int(m.group(1))
+        text = PYPROJECT_TOML.read_text(encoding="utf-8")
+        req = re.search(r'(?m)^requires-python\s*=\s*">=3\.(\d+)"', text)
+        self.assertIsNotNone(req, "requires-python must be of the form \">=3.N\"")
+        self.assertEqual(int(req.group(1)), minor, "requires-python must equal the abi3 floor")
+        for classifier_minor in re.findall(r"Programming Language :: Python :: 3\.(\d+)", text):
+            self.assertGreaterEqual(
+                int(classifier_minor), minor, "classifier advertises a Python below the abi3 floor"
+            )
+
+    def test_description_names_only_registered_libraries(self) -> None:
+        """P12: every NVIDIA library the package description advertises has a submodule."""
+        advertised = {
+            "cuBLAS": "cublas",
+            "cuFFT": "cufft",
+            "cuRAND": "curand",
+            "cuSPARSE": "cusparse",
+            "cuSOLVER": "cusolver",
+            "cuTENSOR": "cutensor",
+            "cuDNN": "cudnn",
+            "NVML": "nvml",
+            "NVRTC": "nvrtc",
+            "nvCOMP": "nvcomp",
+            "nvJPEG": "nvjpeg",
+            "nvTIFF": "nvtiff",
+            "nvImageCodec": "nvimgcodec",
+            "NPP": "npp",
+            "OptiX": "optix",
+            "NGX": "ngx",
+            "NVENC": "nvenc",
+            "NVDEC": "nvdec",
+            "NVOFA": "nvofa",
+            "NCCL": "nccl",
+            "cuFile": "cufile",
+            "CUPTI": "cupti",
+            "NVTX": "nvtx",
+            "NVAPI": "nvapi",
+        }
+        rust_submodules, _ = _parse_rust_registered_submodules()
+        description = _load_pyproject()["project"]["description"]
+        for name, module in advertised.items():
+            if re.search(rf"\b{name}\b", description):
+                self.assertIn(module, rust_submodules, f"description advertises {name}, no `{module}` submodule")
+
     def test_rust_pyclasses_pyfunctions_and_methods_match_pyi(self) -> None:
         rust_submodules, _ = _parse_rust_registered_submodules()
         (

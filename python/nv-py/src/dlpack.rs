@@ -11,7 +11,8 @@ pub struct DLDevice {
     pub device_id: i32,
 }
 
-#[allow(dead_code)]
+/// Only the unit tests build CPU tensors; imports reject every device type except `DL_CUDA`.
+#[cfg(test)]
 pub const DL_CPU: i32 = 1;
 pub const DL_CUDA: i32 = 2;
 

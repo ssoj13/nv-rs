@@ -1,7 +1,7 @@
 //! Unified Python exception hierarchy for `nv_rs` with automatic diagnostic error recording.
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyException, PyRuntimeError};
 use pyo3::prelude::*;
 
 create_exception!(nv_rs.errors, NvError, PyException);
@@ -25,13 +25,12 @@ pub fn record_and_err<E: std::fmt::Display>(
         ErrorKind::InvalidArgument => NvInvalidArgumentError::new_err(msg),
         ErrorKind::Compile => NvCompileError::new_err(msg),
         ErrorKind::General => NvError::new_err(msg),
-        ErrorKind::Value => PyValueError::new_err(msg),
+        ErrorKind::Buffer => PyBufferError::new_err(msg),
         ErrorKind::Runtime => PyRuntimeError::new_err(msg),
     }
 }
 
 /// Classification of `nv_rs` errors mapped to Python exception subclasses.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
     /// Missing or rejected NVIDIA DLL / shared object.
@@ -43,9 +42,17 @@ pub enum ErrorKind {
     /// NVRTC compilation failure (includes compiler build log).
     Compile,
     /// General `NvError`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux-only cuFile binding maps an error to `General`"
+        )
+    )]
     General,
-    /// Standard `ValueError` when appropriate.
-    Value,
+    /// Standard `BufferError`: a DLPack export cannot satisfy the consumer's request
+    /// (Array API `__dlpack__` contract).
+    Buffer,
     /// Standard `RuntimeError` fallback.
     Runtime,
 }

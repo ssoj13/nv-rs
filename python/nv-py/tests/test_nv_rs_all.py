@@ -5,22 +5,23 @@ import nv_rs
 
 
 def _skip_if_missing_runtime(exc: Exception, component: str) -> None:
-    """Skip only when the host lacks the required optional runtime DLL/SO or GPU capability."""
-    msg = str(exc).lower()
-    if isinstance(exc, nv_rs.errors.NvLibraryNotFoundError) or any(
-        needle in msg
-        for needle in (
-            "not found",
-            "failed to load",
-            "could not load",
-            "unsupported",
-            "not supported",
-            "no such file",
-            "unavailable",
-        )
-    ):
+    """Skip only when the host lacks the required optional runtime DLL/SO.
+
+    Matching on message words would turn argument errors ("unsupported dtype ...") into skips,
+    so only the typed `NvLibraryNotFoundError` qualifies (P15).
+    """
+    if isinstance(exc, nv_rs.errors.NvLibraryNotFoundError):
         pytest.skip(f"{component} runtime unavailable on host: {exc}")
     raise exc
+
+
+def test_p15_skip_helper_does_not_hide_argument_errors():
+    """P15: an `NvInvalidArgumentError` mentioning "unsupported" must fail, not skip."""
+    err = nv_rs.errors.NvInvalidArgumentError("unsupported dtype `c64`")
+    with pytest.raises(nv_rs.errors.NvInvalidArgumentError):
+        _skip_if_missing_runtime(err, "probe")
+    with pytest.raises(pytest.skip.Exception):
+        _skip_if_missing_runtime(nv_rs.errors.NvLibraryNotFoundError("missing"), "probe")
 
 
 # ---------------------------------------------------------------------------

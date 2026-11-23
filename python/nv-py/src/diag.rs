@@ -1,7 +1,9 @@
 //! `nv_rs.diag` — runtime diagnostics, environment doctor, event ring-buffer, and leak tracing.
 
+use std::ffi::CString;
+
 use nv_loader::diag::{self, Level};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -71,9 +73,23 @@ fn clear_events() {
 }
 
 /// Registers an additional directory to search when loading NVIDIA shared libraries.
+///
+/// Affects only libraries not loaded yet: a failed load is cached for the process lifetime, so a
+/// `RuntimeWarning` is issued when a load has already failed.
 #[pyfunction]
-fn add_dll_directory(path: std::path::PathBuf) {
+fn add_dll_directory(py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
     nv_loader::add_search_dir(&path);
+    let failures = diag::stats().lib_load_failures;
+    if failures > 0 {
+        let msg = CString::new(format!(
+            "{failures} NVIDIA library load(s) already failed in this process; failures are \
+             cached, so the new search directory `{}` applies only to libraries not loaded yet. \
+             Call add_dll_directory before first use or restart the process.",
+            path.display()
+        ))?;
+        PyErr::warn(py, py.get_type::<PyRuntimeWarning>().as_any(), &msg, 1)?;
+    }
+    Ok(())
 }
 
 /// Probes all known NVIDIA libraries without loading them into the process.

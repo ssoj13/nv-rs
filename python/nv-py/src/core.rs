@@ -1,18 +1,34 @@
 //! `nv_rs.core` — CUDA Context, Stream, and zero-copy DeviceBuffer (DLPack + `__cuda_array_interface__` + Buffer Protocol).
+//!
+//! **Invariants every `PyDeviceBuffer` upholds** (the other binding modules rely on them):
+//! - the layout is dense row-major: `from_dlpack` rejects any other strides (size-1 dimensions
+//!   and empty tensors excepted) and stores canonical row-major strides, so `(ptr, nbytes)` is
+//!   the exact span the elements occupy;
+//! - `dtype` is the canonical short name from `dlpack::DTYPE_TABLE`;
+//! - [`PyDeviceBuffer::storage`] is the `cuda_core::RawDeviceBuffer` that completion leases
+//!   (`buf_util::enqueue_leased`) attach to: the owned allocation, or a foreign view whose owner
+//!   keeps a DLPack producer's tensor alive (its deleter runs after the last view and lease);
+//! - nv_rs-owned buffers always record the stream their contents are produced on, which
+//!   `__dlpack__`, `__cuda_array_interface__` and `to_bytes` wait for.
+//!
+//! Argument validation for native calls lives in `buf_util::check_buf`.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cuda_core::{Context, DeviceBuffer as CudaDeviceBuffer, Stream};
+use cuda_core::{
+    Context, DeviceAllocation, DeviceBuffer as CudaDeviceBuffer, RawDeviceBuffer, Stream,
+};
 use nv_loader::diag::{self, Level};
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyDict, PyTuple};
 
+use crate::buf_util::{Access, check_buf, enqueue_leased};
 use crate::dlpack::{
-    DL_CUDA, DLManagedTensor, DLTENSOR_CAPSULE_NAME, USED_DLTENSOR_CAPSULE_NAME, format_dl_dtype,
-    into_dlpack_managed, parse_dtype, pycapsule_dlpack_destructor,
+    DL_CUDA, DLManagedTensor, DLTENSOR_CAPSULE_NAME, USED_DLTENSOR_CAPSULE_NAME, find_dtype_entry,
+    format_dl_dtype, into_dlpack_managed, parse_dtype, pycapsule_dlpack_destructor,
 };
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -128,40 +144,65 @@ impl PyStream {
     }
 }
 
+/// Producer-owned tensor memory adopted by [`PyDeviceBuffer::from_dlpack`].
+///
+/// It is the owner of a `RawDeviceBuffer::foreign` view, so a completion lease taken on that
+/// view keeps the producer's tensor alive until the queued work completes. The producer's
+/// deleter runs in `Drop`, after the last view and the last lease are gone; that can happen on
+/// `cuda-core`'s retirement worker without the GIL, which DLPack deleters must tolerate
+/// (NumPy, CuPy and PyTorch acquire the GIL themselves where they need it).
+struct DlPackOwner {
+    managed: *mut DLManagedTensor,
+    ptr: u64,
+    nbytes: usize,
+    context: Arc<Context>,
+}
+
+// SAFETY: the producer transferred exclusive ownership of `managed` to us; it is touched only
+// once, by `Drop`, and DLPack deleters may be invoked from any thread.
+unsafe impl Send for DlPackOwner {}
+// SAFETY: shared references read only the immutable `ptr`, `nbytes` and `context` fields.
+unsafe impl Sync for DlPackOwner {}
+
+impl Drop for DlPackOwner {
+    fn drop(&mut self) {
+        // SAFETY: `managed` is the non-null `DLManagedTensor` taken from a `"dltensor"` capsule;
+        // its deleter is called exactly once, here.
+        if let Some(del) = unsafe { (*self.managed).deleter } {
+            // SAFETY: see above; ownership ends with this call.
+            unsafe { del(self.managed) };
+        }
+    }
+}
+
+// SAFETY: `ptr..ptr + nbytes` is the producer's tensor extent on `context`'s device (overflow is
+// rejected before construction) and stays valid until `Drop` runs the producer's deleter.
+unsafe impl DeviceAllocation for DlPackOwner {
+    fn device_ptr(&self) -> cuda_bindings::CUdeviceptr {
+        self.ptr
+    }
+    fn len_bytes(&self) -> usize {
+        self.nbytes
+    }
+    fn context(&self) -> Arc<Context> {
+        self.context.clone()
+    }
+}
+
 /// Backing storage for [`PyDeviceBuffer`]: either owned `cuda_core::DeviceBuffer<u8>` or borrowed DLPack tensor.
 enum Backing {
     Owned {
         buf: Arc<CudaDeviceBuffer<u8>>,
         nbytes: usize,
     },
-    BorrowedDlPack {
-        managed: *mut DLManagedTensor,
-        ptr: u64,
-        nbytes: usize,
-    },
+    /// Foreign view over a [`DlPackOwner`].
+    BorrowedDlPack { raw: RawDeviceBuffer },
 }
-
-// SAFETY: CUDA device pointers and `DLManagedTensor` ownership are thread-safe to transfer/drop across threads.
-unsafe impl Send for Backing {}
-// SAFETY: Shared immutable references only expose the device pointer and byte length.
-unsafe impl Sync for Backing {}
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        match self {
-            Backing::Owned { nbytes, .. } => {
-                diag::record_gpu_free(*nbytes);
-            }
-            Backing::BorrowedDlPack { managed, .. } => {
-                if !managed.is_null() {
-                    // SAFETY: We own this `DLManagedTensor` extracted from `"dltensor"` capsule.
-                    if let Some(del) = unsafe { (**managed).deleter } {
-                        // SAFETY: Calling consumer deleter once on Drop.
-                        unsafe { del(*managed) };
-                    }
-                    *managed = std::ptr::null_mut();
-                }
-            }
+        if let Backing::Owned { nbytes, .. } = self {
+            diag::record_gpu_free(*nbytes);
         }
     }
 }
@@ -170,13 +211,21 @@ impl Backing {
     fn device_ptr(&self) -> u64 {
         match self {
             Backing::Owned { buf, .. } => buf.cu_deviceptr(),
-            Backing::BorrowedDlPack { ptr, .. } => *ptr,
+            Backing::BorrowedDlPack { raw } => raw.cu_deviceptr(),
         }
     }
 
     fn nbytes(&self) -> usize {
         match self {
-            Backing::Owned { nbytes, .. } | Backing::BorrowedDlPack { nbytes, .. } => *nbytes,
+            Backing::Owned { nbytes, .. } => *nbytes,
+            Backing::BorrowedDlPack { raw } => raw.len_bytes(),
+        }
+    }
+
+    fn storage(&self) -> &RawDeviceBuffer {
+        match self {
+            Backing::Owned { buf, .. } => buf.storage(),
+            Backing::BorrowedDlPack { raw } => raw,
         }
     }
 
@@ -254,6 +303,30 @@ fn validate_shape_and_bytes(shape: &[i64], itemsize: usize) -> Result<(usize, us
     Ok((numel, nbytes))
 }
 
+/// Checks that element `strides` describe the dense row-major layout of `shape`.
+///
+/// Size-1 dimensions may carry any stride (they are never stepped over) and an empty tensor
+/// addresses no element, so both are accepted; zero, negative or permuted strides are not,
+/// because every native binding treats `(ptr, nbytes)` as one dense span.
+fn check_c_contiguous(shape: &[i64], strides: &[i64]) -> Result<(), String> {
+    if shape.contains(&0) {
+        return Ok(());
+    }
+    let mut expected = 1i64;
+    for (&dim, &stride) in shape.iter().zip(strides).rev() {
+        if dim != 1 && stride != expected {
+            return Err(format!(
+                "non-contiguous DLPack tensor (shape {shape:?}, element strides {strides:?}); \
+                 only dense row-major tensors are accepted, call .contiguous() first"
+            ));
+        }
+        expected = expected
+            .checked_mul(dim)
+            .ok_or_else(|| "stride overflow in DLPack tensor".to_owned())?;
+    }
+    Ok(())
+}
+
 /// GPU device buffer supporting DLPack, `__cuda_array_interface__` v3, and Python Buffer Protocol.
 #[pyclass(name = "DeviceBuffer", module = "nv_rs.core")]
 #[derive(Clone)]
@@ -266,58 +339,81 @@ pub struct PyDeviceBuffer {
     stream: Option<Arc<Stream>>,
 }
 
+/// Checks that an owned allocation of `len` bytes holds `shape` elements of `dtype` and returns
+/// the canonical dtype name; split from [`PyDeviceBuffer::from_owned_cuda`] so it is testable
+/// without a GPU.
+fn check_owned_layout(len: usize, dtype: &str, shape: &[i64]) -> Result<&'static str, String> {
+    let entry = find_dtype_entry(dtype).ok_or_else(|| format!("unsupported dtype `{dtype}`"))?;
+    let (_, expected) = validate_shape_and_bytes(shape, entry.itemsize)?;
+    if len != expected {
+        return Err(format!(
+            "device buffer length ({len} bytes) does not match shape {shape:?} and dtype \
+             '{dtype}' (expected {expected} bytes)"
+        ));
+    }
+    Ok(entry.canonical)
+}
+
 impl PyDeviceBuffer {
-    /// Wraps an already-allocated `cuda_core::DeviceBuffer<u8>` and tracks it in `diag`.
+    /// Wraps an nv_rs-owned allocation whose contents are produced by work queued on `stream`.
+    ///
+    /// `stream` becomes the buffer's producer stream: `__dlpack__`, `__cuda_array_interface__`
+    /// and `to_bytes` wait for it, so pass the stream the filling work was queued on. Fails with
+    /// `NvInvalidArgumentError` when `buf.len()` does not match `shape` x `dtype`, or when `buf`
+    /// and `stream` belong to different CUDA contexts. The device id is taken from `stream`.
     pub fn from_owned_cuda(
         buf: CudaDeviceBuffer<u8>,
-        device_id: i32,
-        dtype: impl Into<String>,
+        dtype: &str,
         shape: Vec<i64>,
-    ) -> Self {
-        Self::from_owned_cuda_with_stream(buf, device_id, dtype, shape, None)
-    }
-
-    /// Wraps an already-allocated `cuda_core::DeviceBuffer<u8>` with an associated stream.
-    pub fn from_owned_cuda_with_stream(
-        buf: CudaDeviceBuffer<u8>,
-        device_id: i32,
-        dtype: impl Into<String>,
-        shape: Vec<i64>,
-        stream: Option<Arc<Stream>>,
-    ) -> Self {
-        let dtype_str = dtype.into();
-        let (_, _, itemsize) =
-            parse_dtype(&dtype_str).unwrap_or_else(|e| panic!("from_owned_cuda: {e}"));
-        let (_, expected_bytes) = validate_shape_and_bytes(&shape, itemsize)
-            .unwrap_or_else(|e| panic!("from_owned_cuda: {e}"));
-        assert_eq!(
-            buf.len(),
-            expected_bytes,
-            "CudaDeviceBuffer length ({}) does not match shape {:?} and dtype '{}' (expected {} bytes)",
-            buf.len(),
-            shape,
-            dtype_str,
-            expected_bytes
-        );
+        stream: &Arc<Stream>,
+    ) -> PyResult<Self> {
+        let invalid =
+            |e: String| record_and_err("core", "from_owned_cuda", e, ErrorKind::InvalidArgument);
+        let canonical = check_owned_layout(buf.len(), dtype, &shape).map_err(invalid)?;
+        if buf.storage().context().as_ref() != stream.context().as_ref() {
+            return Err(invalid(
+                "device buffer and producer stream belong to different CUDA contexts".to_owned(),
+            ));
+        }
+        let ordinal = stream.context().ordinal();
+        let device_id = i32::try_from(ordinal)
+            .map_err(|_| invalid(format!("device ordinal {ordinal} does not fit i32")))?;
         let nbytes = buf.len();
         diag::record_gpu_alloc(nbytes);
         let strides = compute_row_major_strides(&shape);
-        Self {
+        Ok(Self {
             backing: Arc::new(Backing::Owned {
                 buf: Arc::new(buf),
                 nbytes,
             }),
             device_id,
-            dtype: dtype_str,
+            dtype: canonical.to_owned(),
             shape,
             strides,
-            stream,
-        }
+            stream: Some(stream.clone()),
+        })
     }
 
     /// Returns the underlying `cuda_core::DeviceBuffer<u8>` if owned by `nv_rs`.
     pub fn owned_cuda_buf(&self) -> Option<&Arc<CudaDeviceBuffer<u8>>> {
         self.backing.as_owned_cuda()
+    }
+
+    /// Allocation identity and access tracker for completion leases (`buf_util::enqueue_leased`);
+    /// covers owned buffers and DLPack imports alike.
+    pub fn storage(&self) -> &RawDeviceBuffer {
+        self.backing.storage()
+    }
+
+    /// Canonical dtype name (`dlpack::DTYPE_TABLE`).
+    pub fn dtype_name(&self) -> &str {
+        &self.dtype
+    }
+
+    /// Element count (`1` for a 0-d buffer).
+    pub fn numel(&self) -> usize {
+        // Shapes are validated at construction, so every dimension is non-negative.
+        self.shape.iter().map(|&d| d as usize).product()
     }
 
     /// Raw CUDA device pointer (`CUdeviceptr`).
@@ -397,13 +493,7 @@ impl PyDeviceBuffer {
         // SAFETY: Uninitialized GPU memory is immediately owned by `PyDeviceBuffer`; caller writes before reading.
         let buf = unsafe { CudaDeviceBuffer::<u8>::uninitialized_async(&stream.inner, nbytes) }
             .map_err(|e| record_and_err("core", "DeviceBuffer::alloc", e, ErrorKind::Cuda))?;
-        Ok(Self::from_owned_cuda_with_stream(
-            buf,
-            stream.device_id,
-            dtype,
-            shape,
-            Some(stream.inner.clone()),
-        ))
+        Self::from_owned_cuda(buf, dtype, shape, &stream.inner)
     }
 
     /// Uploads host bytes / `bytearray` / `memoryview` / `numpy.ndarray` (any dtype) to GPU via Python Buffer Protocol.
@@ -428,24 +518,8 @@ impl PyDeviceBuffer {
                 .ok()
                 .and_then(|d| d.getattr("str").ok())
                 .and_then(|s| s.extract::<String>().ok())
-                .and_then(|typestr| {
-                    // Normalize numpy typestr to our canonical short dtype if supported.
-                    match typestr.as_str() {
-                        "|u1" => Some("u8".to_owned()),
-                        "|i1" => Some("i8".to_owned()),
-                        "<u2" => Some("u16".to_owned()),
-                        "<i2" => Some("i16".to_owned()),
-                        "<u4" => Some("u32".to_owned()),
-                        "<i4" => Some("i32".to_owned()),
-                        "<u8" => Some("u64".to_owned()),
-                        "<i8" => Some("i64".to_owned()),
-                        "<f2" => Some("f16".to_owned()),
-                        "<f4" => Some("f32".to_owned()),
-                        "<f8" => Some("f64".to_owned()),
-                        "|b1" => Some("bool".to_owned()),
-                        _ => None,
-                    }
-                })
+                // NumPy typestrs are aliases in `DTYPE_TABLE`; unknown ones stay uninferred.
+                .and_then(|typestr| find_dtype_entry(&typestr).map(|e| e.canonical.to_owned()))
         } else {
             None
         };
@@ -528,16 +602,12 @@ impl PyDeviceBuffer {
         let dev_buf = py
             .detach(move || CudaDeviceBuffer::from_host(&s_inner, &host))
             .map_err(|e| record_and_err("core", "from_buffer", e, ErrorKind::Cuda))?;
-        Ok(Self::from_owned_cuda_with_stream(
-            dev_buf,
-            stream.device_id,
-            resolved_dtype,
-            resolved_shape,
-            Some(stream.inner.clone()),
-        ))
+        Self::from_owned_cuda(dev_buf, &resolved_dtype, resolved_shape, &stream.inner)
     }
 
     /// Zero-copy import from any object implementing `__dlpack__` (PyTorch, CuPy, JAX) or a `"dltensor"` capsule.
+    ///
+    /// Only dense row-major tensors on the CUDA device of `stream` (when given) are accepted.
     #[staticmethod]
     #[pyo3(signature = (obj, stream=None))]
     fn from_dlpack(
@@ -547,7 +617,10 @@ impl PyDeviceBuffer {
     ) -> PyResult<Self> {
         let capsule_bound: Bound<'_, PyAny> = if obj.hasattr("__dlpack__")? {
             if let Some(s) = stream {
-                obj.call_method1("__dlpack__", (s.raw_ptr(),))?
+                // `stream` is keyword-only in the Array API / DLPack >= 0.8 signature.
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("stream", s.raw_ptr())?;
+                obj.call_method("__dlpack__", (), Some(&kwargs))?
             } else {
                 obj.call_method0("__dlpack__")?
             }
@@ -656,12 +729,29 @@ impl PyDeviceBuffer {
         let (_numel, nbytes) = validate_shape_and_bytes(&shape, itemsize)
             .map_err(|e| record_and_err("core", "from_dlpack", e, ErrorKind::InvalidArgument))?;
 
-        let strides: Vec<i64> = if ndim > 0 && !strides_raw.is_null() {
+        // Null strides mean row-major (DLPack); explicit ones must describe the same layout.
+        let strides = compute_row_major_strides(&shape);
+        if ndim > 0 && !strides_raw.is_null() {
             // SAFETY: `strides_raw` is non-null and points to `ndim` elements of i64.
-            unsafe { std::slice::from_raw_parts(strides_raw, ndim) }.to_vec()
-        } else {
-            compute_row_major_strides(&shape)
-        };
+            let given = unsafe { std::slice::from_raw_parts(strides_raw, ndim) };
+            check_c_contiguous(&shape, given).map_err(|e| {
+                record_and_err("core", "from_dlpack", e, ErrorKind::InvalidArgument)
+            })?;
+        }
+
+        if let Some(s) = stream
+            && s.device_id != device_id
+        {
+            return Err(record_and_err(
+                "core",
+                "from_dlpack",
+                format!(
+                    "DLPack tensor is on CUDA device {device_id}, but `stream` is on device {}",
+                    s.device_id
+                ),
+                ErrorKind::InvalidArgument,
+            ));
+        }
 
         if data_ptr.is_null() && nbytes > 0 {
             return Err(record_and_err(
@@ -680,9 +770,34 @@ impl PyDeviceBuffer {
                 ErrorKind::InvalidArgument,
             )
         })?;
+        if ptr.checked_add(nbytes as u64).is_none() {
+            return Err(record_and_err(
+                "core",
+                "from_dlpack",
+                "DLPack tensor extent overflows the device address space",
+                ErrorKind::InvalidArgument,
+            ));
+        }
 
-        // Transfer ownership of `managed` out of the guard to `Backing::BorrowedDlPack`.
-        let managed = guard.into_raw();
+        let ordinal = usize::try_from(device_id).map_err(|_| {
+            record_and_err(
+                "core",
+                "from_dlpack",
+                format!("negative CUDA device id in DLPack tensor: {device_id}"),
+                ErrorKind::InvalidArgument,
+            )
+        })?;
+        // The tensor's device context: leases check it against the stream of every native call.
+        let context = Context::new(ordinal)
+            .map_err(|e| record_and_err("core", "from_dlpack", e, ErrorKind::Cuda))?;
+
+        // Transfer ownership of `managed` out of the guard to the lease-aware owner.
+        let owner = Arc::new(DlPackOwner {
+            managed: guard.into_raw(),
+            ptr,
+            nbytes,
+            context,
+        });
 
         diag::record_event(
             Level::Trace,
@@ -695,9 +810,7 @@ impl PyDeviceBuffer {
 
         Ok(Self {
             backing: Arc::new(Backing::BorrowedDlPack {
-                managed,
-                ptr,
-                nbytes,
+                raw: RawDeviceBuffer::foreign(owner, nbytes),
             }),
             device_id,
             dtype: dtype_str.to_owned(),
@@ -708,12 +821,42 @@ impl PyDeviceBuffer {
     }
 
     /// Exports this buffer as a zero-copy DLPack `"dltensor"` `PyCapsule`.
-    #[pyo3(signature = (stream=None))]
+    ///
+    /// Accepts the Array API keywords: `max_version` (the unversioned legacy capsule is always
+    /// returned, which consumers accept), `dl_device` (must be this buffer's CUDA device) and
+    /// `copy` (`True` raises `BufferError`: exports are zero-copy only).
+    #[pyo3(signature = (stream=None, max_version=None, dl_device=None, copy=None))]
     fn __dlpack__<'py>(
         &self,
         py: Python<'py>,
         stream: Option<&Bound<'py, PyAny>>,
+        max_version: Option<&Bound<'py, PyAny>>,
+        dl_device: Option<(i32, i32)>,
+        copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        let _ = max_version;
+        if let Some(dev) = dl_device
+            && dev != (DL_CUDA, self.device_id)
+        {
+            return Err(record_and_err(
+                "core",
+                "__dlpack__",
+                format!(
+                    "dl_device {dev:?} differs from this buffer's device ({DL_CUDA}, {}); \
+                     cross-device export is not supported",
+                    self.device_id
+                ),
+                ErrorKind::Buffer,
+            ));
+        }
+        if copy == Some(true) {
+            return Err(record_and_err(
+                "core",
+                "__dlpack__",
+                "copy=True is not supported: nv_rs exports DLPack tensors zero-copy only",
+                ErrorKind::Buffer,
+            ));
+        }
         self.sync_for_consumer_stream(py, stream)?;
 
         let (dl_dtype, _, _) = parse_dtype(&self.dtype)
@@ -809,34 +952,57 @@ impl PyDeviceBuffer {
         Ok(d.unbind())
     }
 
-    /// Downloads device memory to host `bytes`, synchronizing `stream`.
+    /// Downloads device memory (owned buffer or DLPack import) to host `bytes` on `stream`,
+    /// after the buffer's producer stream and `stream` have finished their queued work.
     fn to_bytes<'py>(&self, py: Python<'py>, stream: &PyStream) -> PyResult<Bound<'py, PyBytes>> {
-        if !self.is_c_contiguous() {
-            return Err(record_and_err(
-                "core",
-                "to_bytes",
-                "to_bytes requires a contiguous buffer; non-contiguous layout is not supported",
-                ErrorKind::InvalidArgument,
-            ));
-        }
-        let owned = self
-            .owned_cuda_buf()
-            .ok_or_else(|| {
-                record_and_err(
-                    "core",
-                    "to_bytes",
-                    "to_bytes currently requires an nv_rs-owned DeviceBuffer",
-                    ErrorKind::InvalidArgument,
-                )
-            })?
-            .clone();
+        let (ptr, nbytes) = check_buf(
+            "core",
+            "to_bytes",
+            "self",
+            self,
+            &[],
+            0,
+            stream.inner.context(),
+        )?;
+        let cuda_err =
+            |e: cuda_core::DriverError| record_and_err("core", "to_bytes", e, ErrorKind::Cuda);
         let s_inner = stream.inner.clone();
-        let host = py
-            .detach(move || {
-                s_inner.synchronize()?;
-                owned.to_host_vec(&s_inner)
-            })
-            .map_err(|e| record_and_err("core", "to_bytes", e, ErrorKind::Cuda))?;
+        let host = py.detach(|| -> PyResult<Vec<u8>> {
+            // The contents may still be in flight on the producer stream (the copy below is
+            // ordered only after work already queued on `stream`).
+            if let Some(p) = &self.stream
+                && p.cu_stream() != s_inner.cu_stream()
+            {
+                p.synchronize().map_err(cuda_err)?;
+            }
+            let mut host = vec![0u8; nbytes];
+            if nbytes == 0 {
+                return Ok(host);
+            }
+            let queued =
+                enqueue_leased("core", "to_bytes", &s_inner, [(self, Access::Read)], || {
+                    // SAFETY: `host` holds `nbytes` writable bytes and outlives the copy (synchronized
+                    // below); `ptr..ptr + nbytes` is this buffer's dense span (`check_buf`).
+                    unsafe {
+                        cuda_core::memory::memcpy_dtoh_async(
+                            host.as_mut_ptr(),
+                            ptr,
+                            nbytes,
+                            s_inner.cu_stream(),
+                        )
+                    }
+                    .map_err(cuda_err)
+                });
+            // Synchronize even when `queued` failed: the copy may have been queued before a
+            // lease bookkeeping error, and `host` must outlive it.
+            if let Err(e) = s_inner.synchronize() {
+                // The driver has not confirmed that it stopped writing `host`: never free it.
+                std::mem::forget(host);
+                return Err(cuda_err(e));
+            }
+            queued?;
+            Ok(host)
+        })?;
         Ok(PyBytes::new(py, &host))
     }
 
@@ -973,6 +1139,142 @@ mod tests {
         assert_eq!(compute_row_major_strides(&[10]), vec![1]);
         assert_eq!(compute_row_major_strides(&[2, 3]), vec![3, 1]);
         assert_eq!(compute_row_major_strides(&[2, 3, 4]), vec![12, 4, 1]);
+    }
+
+    #[test]
+    fn test_check_c_contiguous_accepts_row_major_and_wildcards() {
+        assert!(check_c_contiguous(&[2, 3], &[3, 1]).is_ok());
+        assert!(check_c_contiguous(&[], &[]).is_ok());
+        // Size-1 dimensions carry arbitrary strides (PyTorch emits these for `unsqueeze`).
+        assert!(check_c_contiguous(&[3, 1], &[1, 7]).is_ok());
+        assert!(check_c_contiguous(&[1, 4], &[0, 1]).is_ok());
+        // An empty tensor addresses no element.
+        assert!(check_c_contiguous(&[0, 5], &[1, 0]).is_ok());
+    }
+
+    #[test]
+    fn test_check_c_contiguous_rejects_strided_layouts() {
+        // P1: transposed view, zero-stride broadcast (`expand`) and negative strides.
+        for (shape, strides) in [
+            (vec![3i64, 2], vec![1i64, 3]),
+            (vec![1000], vec![0]),
+            (vec![4], vec![-1]),
+            (vec![2, 3], vec![6, 2]),
+        ] {
+            let err = check_c_contiguous(&shape, &strides).expect_err("strided layout accepted");
+            assert!(err.contains("non-contiguous"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_check_owned_layout_reports_errors_instead_of_panicking() {
+        // P6: these inputs used to reach `panic!` / `assert_eq!` in `from_owned_cuda_with_stream`.
+        assert_eq!(check_owned_layout(24, "float32", &[2, 3]), Ok("f32"));
+        assert!(check_owned_layout(4, "complex64", &[1]).is_err());
+        assert!(check_owned_layout(4, "f32", &[-1]).is_err());
+        let err = check_owned_layout(20, "f32", &[2, 3]).expect_err("length mismatch accepted");
+        assert!(err.contains("expected 24 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn test_numpy_typestr_inference_matches_previous_table() {
+        // P13: `from_buffer` infers dtypes through `DTYPE_TABLE` aliases instead of a copy.
+        for (typestr, canonical) in [
+            ("|u1", "u8"),
+            ("|i1", "i8"),
+            ("<u2", "u16"),
+            ("<i2", "i16"),
+            ("<u4", "u32"),
+            ("<i4", "i32"),
+            ("<u8", "u64"),
+            ("<i8", "i64"),
+            ("<f2", "f16"),
+            ("<f4", "f32"),
+            ("<f8", "f64"),
+            ("|b1", "bool"),
+        ] {
+            assert_eq!(
+                find_dtype_entry(typestr).map(|e| e.canonical),
+                Some(canonical)
+            );
+        }
+        // Byte-swapped and void typestrs stay uninferred rather than reinterpreted.
+        assert!(find_dtype_entry(">f4").is_none());
+        assert!(find_dtype_entry("<V2").is_none());
+    }
+
+    static LEASED_DELETES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn leased_deleter(self_: *mut DLManagedTensor) {
+        LEASED_DELETES.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: `self_` was allocated via `Box::into_raw` in the test below.
+        drop(unsafe { Box::from_raw(self_) });
+    }
+
+    #[test]
+    #[ignore = "GPU: needs a CUDA driver"]
+    fn gpu_dlpack_import_deleter_waits_for_leased_work() {
+        // LEASE-API for DLPack imports: the producer's deleter (which lets e.g. PyTorch's caching
+        // allocator reuse the block) must not run while leased work on the tensor is queued.
+        let ctx = Context::new(0).expect("cuda context");
+        let a = ctx.new_stream().expect("stream");
+        let tensor = Box::new(DLManagedTensor {
+            dl_tensor: crate::dlpack::DLTensor {
+                data: std::ptr::null_mut(),
+                device: crate::dlpack::DLDevice {
+                    device_type: DL_CUDA,
+                    device_id: 0,
+                },
+                ndim: 0,
+                dtype: crate::dlpack::DLDataType {
+                    code: 1,
+                    bits: 8,
+                    lanes: 1,
+                },
+                shape: std::ptr::null_mut(),
+                strides: std::ptr::null_mut(),
+                byte_offset: 0,
+            },
+            manager_ctx: std::ptr::null_mut(),
+            deleter: Some(leased_deleter),
+        });
+        // The enqueue below queues no device access, so a placeholder address is never touched.
+        let owner = Arc::new(DlPackOwner {
+            managed: Box::into_raw(tensor),
+            ptr: 0x1000,
+            nbytes: 16,
+            context: ctx.clone(),
+        });
+        let buf = PyDeviceBuffer {
+            backing: Arc::new(Backing::BorrowedDlPack {
+                raw: RawDeviceBuffer::foreign(owner, 16),
+            }),
+            device_id: 0,
+            dtype: "u8".to_owned(),
+            shape: vec![16],
+            strides: vec![1],
+            stream: None,
+        };
+        a.launch_host_function(|| std::thread::sleep(std::time::Duration::from_millis(200)))
+            .expect("busy");
+        enqueue_leased("test", "noop", &a, [(&buf, Access::Read)], || Ok(())).expect("lease");
+        drop(buf);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            LEASED_DELETES.load(Ordering::SeqCst),
+            0,
+            "deleter ran while leased work was queued"
+        );
+        a.synchronize().expect("sync");
+        let t0 = Instant::now();
+        while LEASED_DELETES.load(Ordering::SeqCst) == 0 && t0.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            LEASED_DELETES.load(Ordering::SeqCst),
+            1,
+            "deleter must run once after completion"
+        );
     }
 
     static DELETER_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);

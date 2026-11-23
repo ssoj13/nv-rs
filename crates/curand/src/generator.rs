@@ -7,7 +7,8 @@
 //! `ScrambledSobol64`) algorithms.
 //! **Why.** Enforces host-vs-device, pseudo-vs-quasi, and distribution parameter invariants
 //! before calling cuRAND, binds streams on device generators, and performs zero heap allocations
-//! except for the completion lease `generate_u32` takes on its output (`cuda_core_ext::lease`).
+//! except for the completion lease every device `generate_*` takes on its output
+//! (`cuda_core_ext::lease`).
 //! **Used by** `curand` callers and T0/T3 tests.
 
 use crate::error::{check, ensure_loaded, teardown};
@@ -147,6 +148,12 @@ pub(crate) fn validate_poisson_lambda(lambda: f64) -> Result<()> {
 }
 
 /// Owning Poisson discrete distribution histogram (`curandDiscreteDistribution_t`).
+///
+/// The histogram lives in device memory (`curand.h`: "pointer to the histogram in device
+/// memory"). Nothing in this crate reads it: it is passed through [`Self::raw`] to user CUDA
+/// kernels that sample it with the device API `curand_discrete(state, distribution)`
+/// (`curand_discrete2.h`). Bulk Poisson generation through the host API
+/// ([`Generator::generate_poisson`] / [`Generator::generate_host_poisson`]) does not need this type.
 pub struct PoissonDistribution {
     raw: cuda_bindings::curandDiscreteDistribution_t,
     cuda: Option<Arc<Context>>,
@@ -156,7 +163,13 @@ pub struct PoissonDistribution {
 unsafe impl Send for PoissonDistribution {}
 
 impl PoissonDistribution {
-    /// Precomputes a host-side Poisson distribution histogram for `lambda > 0.0`.
+    /// Precomputes a device-memory Poisson distribution histogram for `lambda > 0.0`.
+    ///
+    /// No context is bound: cuRAND allocates the histogram in whatever CUDA context is current on
+    /// the calling thread (or the CUDA runtime's primary context of the current device when none
+    /// is), and `Drop` frees it in whatever context is current on the dropping thread, writing a
+    /// failure to stderr. Prefer [`Self::new_on`], which binds `cuda` for creation and destruction
+    /// and records teardown failures on it.
     pub fn new(lambda: f64) -> Result<Self> {
         validate_poisson_lambda(lambda)?;
         ensure_loaded()?;
@@ -425,45 +438,69 @@ impl Generator {
     }
 
     /// Generates `out.len()` uniformly distributed 64-bit unsigned integers on device (Sobol64).
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_u64(&self, stream: &Stream, out: &mut DeviceBuffer<u64>) -> Result<()> {
         self.prepare_device(stream)?;
-        // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` u64s.
-        check("curandGenerateLongLong", unsafe {
-            cuda_bindings::curandGenerateLongLong(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut u64,
-                out.len(),
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of
+            // `out.len()` u64s in the stream's context (checked by the lease), and the write
+            // lease keeps it allocated until the generation queued on `stream` completes.
+            check("curandGenerateLongLong", unsafe {
+                cuda_bindings::curandGenerateLongLong(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut u64,
+                    out.len(),
+                )
+            })
         })
     }
 
     /// Generates `out.len()` uniform `f32` values in `(0.0, 1.0]` on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_uniform_f32(&self, stream: &Stream, out: &mut DeviceBuffer<f32>) -> Result<()> {
         self.prepare_device(stream)?;
-        // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` f32s.
-        check("curandGenerateUniform", unsafe {
-            cuda_bindings::curandGenerateUniform(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f32,
-                out.len(),
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of
+            // `out.len()` f32s in the stream's context (checked by the lease), and the write
+            // lease keeps it allocated until the generation queued on `stream` completes.
+            check("curandGenerateUniform", unsafe {
+                cuda_bindings::curandGenerateUniform(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f32,
+                    out.len(),
+                )
+            })
         })
     }
 
     /// Generates `out.len()` uniform `f64` values in `(0.0, 1.0]` on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_uniform_f64(&self, stream: &Stream, out: &mut DeviceBuffer<f64>) -> Result<()> {
         self.prepare_device(stream)?;
-        // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of `out.len()` f64s.
-        check("curandGenerateUniformDouble", unsafe {
-            cuda_bindings::curandGenerateUniformDouble(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f64,
-                out.len(),
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: `self.raw` is bound to `stream`; `out` is a live device buffer of
+            // `out.len()` f64s in the stream's context (checked by the lease), and the write
+            // lease keeps it allocated until the generation queued on `stream` completes.
+            check("curandGenerateUniformDouble", unsafe {
+                cuda_bindings::curandGenerateUniformDouble(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f64,
+                    out.len(),
+                )
+            })
         })
     }
 
     /// Generates `out.len()` normally distributed `f32` values on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_normal_f32(
         &self,
         stream: &Stream,
@@ -478,19 +515,26 @@ impl Generator {
             mean.is_finite() && stddev.is_finite(),
         )?;
         self.prepare_device(stream)?;
-        // SAFETY: parameters and even length (for pseudo-random) are validated above.
-        check("curandGenerateNormal", unsafe {
-            cuda_bindings::curandGenerateNormal(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f32,
-                out.len(),
-                mean,
-                stddev,
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: parameters and even length (for pseudo-random) are validated above; `out`
+            // is in the stream's context (checked by the lease), and the write lease keeps it
+            // allocated until the generation queued on `stream` completes.
+            check("curandGenerateNormal", unsafe {
+                cuda_bindings::curandGenerateNormal(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f32,
+                    out.len(),
+                    mean,
+                    stddev,
+                )
+            })
         })
     }
 
     /// Generates `out.len()` normally distributed `f64` values on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_normal_f64(
         &self,
         stream: &Stream,
@@ -505,19 +549,26 @@ impl Generator {
             mean.is_finite() && stddev.is_finite(),
         )?;
         self.prepare_device(stream)?;
-        // SAFETY: parameters and even length (for pseudo-random) are validated above.
-        check("curandGenerateNormalDouble", unsafe {
-            cuda_bindings::curandGenerateNormalDouble(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f64,
-                out.len(),
-                mean,
-                stddev,
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: parameters and even length (for pseudo-random) are validated above; `out`
+            // is in the stream's context (checked by the lease), and the write lease keeps it
+            // allocated until the generation queued on `stream` completes.
+            check("curandGenerateNormalDouble", unsafe {
+                cuda_bindings::curandGenerateNormalDouble(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f64,
+                    out.len(),
+                    mean,
+                    stddev,
+                )
+            })
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f32` values on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_log_normal_f32(
         &self,
         stream: &Stream,
@@ -532,19 +583,26 @@ impl Generator {
             mean.is_finite() && stddev.is_finite(),
         )?;
         self.prepare_device(stream)?;
-        // SAFETY: parameters and even length (for pseudo-random) are validated above.
-        check("curandGenerateLogNormal", unsafe {
-            cuda_bindings::curandGenerateLogNormal(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f32,
-                out.len(),
-                mean,
-                stddev,
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: parameters and even length (for pseudo-random) are validated above; `out`
+            // is in the stream's context (checked by the lease), and the write lease keeps it
+            // allocated until the generation queued on `stream` completes.
+            check("curandGenerateLogNormal", unsafe {
+                cuda_bindings::curandGenerateLogNormal(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f32,
+                    out.len(),
+                    mean,
+                    stddev,
+                )
+            })
         })
     }
 
     /// Generates `out.len()` log-normally distributed `f64` values on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_log_normal_f64(
         &self,
         stream: &Stream,
@@ -559,19 +617,26 @@ impl Generator {
             mean.is_finite() && stddev.is_finite(),
         )?;
         self.prepare_device(stream)?;
-        // SAFETY: parameters and even length (for pseudo-random) are validated above.
-        check("curandGenerateLogNormalDouble", unsafe {
-            cuda_bindings::curandGenerateLogNormalDouble(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut f64,
-                out.len(),
-                mean,
-                stddev,
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: parameters and even length (for pseudo-random) are validated above; `out`
+            // is in the stream's context (checked by the lease), and the write lease keeps it
+            // allocated until the generation queued on `stream` completes.
+            check("curandGenerateLogNormalDouble", unsafe {
+                cuda_bindings::curandGenerateLogNormalDouble(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut f64,
+                    out.len(),
+                    mean,
+                    stddev,
+                )
+            })
         })
     }
 
     /// Generates `out.len()` Poisson-distributed `u32` values on device.
+    ///
+    /// `out` stays allocated until the queued generation completes, even if it is dropped first.
+    /// Fails with `CUDA_ERROR_NOT_READY` while another stream still has unfinished work on `out`.
     pub fn generate_poisson(
         &self,
         stream: &Stream,
@@ -580,14 +645,18 @@ impl Generator {
     ) -> Result<()> {
         validate_poisson_lambda(lambda)?;
         self.prepare_device(stream)?;
-        // SAFETY: `lambda > 0.0` is validated and `out` is a live device buffer.
-        check("curandGeneratePoisson", unsafe {
-            cuda_bindings::curandGeneratePoisson(
-                self.raw,
-                out.cu_deviceptr() as usize as *mut u32,
-                out.len(),
-                lambda,
-            )
+        enqueue_leased(stream, [(out.storage(), Access::Write)], || {
+            // SAFETY: `lambda > 0.0` is validated; `out` is a live device buffer in the stream's
+            // context (checked by the lease), and the write lease keeps it allocated until the
+            // generation queued on `stream` completes.
+            check("curandGeneratePoisson", unsafe {
+                cuda_bindings::curandGeneratePoisson(
+                    self.raw,
+                    out.cu_deviceptr() as usize as *mut u32,
+                    out.len(),
+                    lambda,
+                )
+            })
         })
     }
 

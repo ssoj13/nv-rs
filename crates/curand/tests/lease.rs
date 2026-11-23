@@ -4,7 +4,8 @@
 //! **What.** `Generator::generate_u32` queues a kernel on the caller's stream that writes into the
 //! caller's `DeviceBuffer`. The test drops that buffer right after the call, allocates a fresh
 //! zeroed buffer of the same size, and checks whether the queued generation later writes into the
-//! fresh buffer (write-after-free observed through safe code).
+//! fresh buffer (write-after-free observed through safe code). `generate_uniform_f32` repeats the
+//! corrupting case as the representative of the other leased device `generate_*` functions.
 //! **How.** Stream A is held busy by a host function that sleeps, so the generation queued behind
 //! it cannot have run when the buffer is dropped. Three allocation kinds are covered, because
 //! `cuda-core` frees them differently (`Allocation::drop`): stream-ordered on another stream B
@@ -142,6 +143,52 @@ fn gpu_generate_u32_output_dropped_before_completion_is_not_reused() {
     assert!(
         failures.is_empty(),
         "queued generation wrote into a buffer allocated after the output was dropped: {failures:?}"
+    );
+}
+
+/// Same reproduction as [`run_case`] for `Kind::OrderedOtherStream` (the only kind that corrupted
+/// without a lease), through `generate_uniform_f32`, to cover the lease on the remaining device
+/// `generate_*` functions with one representative.
+#[test]
+#[ignore = "GPU: needs CUDA driver + curand64_10.dll"]
+fn gpu_generate_uniform_f32_output_dropped_before_completion_is_not_reused() {
+    let ctx = Context::new(0).expect("cuda context");
+    let a = ctx.new_stream().expect("stream A");
+    let b = ctx.new_stream().expect("stream B");
+    let generator = Generator::new_device(&ctx, RngType::Philox4_32_10).unwrap();
+    generator.set_seed(7).unwrap();
+    let mut warm = DeviceBuffer::<f32>::zeroed(&a, LEN).unwrap();
+    generator.generate_uniform_f32(&a, &mut warm).unwrap();
+    a.synchronize().unwrap();
+    drop(warm);
+
+    let mut corrupt = 0usize;
+    for _ in 0..REPS {
+        // SAFETY: the buffer is zero-filled on B (ordered after the allocation) and B is
+        // synchronized before the generation on A writes it.
+        let mut x = unsafe { DeviceBuffer::<f32>::uninitialized_async(&b, LEN) }.unwrap();
+        x.zero_async(&b).unwrap();
+        b.synchronize().unwrap();
+
+        a.launch_host_function(|| std::thread::sleep(BUSY)).unwrap();
+        generator.generate_uniform_f32(&a, &mut x).unwrap();
+        drop(x);
+        std::thread::sleep(RETIRE);
+
+        // Uniform values lie in (0, 1], so any write into the replacement leaves a nonzero word.
+        let y = zeroed(Kind::OrderedOtherStream, &b);
+        a.synchronize().unwrap();
+        if y.to_host_vec(&b).unwrap().iter().any(|v| *v != 0) {
+            corrupt += 1;
+        }
+        drop(y);
+        a.synchronize().unwrap();
+        b.synchronize().unwrap();
+    }
+    assert_eq!(
+        corrupt, 0,
+        "queued generate_uniform_f32 wrote into a buffer allocated after the output was dropped \
+         ({corrupt}/{REPS} repetitions)"
     );
 }
 

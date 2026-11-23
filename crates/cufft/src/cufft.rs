@@ -118,14 +118,14 @@ mod tests {
             Err(Error::Invalid(_))
         ));
 
-        // embed[0] is ignored by cuFFT, so rank=1 n=[1024] with inembed=[1] still requires 1024 elems
+        // embed[0] is ignored by cuFFT, so rank=1 n=[1024] with embed=[1] still requires 1024 elems
         let rank1_small_embed0 = ManyDesc {
             rank: 1,
             n: [1024, 1, 1],
             inembed: Some([1, 1, 1]),
             istride: 1,
             idist: 1024,
-            onembed: None,
+            onembed: Some([1, 1, 1]),
             ostride: 1,
             odist: 1024,
             fft_type: FftType::C2C,
@@ -133,9 +133,10 @@ mod tests {
         };
         assert_eq!(rank1_small_embed0.min_io_elems().unwrap(), (1024, 1024));
 
-        // inner embed[1] < n[1] must be rejected
+        // inner embed[1] < n[1] must be rejected (onembed is valid, so only inembed[1] is at fault)
         let bad_inner_embed = ManyDesc {
             inembed: Some([16, 16, 1]),
+            onembed: Some([16, 32, 1]),
             ..valid
         };
         assert!(matches!(bad_inner_embed.validate(), Err(Error::Invalid(_))));
@@ -151,12 +152,17 @@ mod tests {
         let n = 64usize;
         let mut scratch = Scratch::new(&stream);
 
-        // Budget rejection test if plan requires workspace > 0
-        let est = Plan::estimate_1d(n as i32, FftType::C2C, 1).unwrap();
-        if est > 0 {
-            let err = Plan::plan_1d(&ctx, n as i32, FftType::C2C, 1, 0, &mut scratch);
-            assert!(matches!(err, Err(Error::Budget { .. })));
-        }
+        // Budget rejection: a large prime length takes cuFFT's Bluestein path, which needs a work
+        // area, so a zero budget must be refused (a power-of-two length may need none and would
+        // skip the check).
+        let prime_len = 1_000_003;
+        let est = Plan::estimate_1d(prime_len, FftType::C2C, 1).unwrap();
+        assert!(
+            est > 0,
+            "cuFFT estimates no work area for length {prime_len}; budget path not exercised"
+        );
+        let err = Plan::plan_1d(&ctx, prime_len, FftType::C2C, 1, 0, &mut scratch);
+        assert!(matches!(err, Err(Error::Budget { .. })), "{err:?}");
 
         let plan = Plan::plan_1d(
             &ctx,

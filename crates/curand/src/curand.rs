@@ -9,7 +9,7 @@
 //! **Conventions.** Uses `cuda-bindings` directly (no `curand-sys` crate). Device generators hold
 //! `Arc<Context>` and record any `Drop` teardown failure on the owning CUDA context. Enqueueing
 //! calls take `&Stream` and perform zero heap allocations, except for the completion lease that
-//! `Generator::generate_u32` takes on its output buffer.
+//! every device `Generator::generate_*` takes on its output buffer.
 //! **Used by** Monte Carlo, rendering, and simulation workloads, and the nv-rs T0/T3 test suite.
 
 pub mod error;

@@ -5,17 +5,21 @@
 //! enforcement via [`Scratch`], stream binding (`cufftSetStream`), and typed execution for
 //! `C2C`, `R2C`, `C2R`, `Z2Z`, `D2Z`, and `Z2D`.
 //! **Why.** Prevents hidden driver/cuFFT workspace allocations by enforcing two-phase sizing and
-//! explicit byte budgets, retains shared workspace ownership to prevent dangling native pointers,
-//! and validates transform types, stream compatibility, and buffer extents before launching.
+//! explicit byte budgets, retains shared workspace ownership and holds the scratch lock from
+//! work-area rebinding until the exec is queued to prevent dangling native pointers, and validates
+//! transform types, stream compatibility, buffer extents, and batch layouts before launching.
+//! `Plan` is `Send` but `!Sync` (cuFFT plans must not be used from several threads at once).
 //! **Used by** `cufft` callers and T0/T3 tests.
 
 use crate::error::{check, teardown};
-use crate::scratch::ScratchInner;
+use crate::scratch::{ScratchInner, ScratchState};
 use crate::{Error, Result, Scratch, sys};
 use cuda_core::{Context, DeviceBuffer, DeviceCopy, Stream};
+use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, MutexGuard};
 
 /// Single-precision complex number matching `cufftComplex` (`float2`, 8-byte aligned).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -117,6 +121,10 @@ pub enum Direction {
     /// Forward transform (`CUFFT_FORWARD = -1`).
     Forward,
     /// Inverse transform (`CUFFT_INVERSE = 1`).
+    ///
+    /// cuFFT does not normalize: a forward transform followed by an inverse one returns the input
+    /// multiplied by the transform size (the product of the plan's dimensions). Divide by it to
+    /// recover the input.
     Inverse,
 }
 
@@ -138,13 +146,16 @@ pub struct ManyDesc {
     pub rank: usize,
     /// Transform dimensions `[n0, n1, n2]` (only first `rank` entries are used).
     pub n: [i32; 3],
-    /// Optional input storage dimensions; `None` means contiguous `n`.
+    /// Optional input storage dimensions; `None` means contiguous `n`. Must be `Some` exactly when
+    /// `onembed` is `Some`: cuFFT documents that a NULL embed makes it ignore all other advanced
+    /// layout parameters.
     pub inembed: Option<[i32; 3]>,
     /// Stride between consecutive input elements.
     pub istride: i32,
     /// Distance between consecutive input batches.
     pub idist: i32,
-    /// Optional output storage dimensions; `None` means contiguous.
+    /// Optional output storage dimensions; `None` means contiguous. Must be `Some` exactly when
+    /// `inembed` is `Some`.
     pub onembed: Option<[i32; 3]>,
     /// Stride between consecutive output elements.
     pub ostride: i32,
@@ -174,6 +185,14 @@ impl ManyDesc {
     pub fn validate(&self) -> Result<()> {
         if !(1..=3).contains(&self.rank) {
             return Err(Error::Invalid("ManyDesc rank must be 1, 2, or 3"));
+        }
+        // `cufftMakePlanMany` docs: when `inembed` or `onembed` is NULL "all other advanced data
+        // layout parameters are ignored", so a mixed pair would make cuFFT use the dense layout on
+        // the side declared explicit; such descriptors are rejected instead of guessed.
+        if self.inembed.is_some() != self.onembed.is_some() {
+            return Err(Error::Invalid(
+                "ManyDesc inembed and onembed must both be Some or both be None",
+            ));
         }
         for i in 0..self.rank {
             if self.n[i] <= 0 {
@@ -234,10 +253,16 @@ impl ManyDesc {
     /// arithmetic.
     ///
     /// Per `cufftMakePlanMany` semantics:
-    /// - When `inembed` is `None`, cuFFT ignores `istride` and `idist` and assumes contiguous dense layout.
-    /// - When `onembed` is `None`, cuFFT ignores `ostride` and `odist` and assumes contiguous dense layout.
-    /// - When an embed array is provided (`Some`), `embed[0]` is ignored (dim 0 uses `req_dim[0]`), and
+    /// - When both embeds are `None`, cuFFT ignores strides and distances and assumes the
+    ///   contiguous dense layout on both sides (mixed `Some`/`None` is rejected by [`Self::validate`]).
+    /// - When embed arrays are provided (`Some`), `embed[0]` is ignored (dim 0 uses `req_dim[0]`), and
     ///   `embed[1..rank]` give the storage pitch of inner dimensions.
+    ///
+    /// With explicit embeds and `batch > 1`, output batches must not overlap, otherwise the
+    /// transforms of one batch write the same elements concurrently. Accepted layouts: disjoint
+    /// blocks (`odist` at least one transform's output span) or interleaved batches
+    /// (`(batch - 1) * odist < ostride`). Overlapping input batches stay allowed because cuFFT only
+    /// reads them for `C2C`/`R2C`/`Z2Z`/`D2Z`.
     pub fn min_io_elems(&self) -> Result<(usize, usize)> {
         self.validate()?;
         let (dense_in, dense_out) =
@@ -278,6 +303,26 @@ impl ManyDesc {
             None => dense_out,
             Some(embed) => span(max_idx_for(req_out, embed)?, self.ostride, self.odist)?,
         };
+        if let Some(embed) = self.onembed
+            && self.batch > 1
+        {
+            // Offsets are `b * odist + ostride * m` with distinct linear embed indices `m` (inner
+            // pitches are >= the required dims). Disjoint blocks keep batches apart; with
+            // `(batch - 1) * odist < ostride` every `b * odist` is a distinct residue mod `ostride`.
+            let out_intra = max_idx_for(req_out, embed)?
+                .checked_mul(self.ostride as usize)
+                .and_then(|s| s.checked_add(1))
+                .ok_or(Error::Invalid("ManyDesc element span overflow"))?;
+            let disjoint_blocks = self.odist as usize >= out_intra;
+            let interleaved = ((self.batch - 1) as usize)
+                .checked_mul(self.odist as usize)
+                .is_some_and(|s| s < self.ostride as usize);
+            if !disjoint_blocks && !interleaved {
+                return Err(Error::Invalid(
+                    "ManyDesc output batches overlap: odist must cover one transform's output span, or (batch - 1) * odist must be < ostride",
+                ));
+            }
+        }
         Ok((in_span, out_span))
     }
 }
@@ -369,6 +414,9 @@ pub struct Plan {
     workspace: Option<Arc<ScratchInner>>,
     last_generation: AtomicU64,
     last_ws_ptr: AtomicUsize,
+    /// Makes `Plan` `!Sync`: cuFFT allows concurrent use only of different plans, and each exec
+    /// is a non-atomic `cufftSetWorkArea` + `cufftSetStream` + `cufftExec*` sequence on `&self`.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl std::fmt::Debug for Plan {
@@ -383,7 +431,8 @@ impl std::fmt::Debug for Plan {
     }
 }
 
-// SAFETY: `cufftHandle` has no thread-local state; moving ownership is safe, concurrent use is `!Sync`.
+// SAFETY: `cufftHandle` has no thread-local state and every call rebinds `cuda` on the calling
+// thread, so moving ownership is safe; concurrent use is excluded by `_not_sync` (`!Sync`).
 unsafe impl Send for Plan {}
 
 impl Plan {
@@ -465,6 +514,7 @@ impl Plan {
             workspace,
             last_generation: AtomicU64::new(ws_gen),
             last_ws_ptr: AtomicUsize::new(ptr),
+            _not_sync: PhantomData,
         })
     }
 
@@ -660,9 +710,15 @@ impl Plan {
         })
     }
 
-    fn ensure_workspace(&self, stream: &Stream) -> Result<()> {
+    /// Rebinds the work area if the shared scratch buffer changed and returns the scratch lock.
+    ///
+    /// The caller must hold the returned guard until `cufftExec*` has been enqueued: while it is
+    /// held no clone of the [`Scratch`] can `reserve` (and so drop) the buffer bound to this plan.
+    /// Once the exec is queued on the scratch stream, a later drop frees the buffer with
+    /// `cuMemFreeAsync` on that same stream, ordered after the exec.
+    fn ensure_workspace(&self, stream: &Stream) -> Result<Option<MutexGuard<'_, ScratchState>>> {
         if self.work_size == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let ws = self.workspace.as_ref().ok_or(Error::Invalid(
             "cuFFT plan requires workspace but none is retained",
@@ -696,7 +752,7 @@ impl Plan {
             self.last_ws_ptr
                 .store(current_ptr as usize, Ordering::Release);
         }
-        Ok(())
+        Ok(Some(state))
     }
 
     fn check_exec(&self, expected: FftType, in_len: usize, out_len: usize) -> Result<()> {
@@ -714,6 +770,8 @@ impl Plan {
     }
 
     /// Executes a single-precision complex-to-complex FFT (`cufftExecC2C`).
+    ///
+    /// [`Direction::Inverse`] is unnormalized: the output is scaled by the transform size.
     pub fn exec_c2c(
         &self,
         stream: &Stream,
@@ -722,7 +780,7 @@ impl Plan {
         direction: Direction,
     ) -> Result<()> {
         self.check_exec(FftType::C2C, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: `cufftComplex` matches `Complex32` layout; cuFFT reads `input` without mutating it; stream and workspace are bound.
         check("cufftExecC2C", unsafe {
@@ -743,7 +801,7 @@ impl Plan {
         output: &mut DeviceBuffer<Complex32>,
     ) -> Result<()> {
         self.check_exec(FftType::R2C, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound.
         check("cufftExecR2C", unsafe {
@@ -757,6 +815,9 @@ impl Plan {
 
     /// Executes a single-precision complex-to-real inverse FFT (`cufftExecC2R`).
     ///
+    /// Unnormalized: the output is scaled by the transform size (the real-domain element count of
+    /// one transform).
+    ///
     /// # Note on Input Mutation
     /// Per NVIDIA cuFFT documentation, out-of-place C2R transforms overwrite the input buffer
     /// during execution. `input` is taken as `&mut DeviceBuffer<Complex32>` to enforce exclusive
@@ -768,7 +829,7 @@ impl Plan {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         self.check_exec(FftType::C2R, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound;
         // `input` is exclusively borrowed and mutated per cuFFT C2R specification.
@@ -782,6 +843,8 @@ impl Plan {
     }
 
     /// Executes a double-precision complex-to-complex FFT (`cufftExecZ2Z`).
+    ///
+    /// [`Direction::Inverse`] is unnormalized: the output is scaled by the transform size.
     pub fn exec_z2z(
         &self,
         stream: &Stream,
@@ -790,7 +853,7 @@ impl Plan {
         direction: Direction,
     ) -> Result<()> {
         self.check_exec(FftType::Z2Z, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: `cufftDoubleComplex` matches `Complex64` layout; stream and workspace are bound.
         check("cufftExecZ2Z", unsafe {
@@ -811,7 +874,7 @@ impl Plan {
         output: &mut DeviceBuffer<Complex64>,
     ) -> Result<()> {
         self.check_exec(FftType::D2Z, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound.
         check("cufftExecD2Z", unsafe {
@@ -825,6 +888,9 @@ impl Plan {
 
     /// Executes a double-precision complex-to-real inverse FFT (`cufftExecZ2D`).
     ///
+    /// Unnormalized: the output is scaled by the transform size (the real-domain element count of
+    /// one transform).
+    ///
     /// # Note on Input Mutation
     /// Per NVIDIA cuFFT documentation, out-of-place Z2D transforms overwrite the input buffer
     /// during execution. `input` is taken as `&mut DeviceBuffer<Complex64>` to enforce exclusive
@@ -836,7 +902,7 @@ impl Plan {
         output: &mut DeviceBuffer<f64>,
     ) -> Result<()> {
         self.check_exec(FftType::Z2D, input.len(), output.len())?;
-        self.ensure_workspace(stream)?;
+        let _workspace = self.ensure_workspace(stream)?;
         self.set_stream(stream)?;
         // SAFETY: buffer extents and transform type are validated above; stream and workspace are bound;
         // `input` is exclusively borrowed and mutated per cuFFT Z2D specification.
@@ -887,29 +953,254 @@ mod tests {
         };
         assert_eq!(desc_c2c.min_io_elems().unwrap(), (16, 16));
 
-        // When explicit embeds are provided, custom strides/distances are respected
+        // When explicit embeds are provided, custom strides/distances are respected; overlapping
+        // input batches (idist = 1) are allowed, output batches must be disjoint (odist = 8).
         let desc_c2c_explicit = ManyDesc {
             inembed: Some([8, 1, 1]),
             onembed: Some([8, 1, 1]),
+            odist: 8,
             ..desc_c2c
         };
-        assert_eq!(desc_c2c_explicit.min_io_elems().unwrap(), (9, 9));
+        assert_eq!(desc_c2c_explicit.min_io_elems().unwrap(), (9, 16));
+    }
 
-        // Mixed embeds: input NULL (dense 16), output explicit (9)
-        let desc_mixed_in_null = ManyDesc {
+    #[test]
+    fn many_desc_rejects_mixed_embeds() {
+        // FFT-03: cuFFT ignores every advanced layout parameter when either embed is NULL, so the
+        // explicit side would be laid out densely (16 output elements) while the wrapper sized it
+        // from the explicit embed (9 elements).
+        let desc = ManyDesc {
+            rank: 1,
+            n: [8, 1, 1],
             inembed: None,
+            istride: 1,
+            idist: 1,
             onembed: Some([8, 1, 1]),
-            ..desc_c2c
+            ostride: 1,
+            odist: 1,
+            fft_type: FftType::C2C,
+            batch: 2,
         };
-        assert_eq!(desc_mixed_in_null.min_io_elems().unwrap(), (16, 9));
+        assert!(matches!(desc.validate(), Err(Error::Invalid(_))));
+        assert!(matches!(desc.min_io_elems(), Err(Error::Invalid(_))));
 
-        // Mixed embeds: input explicit (9), output NULL (dense 16)
-        let desc_mixed_out_null = ManyDesc {
+        let desc_out_null = ManyDesc {
             inembed: Some([8, 1, 1]),
             onembed: None,
-            ..desc_c2c
+            ..desc
         };
-        assert_eq!(desc_mixed_out_null.min_io_elems().unwrap(), (9, 16));
+        assert!(matches!(desc_out_null.validate(), Err(Error::Invalid(_))));
+        assert!(matches!(
+            desc_out_null.min_io_elems(),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn many_desc_rejects_overlapping_output_batches() {
+        // FFT-04: odist = 1 with ostride = 1 makes 4 transforms of 1024 points write overlapping
+        // output ranges concurrently.
+        let overlapping = ManyDesc {
+            rank: 1,
+            n: [1024, 1, 1],
+            inembed: Some([1024, 1, 1]),
+            istride: 1,
+            idist: 1024,
+            onembed: Some([1024, 1, 1]),
+            ostride: 1,
+            odist: 1,
+            fft_type: FftType::C2C,
+            batch: 4,
+        };
+        assert!(matches!(
+            overlapping.min_io_elems(),
+            Err(Error::Invalid(_))
+        ));
+
+        // Disjoint blocks: odist equals one transform's output span.
+        let blocks = ManyDesc {
+            odist: 1024,
+            ..overlapping
+        };
+        assert_eq!(blocks.min_io_elems().unwrap(), (4096, 4096));
+
+        // Interleaved: batch b writes offsets b + 4 * k, (batch - 1) * odist = 3 < ostride = 4.
+        let interleaved = ManyDesc {
+            ostride: 4,
+            odist: 1,
+            ..overlapping
+        };
+        assert_eq!(interleaved.min_io_elems().unwrap(), (4096, 4096));
+
+        // One batch too many for the interleave: batch 4 would land on batch 0's element 1.
+        let interleaved_overflow = ManyDesc {
+            batch: 5,
+            ..interleaved
+        };
+        assert!(matches!(
+            interleaved_overflow.min_io_elems(),
+            Err(Error::Invalid(_))
+        ));
+
+        // R2C 2D: one output plane spans (16 - 1) * 17 + (17 - 1) + 1 = 272 complex elements.
+        let r2c = ManyDesc {
+            rank: 2,
+            n: [16, 32, 1],
+            inembed: Some([16, 32, 1]),
+            istride: 1,
+            idist: 512,
+            onembed: Some([16, 17, 1]),
+            ostride: 1,
+            odist: 271,
+            fft_type: FftType::R2C,
+            batch: 2,
+        };
+        assert!(matches!(r2c.min_io_elems(), Err(Error::Invalid(_))));
+        let r2c_ok = ManyDesc { odist: 272, ..r2c };
+        assert_eq!(r2c_ok.min_io_elems().unwrap(), (1024, 544));
+    }
+
+    #[test]
+    fn plan_is_send_but_not_sync() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Plan>();
+
+        // FFT-01 compile-time proof that `Plan` is `!Sync`: if `Plan: Sync`, both impls apply,
+        // the `_` below is ambiguous and this test module fails to compile.
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        <Plan as AmbiguousIfSync<_>>::check();
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cufft64_12.dll; run via xtask gpu-test"]
+    fn gpu_exec_keeps_scratch_bound_while_another_thread_grows_it() {
+        // FFT-02: another thread holding a `Scratch` clone grows it (dropping the buffer bound to
+        // `plan`) while `plan` executes. Probabilistic: run it under
+        // `compute-sanitizer --tool memcheck`, which reports the use-after-free directly.
+        let ctx = Context::new(0).expect("cuda context");
+        let stream = ctx.new_stream().expect("stream");
+        let mut scratch = Scratch::new(&stream);
+        // The smallest prime length that needs a work area: cuFFT 12 on sm_86 runs length 1009
+        // without one, so the length is probed instead of assumed.
+        let (n, plan) = [1_009, 2_003, 4_001, 8_009]
+            .into_iter()
+            .map(|n| {
+                let plan = Plan::plan_1d(&ctx, n, FftType::C2C, 1, 1 << 30, &mut scratch).unwrap();
+                (n, plan)
+            })
+            .find(|(_, plan)| plan.work_size() > 0)
+            .expect("no probed length needs a work area; test is vacuous");
+
+        let host = vec![Complex32::new(1.0, 0.0); n as usize];
+        let input = DeviceBuffer::from_host(&stream, &host).unwrap();
+        let mut output = DeviceBuffer::<Complex32>::zeroed(&stream, n as usize).unwrap();
+
+        let grower = {
+            let ctx = ctx.clone();
+            let mut scratch = scratch.clone();
+            std::thread::spawn(move || {
+                // Growing lengths with large prime factors need ever larger work areas, so each
+                // plan larger than the current reservation makes `reserve` drop and replace the
+                // shared buffer.
+                for n in [
+                    2_003, 4_001, 8_009, 16_001, 32_003, 64_007, 128_021, 256_019, 524_287,
+                    1_048_573,
+                ] {
+                    drop(Plan::plan_1d(&ctx, n, FftType::C2C, 1, 1 << 30, &mut scratch).unwrap());
+                }
+            })
+        };
+        for _ in 0..500 {
+            plan.exec_c2c(&stream, &input, &mut output, Direction::Forward)
+                .unwrap();
+        }
+        grower.join().expect("grower thread");
+
+        // Forward transform of a constant 1: bin 0 = n, every other bin = 0 (f32 rounding of an
+        // n-point Bluestein transform stays far below 1e-3 * n).
+        let tol = 1e-3 * n as f32;
+        let out = output.to_host_vec(&stream).unwrap();
+        assert!((out[0].re() - n as f32).abs() < tol, "bin 0 = {:?}", out[0]);
+        for (k, c) in out.iter().enumerate().skip(1) {
+            assert!(c.re().abs() < tol && c.im().abs() < tol, "bin {k} = {c:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cufft64_12.dll; run via xtask gpu-test"]
+    fn gpu_mixed_null_embed_layout_semantics() {
+        // FFT-03 decision: plan rank 1, n = 8, batch 2 with inembed = NULL and an explicit
+        // interleaved output (onembed = [8], ostride = 2, odist = 1) through the raw API, which
+        // `ManyDesc` now rejects. Batch 0 is all 1 (bin 0 = 8), batch 1 all 2 (bin 0 = 16).
+        // Dense output puts batch 1's bin 0 at index 8; the interleaved layout puts it at index 1.
+        let ctx = Context::new(0).expect("cuda context");
+        let stream = ctx.new_stream().expect("stream");
+        let guard = RawHandle::create(&ctx).unwrap();
+        let mut n = [8i32, 1, 1];
+        let mut onembed = [8i32, 1, 1];
+        let mut work_size = 0usize;
+        // SAFETY: `guard.handle` is live; `n` and `onembed` are stack arrays valid for rank 1 and
+        // `cufftMakePlanMany` accepts a NULL `inembed`.
+        check("cufftMakePlanMany", unsafe {
+            sys::cufftMakePlanMany(
+                guard.handle,
+                1,
+                n.as_mut_ptr(),
+                std::ptr::null_mut(),
+                1,
+                8,
+                onembed.as_mut_ptr(),
+                2,
+                1,
+                FftType::C2C.raw(),
+                2,
+                &mut work_size,
+            )
+        })
+        .unwrap();
+        let work = DeviceBuffer::<u8>::zeroed(&stream, work_size.max(1)).unwrap();
+        if work_size > 0 {
+            // SAFETY: auto-allocation is disabled and `work` holds at least `work_size` bytes.
+            check("cufftSetWorkArea", unsafe {
+                sys::cufftSetWorkArea(guard.handle, work.cu_deviceptr() as usize as *mut c_void)
+            })
+            .unwrap();
+        }
+        // SAFETY: `guard.handle` and `stream` belong to `ctx`, bound by `RawHandle::create`.
+        check("cufftSetStream", unsafe {
+            sys::cufftSetStream(guard.handle, stream.cu_stream())
+        })
+        .unwrap();
+        let host_in: Vec<Complex32> = (0..16)
+            .map(|i| Complex32::new(if i < 8 { 1.0 } else { 2.0 }, 0.0))
+            .collect();
+        let input = DeviceBuffer::from_host(&stream, &host_in).unwrap();
+        let output = DeviceBuffer::<Complex32>::zeroed(&stream, 32).unwrap();
+        // SAFETY: `input` holds the 16 dense input elements; `output` holds 32 elements, more than
+        // either candidate layout writes (16 each); stream and work area are bound.
+        check("cufftExecC2C", unsafe {
+            sys::cufftExecC2C(
+                guard.handle,
+                input.cu_deviceptr() as usize as *mut sys::cufftComplex,
+                output.cu_deviceptr() as usize as *mut sys::cufftComplex,
+                Direction::Forward.raw(),
+            )
+        })
+        .unwrap();
+        let out = output.to_host_vec(&stream).unwrap();
+        drop(guard);
+        let dense = (out[8].re() - 16.0).abs() < 1e-3;
+        let interleaved = (out[1].re() - 16.0).abs() < 1e-3;
+        eprintln!("mixed NULL inembed: dense output = {dense}, interleaved output = {interleaved}");
+        assert!(
+            dense != interleaved,
+            "output matches neither candidate layout: {out:?}"
+        );
     }
 
     #[test]

@@ -1176,6 +1176,177 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    /// Deterministic DCC-style OS cursor grab & hide state machine (`Click -> Drag -> Locked -> Restore`).
+    ///
+    /// - Single clicks and double-clicks (`drag_dist < DRAG_THRESHOLD_PX`) never engage OS
+    ///   `CursorGrabMode::Locked`, preventing Win32 `ClipCursor` center-warping on click.
+    /// - Once a real drag exceeds `DRAG_THRESHOLD_PX`, the exact pre-grab OS cursor position is
+    ///   saved, the cursor is hidden and locked (`Locked` with `Confined` fallback) for infinite
+    ///   unbounded orbit/pan/fly, and synthetic center-warp `CursorMoved` events are ignored.
+    /// - On release (or focus loss), the grab is cleared, the OS cursor is restored to the exact
+    ///   saved pre-grab position, and visibility is restored.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct CursorGrabController {
+        last_cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+        pre_grab_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+        press_origin: Option<winit::dpi::PhysicalPosition<f64>>,
+        drag_accum_px: f64,
+        buttons_held: u8,
+        grab_active: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(crate) struct CursorOsAction {
+        pub grab: Option<winit::window::CursorGrabMode>,
+        pub visible: Option<bool>,
+        pub restore_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+    }
+
+    impl CursorGrabController {
+        const DRAG_THRESHOLD_PX: f64 = 4.0;
+
+        pub(crate) fn on_cursor_moved(&mut self, pos: winit::dpi::PhysicalPosition<f64>) {
+            if self.grab_active {
+                // Ignore synthetic center-warp events while OS grab is active.
+                return;
+            }
+            if let Some(origin) = self.press_origin {
+                let dx = pos.x - origin.x;
+                let dy = pos.y - origin.y;
+                self.drag_accum_px = self.drag_accum_px.max((dx * dx + dy * dy).sqrt());
+            }
+            self.last_cursor_pos = Some(pos);
+        }
+
+        pub(crate) fn on_mouse_motion(&mut self, delta: (f64, f64)) {
+            if !self.grab_active && self.buttons_held > 0 {
+                self.drag_accum_px += (delta.0 * delta.0 + delta.1 * delta.1).sqrt();
+            }
+        }
+
+        pub(crate) fn on_mouse_button(&mut self, pressed: bool) -> CursorOsAction {
+            if pressed {
+                self.buttons_held = self.buttons_held.saturating_add(1);
+                if self.buttons_held == 1 {
+                    self.press_origin = self.last_cursor_pos;
+                    self.drag_accum_px = 0.0;
+                }
+                CursorOsAction {
+                    grab: None,
+                    visible: None,
+                    restore_pos: None,
+                }
+            } else {
+                self.buttons_held = self.buttons_held.saturating_sub(1);
+                if self.buttons_held == 0 {
+                    self.press_origin = None;
+                    self.drag_accum_px = 0.0;
+                    if self.grab_active {
+                        return self.release_grab();
+                    }
+                }
+                CursorOsAction {
+                    grab: None,
+                    visible: None,
+                    restore_pos: None,
+                }
+            }
+        }
+
+        pub(crate) fn on_focus_lost(&mut self) -> CursorOsAction {
+            self.buttons_held = 0;
+            self.press_origin = None;
+            self.drag_accum_px = 0.0;
+            if self.grab_active {
+                self.release_grab()
+            } else {
+                CursorOsAction {
+                    grab: None,
+                    visible: None,
+                    restore_pos: None,
+                }
+            }
+        }
+
+        pub(crate) fn apply_egui_request(
+            &mut self,
+            want_grab: Option<egui::CursorGrab>,
+            want_visible: Option<bool>,
+        ) -> CursorOsAction {
+            let requesting_lock = matches!(
+                want_grab,
+                Some(egui::CursorGrab::Locked | egui::CursorGrab::Confined)
+            );
+            let requesting_release = matches!(want_grab, Some(egui::CursorGrab::None));
+
+            if requesting_release {
+                if self.grab_active {
+                    return self.release_grab();
+                }
+                return CursorOsAction {
+                    grab: None,
+                    visible: want_visible.filter(|&v| v),
+                    restore_pos: None,
+                };
+            }
+
+            if requesting_lock {
+                if self.grab_active {
+                    return CursorOsAction {
+                        grab: None,
+                        visible: None,
+                        restore_pos: None,
+                    };
+                }
+                if self.drag_accum_px >= Self::DRAG_THRESHOLD_PX {
+                    self.pre_grab_pos = self.press_origin.or(self.last_cursor_pos);
+                    self.grab_active = true;
+                    let mode = match want_grab {
+                        Some(egui::CursorGrab::Confined) => {
+                            winit::window::CursorGrabMode::Confined
+                        }
+                        _ => winit::window::CursorGrabMode::Locked,
+                    };
+                    return CursorOsAction {
+                        grab: Some(mode),
+                        visible: Some(false),
+                        restore_pos: None,
+                    };
+                }
+                // Still within click/double-click deadzone: keep cursor free and visible.
+                return CursorOsAction {
+                    grab: None,
+                    visible: None,
+                    restore_pos: None,
+                };
+            }
+
+            // No grab change requested; honor explicit show (never hide while ungrabbed).
+            CursorOsAction {
+                grab: None,
+                visible: if self.grab_active {
+                    want_visible
+                } else {
+                    want_visible.filter(|&v| v)
+                },
+                restore_pos: None,
+            }
+        }
+
+        fn release_grab(&mut self) -> CursorOsAction {
+            self.grab_active = false;
+            let restore_pos = self.pre_grab_pos.take();
+            if let Some(pos) = restore_pos {
+                self.last_cursor_pos = Some(pos);
+            }
+            CursorOsAction {
+                grab: Some(winit::window::CursorGrabMode::None),
+                visible: Some(true),
+                restore_pos,
+            }
+        }
+    }
+
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
@@ -1270,6 +1441,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         possess_saved_projection: Option<crate::renderer::CameraProjection>,
         viewport_toolbar: crate::viewport_toolbar::ToolbarState,
         tod_transition: Option<TodTransition>,
+        cursor_grab: CursorGrabController,
         last_sent_possess_look: (u32, u32, u32, bool),
         last_possess_camera: Option<CameraFrame>,
         pick_possess_mode: bool,
@@ -1671,6 +1843,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_saved_projection: None,
                 viewport_toolbar: crate::viewport_toolbar::ToolbarState::default(),
                 tod_transition: None,
+                cursor_grab: CursorGrabController::default(),
                 last_sent_possess_look: (
                     0.0f32.to_bits(),
                     0.0f32.to_bits(),
@@ -1778,12 +1951,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
+        fn apply_cursor_os_action(&self, action: CursorOsAction) {
+            if let Some(mode) = action.grab
+                && self.window.set_cursor_grab(mode).is_err()
+                && matches!(mode, winit::window::CursorGrabMode::Locked)
+            {
+                let _ = self
+                    .window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Confined);
+            }
+            if let Some(pos) = action.restore_pos {
+                let _ = self.window.set_cursor_position(pos);
+            }
+            if let Some(vis) = action.visible {
+                self.window.set_cursor_visible(vis);
+            }
+        }
+
         pub fn handle_window_event(&mut self, event: &WindowEvent) -> bool {
+            match event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_grab.on_cursor_moved(*position);
+                }
+                WindowEvent::MouseInput { state, .. } => {
+                    let act = self
+                        .cursor_grab
+                        .on_mouse_button(*state == winit::event::ElementState::Pressed);
+                    self.apply_cursor_os_action(act);
+                }
+                WindowEvent::Focused(false) => {
+                    let act = self.cursor_grab.on_focus_lost();
+                    self.apply_cursor_os_action(act);
+                }
+                _ => {}
+            }
             let resp = self.egui_winit.on_window_event(&self.window, event);
             resp.repaint
         }
 
         pub fn handle_mouse_motion(&mut self, delta: (f64, f64)) {
+            self.cursor_grab.on_mouse_motion(delta);
             self.egui_winit.on_mouse_motion(delta);
         }
 
@@ -3090,32 +3297,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.egui_winit
                 .handle_platform_output(&self.window, full_output.platform_output);
             if let Some(vo) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
-                let rmb_held = self.egui_ctx.input(|i| i.pointer.secondary_down());
+                let mut want_grab: Option<egui::CursorGrab> = None;
+                let mut want_visible: Option<bool> = None;
                 for cmd in &vo.commands {
                     match cmd {
                         egui::ViewportCommand::CursorGrab(grab) => {
-                            // Never call Win32 `CursorGrabMode::Locked` on LMB click/drag: on
-                            // Windows 11 `Locked` warps the system cursor to the window center on
-                            // every single click, breaking double-click Pick-to-Possess. Only
-                            // confine the cursor while RMB-flying, and keep it free otherwise.
-                            let mode = match grab {
-                                egui::CursorGrab::None => winit::window::CursorGrabMode::None,
-                                egui::CursorGrab::Confined | egui::CursorGrab::Locked => {
-                                    if rmb_held {
-                                        winit::window::CursorGrabMode::Confined
-                                    } else {
-                                        winit::window::CursorGrabMode::None
-                                    }
-                                }
-                            };
-                            let _ = self.window.set_cursor_grab(mode);
+                            want_grab = Some(*grab);
                         }
                         egui::ViewportCommand::CursorVisible(visible) => {
-                            // Keep cursor visible during LMB clicks/orbit; only hide during RMB fly.
-                            self.window.set_cursor_visible(*visible || !rmb_held);
+                            want_visible = Some(*visible);
                         }
                         _ => {}
                     }
+                }
+                if want_grab.is_some() || want_visible.is_some() {
+                    let act = self.cursor_grab.apply_egui_request(want_grab, want_visible);
+                    self.apply_cursor_os_action(act);
                 }
             }
             let tris = self
@@ -4272,5 +4469,37 @@ mod ui_pacing_tests {
         assert!((s.sun_elevation - 24.0).abs() < 1e-5);
         assert!((s.sun_intensity - 0.16).abs() < 1e-5);
         assert_eq!(s.sky_mode, 8);
+    }
+
+    #[test]
+    fn cursor_grab_controller_preserves_clicks_and_restores_pre_grab_pos_on_drag_end() {
+        let mut ctl = demo_app::CursorGrabController::default();
+        let start = winit::dpi::PhysicalPosition::new(320.0, 210.0);
+        ctl.on_cursor_moved(start);
+
+        // 1. Single click (no drag >= 4 px) must NOT lock or hide the cursor.
+        ctl.on_mouse_button(true);
+        let a_click = ctl.apply_egui_request(Some(egui::CursorGrab::Locked), Some(false));
+        assert_eq!(a_click.grab, None);
+        assert_eq!(a_click.visible, None);
+        let a_up = ctl.on_mouse_button(false);
+        assert_eq!(a_up.grab, None);
+        assert_eq!(a_up.restore_pos, None);
+
+        // 2. Real drag (>= 4 px) hides & locks cursor, ignores center-warp CursorMoved, and
+        //    restores the exact pre-grab position when released.
+        ctl.on_mouse_button(true);
+        ctl.on_mouse_motion((6.0, 0.0));
+        let a_lock = ctl.apply_egui_request(Some(egui::CursorGrab::Locked), Some(false));
+        assert_eq!(a_lock.grab, Some(winit::window::CursorGrabMode::Locked));
+        assert_eq!(a_lock.visible, Some(false));
+
+        // Synthetic center-warp during lock must NOT overwrite pre_grab_pos.
+        ctl.on_cursor_moved(winit::dpi::PhysicalPosition::new(960.0, 540.0));
+
+        let a_rel = ctl.on_mouse_button(false);
+        assert_eq!(a_rel.grab, Some(winit::window::CursorGrabMode::None));
+        assert_eq!(a_rel.visible, Some(true));
+        assert_eq!(a_rel.restore_pos, Some(start));
     }
 }

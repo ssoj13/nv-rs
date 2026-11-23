@@ -21,7 +21,7 @@ Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before c
 - [~] `ngx` + `nvapi` + `nvml`: NGX-1..14, NVAPI-1..3, NVML-1..2
 - [~] `cupti` + `nccl` + `nvrtc`: CUPTI-1..4, 6, 7, NVRTC-1..2, NCCL-1..4, 6..8, null `CStr` checks
 - [ ] Gate W1: one serial pass - `cargo clippy` + tests for every touched crate, then `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` once
-- [ ] Lead review W1: read the diffs of every P0 fix; seeded-mutant check on the new tests (a reverted fix must turn its test red)
+- [ ] Lead review W1: read the diffs of every P0 fix and check each new test analytically (does its assertion depend on the fixed line?); no revert-and-rerun mutation runs (operator decision 2026-11-23)
 - [ ] Callers outside the wrapper crates reported by workers (`nv-demo`, `python/nv-py`): apply in one follow-up pass
 
 ## Wave 2 - OptiX and graphics interop (repair workers launched with Wave 1)

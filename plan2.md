@@ -195,6 +195,59 @@ Every fix starts with a test that reproduces the defect. Items rated PLAUSIBLE a
 ### Wave 7 - Documentation
 - [ ] **W7.1** Correct `crates/nv-demo/AGENTS.md`, root `AGENTS.md`, `plan1.md:33`, `optix` module docs as listed under Documentation drift; add the systemic defects to `## Traps` | verify: every cited constant re-read in source
 
+## Execution record - Waves 1 and 2 (2026-11-23)
+
+Eleven edit-only workers re-verified every finding in their crates before changing code. Status of the code: edits committed as pre-gate work in progress; the single gate (workspace check, clippy, tests, then ignored GPU tests per crate) decides what is verified. Until the gate result is recorded here, nothing in this section is "verified".
+
+### Findings refuted on re-verification (no code change)
+- `BLA:LT-10` `HeuristicResult::from_algo`: `cublasLtMatmul` itself rejects an undersized workspace (`cublasLt.h:1017-1019`).
+- `SOL:S2` Mg `lwork`: `unsafe fn` with an explicit contract. `SOL:S4` `csreigvsi` allocation: the module makes no zero-allocation promise.
+- cuDNN workspace ownership (asked by the cuBLAS audit): cuDNN takes the workspace per call; `Handle` holds none.
+- `SYS:NGX-5` (`DlssOptimalSettings` fallbacks mirror the SDK helper `NGX_DLSS_GET_OPTIMAL_SETTINGS`), `SYS:NVAPI-1`, `SYS:NVML-2` (no init requirement on the error-string calls), `SYS:NVML-1` (literal is correct and intentional).
+- `SYS:NVRTC-1` (the log-fetch error is typed and names the call), null `CStr` checks in `cupti`/`nccl`/`nvrtc` (all seven sites already check).
+- `MED:DEC-5` mechanism (`vidLock` is unrelated to the decoder, `cuviddec.h:306`); `MED:ENC-8` for CUDA arrays (pitch is defined differently there).
+- `MED:CMP-9` compression-level part (levels above the maximum are accepted by design, `cascaded.h:157-165`); nvCOMP internal scratch never crosses streams.
+- `OPX:PF1` (SBTs are built only at pipeline creation; making them stream-ordered would create the measured cross-stream hazard).
+- `IOP:NW-13` (unreachable once the dedicated barrier queue is removed).
+- Systemic 1 inside the wrappers: scratch buffers in `cublas`, `cudnn`, `cusolver`, `nvcomp`, `optix` are allocated and used on one checked stream. The only real cross-stream cases were `cusparse` SpSV/SpSM/SpGEMM (fixed by ownership, no lease) and caller-supplied buffers (`curand`, leased).
+- Narrower than reported: `SYS:CUPTI-3` (field offsets are identical across record versions, so values were read correctly; the reference to a larger struct was formal UB and is fixed).
+
+### Decisions taken by the lead (operator delegated design decisions on 2026-11-23)
+| Topic | Decision | Rejected alternative and why |
+| --- | --- | --- |
+| Buffer leases | Targeted: `curand` (caller buffers) is leased; everything else is fixed by ownership or same-stream checks | Lease every entry point: about +2 us per call and new `NOT_READY` errors for a hazard that only exists for stream-ordered buffers crossing streams |
+| `nv-wgpu` raw Vulkan work | Record into a `wgpu` command encoder and submit through `wgpu::Queue::submit`; own command runner, global submit mutex and dedicated barrier queue removed | Keep raw `vkQueueSubmit` with a private lock: it cannot be synchronised with wgpu's own submissions, which is undefined behaviour under the Vulkan spec |
+| `optix` IAS children built on another stream | Require and check one stream; document it | Lease every child in `instances_into`: per-child cost on the per-frame path, new dependency, and `nv-demo` uses one stream |
+| `ngx` thread safety | One process-wide mutex around every NGX call, `Send`/`Sync` kept | Make `NgxVulkan` `!Sync`: does not cover the static `required_extensions` path that Python calls from several threads |
+| `cublas` workspace | The handle owns the workspace buffer while set and refuses to switch streams; `clear_workspace` restores the default pool | Two separate patches for the dangling pointer and the silent reset by `cublasSetStream` |
+| cuBLASLt / descriptor raw attribute setters | `unsafe fn` | Re-validating every raw attribute against the typed cache: the attribute set is open-ended |
+| `nvenc` B-frames | `encode_picture` returns `EncodeOutcome { Ready, NeedMoreInput }` | Keep status 17 as `Err`: the header calls it non-fatal and forbids locking the bitstream after it |
+| `cusparse` SpSV/SpSM/SpGEMM `scratch` parameter | Now only a stream check; remove it in Wave 1b | Keep a parameter that no longer supplies memory |
+| Dead error variants (`Budget`, `Unsupported`) in media crates | Remove together with the `python/nv-py` matches in Wave 6 | Remove now: breaks `python/nv-py/src/video.rs` |
+
+### Behaviour changes callers will notice
+- `cublas`: `set_stream` to another stream fails while a workspace is set; overlapping output batches, undersized `ld`, pointer-array layouts in `min_elems` and non-F32 grouped GEMM are rejected.
+- `cufft`: `Plan` is no longer `Sync`; mixed `inembed`/`onembed` and overlapping output batches are rejected.
+- `cudnn`, `nvcomp`: scratch budgets bound the whole allocation, not the growth; `cudnn::HeurMode` is no longer public.
+- `cusparse`: `set_pointer_mode(Device)` fails; SpSV/SpSM/SpGEMM phases must run in order on one stream; `set_csr_pointers` requires the native `nnz` and matching index/value types.
+- `nvjpeg`: decode validates against the bitstream geometry; `JpegStream::parse(.., false)` and `encode_yuv` with `Yuv410v` fail; a scratch buffer attaches to one state.
+- `npp`: "no operation" warnings are errors; row step must be a multiple of the element size.
+- `nvofa`: `set_io_streams` takes `&Arc<Stream>`; readback waits for the I/O streams.
+- `nvenc` / `nvdec`: `set_io_streams(&Arc<Stream>, ..)`; `DecoderConfig::display_area`; `map_frame` ties the frame to its stream.
+- `cufile`: `FileHandle::read` takes `&mut D`; reusing a slot without harvesting and `try_complete` on an idle slot fail.
+- `ngx`: success follows `NVSDK_NGX_SUCCEED`; a second `init` on a live `VkDevice` fails; outputs without `read_write` are rejected.
+- `cupti`: activity kinds are reference-counted per process; dropping a `Subscriber` waits for running callbacks (dropping it inside its own callback deadlocks).
+- `nccl`: `GroupGuard` is `!Send`; no `Abort` after a failed `Destroy`.
+- `optix`: in-place tiled denoise, streams/SBTs of another CUDA context are rejected; compacting builds need about twice the output size in budget.
+- `nv-wgpu` / `cuda-core-ext`: `with_vulkan_barrier_queue` removed; drops of semaphores and shared resources wait for pending work; 2D textures import as 2D CUDA arrays; mip counts and timeline values are validated.
+
+### Open after Waves 1-2
+- Needs a run of `nv-demo` on hardware: DLSS SR/RR after NGX commands moved into the wgpu encoder; camera feel after the `camera-rs` switch.
+- Needs Linux / multi-GPU: `nccl` drop behaviour, `cufile` GDS session lifetime, every Linux cfg branch touched.
+- Needs a Vulkan test harness for `ngx` (`ash` as a dev-dependency): `SYS:NGX-2`, `SYS:NGX-7`, `SYS:NGX-11` have documentation only.
+- Callers to adapt in Wave 6 (`python/nv-py`): `video.rs:551-552` unmaps before `lock` (violates `nvEncodeAPI.h:4180`), `NeedMoreInput` handling and `flush`, `platform_ext.rs:1234` passes a shared buffer to `FileHandle::read`, `compute.rs:415-456` calls `cufftExec*` directly.
+- Reported outside their manifests, not fixed yet: `cublas` `MatmulDesc::set_emulation_desc` does not retain the `EmulationDesc`, `gemm_*_on_bound_stream` do not bind the context, `set_epilogue` / `set_bias_batch_stride` remain safe; `cudnn` `GraphConvPlan::build*` does not bind; `nv-demo` empty CUPTI `Subscriber` occupies the single process-wide subscriber slot (blocks Nsight).
+
 ## Out of scope
 - External dependencies: `cuda-core` / `cuda-bindings` (NVIDIA), `csg-rs`, `camera-rs`, `appbus-rs`. Two `csg-rs` notes are recorded in `10_demo_gpu.md` (`E01`, `E02`) for that repository.
 - Generated `prebuilt/` bindings, the Astro site under `docs/`, untracked `0/`.

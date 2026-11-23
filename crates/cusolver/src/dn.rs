@@ -784,14 +784,16 @@ impl DnHandle {
         &self.cuda
     }
 
-    /// Binds `stream` to this handle.
+    /// Binds `stream` to this handle and makes the handle's context current on the calling
+    /// thread (the handle is `Send`; every operation calls this before reaching the library).
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(&self.cuda, stream.context()) {
             return Err(Error::InvalidInput(
                 "stream belongs to a different CUDA context than DnHandle",
             ));
         }
-        // SAFETY: `self.raw` and `stream.cu_stream()` are valid on `self.cuda`.
+        self.cuda.bind_to_thread()?;
+        // SAFETY: `self.raw` and `stream.cu_stream()` are valid on `self.cuda`, which is current.
         check("cusolverDnSetStream", unsafe {
             sys::cusolverDnSetStream(self.raw, stream.cu_stream())
         })

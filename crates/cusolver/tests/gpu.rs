@@ -32,6 +32,8 @@ fn dn_lu_getrf_getrs_solves_and_checks_residual() {
     let mut a = DeviceBuffer::from_host(&stream, &a_host).expect("a");
     let mut b = DeviceBuffer::from_host(&stream, &b_host).expect("b");
     let mut ipiv = DeviceBuffer::<i32>::zeroed(&stream, 3).expect("ipiv");
+    // Separate info buffers so the solve cannot overwrite the factorization status unread.
+    let mut info_f = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info_f");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
     dn.getrf(
@@ -41,7 +43,7 @@ fn dn_lu_getrf_getrs_solves_and_checks_residual() {
         &mut a,
         3,
         &mut ipiv,
-        &mut info,
+        &mut info_f,
         &mut scratch,
         64 * 1024 * 1024,
     )
@@ -61,7 +63,8 @@ fn dn_lu_getrf_getrs_solves_and_checks_residual() {
     .expect("getrs");
     stream.synchronize().expect("sync");
 
-    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
+    assert_eq!(info_f.to_host_vec(&stream).expect("info_f")[0], 0, "getrf info");
+    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0, "getrs info");
     let x = b.to_host_vec(&stream).expect("x");
     let ax = matvec_col_major(&a_host, 3, 3, &x);
     let res = ax
@@ -86,6 +89,7 @@ fn dn_cholesky_potrf_potrs_solves_spd_system() {
 
     let mut a = DeviceBuffer::from_host(&stream, &a_host).expect("a");
     let mut b = DeviceBuffer::from_host(&stream, &b_host).expect("b");
+    let mut info_f = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info_f");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
     dn.potrf(
@@ -94,7 +98,7 @@ fn dn_cholesky_potrf_potrs_solves_spd_system() {
         3,
         &mut a,
         3,
-        &mut info,
+        &mut info_f,
         &mut scratch,
         64 * 1024 * 1024,
     )
@@ -103,7 +107,8 @@ fn dn_cholesky_potrf_potrs_solves_spd_system() {
         .expect("potrs");
     stream.synchronize().expect("sync");
 
-    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
+    assert_eq!(info_f.to_host_vec(&stream).expect("info_f")[0], 0, "potrf info");
+    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0, "potrs info");
     let x = b.to_host_vec(&stream).expect("x");
     let ax = matvec_col_major(&a_host, 3, 3, &x);
     let res = ax
@@ -125,6 +130,7 @@ fn dn_qr_geqrf_orgqr_checks_orthogonality() {
     let a_host = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3x2 col-major
     let mut a = DeviceBuffer::from_host(&stream, &a_host).expect("a");
     let mut tau = DeviceBuffer::<f32>::zeroed(&stream, 2).expect("tau");
+    let mut info_f = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info_f");
     let mut info = DeviceBuffer::<i32>::zeroed(&stream, 1).expect("info");
 
     dn.geqrf(
@@ -134,7 +140,7 @@ fn dn_qr_geqrf_orgqr_checks_orthogonality() {
         &mut a,
         3,
         &mut tau,
-        &mut info,
+        &mut info_f,
         &mut scratch,
         64 * 1024 * 1024,
     )
@@ -154,7 +160,8 @@ fn dn_qr_geqrf_orgqr_checks_orthogonality() {
     .expect("orgqr");
     stream.synchronize().expect("sync");
 
-    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0);
+    assert_eq!(info_f.to_host_vec(&stream).expect("info_f")[0], 0, "geqrf info");
+    assert_eq!(info.to_host_vec(&stream).expect("info")[0], 0, "orgqr info");
     let q = a.to_host_vec(&stream).expect("q");
     // Check Q^T * Q == I_2
     let mut max_err = 0.0f32;
@@ -322,4 +329,43 @@ fn sp_csrlsvqr_and_csreigvsi_numerical_checks() {
         (mu - 4.0).abs() < 1e-3,
         "expected eigenvalue near 4.0, got {mu}"
     );
+}
+
+/// Returns the context current on the calling thread (null if none).
+fn current_ctx() -> cuda_core::sys::CUcontext {
+    let mut cur: cuda_core::sys::CUcontext = std::ptr::null_mut();
+    // SAFETY: `cur` is a valid out-pointer for `cuCtxGetCurrent`.
+    let rc = unsafe { cuda_core::sys::cuCtxGetCurrent(&mut cur) };
+    assert_eq!(rc, 0, "cuCtxGetCurrent failed: {rc}");
+    cur
+}
+
+/// Detaches any context from the calling thread.
+fn detach_ctx() {
+    // SAFETY: detaching the current context of this thread is always valid.
+    let rc = unsafe { cuda_core::sys::cuCtxSetCurrent(std::ptr::null_mut()) };
+    assert_eq!(rc, 0, "cuCtxSetCurrent(null) failed: {rc}");
+}
+
+/// X2: `DnHandle` / `SpHandle` are `Send`; using them from a thread without a current context
+/// must bind the handle's context. (With a single primary context the runtime may bind it
+/// implicitly, so this fails before the fix only when `*SetStream` does not touch the runtime.)
+#[test]
+#[ignore = "GPU: requires CUDA toolkit cusolver DLL and an NVIDIA GPU"]
+fn dn_and_sp_set_stream_bind_context_on_another_thread() {
+    let cuda = Context::new(0).expect("CUDA device 0");
+    let stream = cuda.default_stream();
+    let dn = DnHandle::new(&cuda).expect("DnHandle");
+    let sp = SpHandle::new(&cuda).expect("SpHandle");
+    let want = cuda.cu_ctx() as usize;
+    std::thread::spawn(move || {
+        detach_ctx();
+        dn.set_stream(&stream).expect("DnHandle::set_stream");
+        assert_eq!(current_ctx() as usize, want, "DnHandle::set_stream must bind");
+        detach_ctx();
+        sp.set_stream(&stream).expect("SpHandle::set_stream");
+        assert_eq!(current_ctx() as usize, want, "SpHandle::set_stream must bind");
+    })
+    .join()
+    .expect("worker thread");
 }

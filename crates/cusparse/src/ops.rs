@@ -8,11 +8,21 @@
 //! - [`SpSv`] / [`SpSm`] — sparse triangular vector/matrix solve with analysis + solve phases.
 //!
 //! **Workspace discipline.** Every operation queries required workspace bytes first, checks the
-//! caller's byte budget, and reuses a caller-owned [`Scratch`] buffer on the target [`Stream`].
-//! No steady-state allocations occur once `Scratch` reaches the high-water mark.
+//! caller's byte budget, and allocates on the target [`Stream`]. `spmv` / `spmm` reuse the
+//! caller-owned [`Scratch`] (no steady-state allocations once it reaches the high-water mark).
+//! `cusparseSpSV_solve`, `cusparseSpSM_solve`, and `cusparseSpGEMM_copy` take no buffer argument
+//! and keep reading the buffers passed to the earlier phases, so [`SpSv`], [`SpSm`], and
+//! [`SpGemm`] own those buffers (the caller's `Scratch` only names the stream) and require every
+//! later phase to run on that same stream, which also orders the stream-ordered free on drop.
+//!
+//! **Validation.** Host scalars `alpha`/`beta` must have `S::DATA_TYPE == compute_type`
+//! (cuSPARSE reads them as `compute_type`), every descriptor must belong to the handle's
+//! `Context`, and input sparse descriptors must have bound buffers.
 
 use crate::descr::{DnMatDescr, DnVecDescr, SpMatDescr, SparseScalar};
-use crate::{DataType, Error, Handle, Op, Result, Scratch, check, ensure_loaded, sys, teardown};
+use crate::{
+    DataType, Error, Handle, Op, Result, Scratch, check, ensure_loaded, same_stream, sys, teardown,
+};
 use cuda_core::{Context, Stream};
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -209,6 +219,60 @@ pub fn validate_spmm_dims(
     Ok(())
 }
 
+/// Validates that the host scalar type `S` of `alpha`/`beta` equals `compute_type`.
+///
+/// cuSPARSE reads `alpha` and `beta` as `compute_type` values; a narrower `S` would be read past
+/// its end on the host.
+pub fn validate_scalar_type<S: SparseScalar>(compute_type: DataType) -> Result<()> {
+    if S::DATA_TYPE != compute_type {
+        return Err(Error::InvalidInput(
+            "host scalar type of alpha/beta must equal compute_type",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects any descriptor `Context` that is not the handle's `Context`.
+fn ensure_handle_context(handle: &Handle, contexts: &[&Arc<Context>]) -> Result<()> {
+    if contexts.iter().all(|c| Arc::ptr_eq(handle.cuda(), *c)) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(
+            "descriptor belongs to a different CUDA context than the cuSPARSE handle",
+        ))
+    }
+}
+
+/// Returns the workspace owned by `slot` for `stream`, replacing it with an empty one bound to
+/// `scratch`'s stream when it is missing or bound to another stream.
+fn owned_workspace<'a>(
+    slot: &'a mut Option<Scratch>,
+    scratch: &Scratch,
+    stream: &Stream,
+) -> Result<&'a mut Scratch> {
+    if !same_stream(scratch.stream(), stream) {
+        return Err(Error::InvalidInput(
+            "scratch used on a different stream than it was created for",
+        ));
+    }
+    if !slot
+        .as_ref()
+        .is_some_and(|ws| same_stream(ws.stream(), stream))
+    {
+        *slot = Some(Scratch::new(scratch.stream()));
+    }
+    slot.as_mut()
+        .ok_or(Error::InvalidInput("owned workspace missing after creation"))
+}
+
+/// Requires that an earlier phase left its workspace in `ws` on `stream`.
+fn ensure_phase_on(ws: Option<&Scratch>, stream: &Stream, msg: &'static str) -> Result<()> {
+    match ws {
+        Some(ws) if same_stream(ws.stream(), stream) => Ok(()),
+        _ => Err(Error::InvalidInput(msg)),
+    }
+}
+
 /// Queries the workspace byte size required for `spmv`.
 #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
 pub fn spmv_buffer_size<S: SparseScalar>(
@@ -222,6 +286,9 @@ pub fn spmv_buffer_size<S: SparseScalar>(
     compute_type: DataType,
     alg: SpMvAlg,
 ) -> Result<usize> {
+    validate_scalar_type::<S>(compute_type)?;
+    ensure_handle_context(handle, &[mat_a.cuda(), vec_x.cuda(), vec_y.cuda()])?;
+    mat_a.ensure_bound()?;
     handle.ensure_host_pointer_mode()?;
     validate_spmv_dims(op_a, mat_a.rows(), mat_a.cols(), vec_x.len(), vec_y.len())?;
     let mut size = 0usize;
@@ -319,6 +386,9 @@ pub fn spmm_buffer_size<S: SparseScalar>(
     compute_type: DataType,
     alg: SpMmAlg,
 ) -> Result<usize> {
+    validate_scalar_type::<S>(compute_type)?;
+    ensure_handle_context(handle, &[mat_a.cuda(), mat_b.cuda(), mat_c.cuda()])?;
+    mat_a.ensure_bound()?;
     handle.ensure_host_pointer_mode()?;
     validate_spmm_dims(
         op_a,
@@ -417,9 +487,16 @@ pub fn spmm<S: SparseScalar>(
 }
 
 /// Owning `cusparseSpGEMMDescr_t` for two-phase sparse-sparse matrix multiplication.
+///
+/// Owns `externalBuffer1` (from [`SpGemm::work_estimation`]) and `externalBuffer2` (from
+/// [`SpGemm::compute`]): the native descriptor keeps referencing them until
+/// `cusparseSpGEMM_copy`, which takes no buffer argument. All three phases must run on the
+/// same stream.
 pub struct SpGemm {
     raw: sys::cusparseSpGEMMDescr_t,
     cuda: Arc<Context>,
+    ws1: Option<Scratch>,
+    ws2: Option<Scratch>,
 }
 
 // SAFETY: `cusparseSpGEMMDescr_t` is externally synchronized by callers.
@@ -438,11 +515,16 @@ impl SpGemm {
         Ok(Self {
             raw,
             cuda: cuda.clone(),
+            ws1: None,
+            ws2: None,
         })
     }
 
-    /// Phase 1: two-phase `cusparseSpGEMM_workEstimation` (queries `bufferSize1`, reserves
-    /// `scratch` within `budget`, then runs work estimation).
+    /// Phase 1: two-phase `cusparseSpGEMM_workEstimation` (queries `bufferSize1`, allocates it
+    /// within `budget` into a buffer owned by `self`, then runs work estimation).
+    ///
+    /// `scratch` must be bound to `stream`; only its stream is used. Starting phase 1 on another
+    /// stream than a previous run drops the previous buffers.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn work_estimation<S: SparseScalar>(
         &mut self,
@@ -460,8 +542,23 @@ impl SpGemm {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<usize> {
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), mat_b.cuda(), mat_c.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
+        mat_b.ensure_bound()?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
+        if !self
+            .ws1
+            .as_ref()
+            .is_some_and(|ws| same_stream(ws.stream(), stream))
+        {
+            // Buffer2 of a run on another stream belongs to that stream; start this run clean.
+            self.ws2 = None;
+        }
         let mut size1 = 0usize;
         // SAFETY: size query with null externalBuffer1.
         check("cusparseSpGEMM_workEstimation", unsafe {
@@ -481,8 +578,10 @@ impl SpGemm {
                 std::ptr::null_mut(),
             )
         })?;
-        let (ws1, _) = scratch.reserve_with_budget(stream, size1, budget)?;
-        // SAFETY: `ws1` has at least `size1` bytes on `stream`.
+        let (ws1, _) = owned_workspace(&mut self.ws1, scratch, stream)?
+            .reserve_with_budget(stream, size1, budget)?;
+        // SAFETY: `ws1` has at least `size1` bytes on `stream` and is owned by `self` until the
+        // descriptor is destroyed or phase 1 is rerun.
         check("cusparseSpGEMM_workEstimation", unsafe {
             sys::cusparseSpGEMM_workEstimation(
                 handle.raw(),
@@ -503,8 +602,11 @@ impl SpGemm {
         Ok(size1)
     }
 
-    /// Phase 2: two-phase `cusparseSpGEMM_compute` (queries `bufferSize2`, reserves `scratch`
-    /// within `budget`, then computes the product structure and values).
+    /// Phase 2: two-phase `cusparseSpGEMM_compute` (queries `bufferSize2`, allocates it within
+    /// `budget` into a buffer owned by `self`, then computes the product structure and values).
+    ///
+    /// Requires [`SpGemm::work_estimation`] on the same `stream`; `scratch` must be bound to
+    /// `stream` and only its stream is used.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn compute<S: SparseScalar>(
         &mut self,
@@ -522,6 +624,18 @@ impl SpGemm {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<usize> {
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), mat_b.cuda(), mat_c.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
+        mat_b.ensure_bound()?;
+        ensure_phase_on(
+            self.ws1.as_ref(),
+            stream,
+            "SpGEMM compute requires work_estimation on the same stream",
+        )?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
         let mut size2 = 0usize;
@@ -543,8 +657,10 @@ impl SpGemm {
                 std::ptr::null_mut(),
             )
         })?;
-        let (ws2, _) = scratch.reserve_with_budget(stream, size2, budget)?;
-        // SAFETY: `ws2` has at least `size2` bytes on `stream`.
+        let (ws2, _) = owned_workspace(&mut self.ws2, scratch, stream)?
+            .reserve_with_budget(stream, size2, budget)?;
+        // SAFETY: `ws2` has at least `size2` bytes on `stream`; it and buffer1 are owned by
+        // `self` until the descriptor is destroyed or phase 1 is rerun.
         check("cusparseSpGEMM_compute", unsafe {
             sys::cusparseSpGEMM_compute(
                 handle.raw(),
@@ -567,6 +683,9 @@ impl SpGemm {
 
     /// Phase 3: `cusparseSpGEMM_copy`, writing the computed `C` into `mat_c`'s buffers after
     /// `mat_c.set_csr_pointers(...)`.
+    ///
+    /// Requires [`SpGemm::compute`] on the same `stream`, and `mat_c` bound to buffers validated
+    /// for its current native nnz.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn copy<S: SparseScalar>(
         &mut self,
@@ -582,9 +701,29 @@ impl SpGemm {
         compute_type: DataType,
         alg: SpGemmAlg,
     ) -> Result<()> {
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), mat_b.cuda(), mat_c.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
+        mat_b.ensure_bound()?;
+        mat_c.ensure_bound()?;
+        let (_, _, native_nnz) = mat_c.query_size()?;
+        if native_nnz != mat_c.nnz() {
+            return Err(Error::InvalidInput(
+                "SpGEMM copy: mat_c buffers were bound for a different nnz than compute produced",
+            ));
+        }
+        ensure_phase_on(
+            self.ws2.as_ref(),
+            stream,
+            "SpGEMM copy requires compute on the same stream",
+        )?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
-        // SAFETY: `mat_c` buffers were allocated and bound via `set_csr_pointers`.
+        // SAFETY: `mat_c` is bound to buffers validated for its native nnz; buffer1/buffer2
+        // referenced by `self.raw` are owned by `self` and were used on `stream`.
         check("cusparseSpGEMM_copy", unsafe {
             sys::cusparseSpGEMM_copy(
                 handle.raw(),
@@ -617,9 +756,13 @@ impl Drop for SpGemm {
 }
 
 /// Owning `cusparseSpSVDescr_t` for sparse triangular vector solve (`op(A) * y = alpha * x`).
+///
+/// Owns the analysis buffer: `cusparseSpSV_solve` takes no buffer argument and reads the one
+/// passed to `cusparseSpSV_analysis`, so `solve` must run on the stream used by `prepare`.
 pub struct SpSv {
     raw: sys::cusparseSpSVDescr_t,
     cuda: Arc<Context>,
+    ws: Option<Scratch>,
 }
 
 // SAFETY: `cusparseSpSVDescr_t` is externally synchronized by callers.
@@ -638,10 +781,14 @@ impl SpSv {
         Ok(Self {
             raw,
             cuda: cuda.clone(),
+            ws: None,
         })
     }
 
-    /// Queries workspace bytes, reserves `scratch` within `budget`, and runs `cusparseSpSV_analysis`.
+    /// Queries workspace bytes, allocates them within `budget` into an analysis buffer owned by
+    /// `self`, and runs `cusparseSpSV_analysis`.
+    ///
+    /// `scratch` must be bound to `stream`; only its stream is used.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn prepare<S: SparseScalar>(
         &mut self,
@@ -665,6 +812,12 @@ impl SpSv {
                 "SpSV requires square A matching x and y lengths",
             ));
         }
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), vec_x.cuda(), vec_y.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
         let mut size = 0usize;
@@ -683,8 +836,10 @@ impl SpSv {
                 &mut size,
             )
         })?;
-        let (ws, _) = scratch.reserve_with_budget(stream, size, budget)?;
-        // SAFETY: `ws` holds at least `size` bytes on `stream`; descriptors are valid.
+        let (ws, _) = owned_workspace(&mut self.ws, scratch, stream)?
+            .reserve_with_budget(stream, size, budget)?;
+        // SAFETY: `ws` holds at least `size` bytes on `stream` and is owned by `self` for as long
+        // as `self.raw` can read it; descriptors are valid.
         check("cusparseSpSV_analysis", unsafe {
             sys::cusparseSpSV_analysis(
                 handle.raw(),
@@ -703,6 +858,8 @@ impl SpSv {
     }
 
     /// Executes `cusparseSpSV_solve` using the analysis stored in `self`.
+    ///
+    /// Requires [`SpSv::prepare`] on the same `stream`.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn solve<S: SparseScalar>(
         &self,
@@ -716,9 +873,20 @@ impl SpSv {
         compute_type: DataType,
         alg: SpSvAlg,
     ) -> Result<()> {
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), vec_x.cuda(), vec_y.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
+        ensure_phase_on(
+            self.ws.as_ref(),
+            stream,
+            "SpSV solve requires prepare on the same stream",
+        )?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
-        // SAFETY: `prepare` has analyzed this descriptor for compatible shapes/types.
+        // SAFETY: `prepare` has analyzed this descriptor on `stream` into a buffer owned by `self`.
         check("cusparseSpSV_solve", unsafe {
             sys::cusparseSpSV_solve(
                 handle.raw(),
@@ -749,9 +917,13 @@ impl Drop for SpSv {
 }
 
 /// Owning `cusparseSpSMDescr_t` for sparse triangular matrix solve (`op(A) * C = alpha * op(B)`).
+///
+/// Owns the analysis buffer: `cusparseSpSM_solve` takes no buffer argument and reads the one
+/// passed to `cusparseSpSM_analysis`, so `solve` must run on the stream used by `prepare`.
 pub struct SpSm {
     raw: sys::cusparseSpSMDescr_t,
     cuda: Arc<Context>,
+    ws: Option<Scratch>,
 }
 
 // SAFETY: `cusparseSpSMDescr_t` is externally synchronized by callers.
@@ -770,10 +942,14 @@ impl SpSm {
         Ok(Self {
             raw,
             cuda: cuda.clone(),
+            ws: None,
         })
     }
 
-    /// Queries workspace bytes, reserves `scratch` within `budget`, and runs `cusparseSpSM_analysis`.
+    /// Queries workspace bytes, allocates them within `budget` into an analysis buffer owned by
+    /// `self`, and runs `cusparseSpSM_analysis`.
+    ///
+    /// `scratch` must be bound to `stream`; only its stream is used.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn prepare<S: SparseScalar>(
         &mut self,
@@ -793,7 +969,12 @@ impl SpSm {
         if mat_a.rows() != mat_a.cols() {
             return Err(Error::InvalidInput("SpSM requires square sparse matrix A"));
         }
-        handle.ensure_host_pointer_mode()?;
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), mat_b.cuda(), mat_c.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
         validate_spmm_dims(
             op_a,
             op_b,
@@ -823,8 +1004,10 @@ impl SpSm {
                 &mut size,
             )
         })?;
-        let (ws, _) = scratch.reserve_with_budget(stream, size, budget)?;
-        // SAFETY: `ws` holds at least `size` bytes on `stream`; descriptors are valid.
+        let (ws, _) = owned_workspace(&mut self.ws, scratch, stream)?
+            .reserve_with_budget(stream, size, budget)?;
+        // SAFETY: `ws` holds at least `size` bytes on `stream` and is owned by `self` for as long
+        // as `self.raw` can read it; descriptors are valid.
         check("cusparseSpSM_analysis", unsafe {
             sys::cusparseSpSM_analysis(
                 handle.raw(),
@@ -844,6 +1027,8 @@ impl SpSm {
     }
 
     /// Executes `cusparseSpSM_solve` using the analysis stored in `self`.
+    ///
+    /// Requires [`SpSm::prepare`] on the same `stream`.
     #[expect(clippy::too_many_arguments, reason = "matches NVIDIA C API signature")]
     pub fn solve<S: SparseScalar>(
         &self,
@@ -858,9 +1043,20 @@ impl SpSm {
         compute_type: DataType,
         alg: SpSmAlg,
     ) -> Result<()> {
+        validate_scalar_type::<S>(compute_type)?;
+        ensure_handle_context(
+            handle,
+            &[&self.cuda, mat_a.cuda(), mat_b.cuda(), mat_c.cuda()],
+        )?;
+        mat_a.ensure_bound()?;
+        ensure_phase_on(
+            self.ws.as_ref(),
+            stream,
+            "SpSM solve requires prepare on the same stream",
+        )?;
         handle.ensure_host_pointer_mode()?;
         handle.set_stream(stream)?;
-        // SAFETY: `prepare` has analyzed this descriptor for compatible shapes/types.
+        // SAFETY: `prepare` has analyzed this descriptor on `stream` into a buffer owned by `self`.
         check("cusparseSpSM_solve", unsafe {
             sys::cusparseSpSM_solve(
                 handle.raw(),
@@ -910,5 +1106,22 @@ mod tests {
         assert!(validate_spmm_dims(Op::NonTranspose, Op::Transpose, 3, 4, 2, 4, 3, 2).is_ok());
         assert!(validate_spmm_dims(Op::NonTranspose, Op::NonTranspose, 3, 4, 5, 2, 3, 2).is_err());
         assert!(validate_spmm_dims(Op::NonTranspose, Op::NonTranspose, 3, 4, 4, 2, 4, 2).is_err());
+    }
+
+    #[test]
+    fn scalar_type_must_equal_compute_type() {
+        // F64 descriptors with F64 compute are valid in cuSPARSE, so an `&f32` alpha would be
+        // read as 8 bytes from a 4-byte host value.
+        assert!(matches!(
+            validate_scalar_type::<f32>(DataType::F64),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_scalar_type::<f64>(DataType::C64),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(validate_scalar_type::<f32>(DataType::F32).is_ok());
+        assert!(validate_scalar_type::<[f64; 2]>(DataType::C64).is_ok());
+        assert!(validate_scalar_type::<i32>(DataType::I32).is_ok());
     }
 }

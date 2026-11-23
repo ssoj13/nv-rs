@@ -1,7 +1,10 @@
 //! cuSPARSE library [`Handle`] bound to a `cuda_core::Context`.
 //!
 //! **What.** Owns a `cusparseHandle_t`, binds it to the current `cuda_core::Stream` before
-//! launching work, configures host/device scalar pointer mode, and queries the toolkit version.
+//! launching work, queries the scalar pointer mode, and queries the toolkit version.
+//! **Context.** The handle is `Send`, so every method that reaches the library first makes the
+//! handle's `Context` current on the calling thread (`Context::bind_to_thread`); operations reach
+//! the library through [`Handle::set_stream`] or [`Handle::pointer_mode`], which both bind.
 //! **Teardown.** `Drop` calls `cusparseDestroy` and records any error on the owning
 //! `cuda_core::Context` rather than panicking.
 //! **Used by** [`crate::ops`] and external sparse linear algebra callers.
@@ -44,14 +47,17 @@ impl Handle {
         &self.cuda
     }
 
-    /// Binds `stream` to this handle so subsequent cuSPARSE calls execute on `stream`.
+    /// Binds `stream` to this handle so subsequent cuSPARSE calls execute on `stream`, and makes
+    /// the handle's context current on the calling thread.
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(&self.cuda, stream.context()) {
             return Err(Error::InvalidInput(
                 "stream belongs to a different CUDA context than the cuSPARSE handle",
             ));
         }
-        // SAFETY: `self.raw` and `stream.cu_stream()` are valid handles on the same context.
+        self.cuda.bind_to_thread()?;
+        // SAFETY: `self.raw` and `stream.cu_stream()` are valid handles on the same context,
+        // which is current on this thread.
         check("cusparseSetStream", unsafe {
             sys::cusparseSetStream(self.raw, stream.cu_stream())
         })
@@ -59,6 +65,7 @@ impl Handle {
 
     /// Returns the raw `CUstream` currently bound to this handle.
     pub fn raw_stream(&self) -> Result<sys::cudaStream_t> {
+        self.cuda.bind_to_thread()?;
         let mut stream: sys::cudaStream_t = std::ptr::null_mut();
         // SAFETY: `self.raw` is valid and `stream` is a valid out-pointer.
         check("cusparseGetStream", unsafe {
@@ -68,8 +75,17 @@ impl Handle {
     }
 
     /// Sets whether scalar arguments (`alpha`, `beta`) live in host or device memory.
+    ///
+    /// Only [`PointerMode::Host`] is accepted: every operation in this crate passes `alpha` and
+    /// `beta` as host references, so a handle in device mode could not run any of them.
     pub fn set_pointer_mode(&self, mode: PointerMode) -> Result<()> {
-        // SAFETY: `self.raw` is valid.
+        if mode != PointerMode::Host {
+            return Err(Error::InvalidInput(
+                "cuSPARSE operations in this crate take host scalars; only PointerMode::Host is supported",
+            ));
+        }
+        self.cuda.bind_to_thread()?;
+        // SAFETY: `self.raw` is valid and its context is current.
         check("cusparseSetPointerMode", unsafe {
             sys::cusparseSetPointerMode(self.raw, mode.to_sys())
         })
@@ -77,6 +93,7 @@ impl Handle {
 
     /// Returns the current scalar pointer mode.
     pub fn pointer_mode(&self) -> Result<PointerMode> {
+        self.cuda.bind_to_thread()?;
         let mut raw = 0;
         // SAFETY: `self.raw` is valid and `raw` is a valid out-pointer.
         check("cusparseGetPointerMode", unsafe {
@@ -107,6 +124,7 @@ impl Handle {
 
     /// Queries the cuSPARSE library version (`major * 1000 + minor * 100 + patch`).
     pub fn version(&self) -> Result<i32> {
+        self.cuda.bind_to_thread()?;
         let mut ver = 0i32;
         // SAFETY: `self.raw` is valid and `ver` is a valid out-pointer.
         check("cusparseGetVersion", unsafe {

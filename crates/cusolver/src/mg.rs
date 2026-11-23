@@ -10,6 +10,9 @@
 //!   matrix over an [`MgGrid`].
 //! - Two-phase workspace sizing (`*_bufferSize` -> byte budget check -> caller-owned per-GPU
 //!   work pointers) for `potrf`, `potrs`, `potri`, `getrf`, `getrs`, and `syevd`.
+//! - Every per-GPU pointer slice is checked to hold an entry for each device cusolverMg indexes
+//!   (the larger of the `device_select` count and the descriptor's grid size) before the call;
+//!   pointer validity and `lwork` sizing remain the caller's `unsafe` contract.
 
 use crate::{EigMode, Error, FillMode, Op, Result, check_mg, ensure_mg_loaded, mg_sys};
 use cuda_core::{Context, DriverError};
@@ -115,6 +118,18 @@ pub fn validate_mg_syevd_w_type(data_type_w: MgDataType) -> Result<()> {
     Ok(())
 }
 
+/// Validates that every per-GPU pointer array (`array_d_*`) has an entry for each device that
+/// cusolverMg indexes: the devices selected on the handle and the devices of the matrix grid.
+pub fn validate_mg_ptr_arrays(selected: usize, grid: usize, lens: &[usize]) -> Result<()> {
+    let need = selected.max(grid);
+    if lens.iter().any(|&len| len < need) {
+        return Err(Error::InvalidInput(
+            "cusolverMg per-GPU pointer array has fewer entries than participating devices",
+        ));
+    }
+    Ok(())
+}
+
 /// Checks `lwork` elements of `compute_type` against `budget_bytes` per GPU.
 pub fn check_mg_work_budget(
     lwork: i64,
@@ -144,6 +159,8 @@ pub fn check_mg_work_budget(
 pub struct MgHandle {
     raw: mg_sys::cusolverMgHandle_t,
     cuda: Arc<Context>,
+    /// Device count passed to the last successful `device_select` (0 before it).
+    devices: usize,
 }
 
 // SAFETY: `cusolverMgHandle_t` is externally synchronized; `!Sync` prevents concurrent calls.
@@ -162,7 +179,13 @@ impl MgHandle {
         Ok(Self {
             raw,
             cuda: cuda.clone(),
+            devices: 0,
         })
+    }
+
+    /// Rejects per-GPU pointer arrays shorter than the devices cusolverMg indexes for `descr`.
+    fn check_ptr_arrays(&self, descr: &MgMatrixDesc, lens: &[usize]) -> Result<()> {
+        validate_mg_ptr_arrays(self.devices, descr.grid.devices, lens)
     }
 
     /// Selects the CUDA device ordinals participating in multi-GPU operations.
@@ -178,7 +201,9 @@ impl MgHandle {
         // SAFETY: `self.raw` is valid and `devices` has `nb` elements.
         check_mg("cusolverMgDeviceSelect", unsafe {
             mg_sys::cusolverMgDeviceSelect(self.raw, nb, devices.as_ptr().cast_mut())
-        })
+        })?;
+        self.devices = devices.len();
+        Ok(())
     }
 
     /// Queries workspace element count for `cusolverMgPotrf` and checks it against `budget_bytes`.
@@ -198,6 +223,7 @@ impl MgHandle {
         compute_type: MgDataType,
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees `array_d_a` holds valid per-device pointers for `descr_a`.
@@ -237,6 +263,7 @@ impl MgHandle {
         array_d_work: &mut [*mut c_void],
         lwork: i64,
     ) -> Result<i32> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_work.len()])?;
         self.cuda.bind_to_thread()?;
         let mut h_info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix and workspace pointers.
@@ -280,6 +307,8 @@ impl MgHandle {
         compute_type: MgDataType,
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len()])?;
+        self.check_ptr_arrays(descr_b, &[array_d_b.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees per-GPU matrix pointers.
@@ -328,6 +357,8 @@ impl MgHandle {
         array_d_work: &mut [*mut c_void],
         lwork: i64,
     ) -> Result<i32> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_work.len()])?;
+        self.check_ptr_arrays(descr_b, &[array_d_b.len()])?;
         self.cuda.bind_to_thread()?;
         let mut h_info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix and workspace pointers.
@@ -372,6 +403,7 @@ impl MgHandle {
         compute_type: MgDataType,
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_ipiv.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees per-GPU matrix and pivot pointers.
@@ -412,6 +444,10 @@ impl MgHandle {
         array_d_work: &mut [*mut c_void],
         lwork: i64,
     ) -> Result<i32> {
+        self.check_ptr_arrays(
+            descr_a,
+            &[array_d_a.len(), array_d_ipiv.len(), array_d_work.len()],
+        )?;
         self.cuda.bind_to_thread()?;
         let mut info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix, pivot, and workspace pointers.
@@ -457,6 +493,8 @@ impl MgHandle {
         compute_type: MgDataType,
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_ipiv.len()])?;
+        self.check_ptr_arrays(descr_b, &[array_d_b.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees per-GPU matrix and pivot pointers.
@@ -507,6 +545,11 @@ impl MgHandle {
         array_d_work: &mut [*mut c_void],
         lwork: i64,
     ) -> Result<i32> {
+        self.check_ptr_arrays(
+            descr_a,
+            &[array_d_a.len(), array_d_ipiv.len(), array_d_work.len()],
+        )?;
+        self.check_ptr_arrays(descr_b, &[array_d_b.len()])?;
         self.cuda.bind_to_thread()?;
         let mut info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix, pivot, and workspace pointers.
@@ -551,6 +594,7 @@ impl MgHandle {
         compute_type: MgDataType,
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees `array_d_a` holds valid per-device pointers for `descr_a`.
@@ -590,6 +634,7 @@ impl MgHandle {
         array_d_work: &mut [*mut c_void],
         lwork: i64,
     ) -> Result<i32> {
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_work.len()])?;
         self.cuda.bind_to_thread()?;
         let mut h_info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix and workspace pointers.
@@ -633,6 +678,7 @@ impl MgHandle {
         budget_bytes: usize,
     ) -> Result<(i64, usize)> {
         validate_mg_syevd_w_type(data_type_w)?;
+        self.check_ptr_arrays(descr_a, &[array_d_a.len()])?;
         self.cuda.bind_to_thread()?;
         let mut lwork = 0i64;
         // SAFETY: caller guarantees `array_d_a` and `w` are valid pointers for `descr_a` and `n`.
@@ -679,6 +725,7 @@ impl MgHandle {
         lwork: i64,
     ) -> Result<i32> {
         validate_mg_syevd_w_type(data_type_w)?;
+        self.check_ptr_arrays(descr_a, &[array_d_a.len(), array_d_work.len()])?;
         self.cuda.bind_to_thread()?;
         let mut info = 0i32;
         // SAFETY: caller guarantees per-GPU matrix, eigenvalue, and workspace pointers.
@@ -731,6 +778,8 @@ impl Drop for MgHandle {
 pub struct MgGrid {
     raw: mg_sys::cudaLibMgGrid_t,
     cuda: Arc<Context>,
+    /// `num_row_devices * num_col_devices` (validated against the device list at creation).
+    devices: usize,
 }
 
 // SAFETY: `cudaLibMgGrid_t` is metadata; thread safety is governed by caller sync.
@@ -764,6 +813,7 @@ impl MgGrid {
         Ok(Arc::new(Self {
             raw,
             cuda: cuda.clone(),
+            devices: devices.len(),
         }))
     }
 
@@ -954,6 +1004,60 @@ mod tests {
     }
 
     #[test]
+    fn mg_ptr_arrays_must_cover_participating_devices() {
+        // Two selected devices: a one-entry slice would be read past its end by cusolverMg.
+        assert!(matches!(
+            validate_mg_ptr_arrays(2, 2, &[1]),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_mg_ptr_arrays(2, 1, &[2, 1]),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_mg_ptr_arrays(0, 2, &[1]),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(validate_mg_ptr_arrays(2, 2, &[2, 2, 3]).is_ok());
+        assert!(validate_mg_ptr_arrays(0, 1, &[1]).is_ok());
+    }
+
+    /// S3 (decides it): whether cusolverMg itself rejects a descriptor data type that differs from
+    /// `compute_type`. If this fails, mixed types reach the native routine unchecked and the
+    /// wrapper must validate them.
+    #[test]
+    #[ignore = "GPU: requires CUDA device and cusolverMg library; run with --ignored"]
+    fn mg_potrf_rejects_desc_compute_type_mismatch() {
+        let cuda = Context::new(0).expect("CUDA context on device 0");
+        let stream = cuda.default_stream();
+        let mut handle = MgHandle::new(&cuda).expect("cusolverMgCreate");
+        handle.device_select(&[0]).expect("cusolverMgDeviceSelect");
+        let grid = MgGrid::new(&cuda, 1, 1, &[0], MgGridMapping::ColMajor)
+            .expect("cusolverMgCreateDeviceGrid");
+        let desc = MgMatrixDesc::new(&grid, 4, 4, 4, 4, MgDataType::F32)
+            .expect("cusolverMgCreateMatrixDesc");
+        let a = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 16).expect("a");
+        let mut array_d_a = [a.cu_deviceptr() as *mut c_void];
+        // SAFETY: `array_d_a` holds one live device pointer of 16 f32 matching the 4x4 descriptor.
+        let res = unsafe {
+            handle.potrf_buffer_size(
+                FillMode::Lower,
+                4,
+                &mut array_d_a,
+                1,
+                1,
+                &desc,
+                MgDataType::F64,
+                usize::MAX,
+            )
+        };
+        assert!(
+            res.is_err(),
+            "cusolverMg accepted an F32 descriptor with F64 compute: {res:?}"
+        );
+    }
+
+    #[test]
     #[ignore = "GPU: requires CUDA device and cusolverMg library; run with --ignored"]
     fn mg_handle_grid_and_desc_lifecycle() {
         let cuda = Context::new(0).expect("CUDA context on device 0");
@@ -961,7 +1065,9 @@ mod tests {
         handle.device_select(&[0]).expect("cusolverMgDeviceSelect");
         let grid = MgGrid::new(&cuda, 1, 1, &[0], MgGridMapping::ColMajor)
             .expect("cusolverMgCreateDeviceGrid");
-        let _desc = MgMatrixDesc::new(&grid, 4, 4, 2, 2, MgDataType::F32)
+        // cusolverMg supports only 1D column block-cyclic layouts: the row block must span all
+        // rows (`mb == m`); `mb = 2` is rejected with CUSOLVER_STATUS_INVALID_VALUE.
+        let _desc = MgMatrixDesc::new(&grid, 4, 4, 4, 2, MgDataType::F32)
             .expect("cusolverMgCreateMatrixDesc");
     }
 }

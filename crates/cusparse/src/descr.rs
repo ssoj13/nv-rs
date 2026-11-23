@@ -21,8 +21,33 @@ use cuda_core::{Context, DeviceBuffer};
 use std::ffi::c_void;
 use std::sync::Arc;
 
+mod sealed {
+    /// Private supertrait: only this module's impls exist, so `size_of::<T>()` always equals the
+    /// byte size of the declared native type (host scalars are read by cuSPARSE at that size).
+    pub trait Sealed {}
+
+    impl Sealed for u16 {}
+    impl Sealed for i32 {}
+    impl Sealed for i64 {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+    impl Sealed for [f32; 2] {}
+    impl Sealed for [f64; 2] {}
+    impl Sealed for i8 {}
+    impl Sealed for u8 {}
+    impl Sealed for u32 {}
+}
+
 /// Sealed trait for Rust integer types usable as cuSPARSE sparse indices.
-pub trait SparseIndex: Copy + 'static {
+///
+/// ```compile_fail
+/// #[derive(Clone, Copy)]
+/// struct Foreign;
+/// impl cusparse::descr::SparseIndex for Foreign {
+///     const INDEX_TYPE: cusparse::IndexType = cusparse::IndexType::I64;
+/// }
+/// ```
+pub trait SparseIndex: sealed::Sealed + Copy + 'static {
     /// Corresponding [`IndexType`].
     const INDEX_TYPE: IndexType;
 }
@@ -40,7 +65,18 @@ impl SparseIndex for i64 {
 }
 
 /// Sealed trait for Rust scalar types usable as cuSPARSE matrix/vector values.
-pub trait SparseScalar: Copy + 'static {
+///
+/// Sealing is load-bearing: `ops` passes `&S` host scalars that cuSPARSE reads as
+/// `compute_type` values, and only rejects `S::DATA_TYPE != compute_type`.
+///
+/// ```compile_fail
+/// #[derive(Clone, Copy)]
+/// struct Foreign(u8);
+/// impl cusparse::descr::SparseScalar for Foreign {
+///     const DATA_TYPE: cusparse::DataType = cusparse::DataType::F64;
+/// }
+/// ```
+pub trait SparseScalar: sealed::Sealed + Copy + 'static {
     /// Corresponding [`DataType`].
     const DATA_TYPE: DataType;
 }
@@ -316,9 +352,15 @@ pub struct SpMatDescr {
     cuda: Arc<Context>,
     rows: i64,
     cols: i64,
+    /// Elements validated in the bound buffers (the native nnz when they were bound; a later
+    /// `SpGemm::compute` into this descriptor can change the native nnz, which `copy` checks).
     nnz: i64,
     format: SparseFormat,
     value_type: DataType,
+    /// `(row offsets, column indices)` index types for CSR descriptors, `None` otherwise.
+    csr_index_types: Option<(IndexType, IndexType)>,
+    /// `false` while the native descriptor holds null data pointers (`csr_empty`).
+    bound: bool,
 }
 
 // SAFETY: cuSPARSE descriptors are metadata handles; thread safety is governed by caller sync.
@@ -392,10 +434,16 @@ impl SpMatDescr {
             nnz,
             format: SparseFormat::Csr,
             value_type: V::DATA_TYPE,
+            csr_index_types: Some((R::INDEX_TYPE, C::INDEX_TYPE)),
+            bound: true,
         })
     }
 
     /// Creates an empty CSR descriptor (null pointers, `nnz = 0`) to be populated by `SpGemm` copy.
+    ///
+    /// The descriptor is unbound: operations reject it as an input, and [`crate::SpGemm::copy`]
+    /// rejects it as an output, until [`SpMatDescr::set_csr_pointers`] binds buffers sized for the
+    /// native nnz computed by [`crate::SpGemm::compute`].
     pub fn csr_empty(
         cuda: &Arc<Context>,
         rows: i64,
@@ -437,6 +485,8 @@ impl SpMatDescr {
             nnz: 0,
             format: SparseFormat::Csr,
             value_type,
+            csr_index_types: Some((row_off_type, col_ind_type)),
+            bound: false,
         })
     }
 
@@ -506,6 +556,8 @@ impl SpMatDescr {
             nnz,
             format: SparseFormat::Csc,
             value_type: V::DATA_TYPE,
+            csr_index_types: None,
+            bound: true,
         })
     }
 
@@ -573,6 +625,8 @@ impl SpMatDescr {
             nnz,
             format: SparseFormat::Coo,
             value_type: V::DATA_TYPE,
+            csr_index_types: None,
+            bound: true,
         })
     }
 
@@ -645,14 +699,20 @@ impl SpMatDescr {
                 ell_cols,
             },
             value_type: V::DATA_TYPE,
+            csr_index_types: None,
+            bound: true,
         })
     }
 
     /// Updates CSR device pointers (e.g. after `SpGemm::compute` determines `nnz` and allocates `col_ind`/`values`).
     ///
+    /// `cusparseCsrSetPointers` cannot change the native nnz, so `nnz` must equal the descriptor's
+    /// current native nnz ([`SpMatDescr::query_size`]); `R`, `C`, and `V` must equal the index and
+    /// value types the descriptor was created with. On success the descriptor is bound.
+    ///
     /// # Safety
     ///
-    /// The buffers must match the index/value types of this CSR descriptor and outlive its use.
+    /// The buffers must outlive every use of this descriptor.
     pub unsafe fn set_csr_pointers<R: SparseIndex, C: SparseIndex, V: SparseScalar>(
         &mut self,
         nnz: i64,
@@ -663,6 +723,19 @@ impl SpMatDescr {
         if self.format != SparseFormat::Csr {
             return Err(Error::InvalidInput(
                 "set_csr_pointers requires a CSR descriptor",
+            ));
+        }
+        if self.csr_index_types != Some((R::INDEX_TYPE, C::INDEX_TYPE))
+            || self.value_type != V::DATA_TYPE
+        {
+            return Err(Error::InvalidInput(
+                "set_csr_pointers buffer element types differ from the descriptor's index/value types",
+            ));
+        }
+        let (_, _, native_nnz) = self.query_size()?;
+        if nnz != native_nnz {
+            return Err(Error::InvalidInput(
+                "set_csr_pointers nnz must equal the descriptor's native nnz",
             ));
         }
         let row_bytes = row_offsets
@@ -698,6 +771,17 @@ impl SpMatDescr {
             )
         })?;
         self.nnz = nnz;
+        self.bound = true;
+        Ok(())
+    }
+
+    /// Rejects a descriptor whose native data pointers are still null (see [`Self::csr_empty`]).
+    pub(crate) fn ensure_bound(&self) -> Result<()> {
+        if !self.bound {
+            return Err(Error::InvalidInput(
+                "sparse matrix descriptor has no bound buffers; call set_csr_pointers first",
+            ));
+        }
         Ok(())
     }
 
@@ -860,6 +944,11 @@ impl DnVecDescr {
     pub fn value_type(&self) -> DataType {
         self.value_type
     }
+
+    /// Owning CUDA context.
+    pub fn cuda(&self) -> &Arc<Context> {
+        &self.cuda
+    }
 }
 
 impl Drop for DnVecDescr {
@@ -968,6 +1057,11 @@ impl DnMatDescr {
     /// Element scalar type.
     pub fn value_type(&self) -> DataType {
         self.value_type
+    }
+
+    /// Owning CUDA context.
+    pub fn cuda(&self) -> &Arc<Context> {
+        &self.cuda
     }
 }
 
@@ -1116,5 +1210,29 @@ mod tests {
         assert!(validate_dn_mat(4, 3, 4, Order::Col, 48, DataType::F32).is_ok());
         assert!(validate_dn_mat(4, 3, 2, Order::Row, 48, DataType::F32).is_err());
         assert!(validate_dn_mat(4, 3, 3, Order::Row, 48, DataType::F32).is_ok());
+    }
+
+    fn scalar_size_matches<S: SparseScalar>() -> bool {
+        std::mem::size_of::<S>() == S::DATA_TYPE.byte_size()
+    }
+
+    fn index_size_matches<I: SparseIndex>() -> bool {
+        std::mem::size_of::<I>() == I::INDEX_TYPE.byte_size()
+    }
+
+    #[test]
+    fn sealed_impls_match_native_element_sizes() {
+        // `ops::validate_scalar_type` relies on this: cuSPARSE reads `&S` at the declared size.
+        assert!(scalar_size_matches::<f32>());
+        assert!(scalar_size_matches::<f64>());
+        assert!(scalar_size_matches::<[f32; 2]>());
+        assert!(scalar_size_matches::<[f64; 2]>());
+        assert!(scalar_size_matches::<i8>());
+        assert!(scalar_size_matches::<u8>());
+        assert!(scalar_size_matches::<i32>());
+        assert!(scalar_size_matches::<u32>());
+        assert!(index_size_matches::<u16>());
+        assert!(index_size_matches::<i32>());
+        assert!(index_size_matches::<i64>());
     }
 }

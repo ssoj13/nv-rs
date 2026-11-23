@@ -85,6 +85,44 @@ impl Status {
             x if x == Self::NOT_SUPPORTED.0 => "CUSOLVER_STATUS_NOT_SUPPORTED",
             x if x == Self::ZERO_PIVOT.0 => "CUSOLVER_STATUS_ZERO_PIVOT",
             x if x == Self::INVALID_LICENSE.0 => "CUSOLVER_STATUS_INVALID_LICENSE",
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_PARAMS_NOT_INITIALIZED => {
+                "CUSOLVER_STATUS_IRS_PARAMS_NOT_INITIALIZED"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_PARAMS_INVALID => {
+                "CUSOLVER_STATUS_IRS_PARAMS_INVALID"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_PARAMS_INVALID_PREC => {
+                "CUSOLVER_STATUS_IRS_PARAMS_INVALID_PREC"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_PARAMS_INVALID_REFINE => {
+                "CUSOLVER_STATUS_IRS_PARAMS_INVALID_REFINE"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_PARAMS_INVALID_MAXITER => {
+                "CUSOLVER_STATUS_IRS_PARAMS_INVALID_MAXITER"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_INTERNAL_ERROR => {
+                "CUSOLVER_STATUS_IRS_INTERNAL_ERROR"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_NOT_SUPPORTED => {
+                "CUSOLVER_STATUS_IRS_NOT_SUPPORTED"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_OUT_OF_RANGE => {
+                "CUSOLVER_STATUS_IRS_OUT_OF_RANGE"
+            }
+            x if x
+                == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_NRHS_NOT_SUPPORTED_FOR_REFINE_GMRES =>
+            {
+                "CUSOLVER_STATUS_IRS_NRHS_NOT_SUPPORTED_FOR_REFINE_GMRES"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_INFOS_NOT_INITIALIZED => {
+                "CUSOLVER_STATUS_IRS_INFOS_NOT_INITIALIZED"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_INFOS_NOT_DESTROYED => {
+                "CUSOLVER_STATUS_IRS_INFOS_NOT_DESTROYED"
+            }
+            x if x == sys::cusolverStatus_t_CUSOLVER_STATUS_IRS_MATRIX_SINGULAR => {
+                "CUSOLVER_STATUS_IRS_MATRIX_SINGULAR"
+            }
             x if x == Self::INVALID_WORKSPACE.0 => "CUSOLVER_STATUS_INVALID_WORKSPACE",
             _ => "CUSOLVER_STATUS_UNKNOWN",
         }
@@ -388,6 +426,23 @@ mod tests {
             Status::INVALID_WORKSPACE.name(),
             "CUSOLVER_STATUS_INVALID_WORKSPACE"
         );
+    }
+
+    #[test]
+    fn status_names_cover_irs_codes() {
+        assert_eq!(Status(12).name(), "CUSOLVER_STATUS_IRS_PARAMS_NOT_INITIALIZED");
+        assert_eq!(Status(16).name(), "CUSOLVER_STATUS_IRS_PARAMS_INVALID_MAXITER");
+        assert_eq!(Status(20).name(), "CUSOLVER_STATUS_IRS_INTERNAL_ERROR");
+        assert_eq!(
+            Status(23).name(),
+            "CUSOLVER_STATUS_IRS_NRHS_NOT_SUPPORTED_FOR_REFINE_GMRES"
+        );
+        assert_eq!(Status(26).name(), "CUSOLVER_STATUS_IRS_INFOS_NOT_DESTROYED");
+        assert_eq!(Status(30).name(), "CUSOLVER_STATUS_IRS_MATRIX_SINGULAR");
+        // Every code the bindings define has a name.
+        for code in (0..=31).filter(|c| ![17, 18, 19, 24, 27, 28, 29].contains(c)) {
+            assert_ne!(Status(code).name(), "CUSOLVER_STATUS_UNKNOWN", "code {code}");
+        }
     }
 
     #[test]

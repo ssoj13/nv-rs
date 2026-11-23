@@ -2,11 +2,14 @@
 //!
 //! **What.**
 //! - [`handle`] — [`Handle`]: cuSPARSE library handle bound to one `cuda_core::Context`, with
-//!   stream binding and pointer-mode control.
+//!   stream binding (which also makes the handle's context current on the calling thread) and
+//!   pointer-mode queries.
 //! - [`descr`] — [`SpMatDescr`] (CSR, CSC, COO, Blocked-ELL), [`DnVecDescr`], and
 //!   [`DnMatDescr`] with dimension/index validation and context-tracked teardown.
 //! - [`ops`] — [`spmv`], [`spmm`], [`SpGemm`], [`SpSv`], and [`SpSm`] with two-phase workspace
-//!   sizing, caller byte-budget enforcement, and reusable [`Scratch`] buffers.
+//!   sizing, caller byte-budget enforcement, and reusable [`Scratch`] buffers. Buffers that a
+//!   native descriptor keeps referencing after the call (SpGEMM, SpSV/SpSM analysis) are owned
+//!   by that descriptor wrapper, not by the caller's [`Scratch`].
 //!
 //! **Conventions.** Every handle and descriptor owns its native cuSPARSE object, holds an
 //! `Arc<cuda_core::Context>`, and destroys it on `Drop`; teardown failures are recorded on the
@@ -369,6 +372,8 @@ pub enum PointerMode {
     /// Scalars (`alpha`, `beta`) reside in host memory (`CUSPARSE_POINTER_MODE_HOST`).
     Host,
     /// Scalars (`alpha`, `beta`) reside in device memory (`CUSPARSE_POINTER_MODE_DEVICE`).
+    /// Reported by [`Handle::pointer_mode`] but refused by [`Handle::set_pointer_mode`]: no
+    /// operation in this crate accepts device scalars.
     Device,
 }
 
@@ -379,6 +384,11 @@ impl PointerMode {
             Self::Device => sys::cusparsePointerMode_t_CUSPARSE_POINTER_MODE_DEVICE,
         }
     }
+}
+
+/// Returns `true` if `a` and `b` name the same native stream in the same `Context`.
+pub(crate) fn same_stream(a: &Stream, b: &Stream) -> bool {
+    a.cu_stream() == b.cu_stream() && Arc::ptr_eq(a.context(), b.context())
 }
 
 /// Caller-owned reusable device scratch workspace bound to one [`Stream`].
@@ -420,9 +430,7 @@ impl Scratch {
         required: usize,
         budget: usize,
     ) -> Result<(*mut c_void, usize)> {
-        if stream.cu_stream() != self.stream.cu_stream()
-            || !Arc::ptr_eq(stream.context(), self.stream.context())
-        {
+        if !same_stream(stream, &self.stream) {
             return Err(Error::InvalidInput(
                 "scratch used on a different stream than it was created for",
             ));

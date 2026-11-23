@@ -8,9 +8,12 @@ Cross-platform, Python 3, standard library only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -34,7 +37,12 @@ if hasattr(sys.stderr, "reconfigure"):
 
 ROOT_DIR = Path(__file__).parent.resolve()
 DEFAULT_SDK_DIR = ROOT_DIR / ".sdk"
-DEFAULT_TOOLCHAIN = "1.99.1"
+# Single CUDA Toolkit version used for the manual-install hint below. The CI install steps in
+# `.github/workflows/release.yml` carry their own `CUDA_VERSION` env; keep the two in step.
+CUDA_VERSION = "13.3.1"
+# Written last into every SDK directory this script installs. It marks the directory as complete
+# and as script-owned (`clean --sdk` removes only owned directories unless `--include-manual`).
+SDK_COMPLETE_MARKER = ".nv-rs-sdk-complete"
 IS_WINDOWS = platform.system() == "Windows"
 IS_MACOS = platform.system() == "Darwin"
 IS_LINUX = platform.system() == "Linux"
@@ -54,7 +62,8 @@ COMMANDS (short or long):
     s,  status
         Show Rust toolchain, git status, and detected NVIDIA SDK summary.
     cl, clean [opts]
-        Run `cargo clean` (-p/--package optional; --sdk removes .sdk cache).
+        Run `cargo clean` (-p/--package optional; --sdk removes SDKs installed by `deps dl`
+        plus download/staging leftovers; --sdk --include-manual also removes manual SDKs).
     x,  xtask <args...>
         Forward arguments to `cargo xtask <args...>` (e.g. `coverage check`, `coverage optix`).
     d,  deps [all|s|dl|sys] [opts]
@@ -87,6 +96,8 @@ DEPS DL OPTIONS:
     --dry-run                Show what would be downloaded/extracted or skipped.
     --force                  Re-download/re-extract even if already present.
     --allow-manual           Skip auth-gated SDKs with notice instead of failing.
+    Public SDKs are pinned (git commit or archive SHA-256); a mismatch or a missing pin fails.
+    Each SDK is staged in <sdk>.partial and renamed into place only when complete.
 
 DEPS ALL / SYS OPTIONS:
     -y, --yes                Non-interactive install (pass -y/--noconfirm to package manager).
@@ -242,6 +253,7 @@ class SdkSpec:
     system_globs: tuple[str, ...] = ()
     platforms: tuple[str, ...] = ("Windows", "Linux")
     strip_top: bool = True
+    rev: str | None = None  # full 40-hex commit; required when archive_type == "git"
 
 
 def _platform_url(win: str | None, linux: str | None) -> tuple[str | None, str]:
@@ -275,10 +287,25 @@ _CUDNN_LIN_URL = (
 
 _NVCOMP_URL, _NVCOMP_ARC = _platform_url(_NVCOMP_WIN_URL, _NVCOMP_LIN_URL)
 _CUDNN_URL, _CUDNN_ARC = _platform_url(_CUDNN_WIN_URL, _CUDNN_LIN_URL)
+_VULKAN_VERSION = "1.4.363.1"
 _VULKAN_URL, _VULKAN_ARC = _platform_url(
     None,
-    "https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz",
+    f"https://sdk.lunarg.com/sdk/download/{_VULKAN_VERSION}/linux/vulkan-sdk.tar.xz",
 )
+
+# Expected SHA-256 of every archive `deps dl` downloads, keyed by URL (the single pin table for
+# archives; git-hosted SDKs are pinned by `SdkSpec.rev` instead). A download without an entry here
+# is refused. Sources: nvCOMP `redistrib_6.0.0.json` and cuDNN `redistrib_9.28.1.json` (the
+# `cuda13` entries) published next to the archives; Vulkan from LunarG's
+# `https://sdk.lunarg.com/sdk/sha/<version>/linux/vulkan_sdk.tar.xz.txt`.
+ARCHIVE_SHA256: dict[str, str] = {
+    _NVCOMP_WIN_URL: "9887573b47667c1c3daabb4618c3428afc91cd719d8abc0c6f4e9dccd0889ed5",
+    _NVCOMP_LIN_URL: "fc46eb005b1ad4d9ff6ee5b7c5b1892021adbe1b8db0ed12e9ded0df102e3611",
+    _CUDNN_WIN_URL: "5963a8776803a2c3772a5b71ecbb27cba81977321612f5d794c0468af4e5e66b",
+    _CUDNN_LIN_URL: "324d85cd0f3415c28cf5b193584ea5a2903feb92ac77fb8995017fd3ecbb4283",
+}
+if _VULKAN_URL is not None:
+    ARCHIVE_SHA256[_VULKAN_URL] = "b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8"
 
 SDK_SPECS: tuple[SdkSpec, ...] = (
     SdkSpec(
@@ -289,8 +316,8 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         marker_paths=("include/cuda.h", "include/crt/host_config.h"),
         url=None,
         archive_type="manual",
-        manual_url="https://developer.download.nvidia.com/compute/cuda/13.3.1/network_installers/cuda_13.3.1_windows_network.exe",
-        manual_note="System installer (or redistrib_13.5.0.json)",
+        manual_url=f"https://developer.download.nvidia.com/compute/cuda/{CUDA_VERSION}/network_installers/cuda_{CUDA_VERSION}_windows_network.exe",
+        manual_note=f"System installer (CUDA {CUDA_VERSION})",
         system_globs=(
             r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*",
             "/usr/local/cuda*",
@@ -302,8 +329,9 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         env_vars=("OPTIX_ROOT", "OptiX_INSTALL_DIR", "OPTIX_PATH"),
         subdir="optix",
         marker_paths=("include/optix.h", "include/optix_function_table.h"),
-        url="https://github.com/NVIDIA/optix-dev/archive/refs/heads/master.zip",
-        archive_type="zip",
+        url="https://github.com/NVIDIA/optix-dev.git",
+        archive_type="git",
+        rev="f1f6dd803f3159992d248178f6e09421c6eb8b6d",
         manual_url="https://developer.nvidia.com/rtx/ray-tracing/optix",
         manual_note="Public headers via NVIDIA/optix-dev",
         system_globs=(
@@ -367,8 +395,9 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         env_vars=("NVAPI_ROOT", "NVAPI_PATH"),
         subdir="nvapi",
         marker_paths=("nvapi_interface.h", "nvapi_lite_common.h"),
-        url="https://github.com/NVIDIA/nvapi/archive/refs/heads/main.zip",
-        archive_type="zip",
+        url="https://github.com/NVIDIA/nvapi.git",
+        archive_type="git",
+        rev="51e5aae4bc40c3ccd3fb7d4dfd94256e7bfc496e",
         manual_url="https://github.com/NVIDIA/nvapi",
         manual_note="Public NVIDIA/nvapi repository",
         platforms=("Windows",),
@@ -391,8 +420,9 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         env_vars=("NGX_SDK_ROOT", "DLSS_ROOT"),
         subdir="ngx",
         marker_paths=("include/nvsdk_ngx.h", "include/nvsdk_ngx_defs.h", "include/nvsdk_ngx_vk.h"),
-        url="https://github.com/NVIDIA/DLSS/archive/refs/heads/main.zip",
-        archive_type="zip",
+        url="https://github.com/NVIDIA/DLSS.git",
+        archive_type="git",
+        rev="9981c6350dc58c0ce21f024fd65e31e851c31689",
         manual_url="https://github.com/NVIDIA/DLSS",
         manual_note="Public NVIDIA/DLSS repository",
         system_globs=(r"C:\Program Files\NVIDIA\Streamline\external\ngx-sdk",),
@@ -403,8 +433,9 @@ SDK_SPECS: tuple[SdkSpec, ...] = (
         env_vars=("NCCL_ROOT", "NCCL_PATH"),
         subdir="nccl",
         marker_paths=("include/nccl.h", "include/*/nccl.h", "src/include/nccl.h"),
-        url="https://github.com/NVIDIA/nccl/archive/refs/heads/master.zip" if IS_LINUX else None,
-        archive_type="zip" if IS_LINUX else "manual",
+        url="https://github.com/NVIDIA/nccl.git" if IS_LINUX else None,
+        archive_type="git" if IS_LINUX else "manual",
+        rev="ad2d192c1f279aefcaf340f67e07880b65a1116b",  # tag v2.32.6-1
         manual_url="https://github.com/NVIDIA/nccl",
         manual_note="Linux-only; source archive or libnccl-dev package",
         platforms=("Linux",),
@@ -516,25 +547,85 @@ def cmd_deps_status(sdk_root: Path = DEFAULT_SDK_DIR) -> int:
     return 0
 
 
-def _download_file(url: str, dst: Path) -> None:
+def _download_file(url: str, dst: Path, expected_sha256: str) -> None:
+    """Download `url` to `dst` via `dst.part`; `dst` appears only after size and SHA-256 both match."""
     dst.parent.mkdir(parents=True, exist_ok=True)
+    part = dst.with_name(dst.name + ".part")
+    digest = hashlib.sha256()
     req = urllib.request.Request(url, headers={"User-Agent": "nv-rs-bootstrap/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        downloaded = 0
-        last_pct = -1
-        with dst.open("wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = int(downloaded * 100 / total)
-                    if pct != last_pct and pct % 10 == 0:
-                        last_pct = pct
-                        print(f"    downloading... {pct}% ({downloaded // (1024 * 1024)} MiB)")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            downloaded = 0
+            last_pct = -1
+            with part.open("wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    digest.update(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = int(downloaded * 100 / total)
+                        if pct != last_pct and pct % 10 == 0:
+                            last_pct = pct
+                            print(f"    downloading... {pct}% ({downloaded // (1024 * 1024)} MiB)")
+        if total > 0 and downloaded != total:
+            raise OSError(f"truncated download of {url}: got {downloaded} of {total} bytes")
+        actual = digest.hexdigest()
+        if actual != expected_sha256.lower():
+            raise ValueError(f"SHA-256 mismatch for {url}: expected {expected_sha256}, got {actual}")
+        os.replace(part, dst)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def _rmtree(path: Path) -> None:
+    """`shutil.rmtree` that also removes read-only files (git objects on Windows)."""
+
+    def _unlock(func, p, _exc) -> None:
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_unlock)
+    else:
+        shutil.rmtree(path, onerror=_unlock)
+
+
+def _git_checkout_rev(url: str, rev: str | None, dst: Path) -> None:
+    """Fetch exactly commit `rev` of `url` into `dst` (depth 1, no `.git` left behind)."""
+    if not rev or not re.fullmatch(r"[0-9a-f]{40}", rev):
+        raise ValueError(f"git SDK {url} needs a full 40-hex commit pin, got {rev!r}")
+    dst.mkdir(parents=True, exist_ok=True)
+    steps = (
+        ["init", "--quiet"],
+        ["remote", "add", "origin", url],
+        ["fetch", "--quiet", "--depth", "1", "origin", rev],
+        ["-c", "advice.detachedHead=false", "checkout", "--quiet", "FETCH_HEAD"],
+    )
+    for git_args in steps:
+        code, out, _ = run(["git", *git_args], cwd=dst, capture=True)
+        if code != 0:
+            raise OSError(f"git {' '.join(git_args)} failed (exit {code}): {out.strip()}")
+    code, out, _ = run(["git", "rev-parse", "HEAD"], cwd=dst, capture=True)
+    if code != 0 or out.strip() != rev:
+        raise ValueError(f"{url}: checked out {out.strip()!r}, expected {rev}")
+    _rmtree(dst / ".git")
+
+
+def _publish_sdk(staging: Path, target: Path) -> None:
+    """Move a complete `staging` tree to `target`; the previous `target` is renamed away first."""
+    old = target.with_name(target.name + ".old")
+    if old.exists():
+        _rmtree(old)
+    if target.exists():
+        os.replace(target, old)
+    os.replace(staging, target)
+    if old.exists():
+        _rmtree(old)
 
 
 def _safe_relpath(raw_name: str, strip_top: bool) -> Path | None:
@@ -745,33 +836,50 @@ def cmd_deps_dl(args: argparse.Namespace) -> int:
             continue
 
         target_dir = sdk_root / spec.subdir
+        pin = spec.rev if spec.archive_type == "git" else ARCHIVE_SHA256.get(spec.url)
+        if pin is None:
+            err(f"{spec.key}: no pinned SHA-256 for {spec.url} in ARCHIVE_SHA256; refusing an unverified download")
+            return 1
         if args.dry_run:
-            step(f"[DRY-RUN] {spec.key}: {spec.url} ({spec.archive_type}) -> {target_dir}")
+            step(f"[DRY-RUN] {spec.key}: {spec.url} ({spec.archive_type}, pin {pin}) -> {target_dir}")
             continue
+        if target_dir.exists() and not args.force and not (target_dir / SDK_COMPLETE_MARKER).is_file():
+            err(f"{target_dir} exists but was not installed by bootstrap and has no SDK markers; remove it or pass --force")
+            return 1
 
-        step(f"Fetching {spec.key} from {spec.url} ...")
-        if spec.archive_type == "git":
-            if target_dir.exists() and args.force:
-                shutil.rmtree(target_dir)
-            code, _, ms = run(["git", "clone", "--depth", "1", spec.url, str(target_dir)])
-            if code != 0:
-                err(f"git clone failed for {spec.key} ({fmt_time(ms)})")
-                return code
-            ok(f"{spec.key} cloned into {target_dir} ({fmt_time(ms)})")
-        else:
-            ext = f".{spec.archive_type}"
-            archive_path = sdk_root / "_downloads" / f"{spec.key}{ext}"
-            try:
-                t0 = time.perf_counter()
-                _download_file(spec.url, archive_path)
-                if target_dir.exists() and args.force:
-                    shutil.rmtree(target_dir)
-                _extract_archive(archive_path, target_dir, spec.archive_type, strip_top=spec.strip_top)
-                ms = (time.perf_counter() - t0) * 1000
-                ok(f"{spec.key} extracted to {target_dir} ({fmt_time(ms)})")
-            except (urllib.error.URLError, OSError, ValueError, zipfile.BadZipFile, tarfile.TarError) as exc:
-                err(f"{spec.key} download/extract failed: {exc}")
-                return 1
+        step(f"Fetching {spec.key} from {spec.url} (pin {pin}) ...")
+        # Everything is built beside the final directory and renamed into place only when complete,
+        # so an interrupted run can never leave a half-extracted SDK at `target_dir`.
+        staging = sdk_root / f"{spec.subdir}.partial"
+        for stale in (staging, sdk_root / f"{spec.subdir}.old"):
+            if stale.exists():
+                _rmtree(stale)
+        try:
+            t0 = time.perf_counter()
+            if spec.archive_type == "git":
+                _git_checkout_rev(spec.url, spec.rev, staging)
+            else:
+                archive_path = sdk_root / "_downloads" / f"{spec.key}.{spec.archive_type}"
+                _download_file(spec.url, archive_path, pin)
+                _extract_archive(archive_path, staging, spec.archive_type, strip_top=spec.strip_top)
+            if not _has_marker(staging, spec.marker_paths):
+                raise ValueError(f"fetched tree lacks the expected SDK files ({', '.join(spec.marker_paths)})")
+            (staging / SDK_COMPLETE_MARKER).write_text(f"{spec.url}\n{pin}\n", encoding="utf-8")
+            _publish_sdk(staging, target_dir)
+            ms = (time.perf_counter() - t0) * 1000
+            ok(f"{spec.key} installed to {target_dir} ({fmt_time(ms)})")
+        except (
+            urllib.error.URLError,
+            OSError,
+            ValueError,
+            zipfile.BadZipFile,
+            tarfile.TarError,
+            subprocess.CalledProcessError,
+        ) as exc:
+            err(f"{spec.key} download/extract failed: {exc}")
+            if staging.exists():
+                _rmtree(staging)
+            return 1
 
     if manual_failures > 0:
         _print_manual_sdk_guide(sdk_root, only_set)
@@ -1137,7 +1245,7 @@ def cmd_py_stubs(toolchain: str | None = None) -> int:
     if not check_cargo():
         return 1
     cmd = cargo_cmd(toolchain, "run", "-p", "xtask", "--", "py-stubs", "check")
-    code, _, ms = run(cmd)
+    code, _, ms = run(cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"xtask py-stubs check ({fmt_time(ms)})")
     return code
 
@@ -1170,6 +1278,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     return cmd_py_stubs(args.toolchain)
 
 
+def pinned_toolchain() -> str | None:
+    """Channel pinned in rust-toolchain.toml, the single source of truth for the toolchain."""
+    tc_file = ROOT_DIR / "rust-toolchain.toml"
+    if not tc_file.is_file():
+        return None
+    m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', tc_file.read_text(encoding="utf-8"), re.MULTILINE)
+    return m.group(1) if m else None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     header("NV-RS WORKSPACE STATUS")
     if check_cargo():
@@ -1182,7 +1299,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         step(f"Toolchain : {rustc_out.strip() or 'unknown'}")
     tc_file = ROOT_DIR / "rust-toolchain.toml"
     if tc_file.is_file():
-        step(f"Pinned    : {tc_file.name} present (default {DEFAULT_TOOLCHAIN})")
+        step(f"Pinned    : {tc_file.name} present (channel {pinned_toolchain() or 'unset'})")
     if which("git"):
         rc, rev, _ = run(["git", "rev-parse", "--short", "HEAD"], capture=True)
         rc2, st, _ = run(["git", "status", "--porcelain"], capture=True)
@@ -1196,6 +1313,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if not check_cargo():
         return 1
     header("CLEAN (nv-rs)")
+    if args.include_manual and not args.sdk:
+        err("--include-manual requires --sdk")
+        return 2
     cmd = cargo_cmd(args.toolchain, "clean")
     if args.package:
         cmd.extend(pkg_flags(args.package))
@@ -1204,8 +1324,29 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if code != 0:
         return code
     if args.sdk and DEFAULT_SDK_DIR.exists():
-        shutil.rmtree(DEFAULT_SDK_DIR)
-        ok(f"Removed {DEFAULT_SDK_DIR}")
+        # Owned = installed by `deps dl` (carries SDK_COMPLETE_MARKER) or its download/staging
+        # leftovers. Anything else under .sdk was provisioned by hand (auth-gated SDKs that cannot
+        # be re-downloaded), so it is kept unless --include-manual is given.
+        kept: list[Path] = []
+        for child in sorted(DEFAULT_SDK_DIR.iterdir()):
+            owned = child.is_dir() and (
+                (child / SDK_COMPLETE_MARKER).is_file()
+                or child.name == "_downloads"
+                or child.suffix in (".partial", ".old")
+            )
+            if not (owned or args.include_manual):
+                kept.append(child)
+                continue
+            if child.is_symlink() or child.is_file():
+                child.unlink()
+            else:
+                _rmtree(child)
+            ok(f"Removed {child}")
+        for child in kept:
+            warn(f"Kept {child} (not installed by `deps dl`; pass --include-manual to remove it)")
+        if args.include_manual:
+            DEFAULT_SDK_DIR.rmdir()
+            ok(f"Removed {DEFAULT_SDK_DIR}")
     return 0
 
 
@@ -1214,7 +1355,7 @@ def cmd_xtask(rest: list[str], toolchain: str | None) -> int:
         return 1
     header(f"XTASK ({' '.join(rest) if rest else 'help'})")
     cmd = cargo_cmd(toolchain, "xtask", *rest)
-    code, _, ms = run(cmd)
+    code, _, ms = run(cmd, env=_cargo_env())
     (ok if code == 0 else err)(f"xtask ({fmt_time(ms)})")
     return code
 
@@ -1274,7 +1415,8 @@ def main() -> int:
         p = argparse.ArgumentParser(prog="bootstrap.py clean")
         p.add_argument("-p", "--package", action="append", default=[], help="Target crate (repeatable)")
         p.add_argument("--toolchain", default=None, help="Cargo toolchain override")
-        p.add_argument("--sdk", action="store_true", help="Also remove .sdk directory")
+        p.add_argument("--sdk", action="store_true", help="Also remove SDKs installed by `deps dl` from .sdk")
+        p.add_argument("--include-manual", action="store_true", help="With --sdk: also remove manually provisioned SDKs")
         return cmd_clean(p.parse_args(rest))
 
     if cmd in ("d", "deps"):

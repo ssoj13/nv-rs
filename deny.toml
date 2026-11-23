@@ -21,15 +21,35 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
+# Duplicate versions come from transitive dependencies and are reported, not blocking.
 multiple-versions = "warn"
+# Not enforced: workspace members depend on each other by path.
 wildcards = "allow"
 highlight = "all"
 
 [sources]
 unknown-registry = "warn"
-unknown-git = "warn"
+# Anything outside allow-git is an unreviewed dependency source, so it fails the check.
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Exactly the git sources in Cargo.lock for this workspace. The ssoj13 crates are declared as
+# ssh:// (CI rewrites them to https for the fetch only; the lock still names the ssh URL).
+# `device/` is a separate workspace with its own sources (ssoj13/cuda-rust_b) and is not checked here.
 allow-git = [
     "https://github.com/NVIDIA/cuda-rust.git",
-    "https://github.com/ssoj13/cuda-rust_b.git",
+    "https://github.com/ssoj13/gpu-info-rs.git",
+    "ssh://git@github.com/ssoj13/appbus-rs.git",
+    "ssh://git@github.com/ssoj13/box-rs.git",
+    "ssh://git@github.com/ssoj13/camera-rs.git",
+    "ssh://git@github.com/ssoj13/codec-simd-rs.git",
+    "ssh://git@github.com/ssoj13/crashdump-rs.git",
+    "ssh://git@github.com/ssoj13/csg-rs.git",
+    "ssh://git@github.com/ssoj13/exr-rs.git",
+    "ssh://git@github.com/ssoj13/fsio-rs.git",
+    "ssh://git@github.com/ssoj13/graph-layout-rs.git",
+    "ssh://git@github.com/ssoj13/jph-rs.git",
+    "ssh://git@github.com/ssoj13/murmur3.git",
+    "ssh://git@github.com/ssoj13/nodes-rs.git",
+    "ssh://git@github.com/ssoj13/osm-rs.git",
+    "ssh://git@github.com/ssoj13/wgpu-widgets-rs.git",
 ]

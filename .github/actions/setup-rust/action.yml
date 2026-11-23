@@ -1,0 +1,34 @@
+name: Setup Rust
+description: >-
+  Installs the toolchain pinned in rust-toolchain.toml (the single source of truth), enables the
+  Rust cache, and lets runners without SSH keys fetch the public ssoj13 git dependencies over https.
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+
+    - name: Read pinned toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        channel="$(python -c "import tomllib; print(tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel'])")"
+        echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.toolchain.outputs.channel }}
+        components: rustfmt, clippy
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    # Cargo.toml and Cargo.lock name these repositories as ssh://git@github.com/..., which needs a
+    # key on the runner. They are public, so rewrite the scheme for git (git-fetch-with-cli = true).
+    - name: Fetch git dependencies over https
+      shell: bash
+      run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"

@@ -1,0 +1,71 @@
+name: Setup CUDA Toolkit
+description: >-
+  Installs the CUDA Toolkit components nv-rs builds against (Windows network installer, or the
+  NVIDIA apt repository on Ubuntu 26.04) and exports CUDA_PATH, CUDA_HOME and CUDA_TOOLKIT_PATH.
+
+inputs:
+  version:
+    description: Full toolkit version (major.minor.patch). Keep in step with CUDA_VERSION in bootstrap.py.
+    default: "13.3.1"
+
+runs:
+  using: composite
+  steps:
+    - name: Install CUDA Toolkit (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        CUDA_VERSION: ${{ inputs.version }}
+      run: |
+        $series = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+        $installer = "$env:RUNNER_TEMP\cuda_$($env:CUDA_VERSION)_windows_network.exe"
+        Invoke-WebRequest -UseBasicParsing -Uri "https://developer.download.nvidia.com/compute/cuda/$($env:CUDA_VERSION)/network_installers/cuda_$($env:CUDA_VERSION)_windows_network.exe" -OutFile $installer
+        $components = @(
+          "nvcc", "crt", "cudart", "curand", "curand_dev", "nvrtc", "nvrtc_dev", "cufft",
+          "cufft_dev", "nvjpeg", "nvjpeg_dev", "cupti", "nvml_dev"
+        ) | ForEach-Object { "$($_)_$series" }
+        $proc = Start-Process -FilePath $installer -ArgumentList (@("-s") + $components) -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+          throw "CUDA $($env:CUDA_VERSION) installer failed with exit code $($proc.ExitCode)"
+        }
+        $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$series"
+        if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
+          throw "CUDA $series installation missing nvcc.exe at $cudaPath\bin\nvcc.exe"
+        }
+        "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Install CUDA Toolkit (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        CUDA_VERSION: ${{ inputs.version }}
+      run: |
+        series="${CUDA_VERSION%.*}"
+        apt_series="${series/./-}"
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          "cuda-nvcc-${apt_series}" \
+          "cuda-cudart-dev-${apt_series}" \
+          "cuda-driver-dev-${apt_series}" \
+          "libcurand-${apt_series}" \
+          "libcurand-dev-${apt_series}" \
+          "cuda-nvrtc-${apt_series}" \
+          "cuda-nvrtc-dev-${apt_series}" \
+          "libcufft-${apt_series}" \
+          "libcufft-dev-${apt_series}" \
+          "libnvjpeg-${apt_series}" \
+          "libnvjpeg-dev-${apt_series}" \
+          "cuda-cupti-${apt_series}" \
+          "cuda-cupti-dev-${apt_series}" \
+          "cuda-nvml-dev-${apt_series}" \
+          "cuda-tileiras-${apt_series}"
+        echo "CUDA_PATH=/usr/local/cuda-${series}" >> "$GITHUB_ENV"
+        echo "CUDA_HOME=/usr/local/cuda-${series}" >> "$GITHUB_ENV"
+        echo "CUDA_TOOLKIT_PATH=/usr/local/cuda-${series}" >> "$GITHUB_ENV"
+        echo "/usr/local/cuda-${series}/bin" >> "$GITHUB_PATH"

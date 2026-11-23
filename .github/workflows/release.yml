@@ -32,10 +32,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-rust
 
       - name: Install Linux GUI, Clang & Vulkan dev dependencies
         if: matrix.os == 'ubuntu-26.04'
@@ -58,90 +55,30 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "${GITHUB_WORKSPACE}/vulkan-headers"
+          # v1.4.369 (Vulkan-Headers); fetching by commit keeps the build reproducible.
+          git init --quiet "${GITHUB_WORKSPACE}/vulkan-headers"
+          git -C "${GITHUB_WORKSPACE}/vulkan-headers" fetch --quiet --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git d277a0a3cda9c682708c93279f0c72cd6b0ae3f3
+          git -C "${GITHUB_WORKSPACE}/vulkan-headers" checkout --quiet FETCH_HEAD
           mkdir -p "${GITHUB_WORKSPACE}/vulkan-sdk"
           mv "${GITHUB_WORKSPACE}/vulkan-headers/include" "${GITHUB_WORKSPACE}/vulkan-sdk/Include"
           echo "VULKAN_SDK=${GITHUB_WORKSPACE}/vulkan-sdk" >> "$GITHUB_ENV"
 
-      - name: Setup CUDA Toolkit 13.3 (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $installer = "$env:RUNNER_TEMP\cuda_13.3.1_windows_network.exe"
-          Invoke-WebRequest -UseBasicParsing -Uri "https://developer.download.nvidia.com/compute/cuda/13.3.1/network_installers/cuda_13.3.1_windows_network.exe" -OutFile $installer
-          $proc = Start-Process -FilePath $installer -ArgumentList @(
-            "-s",
-            "nvcc_13.3",
-            "crt_13.3",
-            "cudart_13.3",
-            "curand_13.3",
-            "curand_dev_13.3",
-            "nvrtc_13.3",
-            "nvrtc_dev_13.3",
-            "cufft_13.3",
-            "cufft_dev_13.3",
-            "nvjpeg_13.3",
-            "nvjpeg_dev_13.3",
-            "cupti_13.3",
-            "nvml_dev_13.3"
-          ) -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            throw "CUDA 13.3.1 installer failed with exit code $($proc.ExitCode)"
-          }
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-          if (-not (Test-Path "$cudaPath\bin\nvcc.exe")) {
-            throw "CUDA 13.3 installation missing nvcc.exe at $cudaPath\bin\nvcc.exe"
-          }
-          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/setup-cuda
 
-      - name: Setup CUDA Toolkit 13.3 (Linux)
-        if: matrix.os == 'ubuntu-26.04'
+      - name: Fetch pinned OptiX and DLSS SDKs
         shell: bash
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cuda-nvcc-13-3 \
-            cuda-cudart-dev-13-3 \
-            cuda-driver-dev-13-3 \
-            libcurand-13-3 \
-            libcurand-dev-13-3 \
-            cuda-nvrtc-13-3 \
-            cuda-nvrtc-dev-13-3 \
-            libcufft-13-3 \
-            libcufft-dev-13-3 \
-            libnvjpeg-13-3 \
-            libnvjpeg-dev-13-3 \
-            cuda-cupti-13-3 \
-            cuda-cupti-dev-13-3 \
-            cuda-nvml-dev-13-3 \
-            cuda-tileiras-13-3
-          echo "CUDA_PATH=/usr/local/cuda-13.3" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=/usr/local/cuda-13.3" >> "$GITHUB_ENV"
-          echo "CUDA_TOOLKIT_PATH=/usr/local/cuda-13.3" >> "$GITHUB_ENV"
-          echo "/usr/local/cuda-13.3/bin" >> "$GITHUB_PATH"
-
-      - name: Fetch OptiX SDK headers (NVIDIA/optix-dev)
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/NVIDIA/optix-dev.git "${GITHUB_WORKSPACE}/optix-dev"
-          echo "OPTIX_ROOT=${GITHUB_WORKSPACE}/optix-dev" >> "$GITHUB_ENV"
-
-      - name: Fetch NVIDIA DLSS SDK (NVIDIA/DLSS)
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/NVIDIA/DLSS.git "${GITHUB_WORKSPACE}/dlss-sdk"
-          echo "NGX_SDK_ROOT=${GITHUB_WORKSPACE}/dlss-sdk" >> "$GITHUB_ENV"
+          python bootstrap.py deps dl --only optix,ngx
+          echo "OPTIX_ROOT=${GITHUB_WORKSPACE}/.sdk/optix" >> "$GITHUB_ENV"
+          echo "NGX_SDK_ROOT=${GITHUB_WORKSPACE}/.sdk/ngx" >> "$GITHUB_ENV"
 
       - name: Fetch Video Codec SDK headers (FFmpeg/nv-codec-headers)
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/FFmpeg/nv-codec-headers.git "${GITHUB_WORKSPACE}/nv-codec-headers"
+          git init --quiet "${GITHUB_WORKSPACE}/nv-codec-headers"
+          git -C "${GITHUB_WORKSPACE}/nv-codec-headers" fetch --quiet --depth 1 https://github.com/FFmpeg/nv-codec-headers.git f2053071ea93137255b6dcf42e9b4c9e0965a44e
+          git -C "${GITHUB_WORKSPACE}/nv-codec-headers" checkout --quiet FETCH_HEAD
           mkdir -p "${GITHUB_WORKSPACE}/video-codec-sdk/Interface"
           cp "${GITHUB_WORKSPACE}/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h" "${GITHUB_WORKSPACE}/video-codec-sdk/Interface/nvEncodeAPI.h"
           echo "VIDEO_CODEC_SDK_ROOT=${GITHUB_WORKSPACE}/video-codec-sdk" >> "$GITHUB_ENV"

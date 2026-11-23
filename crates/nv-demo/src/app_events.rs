@@ -139,6 +139,8 @@ pub enum UiCommand {
     SpawnCrowdStress { target_count: usize },
     /// Launch a multi-frame OpenEXR + SDG JSON + `manifest.json` dataset burst capture (`16 / 30 / 60` frames).
     StartSdgBurst { frames: u32 },
+    /// Switch CSG time-of-day (`0 = Day`, `1 = Sunset`, `2 = Night`), smoothly transitioning when enabled.
+    SetTimeOfDay(u32),
 }
 
 /// Discrete non-coalescable control commands dispatched from the UI thread to the OptiX worker.
@@ -256,6 +258,8 @@ pub struct RenderStateSnapshot {
     pub possess_free_pitch: f32,
     /// Keep possessed camera horizon level (`true`) or follow full body roll/pitch (`false`).
     pub possess_auto_level: bool,
+    /// User scroll/pinch zoom offset (meters along `-forward`) while possessing a vehicle or actor.
+    pub possess_zoom_offset: f32,
 }
 
 /// Lost-wakeup-immune condvar waking the OptiX worker whenever a command or state snapshot arrives.
@@ -416,6 +420,7 @@ mod tests {
             possess_free_yaw: 0.0,
             possess_free_pitch: 0.0,
             possess_auto_level: true,
+            possess_zoom_offset: 0.0,
         };
         let bus = AppBus::new(initial);
 
@@ -432,6 +437,7 @@ mod tests {
                 possess_free_yaw: 0.0,
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
+                possess_zoom_offset: 0.0,
             });
         }
 
@@ -453,6 +459,7 @@ mod tests {
             possess_free_yaw: 0.0,
             possess_free_pitch: 0.0,
             possess_auto_level: true,
+            possess_zoom_offset: 0.0,
         };
         let bus = AppBus::new(initial);
         let mut scratch = Vec::with_capacity(16);

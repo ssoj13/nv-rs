@@ -394,6 +394,8 @@ pub struct UiContext<'a> {
     pub possess_free_yaw: &'a mut f32,
     pub possess_free_pitch: &'a mut f32,
     pub possess_auto_level: &'a mut bool,
+    pub possess_zoom_offset: &'a mut f32,
+    pub viewport_toolbar: &'a mut crate::viewport_toolbar::ToolbarState,
     pub pick_possess_mode: &'a mut bool,
     pub smart_view_seed: &'a mut u64,
     pub last_smart_view: Option<SmartViewResult>,
@@ -752,23 +754,142 @@ impl UiContext<'_> {
 
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
-        if *self.pick_possess_mode && resp.hovered() {
+        // Vendored floating ViewportToolbar (bottom edge above HUD strip) with input gating.
+        let toolbar_resp = crate::viewport_toolbar::ViewportToolbar::new("nv_demo_viewport_toolbar")
+            .bottom_margin(34.0)
+            .show(ui.ctx(), rect, self.viewport_toolbar, |ui| {
+                // 1. AOV quick selector
+                let aov_cur = AOV_HUD_TAGS
+                    .get(self.settings.aov_mode as usize)
+                    .copied()
+                    .unwrap_or("BEAUTY");
+                egui::ComboBox::from_id_salt("vt_aov")
+                    .selected_text(format!("{} {aov_cur}", ic::STACK))
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, tag) in AOV_HUD_TAGS.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.settings.aov_mode,
+                                idx as u32,
+                                *tag,
+                            );
+                        }
+                    });
+                ui.separator();
+
+                // 2. Optical Lens selector
+                egui::ComboBox::from_id_salt("vt_lens")
+                    .selected_text(format!(
+                        "{} {}",
+                        ic::APERTURE,
+                        self.settings.camera_projection.label()
+                    ))
+                    .width(94.0)
+                    .show_ui(ui, |ui| {
+                        for proj in [
+                            CameraProjection::Pinhole,
+                            CameraProjection::Fisheye180,
+                            CameraProjection::Equirect360,
+                            CameraProjection::SlitCam,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.settings.camera_projection,
+                                proj,
+                                proj.label(),
+                            );
+                        }
+                    });
+                ui.separator();
+
+                // 3. Day / Sunset / Night quick pills (routed through smooth transition)
+                for (tod, icon, tip) in [
+                    (0u32, ic::SUN, "Daylight"),
+                    (1u32, ic::SUN_HORIZON, "Golden Sunset"),
+                    (2u32, ic::MOON_STARS, "Coastal Night"),
+                ] {
+                    if ui
+                        .add(egui::Button::selectable(self.settings.csg_time_of_day == tod, icon).small())
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
+                    }
+                }
+                ui.separator();
+
+                // 4. Pick / Poke / Freeze quick actions
+                if ui
+                    .add(egui::Button::selectable(*self.pick_possess_mode, ic::CROSSHAIR).small())
+                    .on_hover_text("Pick object to possess (or double-click / double-tap in viewport)")
+                    .clicked()
+                {
+                    *self.pick_possess_mode = !*self.pick_possess_mode;
+                }
+                if self.settings.csg_mode > 0
+                    && ui
+                        .add(egui::Button::new(ic::HAND_POINTING).small())
+                        .on_hover_text("Poke nearest articulated actor (P)")
+                        .clicked()
+                {
+                    let is_inspector_109 = self
+                        .scene_descriptors
+                        .get((self.settings.csg_mode as usize).saturating_sub(1))
+                        .is_some_and(|d| d.id == "inspector" && self.settings.csg_asset_idx == 109);
+                    self.bus.emit_ui(UiCommand::PokeCrowd {
+                        impulse: self.settings.poke_impulse,
+                        all: is_inspector_109,
+                    });
+                }
+                if ui
+                    .add(egui::Button::selectable(self.settings.csg_freeze_pose, ic::PAUSE).small())
+                    .on_hover_text("Freeze dynamic traffic & crowd poses for clean accumulation")
+                    .clicked()
+                {
+                    self.bus.emit_ui(UiCommand::ToggleFreezePose);
+                }
+                ui.separator();
+
+                // 5. Compact Exposure EV drag
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.exposure)
+                        .range(0.05..=8.0)
+                        .speed(0.02)
+                        .prefix("EV "),
+                )
+                .on_hover_text("Exposure multiplier");
+
+                // 6. Save PNG & SDG EXR Burst
+                if ui
+                    .add(egui::Button::new(ic::CAMERA).small())
+                    .on_hover_text("Save PNG snapshot")
+                    .clicked()
+                {
+                    self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
+                }
+                if self.settings.csg_mode > 0
+                    && ui
+                        .add(egui::Button::new(ic::FILM_STRIP).small())
+                        .on_hover_text("Export multi-frame 9-channel OpenEXR + SDG JSON burst")
+                        .clicked()
+                {
+                    self.bus.emit_ui(UiCommand::StartSdgBurst {
+                        frames: self.settings.sdg_burst_frames,
+                    });
+                }
+            });
+
+        let toolbar_blocking = toolbar_resp.contains_pointer;
+        if *self.pick_possess_mode && resp.hovered() && !toolbar_blocking {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
-        let ctrl_down = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
-        let pick_active = self.settings.csg_mode != 0
-            && (*self.pick_possess_mode
-                || (ctrl_down
-                    && (resp.hovered()
-                        || ui.input(|i| {
-                            i.pointer.primary_down()
-                                || i.pointer.primary_pressed()
-                                || i.pointer.primary_released()
-                        }))));
+        let pick_active = self.settings.csg_mode != 0 && *self.pick_possess_mode && !toolbar_blocking;
+        // Double-click / double-tap anywhere in the viewport (or click in Pick crosshair mode)
+        // possesses the vehicle, pedestrian, or camera mount under the cursor.
         let pick_clicked = !split_dragging
+            && !toolbar_blocking
             && self.settings.csg_mode != 0
-            && resp.clicked_by(egui::PointerButton::Primary)
-            && (ctrl_down || *self.pick_possess_mode);
+            && (resp.double_clicked_by(egui::PointerButton::Primary)
+                || (*self.pick_possess_mode && resp.clicked_by(egui::PointerButton::Primary)));
         if pick_clicked
             && let Some(pos) = resp.interact_pointer_pos()
             && img_rect.width() > 2.0
@@ -810,7 +931,7 @@ impl UiContext<'_> {
                 .mounts
                 .get(pinfo.mount_idx)
                 .is_none_or(|m| m.allow_free_look);
-            if !split_dragging && allow_look && resp.dragged() {
+            if !split_dragging && !toolbar_blocking && allow_look && resp.dragged() {
                 let d = resp.drag_delta();
                 if d.x.abs() > 0.0 || d.y.abs() > 0.0 {
                     *self.possess_free_yaw =
@@ -819,7 +940,26 @@ impl UiContext<'_> {
                         .clamp(-1.35, 1.35);
                 }
             }
-        } else if !split_dragging && !pick_clicked && !pick_active {
+            // Pinch or scroll-wheel zoom while riding a vehicle or actor.
+            if !split_dragging && !toolbar_blocking && resp.hovered() {
+                let (scroll_y, zoom_delta) =
+                    ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+                let pinch_delta = if (zoom_delta - 1.0).abs() > 1e-4 {
+                    (1.0 - zoom_delta) * 14.0
+                } else {
+                    0.0
+                };
+                let wheel_delta = if scroll_y.abs() > 1e-3 {
+                    -scroll_y * 0.025
+                } else {
+                    0.0
+                };
+                if pinch_delta != 0.0 || wheel_delta != 0.0 {
+                    *self.possess_zoom_offset =
+                        (*self.possess_zoom_offset + pinch_delta + wheel_delta).clamp(-1.5, 40.0);
+                }
+            }
+        } else if !split_dragging && !toolbar_blocking && !pick_clicked && !pick_active {
             if resp.dragged() && self.camera_rail.playing {
                 self.camera_rail.playing = false;
             }
@@ -1774,8 +1914,22 @@ impl UiContext<'_> {
                             )
                             .clicked()
                         {
-                            apply_csg_time_of_day_preset(s, tod);
+                            self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.tod_transition_enabled, "Transition")
+                            .on_hover_text(
+                                "Smoothly animate sky and sun lighting across Day / Sunset / Night.",
+                            );
+                        ui.add_enabled(
+                            s.tod_transition_enabled,
+                            egui::DragValue::new(&mut s.tod_transition_secs)
+                                .range(0.1..=15.0)
+                                .speed(0.1)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text("Transition duration in seconds.");
                     });
                     // 4-way Road Mode selector (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`)
                     let prev_road_mode = s.csg_road_mode.min(3);
@@ -3491,7 +3645,7 @@ impl UiContext<'_> {
     }
 }
 
-fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
+pub fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
     s.csg_time_of_day = tod.min(2);
     match s.csg_time_of_day {
         0 => {

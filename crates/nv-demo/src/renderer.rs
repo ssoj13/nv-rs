@@ -422,6 +422,14 @@ fn default_csg_road_mode() -> u8 {
     2
 }
 
+fn default_tod_transition_enabled() -> bool {
+    true
+}
+
+fn default_tod_transition_secs() -> f32 {
+    2.0
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct DemoSettings {
@@ -564,6 +572,12 @@ pub struct DemoSettings {
     pub csg_seed: u32,
     /// `0 = Day`, `1 = Sunset`, `2 = Night`.
     pub csg_time_of_day: u32,
+    /// Smoothly interpolate sky/sun parameters when switching Day / Sunset / Night.
+    #[serde(default = "default_tod_transition_enabled")]
+    pub tod_transition_enabled: bool,
+    /// Duration in seconds for smooth Day / Sunset / Night transitions (`0.1..=15.0`).
+    #[serde(default = "default_tod_transition_secs")]
+    pub tod_transition_secs: f32,
     /// Coastal road & concrete wetness (`0.0..=1.0`).
     pub csg_wetness: f32,
     /// Animate highway traffic & spinning wheels in `Gundo`.
@@ -707,6 +721,8 @@ impl Default for DemoSettings {
             csg_asset_idx: 13,
             csg_seed: 1337,
             csg_time_of_day: 1,
+            tod_transition_enabled: default_tod_transition_enabled(),
+            tod_transition_secs: default_tod_transition_secs(),
             csg_wetness: 0.38,
             csg_traffic_on: true,
             csg_traffic_speed: 1.0,
@@ -2750,6 +2766,7 @@ pub fn spawn_render_thread(
             let mut possess_free_yaw = init_snap.possess_free_yaw;
             let mut possess_free_pitch = init_snap.possess_free_pitch;
             let mut possess_auto_level = init_snap.possess_auto_level;
+            let mut possess_zoom_offset = init_snap.possess_zoom_offset;
             let mut possess_damper = crate::camera_rail::CameraDamper::default();
             possess_damper.snap(camera_frame_to_core_pose(camera));
             let mut possess_blend_rem: f32 = 0.0;
@@ -3288,6 +3305,7 @@ pub fn spawn_render_thread(
                     let possess_look_changed = rig.csg_host.is_possessing()
                         && (snap.possess_free_yaw.to_bits() != possess_free_yaw.to_bits()
                             || snap.possess_free_pitch.to_bits() != possess_free_pitch.to_bits()
+                            || snap.possess_zoom_offset.to_bits() != possess_zoom_offset.to_bits()
                             || snap.possess_auto_level != possess_auto_level);
                     if reset_accum
                         || possess_look_changed
@@ -3301,6 +3319,7 @@ pub fn spawn_render_thread(
                     possess_free_yaw = snap.possess_free_yaw;
                     possess_free_pitch = snap.possess_free_pitch;
                     possess_auto_level = snap.possess_auto_level;
+                    possess_zoom_offset = snap.possess_zoom_offset;
                 }
 
                 let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
@@ -3539,7 +3558,12 @@ pub fn spawn_render_thread(
                     possess_free_pitch,
                     possess_auto_level,
                 ) {
-                    let target_frame = csg_pose_to_camera_frame(csg_pose);
+                    let mut target_frame = csg_pose_to_camera_frame(csg_pose);
+                    if possess_zoom_offset.abs() > 1e-4 {
+                        target_frame.eye[0] -= target_frame.fwd[0] * possess_zoom_offset;
+                        target_frame.eye[1] -= target_frame.fwd[1] * possess_zoom_offset;
+                        target_frame.eye[2] -= target_frame.fwd[2] * possess_zoom_offset;
+                    }
                     let final_frame = if possess_blend_rem > 0.0 {
                         let frac = (possess_blend_rem / 0.9).clamp(0.0, 1.0);
                         possess_blend_rem = (possess_blend_rem - dt.max(1.0 / 120.0)).max(0.0);
@@ -3857,7 +3881,12 @@ pub fn spawn_render_thread(
                                     possess_auto_level,
                                 )
                             {
-                                let updated = csg_pose_to_camera_frame(csg_pose);
+                                let mut updated = csg_pose_to_camera_frame(csg_pose);
+                                if possess_zoom_offset.abs() > 1e-4 {
+                                    updated.eye[0] -= updated.fwd[0] * possess_zoom_offset;
+                                    updated.eye[1] -= updated.fwd[1] * possess_zoom_offset;
+                                    updated.eye[2] -= updated.fwd[2] * possess_zoom_offset;
+                                }
                                 if possess_blend_rem <= 0.0 {
                                     possess_damper.snap(camera_frame_to_core_pose(updated));
                                     active_camera = updated;

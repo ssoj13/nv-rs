@@ -21,6 +21,7 @@ mod profiler;
 mod renderer;
 mod sdg_export;
 mod ui;
+mod viewport_toolbar;
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -1069,6 +1070,112 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         last_frame_at: Option<Instant>,
     }
 
+    /// Returns true when `mount` represents a 360-degree / LiDAR roof sensor mount.
+    pub(crate) fn is_360_lidar_mount(mount: &csg_scene::CameraMount) -> bool {
+        let id_lc = mount.id.to_ascii_lowercase();
+        let lbl_lc = mount.label.to_ascii_lowercase();
+        id_lc.contains("360")
+            || id_lc.contains("lidar")
+            || lbl_lc.contains("360")
+            || lbl_lc.contains("lidar")
+    }
+
+    /// Automatically switch `projection` to `Equirect360` when possessing a 360°/LiDAR mount,
+    /// saving the previous projection in `saved` and restoring it upon switching to a regular
+    /// mount or ejecting (`mount == None`).
+    pub(crate) fn sync_mount_camera_projection(
+        mount: Option<&csg_scene::CameraMount>,
+        projection: &mut crate::renderer::CameraProjection,
+        saved: &mut Option<crate::renderer::CameraProjection>,
+    ) {
+        if let Some(m) = mount
+            && is_360_lidar_mount(m)
+        {
+            if saved.is_none() {
+                *saved = Some(*projection);
+            }
+            *projection = crate::renderer::CameraProjection::Equirect360;
+        } else if let Some(prev) = saved.take() {
+            *projection = prev;
+        }
+    }
+
+    /// Smooth time-of-day lighting interpolator (`Day` / `Sunset` / `Night`) driven over `duration_s`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct TodTransition {
+        from_azimuth: f32,
+        from_elevation: f32,
+        from_sun_intensity: f32,
+        from_sky_intensity: f32,
+        from_exposure: f32,
+        to_tod: u32,
+        to_sky_mode: u32,
+        to_azimuth: f32,
+        to_elevation: f32,
+        to_sun_intensity: f32,
+        to_sky_intensity: f32,
+        to_exposure: f32,
+        elapsed_s: f32,
+        duration_s: f32,
+    }
+
+    impl TodTransition {
+        /// Capture current lighting state as the start keyframe and target `tod` preset as the end.
+        pub(crate) fn new(current: &DemoSettings, target_tod: u32, duration_s: f32) -> Self {
+            let mut target = *current;
+            crate::ui::apply_csg_time_of_day_preset(&mut target, target_tod);
+            Self {
+                from_azimuth: current.sun_azimuth,
+                from_elevation: current.sun_elevation,
+                from_sun_intensity: current.sun_intensity,
+                from_sky_intensity: current.sky_intensity,
+                from_exposure: current.exposure,
+                to_tod: target.csg_time_of_day,
+                to_sky_mode: target.sky_mode,
+                to_azimuth: target.sun_azimuth,
+                to_elevation: target.sun_elevation,
+                to_sun_intensity: target.sun_intensity,
+                to_sky_intensity: target.sky_intensity,
+                to_exposure: target.exposure,
+                elapsed_s: 0.0,
+                duration_s: duration_s.clamp(0.1, 15.0),
+            }
+        }
+
+        /// Advance transition by `dt` seconds. Returns `true` when finished.
+        pub(crate) fn step(&mut self, s: &mut DemoSettings, dt: f32) -> bool {
+            self.elapsed_s = (self.elapsed_s + dt.max(0.0)).min(self.duration_s);
+            let t = (self.elapsed_s / self.duration_s).clamp(0.0, 1.0);
+            let u = t * t * (3.0 - 2.0 * t);
+
+            // Shortest angular interpolation for sun azimuth in degrees.
+            let mut daz = (self.to_azimuth - self.from_azimuth) % 360.0;
+            if daz > 180.0 {
+                daz -= 360.0;
+            } else if daz < -180.0 {
+                daz += 360.0;
+            }
+            s.sun_azimuth = self.from_azimuth + daz * u;
+            s.sun_elevation = self.from_elevation + (self.to_elevation - self.from_elevation) * u;
+            s.sun_intensity =
+                self.from_sun_intensity + (self.to_sun_intensity - self.from_sun_intensity) * u;
+            s.sky_intensity =
+                self.from_sky_intensity + (self.to_sky_intensity - self.from_sky_intensity) * u;
+            s.exposure = self.from_exposure + (self.to_exposure - self.from_exposure) * u;
+
+            if t >= 0.5 {
+                s.csg_time_of_day = self.to_tod;
+                s.sky_mode = self.to_sky_mode;
+            }
+            if t >= 1.0 {
+                crate::ui::apply_csg_time_of_day_preset(s, self.to_tod);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
@@ -1159,7 +1266,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         possess_free_yaw: f32,
         possess_free_pitch: f32,
         possess_auto_level: bool,
-        last_sent_possess_look: (u32, u32, bool),
+        possess_zoom_offset: f32,
+        possess_saved_projection: Option<crate::renderer::CameraProjection>,
+        viewport_toolbar: crate::viewport_toolbar::ToolbarState,
+        tod_transition: Option<TodTransition>,
+        last_sent_possess_look: (u32, u32, u32, bool),
         last_possess_camera: Option<CameraFrame>,
         pick_possess_mode: bool,
         last_smart_view: Option<SmartViewResult>,
@@ -1445,6 +1556,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_free_yaw: 0.0,
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
+                possess_zoom_offset: 0.0,
             });
             let render_thread = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
@@ -1555,7 +1667,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_free_yaw: 0.0,
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
-                last_sent_possess_look: (0.0f32.to_bits(), 0.0f32.to_bits(), true),
+                possess_zoom_offset: 0.0,
+                possess_saved_projection: None,
+                viewport_toolbar: crate::viewport_toolbar::ToolbarState::default(),
+                tod_transition: None,
+                last_sent_possess_look: (
+                    0.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    0.0f32.to_bits(),
+                    true,
+                ),
                 last_possess_camera: None,
                 pick_possess_mode: false,
                 last_smart_view: None,
@@ -1785,11 +1906,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.camera_rail.set_playing(false);
                             self.possess_free_yaw = 0.0;
                             self.possess_free_pitch = 0.0;
+                            self.possess_zoom_offset = 0.0;
                             if let Some(m) = pinfo.mounts.get(pinfo.mount_idx) {
                                 self.possess_auto_level = m.auto_level;
+                                sync_mount_camera_projection(
+                                    Some(m),
+                                    &mut self.settings.camera_projection,
+                                    &mut self.possess_saved_projection,
+                                );
                             }
                             self.possess_info = Some(pinfo.clone());
                         } else {
+                            self.possess_zoom_offset = 0.0;
+                            sync_mount_camera_projection(
+                                None,
+                                &mut self.settings.camera_projection,
+                                &mut self.possess_saved_projection,
+                            );
                             if self.possess_info.is_some()
                                 && let Some(pc) = self.last_possess_camera.take()
                             {
@@ -1898,6 +2031,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_free_yaw: &mut self.possess_free_yaw,
                 possess_free_pitch: &mut self.possess_free_pitch,
                 possess_auto_level: &mut self.possess_auto_level,
+                possess_zoom_offset: &mut self.possess_zoom_offset,
+                viewport_toolbar: &mut self.viewport_toolbar,
                 pick_possess_mode: &mut self.pick_possess_mode,
                 smart_view_seed: &mut self.smart_view_seed,
                 last_smart_view: self.last_smart_view,
@@ -1992,6 +2127,30 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     UiCommand::StartSdgBurst { frames } => {
                         start_sdg_burst = Some(frames);
                     }
+                    UiCommand::SetTimeOfDay(tod) => {
+                        let target_tod = tod.min(2);
+                        if self.settings.tod_transition_enabled
+                            && self.settings.tod_transition_secs > 0.05
+                        {
+                            self.tod_transition = Some(TodTransition::new(
+                                &self.settings,
+                                target_tod,
+                                self.settings.tod_transition_secs,
+                            ));
+                        } else {
+                            self.tod_transition = None;
+                            crate::ui::apply_csg_time_of_day_preset(
+                                &mut self.settings,
+                                target_tod,
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(tr) = self.tod_transition.as_mut() {
+                let done = tr.step(&mut self.settings, dt);
+                if done {
+                    self.tod_transition = None;
                 }
             }
             if self.theme != prev_theme {
@@ -2873,6 +3032,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let possess_look = (
                     self.possess_free_yaw.to_bits(),
                     self.possess_free_pitch.to_bits(),
+                    self.possess_zoom_offset.to_bits(),
                     self.possess_auto_level,
                 );
                 if reset_accum_requested
@@ -2885,7 +3045,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     let automated_motion = self.is_recording
                         || self.demo_anim.is_running()
-                        || self.camera_rail.is_active();
+                        || self.camera_rail.is_active()
+                        || self.tod_transition.is_some();
                     self.interacting_until = if automated_motion {
                         None
                     } else {
@@ -2902,6 +3063,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         possess_free_yaw: self.possess_free_yaw,
                         possess_free_pitch: self.possess_free_pitch,
                         possess_auto_level: self.possess_auto_level,
+                        possess_zoom_offset: self.possess_zoom_offset,
                     });
                 }
             }
@@ -4048,5 +4210,64 @@ mod ui_pacing_tests {
             compute_next_ui_tick(t0, future_deadline, interval),
             t0 + interval
         );
+    }
+
+    #[test]
+    fn lidar_360_mount_auto_switches_and_restores_lens_projection() {
+        use crate::renderer::CameraProjection;
+
+        let mut proj = CameraProjection::Pinhole;
+        let mut saved = None;
+        let lidar = csg_scene::CameraMount::new(
+            "roof_lidar",
+            "360° Roof LiDAR",
+            csg_core::math::Vec3::new(0.0, 2.0, 0.0),
+            csg_core::math::Vec3::Z,
+            60.0,
+        );
+        let chase = csg_scene::CameraMount::new(
+            "chase_cam",
+            "Chase Cam",
+            csg_core::math::Vec3::new(0.0, 2.5, -6.0),
+            csg_core::math::Vec3::Z,
+            52.0,
+        );
+
+        demo_app::sync_mount_camera_projection(Some(&lidar), &mut proj, &mut saved);
+        assert_eq!(proj, CameraProjection::Equirect360);
+        assert_eq!(saved, Some(CameraProjection::Pinhole));
+
+        // Switching to a regular mount restores the saved projection.
+        demo_app::sync_mount_camera_projection(Some(&chase), &mut proj, &mut saved);
+        assert_eq!(proj, CameraProjection::Pinhole);
+        assert_eq!(saved, None);
+
+        // Ejecting from LiDAR also restores the saved projection.
+        demo_app::sync_mount_camera_projection(Some(&lidar), &mut proj, &mut saved);
+        assert_eq!(proj, CameraProjection::Equirect360);
+        demo_app::sync_mount_camera_projection(None, &mut proj, &mut saved);
+        assert_eq!(proj, CameraProjection::Pinhole);
+    }
+
+    #[test]
+    fn tod_transition_smoothly_interpolates_from_day_to_night() {
+        let mut s = crate::renderer::DemoSettings::default();
+        crate::ui::apply_csg_time_of_day_preset(&mut s, 0); // Day
+        let day_elev = s.sun_elevation;
+        let day_sun = s.sun_intensity;
+
+        let mut tr = demo_app::TodTransition::new(&s, 2, 2.0); // -> Night in 2.0 s
+        assert!(!tr.step(&mut s, 0.5));
+        assert!(s.sun_elevation < day_elev && s.sun_elevation > 24.0);
+        assert!(s.sun_intensity < day_sun && s.sun_intensity > 0.16);
+        assert_eq!(s.csg_time_of_day, 0);
+
+        assert!(!tr.step(&mut s, 0.5)); // t = 0.5
+        assert_eq!(s.csg_time_of_day, 2);
+
+        assert!(tr.step(&mut s, 1.0)); // t = 1.0
+        assert!((s.sun_elevation - 24.0).abs() < 1e-5);
+        assert!((s.sun_intensity - 0.16).abs() < 1e-5);
+        assert_eq!(s.sky_mode, 8);
     }
 }

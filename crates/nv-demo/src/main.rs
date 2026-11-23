@@ -3090,26 +3090,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.egui_winit
                 .handle_platform_output(&self.window, full_output.platform_output);
             if let Some(vo) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+                let rmb_held = self.egui_ctx.input(|i| i.pointer.secondary_down());
                 for cmd in &vo.commands {
                     match cmd {
                         egui::ViewportCommand::CursorGrab(grab) => {
+                            // Never call Win32 `CursorGrabMode::Locked` on LMB click/drag: on
+                            // Windows 11 `Locked` warps the system cursor to the window center on
+                            // every single click, breaking double-click Pick-to-Possess. Only
+                            // confine the cursor while RMB-flying, and keep it free otherwise.
                             let mode = match grab {
                                 egui::CursorGrab::None => winit::window::CursorGrabMode::None,
-                                egui::CursorGrab::Confined => {
-                                    winit::window::CursorGrabMode::Confined
+                                egui::CursorGrab::Confined | egui::CursorGrab::Locked => {
+                                    if rmb_held {
+                                        winit::window::CursorGrabMode::Confined
+                                    } else {
+                                        winit::window::CursorGrabMode::None
+                                    }
                                 }
-                                egui::CursorGrab::Locked => winit::window::CursorGrabMode::Locked,
                             };
-                            if self.window.set_cursor_grab(mode).is_err()
-                                && matches!(mode, winit::window::CursorGrabMode::Locked)
-                            {
-                                let _ = self
-                                    .window
-                                    .set_cursor_grab(winit::window::CursorGrabMode::Confined);
-                            }
+                            let _ = self.window.set_cursor_grab(mode);
                         }
                         egui::ViewportCommand::CursorVisible(visible) => {
-                            self.window.set_cursor_visible(*visible);
+                            // Keep cursor visible during LMB clicks/orbit; only hide during RMB fly.
+                            self.window.set_cursor_visible(*visible || !rmb_held);
                         }
                         _ => {}
                     }

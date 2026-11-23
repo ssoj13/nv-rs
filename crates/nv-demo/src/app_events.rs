@@ -19,6 +19,7 @@ use csg_scene::{CameraMount, ProbeBackendKind, RailSpec, ViewScore};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady};
+use crate::sdg_export::SdgOccluderBackend;
 
 /// Duration after the last camera or setting change during which interactive fast-preview stays active.
 pub const INTERACTION_SETTLE_WINDOW: Duration = Duration::from_millis(150);
@@ -132,6 +133,12 @@ pub enum UiCommand {
     RunSmartView { seed: u64, backend: ProbeBackendKind },
     /// Generate multiple candidate rails, score their key vistas on `backend`, and activate the best rail.
     RunSmartRail { seed: u64, backend: ProbeBackendKind },
+    /// Trigger an interactive poke impulse on the nearest actor (or all actors in `Inspector 109`).
+    PokeCrowd { impulse: f32, all: bool },
+    /// Spawn (or toggle) the 2,000-actor GPU/CPU crowd stress grid around the camera.
+    SpawnCrowdStress { target_count: usize },
+    /// Launch a multi-frame OpenEXR + SDG JSON + `manifest.json` dataset burst capture (`16 / 30 / 60` frames).
+    StartSdgBurst { frames: u32 },
 }
 
 /// Discrete non-coalescable control commands dispatched from the UI thread to the OptiX worker.
@@ -153,7 +160,28 @@ pub enum RenderControl {
     /// Encode the current viewport frame as a GPU nvJPEG file.
     SaveJpeg { path: PathBuf, quality: u8 },
     /// Export exact SDG actor keypoints, tight bounding boxes, and ray-occluded visibility as JSON.
-    ExportSdgJson { path: PathBuf },
+    ExportSdgJson {
+        path: PathBuf,
+        occluder: SdgOccluderBackend,
+    },
+    /// Capture a multi-frame SDG dataset burst (9-channel `.exr` + `.sdg.json` + `manifest.json`).
+    StartSdgBurst {
+        dir: PathBuf,
+        frames: u32,
+        occluder: SdgOccluderBackend,
+    },
+    /// Apply a poke stumble/flinch impulse to the nearest actor along camera ray or all actors.
+    PokeCrowd {
+        origin: [f32; 3],
+        forward: [f32; 3],
+        impulse: f32,
+        all: bool,
+    },
+    /// Spawn a large crowd stress grid (`target_count`, e.g. `2000`) around `origin`.
+    SpawnCrowdStress {
+        target_count: usize,
+        origin: [f32; 3],
+    },
     /// Toggle Smooth 60 FPS / 180-degree shutter recording mode on the render worker.
     SetRecording {
         active: bool,
@@ -434,7 +462,13 @@ mod tests {
         bus.emit_ui(UiCommand::GenerateRandomRail { seed: 42 });
         bus.emit_ui(UiCommand::ToggleFreezePose);
         bus.emit_ui(UiCommand::ExportSdgJson);
-        assert_eq!(bus.poll_ui_commands(&mut scratch), 5);
+        bus.emit_ui(UiCommand::PokeCrowd {
+            impulse: 1.8,
+            all: false,
+        });
+        bus.emit_ui(UiCommand::SpawnCrowdStress { target_count: 2000 });
+        bus.emit_ui(UiCommand::StartSdgBurst { frames: 30 });
+        assert_eq!(bus.poll_ui_commands(&mut scratch), 8);
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[0]),
             Some(&UiCommand::ResetAccum)
@@ -454,6 +488,21 @@ mod tests {
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[4]),
             Some(&UiCommand::ExportSdgJson)
+        );
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[5]),
+            Some(&UiCommand::PokeCrowd {
+                impulse: 1.8,
+                all: false
+            })
+        );
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[6]),
+            Some(&UiCommand::SpawnCrowdStress { target_count: 2000 })
+        );
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[7]),
+            Some(&UiCommand::StartSdgBurst { frames: 30 })
         );
 
         bus.send_render(RenderControl::ReloadShader);

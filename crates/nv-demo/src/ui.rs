@@ -16,6 +16,7 @@ use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::DemoAnimator;
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::{CameraProjection, CaptureSource, DemoSettings};
+use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
 use csg_scene::{ProbeBackendKind, SceneDescriptor, SceneViewpoint, TimeOfDay};
 
 const AOV_LABELS: [&str; 11] = [
@@ -380,6 +381,9 @@ pub struct UiContext<'a> {
     pub record_frames: u64,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
+    pub crowd_step_ms: f32,
+    pub crowd_active_backend: ActiveCrowdBackend,
+    pub crowd_actor_count: u32,
     pub scene_descriptors: &'a [SceneDescriptor],
     pub scene_viewpoints: &'a [SceneViewpoint],
     pub rail_random_seed: &'a mut u64,
@@ -770,6 +774,19 @@ impl UiContext<'_> {
         }
 
         let kb_free = !ui.ctx().egui_wants_keyboard_input();
+        if kb_free
+            && self.settings.csg_mode > 0
+            && ui.input(|i| i.key_pressed(egui::Key::P))
+        {
+            let is_inspector_109 = self
+                .scene_descriptors
+                .get((self.settings.csg_mode as usize).saturating_sub(1))
+                .is_some_and(|d| d.id == "inspector" && self.settings.csg_asset_idx == 109);
+            self.bus.emit_ui(UiCommand::PokeCrowd {
+                impulse: self.settings.poke_impulse,
+                all: is_inspector_109,
+            });
+        }
         if let Some(pinfo) = self.possess_info {
             if kb_free {
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1825,6 +1842,98 @@ impl UiContext<'_> {
                     if freeze_pose != s.csg_freeze_pose {
                         self.bus.emit_ui(UiCommand::ToggleFreezePose);
                     }
+                    ui.add_space(2.0);
+                    let crowd_badge = if self.crowd_actor_count > 0 {
+                        format!(
+                            "Crowd Backend ({} {:.2} ms, {}a)",
+                            self.crowd_active_backend.label(),
+                            self.crowd_step_ms,
+                            self.crowd_actor_count
+                        )
+                    } else {
+                        "Crowd Backend".to_string()
+                    };
+                    ui.label(RichText::new(crowd_badge).small().weak());
+                    equal_grid(ui, 3, 3, |ui, idx, w| {
+                        let b = CrowdBackend::ALL[idx];
+                        let tip = match b {
+                            CrowdBackend::Auto => "Prefer GPU-direct CUDA crowd stepping when available; falls back to CPU and reports active backend.",
+                            CrowdBackend::Cpu => "Run analytical CPU crowd stepping (deterministic reference).",
+                            CrowdBackend::Cuda => "Require GPU-direct NVRTC CUDA crowd stepping (returns error if unavailable; never downgrades).",
+                        };
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::selectable(s.crowd_backend == b, b.label()),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            s.crowd_backend = b;
+                        }
+                    });
+                    ui.label(RichText::new("SDG Occluder").small().weak());
+                    equal_grid(ui, 3, 3, |ui, idx, w| {
+                        let b = SdgOccluderBackend::ALL[idx];
+                        let tip = match b {
+                            SdgOccluderBackend::Auto => "Prefer hardware OptiX 9 batched keypoint occlusion; falls back to CPU and reports active backend.",
+                            SdgOccluderBackend::Cpu => "Analytical CPU CSG ray-occlusion oracle (csg-core).",
+                            SdgOccluderBackend::Optix => "Require hardware OptiX 9 __raygen__sdg_keypoints occlusion (never silently downgrades).",
+                        };
+                        if ui
+                            .add_sized(
+                                [w, ROW_H + 2.0],
+                                egui::Button::selectable(s.sdg_occluder_backend == b, b.label()),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            s.sdg_occluder_backend = b;
+                        }
+                    });
+                    let is_inspector_109 = desc.id == "inspector" && s.csg_asset_idx == 109;
+                    equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                        0 => {
+                            let lbl = if is_inspector_109 {
+                                format!("{}  Poke All (P)", ic::HAND_POINTING)
+                            } else {
+                                format!("{}  Poke (P)", ic::HAND_POINTING)
+                            };
+                            if ui
+                                .add_sized([w, ROW_H + 2.0], egui::Button::new(lbl).truncate())
+                                .on_hover_text(
+                                    "Apply a stumble/flinch impulse to the nearest actor along view (or all actors in Inspector 109). Hotkey: P.",
+                                )
+                                .clicked()
+                            {
+                                self.bus.emit_ui(UiCommand::PokeCrowd {
+                                    impulse: s.poke_impulse,
+                                    all: is_inspector_109,
+                                });
+                            }
+                        }
+                        _ => {
+                            let lbl = format!("{}  Stress 2000", ic::USERS_THREE);
+                            if ui
+                                .add_sized([w, ROW_H + 2.0], egui::Button::new(lbl).truncate())
+                                .on_hover_text(
+                                    "Spawn a 2,000-actor walking crowd stress grid around the camera to benchmark GPU-direct CUDA vs CPU.",
+                                )
+                                .clicked()
+                            {
+                                self.bus
+                                    .emit_ui(UiCommand::SpawnCrowdStress { target_count: 2000 });
+                            }
+                        }
+                    });
+                    prop_slider_f32(
+                        ui,
+                        "Impulse",
+                        &mut s.poke_impulse,
+                        0.5..=4.0,
+                        2,
+                        "m/s",
+                    );
                     prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
                     anim_slider_f32(
                         ui,
@@ -2644,6 +2753,55 @@ impl UiContext<'_> {
                 }
             });
             ui.add_space(2.0);
+            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                0 => {
+                    const BURST_PRESETS: [u32; 3] = [16, 30, 60];
+                    let cur = BURST_PRESETS
+                        .iter()
+                        .position(|&n| n == s.sdg_burst_frames)
+                        .unwrap_or(0);
+                    let lbl = format!("{}f", BURST_PRESETS[cur]);
+                    let step = cycle_toggle_btn(
+                        ui,
+                        w,
+                        "Burst",
+                        &lbl,
+                        "Number of frames captured in one SDG dataset burst (16, 30, or 60 frames).",
+                        s.csg_mode > 0,
+                        None,
+                    );
+                    if step != 0 {
+                        let next =
+                            (cur as i32 + step).rem_euclid(BURST_PRESETS.len() as i32) as usize;
+                        s.sdg_burst_frames = BURST_PRESETS[next];
+                    }
+                }
+                _ => {
+                    let enabled = s.csg_mode > 0;
+                    let lbl = format!(
+                        "{}  SDG Burst ({}f)",
+                        ic::FILM_STRIP,
+                        s.sdg_burst_frames.clamp(1, 240)
+                    );
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(lbl)
+                                .truncate()
+                                .min_size(egui::vec2(w, ROW_H + 2.0)),
+                        )
+                        .on_hover_text(
+                            "Capture a multi-frame SDG dataset burst (9-channel linear OpenEXR + .sdg.json keypoints/BBoxes + manifest.json) into renders/.",
+                        )
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::StartSdgBurst {
+                            frames: s.sdg_burst_frames,
+                        });
+                    }
+                }
+            });
+            ui.add_space(2.0);
             equal_grid(ui, 2, 4, |ui, idx, w| match idx {
                 0 => {
                     let val = match s.capture_source {
@@ -3264,6 +3422,18 @@ impl UiContext<'_> {
                     "CSG VRAM",
                     &format!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
                 );
+                if self.crowd_actor_count > 0 {
+                    stat_row(
+                        ui,
+                        "Crowd Sim",
+                        &format!(
+                            "{} {:.2} ms ({})",
+                            self.crowd_active_backend.label(),
+                            self.crowd_step_ms,
+                            self.crowd_actor_count
+                        ),
+                    );
+                }
             }
         });
 

@@ -1,6 +1,6 @@
 //! Asynchronous OptiX path-tracing worker thread communicating with the 60+ FPS GUI via `appbus`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, c_void};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,9 +27,15 @@ use crate::app_events::{
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
 };
+use crate::cuda_crowd::{CudaCrowdBackend, GpuScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 use crate::profiler::GpuPassProfiler;
+use crate::sdg_export::{
+    ActiveCrowdBackend, ActiveSdgOccluder, CrowdBackend, SdgBurstFrameEntry, SdgBurstManifest,
+    SdgExrFrame, SdgOccluderBackend, write_sdg_exr_atomic, write_sdg_manifest_atomic,
+};
+use csg_actors::{KeypointVis, RayOccluder, SdgCamera, Vec3 as ActorVec3};
 use csg_scene::{
     CpuViewProber, PackedGpuScene, ProbeBackendKind, ProbeSample, SmartViewSelector,
     ViewCandidate, ViewProbeBackend, ViewScore, WgpuViewProber, WorldScene, score_probe_grid,
@@ -127,11 +133,30 @@ struct LaunchParams {
     probe_candidates: u64,
     probe_samples: u64,
     csg_prev_xforms: u64,
-    _pad2: u64,
+    out_semantic_u32: u64,
+    out_instance_u32: u64,
+    sdg_ray_queries: u64,
+    sdg_ray_results: u64,
+    sdg_ray_count: u32,
+    _pad2: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 608);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 640);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_prev_xforms) == 592);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, out_semantic_u32) == 600);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, out_instance_u32) == 608);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_queries) == 616);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_results) == 624);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_count) == 632);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct GpuSdgRayQuery {
+    origin_tmin: [f32; 4],
+    dir_tmax: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<GpuSdgRayQuery>() == 32);
 
 /// Optical sensor projection model for primary ray generation and `Ctrl+Click` Pick-to-Possess.
 #[repr(u32)]
@@ -558,6 +583,14 @@ pub struct DemoSettings {
     pub camera_projection: CameraProjection,
     /// Active primary-ray view scoring backend (`Auto`, `Optix`, `Wgpu`, `Cpu`).
     pub probe_backend: ProbeBackendKind,
+    /// Articulated crowd simulation compute backend (`Auto`, `Cpu`, `Cuda`).
+    pub crowd_backend: CrowdBackend,
+    /// SDG keypoint occlusion raycasting backend (`Auto`, `Cpu`, `Optix`).
+    pub sdg_occluder_backend: SdgOccluderBackend,
+    /// Interactive poke impulse strength (`0.5..=4.0`, default `1.8`).
+    pub poke_impulse: f32,
+    /// Number of frames captured by `Export SDG Burst` (`16`, `30`, or `60`).
+    pub sdg_burst_frames: u32,
 }
 
 impl Default for DemoSettings {
@@ -683,6 +716,10 @@ impl Default for DemoSettings {
             csg_road_mode: default_csg_road_mode(),
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
+            crowd_backend: CrowdBackend::Auto,
+            sdg_occluder_backend: SdgOccluderBackend::Auto,
+            poke_impulse: 1.8,
+            sdg_burst_frames: 16,
         }
     }
 }
@@ -727,6 +764,14 @@ pub struct FrameReady {
     pub fast_preview: bool,
     /// Resolved world camera basis when actively possessing a body (synced back to UI for picking & Eject).
     pub possess_camera: Option<CameraFrame>,
+    /// Exact world camera basis that rendered this frame (consumed by DLSS-RR `WorldToView` / `ViewToClip`).
+    pub rendered_camera: CameraFrame,
+    /// Articulated crowd step wall/GPU duration in milliseconds for the latest frame.
+    pub crowd_step_ms: f32,
+    /// Concrete backend that executed the latest crowd step (`None`, `Cpu`, `Cuda`).
+    pub crowd_active_backend: ActiveCrowdBackend,
+    /// Number of articulated crowd actors currently simulated.
+    pub crowd_actor_count: u32,
 }
 
 struct TonemapKernel {
@@ -763,6 +808,7 @@ struct OptixRig {
     pipeline: Pipeline,
     sbt: ShaderBindingTable,
     probe_sbt: ShaderBindingTable,
+    sdg_sbt: ShaderBindingTable,
     ser_supported: bool,
     denoiser: Denoiser,
     denoiser_is_temporal: bool,
@@ -776,6 +822,8 @@ struct OptixRig {
     prev_denoised_f32: DeviceBuffer<[f32; 4]>,
     motion_f32: DeviceBuffer<[f32; 2]>,
     depth_f32: DeviceBuffer<f32>,
+    semantic_u32: Option<DeviceBuffer<u32>>,
+    instance_u32: Option<DeviceBuffer<u32>>,
     params_buf: DeviceBuffer<u8>,
     tonemap: TonemapKernel,
     bloom: Option<FftBloomPass>,
@@ -787,8 +835,15 @@ struct OptixRig {
     probe_samples_buf: Option<DeviceBuffer<u8>>,
     probe_candidates_host: Vec<GpuProbeCandidate>,
     probe_samples_host: Vec<ProbeSample>,
+    sdg_queries_buf: Option<DeviceBuffer<u8>>,
+    sdg_results_buf: Option<DeviceBuffer<u8>>,
+    sdg_queries_host: Vec<GpuSdgRayQuery>,
+    sdg_results_host: Vec<u32>,
     cpu_prober: CpuViewProber,
     wgpu_prober: Option<WgpuViewProber>,
+    cuda_crowd: Option<Result<CudaCrowdBackend, String>>,
+    crowd_slot_map_host: Vec<u32>,
+    crowd_gas_handles_host: Vec<u64>,
 }
 
 fn find_optix_include() -> Option<String> {
@@ -862,7 +917,15 @@ fn build_optix_pipeline(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Stream,
     rt_ptx: &[u8],
-) -> Result<(Pipeline, ShaderBindingTable, ShaderBindingTable), String> {
+) -> Result<
+    (
+        Pipeline,
+        ShaderBindingTable,
+        ShaderBindingTable,
+        ShaderBindingTable,
+    ),
+    String,
+> {
     let mut opts = PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8)
         .map_err(|e| format!("PipelineOptions: {e}"))?;
     opts.attribute_values = 5;
@@ -875,6 +938,8 @@ fn build_optix_pipeline(
         ProgramGroup::raygen(&module, "__raygen__render").map_err(|e| format!("raygen: {e}"))?;
     let raygen_probe = ProgramGroup::raygen(&module, "__raygen__score_views")
         .map_err(|e| format!("raygen_probe: {e}"))?;
+    let raygen_sdg = ProgramGroup::raygen(&module, "__raygen__sdg_keypoints")
+        .map_err(|e| format!("raygen_sdg: {e}"))?;
     let miss = ProgramGroup::miss(&module, "__miss__miss").map_err(|e| format!("miss: {e}"))?;
     let miss_shadow =
         ProgramGroup::miss(&module, "__miss__shadow").map_err(|e| format!("miss_shadow: {e}"))?;
@@ -939,6 +1004,7 @@ fn build_optix_pipeline(
         &[
             raygen.clone(),
             raygen_probe.clone(),
+            raygen_sdg.clone(),
             miss.clone(),
             miss_shadow.clone(),
             hit_floor.clone(),
@@ -977,8 +1043,15 @@ fn build_optix_pipeline(
         &hit_recs,
     )
     .map_err(|e| format!("probe SBT::new: {e}"))?;
+    let sdg_sbt = ShaderBindingTable::new(
+        stream,
+        &SbtRecord::new(&raygen_sdg, 0u32).map_err(|e| format!("sbt sdg raygen: {e}"))?,
+        &miss_recs,
+        &hit_recs,
+    )
+    .map_err(|e| format!("sdg SBT::new: {e}"))?;
 
-    Ok((pipeline, sbt, probe_sbt))
+    Ok((pipeline, sbt, probe_sbt, sdg_sbt))
 }
 
 fn create_denoiser(
@@ -1602,7 +1675,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         pack_rr_func,
     };
 
-    let (pipeline, sbt, probe_sbt) =
+    let (pipeline, sbt, probe_sbt, sdg_sbt) =
         build_optix_pipeline(&optix_ctx, &stream, &rt_ptx).expect("OptiX pipeline");
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
@@ -1833,6 +1906,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         pipeline,
         sbt,
         probe_sbt,
+        sdg_sbt,
         ser_supported,
         denoiser,
         denoiser_is_temporal,
@@ -1846,6 +1920,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         prev_denoised_f32,
         motion_f32,
         depth_f32,
+        semantic_u32: None,
+        instance_u32: None,
         params_buf,
         tonemap,
         bloom,
@@ -1857,9 +1933,45 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         probe_samples_buf: None,
         probe_candidates_host: Vec::with_capacity(128),
         probe_samples_host: Vec::with_capacity(128 * 192),
+        sdg_queries_buf: None,
+        sdg_results_buf: None,
+        sdg_queries_host: Vec::with_capacity(256),
+        sdg_results_host: Vec::with_capacity(256),
         cpu_prober: CpuViewProber::new(),
         wgpu_prober: None,
+        cuda_crowd: None,
+        crowd_slot_map_host: Vec::with_capacity(1024),
+        crowd_gas_handles_host: Vec::with_capacity(256),
     }
+}
+
+/// Lazily initializes `rig.cuda_crowd` once on first use, caching either the compiled NVRTC
+/// backend or the diagnostic failure string so failed builds are not retried every frame.
+fn ensure_cuda_crowd(rig: &mut OptixRig) -> Result<&mut CudaCrowdBackend, String> {
+    if rig.cuda_crowd.is_none() {
+        rig.cuda_crowd = Some(CudaCrowdBackend::new());
+    }
+    match rig.cuda_crowd.as_mut() {
+        Some(Ok(cc)) => Ok(cc),
+        Some(Err(e)) => Err(e.clone()),
+        None => Err("CUDA crowd backend uninitialized".to_string()),
+    }
+}
+
+/// Pulls GPU-stepped crowd poses (`states`, `bone_outs`, `prev_xforms`, `world_joints`) back into
+/// `rig.csg_host`'s CPU `CrowdSim` (and optionally `WorldScene`) whenever CPU consumers need fresh
+/// geometry (camera repack, `Ctrl+Click` picking, `SpawnCrowdStress`, or SDG JSON export).
+fn sync_cuda_crowd_to_cpu(rig: &mut OptixRig, sync_to_world: bool) -> Result<(), String> {
+    let Some(Ok(cc)) = rig.cuda_crowd.as_mut() else {
+        return Ok(());
+    };
+    if !cc.cpu_bones_stale() {
+        return Ok(());
+    }
+    let Some(scene) = rig.csg_host.active_scene_mut() else {
+        return Ok(());
+    };
+    cc.sync_cpu_snapshot(&rig.stream, scene, sync_to_world)
 }
 
 /// Hardware OptiX 9 primary-ray [`ViewProbeBackend`] launching `__raygen__score_views`
@@ -2138,6 +2250,385 @@ fn score_views_on_rig(
     }
 }
 
+/// Lookup key matching one `(actor_user_id, target_xyz_bits)` keypoint visibility ray.
+type SdgRayKey = (u32, u32, u32, u32);
+
+/// Hardware OptiX 9 batched [`RayOccluder`] populated by a single 1D `__raygen__sdg_keypoints`
+/// launch across all in-frame actor joints.
+struct OptixBatchedOccluder {
+    /// Maps `(actor_user_id, target_x_bits, target_y_bits, target_z_bits)` -> blocking `user_id`
+    /// (`u32::MAX` = unobstructed line of sight).
+    results: HashMap<SdgRayKey, u32>,
+}
+
+impl OptixBatchedOccluder {
+    fn from_pairs(keys: &[SdgRayKey], blockers: &[u32]) -> Self {
+        let mut results = HashMap::with_capacity(keys.len());
+        for (&k, &uid) in keys.iter().zip(blockers.iter()) {
+            results.insert(k, uid);
+        }
+        Self { results }
+    }
+}
+
+impl RayOccluder for OptixBatchedOccluder {
+    fn test_visibility(
+        &self,
+        _eye: ActorVec3,
+        target: ActorVec3,
+        _joint_radius: f32,
+        actor_user_id: u32,
+    ) -> KeypointVis {
+        let key = (
+            actor_user_id,
+            target.x.to_bits(),
+            target.y.to_bits(),
+            target.z.to_bits(),
+        );
+        match self.results.get(&key).copied() {
+            None | Some(u32::MAX) => KeypointVis::Visible,
+            Some(uid) if uid == actor_user_id => KeypointVis::SelfOccluded,
+            Some(_) => KeypointVis::OccludedWorld,
+        }
+    }
+}
+
+/// Runs a single batched OptiX 9 `__raygen__sdg_keypoints` launch across all in-frame crowd
+/// keypoints against the live scene IAS with zero steady-state GPU reallocations.
+fn trace_sdg_occluder_optix(
+    rig: &mut OptixRig,
+    sdg_cam: &SdgCamera,
+) -> Result<OptixBatchedOccluder, String> {
+    let ias_handle = rig
+        .ias
+        .as_ref()
+        .map(|a| a.handle())
+        .filter(|&h| h != 0)
+        .ok_or_else(|| "OptiX IAS unavailable for hardware SDG keypoint occlusion".to_string())?;
+    let crowd = rig
+        .csg_host
+        .active_crowd()
+        .ok_or_else(|| "Load a CSG scene before running OptiX SDG keypoint occlusion".to_string())?;
+
+    rig.sdg_queries_host.clear();
+    let mut keys: Vec<SdgRayKey> = Vec::with_capacity(crowd.world_joints.len());
+    let w = sdg_cam.width as f32;
+    let h = sdg_cam.height as f32;
+    let eye = sdg_cam.eye;
+
+    for desc in &crowd.descs {
+        let topo = &crowd.topologies[desc.archetype_id as usize];
+        let b0 = desc.bone_offset as usize;
+        for li in 0..topo.joints.len() {
+            let jw = crowd.world_joints[b0 + li];
+            let p3 = ActorVec3::new(jw[0], jw[1], jw[2]);
+            let Some(p2) = sdg_cam.project_point(p3) else {
+                continue;
+            };
+            if p2[0] < 0.0 || p2[0] >= w || p2[1] < 0.0 || p2[1] >= h {
+                continue;
+            }
+            let delta = p3 - eye;
+            let dist = delta.len();
+            let tmin = 1e-3_f32;
+            let tmax = dist - jw[3].max(0.01) - 1e-3;
+            if !dist.is_finite() || !tmax.is_finite() || tmax <= tmin {
+                continue;
+            }
+            let inv_dist = 1.0 / dist;
+            rig.sdg_queries_host.push(GpuSdgRayQuery {
+                origin_tmin: [eye.x, eye.y, eye.z, tmin],
+                dir_tmax: [
+                    delta.x * inv_dist,
+                    delta.y * inv_dist,
+                    delta.z * inv_dist,
+                    tmax,
+                ],
+            });
+            keys.push((
+                desc.user_id,
+                p3.x.to_bits(),
+                p3.y.to_bits(),
+                p3.z.to_bits(),
+            ));
+        }
+    }
+
+    let query_count = rig.sdg_queries_host.len();
+    if query_count == 0 {
+        return Ok(OptixBatchedOccluder {
+            results: HashMap::new(),
+        });
+    }
+
+    let q_bytes_len = query_count * std::mem::size_of::<GpuSdgRayQuery>();
+    if rig
+        .sdg_queries_buf
+        .as_ref()
+        .is_none_or(|b| b.num_bytes() < q_bytes_len)
+    {
+        let cap_bytes = q_bytes_len
+            .next_power_of_two()
+            .max(256 * std::mem::size_of::<GpuSdgRayQuery>());
+        rig.sdg_queries_buf = Some(
+            DeviceBuffer::zeroed(&rig.stream, cap_bytes)
+                .map_err(|e| format!("OptiX SDG ray query buffer alloc failed: {e}"))?,
+        );
+    }
+    let r_bytes_len = query_count * std::mem::size_of::<u32>();
+    if rig
+        .sdg_results_buf
+        .as_ref()
+        .is_none_or(|b| b.num_bytes() < r_bytes_len)
+    {
+        let cap_bytes = r_bytes_len
+            .next_power_of_two()
+            .max(256 * std::mem::size_of::<u32>());
+        rig.sdg_results_buf = Some(
+            DeviceBuffer::zeroed(&rig.stream, cap_bytes)
+                .map_err(|e| format!("OptiX SDG ray result buffer alloc failed: {e}"))?,
+        );
+    }
+
+    let q_ptr = rig
+        .sdg_queries_buf
+        .as_ref()
+        .ok_or_else(|| "SDG query buffer missing".to_string())?
+        .cu_deviceptr();
+    let r_ptr = rig
+        .sdg_results_buf
+        .as_ref()
+        .ok_or_else(|| "SDG result buffer missing".to_string())?
+        .cu_deviceptr();
+
+    let q_bytes: &[u8] = bytemuck::cast_slice(&rig.sdg_queries_host);
+    // SAFETY: `sdg_queries_buf` holds `>= q_bytes.len()` bytes on `rig.stream`, and
+    // `sdg_queries_host` stays live through `rig.stream.synchronize()`.
+    let h2d = unsafe {
+        cu::cuMemcpyHtoDAsync_v2(
+            q_ptr,
+            q_bytes.as_ptr().cast(),
+            q_bytes.len(),
+            rig.stream.cu_stream(),
+        )
+    };
+    if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("OptiX SDG query upload failed ({h2d:?})"));
+    }
+
+    let csg_ptrs = rig.csg_host.device_pointers();
+    let lp = LaunchParams {
+        handle: ias_handle,
+        csg_compounds: csg_ptrs.compounds,
+        csg_ops: csg_ptrs.ops,
+        csg_prims: csg_ptrs.prims,
+        csg_aux_planes: csg_ptrs.aux_planes,
+        csg_guard_aabbs: csg_ptrs.guard_aabbs,
+        csg_repeats: csg_ptrs.repeats,
+        csg_materials: csg_ptrs.materials,
+        csg_instances: csg_ptrs.instances,
+        csg_instance_count: csg_ptrs.instance_count,
+        csg_material_count: csg_ptrs.material_count,
+        csg_compound_count: csg_ptrs.compound_count,
+        csg_flags: csg_flags::ENABLED,
+        sdg_ray_queries: q_ptr,
+        sdg_ray_results: r_ptr,
+        sdg_ray_count: query_count as u32,
+        ..LaunchParams::zeroed()
+    };
+    rig.params_buf
+        .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
+        .map_err(|e| format!("OptiX SDG LaunchParams upload failed: {e}"))?;
+
+    // SAFETY: `params_buf` matches `Params` layout; `sdg_queries_buf` and `sdg_results_buf` are
+    // sized for `query_count` entries and remain live through `rig.stream.synchronize()`.
+    unsafe {
+        rig.pipeline.launch(
+            &rig.stream,
+            &rig.params_buf,
+            &rig.sdg_sbt,
+            [query_count as u32, 1, 1],
+        )
+    }
+    .map_err(|e| format!("OptiX __raygen__sdg_keypoints launch failed: {e}"))?;
+    rig.stream
+        .synchronize()
+        .map_err(|e| format!("OptiX SDG occluder sync failed: {e}"))?;
+
+    rig.sdg_results_host.resize(query_count, u32::MAX);
+    let r_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut rig.sdg_results_host[..query_count]);
+    // SAFETY: `sdg_results_buf` holds `>= query_count` `u32` elements and GPU execution synced.
+    let d2h = unsafe { cu::cuMemcpyDtoH_v2(r_bytes.as_mut_ptr().cast(), r_ptr, r_bytes.len()) };
+    if d2h != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("OptiX SDG result readback failed ({d2h:?})"));
+    }
+
+    Ok(OptixBatchedOccluder::from_pairs(
+        &keys,
+        &rig.sdg_results_host[..query_count],
+    ))
+}
+
+/// Exports exact SDG keypoints & tight BBoxes honoring strict backend semantics:
+/// explicit [`SdgOccluderBackend::Optix`] never silently downgrades to CPU on failure, while
+/// [`SdgOccluderBackend::Auto`] tries OptiX first and reports which concrete backend ran.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "forwards output path, camera, projection, viewport dims, frame metadata, and backend selector cleanly"
+)]
+fn export_sdg_json_with_backend(
+    rig: &mut OptixRig,
+    path: &std::path::Path,
+    cam: &CameraFrame,
+    projection: CameraProjection,
+    width: u32,
+    height: u32,
+    frame_index: u32,
+    time_s: f32,
+    backend: SdgOccluderBackend,
+) -> Result<(usize, ActiveSdgOccluder), String> {
+    sync_cuda_crowd_to_cpu(rig, true)?;
+    match backend {
+        SdgOccluderBackend::Cpu => {
+            let count = rig
+                .csg_host
+                .export_sdg_json(path, cam, projection, width, height, frame_index, time_s)?;
+            Ok((count, ActiveSdgOccluder::Cpu))
+        }
+        SdgOccluderBackend::Optix => {
+            let sdg_cam = CsgGpuHost::build_sdg_camera(cam, projection, width, height);
+            let occluder = trace_sdg_occluder_optix(rig, &sdg_cam)?;
+            let count = rig.csg_host.export_sdg_json_with_occluder(
+                path,
+                sdg_cam,
+                frame_index,
+                time_s,
+                &occluder,
+            )?;
+            Ok((count, ActiveSdgOccluder::Optix))
+        }
+        SdgOccluderBackend::Auto => {
+            let sdg_cam = CsgGpuHost::build_sdg_camera(cam, projection, width, height);
+            if let Ok(occluder) = trace_sdg_occluder_optix(rig, &sdg_cam) {
+                let count = rig.csg_host.export_sdg_json_with_occluder(
+                    path,
+                    sdg_cam,
+                    frame_index,
+                    time_s,
+                    &occluder,
+                )?;
+                Ok((count, ActiveSdgOccluder::Optix))
+            } else {
+                let count = rig.csg_host.export_sdg_json(
+                    path,
+                    cam,
+                    projection,
+                    width,
+                    height,
+                    frame_index,
+                    time_s,
+                )?;
+                Ok((count, ActiveSdgOccluder::Cpu))
+            }
+        }
+    }
+}
+
+/// Reusable host-side staging scratch for multi-channel OpenEXR SDG burst readbacks.
+#[derive(Default)]
+struct SdgExrReadbackScratch {
+    color_rgba: Vec<[f32; 4]>,
+    depth_f32: Vec<f32>,
+    motion_xy: Vec<[f32; 2]>,
+    semantic_u32: Vec<u32>,
+    instance_u32: Vec<u32>,
+}
+
+/// Active multi-frame OpenEXR + SDG JSON + `manifest.json` dataset burst capture state.
+struct SdgBurstState {
+    dir: PathBuf,
+    total_frames: u32,
+    current_frame: u32,
+    target_accum: u32,
+    occluder: SdgOccluderBackend,
+    last_active_occluder: ActiveSdgOccluder,
+    stepped_current_frame: bool,
+    entries: Vec<SdgBurstFrameEntry>,
+}
+
+/// Reads back the 9 SDG AOV channels (`R/G/B/A`, `depth.Z`, `motion.X/Y`, `semantic.id`,
+/// `instance.id`) from `rig` and writes one atomic ZIP-compressed OpenEXR frame to `path`.
+fn readback_and_write_sdg_exr(
+    rig: &OptixRig,
+    width: u32,
+    height: u32,
+    path: &std::path::Path,
+    scratch: &mut SdgExrReadbackScratch,
+) -> Result<(), String> {
+    let n = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "SDG EXR pixel count overflow".to_string())?;
+    let sem_buf = rig
+        .semantic_u32
+        .as_ref()
+        .ok_or_else(|| "SDG semantic_u32 device buffer not initialized".to_string())?;
+    let inst_buf = rig
+        .instance_u32
+        .as_ref()
+        .ok_or_else(|| "SDG instance_u32 device buffer not initialized".to_string())?;
+
+    scratch.color_rgba.resize(n, [0.0; 4]);
+    scratch.depth_f32.resize(n, 0.0);
+    scratch.motion_xy.resize(n, [0.0; 2]);
+    scratch.semantic_u32.resize(n, 0);
+    scratch.instance_u32.resize(n, 0);
+
+    let copy_d2h = |dst: &mut [u8], src_ptr: u64, label: &str| -> Result<(), String> {
+        // SAFETY: GPU stream synced before readback; `src_ptr` holds `>= dst.len()` bytes.
+        let rc = unsafe { cu::cuMemcpyDtoH_v2(dst.as_mut_ptr().cast(), src_ptr, dst.len()) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("SDG EXR {label} readback failed ({rc:?})"));
+        }
+        Ok(())
+    };
+    copy_d2h(
+        bytemuck::cast_slice_mut(&mut scratch.color_rgba[..n]),
+        rig.color_f32.cu_deviceptr(),
+        "color_f32",
+    )?;
+    copy_d2h(
+        bytemuck::cast_slice_mut(&mut scratch.depth_f32[..n]),
+        rig.depth_f32.cu_deviceptr(),
+        "depth_f32",
+    )?;
+    copy_d2h(
+        bytemuck::cast_slice_mut(&mut scratch.motion_xy[..n]),
+        rig.motion_f32.cu_deviceptr(),
+        "motion_f32",
+    )?;
+    copy_d2h(
+        bytemuck::cast_slice_mut(&mut scratch.semantic_u32[..n]),
+        sem_buf.cu_deviceptr(),
+        "semantic_u32",
+    )?;
+    copy_d2h(
+        bytemuck::cast_slice_mut(&mut scratch.instance_u32[..n]),
+        inst_buf.cu_deviceptr(),
+        "instance_u32",
+    )?;
+
+    let frame = SdgExrFrame {
+        width,
+        height,
+        color_rgba: &scratch.color_rgba[..n],
+        depth: &scratch.depth_f32[..n],
+        motion: &scratch.motion_xy[..n],
+        semantic_id: &scratch.semantic_u32[..n],
+        instance_id: &scratch.instance_u32[..n],
+    };
+    write_sdg_exr_atomic(path, &frame)
+}
+
 fn csg_pose_to_camera_frame(pose: csg_scene::CameraPose) -> CameraFrame {
     let fwd = glam::Vec3::new(pose.forward.x, pose.forward.y, pose.forward.z).normalize_or_zero();
     let fwd = if fwd.length_squared() > 1e-8 {
@@ -2214,6 +2705,8 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) {
     rig.prev_denoised_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("prev_denoised_f32 resize");
     rig.motion_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("motion_f32 resize");
     rig.depth_f32 = DeviceBuffer::zeroed(&rig.stream, n).expect("depth_f32 resize");
+    rig.semantic_u32 = None;
+    rig.instance_u32 = None;
     let (denoiser, is_temporal) =
         create_denoiser(&rig._optix_ctx, &rig.stream, width, height, temporal);
     rig.denoiser = denoiser;
@@ -2317,6 +2810,11 @@ pub fn spawn_render_thread(
             );
             let mut last_tick = Instant::now();
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
+            let mut active_burst: Option<SdgBurstState> = None;
+            let mut burst_exr_scratch = SdgExrReadbackScratch::default();
+            let mut last_crowd_step_ms: f32 = 0.0;
+            let mut last_crowd_backend = ActiveCrowdBackend::None;
+            let mut last_cuda_crowd_err: Option<String> = None;
             let mut rec_active = false;
             let mut rec_fixed_fps: u32 = 0;
             let mut rec_shutter_subframes: u32 = 1;
@@ -2346,6 +2844,11 @@ pub fn spawn_render_thread(
                                 resize_rig(&mut rig, *width, *height, settings.temporal_denoise);
                                 cur_w = *width;
                                 cur_h = *height;
+                                if active_burst.take().is_some() {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(
+                                        "SDG Burst cancelled (viewport resized)".to_string(),
+                                    ));
+                                }
                             }
                             buf_ptrs = *new_ptrs;
                             depth_ptrs = *new_depth_ptrs;
@@ -2369,8 +2872,9 @@ pub fn spawn_render_thread(
                             pending_jpeg = Some((path.clone(), *quality));
                             accum_count = accum_count.min(settings.max_accum.saturating_sub(1));
                         }
-                        RenderControl::ExportSdgJson { path } => {
-                            match rig.csg_host.export_sdg_json(
+                        RenderControl::ExportSdgJson { path, occluder } => {
+                            match export_sdg_json_with_backend(
+                                &mut rig,
                                 path,
                                 &last_rendered_camera,
                                 settings.camera_projection,
@@ -2378,10 +2882,12 @@ pub fn spawn_render_thread(
                                 cur_h,
                                 frame_index,
                                 traffic_time,
+                                *occluder,
                             ) {
-                                Ok(actor_count) => {
+                                Ok((actor_count, active_occ)) => {
                                     bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                        "Saved SDG JSON ({actor_count} actors) -> {}",
+                                        "Saved SDG JSON ({actor_count} actors, {}) -> {}",
+                                        active_occ.label(),
                                         path.display()
                                     )));
                                 }
@@ -2389,6 +2895,83 @@ pub fn spawn_render_thread(
                                     bus.emit_render_event(RenderEvent::StatusMessage(format!(
                                         "SDG JSON export failed: {e}"
                                     )));
+                                }
+                            }
+                        }
+                        RenderControl::StartSdgBurst {
+                            dir,
+                            frames,
+                            occluder,
+                        } => {
+                            if settings.csg_mode == 0 {
+                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                    "Load a CSG scene before exporting an SDG Burst".to_string(),
+                                ));
+                            } else {
+                                let total_frames = (*frames).clamp(1, 240);
+                                let target_accum = settings.max_accum.clamp(4, 16);
+                                active_burst = Some(SdgBurstState {
+                                    dir: dir.clone(),
+                                    total_frames,
+                                    current_frame: 0,
+                                    target_accum,
+                                    occluder: *occluder,
+                                    last_active_occluder: ActiveSdgOccluder::Cpu,
+                                    stepped_current_frame: false,
+                                    entries: Vec::with_capacity(total_frames as usize),
+                                });
+                                accum_count = 0;
+                                fast_preview_reduced = false;
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "Starting SDG Burst ({total_frames}f @ {target_accum}x{} spp) -> {}",
+                                    settings.spp.max(1),
+                                    dir.display()
+                                )));
+                            }
+                        }
+                        RenderControl::PokeCrowd {
+                            origin,
+                            forward,
+                            impulse,
+                            all,
+                        } => {
+                            match rig.csg_host.poke_crowd(*origin, *forward, *impulse, *all) {
+                                Ok(msg) => {
+                                    if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                                        cc.mark_intents_dirty();
+                                    }
+                                    accum_count = 0;
+                                    bus.emit_render_event(RenderEvent::StatusMessage(msg));
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
+                                }
+                            }
+                        }
+                        RenderControl::SpawnCrowdStress {
+                            target_count,
+                            origin,
+                        } => {
+                            let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
+                            match rig.csg_host.spawn_crowd_stress(
+                                &rig._optix_ctx,
+                                &rig.stream,
+                                &mut rig._scratch,
+                                *target_count,
+                                *origin,
+                            ) {
+                                Ok(added) => {
+                                    if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                                        cc.mark_scene_dirty();
+                                    }
+                                    accum_count = 0;
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Crowd stress grid: +{added} actors (total {})",
+                                        rig.csg_host.crowd_actor_count()
+                                    )));
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
                                 }
                             }
                         }
@@ -2438,6 +3021,7 @@ pub fn spawn_render_thread(
                             }
                         }
                         RenderControl::PickPossess { origin, dir } => {
+                            let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
                             match rig.csg_host.pick_possess(*origin, *dir) {
                                 Ok(info) => {
                                     possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
@@ -2452,6 +3036,7 @@ pub fn spawn_render_thread(
                             }
                         }
                         RenderControl::PossessNextVehicle => {
+                            let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
                             match rig.csg_host.possess_next_vehicle() {
                                 Ok(info) => {
                                     possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
@@ -2635,11 +3220,12 @@ pub fn spawn_render_thread(
                                     build_optix_pipeline(&rig._optix_ctx, &rig.stream, &ptx)
                                 });
                             match res {
-                                Ok((pipeline, sbt, probe_sbt)) => {
+                                Ok((pipeline, sbt, probe_sbt, sdg_sbt)) => {
                                     let _ = rig.stream.synchronize();
                                     rig.pipeline = pipeline;
                                     rig.sbt = sbt;
                                     rig.probe_sbt = probe_sbt;
+                                    rig.sdg_sbt = sdg_sbt;
                                     accum_count = 0;
                                     fast_preview_reduced = false;
                                     bus.emit_render_event(RenderEvent::StatusMessage(
@@ -2691,6 +3277,10 @@ pub fn spawn_render_thread(
                     tmp.time_scale = settings.time_scale;
                     tmp.record_shutter_subframes = settings.record_shutter_subframes;
                     tmp.probe_backend = settings.probe_backend;
+                    tmp.crowd_backend = settings.crowd_backend;
+                    tmp.sdg_occluder_backend = settings.sdg_occluder_backend;
+                    tmp.poke_impulse = settings.poke_impulse;
+                    tmp.sdg_burst_frames = settings.sdg_burst_frames;
                     if s.aov_mode < 3 && settings.aov_mode < 3 {
                         tmp.aov_mode = settings.aov_mode;
                     }
@@ -2714,9 +3304,11 @@ pub fn spawn_render_thread(
                 }
 
                 let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
+                let burst_active = active_burst.is_some();
                 let now_preview = Instant::now();
                 let fast_preview = !rec_active
                     && !in_shutter_mode
+                    && !burst_active
                     && interacting_until.is_some_and(|until| now_preview < until);
                 if !fast_preview && fast_preview_reduced {
                     // Interaction settle window expired — restart clean full-quality accumulation.
@@ -2740,6 +3332,7 @@ pub fn spawn_render_thread(
                     && settings.csg_traffic_speed > 0.001;
                 let csg_dynamic_moving = csg_traffic_moving || csg_crowd_moving;
                 let converged = !in_shutter_mode
+                    && !burst_active
                     && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
                     && !csg_dynamic_moving
@@ -2815,33 +3408,133 @@ pub fn spawn_render_thread(
                         accum_count = 0;
                     }
                 }
-                if csg_traffic_moving || csg_crowd_moving {
-                    let dyn_dt = dt * settings.csg_traffic_speed;
-                    traffic_time += dyn_dt;
-                    let moved = rig.csg_host.step_dynamic(
-                        if csg_crowd_moving { dyn_dt } else { 0.0 },
-                        traffic_time,
-                        last_rendered_camera.eye,
-                        false,
-                        csg_traffic_moving,
-                    );
-                    if moved && !preserve_shutter_accum {
-                        accum_count = 0;
+                let (step_traffic_now, crowd_step_dt, freeze_now, burst_step_frame) =
+                    if let Some(ref mut burst) = active_burst {
+                        if !burst.stepped_current_frame {
+                            let burst_dt = (1.0 / 30.0) * settings.csg_traffic_speed.max(0.1);
+                            traffic_time += burst_dt;
+                            accum_count = 0;
+                            burst.stepped_current_frame = true;
+                            (
+                                rig.csg_host.has_traffic() && settings.csg_traffic_on,
+                                if rig.csg_host.has_crowd() { burst_dt } else { 0.0 },
+                                false,
+                                true,
+                            )
+                        } else {
+                            (false, 0.0, false, false)
+                        }
+                    } else if csg_traffic_moving || csg_crowd_moving {
+                        let dyn_dt = dt * settings.csg_traffic_speed;
+                        traffic_time += dyn_dt;
+                        (
+                            csg_traffic_moving,
+                            if csg_crowd_moving { dyn_dt } else { 0.0 },
+                            false,
+                            false,
+                        )
+                    } else {
+                        (false, 0.0, settings.csg_freeze_pose, false)
+                    };
+
+                if freeze_now {
+                    let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
+                }
+                if rig.csg_host.sync_freeze_pose(freeze_now)
+                    && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
+                {
+                    cc.mark_intents_dirty();
+                }
+
+                let mut run_cuda_crowd_after_sync = false;
+                if rig.csg_host.has_crowd() && crowd_step_dt > 0.0 {
+                    match settings.crowd_backend {
+                        CrowdBackend::Cpu => {
+                            let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
+                            let t_crowd = Instant::now();
+                            let moved = rig.csg_host.step_dynamic(
+                                crowd_step_dt,
+                                traffic_time,
+                                last_rendered_camera.eye,
+                                false,
+                                step_traffic_now,
+                            );
+                            last_crowd_step_ms = t_crowd.elapsed().as_secs_f32() * 1000.0;
+                            last_crowd_backend = ActiveCrowdBackend::Cpu;
+                            last_cuda_crowd_err = None;
+                            if moved && !preserve_shutter_accum && !burst_step_frame {
+                                accum_count = 0;
+                            }
+                        }
+                        CrowdBackend::Cuda | CrowdBackend::Auto => {
+                            let moved_traffic = rig.csg_host.step_dynamic(
+                                0.0,
+                                traffic_time,
+                                last_rendered_camera.eye,
+                                false,
+                                step_traffic_now,
+                            );
+                            if moved_traffic && !preserve_shutter_accum && !burst_step_frame {
+                                accum_count = 0;
+                            }
+                            match ensure_cuda_crowd(&mut rig) {
+                                Ok(_) => {
+                                    run_cuda_crowd_after_sync = true;
+                                    last_cuda_crowd_err = None;
+                                }
+                                Err(err) => {
+                                    if settings.crowd_backend == CrowdBackend::Cuda {
+                                        // Strict backend semantics: explicit CUDA never silently downgrades.
+                                        if last_cuda_crowd_err.as_deref() != Some(err.as_str()) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("CUDA crowd error: {err}"),
+                                            ));
+                                            last_cuda_crowd_err = Some(err);
+                                        }
+                                        last_crowd_step_ms = 0.0;
+                                        last_crowd_backend = ActiveCrowdBackend::None;
+                                    } else {
+                                        let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
+                                        let t_crowd = Instant::now();
+                                        let moved = rig.csg_host.step_dynamic(
+                                            crowd_step_dt,
+                                            traffic_time,
+                                            last_rendered_camera.eye,
+                                            false,
+                                            false,
+                                        );
+                                        last_crowd_step_ms =
+                                            t_crowd.elapsed().as_secs_f32() * 1000.0;
+                                        last_crowd_backend = ActiveCrowdBackend::Cpu;
+                                        if moved && !preserve_shutter_accum && !burst_step_frame {
+                                            accum_count = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
-                    let _ = rig.csg_host.step_dynamic(
+                    let moved = rig.csg_host.step_dynamic(
                         0.0,
                         traffic_time,
                         last_rendered_camera.eye,
-                        settings.csg_freeze_pose,
-                        false,
+                        freeze_now,
+                        step_traffic_now,
                     );
+                    if moved && !preserve_shutter_accum && !burst_step_frame {
+                        accum_count = 0;
+                    }
+                    if !rig.csg_host.has_crowd() {
+                        last_crowd_step_ms = 0.0;
+                        last_crowd_backend = ActiveCrowdBackend::None;
+                    }
                 }
 
                 // Resolve live possessed camera mount AFTER dynamic traffic advances so the
                 // camera stays mathematically locked to moving vehicles with zero 1-frame lag.
                 let mut possess_cam_out: Option<CameraFrame> = None;
-                let active_camera = if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                let mut active_camera = if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
                     possess_free_yaw,
                     possess_free_pitch,
                     possess_auto_level,
@@ -2882,9 +3575,25 @@ pub fn spawn_render_thread(
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
                 if building_scene {
+                    if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                        cc.mark_scene_dirty();
+                    }
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::BuildingCsgScene));
                 }
                 let vfov_rad = 2.0 * active_camera.tan_half_fov.max(0.05).atan();
+                let csg_cam_params = CsgCameraParams {
+                    eye: active_camera.eye,
+                    fwd: active_camera.fwd,
+                    up: active_camera.up,
+                    viewport_w: cur_w,
+                    viewport_h: cur_h,
+                    vfov_rad,
+                    lod_bias: settings.csg_lod_bias,
+                    omnidirectional: settings.camera_projection.is_omnidirectional(),
+                };
+                if !building_scene && rig.csg_host.will_camera_repack(csg_key, csg_cam_params) {
+                    let _ = sync_cuda_crowd_to_cpu(&mut rig, true);
+                }
                 let csg_sync = match rig.csg_host.sync(
                     &rig._optix_ctx,
                     &rig.stream,
@@ -2892,18 +3601,9 @@ pub fn spawn_render_thread(
                     csg_key,
                     settings.csg_wetness,
                     settings.csg_time_of_day,
-                    CsgCameraParams {
-                        eye: active_camera.eye,
-                        fwd: active_camera.fwd,
-                        up: active_camera.up,
-                        viewport_w: cur_w,
-                        viewport_h: cur_h,
-                        vfov_rad,
-                        lod_bias: settings.csg_lod_bias,
-                        omnidirectional: settings.camera_projection.is_omnidirectional(),
-                    },
+                    csg_cam_params,
                     traffic_time,
-                    settings.csg_freeze_pose,
+                    settings.csg_freeze_pose || active_burst.is_some(),
                 ) {
                     Ok(sync_res) => sync_res,
                     Err(e) => {
@@ -2913,6 +3613,11 @@ pub fn spawn_render_thread(
                         CsgSyncResult::Unchanged
                     }
                 };
+                if (building_scene || matches!(csg_sync, CsgSyncResult::FullRepack))
+                    && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
+                {
+                    cc.mark_topology_dirty();
+                }
                 let is_possessing_now = rig.csg_host.is_possessing();
                 if was_possessing && !is_possessing_now {
                     bus.emit_render_event(RenderEvent::PossessChanged(None));
@@ -2993,6 +3698,7 @@ pub fn spawn_render_thread(
                                     &rig.ias_dyn_scratch,
                                 )
                                 .is_ok()
+                            && !run_cuda_crowd_after_sync
                         {
                             // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
                             let _ = unsafe {
@@ -3061,6 +3767,115 @@ pub fn spawn_render_thread(
                             },
                         );
                         last_ias_state = ias_state;
+                    }
+                }
+
+                // GPU-direct CUDA articulated crowd step -> scatter into VRAM (`csg_instances`,
+                // `csg_prev_xforms`, `d_optix_instances`) -> single OptiX IAS refit/rebuild.
+                if run_cuda_crowd_after_sync && rig.csg_host.has_crowd() && rig.ias.is_some() {
+                    let csg_ptrs_scatter = rig.csg_host.device_pointers();
+                    let possessing_crowd = rig.csg_host.is_possessing_crowd();
+                    let optix_ptr = if rig.d_optix_instances.len()
+                        >= rig.ias_classic_count + csg_ptrs_scatter.instance_count as usize
+                    {
+                        rig.d_optix_instances.device_ptr()
+                    } else {
+                        0
+                    };
+                    let scatter = GpuScatterTarget {
+                        csg_instances_ptr: csg_ptrs_scatter.instances,
+                        csg_prev_xforms_ptr: csg_ptrs_scatter.prev_xforms,
+                        max_csg_instances: csg_ptrs_scatter.instance_count,
+                        optix_instances_ptr: optix_ptr,
+                        optix_slot_offset: rig.ias_classic_count as u32,
+                        max_optix_instances: rig.d_optix_instances.len() as u32,
+                    };
+
+                    let need_topo = rig
+                        .cuda_crowd
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .is_some_and(CudaCrowdBackend::topology_dirty);
+                    if need_topo {
+                        rig.csg_host
+                            .fill_crowd_bone_slot_map(&mut rig.crowd_slot_map_host);
+                        rig.csg_host
+                            .fill_compound_gas_handles(&mut rig.crowd_gas_handles_host);
+                        if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                            let _ = cc.upload_scatter_topology(
+                                &rig.stream,
+                                &rig.crowd_slot_map_host,
+                                &rig.crowd_gas_handles_host,
+                                rig.csg_host.compound_sbt_offsets(),
+                            );
+                        }
+                    }
+
+                    let cuda_step_res = match (
+                        rig.cuda_crowd.as_mut(),
+                        rig.csg_host.active_scene_mut(),
+                    ) {
+                        (Some(Ok(cc)), Some(scene)) => cc.step_gpu_direct(
+                            &rig.stream,
+                            scene,
+                            crowd_step_dt,
+                            traffic_time,
+                            active_camera.eye,
+                            Some(scatter),
+                            possessing_crowd,
+                        ),
+                        _ => Err("CUDA crowd backend unavailable".to_string()),
+                    };
+                    match cuda_step_res {
+                        Ok(report) => {
+                            last_crowd_step_ms = report.step_ms;
+                            last_crowd_backend = ActiveCrowdBackend::Cuda;
+                            last_cuda_crowd_err = None;
+                            if !preserve_shutter_accum && !burst_step_frame {
+                                accum_count = 0;
+                            }
+                            if optix_ptr != 0 {
+                                // SAFETY: all launches on `rig.stream` are strictly stream-ordered
+                                // and `scatter_crowd_to_csg_and_optix` finished before this call.
+                                let _ = unsafe {
+                                    Accel::instances_into(
+                                        &rig._optix_ctx,
+                                        &rig.stream,
+                                        &mut rig._scratch,
+                                        &rig.d_optix_instances,
+                                        ias_build_opts(),
+                                        report.needs_full_ias_rebuild,
+                                        &mut rig.ias,
+                                    )
+                                }
+                                .expect("IAS CUDA crowd refit");
+                            }
+                            if possessing_crowd
+                                && let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                                    possess_free_yaw,
+                                    possess_free_pitch,
+                                    possess_auto_level,
+                                )
+                            {
+                                let updated = csg_pose_to_camera_frame(csg_pose);
+                                if possess_blend_rem <= 0.0 {
+                                    possess_damper.snap(camera_frame_to_core_pose(updated));
+                                    active_camera = updated;
+                                    last_rendered_camera = updated;
+                                    possess_cam_out = Some(updated);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if last_cuda_crowd_err.as_deref() != Some(err.as_str()) {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA crowd step failed: {err}"
+                                )));
+                                last_cuda_crowd_err = Some(err);
+                            }
+                            last_crowd_step_ms = 0.0;
+                            last_crowd_backend = ActiveCrowdBackend::None;
+                        }
                     }
                 }
                 if building_scene {
@@ -3180,6 +3995,22 @@ pub fn spawn_render_thread(
                 if frame_is_fast_preview {
                     fast_preview_reduced = true;
                 }
+
+                let (out_semantic_u32_ptr, out_instance_u32_ptr) = if active_burst.is_some() {
+                    let n_px = (cur_w * cur_h) as usize;
+                    if rig.semantic_u32.is_none() {
+                        rig.semantic_u32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
+                    }
+                    if rig.instance_u32.is_none() {
+                        rig.instance_u32 = DeviceBuffer::zeroed(&rig.stream, n_px).ok();
+                    }
+                    (
+                        rig.semantic_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
+                        rig.instance_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
+                    )
+                } else {
+                    (0, 0)
+                };
 
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
@@ -3319,9 +4150,14 @@ pub fn spawn_render_thread(
                     probe_candidates: 0,
                     probe_samples: 0,
                     csg_prev_xforms: csg_ptrs.prev_xforms,
+                    out_semantic_u32: out_semantic_u32_ptr,
+                    out_instance_u32: out_instance_u32_ptr,
+                    sdg_ray_queries: 0,
+                    sdg_ray_results: 0,
+                    sdg_ray_count: 0,
                     _pad2: 0,
                 };
-                if publish_frame {
+                if publish_frame && active_burst.is_none() {
                     prev_camera = active_camera;
                 }
                 rig.params_buf
@@ -3357,6 +4193,9 @@ pub fn spawn_render_thread(
                         prof.mark_bloom_end(slot, &rig.stream);
                         prof.mark_frame_end(slot, &rig.stream);
                     }
+                    // Synchronize before looping to the next 180-degree shutter subframe so the
+                    // next subframe's pinned H2D staging upload cannot race with this DMA.
+                    rig.stream.synchronize().expect("shutter subframe sync");
                     accum_count = accum_count.saturating_add(1);
                     frame_index = frame_index.wrapping_add(1);
                     continue;
@@ -3685,6 +4524,108 @@ pub fn spawn_render_thread(
                 accum_count = accum_count.saturating_add(1);
                 frame_index = frame_index.wrapping_add(1);
 
+                if let Some(mut burst) = active_burst.take() {
+                    if accum_count >= burst.target_accum {
+                        let fidx = burst.current_frame;
+                        let exr_name = format!("frame_{fidx:04}.exr");
+                        let json_name = format!("frame_{fidx:04}.sdg.json");
+                        let exr_path = burst.dir.join(&exr_name);
+                        let json_path = burst.dir.join(&json_name);
+
+                        let exr_res = readback_and_write_sdg_exr(
+                            &rig,
+                            cur_w,
+                            cur_h,
+                            &exr_path,
+                            &mut burst_exr_scratch,
+                        );
+                        let json_res = exr_res.and_then(|()| {
+                            export_sdg_json_with_backend(
+                                &mut rig,
+                                &json_path,
+                                &active_camera,
+                                settings.camera_projection,
+                                cur_w,
+                                cur_h,
+                                fidx,
+                                traffic_time,
+                                burst.occluder,
+                            )
+                        });
+                        match json_res {
+                            Ok((actor_count, used_occ)) => {
+                                burst.last_active_occluder = used_occ;
+                                burst.entries.push(SdgBurstFrameEntry {
+                                    burst_index: fidx,
+                                    render_frame_index: frame_index,
+                                    time_s: traffic_time,
+                                    exr_file: exr_name,
+                                    json_file: json_name,
+                                    actor_count,
+                                    occluder_used: used_occ.label().to_string(),
+                                });
+                                burst.current_frame += 1;
+                                burst.stepped_current_frame = false;
+                                prev_camera = active_camera;
+                                if burst.current_frame >= burst.total_frames {
+                                    let manifest = SdgBurstManifest {
+                                        schema_version: "1.0".to_string(),
+                                        scene_id: rig.csg_host.active_scene_id(),
+                                        scene_idx: settings.csg_mode,
+                                        variant_idx: settings.csg_asset_idx,
+                                        width: cur_w,
+                                        height: cur_h,
+                                        spp_per_frame: burst
+                                            .target_accum
+                                            .saturating_mul(launch_spp),
+                                        projection: settings.camera_projection.label().to_string(),
+                                        requested_occluder: burst.occluder.label().to_string(),
+                                        crowd_backend: last_crowd_backend.label().to_string(),
+                                        exr_channels: crate::sdg_export::SDG_EXR_CHANNELS
+                                            .iter()
+                                            .map(|&s| s.to_string())
+                                            .collect(),
+                                        frames: burst.entries,
+                                    };
+                                    let manifest_path = burst.dir.join("manifest.json");
+                                    match write_sdg_manifest_atomic(&manifest_path, &manifest) {
+                                        Ok(()) => {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!(
+                                                    "Saved SDG Burst ({}f EXR+JSON, {}) -> {}",
+                                                    burst.total_frames,
+                                                    burst.last_active_occluder.label(),
+                                                    burst.dir.display()
+                                                ),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("SDG Burst manifest failed: {e}"),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "SDG Burst: {}/{} frames ({})",
+                                        burst.current_frame,
+                                        burst.total_frames,
+                                        burst.last_active_occluder.label()
+                                    )));
+                                    active_burst = Some(burst);
+                                }
+                            }
+                            Err(e) => {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "SDG Burst aborted at frame {fidx}: {e}"
+                                )));
+                            }
+                        }
+                    } else {
+                        active_burst = Some(burst);
+                    }
+                }
+
                 bus.emit_render_event(RenderEvent::FrameReady(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
@@ -3700,6 +4641,10 @@ pub fn spawn_render_thread(
                     csg_stats: rig.csg_host.stats(),
                     fast_preview: frame_is_fast_preview,
                     possess_camera: possess_cam_out,
+                    rendered_camera: active_camera,
+                    crowd_step_ms: last_crowd_step_ms,
+                    crowd_active_backend: last_crowd_backend,
+                    crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
                 }));
             }
         })
@@ -3752,7 +4697,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 608);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 640);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -3764,8 +4709,44 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LaunchParams, probe_candidates), 576);
         assert_eq!(std::mem::offset_of!(LaunchParams, probe_samples), 584);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_prev_xforms), 592);
-        assert_eq!(std::mem::offset_of!(LaunchParams, _pad2), 600);
+        assert_eq!(std::mem::offset_of!(LaunchParams, out_semantic_u32), 600);
+        assert_eq!(std::mem::offset_of!(LaunchParams, out_instance_u32), 608);
+        assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_queries), 616);
+        assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_results), 624);
+        assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_count), 632);
+        assert_eq!(std::mem::offset_of!(LaunchParams, _pad2), 636);
         assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);
+        assert_eq!(std::mem::size_of::<GpuSdgRayQuery>(), 32);
+    }
+
+    #[test]
+    fn optix_batched_occluder_classifies_visible_self_and_world() {
+        let p_vis = ActorVec3::new(1.0, 2.0, 3.0);
+        let p_self = ActorVec3::new(4.0, 5.0, 6.0);
+        let p_world = ActorVec3::new(7.0, 8.0, 9.0);
+        let uid = 700_042u32;
+        let keys = [
+            (uid, p_vis.x.to_bits(), p_vis.y.to_bits(), p_vis.z.to_bits()),
+            (uid, p_self.x.to_bits(), p_self.y.to_bits(), p_self.z.to_bits()),
+            (
+                uid,
+                p_world.x.to_bits(),
+                p_world.y.to_bits(),
+                p_world.z.to_bits(),
+            ),
+        ];
+        let blockers = [u32::MAX, uid, 12345u32];
+        let occ = OptixBatchedOccluder::from_pairs(&keys, &blockers);
+        let eye = ActorVec3::new(0.0, 1.6, 0.0);
+        assert_eq!(occ.test_visibility(eye, p_vis, 0.08, uid), KeypointVis::Visible);
+        assert_eq!(
+            occ.test_visibility(eye, p_self, 0.08, uid),
+            KeypointVis::SelfOccluded
+        );
+        assert_eq!(
+            occ.test_visibility(eye, p_world, 0.08, uid),
+            KeypointVis::OccludedWorld
+        );
     }
 
     #[test]

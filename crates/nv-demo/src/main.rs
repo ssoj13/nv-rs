@@ -10,6 +10,7 @@ mod camera_core;
 mod camera_egui;
 mod camera_rail;
 mod csg_scene_host;
+mod cuda_crowd;
 mod demo_anim;
 mod fft_bloom;
 mod gpu_export;
@@ -18,6 +19,7 @@ mod nvtx;
 mod persist;
 mod profiler;
 mod renderer;
+mod sdg_export;
 mod ui;
 
 use std::sync::Arc;
@@ -1144,6 +1146,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         shutter_in_flight: bool,
         ser_supported: bool,
         csg_stats: crate::csg_scene_host::CsgStats,
+        crowd_step_ms: f32,
+        crowd_active_backend: crate::sdg_export::ActiveCrowdBackend,
+        crowd_actor_count: u32,
+        last_rendered_camera: CameraFrame,
         scene_descriptors: Vec<csg_scene::SceneDescriptor>,
         scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
         pending_scene_auto_frame: Option<(u32, u32)>,
@@ -1536,6 +1542,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 shutter_in_flight: false,
                 ser_supported: false,
                 csg_stats: crate::csg_scene_host::CsgStats::default(),
+                crowd_step_ms: 0.0,
+                crowd_active_backend: crate::sdg_export::ActiveCrowdBackend::None,
+                crowd_actor_count: 0,
+                last_rendered_camera: initial_camera,
                 scene_descriptors: crate::csg_scene_host::default_scene_descriptors(),
                 scene_viewpoints: Vec::new(),
                 pending_scene_auto_frame: None,
@@ -1705,9 +1715,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         }
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
+                        self.crowd_step_ms = msg.crowd_step_ms;
+                        self.crowd_active_backend = msg.crowd_active_backend;
+                        self.crowd_actor_count = msg.crowd_actor_count;
                         self.fast_preview = msg.fast_preview;
                         self.engine_phase = crate::app_events::EnginePhase::Rendering;
                         self.last_possess_camera = msg.possess_camera;
+                        self.last_rendered_camera = msg.rendered_camera;
                         let tensor_cores_ms = msg.denoise_ms + self.dlss_ms;
                         let total_gpu_ms =
                             (msg.rt_ms + tensor_cores_ms + msg.cuda_compute_ms).max(0.1);
@@ -1871,6 +1885,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
                 csg_stats: self.csg_stats,
+                crowd_step_ms: self.crowd_step_ms,
+                crowd_active_backend: self.crowd_active_backend,
+                crowd_actor_count: self.crowd_actor_count,
                 scene_descriptors: &self.scene_descriptors,
                 scene_viewpoints: &self.scene_viewpoints,
                 rail_random_seed: &mut self.rail_random_seed,
@@ -1915,6 +1932,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut eject_possess_requested = false;
             let mut run_smart_view: Option<(u64, csg_scene::ProbeBackendKind)> = None;
             let mut run_smart_rail: Option<(u64, csg_scene::ProbeBackendKind)> = None;
+            let mut poke_crowd_req: Option<(f32, bool)> = None;
+            let mut spawn_crowd_stress: Option<usize> = None;
+            let mut start_sdg_burst: Option<u32> = None;
             self.bus.poll_ui_commands(&mut self.ui_cmd_scratch);
             for boxed in &self.ui_cmd_scratch {
                 let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
@@ -1962,6 +1982,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     UiCommand::RunSmartRail { seed, backend } => {
                         run_smart_rail = Some((seed, backend));
+                    }
+                    UiCommand::PokeCrowd { impulse, all } => {
+                        poke_crowd_req = Some((impulse, all));
+                    }
+                    UiCommand::SpawnCrowdStress { target_count } => {
+                        spawn_crowd_stress = Some(target_count);
+                    }
+                    UiCommand::StartSdgBurst { frames } => {
+                        start_sdg_burst = Some(frames);
                     }
                 }
             }
@@ -2447,7 +2476,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let path = dir.join(format!("nv-demo-sdg-{ts}.json"));
-                self.bus.send_render(RenderControl::ExportSdgJson { path });
+                self.bus.send_render(RenderControl::ExportSdgJson {
+                    path,
+                    occluder: self.settings.sdg_occluder_backend,
+                });
+            }
+            if let Some(frames) = start_sdg_burst
+                && self.settings.csg_mode > 0
+            {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let dir = std::path::Path::new("renders").join(format!("sdg-burst-{ts}"));
+                self.bus.send_render(RenderControl::StartSdgBurst {
+                    dir,
+                    frames: frames.clamp(1, 240),
+                    occluder: self.settings.sdg_occluder_backend,
+                });
+            }
+            if let Some((impulse, all)) = poke_crowd_req
+                && self.settings.csg_mode > 0
+            {
+                let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
+                self.bus.send_render(RenderControl::PokeCrowd {
+                    origin: active_cam.eye,
+                    forward: active_cam.fwd,
+                    impulse: impulse.clamp(0.5, 4.0),
+                    all,
+                });
+            }
+            if let Some(target_count) = spawn_crowd_stress
+                && self.settings.csg_mode > 0
+            {
+                let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
+                self.bus.send_render(RenderControl::SpawnCrowdStress {
+                    target_count,
+                    origin: active_cam.eye,
+                });
             }
             if toggle_record_requested {
                 if let Some(active) = self.video_recorder.take() {
@@ -2651,7 +2717,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.bus.send_render(RenderControl::GenerateRandomRail { seed });
             }
             if let Some((norm_x, norm_y)) = pick_possess_uv {
-                let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
+                let active_cam = self.last_rendered_camera;
                 let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
                 if let Some((origin, dir)) = camera_projection_ray(
                     &active_cam,
@@ -2984,15 +3050,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             8,
                         );
                         self.interop.queue().submit(Some(copy_enc.finish()));
+                        // Wait for wgpu's Vulkan queue to complete all 6 buffer->texture copies
+                        // before `rr.evaluate` submits on the dedicated barrier VkQueue (prevents
+                        // cross-queue normal/depth read hazards and periodic flashes).
+                        let _ = self
+                            .interop
+                            .device()
+                            .poll(wgpu::PollType::wait_indefinitely());
                         let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
+                        let rc = self.last_rendered_camera;
+                        let rc_fov_y = (2.0 * rc.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
                         let world_to_view = glam::camera::rh::view::look_to_mat4(
-                            self.cam_pose.eye,
-                            self.cam_pose.forward(),
-                            self.cam_pose.up(),
+                            Vec3::from_array(rc.eye),
+                            Vec3::from_array(rc.fwd),
+                            Vec3::from_array(rc.up),
                         )
                         .to_cols_array();
                         let view_to_clip = glam::camera::rh::proj::directx::perspective(
-                            self.cam_pose.fov_y,
+                            rc_fov_y,
                             aspect,
                             self.cam_pose.znear.max(1e-3),
                             self.cam_pose.zfar.max(10.0),
@@ -3122,6 +3197,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             8,
                         );
                         self.interop.queue().submit(Some(copy_enc.finish()));
+                        let _ = self
+                            .interop
+                            .device()
+                            .poll(wgpu::PollType::wait_indefinitely());
                         let t_dlss = Instant::now();
                         if let Err(e) = dlss.evaluate(
                             &self.interop,

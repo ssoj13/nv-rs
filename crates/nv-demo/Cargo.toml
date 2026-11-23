@@ -28,6 +28,8 @@ csg-actors = { workspace = true }
 csg-scene = { workspace = true, features = ["wgpu"] }
 csg-device = { workspace = true }
 csg-scenes = { workspace = true }
+exr-core = { workspace = true }
+imath-rs = { workspace = true }
 
 wgpu = "30"
 egui = { version = "0.36", features = ["default_fonts"] }

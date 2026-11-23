@@ -66,11 +66,27 @@ struct Params {
     unsigned long long probe_candidates; // device ptr to GpuProbeCandidate[num_candidates]
     unsigned long long probe_samples;    // device ptr to GpuProbeSample[num_candidates * grid_w * grid_h]
     unsigned long long csg_prev_xforms;  // device ptr to float[12] prev-frame 3x4 per visible CSG instance
-    unsigned long long _pad2;            // 16-byte struct tail alignment
+    unsigned long long out_semantic_u32; // optional uint32[w*h] raw semantic ID AOV for SDG EXR capture
+    unsigned long long out_instance_u32; // optional uint32[w*h] raw instance user_id AOV for SDG EXR capture
+    unsigned long long sdg_ray_queries;  // device ptr to GpuSdgRayQuery[sdg_ray_count]
+    unsigned long long sdg_ray_results;  // device ptr to uint32[sdg_ray_count] (0xFFFFFFFFu on miss)
+    unsigned int sdg_ray_count;          // number of active rays for __raygen__sdg_keypoints
+    unsigned int _pad2;                  // 16-byte struct tail alignment
 };
 
-static_assert(sizeof(Params) == 608, "Params size must match LaunchParams (608 B)");
+static_assert(sizeof(Params) == 640, "Params size must match LaunchParams (640 B)");
 static_assert(__builtin_offsetof(Params, csg_prev_xforms) == 592, "Params::csg_prev_xforms offset must be 592");
+static_assert(__builtin_offsetof(Params, out_semantic_u32) == 600, "Params::out_semantic_u32 offset must be 600");
+static_assert(__builtin_offsetof(Params, out_instance_u32) == 608, "Params::out_instance_u32 offset must be 608");
+static_assert(__builtin_offsetof(Params, sdg_ray_queries) == 616, "Params::sdg_ray_queries offset must be 616");
+static_assert(__builtin_offsetof(Params, sdg_ray_results) == 624, "Params::sdg_ray_results offset must be 624");
+static_assert(__builtin_offsetof(Params, sdg_ray_count) == 632, "Params::sdg_ray_count offset must be 632");
+
+struct GpuSdgRayQuery {
+    float origin_tmin[4]; // xyz = world origin, w = tmin
+    float dir_tmax[4];    // xyz = unit world dir, w = tmax
+};
+static_assert(sizeof(GpuSdgRayQuery) == 32, "GpuSdgRayQuery must be 32 B");
 
 struct GpuProbeCandidate {
     float eye[4];     // xyz = origin, w = unused
@@ -1539,30 +1555,41 @@ static __forceinline__ __device__ void eval_csg_procedural(
             break;
         }
         case CSG_PROC_SAND: {
-            // Wind-aligned coastal dune sand micro-ripples + warm beach/dune albedo variation.
+            // Wind-aligned coastal dune sand micro-ripples (faded cleanly by camera distance and
+            // beach elevation so distant inland bluffs/hillsides never show corduroy striping).
             const float wx_dir = 0.88f;
             const float wz_dir = 0.475f;
+            float3 to_cam = f3_sub(hit_pos, make_f3(params.cam_pos));
+            float cam_dist = f3_len(to_cam);
+            float dist_fade = 1.0f - sky_smoothstep(8.0f, 36.0f, cam_dist);
+            float beach_fade = 1.0f - sky_smoothstep(2.5f, 9.5f, hit_pos.y);
+            float ripple_w = dist_fade * beach_fade;
+
             float wind_u = hit_pos.x * wx_dir + hit_pos.z * wz_dir;
             float wind_v = -hit_pos.x * wz_dir + hit_pos.z * wx_dir;
-            float warp = fbm2(wind_u * 0.35f + 1.4f, wind_v * 0.22f - 2.1f);
-            float phase = wind_u * 5.2f + warp * 3.2f;
+            float warp = fbm2(wind_u * 0.28f + 1.4f, wind_v * 0.20f - 2.1f)
+                + 0.45f * fbm2(hit_pos.x * 0.11f - 5.3f, hit_pos.z * 0.11f + 2.9f);
+            float phase = wind_u * 4.4f + warp * 3.8f;
             float ripple = sinf(phase);
             float ripple_d = cosf(phase);
-            float macro_dune = fbm2(hit_pos.x * 0.045f - 3.2f, hit_pos.z * 0.045f + 5.7f);
-            float grit = value_noise2(hit_pos.x * 36.0f, hit_pos.z * 36.0f);
-            float sparkle = sky_smoothstep(0.86f, 0.96f, value_noise2(hit_pos.x * 78.0f + 4.1f, hit_pos.z * 78.0f - 1.7f));
-            // Subtle darker damp foreshore near sea level (`y < 0.8 m`) vs warm dry upper dunes.
+            float macro_dune = fbm2(hit_pos.x * 0.032f - 3.2f, hit_pos.z * 0.032f + 5.7f);
+            float meso_earth = fbm2(hit_pos.x * 0.14f + 7.1f, hit_pos.z * 0.14f - 4.3f);
+            float grit = value_noise2(hit_pos.x * 32.0f, hit_pos.z * 32.0f) * dist_fade + 0.5f * (1.0f - dist_fade);
+            float sparkle = sky_smoothstep(0.86f, 0.96f, value_noise2(hit_pos.x * 78.0f + 4.1f, hit_pos.z * 78.0f - 1.7f)) * dist_fade;
+            // Subtle darker damp foreshore near sea level (`y < 0.85 m`) vs warm dry upper dunes.
             float foreshore = 1.0f - sky_smoothstep(0.0f, 0.85f, hit_pos.y);
             float3 dune_tint = make_float3(
-                0.96f + 0.09f * macro_dune,
-                0.94f + 0.07f * macro_dune,
-                0.90f + 0.04f * macro_dune
+                0.95f + 0.08f * macro_dune + 0.03f * meso_earth,
+                0.93f + 0.06f * macro_dune + 0.03f * meso_earth,
+                0.89f + 0.04f * macro_dune + 0.02f * meso_earth
             );
-            float shade = (0.91f + 0.09f * ripple) * (0.92f + 0.14f * grit) * (1.0f - 0.28f * foreshore);
+            float shade = (1.0f + 0.038f * ripple * ripple_w)
+                * (0.93f + 0.12f * grit)
+                * (1.0f - 0.28f * foreshore);
             base_col = f3_mul(f3_mul3(base_col, dune_tint), shade);
-            rough = fmaxf(0.32f, fminf(0.95f, rough - 0.22f * foreshore - 0.16f * sparkle));
-            if (fabsf(n.y) > 0.35f) {
-                float slope = ripple_d * 0.11f * (1.0f - 0.5f * foreshore);
+            rough = fmaxf(0.32f, fminf(0.95f, rough - 0.22f * foreshore - 0.14f * sparkle));
+            if (fabsf(n.y) > 0.35f && ripple_w > 0.001f) {
+                float slope = ripple_d * 0.048f * ripple_w * (1.0f - 0.5f * foreshore);
                 n = f3_norm(make_float3(n.x - wx_dir * slope, n.y, n.z - wz_dir * slope));
             }
             break;
@@ -2372,6 +2399,12 @@ extern "C" __global__ void __raygen__render() {
     if (params.out_depth_f32 != 0ull) {
         ((float*)params.out_depth_f32)[out_idx] = first_depth;
     }
+    if (params.out_semantic_u32 != 0ull) {
+        ((unsigned int*)params.out_semantic_u32)[out_idx] = first_sem_id;
+    }
+    if (params.out_instance_u32 != 0ull) {
+        ((unsigned int*)params.out_instance_u32)[out_idx] = first_has_hit ? first_inst_id : 0u;
+    }
     if (params.out_diffuse_albedo_f32 != 0ull) {
         ((float4*)params.out_diffuse_albedo_f32)[out_idx] =
             make_float4(first_diffuse.x, first_diffuse.y, first_diffuse.z, 1.0f);
@@ -2479,6 +2512,45 @@ extern "C" __global__ void __raygen__score_views() {
 
     unsigned int out_idx = (idx.z * grid_h + idx.y) * grid_w + idx.x;
     ((GpuProbeSample*)params.probe_samples)[out_idx] = out_s;
+}
+
+extern "C" __global__ void __raygen__sdg_keypoints() {
+    if (params.sdg_ray_queries == 0ull || params.sdg_ray_results == 0ull) return;
+    const uint3 idx = optixGetLaunchIndex();
+    if (idx.x >= params.sdg_ray_count) return;
+
+    const GpuSdgRayQuery q = ((const GpuSdgRayQuery*)params.sdg_ray_queries)[idx.x];
+    float3 orig = make_float3(q.origin_tmin[0], q.origin_tmin[1], q.origin_tmin[2]);
+    float  tmin = q.origin_tmin[3];
+    float3 dir  = make_float3(q.dir_tmax[0], q.dir_tmax[1], q.dir_tmax[2]);
+    float  tmax = q.dir_tmax[3];
+    if (tmax <= tmin) {
+        ((unsigned int*)params.sdg_ray_results)[idx.x] = 0xFFFFFFFFu;
+        return;
+    }
+
+    unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
+    optixTrace(
+        (OptixTraversableHandle)params.handle,
+        orig, dir,
+        tmin, tmax, 0.0f,
+        OptixVisibilityMask(255),
+        OPTIX_RAY_FLAG_NONE,
+        0, 1, 0,
+        p0, p1, p2, p3, p4, p5, p6, p7
+    );
+
+    unsigned int blocker_uid = 0xFFFFFFFFu;
+    if (p0 == 2u) {
+        if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
+            blocker_uid = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
+        } else {
+            blocker_uid = p6;
+        }
+    } else if (p0 != 0u) {
+        blocker_uid = p6;
+    }
+    ((unsigned int*)params.sdg_ray_results)[idx.x] = blocker_uid;
 }
 
 extern "C" __global__ void __miss__miss() {

@@ -1603,6 +1603,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU"]
     fn cuda_vs_cpu_crowd_step_parity_within_1e_3() {
         let ctx = CudaContext::new(0).expect("CUDA context on device 0");
         ctx.bind_to_thread().expect("bind CUDA context");
@@ -1698,6 +1699,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU"]
     fn cuda_crowd_2000_actors_step_benchmark() {
         let ctx = CudaContext::new(0).expect("CUDA context on device 0");
         ctx.bind_to_thread().expect("bind CUDA context");
@@ -1783,6 +1785,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU"]
     fn cuda_gpu_direct_dem_and_walkway_steering_matches_cpu_without_midframe_sync() {
         let ctx = CudaContext::new(0).expect("CUDA context on device 0");
         ctx.bind_to_thread().expect("bind CUDA context");
@@ -1792,9 +1795,10 @@ mod tests {
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("gundo_osm").expect("gundo_osm registered");
         let mut gpu_scene = module.build(&csg_scene::SceneBuildConfig::default());
-        if gpu_scene.crowd.actor_count() == 0 {
-            return;
-        }
+        assert!(
+            gpu_scene.crowd.actor_count() > 0,
+            "gundo_osm must spawn a crowd for this test to compare anything"
+        );
         let mut cpu_scene = gpu_scene.clone();
         let mut cpu_grounds = Vec::new();
         let offset = if cpu_scene.hints.walkways.is_empty() {
@@ -1808,7 +1812,80 @@ mod tests {
 
         let cam_eye = [0.0f32, 10.0, 0.0];
         let dt = 1.0 / 60.0;
-        for step in 0..4 {
+
+        // The first step's prep kernel steers walkway intents and samples the DEM from the same
+        // initial states the CPU reference above used: compare both before stepping further.
+        backend
+            .step_gpu_direct(
+                &stream,
+                &mut gpu_scene,
+                dt,
+                0.0,
+                cam_eye,
+                CrowdLodParams::default(),
+                None,
+                false,
+            )
+            .expect("first GPU direct step");
+        stream.synchronize().expect("end of frame fence");
+        assert_eq!(backend.d_grounds.len(), cpu_grounds.len());
+        let mut gpu_grounds = vec![
+            GroundSamplePod {
+                height_normal: [0.0; 4],
+                foot_heights: [0.0; 4],
+            };
+            cpu_grounds.len()
+        ];
+        backend
+            .d_grounds
+            .download_into(&stream, &mut gpu_grounds)
+            .expect("download GPU grounds");
+        stream.synchronize().expect("grounds readback");
+        for (i, (c, g)) in cpu_grounds.iter().zip(&gpu_grounds).enumerate() {
+            let cpu_vals = c.height_normal.iter().chain(&c.foot_heights);
+            let gpu_vals = g.height_normal.iter().chain(&g.foot_heights);
+            for (a, b) in cpu_vals.zip(gpu_vals) {
+                assert!(
+                    (a - b).abs() <= 1e-3,
+                    "actor {i}: CPU ground {:?}/{:?} vs GPU {:?}/{:?}",
+                    c.height_normal,
+                    c.foot_heights,
+                    g.height_normal,
+                    g.foot_heights
+                );
+            }
+        }
+        backend
+            .sync_cpu_snapshot(&stream, &mut gpu_scene, false)
+            .expect("sync snapshot after first step");
+        let steer = intent_flags::MASK_VEL | intent_flags::MASK_HEADING;
+        for (i, (c, g)) in cpu_scene
+            .crowd
+            .intents
+            .iter()
+            .zip(&gpu_scene.crowd.intents)
+            .enumerate()
+        {
+            assert_eq!(c.target_id, g.target_id, "actor {i}: walkway target");
+            assert_eq!(c.flags & steer, g.flags & steer, "actor {i}: steering flags");
+            for (k, (a, b)) in c.move_cmd.iter().zip(&g.move_cmd).enumerate() {
+                // Component 2 is a heading angle: compare modulo a full turn.
+                let d = if k == 2 {
+                    let d = (a - b).rem_euclid(std::f32::consts::TAU);
+                    d.min(std::f32::consts::TAU - d)
+                } else {
+                    (a - b).abs()
+                };
+                assert!(
+                    d <= 1e-4,
+                    "actor {i}: CPU move_cmd {:?} vs GPU {:?}",
+                    c.move_cmd,
+                    g.move_cmd
+                );
+            }
+        }
+
+        for step in 1..4 {
             let t = step as f32 * dt;
             let _rep = backend
                 .step_gpu_direct(
@@ -1848,6 +1925,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GPU"]
     fn cuda_crowd_lod_bias_scales_gpu_lod_and_cull_distances() {
         let ctx = CudaContext::new(0).expect("CUDA context on device 0");
         ctx.bind_to_thread().expect("bind CUDA context");

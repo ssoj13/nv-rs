@@ -1,6 +1,9 @@
 //! Safe RAII wrapper over the native Bitcomp plan C API (`bitcompCreatePlan`,
 //! `bitcompCompressLossless`, `bitcompUncompress`, `bitcompMaxBuflen`).
 //!
+//! Decompression validates the stream header (`bitcompGetCompressedInfo`) on the host before the
+//! kernel is queued, because the native kernel trusts it and faults on a truncated input.
+//!
 //! Only lossless compression is exposed: a plan created with a lossy [`BitcompMode`] can be used
 //! for `bitcompUncompress`, but [`BitcompPlan::compress_lossless_async`] rejects it with
 //! [`Error::Unsupported`] instead of mixing a lossy plan with the lossless entry point.
@@ -222,6 +225,17 @@ impl BitcompPlan {
     }
 
     /// Decompresses `input` into `output` on `stream`.
+    ///
+    /// `bitcompUncompress` trusts the stream header: a truncated input makes the kernel read past
+    /// the buffer and fault (CUDA error 700, which poisons the context). Before queuing the kernel
+    /// this method therefore copies the [`BITCOMP_HEADER_BYTES`]-byte stream header to the host on
+    /// `stream` and parses it with `bitcompGetCompressedInfo`. That copy is a **blocking** step:
+    /// it waits for all work already queued on `stream` (pageable device-to-host copies return
+    /// only after completion), so this call is not fully asynchronous.
+    ///
+    /// Fails with [`Error::Invalid`] if `input` is shorter than the header, shorter than the
+    /// compressed size the header declares, or declares an uncompressed size other than the
+    /// plan's; with [`Error::BitcompStatus`] if the header is not a Bitcomp header.
     pub fn uncompress_async(
         &mut self,
         stream: &Arc<Stream>,
@@ -244,8 +258,15 @@ impl BitcompPlan {
                 "bitcomp output buffer smaller than plan uncompressed_bytes",
             ));
         }
+        if input.num_bytes() < BITCOMP_HEADER_BYTES {
+            return Err(Error::Invalid(
+                "bitcomp compressed input is shorter than the stream header",
+            ));
+        }
         self.ensure_stream(stream)?;
-        // SAFETY: context and stream are bound and buffer extents/alignment were verified.
+        self.check_stream_header(stream, input)?;
+        // SAFETY: context and stream are bound, buffer extents/alignment were verified, and the
+        // stream header declares a compressed size within `input` and the plan's uncompressed size.
         let status = unsafe {
             sys::bitcompUncompress(
                 self.raw,
@@ -255,7 +276,67 @@ impl BitcompPlan {
         };
         check_bitcomp("bitcompUncompress", status)
     }
+
+    /// Reads the stream header of `input` on `stream` (blocking) and checks that its declared
+    /// compressed size fits in `input` and its uncompressed size matches the plan.
+    fn check_stream_header(&self, stream: &Stream, input: &DeviceBuffer<u8>) -> Result<()> {
+        let mut header = [0u8; BITCOMP_HEADER_BYTES];
+        // SAFETY: the context is bound (`ensure_stream`), `input` holds at least
+        // `BITCOMP_HEADER_BYTES` bytes (checked by the caller) and `header` has that capacity. The
+        // copy is ordered after earlier work on `stream`; a device-to-pageable-host copy returns
+        // only after it completed, and the stream is synchronized before `header` is read.
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                header.as_mut_ptr(),
+                input.cu_deviceptr(),
+                BITCOMP_HEADER_BYTES,
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()?;
+        let mut compressed = input.num_bytes();
+        let mut uncompressed = 0usize;
+        let mut dtype: sys::bitcompDataType_t = 0;
+        let mut mode: sys::bitcompMode_t = 0;
+        let mut algo: sys::bitcompAlgorithm_t = 0;
+        // SAFETY: `header` is a host buffer holding the complete stream header (the query only
+        // reads the header; the API accepts host pointers), and every out-pointer is valid.
+        let status = unsafe {
+            sys::bitcompGetCompressedInfo(
+                header.as_ptr().cast(),
+                &mut compressed,
+                &mut uncompressed,
+                &mut dtype,
+                &mut mode,
+                &mut algo,
+            )
+        };
+        // `bitcompGetCompressedInfo` reports a buffer smaller than the declared compressed size
+        // as BITCOMP_INVALID_PARAMETER (bitcomp.h:399-401).
+        if status == sys::bitcompResult_t_BITCOMP_INVALID_PARAMETER
+            || compressed > input.num_bytes()
+        {
+            return Err(Error::Invalid(
+                "bitcomp compressed input is shorter than the size its stream header declares",
+            ));
+        }
+        check_bitcomp("bitcompGetCompressedInfo", status)?;
+        if uncompressed != self.uncompressed_bytes {
+            return Err(Error::Invalid(
+                "bitcomp stream header declares an uncompressed size other than the plan's",
+            ));
+        }
+        Ok(())
+    }
 }
+
+/// Size of the native Bitcomp stream header in bytes.
+///
+/// Not published in `bitcomp.h`; established on nvCOMP 6 by probing `bitcompGetCompressedInfo`:
+/// a header whose fields after the `NVZ\0` magic are all zero reports a compressed size of 32
+/// (an empty, header-only stream), and the reported sizes are stable once the first 24 bytes
+/// are present. The smallest real stream (8 input bytes) is 56 bytes.
+pub const BITCOMP_HEADER_BYTES: usize = 32;
 
 impl Drop for BitcompPlan {
     fn drop(&mut self) {

@@ -343,3 +343,53 @@ fn retrieve_bitstream_into_reuses_stale_vec() {
         .expect("reused");
     assert_eq!(reused, fresh);
 }
+
+/// nvJPEG hands out an encode's bitstream once (a second retrieval succeeds but writes nothing),
+/// so the wrapper rejects a retrieval without a fresh encode instead of returning zeros.
+#[test]
+#[ignore = "GPU"]
+fn second_retrieve_of_one_encode_is_rejected() {
+    let cuda = Context::new(0).expect("CUDA device 0");
+    let stream = cuda.default_stream();
+    let handle = Handle::new(&cuda).expect("nvjpeg Handle");
+    let (w, h) = (64u32, 64u32);
+    let rgb_host: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+    let src_dev = DeviceBuffer::from_host(&stream, &rgb_host).expect("src_dev");
+    let src = ImagePlanes::interleaved(&src_dev, w, h, 3, (w * 3) as usize).expect("planes");
+    let mut params = EncoderParams::new(&handle, &stream).expect("params");
+    params
+        .set_sampling_factors(ChromaSubsampling::Yuv444, &stream)
+        .expect("444");
+    let mut enc = EncoderState::new(&handle, &stream).expect("encoder");
+    assert!(matches!(
+        enc.retrieve_bitstream(&stream),
+        Err(nvjpeg::Error::InvalidInput(_))
+    ));
+
+    enc.encode_image(&params, &src, InputFormat::Rgbi, w, h, &stream)
+        .expect("encode");
+    let first = enc.retrieve_bitstream(&stream).expect("first retrieve");
+    assert!(first.len() > 4 && first[..2] == [0xFF, 0xD8], "not a JPEG");
+
+    assert!(matches!(
+        enc.retrieve_bitstream(&stream),
+        Err(nvjpeg::Error::InvalidInput(_))
+    ));
+    let mut kept = vec![0xAAu8; 16];
+    assert!(matches!(
+        enc.retrieve_bitstream_into(&mut kept, &stream),
+        Err(nvjpeg::Error::InvalidInput(_))
+    ));
+    assert_eq!(
+        kept,
+        vec![0xAAu8; 16],
+        "a rejected retrieval must not touch `out`"
+    );
+
+    enc.encode_image(&params, &src, InputFormat::Rgbi, w, h, &stream)
+        .expect("encode again");
+    assert_eq!(
+        enc.retrieve_bitstream(&stream).expect("after re-encode"),
+        first
+    );
+}

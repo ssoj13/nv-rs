@@ -733,6 +733,8 @@ impl Handle {
         compute_type: ComputeType,
         algo: GemmAlgo,
     ) -> Result<()> {
+        // cuBLAS enqueues on the context current on the calling thread (as in `bind_stream`).
+        self.cuda().bind_to_thread()?;
         // SAFETY: caller guarantees stream binding, scalar validity, and device buffer extents.
         check("cublasGemmEx", unsafe {
             sys::cublasGemmEx(
@@ -824,6 +826,8 @@ impl Handle {
         self.require_host_pointer_mode()?;
         let group_count_i32 = i32::try_from(group_count)
             .map_err(|_| Error::Invalid("group_count exceeds i32::MAX"))?;
+        // cuBLAS enqueues on the context current on the calling thread (as in `bind_stream`).
+        self.cuda().bind_to_thread()?;
         // SAFETY: caller guarantees stream binding, valid device pointer arrays, and matrix extents.
         check("cublasGemmGroupedBatchedEx", unsafe {
             sys::cublasGemmGroupedBatchedEx(

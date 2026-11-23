@@ -25,6 +25,8 @@
 //! uses them (work on other streams is the caller's to order, see the `# Safety` sections). A
 //! [`Scratch`], [`DeviceInstances`] or [`InstanceBuffer`] belongs to one stream, which orders its
 //! reuse; streams are identified by their `CUstream` and context, not by the `Arc` holding them.
+//! An [`Accel`] records its build stream, and an instance structure must be built on the stream
+//! its acceleration-structure children were built on (checked when instances are uploaded).
 //! Compaction synchronizes the stream once (to read the compacted size back).
 //! **Persistent IAS.** [`InstanceBuffer`] stages uploads through one pinned host buffer and
 //! records an event after each copy out of it; the next upload waits on that event before it
@@ -829,15 +831,23 @@ const _: () = assert!(
     size_of::<sys::OptixInstance>().is_multiple_of(sys::OPTIX_INSTANCE_BYTE_ALIGNMENT as usize)
 );
 
-/// Rejects instances of structures from another device context.
-fn check_children(ctx: &Arc<DeviceContext>, instances: &[Instance]) -> Result<()> {
-    if instances
-        .iter()
-        .any(|i| !Arc::ptr_eq(i.child.context(), ctx))
-    {
-        return Err(Error::Invalid(
-            "instance of a structure from another device context",
-        ));
+/// Rejects instances of structures from another device context, and instances of acceleration
+/// structures built on another stream than `stream`, the stream the instance structure is built
+/// on: the build reads its children, so they must be ordered before it on that stream.
+fn check_children(ctx: &Arc<DeviceContext>, stream: &Stream, instances: &[Instance]) -> Result<()> {
+    for i in instances {
+        if !Arc::ptr_eq(i.child.context(), ctx) {
+            return Err(Error::Invalid(
+                "instance of a structure from another device context",
+            ));
+        }
+        if let Child::Accel(a) = &i.child
+            && !same_stream(&a.stream, stream)
+        {
+            return Err(Error::Invalid(
+                "instance of an acceleration structure built on another stream than the instance structure",
+            ));
+        }
     }
     Ok(())
 }
@@ -864,7 +874,7 @@ impl DeviceInstances {
                 "device instances need at least one instance",
             ));
         }
-        check_children(ctx, instances)?;
+        check_children(ctx, stream, instances)?;
         let raw: Vec<sys::OptixInstance> = instances.iter().map(Instance::raw).collect();
         // SAFETY: `OptixInstance` has no padding (asserted above).
         let buffer = unsafe { upload(stream, &raw) }?;
@@ -1031,7 +1041,7 @@ impl InstanceBuffer {
                 "an instance structure needs at least one instance",
             ));
         }
-        check_children(&self.ctx, instances)?;
+        check_children(&self.ctx, &self.stream, instances)?;
         let _ = count(instances.len(), "too many instances")?;
 
         if instances.len() > self.cap_instances {
@@ -1096,7 +1106,7 @@ impl InstanceBuffer {
                 "instance prefix update exceeds uploaded instance count",
             ));
         }
-        check_children(&self.ctx, instances)?;
+        check_children(&self.ctx, &self.stream, instances)?;
 
         self.raw_scratch.clear();
         self.raw_scratch.reserve(instances.len());
@@ -1613,7 +1623,7 @@ fn instance_inputs(cx: &Cx<'_>, instances: &[Instance]) -> Result<Inputs> {
             "an instance structure needs at least one instance",
         ));
     }
-    check_children(cx.ctx, instances)?;
+    check_children(cx.ctx, cx.stream, instances)?;
     let raw: Vec<sys::OptixInstance> = instances.iter().map(Instance::raw).collect();
     let n = count(raw.len(), "too many instances")?;
     // SAFETY: `OptixInstance` has no padding (asserted above).
@@ -1713,9 +1723,17 @@ pub enum Relink<'a> {
 }
 
 /// A built acceleration structure.
+///
+/// **Stream rule.** An instance structure ([`Self::instances`], [`Self::instance_pointers`],
+/// [`Self::instances_into`]) must be built on the stream its acceleration-structure children were
+/// built on; a child built on another stream is rejected with [`Error::Invalid`] (checked when the
+/// instances are uploaded: by [`Self::instances`], [`DeviceInstances::new`] and
+/// [`InstanceBuffer`], whose stream the instance build must match).
 pub struct Accel {
     handle: AtomicU64,
     buffer: DeviceBuffer<u8>,
+    /// Stream the structure was built (or last rebuilt in place) on.
+    stream: Arc<Stream>,
     flags: u32,
     motion: sys::OptixMotionOptions,
     /// Buffers per per-key input (motion keys, or 1).
@@ -1974,6 +1992,9 @@ impl Accel {
                 )
             })?;
             existing.handle.store(handle, Ordering::Release);
+            if !same_stream(&existing.stream, stream) {
+                existing.stream = stream.clone();
+            }
             existing.flags = flags;
             existing.motion = motion;
             existing.keys = keys;
@@ -2012,6 +2033,7 @@ impl Accel {
         *target = Some(Arc::new(Self {
             handle: AtomicU64::new(handle),
             buffer: output,
+            stream: stream.clone(),
             flags,
             motion,
             keys,
@@ -2153,6 +2175,7 @@ impl Accel {
             Arc::new(Self {
                 handle: AtomicU64::new(handle),
                 buffer,
+                stream: stream.clone(),
                 flags,
                 motion,
                 keys,
@@ -2620,6 +2643,7 @@ impl Accel {
         Ok(Arc::new(Self {
             handle: AtomicU64::new(handle),
             buffer: target,
+            stream: stream.clone(),
             flags: self.flags,
             motion: self.motion,
             keys: self.keys,

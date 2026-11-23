@@ -215,6 +215,17 @@ Eleven edit-only workers re-verified every finding in their crates before changi
 - Not run: `nccl` (Linux, 2+ GPUs), `cufile` GDS (Linux), `nvml`, the loader tests in `*-sys`; the probabilistic scratch-race tests in `cufft` and `cusparse` pass but were not run under `compute-sanitizer`, so they do not prove the absence of a use-after-free.
 - Environment: `nvcomp` GPU tests need `NVCOMP_ROOT`; the loader does not look in `.sdk/nvcomp` by itself (`LDR` scope, Wave 5). The pre-existing `nvapi` hardware test `live_rtx_3080_ti_nvapi_queries` fails in `GetDisplayIdByDisplayName` (`EXPECTED_PHYSICAL_GPU_HANDLE`); cause not yet established.
 
+### Follow-up after the gate (done; gate rerun: clippy clean, 375 passed / 0 failed / 203 ignored)
+- `MED:CMP-4` fixed: `BitcompPlan::uncompress_async` reads the 32-byte stream header (one blocking device-to-host copy on the same stream) and rejects an input shorter than the header, shorter than the size the header declares, or declaring another uncompressed size than the plan, before any kernel is queued. Measured format: magic `NVZ\0`, 32-byte header, shortest real stream 56 bytes. All seven nvCOMP GPU tests pass in one process.
+- `nvjpeg`: a second bitstream retrieve for the same encode returns `Error::InvalidInput`.
+- `BLA:FFT-03` closed with a probe: cuFFT returns `CUFFT_INVALID_VALUE` for either mixed NULL / non-NULL embed combination and accepts both-NULL and both-set; a regression test pins it.
+- `MED:DEC-3`: the test asserting a hazard that hardware did not show is removed; docs are neutral.
+- `IOP:CE-06`: regression test `dx12_heap_import_accepts_dedicated_flag`.
+- `nvapi` hardware test: the failure is environmental (NVAPI reports 0 connected displays on this machine; `nvapi.h` requires an active display); the code path is unchanged by the repairs.
+- `cublas`: `MatmulDesc` retains its `EmulationDesc` (its setters fail while attached: configure before attaching); `set_epilogue` and `set_bias_batch_stride` are `unsafe fn` because the epilogue decides what cuBLASLt reads or writes through the bias/aux pointers; context bind added to `gemm_*_on_bound_stream` and to `cudnn` `GraphConvPlan::build*`.
+- `optix`: `Accel` records its build stream; instance structures reject children built on another stream (`check_children`, inside the existing child loop; nothing added to the per-frame `instances_into` path).
+- `nv-demo`: four CUDA tests in `cuda_crowd.rs` are `#[ignore = "GPU"]`; the DEM/walkway test now compares GPU grounds and intents against the CPU reference instead of returning early.
+
 ### Findings refuted on re-verification (no code change)
 - `BLA:LT-10` `HeuristicResult::from_algo`: `cublasLtMatmul` itself rejects an undersized workspace (`cublasLt.h:1017-1019`).
 - `SOL:S2` Mg `lwork`: `unsafe fn` with an explicit contract. `SOL:S4` `csreigvsi` allocation: the module makes no zero-allocation promise.

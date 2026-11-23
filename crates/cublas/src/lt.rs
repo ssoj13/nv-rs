@@ -1155,6 +1155,9 @@ pub struct MatmulDesc {
     cuda: Arc<Context>,
     scale: DataType,
     pointer_mode: PointerMode,
+    /// Emulation descriptor installed by [`Self::set_emulation_desc`]. cuBLASLt stores only its
+    /// handle, so it is retained here; fields drop after `Drop::drop` destroys `raw`.
+    emulation: Option<Arc<EmulationRaw>>,
 }
 
 // SAFETY: descriptor owns no thread-local state; concurrent mutation requires external sync (`!Sync`).
@@ -1174,6 +1177,7 @@ impl MatmulDesc {
             cuda: cuda.clone(),
             scale,
             pointer_mode: PointerMode::Host,
+            emulation: None,
         })
     }
 
@@ -1278,7 +1282,16 @@ impl MatmulDesc {
     }
 
     /// Sets the fused epilogue (`CUBLASLT_MATMUL_DESC_EPILOGUE`).
-    pub fn set_epilogue(&mut self, epilogue: Epilogue) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// The epilogue decides which pointer attributes cuBLASLt dereferences during every later
+    /// matmul with this descriptor, how many elements, and whether it reads or writes them
+    /// (`cublasLt.h`, `cublasLtEpilogue_t`: `BIAS` reads a bias vector of D's row count, `BGRADB`
+    /// writes one of D's column count, `*_AUX` epilogues use the aux pointer). Every pointer
+    /// attribute the chosen epilogue uses (bias, epilogue aux) must satisfy the contract of
+    /// [`Self::set_bias_pointer`] / [`Self::set_attribute_bytes`] for this epilogue.
+    pub unsafe fn set_epilogue(&mut self, epilogue: Epilogue) -> Result<()> {
         let v = epilogue.raw();
         self.set_attr(MatmulDescAttr::Epilogue, &v.to_ne_bytes())
     }
@@ -1310,7 +1323,10 @@ impl MatmulDesc {
     ///
     /// # Safety
     ///
-    /// `bias_ptr` must be null or point to a valid device buffer outliving matmul execution.
+    /// `bias_ptr` must be null or point to a device allocation of `self`'s context outliving
+    /// matmul execution and covering the extent the epilogue and bias batch stride imply (D's row
+    /// or column count of [`Self::set_bias_data_type`] elements per batch, offset by the batch
+    /// stride), writable for bias-gradient epilogues.
     pub unsafe fn set_bias_pointer(&mut self, bias_ptr: *const c_void) -> Result<()> {
         // SAFETY: `bias_ptr` is passed as a pointer-sized attribute value.
         check_lt("cublasLtMatmulDescSetAttribute", unsafe {
@@ -1330,14 +1346,25 @@ impl MatmulDesc {
     }
 
     /// Sets the bias batch stride in elements (`CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE`).
-    pub fn set_bias_batch_stride(&mut self, stride: i64) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// cuBLASLt offsets the bias pointer by `stride` elements per batch of D
+    /// (`CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT > 1`), so the bias allocation must cover every batch's
+    /// vector at that stride (see [`Self::set_bias_pointer`]).
+    pub unsafe fn set_bias_batch_stride(&mut self, stride: i64) -> Result<()> {
         self.set_attr(MatmulDescAttr::BiasBatchStride, &stride.to_ne_bytes())
     }
 
     /// Attaches an [`EmulationDesc`] (`CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR`).
+    ///
+    /// cuBLASLt stores only the descriptor's handle, so `self` retains the native emulation
+    /// descriptor until it is replaced or `self` is dropped. While attached, `emulation` cannot
+    /// be changed (its setters fail): configure it before attaching.
     pub fn set_emulation_desc(&mut self, emulation: &EmulationDesc) -> Result<()> {
-        let v = emulation.raw;
-        // SAFETY: `v` is a live `cublasLtEmulationDesc_t` handle.
+        let v = emulation.inner.raw;
+        // SAFETY: `v` is a live `cublasLtEmulationDesc_t` handle, and on success `self` retains
+        // its owner so the handle stays valid for every matmul using `self`.
         check_lt("cublasLtMatmulDescSetAttribute", unsafe {
             lt_sys::cublasLtMatmulDescSetAttribute(
                 self.raw,
@@ -1345,7 +1372,9 @@ impl MatmulDesc {
                 (&raw const v).cast(),
                 size_of_val(&v),
             )
-        })
+        })?;
+        self.emulation = Some(emulation.inner.clone());
+        Ok(())
     }
 }
 
@@ -2290,14 +2319,27 @@ impl EmulationDescAttr {
 }
 
 /// Floating-point emulation descriptor (`cublasLtEmulationDesc_t`).
+///
+/// Shared with every [`MatmulDesc`] it is attached to (cuBLASLt keeps only its handle) and
+/// destroyed after the last of them. It can be changed only while no [`MatmulDesc`] holds it.
 #[must_use]
 pub struct EmulationDesc {
+    inner: Arc<EmulationRaw>,
+}
+
+/// Owner of a native `cublasLtEmulationDesc_t`.
+struct EmulationRaw {
     raw: lt_sys::cublasLtEmulationDesc_t,
     cuda: Arc<Context>,
 }
 
-// SAFETY: emulation descriptor owns no thread-local state (`!Sync`).
-unsafe impl Send for EmulationDesc {}
+// SAFETY: the descriptor owns no thread-local state. It is written only through
+// `EmulationDesc::raw_mut`, which requires the unique `Arc` owner; shared owners (attached
+// `MatmulDesc`s) only hand the handle to cuBLASLt, which reads it, and the handle is destroyed
+// once, by the last owner.
+unsafe impl Send for EmulationRaw {}
+// SAFETY: as above; shared access is read-only.
+unsafe impl Sync for EmulationRaw {}
 
 impl EmulationDesc {
     /// Creates a new emulation descriptor (`cublasLtEmulationDescCreate`).
@@ -2309,9 +2351,20 @@ impl EmulationDesc {
             lt_sys::cublasLtEmulationDescCreate(&mut raw)
         })?;
         Ok(Self {
-            raw,
-            cuda: cuda.clone(),
+            inner: Arc::new(EmulationRaw {
+                raw,
+                cuda: cuda.clone(),
+            }),
         })
+    }
+
+    /// The native handle for writing, available only while no [`MatmulDesc`] holds it.
+    fn raw_mut(&mut self) -> Result<lt_sys::cublasLtEmulationDesc_t> {
+        Arc::get_mut(&mut self.inner)
+            .map(|inner| inner.raw)
+            .ok_or(Error::Invalid(
+                "emulation descriptor is attached to a MatmulDesc; configure it before attaching",
+            ))
     }
 
     /// Writes raw attribute bytes (`cublasLtEmulationDescSetAttribute`).
@@ -2333,10 +2386,12 @@ impl EmulationDesc {
     /// differs from the attribute's storage (`cublasLt.h`, `*SetAttribute` retval
     /// `CUBLAS_STATUS_INVALID_VALUE`), so a 4-byte write can never set an 8-byte pointer attribute.
     fn set_attr(&mut self, attr: EmulationDescAttr, buf: &[u8]) -> Result<()> {
-        // SAFETY: `self.raw` is live and `buf` is valid for `buf.len()` bytes.
+        let raw = self.raw_mut()?;
+        // SAFETY: `raw` is live and uniquely owned by `self`, and `buf` is valid for `buf.len()`
+        // bytes.
         check_lt("cublasLtEmulationDescSetAttribute", unsafe {
             lt_sys::cublasLtEmulationDescSetAttribute(
-                self.raw,
+                raw,
                 attr.raw(),
                 buf.as_ptr().cast(),
                 buf.len(),
@@ -2347,10 +2402,10 @@ impl EmulationDesc {
     /// Reads raw attribute bytes (`cublasLtEmulationDescGetAttribute`), returning bytes written.
     pub fn get_attribute_bytes(&self, attr: EmulationDescAttr, buf: &mut [u8]) -> Result<usize> {
         let mut written = 0usize;
-        // SAFETY: `self.raw` is live, `buf` is writable for `buf.len()` bytes, `written` is valid.
+        // SAFETY: the handle is live, `buf` is writable for `buf.len()` bytes, `written` is valid.
         check_lt("cublasLtEmulationDescGetAttribute", unsafe {
             lt_sys::cublasLtEmulationDescGetAttribute(
-                self.raw,
+                self.inner.raw,
                 attr.raw(),
                 buf.as_mut_ptr().cast(),
                 buf.len(),
@@ -2391,7 +2446,7 @@ impl EmulationDesc {
     }
 }
 
-impl Drop for EmulationDesc {
+impl Drop for EmulationRaw {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             // SAFETY: `self.raw` was created by `cublasLtEmulationDescCreate` and is destroyed once.
@@ -2968,6 +3023,45 @@ mod tests {
         // SAFETY: testing null pointer rejection before any FFI call.
         let err = unsafe { logger_set_file(std::ptr::null_mut()) }.unwrap_err();
         assert!(matches!(err, Error::Invalid(_)));
+    }
+
+    /// cuBLASLt keeps only the emulation descriptor's handle, so `MatmulDesc` must retain it, and
+    /// the descriptor must not change while a `MatmulDesc` holds it.
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cublasLt64_13.dll; run via xtask gpu-test"]
+    fn gpu_matmul_desc_retains_emulation_desc() {
+        let ctx = cuda_core::Context::new(0).expect("cuda context");
+        let mut emu = EmulationDesc::new(&ctx).expect("emulation desc");
+        let strategy = emu
+            .attribute_i32(EmulationDescAttr::Strategy)
+            .expect("strategy");
+        emu.set_attribute_i32(EmulationDescAttr::Strategy, strategy)
+            .expect("set before attach");
+        let mut desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).expect("desc");
+        desc.set_emulation_desc(&emu).expect("attach");
+        assert!(matches!(
+            emu.set_attribute_i32(EmulationDescAttr::Strategy, strategy),
+            Err(Error::Invalid(_))
+        ));
+
+        // Dropping the caller's handle leaves the native descriptor alive and owned by `desc`.
+        let raw = emu.inner.raw;
+        drop(emu);
+        let mut buf = [0u8; size_of::<lt_sys::cublasLtEmulationDesc_t>()];
+        let n = desc
+            .get_attribute_bytes(MatmulDescAttr::EmulationDescriptor, &mut buf)
+            .expect("get emulation attribute");
+        assert_eq!(n, buf.len());
+        assert_eq!(usize::from_ne_bytes(buf), raw as usize);
+        assert_eq!(desc.emulation.as_ref().map(|e| e.raw), Some(raw));
+
+        // Once no `MatmulDesc` holds it, the descriptor can change again.
+        let mut other = EmulationDesc::new(&ctx).expect("second emulation desc");
+        desc.set_emulation_desc(&other).expect("attach second");
+        drop(desc);
+        other
+            .set_attribute_i32(EmulationDescAttr::Strategy, strategy)
+            .expect("set after detach");
     }
 
     #[test]

@@ -3685,6 +3685,62 @@ fn instance_buffer_back_to_back_updates_do_not_tear() {
     );
 }
 
+/// One-stream rule: an instance structure must be built on the stream its acceleration-structure
+/// children were built on. Every instance path rejects a child of another stream; the same
+/// instances on the build stream (also through a fresh `Arc` of it) are accepted.
+#[test]
+#[ignore = "GPU"]
+fn instance_structures_reject_children_of_another_stream() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let instances = numbered(&gas, 0, 2);
+    let other = rig.ctx.cuda().new_stream().expect("stream");
+    let mut other_scratch = Scratch::new(&other);
+    assert!(matches!(
+        Accel::instances(
+            &rig.ctx,
+            &other,
+            &mut other_scratch,
+            &instances,
+            BuildOptions::default()
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        DeviceInstances::new(&rig.ctx, &other, &instances),
+        Err(Error::Invalid(_))
+    ));
+    let mut other_buf = InstanceBuffer::new(&rig.ctx, &other);
+    assert!(matches!(
+        other_buf.upload_all(&other, &instances),
+        Err(Error::Invalid(_))
+    ));
+
+    let s = rig.stream.clone();
+    Accel::instances(
+        &rig.ctx,
+        &s,
+        &mut rig.scratch,
+        &instances,
+        BuildOptions::default(),
+    )
+    .expect("IAS on the children's stream");
+    let set = DeviceInstances::new(&rig.ctx, &s, &instances).expect("device instances");
+    Accel::instance_pointers(
+        &rig.ctx,
+        &s,
+        &mut rig.scratch,
+        &[(&set, 0), (&set, 1)],
+        BuildOptions::default(),
+    )
+    .expect("pointer IAS on the children's stream");
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &instances).expect("upload");
+    let mut target = None;
+    assert!(!ias_into(&mut rig, &buf, persistent(), &mut target));
+    s.synchronize().expect("sync");
+}
+
 /// A fresh memory pool capped at `max` bytes is the device's current pool until dropped, so
 /// stream-ordered allocations above the cap fail deterministically.
 struct CappedPool {

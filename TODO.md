@@ -17,7 +17,7 @@ Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before c
 - [x] `cudnn`: N1..N4, N6..N13, workspace ownership check, scratch stream analysis
 - [x] `nvjpeg` + `npp` + `nvofa`: JPG-1..6, NPP-1..4, OFA-1..4
 - [x] `nvenc` + `nvdec`: ENC-1..4, ENC-6..11, DEC-1..9
-- [~] `nvcomp` + `cufile` (CMP-4 confirmed on hardware and still open; `cufile` GDS paths unverified, no Linux host): CMP-1..12, CUF-1..5, CUF-7..10, `ssize_t` handling
+- [x] `nvcomp` + `cufile` (CMP-4 fixed in the follow-up; `cufile` GDS paths unverified, no Linux host): CMP-1..12, CUF-1..5, CUF-7..10, `ssize_t` handling
 - [x] `ngx` + `nvapi` + `nvml`: NGX-1..14, NVAPI-1..3, NVML-1..2
 - [x] `cupti` + `nccl` + `nvrtc` (`nccl` compiled only; no Linux host): CUPTI-1..4, 6, 7, NVRTC-1..2, NCCL-1..4, 6..8, null `CStr` checks
 - [x] Gate W1+W2 (clippy clean, 379 passed / 0 failed, GPU tests per crate; results in `plan2.md` "Gate result"): one serial pass - `cargo clippy` + tests for every touched crate, then `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` once
@@ -30,12 +30,13 @@ Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before c
 - [x] Gate W2 (with Gate W1) + GPU tests marked `#[ignore]` run explicitly on this machine
 - [ ] Lead review W2: `nv-wgpu` encoder-based submit diff
 
-## Wave 1-2 follow-up (in progress)
-- [~] `nvcomp` CMP-4: validate the bitcomp input before launching the kernel; the truncated-input test must be rejected before any GPU work
-- [~] `nvjpeg`: a second `retrieve_bitstream` for the same encode returns a typed error instead of zeros
-- [~] Deciding tests turned into regression tests of the observed behaviour or removed: `cufft` mixed NULL embed, `nvdec` DEC-3, `nv-wgpu` CE-06
-- [~] `nvapi` `live_rtx_3080_ti_nvapi_queries` failure: establish cause
-- [~] Out-of-manifest items: `cublas` `set_emulation_desc` retention, `gemm_*_on_bound_stream` and `cudnn` `GraphConvPlan::build*` context bind, `optix` one-stream check for IAS children
+## Wave 1-2 follow-up (done; gate: clippy clean, 375 passed / 0 failed / 203 ignored, ignored GPU tests of all touched crates pass)
+- [x] `nvcomp` CMP-4: validate the bitcomp input before launching the kernel; the truncated-input test must be rejected before any GPU work
+- [x] `nvjpeg`: a second `retrieve_bitstream` for the same encode returns a typed error instead of zeros
+- [x] Deciding tests turned into regression tests of the observed behaviour or removed: `cufft` mixed NULL embed, `nvdec` DEC-3, `nv-wgpu` CE-06
+- [x] `nvapi` `live_rtx_3080_ti_nvapi_queries` failure: environmental (0 connected displays reported by NVAPI on this machine); the test now skips only the HDR/VRR part in exactly that case
+- [x] `nv-demo` GPU tests in `cuda_crowd.rs` marked `#[ignore = "GPU"]` (80 non-ignored / 4 ignored); the DEM/walkway test now really compares GPU against CPU
+- [x] Out-of-manifest items (plus `set_epilogue` / `set_bias_batch_stride` made `unsafe fn`): `cublas` `set_emulation_desc` retention, `gemm_*_on_bound_stream` and `cudnn` `GraphConvPlan::build*` context bind, `optix` one-stream check for IAS children
 
 ## Wave 1b - cross-crate items (must not run in parallel with Wave 1)
 - [ ] W1.6a Typed teardown error sink replacing the `CUDA_ERROR_UNKNOWN` mapping (BLA:ERR-01, SOL:X4, MED:ENC-5, MED:CUF-6, SYS:CUPTI-5, SYS:NCCL-5, OPX:X1)

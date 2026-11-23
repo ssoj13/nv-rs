@@ -19,8 +19,6 @@ struct RoundTripCollector {
     decoder: Option<Arc<VideoDecoder>>,
     decoded_frames: Vec<Vec<u8>>,
     scratch_host: Vec<u8>,
-    /// Value returned from `on_sequence` instead of the decoder's surface count.
-    sequence_return: Option<u32>,
 }
 
 impl ParserHandler for RoundTripCollector {
@@ -30,7 +28,7 @@ impl ParserHandler for RoundTripCollector {
         let frame_bytes =
             nv12_frame_bytes(cfg.target_width, cfg.target_height).expect("frame bytes");
         self.scratch_host.resize(frame_bytes, 0);
-        Ok(self.sequence_return.unwrap_or(cfg.num_decode_surfaces))
+        Ok(cfg.num_decode_surfaces)
     }
 
     fn on_decode(&mut self, pic: &nvdec::sys::CUVIDPICPARAMS) -> nvdec::Result<()> {
@@ -122,18 +120,13 @@ fn encode_h264(
 }
 
 /// Decodes `packets` and returns the tight NV12 frames, or the first parser/decoder error.
-fn decode_h264(
-    cuda: &Arc<Context>,
-    packets: &[Vec<u8>],
-    sequence_return: Option<u32>,
-) -> nvdec::Result<Vec<Vec<u8>>> {
+fn decode_h264(cuda: &Arc<Context>, packets: &[Vec<u8>]) -> nvdec::Result<Vec<Vec<u8>>> {
     let collector = RoundTripCollector {
         cuda: cuda.clone(),
         stream: cuda.default_stream(),
         decoder: None,
         decoded_frames: Vec::new(),
         scratch_host: Vec::new(),
-        sequence_return,
     };
     let mut parser = VideoParser::new(cuda, &ParserConfig::new(nvdec::Codec::H264), collector)?;
     for (idx, pkt) in packets.iter().enumerate() {
@@ -161,7 +154,7 @@ fn min_psnr(reference: &[Vec<u8>], decoded: &[Vec<u8>]) -> f64 {
 fn nvenc_to_nvdec_h264_roundtrip_psnr() {
     let cuda = Context::new(0).expect("CUDA device 0");
     let (reference, packets) = encode_h264(&cuda, 256, 256, 4);
-    let decoded = decode_h264(&cuda, &packets, None).expect("decode");
+    let decoded = decode_h264(&cuda, &packets).expect("decode");
     let psnr = min_psnr(&reference, &decoded);
     assert!(psnr >= 30.0, "min PSNR {psnr:.2} dB below 30 dB threshold");
 }
@@ -174,34 +167,7 @@ fn nvenc_to_nvdec_h264_roundtrip_psnr() {
 fn nvenc_to_nvdec_h264_roundtrip_psnr_cropped_unaligned() {
     let cuda = Context::new(0).expect("CUDA device 0");
     let (reference, packets) = encode_h264(&cuda, 200, 120, 4);
-    let decoded = decode_h264(&cuda, &packets, None).expect("decode");
+    let decoded = decode_h264(&cuda, &packets).expect("decode");
     let psnr = min_psnr(&reference, &decoded);
     assert!(psnr >= 30.0, "min PSNR {psnr:.2} dB below 30 dB threshold");
-}
-
-/// DEC-3 decider: returning `1` from `on_sequence` keeps the parser's default DPB size (8) while
-/// `from_video_format` may size the decoder smaller (`max(min_num_decode_surfaces, 4)`). Over 24
-/// frames the parser cycles through all 8 picture indices. The audit predicts a decode error or
-/// corrupted frames; if neither happens the hazard documented on `ParserHandler::on_sequence`
-/// does not reproduce on this driver and this test reports that.
-#[test]
-#[ignore = "GPU: needs NVIDIA driver with NVENC + NVDEC; run with --ignored"]
-fn parser_default_dpb_larger_than_decoder_misdecodes() {
-    let cuda = Context::new(0).expect("CUDA device 0");
-    let (reference, packets) = encode_h264(&cuda, 256, 256, 24);
-    match decode_h264(&cuda, &packets, Some(1)) {
-        Err(e) => eprintln!("DEC-3 reproduced as an error: {e}"),
-        Ok(decoded) => {
-            let psnr = if decoded.len() == reference.len() {
-                min_psnr(&reference, &decoded)
-            } else {
-                0.0
-            };
-            assert!(
-                psnr < 30.0,
-                "DEC-3 not reproduced: all {} frames decoded at min PSNR {psnr:.2} dB",
-                decoded.len()
-            );
-        }
-    }
 }

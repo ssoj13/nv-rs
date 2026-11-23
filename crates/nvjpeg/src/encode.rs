@@ -132,6 +132,10 @@ impl Drop for EncoderParams {
 pub struct EncoderState {
     raw: sys::nvjpegEncoderState_t,
     handle: Arc<Handle>,
+    /// Whether the last successful encode still has a bitstream to hand out. nvJPEG hands an
+    /// encode's bitstream out once: a second `nvjpegEncodeRetrieveBitstream` succeeds with the
+    /// same length but writes nothing, so a repeated retrieval is rejected instead.
+    bitstream_ready: bool,
 }
 
 // SAFETY: `nvjpegEncoderState_t` is owned exclusively; `&mut self` serializes encode calls.
@@ -149,6 +153,7 @@ impl EncoderState {
         Ok(Self {
             raw,
             handle: handle.clone(),
+            bitstream_ready: false,
         })
     }
 
@@ -172,6 +177,7 @@ impl EncoderState {
             .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
         format.validate_layout(src.layout(), width, height)?;
         self.handle.cuda().bind_to_thread()?;
+        self.bitstream_ready = false;
         // SAFETY: `src` has validated device plane pointers matching `format`, and `params`/`stream` are live.
         check("nvjpegEncodeImage", unsafe {
             sys::nvjpegEncodeImage(
@@ -184,7 +190,9 @@ impl EncoderState {
                 h,
                 stream.cu_stream(),
             )
-        })
+        })?;
+        self.bitstream_ready = true;
+        Ok(())
     }
 
     /// Encodes a YUV image with explicit `subsampling` on `stream` (`nvjpegEncodeYUV`).
@@ -208,6 +216,7 @@ impl EncoderState {
             .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
         validate_yuv_source(src.layout(), subsampling, width, height)?;
         self.handle.cuda().bind_to_thread()?;
+        self.bitstream_ready = false;
         // SAFETY: `src` planes cover the Y and chroma extents nvJPEG reads for `subsampling`
         // (checked above), and `params`/`stream` are live.
         check("nvjpegEncodeYUV", unsafe {
@@ -221,11 +230,21 @@ impl EncoderState {
                 h,
                 stream.cu_stream(),
             )
-        })
+        })?;
+        self.bitstream_ready = true;
+        Ok(())
     }
 
     /// Retrieves the compressed JPEG bitstream into `out`, reusing its capacity when sufficient.
+    ///
+    /// Each encode's bitstream can be retrieved once. Fails with [`Error::InvalidInput`] (leaving
+    /// `out` untouched) when no encode succeeded since the last successful retrieval.
     pub fn retrieve_bitstream_into(&mut self, out: &mut Vec<u8>, stream: &Stream) -> Result<()> {
+        if !self.bitstream_ready {
+            return Err(Error::InvalidInput(
+                "no encoded bitstream to retrieve: already retrieved, or no encode succeeded",
+            ));
+        }
         self.handle.cuda().bind_to_thread()?;
         let mut len = 0usize;
         // SAFETY: null `data` queries the exact encoded bitstream length.
@@ -243,6 +262,7 @@ impl EncoderState {
         // sm_86), so `set_len` over nvJPEG's output would expose uninitialized memory.
         out.clear();
         if len == 0 {
+            self.bitstream_ready = false;
             return Ok(());
         }
         out.resize(len, 0);
@@ -264,10 +284,13 @@ impl EncoderState {
             ));
         }
         out.truncate(written);
+        self.bitstream_ready = false;
         Ok(())
     }
 
     /// Retrieves the compressed JPEG bitstream as a new `Vec<u8>`.
+    ///
+    /// Same once-per-encode rule as [`Self::retrieve_bitstream_into`].
     pub fn retrieve_bitstream(&mut self, stream: &Stream) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.retrieve_bitstream_into(&mut out, stream)?;

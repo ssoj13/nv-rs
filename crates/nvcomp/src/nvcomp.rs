@@ -449,10 +449,9 @@ mod tests {
         ));
     }
 
-    /// Decides CMP-4: run under `compute-sanitizer --tool memcheck`. Passes only if a truncated
-    /// Bitcomp stream is rejected (wrapper error, native status, or stream error); a failure or a
-    /// memcheck out-of-bounds report means `bitcompUncompress` trusts the stream header and the
-    /// wrapper must validate it before launch.
+    /// CMP-4 regression: `bitcompUncompress` trusts the stream header and faulted (CUDA error 700)
+    /// on a truncated input. The wrapper must reject every truncation before queuing the kernel,
+    /// so the context stays usable: a valid round trip in the same context must still succeed.
     #[test]
     #[ignore = "requires CUDA GPU and nvCOMP runtime"]
     fn t2_bitcomp_uncompress_rejects_truncated_input() {
@@ -472,13 +471,43 @@ mod tests {
             .unwrap();
         stream.synchronize().unwrap();
         let packed_host = packed.to_host_vec(&stream).unwrap();
-        let truncated = DeviceBuffer::from_host(&stream, &packed_host[..8]).unwrap();
+        let mut packed_len = 0usize;
+        // SAFETY: `packed_host` is a host copy of a complete Bitcomp stream.
+        let status =
+            unsafe { sys::bitcompGetCompressedSize(packed_host.as_ptr().cast(), &mut packed_len) };
+        check_bitcomp("bitcompGetCompressedSize", status).unwrap();
+        assert!(packed_len > bitcomp::BITCOMP_HEADER_BYTES);
+
         let mut out = DeviceBuffer::<u8>::zeroed(&stream, n).unwrap();
-        let launched = plan.uncompress_async(&stream, &truncated, &mut out);
-        let completed = stream.synchronize();
-        assert!(
-            launched.is_err() || completed.is_err(),
-            "truncated Bitcomp input was accepted"
-        );
+        // Shorter than the header, header only, and one byte short of the declared size.
+        for len in [8, bitcomp::BITCOMP_HEADER_BYTES, packed_len - 1] {
+            let truncated = DeviceBuffer::from_host(&stream, &packed_host[..len]).unwrap();
+            let res = plan.uncompress_async(&stream, &truncated, &mut out);
+            assert!(
+                matches!(res, Err(Error::Invalid(_))),
+                "truncated Bitcomp input of {len} bytes was not rejected: {res:?}"
+            );
+            stream.synchronize().unwrap();
+        }
+
+        // A plan whose size differs from the stream's declared size is rejected too.
+        let mut other = BitcompPlan::new(
+            &ctx,
+            n / 2,
+            BitcompDataType::U8,
+            BitcompMode::Lossless,
+            BitcompAlgo::Default,
+        )
+        .unwrap();
+        assert!(matches!(
+            other.uncompress_async(&stream, &packed, &mut out),
+            Err(Error::Invalid(_))
+        ));
+
+        // The context is still usable: the exact-length stream round-trips.
+        let exact = DeviceBuffer::from_host(&stream, &packed_host[..packed_len]).unwrap();
+        plan.uncompress_async(&stream, &exact, &mut out).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(out.to_host_vec(&stream).unwrap(), host);
     }
 }

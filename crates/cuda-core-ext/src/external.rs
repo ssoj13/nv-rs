@@ -48,7 +48,9 @@ unsafe impl Sync for ExternalMemory {}
 
 impl ExternalMemory {
     /// Imports `size` bytes of an exported allocation. `dedicated` must match how the exporter
-    /// allocated it (Vulkan dedicated allocation, or always for D3D12 resources).
+    /// allocated it (Vulkan dedicated allocation, or always for D3D12 resources). For a D3D12 heap
+    /// the driver accepts either value (observed on CUDA 13.3; `nv-wgpu` test
+    /// `dx12_heap_import_accepts_dedicated_flag`).
     ///
     /// # Safety
     /// `handle` must refer to a live memory object of at least `size` bytes on `ctx`'s device,

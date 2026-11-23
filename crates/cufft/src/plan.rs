@@ -147,8 +147,11 @@ pub struct ManyDesc {
     /// Transform dimensions `[n0, n1, n2]` (only first `rank` entries are used).
     pub n: [i32; 3],
     /// Optional input storage dimensions; `None` means contiguous `n`. Must be `Some` exactly when
-    /// `onembed` is `Some`: cuFFT documents that a NULL embed makes it ignore all other advanced
-    /// layout parameters.
+    /// `onembed` is `Some`: cuFFT itself rejects a mixed NULL/non-NULL pair with
+    /// `CUFFT_INVALID_VALUE`, while the same sizes and strides succeed with both embeds set or
+    /// both NULL (observed on cuFFT 12 / CUDA 13.3, regression test
+    /// `gpu_plan_many_rejects_mixed_null_embeds`). With both NULL, cuFFT ignores the strides and
+    /// distances and uses the dense layout.
     pub inembed: Option<[i32; 3]>,
     /// Stride between consecutive input elements.
     pub istride: i32,
@@ -186,9 +189,10 @@ impl ManyDesc {
         if !(1..=3).contains(&self.rank) {
             return Err(Error::Invalid("ManyDesc rank must be 1, 2, or 3"));
         }
-        // `cufftMakePlanMany` docs: when `inembed` or `onembed` is NULL "all other advanced data
-        // layout parameters are ignored", so a mixed pair would make cuFFT use the dense layout on
-        // the side declared explicit; such descriptors are rejected instead of guessed.
+        // cuFFT rejects a mixed NULL/non-NULL embed pair with CUFFT_INVALID_VALUE (the same
+        // sizes and strides succeed with both set or both NULL; regression test
+        // `gpu_plan_many_rejects_mixed_null_embeds`), so the mix is rejected here with a typed
+        // error before reaching cuFFT.
         if self.inembed.is_some() != self.onembed.is_some() {
             return Err(Error::Invalid(
                 "ManyDesc inembed and onembed must both be Some or both be None",
@@ -934,6 +938,7 @@ impl Drop for Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::FftResult;
 
     #[test]
     fn many_desc_null_embed_batch_layout_normalization() {
@@ -1131,76 +1136,66 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "GPU: needs CUDA driver + cufft64_12.dll; run via xtask gpu-test"]
-    fn gpu_mixed_null_embed_layout_semantics() {
-        // FFT-03 decision: plan rank 1, n = 8, batch 2 with inembed = NULL and an explicit
-        // interleaved output (onembed = [8], ostride = 2, odist = 1) through the raw API, which
-        // `ManyDesc` now rejects. Batch 0 is all 1 (bin 0 = 8), batch 1 all 2 (bin 0 = 16).
-        // Dense output puts batch 1's bin 0 at index 8; the interleaved layout puts it at index 1.
-        let ctx = Context::new(0).expect("cuda context");
-        let stream = ctx.new_stream().expect("stream");
-        let guard = RawHandle::create(&ctx).unwrap();
+    /// Raw `cufftMakePlanMany` status for rank 1, `n = 8`, batch 2, C2C, `istride = 1`,
+    /// `idist = 8`, `ostride = 2`, `odist = 1` (interleaved output) with the given embeds.
+    fn plan_many_status(
+        ctx: &Arc<Context>,
+        inembed: Option<[i32; 3]>,
+        onembed: Option<[i32; 3]>,
+    ) -> sys::cufftResult {
+        let guard = RawHandle::create(ctx).unwrap();
         let mut n = [8i32, 1, 1];
-        let mut onembed = [8i32, 1, 1];
+        let mut in_e = inembed.unwrap_or([0; 3]);
+        let mut out_e = onembed.unwrap_or([0; 3]);
+        let in_ptr = if inembed.is_some() {
+            in_e.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
+        let out_ptr = if onembed.is_some() {
+            out_e.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
         let mut work_size = 0usize;
-        // SAFETY: `guard.handle` is live; `n` and `onembed` are stack arrays valid for rank 1 and
-        // `cufftMakePlanMany` accepts a NULL `inembed`.
-        check("cufftMakePlanMany", unsafe {
+        // SAFETY: `guard.handle` is live; `n` and the embeds are stack arrays valid for rank 1;
+        // `cufftMakePlanMany` accepts NULL embeds.
+        unsafe {
             sys::cufftMakePlanMany(
                 guard.handle,
                 1,
                 n.as_mut_ptr(),
-                std::ptr::null_mut(),
+                in_ptr,
                 1,
                 8,
-                onembed.as_mut_ptr(),
+                out_ptr,
                 2,
                 1,
                 FftType::C2C.raw(),
                 2,
                 &mut work_size,
             )
-        })
-        .unwrap();
-        let work = DeviceBuffer::<u8>::zeroed(&stream, work_size.max(1)).unwrap();
-        if work_size > 0 {
-            // SAFETY: auto-allocation is disabled and `work` holds at least `work_size` bytes.
-            check("cufftSetWorkArea", unsafe {
-                sys::cufftSetWorkArea(guard.handle, work.cu_deviceptr() as usize as *mut c_void)
-            })
-            .unwrap();
         }
-        // SAFETY: `guard.handle` and `stream` belong to `ctx`, bound by `RawHandle::create`.
-        check("cufftSetStream", unsafe {
-            sys::cufftSetStream(guard.handle, stream.cu_stream())
-        })
-        .unwrap();
-        let host_in: Vec<Complex32> = (0..16)
-            .map(|i| Complex32::new(if i < 8 { 1.0 } else { 2.0 }, 0.0))
-            .collect();
-        let input = DeviceBuffer::from_host(&stream, &host_in).unwrap();
-        let output = DeviceBuffer::<Complex32>::zeroed(&stream, 32).unwrap();
-        // SAFETY: `input` holds the 16 dense input elements; `output` holds 32 elements, more than
-        // either candidate layout writes (16 each); stream and work area are bound.
-        check("cufftExecC2C", unsafe {
-            sys::cufftExecC2C(
-                guard.handle,
-                input.cu_deviceptr() as usize as *mut sys::cufftComplex,
-                output.cu_deviceptr() as usize as *mut sys::cufftComplex,
-                Direction::Forward.raw(),
-            )
-        })
-        .unwrap();
-        let out = output.to_host_vec(&stream).unwrap();
-        drop(guard);
-        let dense = (out[8].re() - 16.0).abs() < 1e-3;
-        let interleaved = (out[1].re() - 16.0).abs() < 1e-3;
-        eprintln!("mixed NULL inembed: dense output = {dense}, interleaved output = {interleaved}");
-        assert!(
-            dense != interleaved,
-            "output matches neither candidate layout: {out:?}"
-        );
+    }
+
+    /// FFT-03 regression of observed native behaviour (cuFFT 12, CUDA 13.3, RTX 3080 Ti): with
+    /// the same sizes and strides, cuFFT rejects either mixed NULL/non-NULL embed pair with
+    /// `CUFFT_INVALID_VALUE` and accepts both "both set" and "both NULL". The rejection is caused
+    /// by the NULL mix itself, so `ManyDesc::validate` rejecting the mix matches cuFFT.
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cufft64_12.dll; run via xtask gpu-test"]
+    fn gpu_plan_many_rejects_mixed_null_embeds() {
+        let ctx = Context::new(0).expect("cuda context");
+        let e = Some([8i32, 1, 1]);
+        for (name, inembed, onembed, expected) in [
+            ("in NULL, out set", None, e, FftResult::INVALID_VALUE),
+            ("in set, out NULL", e, None, FftResult::INVALID_VALUE),
+            ("both set", e, e, FftResult::SUCCESS),
+            ("both NULL", None, None, FftResult::SUCCESS),
+        ] {
+            let got = FftResult(plan_many_status(&ctx, inembed, onembed));
+            assert_eq!(got, expected, "{name}");
+        }
     }
 
     #[test]

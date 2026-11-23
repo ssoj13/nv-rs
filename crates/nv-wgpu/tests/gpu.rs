@@ -752,12 +752,13 @@ fn dx12_wait_on_host_timeout_is_typed() {
     sem.wait_on_host(5, 1_000_000).expect("reached");
 }
 
-/// CE-06 (decider): does the driver reject `CUDA_EXTERNAL_MEMORY_DEDICATED` for a D3D12 heap?
-/// cuda.h only requires the flag for D3D12 resources and says nothing about heaps.
+/// CE-06 regression of observed driver behaviour (CUDA 13.3, RTX 3080 Ti): a D3D12 heap imports
+/// both without and with `CUDA_EXTERNAL_MEMORY_DEDICATED`. cuda.h only requires the flag for D3D12
+/// resources and says nothing about heaps, so `ExternalMemory::import` passes either value through.
 #[cfg(windows)]
 #[test]
 #[ignore = "GPU"]
-fn dx12_heap_import_dedicated_flag() {
+fn dx12_heap_import_accepts_dedicated_flag() {
     use cuda_core_ext::{ExternalMemory, MemoryHandle};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::GENERIC_ALL;
@@ -816,7 +817,8 @@ fn dx12_heap_import_dedicated_flag() {
         )
     };
     assert!(
-        dedicated.is_err(),
-        "the driver accepted DEDICATED for a heap: CE-06 is refuted"
+        dedicated.is_ok(),
+        "heap import with DEDICATED: {:?}",
+        dedicated.err()
     );
 }

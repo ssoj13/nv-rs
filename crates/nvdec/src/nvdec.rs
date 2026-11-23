@@ -426,10 +426,10 @@ pub trait ParserHandler {
     /// Called on initial sequence header or format change.
     ///
     /// Return `Ok(surface_count)`: `> 1` overrides the parser's DPB size, `1` keeps
-    /// [`ParserConfig::max_num_decode_surfaces`] (`nvcuvid.h`, `PFNVIDSEQUENCECALLBACK`). The parser
-    /// hands out picture indices below that count, so a handler that creates a [`VideoDecoder`]
-    /// must return that decoder's [`DecoderConfig::num_decode_surfaces`]; returning `1` with a
-    /// decoder smaller than the parser default makes `cuvidDecodePicture` index past its surfaces.
+    /// [`ParserConfig::max_num_decode_surfaces`] (`nvcuvid.h`, `PFNVIDSEQUENCECALLBACK`). A handler
+    /// that creates a [`VideoDecoder`] should return that decoder's
+    /// [`DecoderConfig::num_decode_surfaces`], so the parser and the decoder use the same number
+    /// of decode surfaces.
     fn on_sequence(&mut self, fmt: &VideoFormat) -> Result<u32>;
     /// Called when a picture is ready to be decoded (decode order).
     fn on_decode(&mut self, pic: &sys::CUVIDPICPARAMS) -> Result<()>;

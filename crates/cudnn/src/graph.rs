@@ -365,6 +365,8 @@ impl GraphConvPlan {
     /// Builds and finalizes a cuDNN 9 Backend Execution Plan for `spec` under `max_workspace_bytes`.
     pub fn build(handle: &Handle, spec: &GraphConvSpec, max_workspace_bytes: usize) -> Result<Self> {
         let ctx = handle.context();
+        // Heuristics and plan finalization run on the context current on this thread.
+        ctx.bind_to_thread()?;
         let x_desc = make_tensor_desc(ctx, UID_X, spec.x_dtype, &spec.x_dims, &spec.x_strides, spec.alignment_bytes)?;
         let w_desc = make_tensor_desc(ctx, UID_W, spec.w_dtype, &spec.w_dims, &spec.w_strides, spec.alignment_bytes)?;
         let y_desc = make_tensor_desc(ctx, UID_Y, spec.y_dtype, &spec.y_dims, &spec.y_strides, spec.alignment_bytes)?;
@@ -507,6 +509,8 @@ impl GraphConvPlan {
     /// writing the output (`BF16`/`F16`/`F32`), requiring zero extra HBM passes.
     pub fn build_scaled(handle: &Handle, spec: &GraphConvSpec, max_workspace_bytes: usize) -> Result<Self> {
         let ctx = handle.context();
+        // Heuristics and plan finalization run on the context current on this thread.
+        ctx.bind_to_thread()?;
         let x_desc = make_tensor_desc(ctx, UID_X, spec.x_dtype, &spec.x_dims, &spec.x_strides, spec.alignment_bytes)?;
         let w_desc = make_tensor_desc(ctx, UID_W, spec.w_dtype, &spec.w_dims, &spec.w_strides, spec.alignment_bytes)?;
         let y_desc = make_tensor_desc(ctx, UID_Y, spec.y_dtype, &spec.y_dims, &spec.y_strides, spec.alignment_bytes)?;

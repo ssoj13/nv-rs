@@ -622,6 +622,33 @@ mod tests {
         assert!(matches!(NvApi::init(), Err(Error::UnsupportedPlatform)));
     }
 
+    /// Number of displays the GPUs driving `disp` report as connected
+    /// (`NvAPI_GetPhysicalGPUsFromDisplay` + `NvAPI_GPU_GetConnectedDisplayIds`).
+    #[cfg(windows)]
+    fn connected_display_count(disp: &Display) -> u32 {
+        let mut gpus: [sys::NvPhysicalGpuHandle; sys::NVAPI_MAX_PHYSICAL_GPUS as usize] =
+            [std::ptr::null_mut(); sys::NVAPI_MAX_PHYSICAL_GPUS as usize];
+        let mut n = 0u32;
+        // SAFETY: `disp.inner.handle` is a live display handle and `gpus`/`n` are valid out-buffers.
+        let code = unsafe {
+            sys::NvAPI_GetPhysicalGPUsFromDisplay(disp.inner.handle, gpus.as_mut_ptr(), &mut n)
+        };
+        crate::error::check("NvAPI_GetPhysicalGPUsFromDisplay", code).expect("GPUs of display");
+        gpus[..(n as usize).min(gpus.len())]
+            .iter()
+            .map(|&gpu| {
+                let mut count = 0u32;
+                // SAFETY: `gpu` is a live physical GPU handle; a NULL array queries the count.
+                let code = unsafe {
+                    sys::NvAPI_GPU_GetConnectedDisplayIds(gpu, std::ptr::null_mut(), &mut count, 0)
+                };
+                crate::error::check("NvAPI_GPU_GetConnectedDisplayIds", code)
+                    .expect("connected display count");
+                count
+            })
+            .sum()
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "GPU: needs the NVIDIA Windows driver; run via xtask gpu-test"]
@@ -682,15 +709,36 @@ mod tests {
         let displays = nvapi.displays().expect("enumerate displays");
         if let Some(disp) = displays.first() {
             assert!(!disp.name().expect("display name").is_empty());
-            match disp.hdr_capabilities() {
-                Ok(_) => {}
-                Err(Error::Status { status, .. }) if status.is_not_supported() => {}
-                Err(e) => panic!("unexpected hdr_capabilities error: {e}"),
-            }
-            match disp.vrr_info() {
-                Ok(_) => {}
-                Err(Error::Status { status, .. }) if status.is_not_supported() => {}
-                Err(e) => panic!("unexpected vrr_info error: {e}"),
+            // NVAPI resolves display IDs only for active displays (`nvapi.h`,
+            // `NvAPI_DISP_GetDisplayIdByDisplayName`). With no display connected to the GPU (a
+            // monitor that is off or unplugged while Windows keeps the desktop), the driver keeps a
+            // GDI-associated display handle but answers the ID lookup with
+            // NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE; the HDR/VRR queries cannot run then.
+            let display_id_resolved = match disp.display_id() {
+                Ok(_) => true,
+                Err(Error::Status { status, .. })
+                    if status.0 == sys::_NvAPI_Status_NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE
+                        && connected_display_count(disp) == 0 =>
+                {
+                    eprintln!(
+                        "skipping HDR and VRR checks: the GPU reports 0 connected displays, so \
+                         NvAPI_DISP_GetDisplayIdByDisplayName returned {status}"
+                    );
+                    false
+                }
+                Err(e) => panic!("unexpected display_id error: {e}"),
+            };
+            if display_id_resolved {
+                match disp.hdr_capabilities() {
+                    Ok(_) => {}
+                    Err(Error::Status { status, .. }) if status.is_not_supported() => {}
+                    Err(e) => panic!("unexpected hdr_capabilities error: {e}"),
+                }
+                match disp.vrr_info() {
+                    Ok(_) => {}
+                    Err(Error::Status { status, .. }) if status.is_not_supported() => {}
+                    Err(e) => panic!("unexpected vrr_info error: {e}"),
+                }
             }
         }
 

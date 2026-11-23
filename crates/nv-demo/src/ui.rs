@@ -1933,48 +1933,14 @@ impl UiContext<'_> {
             collapsing_section(ui, "sec_csg", ic::BUILDINGS, "CSG World", true, |ui| {
                 let prev_mode = s.csg_mode;
                 let total_choices = descs.len() + 1;
-                let active_name = if s.csg_mode == 0 {
-                    "Off (Classic)"
-                } else {
-                    descs
-                        .get((s.csg_mode as usize).saturating_sub(1))
-                        .map_or("Off (Classic)", |d| d.name)
-                };
 
-                prop_row(ui, "Scene", |ui| {
-                    let gap = 4.0;
-                    let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
-                    ui.spacing_mut().item_spacing.x = gap;
-                    egui::ComboBox::from_id_salt("csg_scene_combo")
-                        .width(combo_w)
-                        .truncate()
-                        .selected_text(active_name)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut s.csg_mode, 0u32, "Off (Classic)")
-                                .on_hover_text("Classic SDF fractal + scratched metal stage floor");
-                            for (i, d) in descs.iter().enumerate() {
-                                ui.selectable_value(&mut s.csg_mode, (i + 1) as u32, d.name)
-                                    .on_hover_text(d.description);
-                            }
-                        });
-                    anim_toggle_btn_disabled(ui);
-                });
-
-                // Quick-pick scene buttons driven strictly by `SceneRegistry::descriptors()`.
+                // Scene selector buttons driven strictly by `SceneRegistry::descriptors()`.
                 let cols = total_choices.clamp(1, 3);
                 equal_grid(ui, cols, total_choices, |ui, idx, w| {
                     let (mode, label, tip) = if idx == 0 {
                         (0u32, "Off", "Classic SDF fractal + stage floor")
                     } else if let Some(d) = descs.get(idx - 1) {
-                        let short = match d.id {
-                            "gundo" => "Gundo",
-                            "gundo_osm" => "Gundo OSM",
-                            "marina" => "Marina",
-                            "sf_house_of_ai" => "SF AI",
-                            "inspector" => "Inspector",
-                            _ => d.name,
-                        };
-                        (idx as u32, short, d.description)
+                        (idx as u32, d.name, d.description)
                     } else {
                         (0u32, "Off", "")
                     };

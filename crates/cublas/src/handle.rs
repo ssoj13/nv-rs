@@ -3,14 +3,22 @@
 //! **What.** Wraps `cublasHandle_t` bound to a `cuda_core::Context`, configures stream ordering,
 //! host/device pointer mode, math mode, and caller-owned [`Scratch`] workspace, and destroys the
 //! handle on `Drop` (recording any teardown error on the owning CUDA context).
+//!
+//! **Workspace rule.** [`Handle::set_workspace`] retains the scratch allocation it hands to
+//! `cublasSetWorkspace_v2` until the workspace is replaced, cleared, or the handle is dropped, and
+//! pins the handle to the scratch stream while it is bound: `cublasSetStream_v2` silently resets the
+//! workspace to the default pool, and using a stream-ordered buffer on another stream is unsound, so
+//! switching streams with a bound workspace is an error. [`Handle::clear_workspace`] restores the
+//! default pool. Every stream bind makes the handle's context current, even on a stream-cache hit.
+//!
 //! **Why.** Centralizes handle lifecycle and ensures every cuBLAS call runs on the caller's
 //! stream and context with zero hidden allocations.
 //! **Used by** [`crate::gemm`] and external cuBLAS callers.
 
 use crate::error::{check, teardown};
 use crate::{Error, Result, Scratch, lt_sys, sys};
-use cuda_core::{Context, Stream};
-use std::cell::Cell;
+use cuda_core::{Context, DeviceBuffer, Stream};
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// Matrix transpose operation (`cublasOperation_t`).
@@ -38,10 +46,8 @@ impl Operation {
     /// Converts to `i32` (`cublasOperation_t`) for `cublasLtMatmulDescSetAttribute`.
     #[inline]
     pub const fn raw_lt(self) -> i32 {
-        #[allow(clippy::unnecessary_cast)]
-        {
-            self.raw() as i32
-        }
+        // `c_int` alias: the bindgen enum repr is `i32` on MSVC and `u32` on Linux.
+        self.raw() as std::ffi::c_int
     }
 }
 
@@ -67,10 +73,8 @@ impl PointerMode {
     /// Converts to `i32` (`cublasLtPointerMode_t`) for `cublasLtMatmulDescSetAttribute`.
     #[inline]
     pub const fn raw_lt(self) -> i32 {
-        #[allow(clippy::unnecessary_cast)]
-        {
-            self.raw() as i32
-        }
+        // `c_int` alias: the bindgen enum repr is `i32` on MSVC and `u32` on Linux.
+        self.raw() as std::ffi::c_int
     }
 
     pub(crate) fn from_raw(raw: sys::cublasPointerMode_t) -> Result<Self> {
@@ -268,6 +272,18 @@ pub struct Handle {
     cuda: Arc<Context>,
     pointer_mode: Cell<PointerMode>,
     last_raw_stream: Cell<*mut std::ffi::c_void>,
+    /// Workspace currently installed with `cublasSetWorkspace_v2`; `None` means cuBLAS uses its
+    /// default pool. Fields drop after `Drop::drop` destroys `raw`.
+    workspace: RefCell<Option<BoundWorkspace>>,
+}
+
+/// User workspace installed on a [`Handle`], retained so it outlives every call that may use it.
+struct BoundWorkspace {
+    /// Installed allocation (`None` for an empty, zero-byte workspace). Never read: holding it is
+    /// the point; its stream-ordered free runs on `stream` after the cuBLAS work queued there.
+    _buf: Option<Arc<DeviceBuffer<u8>>>,
+    /// Stream the handle is pinned to while this workspace is installed.
+    stream: Arc<Stream>,
 }
 
 // SAFETY: `cublasHandle_t` has no thread-local state once created; moving ownership between threads
@@ -287,6 +303,7 @@ impl Handle {
             cuda: cuda.clone(),
             pointer_mode: Cell::new(PointerMode::Host),
             last_raw_stream: Cell::new(std::ptr::null_mut()),
+            workspace: RefCell::new(None),
         })
     }
 
@@ -302,24 +319,19 @@ impl Handle {
         &self.cuda
     }
 
-    /// Binds `stream` to this handle. Fails if `stream` belongs to a different CUDA context.
+    /// Binds `stream` to this handle and makes the handle's context current on this thread.
+    ///
+    /// Fails if `stream` belongs to a different CUDA context, or if a workspace bound with
+    /// [`Self::set_workspace`] belongs to another stream (call [`Self::clear_workspace`] first).
     pub fn set_stream(&self, stream: &Stream) -> Result<()> {
         if !Arc::ptr_eq(stream.context(), &self.cuda) {
             return Err(Error::Invalid(
                 "stream belongs to a different CUDA context than the cuBLAS handle",
             ));
         }
-        let raw_s = stream.cu_stream();
-        if self.last_raw_stream.get() == raw_s.cast() {
-            return Ok(());
-        }
-        self.cuda.bind_to_thread()?;
-        // SAFETY: `self.raw` and `stream.cu_stream()` belong to the same live context.
-        check("cublasSetStream_v2", unsafe {
-            sys::cublasSetStream_v2(self.raw, raw_s)
-        })?;
-        self.last_raw_stream.set(raw_s.cast());
-        Ok(())
+        // SAFETY: `stream` is a live stream of `self.cuda` (checked above); safe callers pass it
+        // again to every enqueueing call, which rebinds it before use.
+        unsafe { self.bind_stream(stream.cu_stream().cast()) }
     }
 
     /// Binds an externally owned raw `CUstream` (e.g. from CubeCL) to this handle, caching the
@@ -329,10 +341,28 @@ impl Handle {
     /// - `raw_stream` must be either null (default stream) or a live `CUstream` created in
     ///   `self.cuda()` that remains valid for all subsequent cuBLAS calls until rebound.
     pub unsafe fn set_raw_stream(&self, raw_stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: forwarded caller contract on `raw_stream`.
+        unsafe { self.bind_stream(raw_stream) }
+    }
+
+    /// Makes `self.cuda` current, then binds `raw_stream` unless it is already bound.
+    ///
+    /// # Safety
+    /// `raw_stream` must be null or a live `CUstream` of `self.cuda`.
+    unsafe fn bind_stream(&self, raw_stream: *mut std::ffi::c_void) -> Result<()> {
+        // Bind before the cache check: the cache skips only `cublasSetStream_v2`, while cuBLAS
+        // enqueues on whatever context is current on the calling thread.
+        self.cuda.bind_to_thread()?;
         if self.last_raw_stream.get() == raw_stream {
             return Ok(());
         }
-        self.cuda.bind_to_thread()?;
+        // `cublasSetStream_v2` would silently drop the workspace to the default pool, and the
+        // stream-ordered workspace must not be used on another stream.
+        if self.workspace.borrow().is_some() {
+            return Err(Error::Invalid(
+                "cuBLAS workspace is bound to another stream; call clear_workspace first",
+            ));
+        }
         // SAFETY: caller guarantees `raw_stream` belongs to `self.cuda` and stays alive.
         check("cublasSetStream_v2", unsafe {
             sys::cublasSetStream_v2(self.raw, raw_stream.cast())
@@ -394,23 +424,68 @@ impl Handle {
 
     /// Binds a caller-owned [`Scratch`] workspace of `bytes` (admitted against `budget`) to this
     /// handle and binds `scratch.stream()` as the active stream.
+    ///
+    /// The handle retains the allocation until the workspace is replaced, cleared, or the handle
+    /// is dropped, so later growth or drop of `scratch` cannot free memory cuBLAS still uses. While
+    /// bound, the handle stays on `scratch.stream()`: [`Self::set_stream`] with another stream fails.
+    /// `bytes == 0` installs an empty workspace (cuBLAS then uses no workspace at all).
     pub fn set_workspace(&self, scratch: &mut Scratch, bytes: usize, budget: usize) -> Result<()> {
         let stream = scratch.stream().clone();
-        self.set_stream(&stream)?;
+        if !Arc::ptr_eq(stream.context(), &self.cuda) {
+            return Err(Error::Invalid(
+                "scratch stream belongs to a different CUDA context than the cuBLAS handle",
+            ));
+        }
         let (ptr, cap) = scratch.reserve(&stream, bytes, budget)?;
-        // SAFETY: `self.raw` is live; `ptr` is valid for `cap` device bytes on `stream` (or null/0).
-        check("cublasSetWorkspace_v2", unsafe {
+        let buf = if cap == 0 {
+            None
+        } else {
+            scratch.shared_buffer()
+        };
+        self.cuda.bind_to_thread()?;
+        let raw_s: *mut std::ffi::c_void = stream.cu_stream().cast();
+        let stream_reset = self.last_raw_stream.get() != raw_s;
+        if stream_reset {
+            // SAFETY: `self.raw` is live and `stream` belongs to `self.cuda` (checked above). This
+            // also resets any previous workspace to the default pool, so cuBLAS stops using it.
+            check("cublasSetStream_v2", unsafe {
+                sys::cublasSetStream_v2(self.raw, stream.cu_stream())
+            })?;
+            self.last_raw_stream.set(raw_s);
+        }
+        // SAFETY: `self.raw` is live; `ptr` is valid for `cap` device bytes on `stream` (or null/0)
+        // and `buf` keeps that allocation alive for as long as it stays installed.
+        let set = check("cublasSetWorkspace_v2", unsafe {
             sys::cublasSetWorkspace_v2(self.raw, ptr, cap)
-        })
+        });
+        if set.is_ok() {
+            *self.workspace.borrow_mut() = Some(BoundWorkspace { _buf: buf, stream });
+        } else if stream_reset {
+            // After a stream reset cuBLAS is back on its default pool and no longer refers to the
+            // previous workspace; without a reset the previous one stays installed and retained.
+            *self.workspace.borrow_mut() = None;
+        }
+        set
     }
 
-    /// Detaches any user-supplied workspace from this handle.
+    /// Detaches any user-supplied workspace and restores cuBLAS's default workspace pool.
+    ///
+    /// `cublasSetWorkspace_v2(NULL, 0)` would instead disable workspace use entirely; rebinding the
+    /// current stream with `cublasSetStream_v2` is the documented way back to the default pool.
+    /// The released allocation is freed stream-ordered after the work already queued on it.
     pub fn clear_workspace(&self) -> Result<()> {
         self.cuda.bind_to_thread()?;
-        // SAFETY: passing null/0 clears the user workspace on a live handle.
-        check("cublasSetWorkspace_v2", unsafe {
-            sys::cublasSetWorkspace_v2(self.raw, std::ptr::null_mut(), 0)
-        })
+        let mut slot = self.workspace.borrow_mut();
+        let Some(ws) = slot.as_ref() else {
+            return Ok(());
+        };
+        // SAFETY: `self.raw` is live and `ws.stream` is the retained stream the handle is pinned
+        // to while the workspace is installed, so this keeps the bound stream unchanged.
+        check("cublasSetStream_v2", unsafe {
+            sys::cublasSetStream_v2(self.raw, ws.stream.cu_stream())
+        })?;
+        *slot = None;
+        Ok(())
     }
 
     /// Returns the cuBLAS library version reported by `cublasGetVersion_v2`.

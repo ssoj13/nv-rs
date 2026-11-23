@@ -10,6 +10,7 @@
 //! heuristic workspace control.
 
 use crate::error::{check_lt, teardown_lt};
+use crate::gemm::batches_disjoint;
 use crate::{
     ComputeType, DataType, Error, Operation, PointerMode, Result, Scratch, Status, lt_sys,
 };
@@ -533,6 +534,7 @@ impl LtHandle {
                 "device buffer smaller than required MatrixLayout extent",
             ));
         }
+        d_desc.check_output_batch()?;
         let ws_bytes = heuristic.workspace_size();
         let (ws_ptr, _) = scratch.reserve(stream, ws_bytes, budget)?;
         self.cuda.bind_to_thread()?;
@@ -769,6 +771,9 @@ impl LtHandle {
                 &mut result.raw,
             )
         })?;
+        // `cublasLtMatmulAlgoCheck` never updates `result.algo` (`cublasLt.h`); carry the checked
+        // algo so the result is directly usable with `matmul_f32` and its checked workspace size.
+        result.raw.algo = algo.raw;
         Ok(result)
     }
 
@@ -809,6 +814,8 @@ impl LtHandle {
                 stream.cu_stream(),
             )
         })?;
+        // `cublasLtMatmulAlgoCheckForStream` never updates `result.algo`; see `matmul_algo_check`.
+        result.raw.algo = algo.raw;
         Ok(result)
     }
 
@@ -903,6 +910,7 @@ impl LtHandle {
                 "device buffer smaller than required MatrixLayout extent",
             ));
         }
+        c_desc.check_output_batch()?;
         let (b_ptr, b_raw_desc) = match b {
             Some((buf, layout)) => {
                 if layout.dtype != DataType::F32 {
@@ -1170,7 +1178,22 @@ impl MatmulDesc {
     }
 
     /// Writes raw attribute bytes (`cublasLtMatmulDescSetAttribute`).
-    pub fn set_attribute_bytes(&mut self, attr: MatmulDescAttr, buf: &[u8]) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// cuBLASLt trusts these bytes during every later matmul with this descriptor:
+    /// - do not change `PointerMode` or `ScaleType` here: [`LtHandle::matmul_f32`] validates its
+    ///   host `f32` scalars against values cached by [`Self::new`] and [`Self::set_pointer_mode`];
+    /// - every pointer attribute (bias, epilogue aux, scale, amax, D-out scale) must be null or a
+    ///   device allocation of `self`'s context covering the extent the descriptor implies, alive
+    ///   until all matmuls using it complete; `EmulationDescriptor` must name a live descriptor;
+    /// - scale modes and alpha/beta batch strides must match the buffers those pointers address.
+    pub unsafe fn set_attribute_bytes(&mut self, attr: MatmulDescAttr, buf: &[u8]) -> Result<()> {
+        self.set_attr(attr, buf)
+    }
+
+    /// Writes an attribute whose value the typed setters have already validated.
+    fn set_attr(&mut self, attr: MatmulDescAttr, buf: &[u8]) -> Result<()> {
         // SAFETY: `self.raw` is live and `buf` is valid for `buf.len()` bytes.
         check_lt("cublasLtMatmulDescSetAttribute", unsafe {
             lt_sys::cublasLtMatmulDescSetAttribute(
@@ -1201,7 +1224,7 @@ impl MatmulDesc {
     /// Sets the transpose operation for matrix A (`CUBLASLT_MATMUL_DESC_TRANSA`).
     pub fn set_trans_a(&mut self, op: Operation) -> Result<()> {
         let v = op.raw_lt();
-        self.set_attribute_bytes(MatmulDescAttr::TransA, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::TransA, &v.to_ne_bytes())
     }
 
     /// Queries the transpose operation for matrix A (`CUBLASLT_MATMUL_DESC_TRANSA`).
@@ -1217,7 +1240,7 @@ impl MatmulDesc {
     /// Sets the transpose operation for matrix B (`CUBLASLT_MATMUL_DESC_TRANSB`).
     pub fn set_trans_b(&mut self, op: Operation) -> Result<()> {
         let v = op.raw_lt();
-        self.set_attribute_bytes(MatmulDescAttr::TransB, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::TransB, &v.to_ne_bytes())
     }
 
     /// Queries the transpose operation for matrix B (`CUBLASLT_MATMUL_DESC_TRANSB`).
@@ -1233,13 +1256,13 @@ impl MatmulDesc {
     /// Sets the transpose operation for matrix C (`CUBLASLT_MATMUL_DESC_TRANSC`).
     pub fn set_trans_c(&mut self, op: Operation) -> Result<()> {
         let v = op.raw_lt();
-        self.set_attribute_bytes(MatmulDescAttr::TransC, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::TransC, &v.to_ne_bytes())
     }
 
     /// Sets the scalar pointer mode (`CUBLASLT_MATMUL_DESC_POINTER_MODE`).
     pub fn set_pointer_mode(&mut self, mode: PointerMode) -> Result<()> {
         let v = mode.raw_lt();
-        self.set_attribute_bytes(MatmulDescAttr::PointerMode, &v.to_ne_bytes())?;
+        self.set_attr(MatmulDescAttr::PointerMode, &v.to_ne_bytes())?;
         self.pointer_mode = mode;
         Ok(())
     }
@@ -1257,7 +1280,7 @@ impl MatmulDesc {
     /// Sets the fused epilogue (`CUBLASLT_MATMUL_DESC_EPILOGUE`).
     pub fn set_epilogue(&mut self, epilogue: Epilogue) -> Result<()> {
         let v = epilogue.raw();
-        self.set_attribute_bytes(MatmulDescAttr::Epilogue, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::Epilogue, &v.to_ne_bytes())
     }
 
     /// Queries the fused epilogue (`CUBLASLT_MATMUL_DESC_EPILOGUE`).
@@ -1274,13 +1297,13 @@ impl MatmulDesc {
 
     /// Sets the target SM count hint (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`).
     pub fn set_sm_count_target(&mut self, sm_count: i32) -> Result<()> {
-        self.set_attribute_bytes(MatmulDescAttr::SmCountTarget, &sm_count.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::SmCountTarget, &sm_count.to_ne_bytes())
     }
 
     /// Enables or disables fast FP8 accumulation (`CUBLASLT_MATMUL_DESC_FAST_ACCUM`).
     pub fn set_fast_accum(&mut self, fast_accum: bool) -> Result<()> {
         let v: i8 = i8::from(fast_accum);
-        self.set_attribute_bytes(MatmulDescAttr::FastAccum, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::FastAccum, &v.to_ne_bytes())
     }
 
     /// Sets the device bias vector pointer (`CUBLASLT_MATMUL_DESC_BIAS_POINTER`).
@@ -1303,12 +1326,12 @@ impl MatmulDesc {
     /// Sets the bias vector element data type (`CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE`).
     pub fn set_bias_data_type(&mut self, dtype: DataType) -> Result<()> {
         let v = dtype.raw_lt();
-        self.set_attribute_bytes(MatmulDescAttr::BiasDataType, &v.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::BiasDataType, &v.to_ne_bytes())
     }
 
     /// Sets the bias batch stride in elements (`CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE`).
     pub fn set_bias_batch_stride(&mut self, stride: i64) -> Result<()> {
-        self.set_attribute_bytes(MatmulDescAttr::BiasBatchStride, &stride.to_ne_bytes())
+        self.set_attr(MatmulDescAttr::BiasBatchStride, &stride.to_ne_bytes())
     }
 
     /// Attaches an [`EmulationDesc`] (`CUBLASLT_MATMUL_DESC_EMULATION_DESCRIPTOR`).
@@ -1452,6 +1475,32 @@ pub struct MatrixLayout {
     order: Order,
     batch_count: i32,
     strided_offset: i64,
+    /// `false` once the layout addresses pointer arrays (grouped layout or non-strided batch
+    /// mode) instead of one dense buffer; [`Self::min_elems`] then has no meaning.
+    dense: bool,
+    /// Created by [`Self::new_grouped`]: `rows`/`cols`/`ld` are placeholders.
+    grouped: bool,
+}
+
+/// Validates the documented minimum leading dimension for `order` (`cublasLt.h`,
+/// `cublasLtOrder_t` and `CUBLASLT_MATRIX_LAYOUT_LD`: "large enough so that matrix memory
+/// locations are not overlapping"); [`MatrixLayout::min_elems`] is only an upper bound under it.
+fn validate_ld(order: Order, rows: u64, cols: u64, ld: i64) -> Result<()> {
+    let ld = u64::try_from(ld).map_err(|_| Error::Invalid("negative leading dimension"))?;
+    let min = match order {
+        Order::Col => Some(rows),
+        Order::Row => Some(cols),
+        Order::Col32 => rows.checked_mul(32),
+        Order::Col44r28c => rows.div_ceil(8).checked_mul(32 * 8),
+        Order::Col322r4r4 => rows.div_ceil(32).checked_mul(32 * 32),
+    }
+    .ok_or(Error::Invalid("matrix layout leading dimension overflow"))?;
+    if ld < min {
+        return Err(Error::Invalid(
+            "leading dimension is smaller than the matrix order requires",
+        ));
+    }
+    Ok(())
 }
 
 // SAFETY: layout descriptor owns no thread-local state (`!Sync`).
@@ -1471,6 +1520,7 @@ impl MatrixLayout {
                 "matrix layout requires positive rows, cols, and ld",
             ));
         }
+        validate_ld(Order::Col, rows, cols, ld)?;
         lt_sys::load().map_err(|e| Error::Unavailable(e.to_string()))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out-pointer.
@@ -1487,6 +1537,8 @@ impl MatrixLayout {
             order: Order::Col,
             batch_count: 1,
             strided_offset: 0,
+            dense: true,
+            grouped: false,
         })
     }
 
@@ -1537,11 +1589,30 @@ impl MatrixLayout {
             order: Order::Col,
             batch_count: group_count,
             strided_offset: 0,
+            dense: false,
+            grouped: true,
         })
     }
 
     /// Writes raw attribute bytes (`cublasLtMatrixLayoutSetAttribute`).
-    pub fn set_attribute_bytes(&mut self, attr: MatrixLayoutAttr, buf: &[u8]) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// Do not change `Type`, `Order`, `Rows`, `Cols`, `Ld`, `BatchCount`, `StridedBatchOffset` or
+    /// `BatchMode` here: [`LtHandle::matmul_f32`] and [`LtHandle::matrix_transform_f32`] validate
+    /// buffers against the values cached by the typed constructors and setters. Any other value
+    /// (for example `PlaneOffset` or grouped arrays) must keep every buffer later bound to this
+    /// layout valid for the extent cuBLASLt derives from it.
+    pub unsafe fn set_attribute_bytes(
+        &mut self,
+        attr: MatrixLayoutAttr,
+        buf: &[u8],
+    ) -> Result<()> {
+        self.set_attr(attr, buf)
+    }
+
+    /// Writes an attribute whose value the typed setters have already validated.
+    fn set_attr(&mut self, attr: MatrixLayoutAttr, buf: &[u8]) -> Result<()> {
         // SAFETY: `self.raw` is live and `buf` is valid for `buf.len()` bytes.
         check_lt("cublasLtMatrixLayoutSetAttribute", unsafe {
             lt_sys::cublasLtMatrixLayoutSetAttribute(
@@ -1571,8 +1642,11 @@ impl MatrixLayout {
 
     /// Sets the matrix memory order (`CUBLASLT_MATRIX_LAYOUT_ORDER`).
     pub fn set_order(&mut self, order: Order) -> Result<()> {
+        if !self.grouped {
+            validate_ld(order, self.rows, self.cols, self.ld)?;
+        }
         let v = order.raw();
-        self.set_attribute_bytes(MatrixLayoutAttr::Order, &v.to_ne_bytes())?;
+        self.set_attr(MatrixLayoutAttr::Order, &v.to_ne_bytes())?;
         self.order = order;
         Ok(())
     }
@@ -1624,11 +1698,8 @@ impl MatrixLayout {
                 "batch_count must be positive and strided_offset non-negative",
             ));
         }
-        self.set_attribute_bytes(MatrixLayoutAttr::BatchCount, &batch_count.to_ne_bytes())?;
-        self.set_attribute_bytes(
-            MatrixLayoutAttr::StridedBatchOffset,
-            &strided_offset.to_ne_bytes(),
-        )?;
+        self.set_attr(MatrixLayoutAttr::BatchCount, &batch_count.to_ne_bytes())?;
+        self.set_attr(MatrixLayoutAttr::StridedBatchOffset, &strided_offset.to_ne_bytes())?;
         self.batch_count = batch_count;
         self.strided_offset = strided_offset;
         Ok(())
@@ -1658,17 +1729,60 @@ impl MatrixLayout {
 
     /// Sets the planar complex plane offset in elements (`CUBLASLT_MATRIX_LAYOUT_PLANE_OFFSET`).
     pub fn set_plane_offset(&mut self, offset: i64) -> Result<()> {
-        self.set_attribute_bytes(MatrixLayoutAttr::PlaneOffset, &offset.to_ne_bytes())
+        self.set_attr(MatrixLayoutAttr::PlaneOffset, &offset.to_ne_bytes())
     }
 
     /// Sets the batching mode (`CUBLASLT_MATRIX_LAYOUT_BATCH_MODE`).
+    ///
+    /// Any mode other than strided makes cuBLASLt read the bound buffer as a device array of
+    /// matrix pointers, so the typed `f32` entry points reject such layouts.
     pub fn set_batch_mode(&mut self, mode: BatchMode) -> Result<()> {
         let v = mode.raw();
-        self.set_attribute_bytes(MatrixLayoutAttr::BatchMode, &v.to_ne_bytes())
+        self.set_attr(MatrixLayoutAttr::BatchMode, &v.to_ne_bytes())?;
+        self.dense = !self.grouped && v == BatchMode::Strided.raw();
+        Ok(())
+    }
+
+    /// Rejects an output layout whose batch matrices overlap (`batch_count > 1` with a
+    /// `strided_offset` that makes concurrent batches write the same element).
+    pub(crate) fn check_output_batch(&self) -> Result<()> {
+        let batch = u64::try_from(self.batch_count)
+            .map_err(|_| Error::Invalid("negative matrix layout batch count"))?;
+        let ld =
+            u64::try_from(self.ld).map_err(|_| Error::Invalid("negative leading dimension"))?;
+        let stride = u64::try_from(self.strided_offset)
+            .map_err(|_| Error::Invalid("negative strided batch offset"))?;
+        let disjoint = match self.order {
+            Order::Col => batches_disjoint(self.rows, self.cols, ld, stride, batch),
+            Order::Row => batches_disjoint(self.cols, self.rows, ld, stride, batch),
+            // Tiled orders: `ld` is the stride between 32-column groups (`cublasLtOrder_t`).
+            Order::Col32 | Order::Col44r28c | Order::Col322r4r4 => {
+                batch <= 1
+                    || self
+                        .cols
+                        .div_ceil(32)
+                        .checked_mul(ld)
+                        .is_some_and(|span| stride >= span)
+            }
+        };
+        if !disjoint {
+            return Err(Error::Invalid(
+                "output layout strided_offset makes batch matrices overlap",
+            ));
+        }
+        Ok(())
     }
 
     /// Minimum required element count for buffers bound to this layout.
+    ///
+    /// Fails for grouped and pointer-array layouts: their buffers are arrays of device pointers,
+    /// not dense matrices.
     pub fn min_elems(&self) -> Result<usize> {
+        if !self.dense {
+            return Err(Error::Invalid(
+                "grouped or pointer-array matrix layout has no dense element extent",
+            ));
+        }
         let ld =
             u64::try_from(self.ld).map_err(|_| Error::Invalid("negative leading dimension"))?;
         let matrix_span = match self.order {
@@ -2019,7 +2133,22 @@ impl MatrixTransformDesc {
     }
 
     /// Writes raw attribute bytes (`cublasLtMatrixTransformDescSetAttribute`).
-    pub fn set_attribute_bytes(&mut self, attr: MatrixTransformDescAttr, buf: &[u8]) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// Do not change `PointerMode` or `ScaleType` here: [`LtHandle::matrix_transform_f32`]
+    /// validates its host `f32` scalars against the values cached by [`Self::new`] and
+    /// [`Self::set_pointer_mode`]. Use the typed setters instead.
+    pub unsafe fn set_attribute_bytes(
+        &mut self,
+        attr: MatrixTransformDescAttr,
+        buf: &[u8],
+    ) -> Result<()> {
+        self.set_attr(attr, buf)
+    }
+
+    /// Writes an attribute whose value the typed setters have already validated.
+    fn set_attr(&mut self, attr: MatrixTransformDescAttr, buf: &[u8]) -> Result<()> {
         // SAFETY: `self.raw` is live and `buf` is valid for `buf.len()` bytes.
         check_lt("cublasLtMatrixTransformDescSetAttribute", unsafe {
             lt_sys::cublasLtMatrixTransformDescSetAttribute(
@@ -2054,7 +2183,7 @@ impl MatrixTransformDesc {
     /// Sets the scalar pointer mode (`CUBLASLT_MATRIX_TRANSFORM_DESC_POINTER_MODE`).
     pub fn set_pointer_mode(&mut self, mode: PointerMode) -> Result<()> {
         let v = mode.raw_lt();
-        self.set_attribute_bytes(MatrixTransformDescAttr::PointerMode, &v.to_ne_bytes())?;
+        self.set_attr(MatrixTransformDescAttr::PointerMode, &v.to_ne_bytes())?;
         self.pointer_mode = mode;
         Ok(())
     }
@@ -2072,7 +2201,7 @@ impl MatrixTransformDesc {
     /// Sets the transpose operation for matrix A (`CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSA`).
     pub fn set_trans_a(&mut self, op: Operation) -> Result<()> {
         let v = op.raw_lt();
-        self.set_attribute_bytes(MatrixTransformDescAttr::TransA, &v.to_ne_bytes())
+        self.set_attr(MatrixTransformDescAttr::TransA, &v.to_ne_bytes())
     }
 
     /// Queries the transpose operation for matrix A (`CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSA`).
@@ -2088,7 +2217,7 @@ impl MatrixTransformDesc {
     /// Sets the transpose operation for matrix B (`CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSB`).
     pub fn set_trans_b(&mut self, op: Operation) -> Result<()> {
         let v = op.raw_lt();
-        self.set_attribute_bytes(MatrixTransformDescAttr::TransB, &v.to_ne_bytes())
+        self.set_attr(MatrixTransformDescAttr::TransB, &v.to_ne_bytes())
     }
 
     /// Queries the transpose operation for matrix B (`CUBLASLT_MATRIX_TRANSFORM_DESC_TRANSB`).
@@ -2186,7 +2315,24 @@ impl EmulationDesc {
     }
 
     /// Writes raw attribute bytes (`cublasLtEmulationDescSetAttribute`).
-    pub fn set_attribute_bytes(&mut self, attr: EmulationDescAttr, buf: &[u8]) -> Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// `FixedpointMantissaBitCountPointer` (or any pointer-valued `Raw` attribute) must be null or
+    /// a writable device allocation of the matmul's context, alive until every matmul whose
+    /// descriptor carries this emulation descriptor completes: cuBLASLt writes through it.
+    pub unsafe fn set_attribute_bytes(
+        &mut self,
+        attr: EmulationDescAttr,
+        buf: &[u8],
+    ) -> Result<()> {
+        self.set_attr(attr, buf)
+    }
+
+    /// Writes an attribute value. Safe for 4-byte values: cuBLASLt rejects a buffer whose size
+    /// differs from the attribute's storage (`cublasLt.h`, `*SetAttribute` retval
+    /// `CUBLAS_STATUS_INVALID_VALUE`), so a 4-byte write can never set an 8-byte pointer attribute.
+    fn set_attr(&mut self, attr: EmulationDescAttr, buf: &[u8]) -> Result<()> {
         // SAFETY: `self.raw` is live and `buf` is valid for `buf.len()` bytes.
         check_lt("cublasLtEmulationDescSetAttribute", unsafe {
             lt_sys::cublasLtEmulationDescSetAttribute(
@@ -2216,7 +2362,7 @@ impl EmulationDesc {
 
     /// Writes an `i32` emulation attribute.
     pub fn set_attribute_i32(&mut self, attr: EmulationDescAttr, value: i32) -> Result<()> {
-        self.set_attribute_bytes(attr, &value.to_ne_bytes())
+        self.set_attr(attr, &value.to_ne_bytes())
     }
 
     /// Reads an `i32` emulation attribute.
@@ -2231,7 +2377,7 @@ impl EmulationDesc {
 
     /// Writes a `u32` emulation attribute.
     pub fn set_attribute_u32(&mut self, attr: EmulationDescAttr, value: u32) -> Result<()> {
-        self.set_attribute_bytes(attr, &value.to_ne_bytes())
+        self.set_attr(attr, &value.to_ne_bytes())
     }
 
     /// Reads a `u32` emulation attribute.
@@ -2659,6 +2805,10 @@ impl HeuristicResult {
 
     /// Constructs a `HeuristicResult` from an explicitly initialized [`MatmulAlgo`] and
     /// `workspace_size` in bytes.
+    ///
+    /// Prefer [`LtHandle::matmul_algo_check`], which returns the checked algo with its required
+    /// workspace size. An undersized `workspace_size` here is not memory-unsafe: `cublasLtMatmul`
+    /// rejects it with `CUBLAS_STATUS_INVALID_VALUE` (`cublasLt.h`, `cublasLtMatmul` retvals).
     pub fn from_algo(algo: MatmulAlgo, workspace_size: usize) -> Self {
         let mut res = Self::zeroed();
         res.raw.algo = algo.raw;
@@ -2902,14 +3052,109 @@ mod tests {
         let d_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
         let pref = Preference::new(&ctx).unwrap();
 
-        let _ = lt
+        let heuristic = lt
             .matmul_heuristic_for_stream(
                 &stream, &desc, &a_layout, &b_layout, &c_layout, &d_layout, &pref,
             )
             .unwrap();
+        // Check the heuristic's algo: a default-configured `ids[0]` may legitimately be
+        // `CUBLAS_STATUS_NOT_SUPPORTED` for this 4x4 problem (observed on sm_86, cuBLASLt 13).
+        let supported = heuristic.algo();
         let checked = lt
-            .matmul_algo_check(&desc, &a_layout, &b_layout, &c_layout, &d_layout, &algo)
+            .matmul_algo_check(&desc, &a_layout, &b_layout, &c_layout, &d_layout, &supported)
             .unwrap();
-        assert!(checked.status().is_success() || !checked.is_valid());
+        // The check result must carry the checked algo (cuBLASLt leaves `result.algo` untouched).
+        assert_eq!(checked.algo().raw().data, supported.raw().data);
+        assert_eq!(checked.algo().id().unwrap(), supported.id().unwrap());
+    }
+
+    #[test]
+    fn ld_validation_follows_documented_order_minimums() {
+        // COL / ROW: ld >= rows / cols (CUBLASLT_MATRIX_LAYOUT_LD).
+        assert!(validate_ld(Order::Col, 4, 4, 4).is_ok());
+        assert!(matches!(
+            validate_ld(Order::Col, 4, 4, 1),
+            Err(Error::Invalid(_))
+        ));
+        assert!(validate_ld(Order::Row, 4, 6, 6).is_ok());
+        assert!(matches!(
+            validate_ld(Order::Row, 4, 6, 4),
+            Err(Error::Invalid(_))
+        ));
+        // Header examples: 2 rows COL32 -> 64; 1 row COL4_4R2_8C -> 256; 1 row COL32_2R_4R4 -> 1024.
+        assert!(validate_ld(Order::Col32, 2, 33, 64).is_ok());
+        assert!(validate_ld(Order::Col32, 2, 33, 63).is_err());
+        assert!(validate_ld(Order::Col44r28c, 1, 33, 256).is_ok());
+        assert!(validate_ld(Order::Col44r28c, 1, 33, 255).is_err());
+        assert!(validate_ld(Order::Col322r4r4, 1, 33, 1024).is_ok());
+        assert!(validate_ld(Order::Col322r4r4, 1, 33, 1023).is_err());
+        assert!(validate_ld(Order::Col, 4, 4, -1).is_err());
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cublasLt64_13.dll; run via xtask gpu-test"]
+    fn gpu_layout_raw_setters_cannot_desync_typed_checks() {
+        let ctx = cuda_core::Context::new(0).expect("cuda context");
+        let stream = ctx.new_stream().expect("stream");
+        let lt = LtHandle::new(&ctx).expect("lt handle");
+
+        // LT-06: ld < rows is rejected before reaching cuBLASLt.
+        assert!(matches!(
+            MatrixLayout::new(&ctx, DataType::F32, 4, 4, 1),
+            Err(Error::Invalid(_))
+        ));
+
+        // LT-02: a pointer-array layout has no dense extent.
+        let mut ptr_layout = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+        assert_eq!(ptr_layout.min_elems().unwrap(), 16);
+        ptr_layout.set_batch_mode(BatchMode::PointerArray).unwrap();
+        assert!(matches!(ptr_layout.min_elems(), Err(Error::Invalid(_))));
+        ptr_layout.set_batch_mode(BatchMode::Strided).unwrap();
+        assert_eq!(ptr_layout.min_elems().unwrap(), 16);
+
+        // LT-05: a grouped layout has no dense extent either.
+        let dims = cuda_core::DeviceBuffer::from_host(&stream, &[4i64]).unwrap();
+        let dim_ptr = (dims.cu_deviceptr() as usize) as *const c_void;
+        // SAFETY: `dims` holds `group_count = 1` i64 entries and outlives the layout's use here.
+        let grouped = unsafe {
+            MatrixLayout::new_grouped(&ctx, DataType::F32, 1, dim_ptr, dim_ptr, dim_ptr)
+        }
+        .expect("grouped layout");
+        assert!(matches!(grouped.min_elems(), Err(Error::Invalid(_))));
+
+        // BL-04 (Lt): overlapping output batches are rejected by matmul_f32.
+        let a = cuda_core::DeviceBuffer::from_host(&stream, &[1.0f32; 32]).unwrap();
+        let b = cuda_core::DeviceBuffer::from_host(&stream, &[1.0f32; 32]).unwrap();
+        let c = cuda_core::DeviceBuffer::from_host(&stream, &[0.0f32; 32]).unwrap();
+        let mut d = cuda_core::DeviceBuffer::<f32>::zeroed(&stream, 32).unwrap();
+        let desc = MatmulDesc::new(&ctx, ComputeType::F32, DataType::F32).unwrap();
+        let mut layouts = Vec::new();
+        for _ in 0..4 {
+            let mut l = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+            l.set_batch(2, 16).unwrap();
+            layouts.push(l);
+        }
+        let mut d_overlap = MatrixLayout::new(&ctx, DataType::F32, 4, 4, 4).unwrap();
+        d_overlap.set_batch(2, 0).unwrap();
+        let mut scratch = Scratch::new(&stream);
+        let heuristic = HeuristicResult::from_algo(MatmulAlgo::zeroed(), 0);
+        let err = lt.matmul_f32(
+            &stream,
+            &desc,
+            1.0,
+            &a,
+            &layouts[0],
+            &b,
+            &layouts[1],
+            0.0,
+            &c,
+            &layouts[2],
+            &mut d,
+            &d_overlap,
+            &heuristic,
+            &mut scratch,
+            0,
+        );
+        assert!(matches!(err, Err(Error::Invalid(_))));
     }
 }

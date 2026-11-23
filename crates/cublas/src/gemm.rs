@@ -4,7 +4,9 @@
 //! `cublasDgemmBatched`, `cublasSgemmStridedBatched`, `cublasDgemmStridedBatched`, and
 //! mixed-precision `gemm_ex` / `gemm_strided_batched_ex`.
 //! **Why.** Enforces column-major leading-dimension and buffer-length invariants before calling
-//! cuBLAS, binds the caller's stream, and performs zero heap allocations on the hot path.
+//! cuBLAS, rejects strided-batched outputs whose batch matrices overlap, checks that host `f32`
+//! scalars match the compute scale type, binds the caller's stream, and performs zero heap
+//! allocations on the hot path.
 //! **Used by** `cublas` callers and T3 numerical verification tests.
 
 use crate::error::check;
@@ -100,6 +102,75 @@ pub(crate) fn validate_strided_batch(
         total(min_b, stride_b)?,
         total(min_c, stride_c)?,
     ))
+}
+
+/// Returns `true` when `batch` column-major `inner x outer` matrices with leading dimension `ld`,
+/// placed `stride` elements apart, never share an element.
+///
+/// Accepts the two non-overlapping families used in practice: disjoint blocks
+/// (`stride >= ld * (outer - 1) + inner`) and row-interleaved batches that all fit inside one
+/// column pitch (`stride >= inner` and `(batch - 1) * stride + inner <= ld`). Any other layout is
+/// rejected even if it happens not to overlap, because concurrent batches writing a shared output
+/// element race on the GPU.
+pub(crate) fn batches_disjoint(inner: u64, outer: u64, ld: u64, stride: u64, batch: u64) -> bool {
+    if batch <= 1 || inner == 0 || outer == 0 {
+        return true;
+    }
+    let span = ld.checked_mul(outer - 1).and_then(|v| v.checked_add(inner));
+    if span.is_some_and(|span| stride >= span) {
+        return true;
+    }
+    stride >= inner
+        && (batch - 1)
+            .checked_mul(stride)
+            .and_then(|v| v.checked_add(inner))
+            .is_some_and(|last| last <= ld)
+}
+
+/// Rejects a strided-batched output stride whose `C` batch matrices overlap (see
+/// [`batches_disjoint`]). Inputs `A`/`B` may still broadcast with stride 0.
+pub(crate) fn validate_output_stride(
+    m: i32,
+    n: i32,
+    ldc: i32,
+    stride_c: i64,
+    batch_count: i32,
+) -> Result<()> {
+    let conv =
+        |v: i64| u64::try_from(v).map_err(|_| Error::Invalid("negative GEMM output extent"));
+    let disjoint = batches_disjoint(
+        conv(m.into())?,
+        conv(n.into())?,
+        conv(ldc.into())?,
+        conv(stride_c)?,
+        conv(batch_count.into())?,
+    );
+    if !disjoint {
+        return Err(Error::Invalid(
+            "stride_c makes output batch matrices overlap",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects compute types whose `alpha`/`beta` scale type is not `f32` (`CUBLAS_COMPUTE_32F*`).
+pub(crate) fn require_f32_scale(compute_type: ComputeType) -> Result<()> {
+    match compute_type {
+        ComputeType::F32
+        | ComputeType::F32Pedantic
+        | ComputeType::F32Fast16F
+        | ComputeType::F32Fast16BF
+        | ComputeType::F32FastTf32 => Ok(()),
+        // Scale types: 16F -> CUDA_R_16F, 64F -> CUDA_R_64F, 32I -> CUDA_R_32I.
+        ComputeType::F16
+        | ComputeType::F16Pedantic
+        | ComputeType::F64
+        | ComputeType::F64Pedantic
+        | ComputeType::I32
+        | ComputeType::I32Pedantic => Err(Error::Invalid(
+            "f32 alpha/beta scalars require a CUBLAS_COMPUTE_32F* compute type",
+        )),
+    }
 }
 
 #[inline]
@@ -250,6 +321,7 @@ impl Handle {
             stride_c,
             batch_count,
         )?;
+        validate_output_stride(m, n, ldc, stride_c, batch_count)?;
         self.require_host_pointer_mode()?;
         if a.len() < tot_a || b.len() < tot_b || c.len() < tot_c {
             return Err(Error::Invalid(
@@ -318,6 +390,7 @@ impl Handle {
             stride_c,
             batch_count,
         )?;
+        validate_output_stride(m, n, ldc, stride_c, batch_count)?;
         self.require_host_pointer_mode()?;
         if a.len() < tot_a || b.len() < tot_b || c.len() < tot_c {
             return Err(Error::Invalid(
@@ -583,6 +656,7 @@ impl Handle {
             stride_c,
             batch_count,
         )?;
+        validate_output_stride(m, n, ldc, stride_c, batch_count)?;
         if a.len() < checked_bytes(tot_a, a_type)?
             || b.len() < checked_bytes(tot_b, b_type)?
             || c.len() < checked_bytes(tot_c, c_type)?
@@ -693,6 +767,10 @@ impl Handle {
     /// to contiguous arrays of `u64` device pointers (`total_batches` entries each). All other arrays
     /// are host slices of length `group_count`.
     ///
+    /// `alpha_f32`/`beta_f32` are host `f32` scalars, so `compute_type` must be a
+    /// `CUBLAS_COMPUTE_32F*` variant and the handle must be in [`crate::PointerMode::Host`]; both
+    /// are checked and rejected with [`Error::Invalid`].
+    ///
     /// # Safety
     /// - All `group_count`-length host slices must be valid and have length `>= group_count`.
     /// - `a_ptrs_dev`, `b_ptrs_dev`, `c_ptrs_dev` must point to valid device arrays of `total_batches`
@@ -742,6 +820,10 @@ impl Handle {
                 "gemm_grouped_batched_ex_on_bound_stream: slice lengths must match group_size.len()",
             ));
         }
+        require_f32_scale(compute_type)?;
+        self.require_host_pointer_mode()?;
+        let group_count_i32 = i32::try_from(group_count)
+            .map_err(|_| Error::Invalid("group_count exceeds i32::MAX"))?;
         // SAFETY: caller guarantees stream binding, valid device pointer arrays, and matrix extents.
         check("cublasGemmGroupedBatchedEx", unsafe {
             sys::cublasGemmGroupedBatchedEx(
@@ -762,7 +844,7 @@ impl Handle {
                 c_ptrs_dev as usize as *const *mut c_void,
                 c_type.raw(),
                 ldc.as_ptr(),
-                group_count as i32,
+                group_count_i32,
                 group_size.as_ptr(),
                 compute_type.raw(),
             )

@@ -1,7 +1,9 @@
 //! Caller-owned reusable workspace [`Scratch`] with byte-budget enforcement.
 //!
 //! **What.** Holds one stream-ordered `DeviceBuffer<u8>` that grows on demand up to a caller's
-//! byte budget and is reused across cuBLAS and cuBLASLt calls on the same stream.
+//! byte budget and is reused across cuBLAS and cuBLASLt calls on the same stream. The buffer is
+//! reference-counted so [`crate::Handle::set_workspace`] can retain the allocation it hands to
+//! cuBLAS: growing or dropping the `Scratch` afterwards never frees memory cuBLAS still points at.
 //! **Why.** Avoids per-matmul `cudaMalloc`/`cudaFree` churn and keeps workspace memory bounded by
 //! explicit byte budgets.
 //! **Used by** [`crate::Handle::set_workspace`] and [`crate::lt::LtHandle::matmul_with_scratch`].
@@ -16,7 +18,7 @@ use std::sync::Arc;
 /// Grows to the largest admitted request and never shrinks until dropped.
 pub struct Scratch {
     stream: Arc<Stream>,
-    buffer: Option<DeviceBuffer<u8>>,
+    buffer: Option<Arc<DeviceBuffer<u8>>>,
 }
 
 impl Scratch {
@@ -73,16 +75,23 @@ impl Scratch {
             return Ok((std::ptr::null_mut(), 0));
         }
         if self.capacity() < bytes {
-            // Drop the old buffer first; its stream-ordered free executes after prior work on `stream`.
+            // Release our reference first; the stream-ordered free executes after prior work on
+            // `stream`, and only once no `Handle` retains the buffer as its workspace.
             self.buffer = None;
             // SAFETY: cuBLAS/cuBLASLt workspace is scratch memory written before being read.
-            self.buffer =
-                Some(unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, bytes)? });
+            let fresh = unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.stream, bytes)? };
+            self.buffer = Some(Arc::new(fresh));
         }
         let buf = self
             .buffer
             .as_ref()
             .ok_or(Error::Invalid("scratch buffer missing after reserve"))?;
         Ok(((buf.cu_deviceptr() as usize) as *mut c_void, buf.len()))
+    }
+
+    /// Shared reference to the current buffer, for native handles that keep its device pointer
+    /// beyond the call that reserved it (see [`crate::Handle::set_workspace`]).
+    pub(crate) fn shared_buffer(&self) -> Option<Arc<DeviceBuffer<u8>>> {
+        self.buffer.clone()
     }
 }

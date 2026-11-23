@@ -37,7 +37,9 @@ pub use cublaslt_sys as lt_sys;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gemm::{validate_gemm_dims, validate_strided_batch};
+    use crate::gemm::{
+        require_f32_scale, validate_gemm_dims, validate_output_stride, validate_strided_batch,
+    };
 
     #[test]
     fn status_newtype_is_copy_and_preserves_unknown_codes() {
@@ -123,6 +125,148 @@ mod tests {
             validate_strided_batch(usize::MAX, 1, 1, 1, 1, 1, 2),
             Err(Error::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn output_stride_rejects_overlapping_batches() {
+        // m = 3, n = 4, ldc = 3: each C matrix spans 12 elements.
+        assert!(validate_output_stride(3, 4, 3, 12, 8).is_ok());
+        assert!(matches!(
+            validate_output_stride(3, 4, 3, 0, 8),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_output_stride(3, 4, 3, 11, 2),
+            Err(Error::Invalid(_))
+        ));
+        // A single batch or an empty matrix cannot overlap.
+        assert!(validate_output_stride(3, 4, 3, 0, 1).is_ok());
+        assert!(validate_output_stride(0, 4, 3, 0, 8).is_ok());
+        // Row-interleaved batches inside one column pitch: m = 2, ldc = 4, stride 2.
+        assert!(validate_output_stride(2, 3, 4, 2, 2).is_ok());
+        assert!(validate_output_stride(2, 3, 4, 2, 3).is_err());
+        assert!(validate_output_stride(2, 3, 4, 1, 2).is_err());
+        assert!(validate_output_stride(3, 4, 3, -1, 2).is_err());
+    }
+
+    #[test]
+    fn grouped_gemm_requires_f32_scale_compute_type() {
+        for ct in [
+            ComputeType::F32,
+            ComputeType::F32Pedantic,
+            ComputeType::F32Fast16F,
+            ComputeType::F32Fast16BF,
+            ComputeType::F32FastTf32,
+        ] {
+            assert!(require_f32_scale(ct).is_ok(), "{ct:?}");
+        }
+        for ct in [
+            ComputeType::F16,
+            ComputeType::F16Pedantic,
+            ComputeType::F64,
+            ComputeType::F64Pedantic,
+            ComputeType::I32,
+            ComputeType::I32Pedantic,
+        ] {
+            assert!(
+                matches!(require_f32_scale(ct), Err(Error::Invalid(_))),
+                "{ct:?}"
+            );
+        }
+    }
+
+    /// All-ones 2x2 SGEMM on `stream`, synchronized, used by the workspace/stream GPU tests.
+    fn sgemm_2x2(handle: &Handle, stream: &cuda_core::Stream) -> Result<()> {
+        let a = cuda_core::DeviceBuffer::from_host(stream, &[1.0f32; 4]).expect("a");
+        let b = cuda_core::DeviceBuffer::from_host(stream, &[1.0f32; 4]).expect("b");
+        let mut c = cuda_core::DeviceBuffer::from_host(stream, &[0.0f32; 4]).expect("c");
+        let res = handle.sgemm(
+            stream,
+            Operation::N,
+            Operation::N,
+            2,
+            2,
+            2,
+            1.0,
+            &a,
+            2,
+            &b,
+            2,
+            0.0,
+            &mut c,
+            2,
+        );
+        stream.synchronize().expect("sync");
+        res
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cublas64_13.dll; run via xtask gpu-test"]
+    fn gpu_set_stream_binds_context_on_cache_hit() {
+        let ctx = cuda_core::Context::new(0).expect("cuda context");
+        let stream = ctx.new_stream().expect("stream");
+        let handle = Handle::new(&ctx).expect("cublas handle");
+        handle.set_stream(&stream).expect("first bind");
+        // SAFETY: binding null only detaches the calling thread's current context.
+        let rc = unsafe { cuda_core::sys::cuCtxSetCurrent(std::ptr::null_mut()) };
+        assert_eq!(rc, cuda_core::sys::cudaError_enum_CUDA_SUCCESS);
+        // Same stream: the cuBLAS stream cache hits, but the context must still be made current.
+        handle.set_stream(&stream).expect("cache-hit bind");
+        let mut cur: cuda_core::sys::CUcontext = std::ptr::null_mut();
+        // SAFETY: `cur` is a valid out-pointer for one `CUcontext`.
+        let rc = unsafe { cuda_core::sys::cuCtxGetCurrent(&mut cur) };
+        assert_eq!(rc, cuda_core::sys::cudaError_enum_CUDA_SUCCESS);
+        assert_eq!(cur, ctx.cu_ctx());
+        sgemm_2x2(&handle, &stream).expect("sgemm after cache-hit bind");
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cublas64_13.dll; run via xtask gpu-test"]
+    fn gpu_handle_retains_workspace_after_scratch_drop() {
+        let ctx = cuda_core::Context::new(0).expect("cuda context");
+        let stream = ctx.new_stream().expect("stream");
+        let handle = Handle::new(&ctx).expect("cublas handle");
+        let mut scratch = Scratch::new(&stream);
+        handle
+            .set_workspace(&mut scratch, 1 << 20, 1 << 20)
+            .expect("set workspace");
+        let ws_ptr = scratch.shared_buffer().expect("workspace").cu_deviceptr();
+        drop(scratch);
+        stream.synchronize().expect("sync");
+        // Without retention the stream-ordered pool hands the freed workspace straight back.
+        // SAFETY: the new buffer is only compared by address, never read.
+        let next = unsafe { cuda_core::DeviceBuffer::<u8>::uninitialized_async(&stream, 1 << 20) }
+            .expect("next allocation");
+        assert_ne!(
+            next.cu_deviceptr(),
+            ws_ptr,
+            "workspace freed while the cuBLAS handle still points at it"
+        );
+        sgemm_2x2(&handle, &stream).expect("sgemm on retained workspace");
+        handle.clear_workspace().expect("clear workspace");
+    }
+
+    #[test]
+    #[ignore = "GPU: needs CUDA driver + cublas64_13.dll; run via xtask gpu-test"]
+    fn gpu_workspace_pins_handle_to_scratch_stream() {
+        let ctx = cuda_core::Context::new(0).expect("cuda context");
+        let stream_a = ctx.new_stream().expect("stream a");
+        let stream_b = ctx.new_stream().expect("stream b");
+        let handle = Handle::new(&ctx).expect("cublas handle");
+        let mut scratch = Scratch::new(&stream_a);
+        handle
+            .set_workspace(&mut scratch, 1 << 20, 1 << 20)
+            .expect("set workspace");
+        // cublasSetStream would silently drop the budgeted workspace: switching must fail.
+        assert!(matches!(
+            sgemm_2x2(&handle, &stream_b),
+            Err(Error::Invalid(_))
+        ));
+        sgemm_2x2(&handle, &stream_a).expect("sgemm on workspace stream");
+        // clear_workspace restores the default pool and releases the pin.
+        handle.clear_workspace().expect("clear workspace");
+        sgemm_2x2(&handle, &stream_b).expect("sgemm on other stream after clear");
+        handle.clear_workspace().expect("clear without workspace is a no-op");
     }
 
     #[test]
@@ -262,27 +406,27 @@ mod tests {
             .unwrap();
         let mut scratch = Scratch::new(&stream);
 
-        // Budget rejection when budget < workspace_size
-        if heuristic.workspace_size() > 0 {
-            let err = lt.matmul_f32(
-                &stream,
-                &desc,
-                1.0,
-                &a_dev,
-                &a_layout,
-                &b_dev,
-                &b_layout,
-                0.0,
-                &c_dev,
-                &c_layout,
-                &mut d_dev,
-                &d_layout,
-                &heuristic,
-                &mut scratch,
-                0,
-            );
-            assert!(matches!(err, Err(Error::Budget { .. })));
-        }
+        // Budget rejection must not depend on whether this tiny problem needs workspace: request
+        // 4 KiB for the same algo with a zero budget, which `Scratch::reserve` rejects up front.
+        let needs_ws = HeuristicResult::from_algo(heuristic.algo(), 4096);
+        let err = lt.matmul_f32(
+            &stream,
+            &desc,
+            1.0,
+            &a_dev,
+            &a_layout,
+            &b_dev,
+            &b_layout,
+            0.0,
+            &c_dev,
+            &c_layout,
+            &mut d_dev,
+            &d_layout,
+            &needs_ws,
+            &mut scratch,
+            0,
+        );
+        assert!(matches!(err, Err(Error::Budget { .. })));
 
         lt.matmul_f32(
             &stream,

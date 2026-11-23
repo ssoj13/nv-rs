@@ -197,8 +197,8 @@ pub fn conv_forward_workspace_size(
 
 /// Executes forward convolution `y = alpha * conv(x, w) + beta * y` on `stream`.
 ///
-/// Queries the required workspace size for `algo`, enforces `budget` on any growth of `scratch`,
-/// and binds `stream` to `handle` when needed.
+/// Queries the required workspace size for `algo`, rejects a workspace larger than `budget` bytes
+/// before growing `scratch`, and binds `stream` to `handle` when needed.
 #[expect(
     clippy::too_many_arguments,
     reason = "Direct typed wrapper over cudnnConvolutionForward parameters"
@@ -703,10 +703,6 @@ pub unsafe fn conv_backward_filter_raw(
     check("cudnnConvolutionBackwardFilter", status)
 }
 
-/// Zero-overhead forward convolution on the stream already bound to `handle` (via
-/// [`Handle::set_stream`] or [`Handle::set_raw_stream`]), using pre-queried workspace memory
-/// `(ws_ptr, ws_bytes)`. Performs zero descriptor creation, zero workspace queries, and zero host
-/// synchronization.
 /// Benchmarks all supported cuDNN forward convolution algorithms on the handle's currently bound
 /// raw stream (`cudnnFindConvolutionForwardAlgorithmEx`) and returns the fastest `(algo, ws_bytes)`
 /// fitting within `ws_bytes`. Note: `y_ptr` is overwritten during benchmarking.
@@ -732,7 +728,9 @@ pub unsafe fn find_conv_forward_algo_ex_on_bound_stream(
     ws_bytes: usize,
     deterministic: bool,
 ) -> Result<Option<(ConvFwdAlgo, usize)>> {
-    const MAX_ALGOS: usize = 8;
+    const MAX_ALGOS: usize =
+        sys::cudnnConvolutionFwdAlgo_t_CUDNN_CONVOLUTION_FWD_ALGO_COUNT as usize;
+    handle.context().bind_to_thread()?;
     // SAFETY: `cudnnConvolutionFwdAlgoPerf_t` is a plain C struct of POD scalars/enums.
     let mut results: [sys::cudnnConvolutionFwdAlgoPerf_t; MAX_ALGOS] =
         unsafe { std::mem::zeroed() };
@@ -798,7 +796,9 @@ pub unsafe fn find_conv_backward_data_algo_ex_on_bound_stream(
     ws_bytes: usize,
     deterministic: bool,
 ) -> Result<Option<(ConvBwdDataAlgo, usize)>> {
-    const MAX_ALGOS: usize = 6;
+    const MAX_ALGOS: usize =
+        sys::cudnnConvolutionBwdDataAlgo_t_CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT as usize;
+    handle.context().bind_to_thread()?;
     // SAFETY: `cudnnConvolutionBwdDataAlgoPerf_t` is a plain C struct of POD scalars/enums.
     let mut results: [sys::cudnnConvolutionBwdDataAlgoPerf_t; MAX_ALGOS] =
         unsafe { std::mem::zeroed() };
@@ -864,7 +864,9 @@ pub unsafe fn find_conv_backward_filter_algo_ex_on_bound_stream(
     ws_bytes: usize,
     deterministic: bool,
 ) -> Result<Option<(ConvBwdFilterAlgo, usize)>> {
-    const MAX_ALGOS: usize = 7;
+    const MAX_ALGOS: usize =
+        sys::cudnnConvolutionBwdFilterAlgo_t_CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT as usize;
+    handle.context().bind_to_thread()?;
     // SAFETY: `cudnnConvolutionBwdFilterAlgoPerf_t` is a plain C struct of POD scalars/enums.
     let mut results: [sys::cudnnConvolutionBwdFilterAlgoPerf_t; MAX_ALGOS] =
         unsafe { std::mem::zeroed() };
@@ -909,6 +911,9 @@ pub unsafe fn find_conv_backward_filter_algo_ex_on_bound_stream(
 
 /// Launches `cudnnConvolutionForward` on the handle's currently bound raw stream.
 ///
+/// Like every `*_on_bound_stream` function, binds `handle.context()` to the calling thread first,
+/// so a [`Handle`] moved to another thread stays valid.
+///
 /// # Safety
 /// - `x_ptr`, `w_ptr`, `y_ptr`, and (when `ws_bytes > 0`) `ws_ptr` must be valid device allocations
 ///   in `handle.context()` spanning at least their descriptor/workspace byte sizes.
@@ -933,10 +938,11 @@ pub unsafe fn conv_forward_on_bound_stream(
     y_desc: &TensorDescriptor,
     y_ptr: cuda_bindings::CUdeviceptr,
 ) -> Result<()> {
+    handle.context().bind_to_thread()?;
     let scale = ScalePair::new(y_desc.data_type(), alpha, beta);
     let (alpha_ptr, beta_ptr) = scale.ptrs();
-    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
-    // workspace capacity.
+    // SAFETY: the handle's context is bound above; caller guarantees stream binding, buffer
+    // validity, non-aliasing, and workspace capacity.
     let status = unsafe {
         sys::cudnnConvolutionForward(
             handle.as_raw(),
@@ -981,10 +987,11 @@ pub unsafe fn conv_backward_data_on_bound_stream(
     dx_desc: &TensorDescriptor,
     dx_ptr: cuda_bindings::CUdeviceptr,
 ) -> Result<()> {
+    handle.context().bind_to_thread()?;
     let scale = ScalePair::new(dx_desc.data_type(), alpha, beta);
     let (alpha_ptr, beta_ptr) = scale.ptrs();
-    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
-    // workspace capacity.
+    // SAFETY: the handle's context is bound above; caller guarantees stream binding, buffer
+    // validity, non-aliasing, and workspace capacity.
     let status = unsafe {
         sys::cudnnConvolutionBackwardData(
             handle.as_raw(),
@@ -1029,10 +1036,11 @@ pub unsafe fn conv_backward_filter_on_bound_stream(
     dw_desc: &FilterDescriptor,
     dw_ptr: cuda_bindings::CUdeviceptr,
 ) -> Result<()> {
+    handle.context().bind_to_thread()?;
     let scale = ScalePair::new(dw_desc.data_type(), alpha, beta);
     let (alpha_ptr, beta_ptr) = scale.ptrs();
-    // SAFETY: caller guarantees context binding, stream binding, buffer validity, non-aliasing, and
-    // workspace capacity.
+    // SAFETY: the handle's context is bound above; caller guarantees stream binding, buffer
+    // validity, non-aliasing, and workspace capacity.
     let status = unsafe {
         sys::cudnnConvolutionBackwardFilter(
             handle.as_raw(),
@@ -1363,11 +1371,13 @@ pub unsafe fn batch_norm_forward_training_on_bound_stream(
     save_mean_ptr: cuda_bindings::CUdeviceptr,
     save_inv_var_ptr: cuda_bindings::CUdeviceptr,
 ) -> Result<()> {
+    handle.context().bind_to_thread()?;
     let scale_pair = ScalePair::new(y_desc.data_type(), alpha, beta);
     let (alpha_ptr, beta_ptr) = scale_pair.ptrs();
     let rm_ptr = running_mean_ptr.map_or(std::ptr::null_mut(), |p| p as *mut c_void);
     let rv_ptr = running_var_ptr.map_or(std::ptr::null_mut(), |p| p as *mut c_void);
-    // SAFETY: caller guarantees context/stream binding, buffer validity, and stream lifetime.
+    // SAFETY: the handle's context is bound above; caller guarantees stream binding, buffer
+    // validity, and stream lifetime.
     let status = unsafe {
         sys::cudnnBatchNormalizationForwardTraining(
             handle.as_raw(),
@@ -1424,11 +1434,13 @@ pub unsafe fn batch_norm_backward_on_bound_stream(
     saved_mean_ptr: cuda_bindings::CUdeviceptr,
     saved_inv_var_ptr: cuda_bindings::CUdeviceptr,
 ) -> Result<()> {
+    handle.context().bind_to_thread()?;
     let data_scale = ScalePair::new(dx_desc.data_type(), alpha_data, beta_data);
     let param_scale = ScalePair::new(bn_param_desc.data_type(), alpha_param, beta_param);
     let (alpha_d_ptr, beta_d_ptr) = data_scale.ptrs();
     let (alpha_p_ptr, beta_p_ptr) = param_scale.ptrs();
-    // SAFETY: caller guarantees context/stream binding, buffer validity, and stream lifetime.
+    // SAFETY: the handle's context is bound above; caller guarantees stream binding, buffer
+    // validity, and stream lifetime.
     let status = unsafe {
         sys::cudnnBatchNormalizationBackward(
             handle.as_raw(),
@@ -1569,6 +1581,88 @@ mod tests {
         let sm = sm_out.to_host_vec(&stream).unwrap();
         assert!((sm[0] + sm[1] - 1.0).abs() < 1e-5);
         assert!(sm[1] > sm[0]);
+        // mean 0, var 1, scale 1, bias 0: y = x / sqrt(1 + eps).
+        let bn = bn_out.to_host_vec(&stream).unwrap();
+        let inv_std = 1.0 / (1.0f32 + 1e-5).sqrt();
+        for (got, &x) in bn.iter().zip(&x_host) {
+            assert!(
+                (got - x * inv_std).abs() < 1e-5,
+                "bn {got} vs {}",
+                x * inv_std
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and cuDNN runtime"]
+    fn t2_bound_stream_conv_on_another_thread() {
+        let ctx = cuda_core::Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut handle = Handle::new(&ctx).unwrap();
+        handle.set_stream(&stream).unwrap();
+
+        let x_desc =
+            TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, [1, 1, 3, 3])
+                .unwrap();
+        let w_desc =
+            FilterDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, [1, 1, 2, 2])
+                .unwrap();
+        let conv_desc = ConvolutionDescriptor::new_2d(
+            &ctx,
+            [0, 0],
+            [1, 1],
+            [1, 1],
+            crate::ConvMode::CrossCorrelation,
+            DataType::F32,
+        )
+        .unwrap();
+        let y_desc =
+            TensorDescriptor::new_4d(&ctx, crate::TensorFormat::Nchw, DataType::F32, [1, 1, 2, 2])
+                .unwrap();
+        let x_dev =
+            DeviceBuffer::from_host(&stream, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+                .unwrap();
+        let w_dev = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).unwrap();
+        let y_dev = DeviceBuffer::<f32>::zeroed(&stream, 4).unwrap();
+        stream.synchronize().unwrap();
+        let (x_ptr, w_ptr, y_ptr) = (
+            x_dev.cu_deviceptr(),
+            w_dev.cu_deviceptr(),
+            y_dev.cu_deviceptr(),
+        );
+
+        // A fresh thread has no current context until the wrapper binds the handle's one.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // SAFETY: buffers are live on `ctx`, sized for their descriptors and do not alias;
+                // `ImplicitGemm` needs no workspace; the stream is synchronized before they drop.
+                unsafe {
+                    conv_forward_on_bound_stream(
+                        &mut handle,
+                        1.0,
+                        &x_desc,
+                        x_ptr,
+                        &w_desc,
+                        w_ptr,
+                        &conv_desc,
+                        ConvFwdAlgo::ImplicitGemm,
+                        0,
+                        0,
+                        0.0,
+                        &y_desc,
+                        y_ptr,
+                    )
+                }
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+        });
+        stream.synchronize().unwrap();
+        assert_eq!(
+            y_dev.to_host_vec(&stream).unwrap(),
+            vec![12.0, 16.0, 24.0, 28.0]
+        );
     }
 
     #[test]

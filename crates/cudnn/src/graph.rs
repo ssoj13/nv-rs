@@ -8,7 +8,12 @@
 //! misses newer cuDNN 9 NHWC Tensor Core engines (particularly on `bwd_data` / `bwd_filter` and
 //! Ada/Hopper/Blackwell GPUs). This module wraps the cuDNN 9 Backend Descriptor Graph API with
 //! RAII ownership, `ENGINEHEUR` (`Mode A -> Mode B -> Fallback`) plan selection under an explicit
-//! workspace budget, and zero-allocation steady-state execution on a bound CUDA stream.
+//! workspace budget, and execution on a bound CUDA stream.
+//!
+//! Each execution creates, finalizes and destroys one `VARIANT_PACK` descriptor: finalized backend
+//! descriptors are read-only (`cudnnBackendFinalize`, `cudnn_graph.h`), so the per-call device
+//! pointers cannot be patched into a cached pack. A plan keeps its engine config, operation graph
+//! and tensor descriptors alive for its own lifetime.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -36,9 +41,9 @@ pub enum GraphConvDirection {
     BackwardFilter,
 }
 
-/// Heuristic search mode (`cudnnBackendHeurMode_t`).
+/// Heuristic search mode (`cudnnBackendHeurMode_t`), tried in declaration order by the builders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum HeurMode {
+enum HeurMode {
     /// Fast heuristic mode A (`CUDNN_HEUR_MODE_A`, default primary).
     ModeA,
     /// Extended heuristic mode B (`CUDNN_HEUR_MODE_B`).
@@ -338,15 +343,22 @@ fn make_virtual_tensor_desc(
 }
 
 /// Finalized cuDNN 9 Backend Execution Plan for a single 2D convolution (`fwd`, `bwd_data`, or
-/// `bwd_filter`), reusable across steps with zero steady-state heap allocations.
+/// `bwd_filter`), reusable across steps. Each execution builds one variant-pack descriptor.
 pub struct GraphConvPlan {
     plan: BackendDesc,
     workspace_size: usize,
     ctx: Arc<Context>,
+    /// Engine config, operation graph, operations and tensor descriptors the plan was finalized
+    /// from. Declared after `plan` so they are destroyed after it, whether cuDNN copies or
+    /// references them.
+    _deps: Vec<BackendDesc>,
 }
 
-// SAFETY: `GraphConvPlan` is owned exclusively by a thread-local or mutex-guarded `CudnnRuntime`
-// and all cuDNN calls serialize through `&mut Handle`.
+// SAFETY: every field is owned by the plan: finalized cuDNN backend descriptors are heap objects
+// not tied to the creating thread (cuDNN only forbids concurrent use of one object), and
+// `Arc<Context>` is `Send`. The raw descriptor pointers keep the plan `!Sync`, so moving it to
+// another thread transfers exclusive access; execution additionally serializes through
+// `&mut Handle`.
 unsafe impl Send for GraphConvPlan {}
 
 impl GraphConvPlan {
@@ -430,7 +442,8 @@ impl GraphConvPlan {
             if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
                 continue;
             }
-            let want = (total_cfgs as usize).min(16);
+            // Try every ranked config: a lower-ranked one may be the only fit for the budget.
+            let want = total_cfgs as usize;
             let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
             let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
             for _ in 0..want {
@@ -454,21 +467,28 @@ impl GraphConvPlan {
                 last_err = Some(e);
                 continue;
             }
-            for cfg in cfgs.iter().take(returned.max(0) as usize) {
+            for cfg in cfgs.into_iter().take(returned.max(0) as usize) {
                 let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
                 plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
-                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, cfg)?;
+                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, &cfg)?;
                 if let Err(e) = plan.finalize() {
                     last_err = Some(e);
                     continue;
                 }
-                let ws_i64 = plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE)?;
+                let ws_i64 = match plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
                 let ws = ws_i64.max(0) as usize;
                 if ws <= max_workspace_bytes {
                     return Ok(Self {
                         plan,
                         workspace_size: ws,
                         ctx: Arc::clone(ctx),
+                        _deps: vec![cfg, op_graph, op, conv_desc, x_desc, w_desc, y_desc],
                     });
                 }
             }
@@ -587,7 +607,8 @@ impl GraphConvPlan {
             if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
                 continue;
             }
-            let want = (total_cfgs as usize).min(16);
+            // Try every ranked config: a lower-ranked one may be the only fit for the budget.
+            let want = total_cfgs as usize;
             let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
             let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
             for _ in 0..want {
@@ -611,21 +632,31 @@ impl GraphConvPlan {
                 last_err = Some(e);
                 continue;
             }
-            for cfg in cfgs.iter().take(returned.max(0) as usize) {
+            for cfg in cfgs.into_iter().take(returned.max(0) as usize) {
                 let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
                 plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
-                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, cfg)?;
+                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, &cfg)?;
                 if let Err(e) = plan.finalize() {
                     last_err = Some(e);
                     continue;
                 }
-                let ws_i64 = plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE)?;
+                let ws_i64 = match plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
                 let ws = ws_i64.max(0) as usize;
                 if ws <= max_workspace_bytes {
                     return Ok(Self {
                         plan,
                         workspace_size: ws,
                         ctx: Arc::clone(ctx),
+                        _deps: vec![
+                            cfg, op_graph, op_mul, op_conv, pw_desc, conv_desc, v_out, scale_desc,
+                            x_desc, w_desc, y_desc,
+                        ],
                     });
                 }
             }
@@ -644,6 +675,9 @@ impl GraphConvPlan {
 
     /// Executes the finalized plan on the stream currently bound to `handle`.
     ///
+    /// Rejects a `handle` from another CUDA context than the plan and binds that context to the
+    /// calling thread. Creates and destroys one variant-pack descriptor per call.
+    ///
     /// # Safety
     /// `x_ptr`, `w_ptr`, `y_ptr` (and `ws_ptr` when [`Self::workspace_size`] > 0) must be valid
     /// device pointers on `handle`'s context matching the [`GraphConvSpec`] dimensions, dtypes,
@@ -656,6 +690,7 @@ impl GraphConvPlan {
         y_ptr: u64,
         ws_ptr: u64,
     ) -> Result<()> {
+        self.bind(handle)?;
         let mut vpack = BackendDesc::new(&self.ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR)?;
         let uids = [UID_X, UID_W, UID_Y];
         let ptrs = [
@@ -678,6 +713,9 @@ impl GraphConvPlan {
     /// Executes a plan built with [`Self::build_scaled`] on the stream currently bound to `handle`,
     /// binding `scale_ptr` (`[1]` `F32` device scalar) to the fused descale epilogue.
     ///
+    /// Same context check, thread binding and per-call variant pack as
+    /// [`Self::execute_on_bound_stream`].
+    ///
     /// # Safety
     /// All device pointers (`x_ptr`, `w_ptr`, `y_ptr`, `scale_ptr`, and `ws_ptr` when
     /// `workspace_size() > 0`) must be valid on `handle`'s context and match the plan's spec.
@@ -690,6 +728,7 @@ impl GraphConvPlan {
         scale_ptr: u64,
         ws_ptr: u64,
     ) -> Result<()> {
+        self.bind(handle)?;
         let mut vpack = BackendDesc::new(&self.ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR)?;
         let uids = [UID_X, UID_W, UID_Y, UID_SCALE];
         let ptrs = [
@@ -708,5 +747,90 @@ impl GraphConvPlan {
         // valid device pointers for the duration of stream execution.
         let status = unsafe { sys::cudnnBackendExecute(handle.as_raw(), self.plan.raw, vpack.raw) };
         check("cudnnBackendExecute(scaled)", status)
+    }
+
+    /// Verifies `handle` shares the plan's context and makes that context current on this thread.
+    fn bind(&self, handle: &Handle) -> Result<()> {
+        if !Arc::ptr_eq(handle.context(), &self.ctx) {
+            return Err(Error::Invalid(
+                "cuDNN handle belongs to a different CUDA context than the graph plan",
+            ));
+        }
+        self.ctx.bind_to_thread()?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuda_core::DeviceBuffer;
+
+    #[test]
+    #[ignore = "requires CUDA GPU and cuDNN runtime"]
+    fn t2_plan_outlives_build_handle_and_rejects_foreign_context() {
+        let ctx = Context::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        // 1x1x3x3 input, 1x1x2x2 ones filter -> 1x1x2x2 output.
+        let x_dims = [1, 1, 3, 3];
+        let w_dims = [1, 1, 2, 2];
+        let y_dims = [1, 1, 2, 2];
+        let spec = GraphConvSpec {
+            direction: GraphConvDirection::Forward,
+            x_dtype: DataType::F32,
+            w_dtype: DataType::F32,
+            y_dtype: DataType::F32,
+            compute_dtype: DataType::F32,
+            x_dims,
+            x_strides: GraphConvSpec::nchw_strides(x_dims),
+            w_dims,
+            w_strides: GraphConvSpec::nchw_strides(w_dims),
+            y_dims,
+            y_strides: GraphConvSpec::nchw_strides(y_dims),
+            stride: [1, 1],
+            pad: [0, 0],
+            dilation: [1, 1],
+            alignment_bytes: 16,
+        };
+
+        // Build with a handle that is destroyed before execution; the plan keeps its descriptors.
+        let plan = {
+            let build_handle = Handle::new(&ctx).unwrap();
+            GraphConvPlan::build(&build_handle, &spec, 64 * 1024 * 1024).unwrap()
+        };
+
+        let x_host: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let w_host: [f32; 4] = [1.0; 4];
+        let x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
+        let w_dev = DeviceBuffer::from_host(&stream, &w_host).unwrap();
+        let y_dev = DeviceBuffer::<f32>::zeroed(&stream, 4).unwrap();
+        let ws_dev = DeviceBuffer::<u8>::zeroed(&stream, plan.workspace_size().max(1)).unwrap();
+        stream.synchronize().unwrap();
+
+        let mut exec_handle = Handle::new(&ctx).unwrap();
+        exec_handle.set_stream(&stream).unwrap();
+        // SAFETY: all pointers are live allocations on `ctx` sized for `spec`; the workspace holds
+        // `plan.workspace_size()` bytes, and the stream is synchronized before the buffers drop.
+        unsafe {
+            plan.execute_on_bound_stream(
+                &mut exec_handle,
+                x_dev.cu_deviceptr(),
+                w_dev.cu_deviceptr(),
+                y_dev.cu_deviceptr(),
+                ws_dev.cu_deviceptr(),
+            )
+        }
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            y_dev.to_host_vec(&stream).unwrap(),
+            vec![12.0, 16.0, 24.0, 28.0]
+        );
+
+        let other_ctx = Context::new(0).unwrap();
+        let mut foreign = Handle::new(&other_ctx).unwrap();
+        // SAFETY: the context check rejects the call before any pointer reaches cuDNN.
+        let res = unsafe { plan.execute_on_bound_stream(&mut foreign, 0, 0, 0, 0) };
+        assert!(matches!(res, Err(Error::Invalid(_))));
     }
 }

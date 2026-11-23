@@ -3,9 +3,10 @@
 //!
 //! Every native handle and descriptor is owned by a single RAII type holding an
 //! `Arc<cuda_core::Context>`; `Drop` destroys the C object and records any teardown error on
-//! `Context` rather than panicking. Forward operations size workspaces up front, enforce an
-//! explicit byte budget before growing a caller-owned [`Scratch`] buffer, and execute on a
-//! bound CUDA stream with zero steady-state host allocations.
+//! `Context` rather than panicking. Forward operations size workspaces up front, reject a
+//! workspace larger than the caller's explicit byte budget before growing a caller-owned
+//! [`Scratch`] buffer, and execute on a bound CUDA stream with zero steady-state host allocations.
+//! The backend [`graph`] executor is the exception: it builds one variant-pack descriptor per call.
 
 /// Layer, tensor, filter, convolution, activation, and pooling descriptors.
 pub mod descriptor;
@@ -31,7 +32,7 @@ pub use descriptor::{
     ConvMode, ConvolutionDescriptor, FilterDescriptor, MAX_DIMS, MathType, PoolingDescriptor,
     PoolingMode, TensorDescriptor,
 };
-pub use graph::{GraphConvDirection, GraphConvPlan, GraphConvSpec, HeurMode};
+pub use graph::{GraphConvDirection, GraphConvPlan, GraphConvSpec};
 pub use handle::Handle;
 pub use ops::{
     BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward,
@@ -117,10 +118,10 @@ pub enum Error {
         /// Returned `cudnnStatus_t` status code.
         code: CudnnStatus,
     },
-    /// Operation workspace growth exceeds the caller's explicit byte budget.
+    /// Operation workspace size exceeds the caller's explicit byte budget.
     #[error("needs {requested} device bytes, budget admits {available}")]
     Budget {
-        /// Additional device bytes required by the operation.
+        /// Total workspace bytes required by the operation.
         requested: usize,
         /// Caller-imposed maximum byte budget.
         available: usize,
@@ -151,9 +152,15 @@ pub(crate) fn same_ctx(stream: &Stream, ctx: &Arc<Context>) -> Result<()> {
     Ok(())
 }
 
-/// Verifies `stream` matches `expected` stream identity.
-pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Result<()> {
-    if !Arc::ptr_eq(stream, expected) {
+/// Verifies `stream` is the same native stream as `expected`.
+///
+/// Compares the raw `CUstream` and the owning context rather than `Arc` identity:
+/// `Context::default_stream()` returns a fresh `Arc<Stream>` on every call for the same native
+/// stream.
+pub(crate) fn same_stream(stream: &Stream, expected: &Stream) -> Result<()> {
+    if stream.cu_stream() != expected.cu_stream()
+        || !Arc::ptr_eq(stream.context(), expected.context())
+    {
         return Err(Error::Invalid(
             "scratch workspace belongs to a different CUDA stream",
         ));
@@ -161,7 +168,7 @@ pub(crate) fn same_stream(stream: &Arc<Stream>, expected: &Arc<Stream>) -> Resul
     Ok(())
 }
 
-/// Rejects an allocation growth or peak byte count above `budget`.
+/// Rejects a workspace byte count above `budget`.
 pub(crate) fn within(budget: Option<usize>, peak: usize) -> Result<()> {
     match budget {
         Some(available) if peak > available => Err(Error::Budget {

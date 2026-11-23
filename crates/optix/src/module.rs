@@ -21,6 +21,10 @@ use std::ffi::{CStr, CString, c_char};
 use std::ops::BitOr;
 use std::sync::Arc;
 
+/// Most attribute words (`OptixPipelineCompileOptions::numAttributeValues`, documented as
+/// `[2..8]` in `optix_types.h`; the SDK defines no macro for it).
+const MAX_ATTRIBUTE_VALUES: u32 = 8;
+
 /// `OptixCompileOptimizationLevel`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OptLevel {
@@ -262,7 +266,7 @@ impl PipelineOptions {
     /// The raw struct; borrows `params_name`.
     pub(crate) fn to_sys(&self) -> Result<sys::OptixPipelineCompileOptions> {
         if self.payload_values > sys::OPTIX_COMPILE_DEFAULT_MAX_PAYLOAD_VALUE_COUNT
-            || self.attribute_values > 8
+            || self.attribute_values > MAX_ATTRIBUTE_VALUES
         {
             return Err(Error::Invalid("at most 32 payload and 8 attribute values"));
         }
@@ -614,6 +618,9 @@ impl Module {
 impl Drop for Module {
     fn drop(&mut self) {
         if let Some(destroy) = self.ctx.table().optixModuleDestroy {
+            // The last owner may drop on a thread where the context is not current.
+            let cuda = self.ctx.cuda();
+            cuda.record_err(cuda.bind_to_thread());
             // SAFETY: owned handle; program groups and modules specialised from it hold an `Arc`
             // of `self`, and task-based compiles hold one until their tasks are gone.
             let code = unsafe { destroy(self.raw) };
@@ -869,7 +876,10 @@ impl ProgramGroup {
             return Err(Error::Invalid("program group mixes device contexts"));
         }
         let t = ctx.table();
-        if payload.is_some_and(|p| p.words.is_empty() || p.words.len() > 32) {
+        if payload.is_some_and(|p| {
+            p.words.is_empty()
+                || p.words.len() > sys::OPTIX_COMPILE_DEFAULT_MAX_PAYLOAD_VALUE_COUNT as usize
+        }) {
             return Err(Error::Invalid("a payload type has 1..=32 words"));
         }
         // `PayloadSemantics` is `repr(transparent)` over the `u32` OptiX reads; `ty` outlives the call.
@@ -927,9 +937,40 @@ impl ProgramGroup {
 impl Drop for ProgramGroup {
     fn drop(&mut self) {
         if let Some(destroy) = self.ctx.table().optixProgramGroupDestroy {
+            // The last owner may drop on a thread where the context is not current.
+            let cuda = self.ctx.cuda();
+            cuda.record_err(cuda.bind_to_thread());
             // SAFETY: owned handle; pipelines using it hold an `Arc` of `self`.
             let code = unsafe { destroy(self.raw) };
             self.ctx.record(code);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compile-option limits are the SDK's: 32 payload words (the header macro) and 8
+    /// attribute words (`optix_types.h`: `[2..8]`), the largest value accepted and one above it
+    /// rejected; host-only, no device needed.
+    #[test]
+    fn compile_option_limits_match_the_sdk() {
+        assert_eq!(sys::OPTIX_COMPILE_DEFAULT_MAX_PAYLOAD_VALUE_COUNT, 32);
+        assert_eq!(MAX_ATTRIBUTE_VALUES, 8);
+        let mut opts = PipelineOptions::new("params", 24, 32).expect("options");
+        opts.attribute_values = MAX_ATTRIBUTE_VALUES;
+        assert!(opts.to_sys().is_ok(), "32 payload and 8 attribute words fit");
+        opts.attribute_values = MAX_ATTRIBUTE_VALUES + 1;
+        assert!(
+            matches!(opts.to_sys(), Err(Error::Invalid(_))),
+            "9 attribute words are rejected"
+        );
+        opts.attribute_values = MAX_ATTRIBUTE_VALUES;
+        opts.payload_values = sys::OPTIX_COMPILE_DEFAULT_MAX_PAYLOAD_VALUE_COUNT + 1;
+        assert!(
+            matches!(opts.to_sys(), Err(Error::Invalid(_))),
+            "33 payload words are rejected"
+        );
     }
 }

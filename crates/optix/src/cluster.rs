@@ -24,10 +24,10 @@
 //! temp memory comes from a [`Scratch`] of the build stream.
 //! **Used by** render-rs (cluster geometry) and the nv-rs OptiX tests.
 
-use crate::accel::{Scratch, VertexFormat, alloc, count, same_ctx, upload, within};
+use crate::accel::{Scratch, VertexFormat, alloc, count, same_ctx, same_stream, upload, within};
 use crate::micromap::OpacityMicromapArray;
 use crate::{DeviceContext, Error, Result, check, entry, sys};
-use cuda_core::{DeviceBuffer, DeviceCopy, Stream};
+use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -499,7 +499,7 @@ impl ClusterAccel {
         if args
             .stream
             .as_ref()
-            .is_some_and(|s| !Arc::ptr_eq(s, stream))
+            .is_some_and(|s| !same_stream(s, stream))
         {
             return Err(Error::Invalid(
                 "cluster arguments were uploaded on a different stream than the build",
@@ -821,10 +821,36 @@ impl ClusterAccel {
                 "only GasesFromClusters builds produce traversable GASes",
             ));
         }
-        let handles = self.handles.to_host_vec(stream)?;
-        let handle = *handles
-            .get(index)
-            .ok_or(Error::Invalid("cluster GAS index out of range"))?;
+        if index >= self.handles.len() {
+            return Err(Error::Invalid("cluster GAS index out of range"));
+        }
+        if stream.context().as_ref() != self.ctx.cuda().as_ref() {
+            return Err(Error::Invalid(
+                "stream belongs to another CUDA context than the cluster GAS",
+            ));
+        }
+        // Only this one handle is read back, not the whole array.
+        let offset = (index * size_of::<u64>()) as u64;
+        let mut out = Box::new(0u64);
+        self.ctx.cuda().bind_to_thread()?;
+        // SAFETY: `index < len`, so the 8 bytes at `offset` lie inside `handles`, which `self`
+        // keeps alive; `out` is 8 writable host bytes, kept alive until the stream has
+        // synchronized (or leaked below if that fails, as the copy may still be writing it).
+        let queued = unsafe {
+            cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                (&raw mut *out).cast(),
+                self.handles.cu_deviceptr() + offset,
+                size_of::<u64>(),
+                stream.cu_stream(),
+            )
+        }
+        .result();
+        if let Err(e) = stream.synchronize() {
+            std::mem::forget(out);
+            return Err(e.into());
+        }
+        queued?;
+        let handle = *out;
         if handle == 0 {
             return Err(Error::Invalid(
                 "cluster GAS slot was not built (past the device count)",

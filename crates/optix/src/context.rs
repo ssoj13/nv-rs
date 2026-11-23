@@ -248,7 +248,6 @@ impl DeviceContext {
     /// `optixReorder` really reorders threads (false: it is a legal no-op)
     /// (`OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING`, flag `STANDARD`).
     pub fn shader_reordering(&self) -> Result<bool> {
-        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING,
             sys::OptixDevicePropertyShaderExecutionReorderingFlags_OPTIX_DEVICE_PROPERTY_SHADER_EXECUTION_REORDERING_FLAG_STANDARD as u32,
@@ -257,7 +256,6 @@ impl DeviceContext {
 
     /// Cooperative vectors are supported (`OPTIX_DEVICE_PROPERTY_COOP_VEC`, flag `STANDARD`).
     pub fn coop_vec(&self) -> Result<bool> {
-        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_COOP_VEC,
             sys::OptixDevicePropertyCoopVecFlags_OPTIX_DEVICE_PROPERTY_COOP_VEC_FLAG_STANDARD
@@ -268,7 +266,6 @@ impl DeviceContext {
     /// Cluster acceleration structure builds are supported (`OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL`,
     /// flag `STANDARD`).
     pub fn cluster_accel(&self) -> Result<bool> {
-        #[allow(clippy::unnecessary_cast)]
         self.flag(
             sys::OptixDeviceProperty_OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL,
             sys::OptixDevicePropertyClusterAccelFlags_OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL_FLAG_STANDARD as u32,
@@ -398,6 +395,8 @@ pub(crate) fn creation_flags(block: bool) -> sys::OptixCreationFlags {
 impl Drop for DeviceContext {
     fn drop(&mut self) {
         if let Some(destroy) = self.t.optixDeviceContextDestroy {
+            // The last owner may drop on a thread where the context is not current.
+            self.cuda.record_err(self.cuda.bind_to_thread());
             // SAFETY: owned handle; every object created from it holds an `Arc` of `self`, so
             // none is alive any more. The sinks are dropped after this, when OptiX is done.
             let code = unsafe { destroy(self.raw) };

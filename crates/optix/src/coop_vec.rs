@@ -9,12 +9,14 @@
 //! `optixCoopVecMatrixConvert` on a stream and turns `count` networks of one layout / element
 //! type (typically row-major `f32` from training) into another (typically inferencing-optimal
 //! `f16` or `f8`).
-//! **Checks** before OptiX sees anything: shapes match matrix by matrix, the element-type pair is
-//! one OptiX converts, 8-bit float outputs use an optimal layout, offsets, base addresses and
+//! **Checks** before OptiX sees anything: the stream and both buffers belong to the OptiX
+//! context's CUDA context, shapes match matrix by matrix, the element-type pair is one OptiX
+//! converts, 8-bit float outputs use an optimal layout, offsets, base addresses and
 //! network strides are [`MATRIX_ALIGN`]-aligned, every matrix is at least the size OptiX
 //! computes, and the networks lie inside their buffers without the source and destination
 //! overlapping. **Used by** neural shading in render-rs and the nv-rs OptiX GPU tests.
 
+use crate::accel::same_ctx;
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, Stream};
 
@@ -321,6 +323,14 @@ pub unsafe fn convert<T: DeviceCopy, U: DeviceCopy>(
     src: Batch<'_, &DeviceBuffer<T>>,
     dst: Batch<'_, &mut DeviceBuffer<U>>,
 ) -> Result<()> {
+    same_ctx(stream, ctx)?;
+    if src.buffer.context().as_ref() != ctx.cuda().as_ref()
+        || dst.buffer.context().as_ref() != ctx.cuda().as_ref()
+    {
+        return Err(Error::Invalid(
+            "network buffer belongs to another CUDA context than the OptiX device context",
+        ));
+    }
     if count == 0 {
         return Err(Error::Invalid("convert needs at least one network"));
     }

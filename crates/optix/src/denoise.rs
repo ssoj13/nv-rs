@@ -15,11 +15,14 @@
 //! creation or [`Denoiser::reset`] tells OptiX that the previous layers hold nothing.
 //! **Tiling** ([`DenoiserOptions::tile`]) sizes scratch with overlap and denoises tile by tile, a
 //! port of `optix_denoiser_tiling.h`; [`split_image`] is public for callers that run tiles
-//! concurrently with scratch of their own.
+//! concurrently with scratch of their own. A layer may denoise in place (output = input, or
+//! output = previous output) only untiled: a later tile's overlap would read pixels an earlier
+//! tile already overwrote.
 //! **Ordering.** State, scratch and guide layers are stream-ordered allocations on the denoiser's
 //! stream and every call goes on that stream, so reuse across frames is ordered without
 //! synchronization. **Used by** render-rs and the nv-rs OptiX GPU tests.
 
+use crate::accel::{same_ctx, same_stream};
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, Stream};
 use std::marker::PhantomData;
@@ -498,6 +501,7 @@ impl Denoiser {
         height: u32,
     ) -> Result<Self> {
         check_options(&options, width, height)?;
+        same_ctx(stream, ctx)?;
         let opts = sys::OptixDenoiserOptions {
             guideAlbedo: u32::from(options.albedo),
             guideNormal: u32::from(options.normal),
@@ -530,6 +534,7 @@ impl Denoiser {
         height: u32,
     ) -> Result<Self> {
         check_options(&options, width, height)?;
+        same_ctx(stream, ctx)?;
         if weights.is_empty() {
             return Err(Error::Invalid("user model weights are empty"));
         }
@@ -696,7 +701,9 @@ impl Denoiser {
     /// # Safety
     ///
     /// The images must stay alive and unmodified (outputs: unread) until the work completes on
-    /// the stream: synchronize it, or order their reuse and release after this call on it.
+    /// the stream: synchronize it, or order their reuse and release after this call on it. The
+    /// denoiser itself must not be dropped before the work completes either: its buffers are
+    /// freed in stream order, but `optixDenoiserDestroy` runs at once on drop.
     pub unsafe fn invoke(
         &mut self,
         stream: &Arc<Stream>,
@@ -774,7 +781,7 @@ impl Denoiser {
     /// # Safety
     ///
     /// `image` must stay alive and unmodified, and `out` unread, until the work completes on the
-    /// stream.
+    /// stream; so must the denoiser (see [`Denoiser::invoke`]).
     pub unsafe fn compute_intensity(
         &mut self,
         stream: &Arc<Stream>,
@@ -835,7 +842,7 @@ impl Denoiser {
     }
 
     fn on(&self, stream: &Arc<Stream>) -> Result<()> {
-        if Arc::ptr_eq(stream, &self.stream) {
+        if same_stream(stream, &self.stream) {
             Ok(())
         } else {
             Err(Error::Invalid(
@@ -964,9 +971,13 @@ impl Denoiser {
             }
             for (j, other) in layers.iter().enumerate() {
                 let own = i == j;
-                if out.overlaps(&other.input) && !(own && out.same(&other.input)) {
+                // In place is per invoke: tiles run one after another, and a later tile's input
+                // overlap would read pixels an earlier tile already overwrote with output.
+                if out.overlaps(&other.input)
+                    && !(own && self.tile.is_none() && out.same(&other.input))
+                {
                     return Err(Error::Invalid(
-                        "an output overlaps an input other than its own, identically laid out input",
+                        "an output overlaps an input other than its own, identically laid out, untiled one",
                     ));
                 }
                 if let Some(p) = other.previous
@@ -1200,7 +1211,11 @@ fn color_input(image: &Image<'_>) -> Result<()> {
 impl Drop for Denoiser {
     fn drop(&mut self) {
         if let Some(destroy) = self.ctx.table().optixDenoiserDestroy {
-            // SAFETY: owned handle; invocations must have completed (the `invoke` contract).
+            // The last owner may drop on a thread where the context is not current.
+            let cuda = self.ctx.cuda();
+            cuda.record_err(cuda.bind_to_thread());
+            // SAFETY: owned handle; invocations must have completed (the `invoke` and `compute_*`
+            // contracts).
             let code = unsafe { destroy(self.raw) };
             self.ctx.record(code);
         }

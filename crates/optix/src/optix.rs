@@ -16,8 +16,13 @@
 //! **Conventions.** Every handle owns its OptiX object, holds an `Arc` of what it depends on
 //! (a pipeline holds its program groups, a program group its modules, everything the
 //! [`DeviceContext`]) and destroys it on drop; drop failures are recorded on the CUDA context, as
-//! in `cuda-core`. Work is stream-ordered: device buffers handed to OptiX are `cuda-core`
-//! stream-ordered buffers, freed after the work that uses them. Errors are [`Error`], carrying
+//! in `cuda-core`. Work is stream-ordered. Build outputs, scratch, instance and argument arrays,
+//! compaction and relocation buffers and denoiser state are stream-ordered allocations on the
+//! stream of the call that creates them, freed with `cuMemFreeAsync` on that stream: ordered
+//! after the work queued there, not after work on other streams (the `unsafe` contracts make
+//! that the caller's job). SBT records ([`ShaderBindingTable`]) and transforms
+//! ([`xform::Transform`]) are synchronous allocations (`cuMemAlloc` + a synchronized copy).
+//! Streams are identified by their `CUstream` and CUDA context. Errors are [`Error`], carrying
 //! the OptiX log when the call produced one.
 //!
 //! **Device code** is written in Rust with cuda-oxide; nv-rs spike S1b traces from a Rust

@@ -10,7 +10,7 @@
 
 use crate::{Error, ProgramGroup, Result, sys};
 use cuda_core::bytemuck::{self, Pod};
-use cuda_core::{DeviceBuffer, Stream};
+use cuda_core::{Context, DeviceBuffer, Stream};
 
 /// `OPTIX_SBT_RECORD_HEADER_SIZE` (a cast macro bindgen does not evaluate).
 pub const HEADER: usize = 32;
@@ -69,7 +69,7 @@ fn upload<T: Pod>(
 /// The records of a launch, on the device.
 pub struct ShaderBindingTable {
     raw: sys::OptixShaderBindingTable,
-    _buffers: Vec<DeviceBuffer<u8>>,
+    buffers: Vec<DeviceBuffer<u8>>,
 }
 
 impl ShaderBindingTable {
@@ -96,7 +96,7 @@ impl ShaderBindingTable {
         };
         Ok(Self {
             raw,
-            _buffers: vec![rg, ms, hg],
+            buffers: vec![rg, ms, hg],
         })
     }
 
@@ -110,7 +110,7 @@ impl ShaderBindingTable {
         self.raw.callablesRecordBase = buf.cu_deviceptr();
         self.raw.callablesRecordStrideInBytes = stride;
         self.raw.callablesRecordCount = count;
-        self._buffers.push(buf);
+        self.buffers.push(buf);
         Ok(self)
     }
 
@@ -122,12 +122,17 @@ impl ShaderBindingTable {
     ) -> Result<Self> {
         let (buf, _, _) = upload(stream, std::slice::from_ref(exception))?;
         self.raw.exceptionRecord = buf.cu_deviceptr();
-        self._buffers.push(buf);
+        self.buffers.push(buf);
         Ok(self)
     }
 
     /// The raw table.
     pub fn raw(&self) -> &sys::OptixShaderBindingTable {
         &self.raw
+    }
+
+    /// Every record buffer lives in `cuda`, so a launch on it reads valid addresses.
+    pub(crate) fn on_context(&self, cuda: &Context) -> bool {
+        self.buffers.iter().all(|b| b.context().as_ref() == cuda)
     }
 }

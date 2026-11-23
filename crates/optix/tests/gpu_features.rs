@@ -14,14 +14,14 @@
 mod common;
 
 use common::*;
-use cuda_core::{DeviceBuffer, DeviceCopy, Stream};
+use cuda_core::{Context, DeviceBuffer, DeviceCopy, Stream};
 use optix::coop_vec::{self, Batch, ElemType, Matrix, MatrixLayout, Network};
 use optix::{
     Aabb, Accel, AovType, BoundValue, BuildOptions, BuiltinIs, ClusterAccel, ClusterArgs,
     ClusterFlags, ClusterInput, ClusterLimits, ClusterMode, ClusterOptions, ClusterRefs,
     CompileState, CurveType, Curves, CustomPrimitives, Denoiser, DenoiserModel, DenoiserOptions,
     DeviceContext, DeviceInstances, Emit, Error, GeometryFlags, GridLimits, Guides, Image, Indices,
-    Instance, Keys, Layer, LinkOptions, MicromapCount, MicromapDesc, MicromapFormat,
+    Instance, InstanceBuffer, Keys, Layer, LinkOptions, MicromapCount, MicromapDesc, MicromapFormat,
     MicromapIndices, MicromapOptions, MicromapUse, Module, ModuleOptions, MotionOptions,
     OpacityMicromapArray, Params, PayloadSemantics, PayloadType, Pipeline, PipelineStack,
     PixelFormat, Primitive, ProgramGroup, Programs, Radii, Relink, SbtOffsets, Scratch, Spheres,
@@ -29,8 +29,10 @@ use optix::{
     base_to_micro_bary, error_name, error_string, micro_to_base_bary, simple_path_tracer, sys,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -128,6 +130,13 @@ fn shift(dx: f32) -> [f32; 12] {
 
 fn misses() -> Vec<u32> {
     vec![0; (W * H) as usize]
+}
+
+/// Reports a test that could not check its feature on this device. Written to the process's
+/// stderr directly: libtest captures `print!`/`eprint!` output of passing tests, which would hide
+/// that nothing was tested.
+fn skipped(test: &str, why: &str) {
+    writeln!(std::io::stderr(), "SKIPPED {test}: {why}").expect("write the skip notice");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2060,7 +2069,6 @@ fn omm_mask() -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "GPU"]
 fn barycentric_helpers_match_hand_values() {
     assert_eq!(
         micro_to_base_bary(0, 0).expect("level 0"),
@@ -2370,8 +2378,9 @@ fn cluster_builds_trace() {
     });
     let supported = rig.ctx.cluster_accel().expect("cluster property");
     if !supported {
-        println!(
-            "cluster acceleration structures are not supported on this device (OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL = 0)"
+        skipped(
+            "cluster_builds_trace",
+            "cluster acceleration structures are not supported on this device (OPTIX_DEVICE_PROPERTY_CLUSTER_ACCEL = 0); only the refusal is checked",
         );
         let r = ClusterAccel::memory_usage(
             &rig.ctx,
@@ -3305,8 +3314,9 @@ fn denoiser_budget_is_exact() {
 fn coop_vec_matrices_convert_round_trip() {
     let (stream, ctx) = den_ctx();
     if !ctx.coop_vec().expect("coop vec property") {
-        println!(
-            "cooperative vectors are not supported on this device (OPTIX_DEVICE_PROPERTY_COOP_VEC = 0)"
+        skipped(
+            "coop_vec_matrices_convert_round_trip",
+            "cooperative vectors are not supported on this device (OPTIX_DEVICE_PROPERTY_COOP_VEC = 0)",
         );
         return;
     }
@@ -3565,4 +3575,600 @@ fn coop_vec_matrices_convert_round_trip() {
             "unaligned network stride",
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistent instance buffers, stream identity, CUDA contexts, in-place denoising, teardown
+// ---------------------------------------------------------------------------------------------
+
+/// Build options of a persistent IAS (`Accel::instances_into` refuses compaction).
+fn persistent() -> BuildOptions {
+    BuildOptions {
+        allow_update: true,
+        compact: false,
+        ..Default::default()
+    }
+}
+
+/// `n` identity instances of `gas` with ids `first..first + n`.
+fn numbered(gas: &Arc<Accel>, first: u32, n: u32) -> Vec<Instance> {
+    (first..first + n)
+        .map(|id| {
+            let mut i = Instance::new(gas);
+            i.id = id;
+            i
+        })
+        .collect()
+}
+
+/// The `instanceId`s resident in `buf` (synchronizes `stream` first).
+fn resident_ids(stream: &Stream, buf: &InstanceBuffer) -> Vec<u32> {
+    stream.synchronize().expect("sync");
+    let mut host = vec![sys::OptixInstance::default(); buf.len()];
+    stream.context().bind_to_thread().expect("bind");
+    // SAFETY: `buf` holds `len` instances at `device_ptr`, `host` has room for as many, and the
+    // stream that wrote them has synchronized.
+    let code = unsafe {
+        cuda_core::sys::cuMemcpyDtoH_v2(
+            host.as_mut_ptr().cast(),
+            buf.device_ptr(),
+            size_of_val(host.as_slice()),
+        )
+    };
+    assert_eq!(
+        code,
+        cuda_core::sys::cudaError_enum_CUDA_SUCCESS,
+        "read the instances back"
+    );
+    host.iter().map(|i| i.instanceId).collect()
+}
+
+/// Keeps `stream` busy for `ms` milliseconds, so work queued next waits behind it.
+fn hold(stream: &Stream, ms: u64) {
+    stream
+        .launch_host_function(move || std::thread::sleep(Duration::from_millis(ms)))
+        .expect("hold the stream");
+}
+
+/// One persistent-IAS build or update into `target` over `buf` with the rig's scratch.
+fn ias_into(
+    rig: &mut Rig,
+    buf: &InstanceBuffer,
+    opts: BuildOptions,
+    target: &mut Option<Arc<Accel>>,
+) -> bool {
+    // SAFETY: no launch reads `target` while it is built: every launch of these tests is on the
+    // rig's stream and ordered after the build.
+    unsafe {
+        Accel::instances_into(
+            &rig.ctx,
+            &rig.stream,
+            &mut rig.scratch,
+            buf,
+            opts,
+            false,
+            target,
+        )
+    }
+    .expect("instances_into")
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instance_buffer_back_to_back_updates_do_not_tear() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    assert!(
+        buf.staging_error().is_none(),
+        "pinned staging: {:?}",
+        buf.staging_error()
+    );
+    // 1024 instances are 80 KiB: each update fits the staging buffer and is far too large for a
+    // copy the driver would inline into the command stream.
+    const N: u32 = 1024;
+    buf.upload_all(&s, &numbered(&gas, 0, 2 * N))
+        .expect("upload");
+    s.synchronize().expect("sync");
+    // Both updates are queued while the stream is held, before either copy has run.
+    hold(&s, 300);
+    buf.update_prefix(&s, 0, &numbered(&gas, 10_000, N))
+        .expect("first update");
+    buf.update_prefix(&s, N as usize, &numbered(&gas, 20_000, N))
+        .expect("second update");
+    let want: Vec<u32> = (10_000..10_000 + N).chain(20_000..20_000 + N).collect();
+    assert_eq!(
+        resident_ids(&s, &buf),
+        want,
+        "each update lands in its own range with its own data"
+    );
+}
+
+/// A fresh memory pool capped at `max` bytes is the device's current pool until dropped, so
+/// stream-ordered allocations above the cap fail deterministically.
+struct CappedPool {
+    dev: cuda_core::sys::CUdevice,
+    old: cuda_core::sys::CUmemoryPool,
+    capped: cuda_core::sys::CUmemoryPool,
+}
+
+impl CappedPool {
+    fn new(cuda: &Context, max: usize) -> Self {
+        let ok = cuda_core::sys::cudaError_enum_CUDA_SUCCESS;
+        cuda.bind_to_thread().expect("bind");
+        let dev = cuda.cu_device();
+        let mut old = std::ptr::null_mut();
+        // SAFETY: `old` is writable and `dev` is the device of the bound context.
+        let got = unsafe { cuda_core::sys::cuDeviceGetMemPool(&mut old, dev) };
+        assert_eq!(got, ok, "cuDeviceGetMemPool");
+        // SAFETY: all-zero is a valid `CUmemPoolProps` (integers, a null pointer, zero reserved
+        // bytes); the zero location id is device 0, the device of `common::cuda`.
+        let mut props: cuda_core::sys::CUmemPoolProps = unsafe { std::mem::zeroed() };
+        props.allocType = cuda_core::sys::CUmemAllocationType_enum_CU_MEM_ALLOCATION_TYPE_PINNED;
+        props.location.type_ = cuda_core::sys::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE;
+        props.maxSize = max;
+        let mut capped = std::ptr::null_mut();
+        // SAFETY: `props` describes a device pool and lives for the call; `capped` is writable.
+        let created = unsafe { cuda_core::sys::cuMemPoolCreate(&mut capped, &props) };
+        assert_eq!(created, ok, "cuMemPoolCreate");
+        // SAFETY: `capped` is a pool of `dev`.
+        let set = unsafe { cuda_core::sys::cuDeviceSetMemPool(dev, capped) };
+        assert_eq!(set, ok, "cuDeviceSetMemPool");
+        Self { dev, old, capped }
+    }
+}
+
+impl Drop for CappedPool {
+    fn drop(&mut self) {
+        // SAFETY: `old` was the device's pool before `new`.
+        let restored = unsafe { cuda_core::sys::cuDeviceSetMemPool(self.dev, self.old) };
+        // SAFETY: created in `new`; the driver defers the release past outstanding allocations.
+        let destroyed = unsafe { cuda_core::sys::cuMemPoolDestroy(self.capped) };
+        if !std::thread::panicking() {
+            let ok = cuda_core::sys::cudaError_enum_CUDA_SUCCESS;
+            assert_eq!((restored, destroyed), (ok, ok), "restore the memory pool");
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instance_buffer_growth_failure_leaves_it_empty() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &numbered(&gas, 0, 64)).expect("upload");
+    s.synchronize().expect("sync");
+    {
+        let _cap = CappedPool::new(rig.ctx.cuda(), 2 << 20);
+        // 60 000 instances need 4.8 MB, over the 2 MiB cap.
+        let grown = buf.upload_all(&s, &numbered(&gas, 0, 60_000));
+        assert!(
+            matches!(grown, Err(Error::Driver(_))),
+            "growth past the pool cap fails: {grown:?}"
+        );
+        assert_eq!(buf.len(), 0, "a failed growth leaves no stale count");
+        assert_eq!(buf.capacity_bytes(), 0);
+        assert_eq!(buf.device_ptr(), 0);
+        invalid(
+            buf.update_prefix(&s, 0, &numbered(&gas, 0, 1)),
+            "update after a failed growth",
+        );
+        s.synchronize().expect("sync");
+    }
+    buf.upload_all(&s, &numbered(&gas, 7, 2))
+        .expect("upload after the failure");
+    assert_eq!(resident_ids(&s, &buf), [7, 8]);
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instances_into_checks_the_budget_before_allocating() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &numbered(&gas, 0, 4)).expect("upload");
+    let tight = BuildOptions {
+        budget: Some(0),
+        ..persistent()
+    };
+    let mut target = None;
+    let mut fresh = Scratch::new(&s);
+    // SAFETY: nothing reads `target`; the build is refused before reaching OptiX.
+    let r = unsafe {
+        Accel::instances_into(&rig.ctx, &s, &mut fresh, &buf, tight, false, &mut target)
+    };
+    assert!(
+        matches!(r, Err(Error::Budget { available: 0, .. })),
+        "build over budget: {r:?}"
+    );
+    assert_eq!(fresh.capacity(), 0, "the refused build grew no scratch");
+    assert!(target.is_none());
+
+    assert!(!ias_into(&mut rig, &buf, persistent(), &mut target), "first build");
+    let mut fresh = Scratch::new(&s);
+    // SAFETY: nothing reads `target`; the update is refused before reaching OptiX.
+    let r = unsafe {
+        Accel::instances_into(&rig.ctx, &s, &mut fresh, &buf, tight, false, &mut target)
+    };
+    assert!(
+        matches!(r, Err(Error::Budget { available: 0, .. })),
+        "update over budget: {r:?}"
+    );
+    assert_eq!(fresh.capacity(), 0, "the refused update grew no scratch");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instances_into_replaces_a_shared_target_at_its_size() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &numbered(&gas, 0, 4)).expect("upload");
+    let mut target = None;
+    ias_into(&mut rig, &buf, persistent(), &mut target);
+    let first = target.as_ref().map(|a| a.size_bytes());
+    let mut held = Vec::new();
+    for round in 0..3 {
+        // A second owner: the buffer cannot be reused in place, so a new one is allocated.
+        held.push(target.clone());
+        // SAFETY: no launch reads `target` while it is rebuilt.
+        let updated = unsafe {
+            Accel::instances_into(
+                &rig.ctx,
+                &s,
+                &mut rig.scratch,
+                &buf,
+                persistent(),
+                true,
+                &mut target,
+            )
+        }
+        .expect("forced rebuild");
+        assert!(!updated);
+        assert_eq!(
+            target.as_ref().map(|a| a.size_bytes()),
+            first,
+            "round {round}: a shared target that was big enough is replaced at its size"
+        );
+    }
+    let handle = target.as_ref().map(|a| a.handle()).expect("built");
+    assert_eq!(rig.trace(handle), mask(0.0));
+    drop(held);
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instances_into_rebuilds_a_target_of_another_device_context() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &numbered(&gas, 0, 1)).expect("upload");
+    let mut target = None;
+    ias_into(&mut rig, &buf, persistent(), &mut target);
+
+    let other = DeviceContext::new(rig.ctx.cuda(), None, 0, false).expect("second context");
+    let verts = up(&s, &tri_verts(0.0, LEG));
+    let other_gas = Accel::triangles(
+        &other,
+        &s,
+        &mut rig.scratch,
+        &[opaque(&verts)],
+        BuildOptions::default(),
+    )
+    .expect("GAS on the second context");
+    let mut other_buf = InstanceBuffer::new(&other, &s);
+    other_buf
+        .upload_all(&s, &numbered(&other_gas, 0, 1))
+        .expect("upload on the second context");
+    // SAFETY: no launch reads `target` while it is rebuilt.
+    let updated = unsafe {
+        Accel::instances_into(
+            &other,
+            &s,
+            &mut rig.scratch,
+            &other_buf,
+            persistent(),
+            false,
+            &mut target,
+        )
+    }
+    .expect("build on the second context");
+    assert!(
+        !updated,
+        "a structure of another context is rebuilt, not updated"
+    );
+    assert!(
+        target
+            .as_ref()
+            .is_some_and(|a| Arc::ptr_eq(a.context(), &other)),
+        "the result belongs to the build's context"
+    );
+    s.synchronize().expect("sync");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn instances_into_rebuilds_when_the_build_options_change() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    buf.upload_all(&s, &numbered(&gas, 0, 2)).expect("upload");
+    let mut target = None;
+    ias_into(&mut rig, &buf, persistent(), &mut target);
+    assert!(
+        ias_into(&mut rig, &buf, persistent(), &mut target),
+        "same options update"
+    );
+    let changed = BuildOptions {
+        prefer_fast_trace: false,
+        ..persistent()
+    };
+    assert!(
+        !ias_into(&mut rig, &buf, changed, &mut target),
+        "changed build flags rebuild instead of updating with the old ones"
+    );
+    assert!(
+        ias_into(&mut rig, &buf, changed, &mut target),
+        "unchanged options update again"
+    );
+    let handle = target.as_ref().map(|a| a.handle()).expect("built");
+    assert_eq!(rig.trace(handle), mask(0.0));
+}
+
+#[test]
+#[ignore = "GPU"]
+fn another_arc_of_the_same_stream_is_the_same_stream() {
+    let rig = rig(Cfg::default());
+    let cuda = rig.ctx.cuda().clone();
+    let mut scratch = Scratch::new(&cuda.default_stream());
+    let verts = up(&rig.stream, &tri_verts(0.0, LEG));
+    let gas = Accel::triangles(
+        &rig.ctx,
+        &cuda.default_stream(),
+        &mut scratch,
+        &[opaque(&verts)],
+        BuildOptions::default(),
+    )
+    .expect("a second Arc of the default stream is the stream the scratch belongs to");
+    assert_eq!(rig.trace(gas.handle()), mask(0.0));
+    let other = cuda.new_stream().expect("stream");
+    invalid(
+        Accel::triangles(
+            &rig.ctx,
+            &other,
+            &mut scratch,
+            &[opaque(&verts)],
+            BuildOptions::default(),
+        ),
+        "scratch of another stream",
+    );
+}
+
+/// A second CUDA context on the device of `device` (not the primary one), destroyed on drop.
+/// Nothing is allocated in it, so nothing outlives it.
+struct OtherCuda {
+    raw: cuda_core::sys::CUcontext,
+    ctx: Arc<Context>,
+}
+
+impl OtherCuda {
+    fn new(device: &Context) -> Self {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is writable; null creation parameters are allowed; the device exists.
+        let code = unsafe {
+            cuda_core::sys::cuCtxCreate_v4(&mut raw, std::ptr::null_mut(), 0, device.cu_device())
+        };
+        assert_eq!(
+            code,
+            cuda_core::sys::cudaError_enum_CUDA_SUCCESS,
+            "cuCtxCreate"
+        );
+        // SAFETY: `raw` is a live context of this device until `drop`, after every stream taken
+        // from it here; borrowed, so the `Arc` never releases it.
+        let ctx = unsafe { Context::borrow_raw(raw.cast(), device.cu_device(), device.ordinal()) };
+        Self { raw, ctx }
+    }
+}
+
+impl Drop for OtherCuda {
+    fn drop(&mut self) {
+        // SAFETY: created in `new`; nothing made from it is alive any more.
+        let code = unsafe { cuda_core::sys::cuCtxDestroy_v2(self.raw) };
+        if !std::thread::panicking() {
+            assert_eq!(
+                code,
+                cuda_core::sys::cudaError_enum_CUDA_SUCCESS,
+                "cuCtxDestroy"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "GPU"]
+fn streams_of_another_cuda_context_are_rejected() {
+    let rig = rig(Cfg::default());
+    let other = OtherCuda::new(rig.ctx.cuda());
+    let foreign = other.ctx.default_stream();
+    let p = up(&rig.stream, &[0u8; PARAMS_SIZE]);
+    // SAFETY: rejected before reaching OptiX.
+    invalid(
+        unsafe { rig.pipeline.launch(&foreign, &p, &rig.sbt, [W, H, 1]) },
+        "launch on a stream of another CUDA context",
+    );
+    invalid(
+        Denoiser::new(&rig.ctx, &foreign, DenoiserOptions::default(), 16, 16),
+        "denoiser on a stream of another CUDA context",
+    );
+    let m = Matrix {
+        n: 4,
+        k: 4,
+        elem: ElemType::F16,
+        layout: MatrixLayout::RowMajor,
+        stride: 8,
+        offset: 0,
+        size: 128,
+    };
+    let net = Network::new(vec![m]).expect("network");
+    let src = up(&rig.stream, &[0u8; 256]);
+    let mut dst = DeviceBuffer::<u8>::zeroed(&rig.stream, 256).expect("dst");
+    // SAFETY: rejected before reaching OptiX.
+    invalid(
+        unsafe {
+            coop_vec::convert(
+                &rig.ctx,
+                &foreign,
+                1,
+                Batch {
+                    network: &net,
+                    buffer: &src,
+                    stride: 0,
+                },
+                Batch {
+                    network: &net,
+                    buffer: &mut dst,
+                    stride: 0,
+                },
+            )
+        },
+        "matrix conversion on a stream of another CUDA context",
+    );
+    drop(foreign);
+}
+
+#[test]
+#[ignore = "GPU"]
+fn denoiser_in_place_is_untiled_only() {
+    let (stream, ctx) = den_ctx();
+    let s = 64u32;
+    let img = up(&stream, &noisy((s * s) as usize, 0.5, 0.25, 3));
+    let layer = Layer::new(
+        Image::new(&img, s, s).expect("image"),
+        Image::new(&img, s, s).expect("image"),
+    );
+    let mut tiled = Denoiser::new(
+        &ctx,
+        &stream,
+        DenoiserOptions {
+            tile: Some([32, 32]),
+            ..Default::default()
+        },
+        s,
+        s,
+    )
+    .expect("tiled denoiser");
+    // SAFETY: rejected before reaching OptiX.
+    invalid(
+        unsafe { tiled.invoke(&stream, &Guides::default(), &[layer], Params::default()) },
+        "in-place layer of a tiled denoiser",
+    );
+    let mut whole =
+        Denoiser::new(&ctx, &stream, DenoiserOptions::default(), s, s).expect("untiled denoiser");
+    // SAFETY: `img` and the denoiser outlive the synchronization below.
+    unsafe { whole.invoke(&stream, &Guides::default(), &[layer], Params::default()) }
+        .expect("in-place layer of an untiled denoiser");
+    stream.synchronize().expect("sync");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn handles_drop_on_a_thread_without_a_current_context() {
+    let rig = rig(Cfg::default());
+    let stream = rig.stream.clone();
+    let cuda = rig.ctx.cuda().clone();
+    let den =
+        Denoiser::new(&rig.ctx, &stream, DenoiserOptions::default(), 16, 16).expect("denoiser");
+    stream.synchronize().expect("sync");
+    cuda.check_err().expect("no error recorded before the drops");
+    // A fresh thread has no current CUDA context; the pipeline, groups, module, denoiser and
+    // OptiX context are destroyed there.
+    std::thread::spawn(move || drop((rig, den)))
+        .join()
+        .expect("drop thread");
+    cuda.check_err()
+        .expect("destroying on a thread without a current context records no error");
+    drop(stream);
+}
+
+#[test]
+#[ignore = "GPU"]
+fn denoiser_dropped_with_queued_work_writes_the_same_output() {
+    let (stream, ctx) = den_ctx();
+    let s = 64u32;
+    let n = (s * s) as usize;
+    let input = up(&stream, &noisy(n, 0.5, 0.25, 11));
+    // `early`: drop the denoiser while its invoke is still queued behind a held stream.
+    let run = |early: bool| {
+        let out = DeviceBuffer::<[f32; 4]>::zeroed(&stream, n).expect("out");
+        let mut den =
+            Denoiser::new(&ctx, &stream, DenoiserOptions::default(), s, s).expect("denoiser");
+        if early {
+            hold(&stream, 300);
+        }
+        let layer = Layer::new(
+            Image::new(&input, s, s).expect("in"),
+            Image::new(&out, s, s).expect("out"),
+        );
+        // SAFETY: the images outlive the synchronization below. With `early` the denoiser does
+        // not: that is the driver behaviour this test probes.
+        unsafe { den.invoke(&stream, &Guides::default(), &[layer], Params::default()) }
+            .expect("invoke");
+        if early {
+            drop(den);
+            stream.synchronize().expect("sync");
+        } else {
+            stream.synchronize().expect("sync");
+            drop(den);
+        }
+        out.to_host_vec(&stream).expect("read")
+    };
+    let reference = run(false);
+    let early = run(true);
+    let diff = reference
+        .iter()
+        .flatten()
+        .zip(early.iter().flatten())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        diff < 1e-4,
+        "a denoiser destroyed under its queued invoke changed the output (max diff {diff})"
+    );
+    ctx.cuda().check_err().expect("no teardown error recorded");
+}
+
+#[test]
+#[ignore = "GPU"]
+fn pipeline_dropped_with_a_queued_launch_still_traces() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let out = up(&rig.stream, &[7u32; (W * H) as usize]);
+    let p = up(&rig.stream, &params(&out, gas.handle(), W, H));
+    hold(&rig.stream, 300);
+    // SAFETY: `p`, the SBT, `out` and `gas` outlive the synchronization below; the pipeline does
+    // not: that is the driver behaviour this test probes.
+    unsafe { rig.pipeline.launch(&rig.stream, &p, &rig.sbt, [W, H, 1]) }.expect("launch");
+    let Rig {
+        stream,
+        ctx,
+        pipeline,
+        sbt,
+        ..
+    } = rig;
+    drop(pipeline);
+    stream.synchronize().expect("sync");
+    assert_eq!(
+        out.to_host_vec(&stream).expect("read"),
+        mask(0.0),
+        "a pipeline destroyed under its queued launch changed the result"
+    );
+    ctx.cuda().check_err().expect("no teardown error recorded");
+    drop(sbt);
 }

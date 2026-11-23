@@ -12,6 +12,7 @@
 //! them with [`Pipeline::set_stack_from_depths`], or compute exact sizes with `stack.rs`
 //! ([`crate::StackSizes`]) and apply them with [`Pipeline::set_stack_size`].
 
+use crate::accel::same_ctx;
 use crate::{
     DeviceContext, Error, LOG_BYTES, PipelineOptions, ProgramGroup, Result, ShaderBindingTable,
     check, check_log, entry, module::log_text, sys,
@@ -20,6 +21,10 @@ use cuda_core::bytemuck::Pod;
 use cuda_core::{DeviceBuffer, Stream};
 use std::ffi::{CString, c_void};
 use std::sync::Arc;
+
+/// Most raygen invocations of one launch (`width * height * depth`), the limit of the OptiX
+/// programming guide; the SDK headers define no constant for it.
+const MAX_LAUNCH_INVOCATIONS: u64 = 1 << 30;
 
 /// Link-time call-depth limits (`OptixPipelineLinkOptions`); OptiX sizes the stacks from them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +77,9 @@ pub struct Pipeline {
     _groups: Vec<Arc<ProgramGroup>>,
 }
 
-// SAFETY: an OptixPipeline is an immutable handle once linked; OptiX allows concurrent launches.
+// SAFETY: an OptixPipeline is an immutable handle once linked. OptiX does not support concurrent
+// launches of one pipeline (optix_host.h, `optixLaunch`); `launch` is `unsafe` and its contract
+// excludes them.
 unsafe impl Send for Pipeline {}
 // SAFETY: as above.
 unsafe impl Sync for Pipeline {}
@@ -168,7 +175,9 @@ impl Pipeline {
     /// programs read, and every device pointer and traversable handle reachable from them must
     /// stay valid until the launch completes on `stream`. `params` and `sbt` themselves must also
     /// outlive the launch (synchronize `stream` before dropping them, or drop them after later
-    /// work on it).
+    /// work on it), and so must the pipeline: `optixPipelineDestroy` runs at once on drop. The
+    /// SBT's records must be packed from program groups linked into this pipeline (OptiX cannot
+    /// tell). OptiX does not support concurrent launches of one pipeline from several threads.
     pub unsafe fn launch(
         &self,
         stream: &Stream,
@@ -176,12 +185,20 @@ impl Pipeline {
         sbt: &ShaderBindingTable,
         dims: [u32; 3],
     ) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        if !sbt.on_context(self.ctx.cuda()) {
+            return Err(Error::Invalid(
+                "SBT records live in another CUDA context than the pipeline",
+            ));
+        }
         if params.len() != self.params_size {
             return Err(Error::Invalid(
                 "launch-parameter buffer size differs from PipelineOptions::params_size",
             ));
         }
-        if dims.contains(&0) || dims.iter().map(|d| u64::from(*d)).product::<u64>() > 1 << 30 {
+        if dims.contains(&0)
+            || dims.iter().map(|d| u64::from(*d)).product::<u64>() > MAX_LAUNCH_INVOCATIONS
+        {
             return Err(Error::Invalid(
                 "launch dimensions must be non-zero with at most 2^30 invocations",
             ));
@@ -361,6 +378,9 @@ impl Pipeline {
 impl Drop for Pipeline {
     fn drop(&mut self) {
         if let Some(destroy) = self.ctx.table().optixPipelineDestroy {
+            // The last owner may drop on a thread where the context is not current.
+            let cuda = self.ctx.cuda();
+            cuda.record_err(cuda.bind_to_thread());
             // SAFETY: owned handle; launches must have completed (the `launch` contract).
             let code = unsafe { destroy(self.raw) };
             self.ctx.record(code);

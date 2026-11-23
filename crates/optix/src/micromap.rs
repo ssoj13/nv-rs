@@ -44,7 +44,6 @@ impl MicromapFormat {
 
     fn from_raw(raw: u16) -> Option<Self> {
         let raw_u32 = u32::from(raw);
-        #[allow(clippy::unnecessary_cast)]
         [Self::TwoState, Self::FourState]
             .into_iter()
             .find(|f| f.raw() as u32 == raw_u32)
@@ -447,7 +446,9 @@ impl OpacityMicromapArray {
     ///
     /// # Safety
     ///
-    /// The source's build must be complete or ordered before `stream`.
+    /// The source's build must be complete or ordered before `stream`. When `stream` is not the
+    /// stream the source was built on, the source must also stay alive until the copy completes
+    /// (its buffer is freed in order on its build stream, not on `stream`).
     pub unsafe fn relocate(
         &self,
         ctx: &Arc<DeviceContext>,

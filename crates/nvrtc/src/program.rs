@@ -177,7 +177,7 @@ impl Program {
         )
     }
 
-    /// Retrieves the compiled LTO-IR bytes, or `None` if `--dlto` was not enabled.
+    /// Retrieves the compiled LTO-IR bytes, or `None` if `-dlto` was not enabled.
     pub fn ltoir(&self) -> Result<Option<Vec<u8>>> {
         self.read_optional_binary(
             "nvrtcGetLTOIRSize",

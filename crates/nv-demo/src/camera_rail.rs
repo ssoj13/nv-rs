@@ -461,8 +461,9 @@ impl CameraRail {
             .iter()
             .position(|r| r.spec.id == self.selected_rail_id)
         {
+            // The same rail survives the rebuild: keep the user's duration like `looping` and
+            // `ease_io`.
             self.scene.active_idx = found;
-            self.duration_s = self.scene.rails[found].spec.duration_s.max(2.0);
         } else if let Some(first) = self.scene.rails.first() {
             self.scene.active_idx = 0;
             self.selected_rail_id = first.spec.id.clone();

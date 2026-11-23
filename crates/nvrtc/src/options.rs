@@ -78,9 +78,10 @@ impl CompileOptions {
         self
     }
 
-    /// Enables `--dlto` (link-time optimization IR generation).
+    /// Enables `-dlto` (link-time optimization IR generation; `nvrtc.h` spells it
+    /// `--dlink-time-opt` / `-dlto`, and NVRTC 13 rejects `--dlto`).
     pub fn dlto(mut self) -> Self {
-        self.args.push("--dlto".to_owned());
+        self.args.push("-dlto".to_owned());
         self
     }
 
@@ -137,7 +138,7 @@ mod tests {
                 "--fmad=false",
                 "--generate-line-info",
                 "--relocatable-device-code=true",
-                "--dlto",
+                "-dlto",
                 "--extra-flag",
             ]
         );

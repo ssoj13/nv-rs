@@ -78,6 +78,11 @@ fn preload_siblings(main_path: &Path) -> Result<Vec<libloading::Library>, String
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     let names = sibling_dll_names(main_name, &entries);
+    // Checked before anything is mapped: once a foreign copy is in the process, our siblings'
+    // bare-name imports would bind to it (Windows error 127, two cuDNN builds mixed).
+    for name in names.iter().map(String::as_str).chain([main_name]) {
+        reject_foreign_copy(dir, name)?;
+    }
     let mut libs = Vec::with_capacity(names.len() + 1);
     for name in names {
         let sibling = dir.join(&name);
@@ -101,6 +106,44 @@ fn preload_siblings(main_path: &Path) -> Result<Vec<libloading::Library>, String
         }
     }
     Ok(libs)
+}
+
+/// Fails when a module named `name` is already loaded in this process from a directory other than
+/// `dir` (for example the cuDNN copy shipped with PyTorch). The Windows loader resolves bare-name
+/// imports to an already-loaded module of that name, so loading this candidate would mix two cuDNN
+/// builds; rejecting it lets the loader report it instead of failing with error 127 later.
+#[cfg(windows)]
+fn reject_foreign_copy(dir: &Path, name: &str) -> Result<(), String> {
+    use libloading::os::windows::Library as WinLibrary;
+
+    // `GetModuleHandleExW` matches a bare name against every loaded module and a full path only
+    // against the module mapped from that file; neither call loads anything new.
+    let Ok(by_name) = WinLibrary::open_already_loaded(name) else {
+        return Ok(());
+    };
+    let ours = dir.join(name);
+    let by_name = by_name.into_raw();
+    let same = match WinLibrary::open_already_loaded(&ours) {
+        Ok(by_path) => {
+            let by_path = by_path.into_raw();
+            // SAFETY: `by_path` came from `into_raw` just above and is re-owned exactly once, so
+            // dropping it releases the reference `GetModuleHandleExW` took.
+            drop(unsafe { WinLibrary::from_raw(by_path) });
+            by_path == by_name
+        }
+        Err(_) => false,
+    };
+    // SAFETY: as above, for the bare-name reference.
+    drop(unsafe { WinLibrary::from_raw(by_name) });
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "a different copy of {name} is already loaded in this process; refusing to load {} \
+             next to it (two cuDNN builds cannot share one process on Windows)",
+            ours.display()
+        ))
+    }
 }
 
 /// See the Windows variant: the dynamic linker resolves cuDNN's sub-libraries itself.

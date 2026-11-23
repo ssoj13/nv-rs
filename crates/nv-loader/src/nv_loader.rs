@@ -1836,7 +1836,8 @@ mod tests {
         let _gate = read_extra_dirs_gate();
         let mut fake = Fake::default();
         fake.env.insert("SystemRoot", r"C:\Windows");
-        let err = open_first_with(&fake, &OPTIX, |_| Ok(())).expect_err("nothing installed");
+        let err = open_first_with(&fake, &OPTIX, |_| Ok::<(), String>(()))
+            .expect_err("nothing installed");
         assert!(
             matches!(&err, LoadError::NotFound { tried, .. } if tried == &vec![PathBuf::from(r"C:\Windows\System32\nvoptix.dll")]),
             "{err}"

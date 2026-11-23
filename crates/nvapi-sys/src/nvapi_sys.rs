@@ -5,7 +5,7 @@
 //! `nvapi_QueryInterface(id)`; each shim asks it for its function by the id listed in the SDK's
 //! `nvapi_interface.h`, returns `NVAPI_LIBRARY_NOT_FOUND` when the DLL is absent and
 //! `NVAPI_NO_IMPLEMENTATION` when this driver has no entry for the id. Windows only (NVAPI does not
-//! exist elsewhere; on other targets `load()` reports `NotFound`).
+//! exist elsewhere; on other targets this crate compiles to nothing, so there is no `load()`).
 //! **Used by** a future safe `nvapi` crate (driver settings, GPU topology, D3D extensions).
 #![cfg(target_os = "windows")]
 

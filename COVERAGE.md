@@ -9,7 +9,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | cublas | 517 | 517 | 18 | 18 |
 | cublaslt | 54 | 54 | 48 | 0 |
 | cudnn | 239 | 239 | 39 | 39 |
-| cufft | 35 | 35 | 20 | 20 |
+| cufft | 35 | 35 | 19 | 20 |
 | cupti | 116 | 116 | 13 | 13 |
 | cusolver | 483 | 483 | 38 | 38 |
 | cusolvermg | 19 | 19 | 19 | 0 |
@@ -20,7 +20,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | nvcomp | 119 | 119 | 55 | 55 |
 | nvcuvid | 24 | 24 | 9 | 9 |
 | nvenc | 42 | 42 | 20 | 20 |
-| nvjpeg | 81 | 81 | 46 | 46 |
+| nvjpeg | 81 | 81 | 45 | 46 |
 | nvml | 390 | 390 | 56 | 56 |
 | nvofa | 12 | 12 | 12 | 12 |
 | nvrtc | 29 | 29 | 19 | 19 |
@@ -877,7 +877,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `cufftExecZ2Z` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftGetPlanPropertyInt64` | yes |  |  |  |
 | `cufftGetProperty` | yes |  |  |  |
-| `cufftGetSize` | yes | `cufft` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `cufftGetSize` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `cufftGetSize1d` | yes |  |  |  |
 | `cufftGetSize2d` | yes |  |  |  |
 | `cufftGetSize3d` | yes |  |  |  |
@@ -10813,7 +10813,7 @@ Status: **bound** (in the generated inventory), **wrapped** (a safe wrapper refe
 | `nvjpegBufferPinnedDestroy` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferPinnedResize` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegBufferPinnedRetrieve` | yes |  |  |  |
-| `nvjpegCreate` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
+| `nvjpegCreate` | yes |  | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegCreateEx` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |
 | `nvjpegCreateExV2` | yes |  |  |  |
 | `nvjpegCreateSimple` | yes | `nvjpeg` | NVIDIA GeForce RTX 3080 Ti R570+ (Windows x86_64, 2026-11-14, 3998a22) |  |

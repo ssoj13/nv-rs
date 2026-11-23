@@ -1874,7 +1874,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 if let Some((_, old)) = active_video.take()
                                     && let Err(e) = old.finish()
                                 {
-                                    eprintln!("nv-demo previous video finish error: {e}");
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Previous video finish failed: {e}"
+                                    )));
                                 }
                                 w_frames.store(0, Ordering::Release);
                                 match crate::gpu_export::VideoRecorder::start_with_format(
@@ -1909,14 +1911,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                             w_frames.store(rec.frame_count(), Ordering::Release);
                                         }
                                         Err(e) => {
-                                            if let Some((_, failed_rec)) = active_video.take()
-                                                && let Err(fe) = failed_rec.finish()
-                                            {
-                                                eprintln!("nv-demo video finish after error: {fe}");
-                                            }
+                                            let finish_err = active_video
+                                                .take()
+                                                .and_then(|(_, failed)| failed.finish().err())
+                                                .map(|fe| format!("; finish also failed: {fe}"))
+                                                .unwrap_or_default();
                                             w_failed.store(session_id, Ordering::Release);
                                             bus.emit_render_event(RenderEvent::StatusMessage(
-                                                format!("Video encode error: {e}"),
+                                                format!("Video encode error: {e}{finish_err}"),
                                             ));
                                         }
                                     }

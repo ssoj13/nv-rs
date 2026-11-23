@@ -9,6 +9,8 @@
 
 /// Layer, tensor, filter, convolution, activation, and pooling descriptors.
 pub mod descriptor;
+/// Non-legacy cuDNN 9 Backend Graph API (`cudnnBackend*`) with native Tensor Core & FP8 support.
+pub mod graph;
 /// RAII cuDNN handle and stream binding.
 pub mod handle;
 /// Forward convolution, activation, pooling, softmax, and batch-normalization primitives.
@@ -29,6 +31,7 @@ pub use descriptor::{
     ConvMode, ConvolutionDescriptor, FilterDescriptor, MAX_DIMS, MathType, PoolingDescriptor,
     PoolingMode, TensorDescriptor,
 };
+pub use graph::{GraphConvDirection, GraphConvPlan, GraphConvSpec, HeurMode};
 pub use handle::Handle;
 pub use ops::{
     BatchNormMode, SoftmaxAlgo, SoftmaxMode, activation_forward,
@@ -194,6 +197,12 @@ pub enum DataType {
     F16,
     /// 16-bit brain floating point (`CUDNN_DATA_BFLOAT16`).
     Bf16,
+    /// 8-bit FP8 E4M3 (`CUDNN_DATA_FP8_E4M3`, SM89+ Ada / Hopper / Blackwell).
+    Fp8E4M3,
+    /// 8-bit FP8 E5M2 (`CUDNN_DATA_FP8_E5M2`, SM89+ Ada / Hopper / Blackwell).
+    Fp8E5M2,
+    /// 8-bit block scale exponent E8M0 (`CUDNN_DATA_FP8_E8M0`, Blackwell MXFP8).
+    Fp8E8M0,
     /// 8-bit signed integer (`CUDNN_DATA_INT8`).
     I8,
     /// 8-bit unsigned integer (`CUDNN_DATA_UINT8`).
@@ -212,6 +221,9 @@ impl DataType {
             Self::F64 => sys::cudnnDataType_t_CUDNN_DATA_DOUBLE,
             Self::F16 => sys::cudnnDataType_t_CUDNN_DATA_HALF,
             Self::Bf16 => sys::cudnnDataType_t_CUDNN_DATA_BFLOAT16,
+            Self::Fp8E4M3 => sys::cudnnDataType_t_CUDNN_DATA_FP8_E4M3,
+            Self::Fp8E5M2 => sys::cudnnDataType_t_CUDNN_DATA_FP8_E5M2,
+            Self::Fp8E8M0 => sys::cudnnDataType_t_CUDNN_DATA_FP8_E8M0,
             Self::I8 => sys::cudnnDataType_t_CUDNN_DATA_INT8,
             Self::U8 => sys::cudnnDataType_t_CUDNN_DATA_UINT8,
             Self::I32 => sys::cudnnDataType_t_CUDNN_DATA_INT32,
@@ -226,6 +238,9 @@ impl DataType {
             sys::cudnnDataType_t_CUDNN_DATA_DOUBLE => Ok(Self::F64),
             sys::cudnnDataType_t_CUDNN_DATA_HALF => Ok(Self::F16),
             sys::cudnnDataType_t_CUDNN_DATA_BFLOAT16 => Ok(Self::Bf16),
+            sys::cudnnDataType_t_CUDNN_DATA_FP8_E4M3 => Ok(Self::Fp8E4M3),
+            sys::cudnnDataType_t_CUDNN_DATA_FP8_E5M2 => Ok(Self::Fp8E5M2),
+            sys::cudnnDataType_t_CUDNN_DATA_FP8_E8M0 => Ok(Self::Fp8E8M0),
             sys::cudnnDataType_t_CUDNN_DATA_INT8 => Ok(Self::I8),
             sys::cudnnDataType_t_CUDNN_DATA_UINT8 => Ok(Self::U8),
             sys::cudnnDataType_t_CUDNN_DATA_INT32 => Ok(Self::I32),
@@ -237,7 +252,7 @@ impl DataType {
     /// Size of one scalar element in bytes.
     pub const fn elem_bytes(self) -> usize {
         match self {
-            Self::I8 | Self::U8 => 1,
+            Self::I8 | Self::U8 | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp8E8M0 => 1,
             Self::F16 | Self::Bf16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::F64 | Self::I64 => 8,

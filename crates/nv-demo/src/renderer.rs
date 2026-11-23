@@ -3090,9 +3090,9 @@ fn csg_pose_to_camera_frame(pose: csg_scene::CameraPose) -> CameraFrame {
     }
 }
 
-fn camera_frame_to_core_pose(cam: CameraFrame) -> crate::camera_core::CameraPose {
+fn camera_frame_to_core_pose(cam: CameraFrame) -> camera::CameraPose {
     let fov_y = (2.0 * cam.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
-    crate::camera_core::CameraPose::from_eye_forward_up(
+    camera::CameraPose::from_eye_forward_up(
         glam::Vec3::from_array(cam.eye),
         glam::Vec3::from_array(cam.fwd),
         glam::Vec3::from_array(cam.up),
@@ -3102,7 +3102,7 @@ fn camera_frame_to_core_pose(cam: CameraFrame) -> crate::camera_core::CameraPose
     )
 }
 
-fn core_pose_to_camera_frame(pose: crate::camera_core::CameraPose) -> CameraFrame {
+fn core_pose_to_camera_frame(pose: camera::CameraPose) -> CameraFrame {
     CameraFrame {
         eye: pose.eye.to_array(),
         fwd: pose.forward().to_array(),

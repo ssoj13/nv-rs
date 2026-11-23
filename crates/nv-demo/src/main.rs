@@ -4,10 +4,6 @@
 //! `cargo run -p nv-demo --release`
 
 mod app_events;
-#[allow(unexpected_cfgs, dead_code, unused_imports, clippy::all)]
-mod camera_core;
-#[allow(unexpected_cfgs, dead_code, unused_imports, deprecated, clippy::all)]
-mod camera_egui;
 mod camera_rail;
 mod csg_scene_host;
 mod cuda_crowd;
@@ -43,10 +39,6 @@ mod demo_app {
         AppBus, INTERACTION_SETTLE_WINDOW, PossessInfo, RenderControl, RenderEvent,
         RenderStateSnapshot, SmartViewResult, StillFormat, UiCommand,
     };
-    use crate::camera_core::input::NavScheme;
-    use crate::camera_core::{
-        CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, NavPrefs, ViewportSize,
-    };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
         CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs,
@@ -55,6 +47,10 @@ mod demo_app {
     use crate::ui::{DockTab, UiContext, UiScratch, UiTheme, default_dock_state, install_fonts};
     use appbus::downcast_event;
     use bytemuck::{Pod, Zeroable};
+    use camera::input::NavScheme;
+    use camera::{
+        CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, NavPrefs, ViewportSize,
+    };
     use egui_dock::{DockArea, DockState, Style as DockStyle};
     use glam::Vec3;
     use nv_wgpu::{
@@ -1133,16 +1129,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         capture_png || capture_jpeg || (recording_full_win && frames_received > 0)
     }
 
-    /// Constructs a lockstep shutter subframe [`crate::camera_core::input::RawInput`] preserving
+    /// Constructs a lockstep shutter subframe [`camera::input::RawInput`] preserving
     /// active drags, held WASD fly keys, modifiers, and `keys_allowed` while clearing one-shot
     /// per-UI-frame deltas/edges that were already applied on the UI pass.
     pub(crate) fn lockstep_subframe_raw_input(
-        base: Option<crate::camera_core::input::RawInput>,
+        base: Option<camera::input::RawInput>,
         sub_dt: f32,
         width: u32,
         height: u32,
-    ) -> crate::camera_core::input::RawInput {
-        use crate::camera_core::input::{ButtonSet, KeySet, RawInput, Wheel};
+    ) -> camera::input::RawInput {
+        use camera::input::{ButtonSet, KeySet, RawInput, Wheel};
         match base {
             Some(mut raw) => {
                 raw.pointer_delta = glam::Vec2::ZERO;
@@ -2160,7 +2156,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         cam_damper: crate::camera_rail::CameraDamper,
         rail_blend_remaining: f32,
         cam_driver: CameraDriver,
-        last_cam_raw_input: Option<crate::camera_core::input::RawInput>,
+        last_cam_raw_input: Option<camera::input::RawInput>,
         cam_home: CameraPose,
         cam_pose: CameraPose,
         last_sent_camera: CameraFrame,
@@ -2350,6 +2346,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             };
             let mut cam_driver = CameraDriver::new(prefs, scheme);
             enable_rmb_fly(&mut cam_driver);
+            // City-scale flight feel (set once: it survives `set_prefs` / `set_scheme`):
+            // 1.25x per `RMB + Wheel` notch down to 0.1x, progressive Shift ramp, and the cursor
+            // locked during orbit / pan / dolly drags.
+            cam_driver.set_nav_extras(camera::input::NavExtras {
+                fly_wheel_step: 1.25,
+                fly_speed_min: 0.1,
+                shift_fly_ramp: true,
+                lock_cursor_on_drag: true,
+            });
             cam_driver.controller_mut().apply_intent(
                 CameraIntent::FrameBounds {
                     min: Vec3::splat(-1.25),
@@ -3969,10 +3974,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                 self.render_w,
                                 self.render_h,
                             );
-                            let fly_scene_radius = 2.0
-                                * crate::camera_core::input::altitude_speed_multiplier(
-                                    self.cam_pose.eye.y,
-                                );
+                            let fly_scene_radius =
+                                2.0 * crate::ui::altitude_speed_multiplier(self.cam_pose.eye.y);
                             let df = self.cam_driver.update(&raw, fly_scene_radius);
                             self.cam_pose = df.pose;
                         }
@@ -5130,7 +5133,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     pub(crate) fn enable_rmb_fly(driver: &mut CameraDriver) {
-        use crate::camera_core::input::{Button, DragBinding, DragRole, Mods};
+        use camera::input::{Button, DragBinding, DragRole, Mods};
         let bindings = driver.bindings_mut();
         bindings.fly_wheel_speed = true;
         let drags = &mut bindings.drags;
@@ -5436,7 +5439,7 @@ mod ui_pacing_tests {
 
     #[test]
     fn lockstep_subframe_input_preserves_held_fly_keys_and_clears_one_shot_deltas() {
-        use crate::camera_core::input::{Button, ButtonSet, Key, KeySet, RawInput, Wheel};
+        use camera::input::{Button, ButtonSet, Key, KeySet, RawInput, Wheel};
 
         let base = RawInput {
             pointer: Some(glam::Vec2::new(640.0, 360.0)),

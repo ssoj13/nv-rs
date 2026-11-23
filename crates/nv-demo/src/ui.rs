@@ -4,6 +4,8 @@ use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 use std::sync::LazyLock;
 
+use camera::input::NavScheme;
+use camera::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use egui::{Align, Color32, FontDefinitions, Layout, RichText, Sense, Ui};
 use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
@@ -11,8 +13,6 @@ use egui_phosphor::regular as ic;
 use crate::app_events::{
     AppBus, EnginePhase, PossessInfo, SmartViewResult, StillFormat, UiCommand,
 };
-use crate::camera_core::input::{NavScheme, altitude_speed_multiplier};
-use crate::camera_core::{CameraDriver, CameraIntent, CameraPose, NavFeel, NavMode, ViewportSize};
 use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::DemoAnimator;
@@ -147,6 +147,7 @@ fn fmt_into<'a>(buf: &'a mut String, args: std::fmt::Arguments<'_>) -> &'a str {
 const fn nav_scheme_label(s: NavScheme) -> &'static str {
     match s {
         NavScheme::Default => "Default",
+        NavScheme::Studio => "Studio",
         NavScheme::Maya => "Maya",
         NavScheme::Houdini => "Houdini",
         NavScheme::Blender => "Blender",
@@ -161,6 +162,19 @@ const fn nav_feel_label(f: NavFeel) -> &'static str {
         NavFeel::Sharp => "Sharp",
         NavFeel::Smooth => "Smooth",
     }
+}
+
+/// Cesium/UE5-style altitude-aware flight speed multiplier (nv-demo host policy, fed into the
+/// driver's `scene_radius` and shown on the HUD).
+///
+/// Keeps close-up ground/bolt inspection (`altitude <= 8 m`) at exact `1.0x`, scaling smoothly
+/// up to `25.0x` at high aerial altitude (`>= 200 m`) so orbital/map sweeps feel effortless.
+#[inline]
+pub(crate) fn altitude_speed_multiplier(altitude_m: f32) -> f32 {
+    if !altitude_m.is_finite() {
+        return 1.0;
+    }
+    (altitude_m.max(2.0) / 8.0).clamp(1.0, 25.0)
 }
 
 /// Synchronizes camera toolbar dropdown selections into both `CameraController` and `NavPrefs`
@@ -470,7 +484,7 @@ pub struct UiContext<'a> {
     pub cam_pose: &'a mut CameraPose,
     pub camera_rail: &'a mut CameraRail,
     pub cam_fixed_dt: Option<f32>,
-    pub last_cam_raw_input: &'a mut Option<crate::camera_core::input::RawInput>,
+    pub last_cam_raw_input: &'a mut Option<camera::input::RawInput>,
     pub scratch: &'a mut UiScratch,
     pub cam_mode: &'a mut NavMode,
     pub cam_fly_mode: &'a mut NavMode,
@@ -1094,13 +1108,13 @@ impl UiContext<'_> {
             let fly_scene_radius = 2.0 * altitude_speed_multiplier(self.cam_pose.eye.y);
             let df = match self.cam_fixed_dt {
                 Some(fixed_dt) => {
-                    let raw = crate::camera_egui::read_input(ui, &resp, fixed_dt);
+                    let raw = camera::egui::read_input(ui, &resp, fixed_dt);
                     *self.last_cam_raw_input = Some(raw);
                     if raw.hovered {
-                        crate::camera_egui::consume_wheel(ui.ctx());
+                        camera::egui::consume_wheel(ui.ctx());
                     }
                     let frame = self.cam_driver.update(&raw, fly_scene_radius);
-                    crate::camera_egui::apply_cursor(ui.ctx(), resp.id, frame.cursor);
+                    camera::egui::apply_cursor(ui.ctx(), resp.id, frame.cursor);
                     if frame.wants_repaint {
                         ui.ctx().request_repaint();
                     }
@@ -1108,7 +1122,7 @@ impl UiContext<'_> {
                 }
                 None => {
                     *self.last_cam_raw_input = None;
-                    crate::camera_egui::drive(ui, &resp, self.cam_driver, fly_scene_radius)
+                    camera::egui::drive(ui, &resp, self.cam_driver, fly_scene_radius)
                 }
             };
             let rmb_down = ui.input(|i| i.pointer.secondary_down());
@@ -4814,7 +4828,7 @@ mod tests {
         assert_eq!(driver.controller().mode(), Some(NavMode::Trackball));
 
         // Next frame's `CameraDriver::update` calls `sync_prefs()` and must NOT revert Trackball!
-        let raw = crate::camera_core::input::RawInput {
+        let raw = camera::input::RawInput {
             dt: 1.0 / 60.0,
             viewport: glam::Vec2::new(1280.0, 720.0),
             ..Default::default()
@@ -4823,6 +4837,18 @@ mod tests {
         assert!(df.pose.eye.is_finite());
         assert_eq!(driver.prefs().mode, NavMode::Trackball);
         assert_eq!(driver.controller().mode(), Some(NavMode::Trackball));
+    }
+
+    #[test]
+    fn altitude_speed_multiplier_scales_smoothly_from_ground_to_aerial() {
+        assert_eq!(altitude_speed_multiplier(0.0), 1.0);
+        assert_eq!(altitude_speed_multiplier(2.0), 1.0);
+        assert_eq!(altitude_speed_multiplier(8.0), 1.0);
+        assert!((altitude_speed_multiplier(16.0) - 2.0).abs() < 1e-5);
+        assert!((altitude_speed_multiplier(80.0) - 10.0).abs() < 1e-5);
+        assert_eq!(altitude_speed_multiplier(200.0), 25.0);
+        assert_eq!(altitude_speed_multiplier(500.0), 25.0);
+        assert_eq!(altitude_speed_multiplier(f32::NAN), 1.0);
     }
 
     #[test]

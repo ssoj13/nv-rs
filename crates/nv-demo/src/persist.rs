@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use camera::input::NavScheme;
+use camera::{CameraPose, NavFeel, NavMode};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::camera_core::input::NavScheme;
-use crate::camera_core::{CameraPose, NavFeel, NavMode};
 use crate::demo_anim::DemoAnimator;
 use crate::renderer::DemoSettings;
 use crate::ui::UiTheme;
@@ -340,6 +340,7 @@ fn parse_nav_mode(s: &str) -> Option<NavMode> {
 fn nav_scheme_name(s: NavScheme) -> &'static str {
     match s {
         NavScheme::Default => "Default",
+        NavScheme::Studio => "Studio",
         NavScheme::Maya => "Maya",
         NavScheme::Houdini => "Houdini",
         NavScheme::Blender => "Blender",
@@ -350,6 +351,7 @@ fn nav_scheme_name(s: NavScheme) -> &'static str {
 fn parse_nav_scheme(s: &str) -> Option<NavScheme> {
     Some(match s {
         "Default" => NavScheme::Default,
+        "Studio" => NavScheme::Studio,
         "Maya" => NavScheme::Maya,
         "Houdini" => NavScheme::Houdini,
         "Blender" => NavScheme::Blender,

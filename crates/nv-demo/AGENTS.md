@@ -1,12 +1,12 @@
 # `nv-demo` Agent Guide
 
 ## What & Why
-`crates/nv-demo/` is the flagship interactive RTX showcase binary (`nv-demo`) of `nv-rs` (`294+` unit tests). It exercises OptiX 9 hardware ray tracing (RT Cores), OptiX AI Denoiser & NGX DLSS SR/RR (Tensor Cores), cuFFT 2D diffraction bloom + CUDA tonemapping + zero-churn IAS/traffic/crowd streaming (CUDA Compute SMs), nvJPEG/nvENC export, atomic SDG JSON ground-truth export, and NVML/CUPTI telemetry inside a decoupled **60 Hz paced** `egui` / `egui-dock` / `wgpu` studio UI. See [plan1.md](../../plan1.md) for the active bug-hunt and acceleration roadmap.
+`crates/nv-demo/` is the flagship interactive RTX showcase binary (`nv-demo`) of `nv-rs` (`84` unit tests; camera navigation is the external `camera-rs` crate and its tests run there). It exercises OptiX 9 hardware ray tracing (RT Cores), OptiX AI Denoiser & NGX DLSS SR/RR (Tensor Cores), cuFFT 2D diffraction bloom + CUDA tonemapping + zero-churn IAS/traffic/crowd streaming (CUDA Compute SMs), nvJPEG/nvENC export, atomic SDG JSON ground-truth export, and NVML/CUPTI telemetry inside a decoupled **60 Hz paced** `egui` / `egui-dock` / `wgpu` studio UI. See [plan1.md](../../plan1.md) for the active bug-hunt and acceleration roadmap.
 
 ## Callers & Dependencies
 - **Callers**: standalone desktop binary (`cargo run -p nv-demo --release`).
 - **Workspace crates**: `optix`, `nv-wgpu`, `nv-loader`, `nvrtc`, `nvml`, `cufft`, `nvjpeg`, `nvenc`, `cupti`, `ngx`, `cuda-core-ext`.
-- **External CG crates**: `cuda-core`, `cuda-bindings`, `appbus`, `csg-core`, `csg-actors`, `csg-scene` (`wgpu`), `csg-device`, `csg-scenes` (`csg-rs` `7b8a085`, 23 crates, 84-slot palette, 15-class `GasLedger` `246/256`), `egui`/`egui-wgpu`/`egui-winit`/`egui_dock`/`egui-phosphor`, `wgpu`, `glam`, `bytemuck`, `serde`, `serde_json`.
+- **External CG crates**: `cuda-core`, `cuda-bindings`, `appbus`, `camera` (`camera-rs`, features `egui` + `serde`; flight feel opted in via `CameraDriver::set_nav_extras` in `main.rs`), `csg-core`, `csg-actors`, `csg-scene` (`wgpu`), `csg-device`, `csg-scenes` (`csg-rs` `7b8a085`, 23 crates, 84-slot palette, 15-class `GasLedger` `246/256`), `egui`/`egui-wgpu`/`egui-winit`/`egui_dock`/`egui-phosphor`, `wgpu`, `glam`, `bytemuck`, `serde`, `serde_json`.
 
 ## How It Works
 ```text

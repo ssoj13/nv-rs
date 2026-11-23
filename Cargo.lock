@@ -386,6 +386,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/camera-rs.git?branch=main#91091081fbae5e8ed0671f956a7b08bb1fe2f044"
+dependencies = [
+ "camera-core",
+ "camera-egui",
+]
+
+[[package]]
+name = "camera-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/camera-rs.git?branch=main#91091081fbae5e8ed0671f956a7b08bb1fe2f044"
+dependencies = [
+ "glam",
+ "serde",
+]
+
+[[package]]
+name = "camera-egui"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/camera-rs.git?branch=main#91091081fbae5e8ed0671f956a7b08bb1fe2f044"
+dependencies = [
+ "camera-core",
+ "egui",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1688,6 +1715,9 @@ name = "glam"
 version = "0.33.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "glifo"
@@ -2556,6 +2586,7 @@ version = "0.1.0"
 dependencies = [
  "appbus-rs",
  "bytemuck",
+ "camera",
  "cc",
  "csg-actors",
  "csg-core",

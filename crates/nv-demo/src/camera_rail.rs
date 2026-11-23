@@ -12,11 +12,10 @@
 //! evaluation allocation-free and deterministic.
 //! Used by: `crate::main`, `crate::ui`, `crate::persist`.
 
+use camera::CameraPose;
 use csg_scene::{CompiledRail, RailSpec};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
-
-use crate::camera_core::CameraPose;
 
 /// Fixed sample count for the inline zero-allocation `Custom` arc-length lookup table.
 const ARC_LUT_SAMPLES: usize = 256;

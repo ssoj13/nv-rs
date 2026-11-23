@@ -1,6 +1,6 @@
 # Repository guide
 
-Verified against source on 2026-11-23 (`5a58bab`, `csg-rs` `539f244`). See [crate guidance](crates/AGENTS.md), [architecture diagrams](DIAGRAMS.md), [bughunt & acceleration plan](plan1.md), and [build instructions](README.md#building--verification).
+Verified against source on 2026-11-23 (`5a58bab`, `csg-rs` `539f244`). See [crate guidance](crates/AGENTS.md), [architecture diagrams](DIAGRAMS.md), [`nv-demo` bughunt & acceleration plan (closed)](plan1.md), [workspace-wide bughunt & remediation plan (open, 2026-11-23)](plan2.md) with per-slice ledgers in `audit/2026-11-23/`, and [build instructions](README.md#building--verification).
 
 ## Workspace boundaries
 
@@ -54,6 +54,8 @@ wgpu Vulkan or DX12 allocation
 - `nv-demo` compiles `nvtx_shim.c` (`cfg(has_nvtx3)`) only when `<nvtx3/nvToolsExt.h>` is found under `CUDA_PATH`/`CUDA_HOME`/`CUDA_ROOT`, falling back to inline Rust no-ops otherwise.
 - GPU integration tests marked `#[ignore]` need explicit execution on suitable hardware. Compile success alone does not verify driver behavior, stream ordering, callbacks, or interop.
 - Check OS-gated branches separately: Windows-only NVAPI and Linux storage/collective paths cannot all execute on one host.
+- **Workspace audit traps (`plan2.md`, 2026-11-23, open)**: safe wrappers queue async work on raw device pointers without taking a `cuda-core` access lease (`storage().acquire` + `retain_until_complete`; only `cupti` does), which `cuda-core` requires of raw-pointer users (`allocation.rs:94-126`) - measured on GPU: a stream-ordered buffer (`DeviceBuffer::uninitialized_async`) dropped while work on a *different* stream still writes it is reused and corrupted 20/20 (`crates/curand/tests/lease.rs`), while same-stream and synchronous (`zeroed`, `from_host`) buffers were not; `cuda_core_ext::lease::enqueue_leased` is the fix helper; `cublas::Handle::set_stream` skips `bind_to_thread` on a stream-cache hit (`handle.rs:313`); `cufft::Plan` is auto-`Sync`; `optix::InstanceBuffer` reuses one pinned staging buffer without a fence (`accel.rs:1074`); `nv-wgpu` `InteropSemaphore` destroys the Vulkan semaphore before its CUDA import drops (`sync.rs:72`); `nv-bindgen` falls back to prebuilt bindings on any generator panic.
+- `nv-demo` camera navigation comes from `camera-rs` (`camera` umbrella crate, git `main`, features `egui` + `serde`); the vendored `camera_core` / `camera_egui` copy was removed on 2026-11-23. nv-demo-only flight feel (wheel step `1.25`, floor `0.1`, progressive Shift ramp, cursor lock on drags) is opted in once through `CameraDriver::set_nav_extras` (`main.rs`); change camera behaviour in `camera-rs`, never by copying its sources back. `altitude_speed_multiplier` is nv-demo host policy and lives in `ui.rs`.
 - Preserve CUDA context ownership and stream ordering when changing wrappers. Keep parent objects alive until dependent native objects and queued operations are finished.
 
 Run `cargo clippy --workspace --all-targets` and `cargo test --workspace` for host changes. Inspect full diagnostics before suppressing warnings. Scope extra checks to the affected excluded workspace when relevant.

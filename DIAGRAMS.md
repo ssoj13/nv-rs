@@ -109,3 +109,46 @@ flowchart TD
     T5 --> T6["Async Export Worker + Disk PTX / Nvjpeg / SceneBuilt LRU Caches"]
   end
 ```
+
+## Open systemic defects found by the workspace audit (`plan2.md`, 2026-11-23)
+
+Async work outlives the buffers it uses (wrapper crates and `python/nv-py`):
+
+```mermaid
+sequenceDiagram
+    participant App as Caller (Rust / Python)
+    participant W as Safe wrapper (cublas, cufft, cusparse, npp, nvjpeg, ...)
+    participant S1 as Stream A (work)
+    participant S2 as Stream B (allocation)
+    App->>W: op(&buf, stream A)
+    W->>S1: enqueue kernel on buf.cu_deviceptr()
+    W-->>App: Ok(()) (no lease taken)
+    App->>S2: drop(buf) -> cuMemFreeAsync on stream B
+    Note over S1,S2: no ordering between A and B
+    S1--xS1: kernel reads/writes freed device memory
+```
+
+Binding generation silently falls back to prebuilt output (`nv-bindgen`):
+
+```mermaid
+flowchart TD
+    A[sys build.rs: nv_bindgen::generate] --> B{SDK headers found?}
+    B -- no --> P[use prebuilt/ bindings]
+    B -- yes --> C[bindgen + shims]
+    C -- ok --> O[OUT_DIR output + rerun-if-changed on headers]
+    C -- Bindgen / HeaderNotFound error --> P
+    C -- any panic, caught by catch_unwind --> P
+    P --> W[one cargo warning: libclang is unavailable]
+    P --> X[header sha256 not compared with installed SDK]
+    P --> Y[no rerun-if-env-changed for LIBCLANG_PATH: fallback is sticky until cargo clean]
+```
+
+`nv-demo` render-worker failure path:
+
+```mermaid
+flowchart LR
+    R[renderer.rs worker: expect / assert on driver error] --> D[thread panics]
+    D --> U[UI never polls is_finished]
+    U --> F[viewport frozen, recording left open, lockstep waits forever]
+    D -. only at exit .-> J[join reports the panic]
+```

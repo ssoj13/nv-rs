@@ -1,0 +1,125 @@
+# Audit: cusolver / cusparse / cudnn (read-only bug hunt)
+
+Date: 2026-11-23. Repo HEAD `38ec140`. cuda-core resolved from Cargo.lock at
+`cuda-rust@348895e` (read from `~/.cargo/git/checkouts/cuda-rust-27a4e94e7e45d2f6/348895e`).
+Native signatures cross-checked against `CUDA v13.3/include/cusparse.h`.
+
+Severity: P0 = UB / memory unsafety / wrong results; P1 = leak, swallowed error, silent fallback, significant perf;
+P2 = dedup/SSOT, dead code, doc drift, test weakness.
+Verdict: CONFIRMED = failing path traced in code; PLAUSIBLE = depends on native runtime behaviour / hardware.
+
+## 1) Item-by-item ledger
+
+### Cross-cutting (all three crates)
+
+| ID | Sev | Verdict | file:line | Defect | Failing scenario | Fix direction |
+|---|---|---|---|---|---|---|
+| X1 | P0 | PLAUSIBLE (code path CONFIRMED) | cusolver/src/dn.rs:802-1125, sp.rs:445-547; cudnn/src/ops.rs:206-270, 391-444, 566-624, 1061-1331; cudnn/src/cudnn.rs:316-327 | Safe wrappers take `&DeviceBuffer`/`&mut DeviceBuffer` (or `DeviceSpan`), extract `cu_deviceptr()`, enqueue async work and return. cuda-core 348895e documents that `DeviceBuffer` drop does **not** wait for GPU work and that "unsafe raw-pointer users must retain storage and order accesses themselves" (device_buffer.rs:15-17, 147-153). No lease/retain is taken. The `DeviceSpan` doc claim "allocation remains alive ... for the duration of any operation referencing this span" is false. | `let a = DeviceBuffer::from_host(&s2, ..)` (stream-ordered on `s2`); `dn.getrf(&s1, .., &mut a, ..)`; `drop(a)` -> allocation.rs:94-119 defers `cuMemFreeAsync(ptr, s2)`, which is not ordered after the cuSOLVER kernels on `s1` -> device use-after-free / memory reused under a running kernel. Same for cudnn `conv_forward(.., x, ..)` then drop `x`. | Use cuda-core's access-lease API for safe submissions (or require buffers allocated on / synchronized with the op stream and record an event the allocation must wait on), or make these fns `unsafe` with an explicit lifetime contract. Fix the `DeviceSpan` doc. |
+| X2 | P1 | PLAUSIBLE (missing bind CONFIRMED) | cusolver/src/dn.rs:788-798 (and every Dn op), sp.rs:428-438 (and every Sp op); cusparse/src/handle.rs:48-58, ops.rs:214-878 | `DnHandle`, `SpHandle`, `cusparse::Handle` are `Send`, but neither `set_stream` nor any operation calls `Context::bind_to_thread()`. cuBLAS (`cublas/src/handle.rs:316,335`), cuDNN (`handle.rs:63,102`) and cusolverMg (every call) do bind. | Handle created on thread A for device 1 (or a non-primary/green context), moved to thread B with no/other current context -> runtime launches in device-0 primary (or the foreign) context with a stream from device 1 -> invalid resource handle / `EXECUTION_FAILED`, or the bufferSize query runs in the wrong context. | Bind `self.cuda` in `set_stream` (as cuBLAS does) so every op path binds once. |
+| X3 | P2 | CONFIRMED | cusolver/src/cusolver.rs:287-374; cusparse/src/cusparse.rs:384-456; cudnn/src/scratch.rs:14-85 | `Scratch` implemented three times with divergent contracts: cusolver/cusparse check total `required <= budget: usize` and compare streams by `cu_stream` + context; cudnn checks only growth (`Option<usize>`) and compares by `Arc::ptr_eq`. | Same caller code behaves differently across crates (see N1, N2). | One shared scratch type (e.g. in a common crate) with one budget definition. |
+| X4 | P2 | CONFIRMED | cusolver/src/cusolver.rs:191-206 (`let _ = e` at 201); mg.rs:707-727 (720), 776-796 (789), 846-866 (859); sp.rs:91-100, 110-119, 134-152; cusparse/src/cusparse.rs:172-188 (183); cudnn/src/cudnn.rs:176-182 | Teardown failures are recorded on `Context` as a fabricated `CUDA_ERROR_INVALID_VALUE` (cusolver/cusparse) or `CUDA_ERROR_UNKNOWN` (cudnn); the real library status is discarded. `record_err` is sticky and is returned by the *next* `bind_to_thread()` on that context (context.rs:498-516), so an unrelated later call fails with a misleading driver code. mg.rs re-implements `teardown` three times instead of reusing it. These are Drop paths (acceptable to not panic), but the substitution loses diagnostics. | `cusolverDnDestroy` returns `NOT_INITIALIZED`; the next `cusparse::Handle::new` on that context fails with `CUDA: CUDA_ERROR_INVALID_VALUE`. | Log/trace the original status; use one shared teardown helper; pick one marker code. |
+
+### cusolver
+
+| ID | Sev | Verdict | file:line | Defect | Failing scenario | Fix direction |
+|---|---|---|---|---|---|---|
+| S1 | P2 | CONFIRMED | cusolver/src/mg.rs:189-705 | Every Mg op takes `array_d_a/array_d_b/array_d_ipiv/array_d_work: &mut [*mut _]` but never checks slice length against the selected device count (the handle does not even record it, `device_select` 169-182). The fns are `unsafe` and the contract is documented only as "valid per-GPU pointers". | `device_select(&[0,1])`, then `potrf(.., &mut [p0], ..)` -> cusolverMg reads `array_d_a[1]` past the 1-element slice (host OOB read). | Store the selected device count in `MgHandle`; reject shorter slices before the FFI call. |
+| S2 | P2 | CONFIRMED | cusolver/src/mg.rs:228-259, 314-355, 402-435, 492-535, 581-612, 666-704 | Execute fns accept any `lwork`; nothing ties it to the value returned by the matching `*_buffer_size` or to the budget. | Caller passes stale `lwork` from a smaller problem -> native reads/writes past the per-GPU work buffers. | Return a typed workspace token from `*_buffer_size` and require it in the execute call. |
+| S3 | P2 | CONFIRMED | cusolver/src/mg.rs:794-866 vs 228-704 | `MgMatrixDesc` data type and the op `compute_type` are never compared; grid devices vs `device_select` devices are never compared. | Desc `F32`, compute `F64`: native error at best; budget computed with the wrong element size. | Validate `descr.data_type == compute_type` (where cusolverMg requires it) and keep grid devices for comparison. |
+| S4 | P2 | CONFIRMED | cusolver/src/sp.rs:527, 546; sp.rs:157-182 | `csreigvsi` allocates a 1-element device buffer and does a blocking D2H readback every call (`from_host` + `to_host_vec`), contradicting the crate's no-steady-state-allocation scratch discipline. | Hot loop of eigen-solves allocates and syncs per call. | Take a caller-owned `&mut DeviceBuffer<T>` for `mu` or a pinned host slot. |
+| S5 | P2 | CONFIRMED | cusolver/src/sp.rs:57-72 | `check_cusparse` re-implements the cuSPARSE status-name lookup that the `cusparse` crate already owns (`cusparse.rs:71-97`). | Two sources of truth for cuSPARSE error names. | Depend on the shared status type or a common helper. |
+| S6 | P2 | CONFIRMED | cusolver/src/cusolver.rs:41-91 | `Status::name()` lacks the `CUSOLVER_STATUS_IRS_*` / `INVALID_WORKSPACE`-era additions other than those listed; unknown codes print `UNKNOWN`. | Cosmetic diagnostics loss for IRS codes. | Generate the table from the sys enum. |
+| S7 | P2 | CONFIRMED | cusolver/tests/gpu.rs:37-64, 91-106, 130-157 | The factorization `info` (getrf / potrf / geqrf) is overwritten by the following solve (getrs / potrs / orgqr) on the same `info` buffer before it is read; only the last call's info is asserted. | A singular/indefinite factorization (info>0) would not be detected by the test. | Read/assert info after each call or use separate buffers. |
+| S8 | P2 | CONFIRMED | cusolver/tests/gpu.rs (whole file); mg.rs:956-966 | No f64 path, no `gesvd` with `Some`/`None`/`Overwrite`, and no Mg numerical test (lifecycle only). | Divergent f64 macro instantiation or Mg pointer-array mistakes go untested. | Add f64 + Mg numerical cases. |
+
+Not defects (checked): Dn `lwork` from `*_bufferSize` is passed unchanged to the compute call with the same parameters (dn.rs:818-831, 895-909, 962-977, 1000-1016, 1061-1083, 1106-1124); S/D macro instantiation is symmetric (715-749); `dev_info` is a device buffer by API design and is left to the caller (documented by tests); `gesvd` passing `rwork = NULL` matches NVIDIA samples; `csrlsvqr` host `singularity` is valid because the routine is blocking; `orgqr`/`gesvd` validators cover `k<=n<=m` and `m>=n`.
+
+### cusparse
+
+| ID | Sev | Verdict | file:line | Defect | Failing scenario | Fix direction |
+|---|---|---|---|---|---|---|
+| P1 | P0 | CONFIRMED | cusparse/src/ops.rs:214-244, 249-306, 310-351, 356-417, 447-504, 509-566, 571-603, 646-703, 707-735, 778-844, 848-878 | The host scalar generic `S: SparseScalar` (`alpha`, `beta` passed as `&S`) is never checked against `compute_type`. cuSPARSE reads `alpha`/`beta` as `compute_type`-sized values. | Safe call `spmv::<f32>(.., &1.0f32, mat_a /*F64*/, .., &0.0f32, .., DataType::F64, ..)`: F64 descriptors + F64 compute is a supported combination, so cuSPARSE reads 8 bytes from a 4-byte `&f32` -> host out-of-bounds read (UB) and garbage scaling. Same for C32/C64 compute with real `S`. | `if S::DATA_TYPE != compute_type { return Err(InvalidInput) }` in every op (buffer-size, preprocess, compute, analysis, solve, copy). |
+| P2 | P0 | CONFIRMED (signature-level) | cusparse/src/ops.rs:646-703 (`ws` at 686-700), 707-735; 778-844 (`ws` at 826-841), 848-878 | `SpSv::prepare` / `SpSm::prepare` hand a pointer into the caller's `Scratch` to `cusparseSpSV_analysis` / `SpSM_analysis`. `cusparseSpSV_solve` / `SpSM_solve` take **no** buffer argument (cusparse.h:5835, 5902), so the descriptor keeps using the analysis buffer. `SpSv`/`SpSm` do not own or borrow that buffer. | `spsv.prepare(.., &mut scratch, ..)`; then `spmv(.., &mut scratch, larger_budget)` grows scratch (old buffer freed) or simply overwrites it; `spsv.solve(..)` (safe) reads freed / clobbered memory -> device UAF or wrong results. | Make `SpSv`/`SpSm` own their analysis buffer (allocate inside, budget-checked), or hold a `&'a mut Scratch` borrow for the descriptor lifetime. |
+| P3 | P0 | PLAUSIBLE | cusparse/src/ops.rs:484-502 and 546-564 | `SpGemm::work_estimation` and `SpGemm::compute` reserve `externalBuffer1` and `externalBuffer2` from the same `Scratch`. cuSPARSE requires buffer1 to stay intact through `compute` and buffer2 through `copy` (NVIDIA sample keeps `dBuffer1`/`dBuffer2` alive until after `cusparseSpGEMM_copy`). | `size2 <= size1`: buffer2 aliases buffer1 -> compute overwrites state it still reads. `size2 > size1`: scratch reallocates -> buffer1 freed while the descriptor still points at it. Any intervening use of the scratch before `copy` clobbers buffer2. Small test matrices may pass by luck (tests/gpu.rs:126-254). | Own two distinct buffers inside `SpGemm` (or require two scratches) and keep them until `copy`/drop. |
+| P4 | P0 | CONFIRMED (code) / PLAUSIBLE (native) | cusparse/src/descr.rs:656-702; ops.rs:571-603 | `set_csr_pointers` validates the new buffers against the caller-supplied `nnz` only; it never compares with the native nnz computed by `SpGEMM_compute` (`query_size`, 705-712) nor checks `R/C/V` against the descriptor's original index/value types (row/col index types are not even stored; `value_type` is stored but not compared). `SpGemm::copy` (safe) then writes native-nnz elements. | After compute native nnz = 100; caller passes `nnz = 50` with 50-element buffers (validation passes) -> `copy` writes 100 indices/values -> device OOB write. Or descriptor created with `IndexType::I64`/`F64` via `csr_empty`, then `set_csr_pointers::<i32,i32,f32>` -> cuSPARSE writes 8-byte elements into 4-byte buffers. | In `set_csr_pointers` call `query_size()` and require `nnz == native_nnz`; store index types and require `R::INDEX_TYPE`/`C::INDEX_TYPE`/`V::DATA_TYPE` to match; make `copy` refuse unless pointers were bound. |
+| P5 | P1 | PLAUSIBLE | cusparse/src/descr.rs:399-441, 656-702 | `csr_empty` (safe) creates a CSR descriptor with null pointers; nothing prevents passing it to `spmv`/`spmm`/`SpSv`/`SpGemm::copy` before pointers are bound. Separately, `cusparseCsrSetPointers` cannot change the native nnz, yet `set_csr_pointers` updates the cached `self.nnz` (700): for non-SpGEMM use the Rust-side `nnz()` and the native nnz diverge. | `csr_empty(3,3,..)` -> `spmv(..)`: cuSPARSE dereferences a null `csrRowOffsets` (device fault) unless it validates. `csr_empty` + `set_csr_pointers(nnz=5)` -> native descriptor still nnz 0 -> nnz-dependent algorithms (e.g. CSR_ALG2) compute wrong results. | Track a `bound` state; reject unbound descriptors in ops; document `set_csr_pointers` as SpGEMM-only or recreate the descriptor when nnz changes. |
+| P6 | P1 | PLAUSIBLE | cusparse/src/ops.rs:277-305, 386-416 | `spmv`/`spmm` run `*_preprocess` on every call. Preprocess is designed to be amortized across repeated products with the same matrix and buffer; repeating it each call adds a full analysis pass per product. | Iterative solver calling `spmv` 10k times pays preprocess 10k times. | Split into `prepare` (preprocess, owning the buffer) + `execute`, or a cached plan object. |
+| P7 | P2 | CONFIRMED | cusparse/src/handle.rs:71-76, 99-106 | `set_pointer_mode(PointerMode::Device)` is public, but every op calls `ensure_host_pointer_mode()` and fails in Device mode; no device-scalar op exists. Dead-end public feature. | User sets Device mode -> every op returns `InvalidInput`. | Remove Device mode from the public surface or add device-scalar op variants. |
+| P8 | P2 | CONFIRMED | cusparse/src/ops.rs:796 and 807 | `SpSm::prepare` calls `ensure_host_pointer_mode()` twice (two native `cusparseGetPointerMode` calls). | Redundant FFI per prepare. | Drop the second call. |
+| P9 | P2 | CONFIRMED | cusparse/src/descr.rs:24-28, 42-46 | `SparseIndex` / `SparseScalar` are documented as "Sealed" but are plain public traits. Byte validation uses `size_of::<T>()` vs `INDEX_TYPE.byte_size()`, so a mismatching external impl only makes validation stricter, but the doc is wrong. | Downstream `impl SparseScalar for Foo` compiles. | Seal them (private supertrait) or fix the doc. |
+| P10 | P2 | CONFIRMED | cusparse/src/ops.rs:249-878 | Descriptor contexts (`SpMatDescr::cuda`, `DnVecDescr::cuda`, `DnMatDescr::cuda`, `SpGemm/SpSv/SpSm::cuda`) are never compared to `handle.cuda()`; only the stream context is checked. | Descriptor from context A used with handle on context B: native error or cross-context device pointers. | Compare `Arc::ptr_eq` for all descriptors (cudnn already does). |
+| P11 | P2 | CONFIRMED | cusparse/tests/gpu.rs:176-197 | Budget-denial assertion is silently skipped when `est_bytes == 0`. | The budget path can be untested without notice. | Report/skip explicitly or force a non-zero requirement. |
+
+Not defects (checked): CSR/CSC/COO/Blocked-ELL validators check `rows+1`/`cols+1` offsets, nnz-sized index/value arrays, block multiples, and `checked_mul` overflow (descr.rs:100-311); descriptor constructors are `unsafe` with an explicit "buffers must outlive the descriptor" contract (descr.rs:330-333 etc.); `SpSv::prepare` validates square A and x/y lengths (660-667); `validate_spmm_dims` is a correct check for SpSM because A is square.
+
+### cudnn
+
+| ID | Sev | Verdict | file:line | Defect | Failing scenario | Fix direction |
+|---|---|---|---|---|---|---|
+| N1 | P1 | CONFIRMED | cudnn/src/scratch.rs:63-69 | `reserve` checks only the growth (`needed - capacity`) against `budget`, then allocates a fresh `needed`-byte buffer while the old one is still held (old dropped on assignment at 68). Peak device usage = `capacity + needed`, and the total is never bounded. cusolver/cusparse bound the total. | capacity 900 MiB, needed 1000 MiB, budget 200 MiB: growth 100 MiB passes, 1000 MiB allocated with 900 MiB still live -> 1.9 GiB peak against a 200 MiB budget. | Define budget as total bytes (SSOT with X3); drop the old buffer before allocating. |
+| N2 | P2 | CONFIRMED | cudnn/src/cudnn.rs:155-162; scratch.rs:59 | `same_stream` uses `Arc::ptr_eq`; `Context::default_stream()` returns a new `Arc<Stream>` on every call (cuda-core context.rs:518-525). | `Scratch::new(&ctx.default_stream())` then `conv_forward(.., &ctx.default_stream(), ..)` -> spurious "scratch workspace belongs to a different CUDA stream". | Compare `cu_stream()` + context like the other crates. |
+| N3 | P1 | CONFIRMED | cudnn/src/graph.rs:651-676, 684-711 | `execute_on_bound_stream` / `execute_scaled_on_bound_stream` create, populate and finalize a `VARIANT_PACK` backend descriptor (host allocation + several FFI calls) and destroy it on every call, contradicting the module doc "zero-allocation steady-state execution" (graph.rs:10-11, 340-341). | Per-step host allocation and descriptor finalize in a training loop. | Cache the variant pack in the plan and only update pointers (or document the cost). |
+| N4 | P1 | PLAUSIBLE | cudnn/src/graph.rs:342-346, 404-472, 561-630 | `GraphConvPlan` keeps only the finalized plan; the handle it was finalized with (`EXECUTION_PLAN_HANDLE`), the engine config, op graph and tensor descriptors are destroyed at the end of `build`. Nothing ties the plan to the build handle or checks that `execute_*` uses a handle from the same context (`self.ctx`). | Build with handle H1, drop H1, execute with H2 (or H2 on another device): depends on cuDNN copying vs referencing these descriptors; cudnn-frontend keeps the engine config alive for the plan's lifetime. | Keep the engine config (and a handle/context identity) in `GraphConvPlan`; check `Arc::ptr_eq(handle.context(), &self.ctx)` in execute. |
+| N5 | P2 | CONFIRMED | cudnn/src/graph.rs:354-480 vs 488-637 | `build` and `build_scaled` duplicate ~120 lines (tensor/conv descriptor setup and the whole heuristic -> engine-config -> plan loop). | Fixes to one loop drift from the other. | Extract `make_conv_desc` and `select_plan(op_graph, ..)`. |
+| N6 | P2 | CONFIRMED | cudnn/src/graph.rs:465, 622 | Inside the per-config loop a failed `get_i64(WORKSPACE_SIZE)` aborts the whole build with `?`, while `finalize` failures continue to the next config. | One misbehaving engine config prevents trying the rest. | Record into `last_err` and `continue`. |
+| N7 | P2 | CONFIRMED | cudnn/src/graph.rs:433, 590; ops.rs:735, 801, 867 | Magic caps: `min(16)` engine configs; `MAX_ALGOS = 8/6/7` hand-copied from the current cuDNN algo counts instead of `cudnnGetConvolution*AlgorithmMaxCount`. | A future cuDNN adding algorithms gets silently truncated. | Query max counts at runtime / use the sys `*_ALGO_COUNT` constants. |
+| N8 | P2 | CONFIRMED | cudnn/src/ops.rs:706-717 | The doc comment of `find_conv_forward_algo_ex_on_bound_stream` starts with a stale paragraph belonging to `conv_forward_on_bound_stream` ("Zero-overhead forward convolution ... zero workspace queries"). | Misleading rustdoc. | Remove lines 706-709. |
+| N9 | P2 | CONFIRMED | cudnn/src/ops.rs:722-1054, 1347-1456; graph.rs:651-711 | The `# Safety` sections of the `*_on_bound_stream` and `execute_*` fns do not state that the handle's context must be current on the calling thread (only the inner SAFETY comments assume it), and these fns do not bind. `Handle` is `Send`. | Handle moved to another thread, `conv_forward_on_bound_stream` called without binding -> launch in the wrong/no context. | Add the requirement to `# Safety` or call `handle.context().bind_to_thread()` (cheap when already current). |
+| N10 | P2 | CONFIRMED | cudnn/src/graph.rs:39-58; cudnn.rs:34 | `HeurMode` is publicly re-exported but no public API accepts it; the A -> B -> Fallback order is hardcoded. | Dead public type. | Accept it in `build`/`build_scaled` or make it private. |
+| N11 | P2 | CONFIRMED | cudnn/src/graph.rs:348-350 | `unsafe impl Send for GraphConvPlan` is justified by a "thread-local or mutex-guarded `CudnnRuntime`" that does not exist in this crate (consumer-specific). | Unsound-looking justification for future readers. | Justify from the type's own invariants. |
+| N12 | P2 | CONFIRMED | cudnn/src/scratch.rs:89-95 | `t0_growth_math` tests `saturating_sub` on local literals, not `Scratch`. Vacuous. | Gives false coverage of the budget logic (which has defect N1). | Test `Scratch::growth`/budget logic through a pure helper. |
+| N13 | P2 | CONFIRMED | cudnn/src/ops.rs:1541-1564 | `t2_pooling_softmax_batchnorm_forward` computes `bn_out` but never asserts it. | BN inference regressions undetected. | Assert expected normalized values. |
+
+Not defects (checked): the `let _ = copy_i32_dims(..)?` sites in descriptor.rs (405, 715, 716, 980, 981) discard only the returned rank; the `?` still propagates errors and ranks were checked equal beforehand. Descriptor `Drop` impls ignoring nothing (status recorded). Workspace size and `cudnnConvolution*` execute use the same descriptors and algo in one function (ops.rs:243-269, 496-523, 676-703). Typed wrappers check context identity and `size_in_bytes` for every buffer. `ScalePair` follows the cuDNN rule (double only for `DOUBLE` tensors).
+
+## 2) Files inspected
+
+| File | Lines (non-blank, PowerShell Measure-Object) | Read fully |
+|---|---|---|
+| crates/cusolver/Cargo.toml | 18 | yes |
+| crates/cusolver/src/cusolver.rs | 367 | yes |
+| crates/cusolver/src/dn.rs | 1129 | yes |
+| crates/cusolver/src/sp.rs | 540 | yes |
+| crates/cusolver/src/mg.rs | 919 | yes |
+| crates/cusolver/tests/gpu.rs | 295 | yes |
+| crates/cusparse/Cargo.toml | 16 | (lib path via cusparse.rs header) |
+| crates/cusparse/src/cusparse.rs | 457 | yes |
+| crates/cusparse/src/handle.rs | 117 | yes |
+| crates/cusparse/src/descr.rs | 1055 | yes |
+| crates/cusparse/src/ops.rs | 875 | yes |
+| crates/cusparse/tests/gpu.rs | 340 | yes |
+| crates/cudnn/Cargo.toml | 17 | yes |
+| crates/cudnn/src/cudnn.rs | 486 | yes |
+| crates/cudnn/src/handle.rs | 106 | yes |
+| crates/cudnn/src/scratch.rs | 83 | yes |
+| crates/cudnn/src/descriptor.rs | 1013 | yes |
+| crates/cudnn/src/ops.rs | 1653 | yes (3 pages) |
+| crates/cudnn/src/graph.rs | 663 | yes |
+| Context: nv-rs/AGENTS.md, crates/AGENTS.md | - | yes |
+| Context: cuda-core 348895e allocation.rs:60-120, runtime.rs:280-309, context.rs:498-525, device_buffer.rs (docs, cu_deviceptr/len/context) | - | targeted |
+| Context: cublas/src/handle.rs bind sites; CUDA 13.3 cusparse.h signatures | - | targeted |
+
+## 3) Files changed
+
+None. No edits, no builds, no cargo, no state-changing git.
+
+## 4) Static / invariant verification performed
+
+- Traced every bufferSize -> reserve -> compute pair in cusolver Dn for parameter identity (same handle/dims/uplo/jobz) and lwork propagation.
+- Compared the S/D macro instantiations in dn.rs line by line (symmetric) and the f32/f64 SpFloat impls in sp.rs (symmetric).
+- Grepped `bind_to_thread` across all crates to establish the workspace convention (cuBLAS/cuDNN/cusolverMg bind; cusolver Dn/Sp and cusparse ops do not).
+- Read cuda-core 348895e `Allocation::drop` / `DeviceBuffer` docs to establish that drop does not wait for GPU work and that raw-pointer users must retain storage; `Context::record_err` / `check_err` sticky semantics; `default_stream()` returning a fresh `Arc`.
+- Verified against CUDA 13.3 `cusparse.h` that `cusparseSpSV_solve` / `cusparseSpSM_solve` take no external buffer and `cusparseCsrSetPointers` takes no nnz.
+- Checked each `let _ =` site in the slice: cusolver.rs:201, mg.rs:720/789/859, cusparse.rs:183 (Drop paths, status replaced by a fabricated code -> X4); descriptor.rs:405/715/716/980/981 (rank discard, errors still propagated -> not a defect).
+- Checked every `#[expect(clippy::too_many_arguments)]`: all mirror C signatures or the validator for them; none hides a design problem beyond S2 (unchecked Mg `lwork`).
+
+## 5) Risks / open seam questions for other slices
+
+1. **Buffer lifetime vs async work (X1)** is almost certainly workspace-wide: any wrapper that takes `&DeviceBuffer` in a safe fn and only uses `cu_deviceptr()` (cublas, cufft, curand, npp, nvjpeg, nvcomp, optix accel/denoise, cuda-core-ext) has the same hole unless it takes cuda-core access leases. The cuda-core owners should confirm the intended lease API for third-party FFI wrappers.
+2. **Context binding (X2)**: verify cufft, curand, npp, nvjpeg, nvcomp handles bind in `set_stream` or every op; cuSOLVER Dn/Sp and cuSPARSE are the outliers found here.
+3. **Scratch SSOT (X3/N1)**: nvcomp has its own `scratch.rs` (grep hit); check whether its budget is total or growth-only, and consider one shared type.
+4. **Teardown error substitution (X4)**: the sticky `record_err` means a fabricated code from one crate surfaces in another crate's next `bind_to_thread`. Whoever owns cuda-core interop should decide on a typed teardown-error channel.
+5. **Host-scalar type vs compute type (P1)**: check cublasLt / cuBLAS `gemm_ex`-style wrappers and cuTENSOR (if present) for the same `alpha: &S` vs `compute_type` mismatch.
+6. **cuDNN backend plan lifetime (N4)**: needs a GPU run (build with H1, drop H1 and descriptors, execute with H2) or confirmation from cuDNN docs; the nv-demo / any consumer using `GraphConvPlan` across handles is exposed.
+7. **SpGEMM buffer aliasing (P3)**: requires a GPU test with a matrix large enough that `bufferSize2 != bufferSize1` and a check of the result; current test matrices are 2x2.
+8. **`python/` workspace**: if it re-exports these wrappers, P1/P2/P4 become reachable from Python with arbitrary inputs.

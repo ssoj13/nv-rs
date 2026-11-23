@@ -65,9 +65,12 @@ struct Params {
     unsigned int probe_grid_wh;     // (grid_h << 16) | grid_w for __raygen__score_views
     unsigned long long probe_candidates; // device ptr to GpuProbeCandidate[num_candidates]
     unsigned long long probe_samples;    // device ptr to GpuProbeSample[num_candidates * grid_w * grid_h]
+    unsigned long long csg_prev_xforms;  // device ptr to float[12] prev-frame 3x4 per visible CSG instance
+    unsigned long long _pad2;            // 16-byte struct tail alignment
 };
 
-static_assert(sizeof(Params) == 592, "Params size must match LaunchParams (592 B)");
+static_assert(sizeof(Params) == 608, "Params size must match LaunchParams (608 B)");
+static_assert(__builtin_offsetof(Params, csg_prev_xforms) == 592, "Params::csg_prev_xforms offset must be 592");
 
 struct GpuProbeCandidate {
     float eye[4];     // xyz = origin, w = unused
@@ -1073,7 +1076,7 @@ static __forceinline__ __device__ CsgSceneView make_csg_view() {
     );
 }
 
-// Perceptually distinct Cityscapes-inspired palette matching `csg_core::ast::semantic` (0..17).
+// Perceptually distinct Cityscapes-inspired palette matching `csg_core::ast::semantic` (0..19).
 static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id) {
     switch (sem_id) {
         case 1u:  return make_float3(0.50f, 0.25f, 0.50f); // ROAD
@@ -1093,8 +1096,46 @@ static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id)
         case 15u: return make_float3(0.06f, 0.46f, 0.78f); // WATER
         case 16u: return make_float3(0.78f, 0.68f, 0.46f); // GROUND / SAND
         case 17u: return make_float3(0.64f, 0.48f, 0.40f); // BARRIER
+        case 18u: return make_float3(0.86f, 0.08f, 0.24f); // PEDESTRIAN
+        case 19u: return make_float3(0.96f, 0.48f, 0.12f); // ANIMAL
         default:  return make_float3(0.08f, 0.08f, 0.10f); // UNKNOWN / SKY
     }
+}
+
+// Exact inverse of a general row-major 3x4 affine object-to-world transform (handles non-uniform
+// bone/instance scale + rotation + translation without assuming orthonormality).
+static __forceinline__ __device__ bool csg_inv_xform_pt(const float m[12], float3 p_world, float3& p_obj) {
+    float a00 = m[0], a01 = m[1], a02 = m[2];
+    float a10 = m[4], a11 = m[5], a12 = m[6];
+    float a20 = m[8], a21 = m[9], a22 = m[10];
+
+    float c00 = a11 * a22 - a12 * a21;
+    float c01 = a12 * a20 - a10 * a22;
+    float c02 = a10 * a21 - a11 * a20;
+    float det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (fabsf(det) <= 1e-12f) {
+        return false;
+    }
+    float inv_det = 1.0f / det;
+
+    float c10 = a02 * a21 - a01 * a22;
+    float c11 = a00 * a22 - a02 * a20;
+    float c12 = a01 * a20 - a00 * a21;
+
+    float c20 = a01 * a12 - a02 * a11;
+    float c21 = a02 * a10 - a00 * a12;
+    float c22 = a00 * a11 - a01 * a10;
+
+    float qx = p_world.x - m[3];
+    float qy = p_world.y - m[7];
+    float qz = p_world.z - m[11];
+
+    p_obj = make_float3(
+        (c00 * qx + c10 * qy + c20 * qz) * inv_det,
+        (c01 * qx + c11 * qy + c21 * qz) * inv_det,
+        (c02 * qx + c12 * qy + c22 * qz) * inv_det
+    );
+    return true;
 }
 
 static __forceinline__ __device__ float3 instance_aov_color(unsigned int inst_id) {
@@ -1880,13 +1921,25 @@ extern "C" __global__ void __raygen__render() {
                 first_world_pos = hit_pos;
                 first_range = f3_len(f3_sub(hit_pos, cam_pos));
                 first_depth = fmaxf(0.0f, f3_dot(f3_sub(hit_pos, cam_pos), cam_fwd));
+                float3 prev_world_pos = hit_pos;
                 if (is_csg) {
                     first_sem_id = (p5 >> 16u) & 0xFFFFu;
                     first_part_id = p7;
                     unsigned int uid = p6 + 1u;
                     if (params.csg_instances != 0ull && p6 < params.csg_instance_count) {
-                        unsigned int u = ((const CsgGpuInstance*)params.csg_instances)[p6].user_id;
-                        if (u != 0u) uid = u;
+                        const CsgGpuInstance inst = ((const CsgGpuInstance*)params.csg_instances)[p6];
+                        if (inst.user_id != 0u) uid = inst.user_id;
+                        if (has_prev_cam
+                            && params.csg_prev_xforms != 0ull
+                            && (inst.flags & CSG_INST_FLAG_MOTION_BLUR) != 0u)
+                        {
+                            float3 p_obj;
+                            if (csg_inv_xform_pt(inst.xform, hit_pos, p_obj)) {
+                                const float* prev_m = ((const float*)params.csg_prev_xforms)
+                                    + ((unsigned long long)p6 * 12ull);
+                                prev_world_pos = csg_xform_pt(prev_m, p_obj);
+                            }
+                        }
                     }
                     first_inst_id = uid;
                 } else {
@@ -1895,7 +1948,7 @@ extern "C" __global__ void __raygen__render() {
                     first_part_id = 0u;
                 }
                 if (has_prev_cam) {
-                    float3 rel = f3_sub(hit_pos, prev_pos);
+                    float3 rel = f3_sub(prev_world_pos, prev_pos);
                     float pz = f3_dot(rel, prev_fwd);
                     if (pz > 1e-4f) {
                         float px_ndc = f3_dot(rel, prev_rgt) / (pz * aspect * prev_tan_fov);

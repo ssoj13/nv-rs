@@ -942,8 +942,14 @@ impl UiContext<'_> {
                 .get((self.settings.csg_mode as usize).saturating_sub(1))
                 .is_some_and(|d| d.supports_traffic);
         let traffic_moving = active_supports_traffic
+            && !self.settings.csg_freeze_pose
             && self.settings.csg_traffic_on
             && self.settings.csg_traffic_speed > 0.001;
+        let freeze_tag = if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
+            "  |  FROZEN"
+        } else {
+            ""
+        };
         let preview_tag = if self.fast_preview { "  |  PREVIEW" } else { "" };
         let nav = self.cam_driver.navigator();
         let fly_mult = nav.fly_speed();
@@ -994,7 +1000,7 @@ impl UiContext<'_> {
             ic::STACK
         };
         let status = format!(
-            "{} {}  |  {}x{}  |  {}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
+            "{} {}  |  {}x{}  |  {}{}{}{}{}{}  |  UI {} FPS  |  RT {:.1} FPS ({:.1} ms)",
             phase_icon,
             phase_label,
             self.render_w,
@@ -1002,6 +1008,7 @@ impl UiContext<'_> {
             aov_tag,
             lens_tag,
             possess_tag,
+            freeze_tag,
             fly_tag,
             preview_tag,
             self.ui_fps.round() as u32,
@@ -1795,7 +1802,7 @@ impl UiContext<'_> {
                     );
                     if desc.supports_traffic {
                         prop_toggle(ui, "Traffic", &mut s.csg_traffic_on, "Animated 3D Traffic");
-                        if s.csg_traffic_on {
+                        if s.csg_traffic_on && !s.csg_freeze_pose {
                             anim_slider_f32(
                                 ui,
                                 anim,
@@ -1807,6 +1814,16 @@ impl UiContext<'_> {
                                 false,
                             );
                         }
+                    }
+                    let mut freeze_pose = s.csg_freeze_pose;
+                    prop_toggle(
+                        ui,
+                        "Freeze Pose",
+                        &mut freeze_pose,
+                        "Pause Traffic & Crowd (SDG Accum)",
+                    );
+                    if freeze_pose != s.csg_freeze_pose {
+                        self.bus.emit_ui(UiCommand::ToggleFreezePose);
                     }
                     prop_slider_u32(ui, "World Seed", &mut s.csg_seed, 1..=9999, false);
                     anim_slider_f32(
@@ -2581,6 +2598,48 @@ impl UiContext<'_> {
                         .clicked()
                     {
                         self.bus.emit_ui(UiCommand::ToggleRecord);
+                    }
+                }
+            });
+            ui.add_space(2.0);
+            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                0 => {
+                    let frozen = s.csg_freeze_pose;
+                    let lbl = if frozen {
+                        format!("{}  Unfreeze Pose", ic::PLAY)
+                    } else {
+                        format!("{}  Freeze Pose", ic::PAUSE)
+                    };
+                    let btn = if frozen {
+                        egui::Button::new(RichText::new(lbl).color(Color32::WHITE))
+                            .fill(active_accent_tint(ui))
+                    } else {
+                        egui::Button::new(lbl)
+                    };
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], btn)
+                        .on_hover_text(
+                            "Pause dynamic traffic and crowd stepping so multi-spp path tracing accumulates cleanly for SDG captures.",
+                        )
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::ToggleFreezePose);
+                    }
+                }
+                _ => {
+                    let enabled = s.csg_mode > 0;
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(format!("{}  Save SDG JSON", ic::STACK))
+                                .min_size(egui::vec2(w, ROW_H + 2.0)),
+                        )
+                        .on_hover_text(
+                            "Export exact 2D/3D actor keypoints, tight bone-OBB bounding boxes, and ray-occluded visibility labels into renders/ (also exported automatically alongside PNG/JPEG when Freeze Pose is active).",
+                        )
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::ExportSdgJson);
                     }
                 }
             });

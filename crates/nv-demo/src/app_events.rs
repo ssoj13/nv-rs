@@ -100,6 +100,8 @@ pub enum UiCommand {
     ResetAccum,
     /// Save a still frame (PNG or JPEG) using the active `CaptureSource`.
     SaveStill(StillFormat),
+    /// Export exact 2D/3D actor keypoints, bone-OBB bounding boxes, and occlusion labels as JSON.
+    ExportSdgJson,
     /// Start or stop MP4 video recording.
     ToggleRecord,
     /// Recompile `raytracer.cu` via NVRTC on the render worker.
@@ -108,6 +110,8 @@ pub enum UiCommand {
     SelectScene { scene_idx: u32, variant_idx: u32 },
     /// User switched the live 4-way CSG road geometry mode (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`).
     SetRoadMode(u8),
+    /// Toggle `Freeze Pose` (pauses dynamic traffic/crowd stepping for clean multi-spp SDG accumulation).
+    ToggleFreezePose,
     /// Synthesize a fresh exact-CSG collision-verified random camera rail with `seed`.
     GenerateRandomRail { seed: u64 },
     /// Snap `CameraDamper` immediately onto the current camera pose (teleport / preset / scrub).
@@ -148,6 +152,8 @@ pub enum RenderControl {
     ReturnBuffer { buf_idx: usize, gen_id: u64 },
     /// Encode the current viewport frame as a GPU nvJPEG file.
     SaveJpeg { path: PathBuf, quality: u8 },
+    /// Export exact SDG actor keypoints, tight bounding boxes, and ray-occluded visibility as JSON.
+    ExportSdgJson { path: PathBuf },
     /// Toggle Smooth 60 FPS / 180-degree shutter recording mode on the render worker.
     SetRecording {
         active: bool,
@@ -426,7 +432,9 @@ mod tests {
         bus.emit_ui(UiCommand::ResetAccum);
         bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
         bus.emit_ui(UiCommand::GenerateRandomRail { seed: 42 });
-        assert_eq!(bus.poll_ui_commands(&mut scratch), 3);
+        bus.emit_ui(UiCommand::ToggleFreezePose);
+        bus.emit_ui(UiCommand::ExportSdgJson);
+        assert_eq!(bus.poll_ui_commands(&mut scratch), 5);
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[0]),
             Some(&UiCommand::ResetAccum)
@@ -438,6 +446,14 @@ mod tests {
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[2]),
             Some(&UiCommand::GenerateRandomRail { seed: 42 })
+        );
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[3]),
+            Some(&UiCommand::ToggleFreezePose)
+        );
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[4]),
+            Some(&UiCommand::ExportSdgJson)
         );
 
         bus.send_render(RenderControl::ReloadShader);

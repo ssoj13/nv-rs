@@ -24,6 +24,7 @@ cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", branch = "mai
 cuda-core-ext = { path = "../cuda-core-ext" }
 appbus = { workspace = true }
 csg-core = { workspace = true }
+csg-actors = { workspace = true }
 csg-scene = { workspace = true, features = ["wgpu"] }
 csg-device = { workspace = true }
 csg-scenes = { workspace = true }

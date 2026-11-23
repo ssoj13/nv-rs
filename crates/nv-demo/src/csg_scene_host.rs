@@ -11,7 +11,9 @@
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
 use std::ffi::c_void;
+use std::io::Write as _;
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytemuck::Pod;
@@ -19,18 +21,22 @@ use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use optix::{Aabb, Accel, BuildOptions, CustomPrimitives, DeviceContext, Instance, Scratch};
 
+use csg_actors::{
+    CsgRayOccluder, SdgActorRecord, SdgCamera, SdgProjection, Vec3 as ActorVec3, extract_sdg_frame,
+};
 use csg_core::abi::compound_flags;
-use csg_core::math::Vec3;
-use csg_core::{GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
+use csg_core::math::{Mat3x4, Vec3};
+use csg_core::{CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
 use csg_scene::{
     CameraPose as CsgCameraPose, CameraView, GpuInstance, GpuMaterial, PackedGpuScene,
-    RailGenConfig, RailSpec, SceneBuildConfig, SceneDescriptor, SceneHints, SceneRegistry,
-    SceneTraffic, SceneViewpoint, TimeOfDay, WorldScene, generate_random_rail, inst_flags,
+    RailGenConfig, RailSpec, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
+    SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, generate_random_rail, inst_flags,
     is_dynamic_inst_id, list_possess_targets, lookup_instance_and_assembly,
     pick_possessable_instance, resolve_possess_pose,
 };
 
 use crate::app_events::PossessInfo;
+use crate::renderer::{CameraFrame, CameraProjection};
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`).
 pub const CSG_SBT_OFFSET: u32 = 4;
@@ -122,6 +128,7 @@ pub struct CsgDevicePointers {
     pub repeats: u64,
     pub materials: u64,
     pub instances: u64,
+    pub prev_xforms: u64,
     pub instance_count: u32,
     pub material_count: u32,
     pub compound_count: u32,
@@ -372,15 +379,44 @@ impl<T: Pod> GrowDeviceBuffer<T> {
     }
 }
 
-/// Owns the active `SceneRegistry`, compiled `WorldScene`, batched per-compound OptiX GAS cache,
-/// dynamic traffic controller, and flat GPU buffers.
+/// Serializable Synthetic Data Generation (SDG) frame ground-truth payload exported as JSON.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SdgExportFrame {
+    /// Active registered scene identifier (e.g. `"inspector"`, `"gundo"`, `"marina"`).
+    pub scene_id: String,
+    /// Active 1-based scene index (`csg_mode`).
+    pub scene_idx: u32,
+    /// Active variant index (e.g. `109` for the 4-archetype actor showcase).
+    pub variant_idx: u32,
+    /// Render frame index at export time.
+    pub frame_index: u32,
+    /// Simulation clock in seconds at export time.
+    pub time_s: f32,
+    /// Exact optical sensor model and camera extrinsics/intrinsics.
+    pub camera: SdgCamera,
+    /// Extracted 2D/3D keypoints, tight bone-OBB bounding boxes, and ray-occluded visibility labels.
+    pub actors: Vec<SdgActorRecord>,
+}
+
+/// Converts `nv-demo` [`CameraProjection`] to [`SdgProjection`].
+#[inline]
+pub const fn to_sdg_projection(proj: CameraProjection) -> SdgProjection {
+    match proj {
+        CameraProjection::Pinhole => SdgProjection::Pinhole,
+        CameraProjection::Fisheye180 => SdgProjection::Fisheye180,
+        CameraProjection::Equirect360 => SdgProjection::Equirect360,
+        CameraProjection::SlitCam => SdgProjection::SlitCam,
+    }
+}
+
+/// Owns the active `SceneRegistry`, compiled `SceneBuilt` (world, traffic, crowd, hints),
+/// batched per-compound OptiX GAS cache, and flat GPU buffers.
 pub struct CsgGpuHost {
     registry: SceneRegistry,
     scene_key: CsgSceneKey,
     active_reg_idx: Option<usize>,
-    world: Option<WorldScene>,
-    traffic: Option<SceneTraffic>,
-    hints: Option<SceneHints>,
+    scene: Option<SceneBuilt>,
+    crowd_frozen: bool,
     pending_metadata: Option<SceneLoadedMetadata>,
     packed: PackedGpuScene,
     /// Per-compound cached OptiX custom-primitive GASes (indexed by `compound_id`).
@@ -397,7 +433,9 @@ pub struct CsgGpuHost {
     aabb_staging_buf: Option<DeviceBuffer<Aabb>>,
     materials_buf: GrowDeviceBuffer<GpuMaterial>,
     instances_buf: GrowDeviceBuffer<GpuInstance>,
+    prev_xforms_buf: GrowDeviceBuffer<[f32; 12]>,
     pinned_staging: Option<PinnedStagingBuffer>,
+    pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
     prev_dyn_compounds: Vec<u32>,
     static_gpu_bytes: usize,
@@ -427,9 +465,8 @@ impl CsgGpuHost {
             registry: csg_scenes::default_scene_registry(),
             scene_key: CsgSceneKey::default(),
             active_reg_idx: None,
-            world: None,
-            traffic: None,
-            hints: None,
+            scene: None,
+            crowd_frozen: false,
             pending_metadata: None,
             packed: PackedGpuScene::new(),
             compound_gases: Vec::new(),
@@ -444,7 +481,9 @@ impl CsgGpuHost {
             aabb_staging_buf: None,
             materials_buf: GrowDeviceBuffer::default(),
             instances_buf: GrowDeviceBuffer::default(),
+            prev_xforms_buf: GrowDeviceBuffer::default(),
             pinned_staging: None,
+            pinned_prev_staging: None,
             prev_packed_len: 0,
             prev_dyn_compounds: Vec::new(),
             static_gpu_bytes: 0,
@@ -464,7 +503,7 @@ impl CsgGpuHost {
 
     /// Returns `true` when any registered CSG scene is loaded and active.
     pub fn is_active(&self) -> bool {
-        self.scene_key.scene_idx != 0 && self.world.is_some()
+        self.scene_key.scene_idx != 0 && self.scene.is_some()
     }
 
     /// Returns the currently loaded [`CsgSceneKey`].
@@ -472,11 +511,16 @@ impl CsgGpuHost {
         self.scene_key
     }
 
-    /// Returns `true` when the active scene has dynamic moving traffic actors.
+    /// Returns `true` when the active scene has dynamic moving traffic actors (legacy or SoA).
     pub fn has_traffic(&self) -> bool {
-        self.traffic
+        self.scene.as_ref().is_some_and(|s| !s.traffic.is_empty())
+    }
+
+    /// Returns `true` when the active scene has articulated crowd actors (pedestrians/animals).
+    pub fn has_crowd(&self) -> bool {
+        self.scene
             .as_ref()
-            .is_some_and(|t| !t.actors.is_empty())
+            .is_some_and(|s| s.crowd.actor_count() > 0)
     }
 
     /// Returns the latest CSG telemetry for the UI.
@@ -496,23 +540,20 @@ impl CsgGpuHost {
 
     /// Synthesizes a fresh deterministic, exact-CSG collision-verified random rail for the active scene.
     pub fn generate_random_rail(&self, seed: u64) -> Result<RailSpec, String> {
-        let (Some(world), Some(hints)) = (&self.world, &self.hints) else {
+        let Some(ref scene) = self.scene else {
             return Err("Load a CSG scene before generating a random rail".to_string());
         };
         let cfg = RailGenConfig {
             seed,
             ..RailGenConfig::default()
         };
-        generate_random_rail(world, hints, seed, &cfg)
+        generate_random_rail(&scene.world, &scene.hints, seed, &cfg)
             .map_err(|e| format!("Random rail gen failed: {e}"))
     }
 
     /// Returns references to the active `WorldScene` and `SceneHints`, if a CSG scene is loaded.
     pub fn world_and_hints(&self) -> Option<(&WorldScene, &SceneHints)> {
-        match (&self.world, &self.hints) {
-            (Some(w), Some(h)) => Some((w, h)),
-            _ => None,
-        }
+        self.scene.as_ref().map(|s| (&s.world, &s.hints))
     }
 
     /// Returns the currently packed GPU instance staging buffer.
@@ -523,7 +564,7 @@ impl CsgGpuHost {
     /// Packs the full scene omnidirectionally into `self.packed` and uploads `self.instances_buf`
     /// for city-wide view scoring, marking `ias_dirty` so the next render frame restores frustum culling.
     pub fn prepare_full_scene_for_probe(&mut self, stream: &Arc<Stream>) -> Result<(), String> {
-        let Some(ref mut world) = self.world else {
+        let Some(ref mut scene) = self.scene else {
             return Err("Load a CSG scene before running Smart View".to_string());
         };
         let cam_pos = if self.last_pack_cam.iter().all(|v| v.is_finite()) {
@@ -535,18 +576,21 @@ impl CsgGpuHost {
         } else {
             Vec3::ZERO
         };
-        world.pack_all(cam_pos, &mut self.packed);
+        scene.world.pack_all(cam_pos, &mut self.packed);
         self.instances_buf
             .upload(stream, self.packed.instances_slice())?;
+        self.prev_xforms_buf
+            .upload(stream, self.packed.motion_prev_xforms_slice())?;
         self.ias_dirty = true;
         Ok(())
     }
 
     /// Casts an exact CSG ray against live dynamic + static instances and enters `Possess` mode.
     pub fn pick_possess(&mut self, origin: [f32; 3], dir: [f32; 3]) -> Result<PossessInfo, String> {
-        let Some(ref world) = self.world else {
+        let Some(ref scene) = self.scene else {
             return Err("Load a CSG scene before picking an object to possess".to_string());
         };
+        let world = &scene.world;
         let d = Vec3::new(dir[0], dir[1], dir[2]).norm();
         let ray = Ray::new(Vec3::new(origin[0], origin[1], origin[2]), d, 0.05, 1500.0);
         let Some((inst_id, _t, mounts)) = pick_possessable_instance(world, ray) else {
@@ -568,9 +612,10 @@ impl CsgGpuHost {
 
     /// Possesses the next dynamic vehicle (prioritizing `Robotaxi`) or mounted scene landmark.
     pub fn possess_next_vehicle(&mut self) -> Result<PossessInfo, String> {
-        let Some(ref world) = self.world else {
+        let Some(ref scene) = self.scene else {
             return Err("Load a CSG scene before possessing a vehicle".to_string());
         };
+        let world = &scene.world;
         let mut targets = list_possess_targets(world);
         if targets.is_empty() {
             return Err("Active scene has no mounted vehicles or landmarks".to_string());
@@ -626,10 +671,10 @@ impl CsgGpuHost {
         free_pitch: f32,
         auto_level: bool,
     ) -> Option<CsgCameraPose> {
-        let world = self.world.as_ref()?;
+        let scene = self.scene.as_ref()?;
         let info = self.active_possess.as_ref()?;
         resolve_possess_pose(
-            world,
+            &scene.world,
             info.inst_id,
             info.mount_idx,
             free_yaw,
@@ -643,9 +688,10 @@ impl CsgGpuHost {
         if !self.is_active() {
             return CsgDevicePointers::default();
         }
-        let Some(ref world) = self.world else {
+        let Some(ref scene) = self.scene else {
             return CsgDevicePointers::default();
         };
+        let world = &scene.world;
         CsgDevicePointers {
             compounds: self.compounds_buf.device_ptr(),
             ops: self.ops_buf.device_ptr(),
@@ -655,38 +701,158 @@ impl CsgGpuHost {
             repeats: self.repeats_buf.device_ptr(),
             materials: self.materials_buf.device_ptr(),
             instances: self.instances_buf.device_ptr(),
+            prev_xforms: self.prev_xforms_buf.device_ptr(),
             instance_count: self.packed.len() as u32,
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
         }
     }
 
-    /// Advances dynamic 3D Frenet traffic in-place to `traffic_time_s` before resolving possessed
-    /// vehicle camera mounts so the camera is locked to the exact current-frame vehicle transform.
-    pub fn step_traffic(&mut self, traffic_time_s: f32) -> bool {
-        let traffic_bits = traffic_time_s.to_bits();
-        let moved = self.has_traffic() && traffic_bits != self.last_traffic_bits;
-        if moved
-            && let (Some(reg_idx), Some(world), Some(traffic)) =
-                (self.active_reg_idx, self.world.as_mut(), self.traffic.as_ref())
+    /// Advances dynamic 3D Frenet traffic and articulated crowd actors in-place before resolving
+    /// possessed vehicle mounts so cameras lock to exact current-frame transforms.
+    ///
+    /// Respects `freeze_pose` (pausing both traffic and crowd stepping so progressive path tracing
+    /// can accumulate cleanly for Synthetic Data Generation captures).
+    pub fn step_dynamic(
+        &mut self,
+        dt: f32,
+        time_s: f32,
+        cam_eye: [f32; 3],
+        freeze_pose: bool,
+        step_traffic: bool,
+    ) -> bool {
+        let Some(ref mut scene) = self.scene else {
+            return false;
+        };
+        if freeze_pose != self.crowd_frozen {
+            scene.set_crowd_frozen(freeze_pose);
+            self.crowd_frozen = freeze_pose;
+            if freeze_pose {
+                scene.reset_crowd_motion_history();
+                for inst in scene.world.dynamic_instances_mut() {
+                    inst.prev_xform = Some(inst.xform);
+                }
+                self.traffic_dirty = true;
+            }
+        }
+        if freeze_pose {
+            return false;
+        }
+
+        let mut moved = false;
+        let traffic_bits = time_s.to_bits();
+        if step_traffic
+            && !scene.traffic.is_empty()
+            && traffic_bits != self.last_traffic_bits
+            && let Some(reg_idx) = self.active_reg_idx
             && let Some(module) = self.registry.get_by_index(reg_idx)
         {
-            module.step_dynamic(world, traffic, traffic_time_s);
+            module.step_dynamic(&mut scene.world, &scene.traffic, time_s);
             self.last_traffic_bits = traffic_bits;
             self.traffic_dirty = true;
-            return true;
+            moved = true;
         }
-        false
+
+        if scene.crowd.actor_count() > 0 && dt > 0.0 && dt.is_finite() {
+            scene.step_crowd(dt, time_s, Vec3::new(cam_eye[0], cam_eye[1], cam_eye[2]));
+            self.traffic_dirty = true;
+            moved = true;
+        }
+
+        moved
+    }
+
+    /// Extracts exact 2D/3D actor keypoints, tight bone-OBB bounding boxes, and analytical
+    /// CSG ray-occluded visibility labels via [`csg_actors::extract_sdg_frame`] and writes them
+    /// atomically to `path` as pretty-printed JSON.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "forwards camera basis, projection, viewport dimensions, and frame metadata cleanly"
+    )]
+    pub fn export_sdg_json(
+        &self,
+        path: &Path,
+        cam: &CameraFrame,
+        projection: CameraProjection,
+        width: u32,
+        height: u32,
+        frame_index: u32,
+        time_s: f32,
+    ) -> Result<usize, String> {
+        let Some(ref scene) = self.scene else {
+            return Err("Load a CSG scene before exporting SDG JSON".to_string());
+        };
+        let scene_id = self
+            .active_reg_idx
+            .and_then(|idx| self.registry.get_by_index(idx))
+            .map(|m| m.descriptor().id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let vfov_rad = 2.0 * cam.tan_half_fov.max(0.05).atan();
+        let sdg_cam = SdgCamera {
+            projection: to_sdg_projection(projection),
+            eye: ActorVec3::from_array(cam.eye),
+            forward: ActorVec3::from_array(cam.fwd),
+            up: ActorVec3::from_array(cam.up),
+            vfov_rad,
+            width: width.max(1),
+            height: height.max(1),
+        };
+
+        let visible_slice = self.packed.instances_slice();
+        let actors = if visible_slice.is_empty() {
+            let occluder = CsgRayOccluder::new(&scene.world.library, &scene.crowd.bone_outs);
+            extract_sdg_frame(&scene.crowd, &sdg_cam, &occluder)
+        } else {
+            let world_insts: Vec<(CompoundId, Mat3x4, u32)> = visible_slice
+                .iter()
+                .map(|inst| (CompoundId(inst.compound_id), Mat3x4(inst.xform), inst.user_id))
+                .collect();
+            let occluder = CsgRayOccluder::from_instances(&scene.world.library, &world_insts);
+            extract_sdg_frame(&scene.crowd, &sdg_cam, &occluder)
+        };
+        let actor_count = actors.len();
+        let payload = SdgExportFrame {
+            scene_id,
+            scene_idx: self.scene_key.scene_idx,
+            variant_idx: self.scene_key.variant_idx,
+            frame_index,
+            time_s,
+            camera: sdg_cam,
+            actors,
+        };
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("SDG JSON serialize failed: {e}"))?;
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("SDG output dir create failed: {e}"))?;
+        }
+        let tmp_path = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("SDG temp file create failed: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("SDG JSON write failed: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("SDG JSON flush failed: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("SDG JSON sync failed: {e}"))?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| format!("SDG JSON atomic rename failed: {e}"))?;
+        Ok(actor_count)
     }
 
     /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
     /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes,
-    /// steps 3D Frenet dynamic traffic, and either streams only `dynamic_instances[0..D]` via the
-    /// reusable `256 KiB` pinned staging buffer (`CsgSyncResult::TrafficOnly`) or repacks visible
-    /// instances with live frustum + small-detail culling (`CsgSyncResult::FullRepack`).
+    /// steps 3D Frenet dynamic traffic (unless `freeze_pose` is enabled), and either streams only
+    /// `dynamic_instances[0..D]` via the reusable `256 KiB` pinned staging buffers
+    /// (`CsgSyncResult::TrafficOnly`) or repacks visible instances with live frustum + small-detail
+    /// culling (`CsgSyncResult::FullRepack`).
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates scene key, material params, camera frustum, and OptiX resources cleanly"
+        reason = "coordinates scene key, material params, camera frustum, freeze flag, and OptiX resources cleanly"
     )]
     pub fn sync(
         &mut self,
@@ -698,9 +864,14 @@ impl CsgGpuHost {
         time_of_day: u32,
         cam: CsgCameraParams,
         traffic_time_s: f32,
+        freeze_pose: bool,
     ) -> Result<CsgSyncResult, String> {
         if self.pinned_staging.is_none() {
             self.pinned_staging =
+                PinnedStagingBuffer::try_new(optix_ctx.cuda(), CSG_PINNED_STAGING_BYTES);
+        }
+        if self.pinned_prev_staging.is_none() {
+            self.pinned_prev_staging =
                 PinnedStagingBuffer::try_new(optix_ctx.cuda(), CSG_PINNED_STAGING_BYTES);
         }
 
@@ -724,24 +895,25 @@ impl CsgGpuHost {
         // Fast in-place material palette refresh (zero GAS/scene rebuild!) via SceneModule.
         let mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
         if mat_state != self.last_mat_state
-            && let (Some(reg_idx), Some(world)) = (self.active_reg_idx, self.world.as_mut())
+            && let (Some(reg_idx), Some(scene)) = (self.active_reg_idx, self.scene.as_mut())
             && let Some(module) = self.registry.get_by_index(reg_idx)
         {
             let tod = time_of_day_from_u32(time_of_day);
-            module.refresh_materials(world, wetness.clamp(0.0, 1.0), tod);
-            self.materials_buf.upload(stream, world.materials.as_slice())?;
+            module.refresh_materials(&mut scene.world, wetness.clamp(0.0, 1.0), tod);
+            self.materials_buf
+                .upload(stream, scene.world.materials.as_slice())?;
             self.last_mat_state = mat_state;
         }
 
-        // Step animated 3D Frenet traffic in-place (zero heap allocations).
+        // Fallback animated 3D Frenet traffic step (zero heap allocations, skipped when frozen).
         let traffic_bits = traffic_time_s.to_bits();
-        let traffic_moved_now = self.has_traffic() && traffic_bits != self.last_traffic_bits;
+        let traffic_moved_now =
+            !freeze_pose && self.has_traffic() && traffic_bits != self.last_traffic_bits;
         if traffic_moved_now
-            && let (Some(reg_idx), Some(world), Some(traffic)) =
-                (self.active_reg_idx, self.world.as_mut(), self.traffic.as_ref())
+            && let (Some(reg_idx), Some(scene)) = (self.active_reg_idx, self.scene.as_mut())
             && let Some(module) = self.registry.get_by_index(reg_idx)
         {
-            module.step_dynamic(world, traffic, traffic_time_s);
+            module.step_dynamic(&mut scene.world, &scene.traffic, traffic_time_s);
             self.last_traffic_bits = traffic_bits;
             self.traffic_dirty = true;
         }
@@ -764,8 +936,9 @@ impl CsgGpuHost {
         let traffic_dirty = self.traffic_dirty;
 
         if (camera_repack_needed || traffic_dirty)
-            && let Some(ref mut world) = self.world
+            && let Some(ref mut scene) = self.scene
         {
+            let world = &mut scene.world;
             let mut cam_view = if cam.omnidirectional {
                 CameraView::omnidirectional(
                     Vec3::new(cam.eye[0], cam.eye[1], cam.eye[2]),
@@ -794,6 +967,7 @@ impl CsgGpuHost {
             world.pack_visible(&cam_view, &mut self.packed);
 
             let slice = self.packed.instances_slice();
+            let prev_slice = self.packed.motion_prev_xforms_slice();
             let dyn_count = slice
                 .iter()
                 .take_while(|inst| (inst.flags & inst_flags::DYNAMIC) != 0)
@@ -801,6 +975,8 @@ impl CsgGpuHost {
             let same_topology = !camera_repack_needed
                 && dyn_count > 0
                 && slice.len() == self.prev_packed_len
+                && prev_slice.len() == slice.len()
+                && self.prev_xforms_buf.len_elems == slice.len()
                 && dyn_count == self.prev_dyn_compounds.len()
                 && slice[..dyn_count]
                     .iter()
@@ -813,11 +989,17 @@ impl CsgGpuHost {
                     self.pinned_staging.as_ref(),
                     &slice[..dyn_count],
                 )?;
+                self.prev_xforms_buf.upload_prefix_pinned(
+                    stream,
+                    self.pinned_prev_staging.as_ref(),
+                    &prev_slice[..dyn_count],
+                )?;
                 CsgSyncResult::TrafficOnly {
                     dynamic_count: dyn_count,
                 }
             } else {
                 self.instances_buf.upload(stream, slice)?;
+                self.prev_xforms_buf.upload(stream, prev_slice)?;
                 self.prev_packed_len = slice.len();
                 self.prev_dyn_compounds.clear();
                 self.prev_dyn_compounds.reserve(dyn_count);
@@ -829,7 +1011,8 @@ impl CsgGpuHost {
 
             let gpu_bytes = self.static_gpu_bytes
                 + self.materials_buf.active_bytes()
-                + self.instances_buf.active_bytes();
+                + self.instances_buf.active_bytes()
+                + self.prev_xforms_buf.active_bytes();
             self.stats = CsgStats {
                 visible_instances: self.packed.len() as u32,
                 total_instances: world.total_instance_count() as u32,
@@ -932,9 +1115,8 @@ impl CsgGpuHost {
 
         self.scene_key = key;
         self.active_reg_idx = None;
-        self.world = None;
-        self.traffic = None;
-        self.hints = None;
+        self.scene = None;
+        self.crowd_frozen = false;
         self.compound_gases.clear();
         self.compound_sbt_offsets.clear();
         self.compounds_buf.clear();
@@ -945,6 +1127,7 @@ impl CsgGpuHost {
         self.repeats_buf.clear();
         self.materials_buf.clear();
         self.instances_buf.clear();
+        self.prev_xforms_buf.clear();
         self.prev_packed_len = 0;
         self.prev_dyn_compounds.clear();
         self.static_gpu_bytes = 0;
@@ -1100,16 +1283,15 @@ impl CsgGpuHost {
             .collect();
         self.packed
             .reserve_instances(built.world.total_instance_count().max(256));
+        built.reset_crowd_motion_history();
         self.active_reg_idx = Some(reg_idx);
         self.pending_metadata = Some(SceneLoadedMetadata {
             scene_idx: key.scene_idx,
             variant_idx: key.variant_idx,
-            viewpoints: built.viewpoints,
-            rails: built.rails,
+            viewpoints: std::mem::take(&mut built.viewpoints),
+            rails: std::mem::take(&mut built.rails),
         });
-        self.world = Some(built.world);
-        self.traffic = Some(built.traffic);
-        self.hints = Some(built.hints);
+        self.scene = Some(built);
         Ok(())
     }
 }
@@ -1250,5 +1432,191 @@ mod tests {
             packed.stats.single_prim_instances > 0,
             "city scenes must route single-prim instances to the lean SBT 5 hit group"
         );
+    }
+
+    #[test]
+    fn crowd_step_dynamic_respects_freeze_pose_and_exports_sdg_json() {
+        let mut host = CsgGpuHost::new();
+        let inspector_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "inspector")
+            .expect("inspector registered");
+        let module = host
+            .registry
+            .get_by_index(inspector_idx)
+            .expect("inspector module");
+        let cfg = SceneBuildConfig {
+            variant_idx: 109, // 4-archetype actor crowd showcase
+            ..SceneBuildConfig::default()
+        };
+        let mut built = module.build(&cfg);
+        assert_eq!(built.crowd.actor_count(), 4, "4-archetype showcase has 4 actors");
+        built.reset_crowd_motion_history();
+        let vp = built.viewpoints[0].clone();
+        let cam_eye = [vp.eye.x, vp.eye.y, vp.eye.z];
+
+        host.scene_key = CsgSceneKey {
+            scene_idx: (inspector_idx + 1) as u32,
+            variant_idx: 109,
+            seed: 1,
+            road_mode: 2,
+        };
+        host.active_reg_idx = Some(inspector_idx);
+        host.scene = Some(built);
+
+        assert!(host.has_crowd());
+        // Freeze Pose must prevent crowd stepping and set FREEZE_POSE flag.
+        assert!(!host.step_dynamic(0.05, 0.05, cam_eye, true, true));
+        assert!(host.crowd_frozen);
+
+        // Unfreezing steps the crowd and populates motion_prev_xforms.
+        assert!(host.step_dynamic(0.05, 0.10, cam_eye, false, true));
+        assert!(!host.crowd_frozen);
+        assert!(host.step_dynamic(0.05, 0.15, cam_eye, false, true));
+
+        let fwd = (vp.target - vp.eye).norm();
+        let right = fwd.cross(Vec3::Y).norm();
+        let up = right.cross(fwd).norm();
+        let cam_frame = CameraFrame {
+            eye: cam_eye,
+            fwd: [fwd.x, fwd.y, fwd.z],
+            right: [right.x, right.y, right.z],
+            up: [up.x, up.y, up.z],
+            tan_half_fov: (0.5 * vp.vfov_deg.to_radians()).tan(),
+        };
+        let cam_view = CameraView::perspective(
+            vp.eye,
+            fwd,
+            up,
+            vp.vfov_deg.to_radians(),
+            16.0 / 9.0,
+            [0.05, 500.0],
+            720.0,
+        );
+        host.scene
+            .as_mut()
+            .expect("scene")
+            .world
+            .pack_visible(&cam_view, &mut host.packed);
+        assert_eq!(
+            host.packed.instances_slice().len(),
+            host.packed.motion_prev_xforms_slice().len(),
+            "motion_prev_xforms must align 1:1 with visible instances"
+        );
+        assert!(
+            host.packed
+                .instances_slice()
+                .iter()
+                .any(|inst| (inst.flags & inst_flags::MOTION_BLUR) != 0),
+            "stepped crowd bones must emit MOTION_BLUR flags for object optical flow"
+        );
+
+        let out_path = std::env::temp_dir().join("nv_demo_sdg_export_test.json");
+        let count = host
+            .export_sdg_json(
+                &out_path,
+                &cam_frame,
+                CameraProjection::Pinhole,
+                1280,
+                720,
+                7,
+                0.15,
+            )
+            .expect("SDG JSON export");
+        assert_eq!(count, 4, "all 4 showcase actors must be exported");
+        let raw = std::fs::read_to_string(&out_path).expect("read exported SDG JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["scene_id"], "inspector");
+        assert_eq!(parsed["actors"].as_array().map(Vec::len), Some(4));
+        let _ = std::fs::remove_file(&out_path);
+
+        // Transitioning freeze_pose false -> true must snap prev_xform = xform for all dynamic
+        // instances and mark traffic_dirty so Motion AOV emits zero stale object optical flow.
+        host.traffic_dirty = false;
+        assert!(!host.step_dynamic(0.05, 0.20, cam_eye, true, true));
+        assert!(host.crowd_frozen);
+        assert!(
+            host.traffic_dirty,
+            "freeze_pose false -> true transition must schedule zero-motion upload"
+        );
+        host.scene
+            .as_mut()
+            .expect("scene")
+            .world
+            .pack_visible(&cam_view, &mut host.packed);
+        for (inst, prev) in host
+            .packed
+            .instances_slice()
+            .iter()
+            .zip(host.packed.motion_prev_xforms_slice())
+        {
+            if (inst.flags & inst_flags::DYNAMIC) != 0 {
+                assert_eq!(
+                    inst.xform, *prev,
+                    "frozen dynamic instance must have zero object optical flow (prev_xform == xform)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn soa_city_traffic_detected_and_stepped_by_host() {
+        let mut host = CsgGpuHost::new();
+        let osm_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "gundo_osm")
+            .expect("gundo_osm registered");
+        let module = host
+            .registry
+            .get_by_index(osm_idx)
+            .expect("gundo_osm module");
+        let built = module.build(&SceneBuildConfig::default());
+        assert!(
+            built.traffic.actors.is_empty() && built.traffic.soa_vehicle_count() > 0,
+            "gundo_osm must exercise TrafficStateSoA (actors empty, soa_vehicle_count > 0)"
+        );
+        let vp = built.viewpoints[0].clone();
+        let cam_eye = [vp.eye.x, vp.eye.y, vp.eye.z];
+
+        host.scene_key = CsgSceneKey {
+            scene_idx: (osm_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 1,
+            road_mode: 2,
+        };
+        host.active_reg_idx = Some(osm_idx);
+        host.scene = Some(built);
+
+        assert!(
+            host.has_traffic(),
+            "has_traffic() must detect SoA traffic even when legacy actors vec is empty"
+        );
+        let before: Vec<[f32; 12]> = host
+            .scene
+            .as_ref()
+            .expect("scene")
+            .world
+            .dynamic_instances()
+            .iter()
+            .map(|i| i.xform.0)
+            .collect();
+        assert!(
+            host.step_dynamic(0.0, 1.5, cam_eye, false, true),
+            "step_dynamic must advance SoA city traffic"
+        );
+        let moved_any = host
+            .scene
+            .as_ref()
+            .expect("scene")
+            .world
+            .dynamic_instances()
+            .iter()
+            .zip(&before)
+            .any(|(inst, prev)| inst.xform.0 != *prev);
+        assert!(moved_any, "SoA city traffic vehicles must move after step_dynamic");
     }
 }

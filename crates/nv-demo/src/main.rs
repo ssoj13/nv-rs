@@ -22,12 +22,12 @@ mod ui;
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use demo_app::{DemoApp, enable_rmb_fly};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 mod demo_app {
@@ -1295,7 +1295,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut surface_config = surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
                 .expect("surface default config");
-            surface_config.present_mode = wgpu::PresentMode::AutoVsync;
+            surface_config.present_mode = wgpu::PresentMode::Fifo;
             let caps = surface.get_capabilities(&adapter);
             let surface_supports_copy_dst = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
             if surface_supports_copy_dst {
@@ -1905,6 +1905,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut generate_random_rail_seed: Option<u64> = None;
             let mut save_png_requested = false;
             let mut save_jpeg_requested = false;
+            let mut export_sdg_json_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
             let mut pick_possess_uv: Option<(f32, f32)> = None;
@@ -1923,6 +1924,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     UiCommand::ResetAccum => reset_accum_requested = true,
                     UiCommand::SaveStill(StillFormat::Png) => save_png_requested = true,
                     UiCommand::SaveStill(StillFormat::Jpeg) => save_jpeg_requested = true,
+                    UiCommand::ExportSdgJson => export_sdg_json_requested = true,
                     UiCommand::ToggleRecord => toggle_record_requested = true,
                     UiCommand::ReloadShader => reload_shader_requested = true,
                     UiCommand::SelectScene {
@@ -1933,6 +1935,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     UiCommand::SetRoadMode(mode) => {
                         self.settings.csg_road_mode = mode.min(3);
+                        reset_accum_requested = true;
+                    }
+                    UiCommand::ToggleFreezePose => {
+                        self.settings.csg_freeze_pose = !self.settings.csg_freeze_pose;
                         reset_accum_requested = true;
                     }
                     UiCommand::GenerateRandomRail { seed } => {
@@ -2400,6 +2406,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             let mut capture_window_png = false;
             let mut capture_window_jpeg = false;
+            let mut companion_sdg_requested = false;
             if save_png_requested {
                 if self.settings.capture_source == CaptureSource::FullWindow {
                     capture_window_png = true;
@@ -2410,6 +2417,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.render_w,
                         self.render_h,
                     ));
+                }
+                if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
+                    companion_sdg_requested = true;
                 }
             }
             if save_jpeg_requested {
@@ -2425,6 +2435,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let path = dir.join(format!("nv-demo-{ts}.jpg"));
                     self.bus.send_render(RenderControl::SaveJpeg { path, quality: 92 });
                 }
+                if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
+                    companion_sdg_requested = true;
+                }
+            }
+            if (export_sdg_json_requested || companion_sdg_requested) && self.settings.csg_mode > 0 {
+                let dir = std::path::Path::new("renders");
+                let _ = std::fs::create_dir_all(dir);
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = dir.join(format!("nv-demo-sdg-{ts}.json"));
+                self.bus.send_render(RenderControl::ExportSdgJson { path });
             }
             if toggle_record_requested {
                 if let Some(active) = self.video_recorder.take() {
@@ -3573,7 +3596,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             // Waiting one frame for `shared_hdr` allocation after recording started.
                             self.video_recorder = Some(active);
                             self.interop.queue().present(frame);
-                            self.window.request_redraw();
                             return;
                         }
                     } else {
@@ -3627,6 +3649,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.update_window_geometry();
                 self.save_persisted();
             }
+        }
+
+        pub fn request_redraw(&self) {
             self.window.request_redraw();
         }
     }
@@ -3826,9 +3851,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
+/// Target UI redraw cadence (`60 Hz` = `16.667 ms`) preventing 250+ FPS GPU/CPU spin-burn.
+const UI_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+
+/// Computes the next 60 Hz UI redraw deadline without spiral-of-death catch-up bursts.
+fn compute_next_ui_tick(now: Instant, prev_deadline: Instant, interval: Duration) -> Instant {
+    let stepped = prev_deadline + interval;
+    if stepped <= now || prev_deadline > now {
+        now + interval
+    } else {
+        stepped
+    }
+}
+
 #[derive(Default)]
 struct Runner {
     app: Option<DemoApp>,
+    next_redraw_at: Option<Instant>,
 }
 
 impl ApplicationHandler for Runner {
@@ -3845,6 +3884,9 @@ impl ApplicationHandler for Runner {
             }
             let win = Arc::new(event_loop.create_window(attrs).expect("window"));
             self.app = Some(DemoApp::new(win, persisted));
+            let now = Instant::now();
+            self.next_redraw_at = Some(now);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now));
         }
     }
 
@@ -3864,9 +3906,26 @@ impl ApplicationHandler for Runner {
         } else if matches!(event, WindowEvent::Moved(_)) {
             app.update_window_geometry();
         } else if matches!(event, WindowEvent::RedrawRequested) {
+            let now = Instant::now();
             app.render();
+            let prev = self.next_redraw_at.unwrap_or(now);
+            self.next_redraw_at = Some(compute_next_ui_tick(now, prev, UI_FRAME_INTERVAL));
         }
         app.handle_window_event(&event);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(app) = self.app.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let deadline = self.next_redraw_at.unwrap_or(now);
+        if now >= deadline {
+            app.request_redraw();
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + UI_FRAME_INTERVAL));
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        }
     }
 
     fn device_event(
@@ -3888,4 +3947,27 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     let mut runner = Runner::default();
     event_loop.run_app(&mut runner).expect("run app");
+}
+
+#[cfg(test)]
+mod ui_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn compute_next_ui_tick_locks_60hz_and_avoids_catchup_bursts() {
+        let t0 = Instant::now();
+        let interval = UI_FRAME_INTERVAL;
+        // Normal on-time frame advances by one exact interval from previous deadline.
+        let on_time = t0 + Duration::from_millis(2);
+        assert_eq!(compute_next_ui_tick(on_time, t0, interval), t0 + interval);
+        // Slow frame (> 1 interval behind) resets smoothly to now + interval (no burst).
+        let late = t0 + Duration::from_millis(40);
+        assert_eq!(compute_next_ui_tick(late, t0, interval), late + interval);
+        // Early OS-triggered redraw schedules one full interval after now.
+        let future_deadline = t0 + Duration::from_millis(10);
+        assert_eq!(
+            compute_next_ui_tick(t0, future_deadline, interval),
+            t0 + interval
+        );
+    }
 }

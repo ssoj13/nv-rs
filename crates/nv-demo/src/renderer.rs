@@ -126,9 +126,12 @@ struct LaunchParams {
     probe_grid_wh: u32,
     probe_candidates: u64,
     probe_samples: u64,
+    csg_prev_xforms: u64,
+    _pad2: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 592);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 608);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_prev_xforms) == 592);
 
 /// Optical sensor projection model for primary ray generation and `Ctrl+Click` Pick-to-Possess.
 #[repr(u32)]
@@ -542,6 +545,8 @@ pub struct DemoSettings {
     pub csg_traffic_on: bool,
     /// Traffic simulation speed multiplier (`0.0..=3.0`).
     pub csg_traffic_speed: f32,
+    /// Freeze dynamic traffic & crowd poses for clean multi-spp accumulation and SDG capture.
+    pub csg_freeze_pose: bool,
     /// Keep the classic foreground fractal & stage floor visible inside CSG modes.
     pub csg_show_fractal: bool,
     /// Distance/SSE LOD detail multiplier (`0.25..=4.0`).
@@ -672,6 +677,7 @@ impl Default for DemoSettings {
             csg_wetness: 0.38,
             csg_traffic_on: true,
             csg_traffic_speed: 1.0,
+            csg_freeze_pose: false,
             csg_show_fractal: false,
             csg_lod_bias: 1.0,
             csg_road_mode: default_csg_road_mode(),
@@ -1342,11 +1348,13 @@ fn splitmix32(mut x: u32) -> f32 {
 }
 
 /// OptiX build options for the persistent top-level IAS (`ALLOW_UPDATE` enables zero-churn
-/// in-place `OPTIX_BUILD_OPERATION_UPDATE` on traffic-only frames).
+/// in-place `OPTIX_BUILD_OPERATION_UPDATE` on traffic-only frames; `compact = false` is required
+/// by `Accel::instances_into`).
 fn ias_build_opts() -> BuildOptions {
     BuildOptions {
         allow_update: true,
         prefer_fast_trace: true,
+        compact: false,
         ..Default::default()
     }
 }
@@ -1512,8 +1520,42 @@ fn initial_ptx() -> (Vec<u8>, Vec<u8>) {
 }
 
 fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> OptixRig {
+    cuda.bind_to_thread()
+        .expect("cuda bind_to_thread before init_optix");
     let stream = cuda.default_stream();
-    let optix_ctx = DeviceContext::new(cuda, None, 0, false).expect("OptiX DeviceContext");
+    let log_level = std::env::var("NV_DEMO_OPTIX_LOG_LEVEL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(3)
+        .min(4);
+    let captured_logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink_logs = Arc::clone(&captured_logs);
+    let log_sink: Box<optix::LogFn> = Box::new(move |level, tag, msg| {
+        let line = format!("[OptiX L{level} {tag}] {msg}");
+        if level <= 3 {
+            eprintln!("{line}");
+        }
+        if let Ok(mut guard) = sink_logs.lock() {
+            if guard.len() >= 64 {
+                guard.remove(0);
+            }
+            guard.push(line);
+        }
+    });
+    let optix_ctx = DeviceContext::new(cuda, Some(log_sink), log_level, false).unwrap_or_else(|e| {
+        let details = captured_logs
+            .lock()
+            .map(|g| g.join("\n"))
+            .unwrap_or_default();
+        let cache_hint = matches!(e, optix::Error::Optix { code: 7999, .. })
+            .then_some(
+                "\nHint: OPTIX_ERROR_INTERNAL_ERROR (7999) is commonly caused by a locked or corrupt \
+                 %LOCALAPPDATA%\\NVIDIA\\OptixCache database. Clear OptixCache or run with \
+                 OPTIX_CACHE_MAXSIZE=0.",
+            )
+            .unwrap_or("");
+        panic!("OptiX DeviceContext failed: {e}{cache_hint}\nOptiX log:\n{details}");
+    });
     let ser_supported = optix_ctx.shader_reordering().unwrap_or(false);
     let mut scratch = Scratch::new(&stream);
 
@@ -1679,6 +1721,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
         0.0,
+        initial_settings.csg_freeze_pose,
     ) {
         eprintln!("nv-demo: initial CSG scene sync failed: {err}");
     }
@@ -2326,6 +2369,29 @@ pub fn spawn_render_thread(
                             pending_jpeg = Some((path.clone(), *quality));
                             accum_count = accum_count.min(settings.max_accum.saturating_sub(1));
                         }
+                        RenderControl::ExportSdgJson { path } => {
+                            match rig.csg_host.export_sdg_json(
+                                path,
+                                &last_rendered_camera,
+                                settings.camera_projection,
+                                cur_w,
+                                cur_h,
+                                frame_index,
+                                traffic_time,
+                            ) {
+                                Ok(actor_count) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Saved SDG JSON ({actor_count} actors) -> {}",
+                                        path.display()
+                                    )));
+                                }
+                                Err(e) => {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "SDG JSON export failed: {e}"
+                                    )));
+                                }
+                            }
+                        }
                         RenderControl::SetRecording {
                             active,
                             fixed_fps,
@@ -2665,13 +2731,18 @@ pub fn spawn_render_thread(
                             .is_some_and(|&(_, _, _, idx, cnt)| idx + 1 >= cnt)
                             && free_bufs.is_empty()));
 
-                let csg_traffic_moving = rig.csg_host.has_traffic()
+                let csg_traffic_moving = !settings.csg_freeze_pose
+                    && rig.csg_host.has_traffic()
                     && settings.csg_traffic_on
                     && settings.csg_traffic_speed > 0.001;
+                let csg_crowd_moving = !settings.csg_freeze_pose
+                    && rig.csg_host.has_crowd()
+                    && settings.csg_traffic_speed > 0.001;
+                let csg_dynamic_moving = csg_traffic_moving || csg_crowd_moving;
                 let converged = !in_shutter_mode
                     && !settings.auto_rotate
                     && !(settings.sat_on && settings.sat_orbit && settings.sat_count > 0)
-                    && !csg_traffic_moving
+                    && !csg_dynamic_moving
                     && possess_blend_rem <= 0.0
                     && !rec_active
                     && pending_jpeg.is_none()
@@ -2725,8 +2796,13 @@ pub fn spawn_render_thread(
                 };
 
                 let preserve_shutter_accum = shutter_sub_idx.is_some_and(|idx| idx > 0);
-                let csg_traffic_moving =
-                    rig.csg_host.has_traffic() && settings.csg_traffic_on && settings.csg_traffic_speed > 0.001;
+                let csg_traffic_moving = !settings.csg_freeze_pose
+                    && rig.csg_host.has_traffic()
+                    && settings.csg_traffic_on
+                    && settings.csg_traffic_speed > 0.001;
+                let csg_crowd_moving = !settings.csg_freeze_pose
+                    && rig.csg_host.has_crowd()
+                    && settings.csg_traffic_speed > 0.001;
                 if settings.auto_rotate {
                     spin_angle += dt * settings.spin_speed;
                     if !preserve_shutter_accum {
@@ -2739,12 +2815,27 @@ pub fn spawn_render_thread(
                         accum_count = 0;
                     }
                 }
-                if csg_traffic_moving {
-                    traffic_time += dt * settings.csg_traffic_speed;
-                    rig.csg_host.step_traffic(traffic_time);
-                    if !preserve_shutter_accum {
+                if csg_traffic_moving || csg_crowd_moving {
+                    let dyn_dt = dt * settings.csg_traffic_speed;
+                    traffic_time += dyn_dt;
+                    let moved = rig.csg_host.step_dynamic(
+                        if csg_crowd_moving { dyn_dt } else { 0.0 },
+                        traffic_time,
+                        last_rendered_camera.eye,
+                        false,
+                        csg_traffic_moving,
+                    );
+                    if moved && !preserve_shutter_accum {
                         accum_count = 0;
                     }
+                } else {
+                    let _ = rig.csg_host.step_dynamic(
+                        0.0,
+                        traffic_time,
+                        last_rendered_camera.eye,
+                        settings.csg_freeze_pose,
+                        false,
+                    );
                 }
 
                 // Resolve live possessed camera mount AFTER dynamic traffic advances so the
@@ -2812,6 +2903,7 @@ pub fn spawn_render_thread(
                         omnidirectional: settings.camera_projection.is_omnidirectional(),
                     },
                     traffic_time,
+                    settings.csg_freeze_pose,
                 ) {
                     Ok(sync_res) => sync_res,
                     Err(e) => {
@@ -3226,6 +3318,8 @@ pub fn spawn_render_thread(
                     probe_grid_wh: 0,
                     probe_candidates: 0,
                     probe_samples: 0,
+                    csg_prev_xforms: csg_ptrs.prev_xforms,
+                    _pad2: 0,
                 };
                 if publish_frame {
                     prev_camera = active_camera;
@@ -3649,8 +3743,16 @@ mod tests {
     }
 
     #[test]
+    fn ias_build_opts_enables_update_and_disables_compaction() {
+        let opts = ias_build_opts();
+        assert!(opts.allow_update, "persistent IAS requires allow_update = true");
+        assert!(!opts.compact, "Accel::instances_into requires compact = false");
+        assert!(opts.prefer_fast_trace);
+    }
+
+    #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 592);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 608);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -3661,6 +3763,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LaunchParams, probe_grid_wh), 572);
         assert_eq!(std::mem::offset_of!(LaunchParams, probe_candidates), 576);
         assert_eq!(std::mem::offset_of!(LaunchParams, probe_samples), 584);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_prev_xforms), 592);
+        assert_eq!(std::mem::offset_of!(LaunchParams, _pad2), 600);
         assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);
     }
 

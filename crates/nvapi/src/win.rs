@@ -5,7 +5,8 @@
 //! **Why.** Isolates Windows-only `nvapi-sys` calls behind `#[cfg(windows)]` so the rest of the
 //! crate compiles and runs T0 tests cleanly on any OS.
 //! **How.** Every versioned NVAPI struct is zero-initialized on the stack with its `version`
-//! field set via [`make_version`]; enumeration loops terminate on `NVAPI_END_ENUMERATION`.
+//! field set from the `*_VER*` constants below (mirrors of the `nvapi.h` macros, built with
+//! [`make_version`]); enumeration loops terminate on `NVAPI_END_ENUMERATION`.
 //! **Used by** [`crate::NvApi`] and its wrapper handles.
 
 use std::ffi::c_char;
@@ -20,6 +21,47 @@ use crate::types::{
     PerfDecreaseReasons, ThermalSensor, VrrInfo, decode_short_string, decode_utf16_z,
     encode_utf16_z, make_version,
 };
+
+// Struct versions, mirroring the `nvapi.h` macros `MAKE_NVAPI_VERSION(<revision struct>, n)`.
+// Each is built from the explicit revision struct, not the unversioned typedef.
+/// `NV_GPU_UUID_VER1` (`nvapi.h:4639`).
+const NV_GPU_UUID_VER1: u32 = make_version::<sys::NV_GPU_UUID_V1>(1);
+/// `NV_GPU_ARCH_INFO_VER_2` (`nvapi.h:2917`).
+const NV_GPU_ARCH_INFO_VER_2: u32 = make_version::<sys::NV_GPU_ARCH_INFO_V2>(2);
+/// `NV_GPU_MEMORY_INFO_EX_VER_1` (`nvapi_lite_common.h:567`).
+const NV_GPU_MEMORY_INFO_EX_VER_1: u32 = make_version::<sys::NV_GPU_MEMORY_INFO_EX_V1>(1);
+/// `NV_GPU_THERMAL_SETTINGS_VER_2` (`nvapi.h:5410`).
+const NV_GPU_THERMAL_SETTINGS_VER_2: u32 = make_version::<sys::NV_GPU_THERMAL_SETTINGS_V2>(2);
+/// `NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER` (`nvapi.h:5293`, unversioned struct).
+const NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER: u32 =
+    make_version::<sys::NV_GPU_DYNAMIC_PSTATES_INFO_EX>(1);
+/// `NV_GPU_CLOCK_FREQUENCIES_VER_3` (`nvapi.h:5504`): version 3 reuses the `_V2` struct.
+const NV_GPU_CLOCK_FREQUENCIES_VER_3: u32 = make_version::<sys::NV_GPU_CLOCK_FREQUENCIES_V2>(3);
+/// `NV_HDR_CAPABILITIES_VER3` (`nvapi.h:8111`).
+const NV_HDR_CAPABILITIES_VER3: u32 = make_version::<sys::NV_HDR_CAPABILITIES_V3>(3);
+/// `NV_GET_VRR_INFO_VER1` (`nvapi.h:9710`).
+const NV_GET_VRR_INFO_VER1: u32 = make_version::<sys::NV_GET_VRR_INFO_V1>(1);
+/// `NV_GSYNC_CAPABILITIES_VER3` (`nvapi.h:10838`).
+const NV_GSYNC_CAPABILITIES_VER3: u32 = make_version::<sys::NV_GSYNC_CAPABILITIES_V3>(3);
+/// `NV_GSYNC_STATUS_VER` (`nvapi.h:11181`, unversioned struct).
+const NV_GSYNC_STATUS_VER: u32 = make_version::<sys::NV_GSYNC_STATUS>(1);
+/// `NVDRS_PROFILE_VER1` (`nvapi.h:24718`).
+const NVDRS_PROFILE_VER1: u32 = make_version::<sys::NVDRS_PROFILE_V1>(1);
+
+// The call sites fill the unversioned typedefs. Pin each typedef to the revision its version
+// constant was built from: an SDK that retypedefs one to a newer revision fails to compile here
+// instead of returning `NVAPI_INCOMPATIBLE_STRUCT_VERSION` at run time.
+const _: fn(sys::NV_GPU_UUID) -> sys::NV_GPU_UUID_V1 = std::convert::identity;
+const _: fn(sys::NV_GPU_ARCH_INFO) -> sys::NV_GPU_ARCH_INFO_V2 = std::convert::identity;
+const _: fn(sys::NV_GPU_MEMORY_INFO_EX) -> sys::NV_GPU_MEMORY_INFO_EX_V1 = std::convert::identity;
+const _: fn(sys::NV_GPU_THERMAL_SETTINGS) -> sys::NV_GPU_THERMAL_SETTINGS_V2 =
+    std::convert::identity;
+const _: fn(sys::NV_GPU_CLOCK_FREQUENCIES) -> sys::NV_GPU_CLOCK_FREQUENCIES_V2 =
+    std::convert::identity;
+const _: fn(sys::NV_HDR_CAPABILITIES) -> sys::NV_HDR_CAPABILITIES_V3 = std::convert::identity;
+const _: fn(sys::NV_GET_VRR_INFO) -> sys::NV_GET_VRR_INFO_V1 = std::convert::identity;
+const _: fn(sys::NV_GSYNC_CAPABILITIES) -> sys::NV_GSYNC_CAPABILITIES_V3 = std::convert::identity;
+const _: fn(sys::NVDRS_PROFILE) -> sys::NVDRS_PROFILE_V1 = std::convert::identity;
 
 #[derive(Debug)]
 pub(crate) struct NvApiSession;
@@ -184,7 +226,7 @@ impl PhysicalGpu {
         let mut raw = MaybeUninit::<sys::NV_GPU_UUID>::zeroed();
         // SAFETY: `raw` is zeroed and its `version` field is set to `NV_GPU_UUID_VER1`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GPU_UUID>(1);
+            (*raw.as_mut_ptr()).version = NV_GPU_UUID_VER1;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a properly versioned `NV_GPU_UUID`.
         let code = unsafe { sys::NvAPI_GPU_GetUUID(self.handle, raw.as_mut_ptr()) };
@@ -238,7 +280,7 @@ impl PhysicalGpu {
         let mut raw = MaybeUninit::<sys::NV_GPU_ARCH_INFO>::zeroed();
         // SAFETY: `raw` is zeroed and its `version` field is set to `NV_GPU_ARCH_INFO_VER_2`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GPU_ARCH_INFO>(2);
+            (*raw.as_mut_ptr()).version = NV_GPU_ARCH_INFO_VER_2;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GPU_ARCH_INFO`.
         let code = unsafe { sys::NvAPI_GPU_GetArchInfo(self.handle, raw.as_mut_ptr()) };
@@ -276,7 +318,7 @@ impl PhysicalGpu {
         let mut raw = MaybeUninit::<sys::NV_GPU_MEMORY_INFO_EX>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GPU_MEMORY_INFO_EX_VER_1`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GPU_MEMORY_INFO_EX>(1);
+            (*raw.as_mut_ptr()).version = NV_GPU_MEMORY_INFO_EX_VER_1;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GPU_MEMORY_INFO_EX`.
         let code = unsafe { sys::NvAPI_GPU_GetMemoryInfoEx(self.handle, raw.as_mut_ptr()) };
@@ -296,7 +338,7 @@ impl PhysicalGpu {
         let mut raw = MaybeUninit::<sys::NV_GPU_THERMAL_SETTINGS>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GPU_THERMAL_SETTINGS_VER_2`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GPU_THERMAL_SETTINGS>(2);
+            (*raw.as_mut_ptr()).version = NV_GPU_THERMAL_SETTINGS_VER_2;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GPU_THERMAL_SETTINGS`.
         let code = unsafe {
@@ -342,7 +384,7 @@ impl PhysicalGpu {
         let mut raw = MaybeUninit::<sys::NV_GPU_DYNAMIC_PSTATES_INFO_EX>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GPU_DYNAMIC_PSTATES_INFO_EX>(1);
+            (*raw.as_mut_ptr()).version = NV_GPU_DYNAMIC_PSTATES_INFO_EX_VER;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GPU_DYNAMIC_PSTATES_INFO_EX`.
         let code = unsafe { sys::NvAPI_GPU_GetDynamicPstatesInfoEx(self.handle, raw.as_mut_ptr()) };
@@ -378,7 +420,7 @@ impl PhysicalGpu {
         // SAFETY: `raw` is zeroed; we initialize `version` (V3) and `ClockType` before the call.
         unsafe {
             let ptr = raw.as_mut_ptr();
-            (*ptr).version = make_version::<sys::NV_GPU_CLOCK_FREQUENCIES>(3);
+            (*ptr).version = NV_GPU_CLOCK_FREQUENCIES_VER_3;
             (*ptr).set_ClockType(clock_type as u32);
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GPU_CLOCK_FREQUENCIES`.
@@ -483,7 +525,7 @@ impl Display {
         let mut raw = MaybeUninit::<sys::NV_HDR_CAPABILITIES>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_HDR_CAPABILITIES_VER3`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_HDR_CAPABILITIES>(3);
+            (*raw.as_mut_ptr()).version = NV_HDR_CAPABILITIES_VER3;
         }
         // SAFETY: `display_id` is valid and `raw` points to a versioned `NV_HDR_CAPABILITIES`.
         let code = unsafe { sys::NvAPI_Disp_GetHdrCapabilities(display_id, raw.as_mut_ptr()) };
@@ -509,7 +551,7 @@ impl Display {
         let mut raw = MaybeUninit::<sys::NV_GET_VRR_INFO>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GET_VRR_INFO_VER1`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GET_VRR_INFO>(1);
+            (*raw.as_mut_ptr()).version = NV_GET_VRR_INFO_VER1;
         }
         // SAFETY: `display_id` is valid and `raw` points to a versioned `NV_GET_VRR_INFO`.
         let code = unsafe { sys::NvAPI_Disp_GetVRRInfo(display_id, raw.as_mut_ptr()) };
@@ -543,7 +585,7 @@ impl GSyncDevice {
         let mut raw = MaybeUninit::<sys::NV_GSYNC_CAPABILITIES>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GSYNC_CAPABILITIES_VER3`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GSYNC_CAPABILITIES>(3);
+            (*raw.as_mut_ptr()).version = NV_GSYNC_CAPABILITIES_VER3;
         }
         // SAFETY: `self.handle` is valid and `raw` points to a versioned `NV_GSYNC_CAPABILITIES`.
         let code = unsafe { sys::NvAPI_GSync_QueryCapabilities(self.handle, raw.as_mut_ptr()) };
@@ -561,7 +603,7 @@ impl GSyncDevice {
         let mut raw = MaybeUninit::<sys::NV_GSYNC_STATUS>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NV_GSYNC_STATUS_VER`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NV_GSYNC_STATUS>(1);
+            (*raw.as_mut_ptr()).version = NV_GSYNC_STATUS_VER;
         }
         // SAFETY: `self.handle` and `gpu.handle` are valid; `raw` is a versioned `NV_GSYNC_STATUS`.
         let code =
@@ -659,7 +701,7 @@ impl DrsSession {
         let mut raw = MaybeUninit::<sys::NVDRS_PROFILE>::zeroed();
         // SAFETY: `raw` is zeroed and `version` is set to `NVDRS_PROFILE_VER1`.
         unsafe {
-            (*raw.as_mut_ptr()).version = make_version::<sys::NVDRS_PROFILE>(1);
+            (*raw.as_mut_ptr()).version = NVDRS_PROFILE_VER1;
         }
         // SAFETY: `self.handle` and `profile` are valid; `raw` is a versioned `NVDRS_PROFILE`.
         let code = unsafe { sys::NvAPI_DRS_GetProfileInfo(self.handle, profile, raw.as_mut_ptr()) };

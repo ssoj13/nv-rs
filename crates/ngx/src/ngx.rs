@@ -12,8 +12,10 @@
 //!   `Shutdown1`, `CreateFeature` / `EvaluateFeature_C` / `ReleaseFeature`).
 //!
 //! **Conventions.** Every native handle owns its NGX object, holds an `Arc` of the parent
-//! [`NgxVulkan`] session, and releases it on `Drop`. Targets without the NGX SDK compile clean
-//! stubs returning [`Error::Unsupported`].
+//! [`NgxVulkan`] session, and releases it on `Drop`; teardown failures are kept for
+//! [`take_teardown_error`]. NGX is documented as not thread-safe (`nvsdk_ngx.h:18-19`,
+//! `nvsdk_ngx_vk.h:16-17`), so every NGX entry point runs under one process-wide lock. Targets
+//! without the NGX SDK compile clean stubs returning [`Error::Unsupported`].
 //! **Used by** renderers, upscalers, and NGX GPU smoke tests.
 
 pub mod error;
@@ -28,8 +30,8 @@ pub use types::{
     DlssRoughnessMode, DlssRrPreset, Feature, Guid, ProjectId, RequiredExtensions,
 };
 pub use vulkan::{
-    DlssOptimalSettings, DlssRrCreateParams, DlssRrEvalParams, FeatureHandle, NgxVulkan,
-    VkImageResourceInfo, VulkanDeviceHandles,
+    DlssOptimalSettings, DlssRrAvailability, DlssRrCreateParams, DlssRrEvalParams, FeatureHandle,
+    NgxVulkan, VkImageResourceInfo, VulkanDeviceHandles,
 };
 
 #[cfg(has_ngx_sdk)]
@@ -41,6 +43,93 @@ pub use ngx_sys as sys;
 #[inline(always)]
 pub(crate) fn check_sys(call: &'static str, rc: sys::NVSDK_NGX_Result) -> Result<()> {
     error::check(call, i32::from_ne_bytes(rc.to_ne_bytes()))
+}
+
+/// Process-wide NGX state, owned by the lock that serialises every NGX entry point.
+///
+/// The lock is global rather than per session because NGX state is process-global and the
+/// header contract ("Methods in this library are NOT thread safe. It is up to the client to
+/// ensure that thread safety is enforced as needed", `nvsdk_ngx_vk.h:16-17`) also covers the
+/// session-less [`NgxVulkan::required_extensions`] and sessions on different `VkDevice`s.
+#[cfg(has_ngx_sdk)]
+pub(crate) struct NgxGlobal {
+    /// `VkDevice` addresses that currently own a live [`NgxVulkan`] session.
+    live_devices: Vec<usize>,
+    /// Most recent teardown failure not yet taken by [`take_teardown_error`].
+    teardown_error: Option<Error>,
+}
+
+#[cfg(has_ngx_sdk)]
+static NGX_GLOBAL: std::sync::Mutex<NgxGlobal> = std::sync::Mutex::new(NgxGlobal {
+    live_devices: Vec::new(),
+    teardown_error: None,
+});
+
+#[cfg(has_ngx_sdk)]
+impl NgxGlobal {
+    /// Reserves `device` for a new session.
+    ///
+    /// `NVSDK_NGX_VULKAN_Shutdown1(device)` shuts down the instance for that device
+    /// (`nvsdk_ngx_vk.h:270-272`), so a second live session on the same device would have NGX
+    /// shut down underneath its features when the first session drops.
+    pub(crate) fn claim_device(&mut self, device: usize) -> Result<()> {
+        if self.live_devices.contains(&device) {
+            return Err(Error::InvalidArgument(
+                "NGX is already initialized on this VkDevice; clone the existing NgxVulkan",
+            ));
+        }
+        self.live_devices.push(device);
+        Ok(())
+    }
+
+    /// Releases a device reserved by [`NgxGlobal::claim_device`].
+    pub(crate) fn release_device(&mut self, device: usize) {
+        self.live_devices.retain(|&d| d != device);
+    }
+
+    /// Keeps a failed teardown status from a `Drop` impl for [`take_teardown_error`].
+    pub(crate) fn record_teardown(&mut self, call: &'static str, rc: sys::NVSDK_NGX_Result) {
+        if let Err(e) = check_sys(call, rc) {
+            self.teardown_error = Some(e);
+        }
+    }
+}
+
+/// Runs `f` while holding the process-wide NGX lock, with access to the shared NGX state.
+///
+/// Callers must not re-enter (`f` must not call another `ngx_*` helper or drop an NGX handle):
+/// the lock is not reentrant.
+#[cfg(has_ngx_sdk)]
+pub(crate) fn ngx_locked<R>(f: impl FnOnce(&mut NgxGlobal) -> R) -> R {
+    // Every update of `NgxGlobal` is a single push/retain/assignment, so a panic in another
+    // holder cannot leave it inconsistent; recover the guard instead of propagating the poison.
+    let mut guard = NGX_GLOBAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut guard)
+}
+
+/// Runs one NGX entry point (`f`) while holding the process-wide NGX lock.
+#[cfg(has_ngx_sdk)]
+pub(crate) fn ngx_call<R>(f: impl FnOnce() -> R) -> R {
+    ngx_locked(|_| f())
+}
+
+/// Takes the most recent failure reported by a teardown call that ran in `Drop`
+/// (`NVSDK_NGX_VULKAN_DestroyParameters`, `NVSDK_NGX_VULKAN_ReleaseFeature`,
+/// `NVSDK_NGX_VULKAN_Shutdown1`) and clears it.
+///
+/// `Drop` cannot return an error, so the status is kept here instead of being discarded. Always
+/// `None` on targets without the NGX SDK.
+pub fn take_teardown_error() -> Option<Error> {
+    #[cfg(has_ngx_sdk)]
+    {
+        ngx_locked(|g| g.teardown_error.take())
+    }
+    #[cfg(not(has_ngx_sdk))]
+    {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -174,10 +263,11 @@ mod tests {
         assert!(msg.contains("FeatureNotSupported"), "unexpected: {msg}");
         assert!(msg.contains("0xBAD00001"), "unexpected: {msg}");
 
-        let unknown = ResultCode(-42);
+        // 0xBAD000FF: in the failure class (`NVSDK_NGX_FAILED`) but not a named code.
+        let unknown = ResultCode(-1_160_773_377);
         assert_eq!(unknown.name(), None);
         assert!(!unknown.is_success());
-        assert!(unknown.to_string().contains("-42"));
+        assert!(unknown.to_string().contains("-1160773377"));
     }
 
     #[cfg(has_ngx_sdk)]
@@ -370,6 +460,104 @@ mod tests {
         assert_eq!(params::keys::GBUFFER_ROUGHNESS, "GBuffer.Roughness");
         assert_eq!(params::keys::WORLD_TO_VIEW_MATRIX, "WorldToViewMatrix");
         assert_eq!(params::keys::VIEW_TO_CLIP_MATRIX, "ViewToClipMatrix");
+    }
+
+    /// `nvsdk_ngx_defs_dlssd.h:152-155`.
+    #[test]
+    fn dlss_rr_availability_keys_match_sdk_defs() {
+        assert_eq!(
+            params::keys::RAY_RECONSTRUCTION_NEEDS_UPDATED_DRIVER,
+            "SuperSamplingDenoising.NeedsUpdatedDriver"
+        );
+        assert_eq!(
+            params::keys::RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MAJOR,
+            "SuperSamplingDenoising.MinDriverVersionMajor"
+        );
+        assert_eq!(
+            params::keys::RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MINOR,
+            "SuperSamplingDenoising.MinDriverVersionMinor"
+        );
+        assert_eq!(
+            params::keys::RAY_RECONSTRUCTION_FEATURE_INIT_RESULT,
+            "SuperSamplingDenoising.FeatureInitResult"
+        );
+    }
+
+    /// The session handle stays shareable across threads (nv-demo, nv-py) because every NGX entry
+    /// point is serialised by the process-wide lock rather than by thread confinement.
+    #[test]
+    fn ngx_vulkan_remains_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NgxVulkan>();
+    }
+
+    #[cfg(has_ngx_sdk)]
+    #[test]
+    fn ngx_call_serialises_concurrent_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inside = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..50 {
+                        crate::ngx_call(|| {
+                            let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::yield_now();
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(has_ngx_sdk)]
+    #[test]
+    fn second_session_on_same_device_is_rejected() {
+        // Fake addresses never handed to NGX; unique to this test.
+        let (dev_a, dev_b) = (0xDEAD_0000_usize, 0xDEAD_0040_usize);
+        crate::ngx_locked(|g| {
+            assert!(g.claim_device(dev_a).is_ok());
+            assert!(matches!(
+                g.claim_device(dev_a),
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(g.claim_device(dev_b).is_ok());
+            g.release_device(dev_a);
+            assert!(g.claim_device(dev_a).is_ok());
+            g.release_device(dev_a);
+            g.release_device(dev_b);
+        });
+    }
+
+    #[cfg(has_ngx_sdk)]
+    #[test]
+    fn teardown_failure_is_recorded_not_dropped() {
+        take_teardown_error();
+        crate::ngx_locked(|g| {
+            g.record_teardown(
+                "NVSDK_NGX_VULKAN_ReleaseFeature",
+                sys::NVSDK_NGX_Result_NVSDK_NGX_Result_Success,
+            );
+        });
+        assert!(take_teardown_error().is_none());
+        crate::ngx_locked(|g| {
+            g.record_teardown(
+                "NVSDK_NGX_VULKAN_ReleaseFeature",
+                sys::NVSDK_NGX_Result_NVSDK_NGX_Result_FAIL_OutOfDate,
+            );
+        });
+        match take_teardown_error() {
+            Some(Error::Ngx { call, code }) => {
+                assert_eq!(call, "NVSDK_NGX_VULKAN_ReleaseFeature");
+                assert_eq!(code, ResultCode::OUT_OF_DATE);
+            }
+            other => panic!("expected recorded teardown error, got {other:?}"),
+        }
+        assert!(take_teardown_error().is_none());
     }
 
     #[cfg(has_ngx_sdk)]

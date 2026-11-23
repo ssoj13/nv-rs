@@ -17,6 +17,10 @@ pub const NGX_RESULT_SUCCESS: i32 = 1;
 /// Base failure code (`NVSDK_NGX_Result_Fail = 0xBAD00000`).
 const NGX_RESULT_FAIL_BASE: i32 = -1_160_773_632;
 
+/// Bits that classify a result as failure (`NVSDK_NGX_SUCCEED` / `NVSDK_NGX_FAILED`,
+/// `nvsdk_ngx_defs.h:183-184`: `(value & 0xFFF00000) == NVSDK_NGX_Result_Fail`).
+const NGX_RESULT_CLASS_MASK: u32 = 0xFFF0_0000;
+
 /// Raw `NVSDK_NGX_Result` code wrapped as a `Copy` integer newtype.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -31,9 +35,13 @@ impl ResultCode {
         self.0
     }
 
-    /// Returns `true` when the code equals `NVSDK_NGX_Result_Success` (`1`).
+    /// Returns `true` unless the code is in the `NVSDK_NGX_Result_Fail` (`0xBAD00000`) class.
+    ///
+    /// Mirrors the SDK predicate `NVSDK_NGX_SUCCEED` (`nvsdk_ngx_defs.h:183`), which the official
+    /// helpers use on every call (`NVSDK_NGX_FAILED`, `nvsdk_ngx_helpers.h:97`): any code outside
+    /// the failure class counts as success, not only `NVSDK_NGX_Result_Success` (`1`).
     pub const fn is_success(self) -> bool {
-        self.0 == NGX_RESULT_SUCCESS
+        (self.0 as u32 & NGX_RESULT_CLASS_MASK) != NGX_RESULT_FAIL_BASE as u32
     }
 
     /// Returns the symbolic NGX result name if known.
@@ -123,5 +131,39 @@ pub fn check(call: &'static str, raw: i32) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Ngx { call, code })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `NVSDK_NGX_SUCCEED(v) ((v & 0xFFF00000) != NVSDK_NGX_Result_Fail)` (`nvsdk_ngx_defs.h:183`).
+    fn sdk_succeed(v: u32) -> bool {
+        (v & 0xFFF0_0000) != 0xBAD0_0000
+    }
+
+    #[test]
+    fn result_success_matches_sdk_mask_predicate() {
+        for raw in [
+            1u32,
+            2,
+            0,
+            0x7FFF_FFFF,
+            0xBACF_FFFF,
+            0xBAE0_0000,
+            0xBAD0_0000,
+            0xBAD0_0001,
+            0xBAD0_0012,
+            0xBAD0_00FF,
+            0xBADF_FFFF,
+        ] {
+            let code = ResultCode(raw as i32);
+            assert_eq!(code.is_success(), sdk_succeed(raw), "code 0x{raw:08X}");
+            assert_eq!(check("c", raw as i32).is_ok(), sdk_succeed(raw));
+        }
+        // A non-`1` code outside the failure class is success per the SDK, not an error.
+        assert!(ResultCode(2).is_success());
+        assert!(!ResultCode::OUT_OF_DATE.is_success());
     }
 }

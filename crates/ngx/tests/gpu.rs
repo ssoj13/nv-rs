@@ -4,8 +4,9 @@
 //! driver / NGX runtime is present on Windows.
 //! **Why.** Verifies end-to-end static linking and runtime NGX core discovery without requiring a
 //! full swapchain/render-pass harness.
-//! **How.** Marked `#[ignore]` per PLAN.md T2 policy; gracefully skips if `NVSDK_NGX_Result_FAIL_NotImplemented`
-//! or `PlatformError` is returned when no NGX runtime DLL is installed.
+//! **How.** Marked `#[ignore]` per PLAN.md T2 policy. Skips only when the build has no NGX SDK
+//! (`Error::Unsupported`); any NGX status failure, including a missing runtime DLL, fails the test
+//! so a broken driver install is not reported as a pass.
 
 #[test]
 #[ignore = "T2 GPU test: requires NVIDIA driver and NGX runtime"]

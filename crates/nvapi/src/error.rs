@@ -6,7 +6,7 @@
 //! **Why.** Preserves unknown status codes from newer drivers while providing ergonomic
 //! classification (`is_not_supported`, `is_end_enumeration`, `is_profile_not_found`) and
 //! `NvAPI_GetErrorMessage` formatting on Windows.
-//! **How.** [`check`] maps any non-`NVAPI_OK` status into [`Error::Status`].
+//! **How.** `check` (Windows only) maps any non-`NVAPI_OK` status into [`Error::Status`].
 //! **Used by** [`crate::NvApi`] and all Windows query modules.
 
 use std::fmt;
@@ -158,8 +158,8 @@ pub enum Error {
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Maps a raw `NvAPI_Status` (`i32`) to [`Result<()>`].
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Maps a raw `NvAPI_Status` (`i32`) to [`Result<()>`]. Windows only: every caller is in `win.rs`.
+#[cfg(windows)]
 #[inline]
 pub(crate) fn check(call: &'static str, code: i32) -> Result<()> {
     let status = Status(code);

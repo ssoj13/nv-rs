@@ -344,7 +344,8 @@ impl DlssFeatureFlags {
     pub const MV_JITTERED: Self = Self(4);
     /// Reverse-Z depth buffer (`1 << 3`).
     pub const DEPTH_INVERTED: Self = Self(8);
-    /// Enable sharpening pass (`1 << 5`).
+    /// Enable sharpening pass (`1 << 5`). Deprecated by the SDK and ignored by current DLSS
+    /// (`nvsdk_ngx_defs.h:296`: "Sharpness is not supported").
     pub const DO_SHARPENING: Self = Self(32);
     /// Enable auto-exposure (`1 << 6`).
     pub const AUTO_EXPOSURE: Self = Self(64);

@@ -43,6 +43,20 @@ pub mod keys {
     pub const SUPER_SAMPLING_AVAILABLE: &str = "SuperSampling.Available";
     /// Ray-reconstruction availability flag (`"SuperSamplingDenoising.Available"`).
     pub const RAY_RECONSTRUCTION_AVAILABLE: &str = "SuperSamplingDenoising.Available";
+    /// Ray-reconstruction driver-update flag (`"SuperSamplingDenoising.NeedsUpdatedDriver"`).
+    pub const RAY_RECONSTRUCTION_NEEDS_UPDATED_DRIVER: &str =
+        "SuperSamplingDenoising.NeedsUpdatedDriver";
+    /// Ray-reconstruction minimum driver major version
+    /// (`"SuperSamplingDenoising.MinDriverVersionMajor"`).
+    pub const RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MAJOR: &str =
+        "SuperSamplingDenoising.MinDriverVersionMajor";
+    /// Ray-reconstruction minimum driver minor version
+    /// (`"SuperSamplingDenoising.MinDriverVersionMinor"`).
+    pub const RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MINOR: &str =
+        "SuperSamplingDenoising.MinDriverVersionMinor";
+    /// Ray-reconstruction feature initialization result (`"SuperSamplingDenoising.FeatureInitResult"`).
+    pub const RAY_RECONSTRUCTION_FEATURE_INIT_RESULT: &str =
+        "SuperSamplingDenoising.FeatureInitResult";
     /// Ray-reconstruction optimal-settings callback pointer (`"DLSSDOptimalSettingsCallback"`).
     pub const DLSSD_OPTIMAL_SETTINGS_CALLBACK: &str = "DLSSDOptimalSettingsCallback";
     /// Ray-reconstruction denoise mode (`"DLSS.Denoise.Mode"`).
@@ -147,9 +161,13 @@ pub struct Parameters {
 impl Drop for Parameters {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: `self.ptr` was allocated by `NVSDK_NGX_VULKAN_AllocateParameters` or
-            // `GetCapabilityParameters` and `_session` keeps the NGX Vulkan device alive.
-            let _ = unsafe { ngx_sys::NVSDK_NGX_VULKAN_DestroyParameters(self.ptr) };
+            let ptr = self.ptr;
+            crate::ngx_locked(|g| {
+                // SAFETY: `ptr` was allocated by `NVSDK_NGX_VULKAN_AllocateParameters` or
+                // `GetCapabilityParameters` and `_session` keeps the NGX Vulkan device alive.
+                let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_DestroyParameters(ptr) };
+                g.record_teardown("NVSDK_NGX_VULKAN_DestroyParameters", rc);
+            });
             self.ptr = std::ptr::null_mut();
         }
     }
@@ -505,6 +523,9 @@ impl Parameters {
 }
 
 /// Invokes `f` with a NUL-terminated C string for `name` without heap allocation for short keys.
+///
+/// `f` runs under the process-wide NGX lock ([`crate::ngx_call`]) because every caller passes the
+/// string straight to an `NVSDK_NGX_Parameter_*` entry point.
 #[cfg(has_ngx_sdk)]
 pub(crate) fn with_cstr<R>(name: &str, f: impl FnOnce(*const c_char) -> R) -> Result<R> {
     let bytes = name.as_bytes();
@@ -517,9 +538,9 @@ pub(crate) fn with_cstr<R>(name: &str, f: impl FnOnce(*const c_char) -> R) -> Re
         let mut buf = [0u8; 128];
         buf[..bytes.len()].copy_from_slice(bytes);
         buf[bytes.len()] = 0;
-        return Ok(f(buf.as_ptr().cast::<c_char>()));
+        return Ok(crate::ngx_call(|| f(buf.as_ptr().cast::<c_char>())));
     }
     let owned = CString::new(name)
         .map_err(|_| Error::InvalidArgument("parameter name contains interior NUL"))?;
-    Ok(f(owned.as_ptr()))
+    Ok(crate::ngx_call(|| f(owned.as_ptr())))
 }

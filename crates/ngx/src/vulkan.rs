@@ -8,10 +8,11 @@
 //! [`Parameters`] and [`FeatureHandle`] holds a reference to the session so `Shutdown1` never
 //! runs while features or parameter bags are still alive.
 //! **How.** NGX FFI calls live behind `#[cfg(has_ngx_sdk)]` (Windows and Linux x86_64 when the
-//! NGX SDK is present); targets without the SDK compile clean stubs returning [`Error::Unsupported`].
+//! NGX SDK is present) and run under the process-wide NGX lock ([`crate::ngx_call`]); targets
+//! without the SDK compile clean stubs returning [`Error::Unsupported`].
 //! **Used by** `ngx` consumers (renderers / upscalers) and T2 GPU smoke tests.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultCode};
 use crate::params::{Parameters, keys};
 use crate::types::{
     DlssDepthType, DlssFeatureFlags, DlssPerfQuality, DlssRoughnessMode, DlssRrPreset, Feature,
@@ -22,8 +23,6 @@ use std::path::Path;
 
 #[cfg(has_ngx_sdk)]
 use crate::check_sys;
-#[cfg(has_ngx_sdk)]
-use crate::error::ResultCode;
 #[cfg(has_ngx_sdk)]
 use crate::types::DlssDenoiseMode;
 #[cfg(has_ngx_sdk)]
@@ -89,6 +88,18 @@ impl VkImageResourceInfo {
         Ok(())
     }
 
+    /// Validates the `Output` resource: non-null handles and `read_write = true`, without which
+    /// NGX fails the evaluation with `NVSDK_NGX_Result_FAIL_RWFlagMissing` (`nvsdk_ngx_defs.h:140-143`).
+    fn validate_output(&self) -> Result<()> {
+        self.validate("output")?;
+        if !self.read_write {
+            return Err(Error::InvalidArgument(
+                "output VkImageResourceInfo must have read_write = true",
+            ));
+        }
+        Ok(())
+    }
+
     fn into_ngx_resource(self, aspect_mask: u32) -> ngx_sys::NVSDK_NGX_Resource_VK {
         ngx_sys::NVSDK_NGX_Resource_VK {
             Resource: ngx_sys::NVSDK_NGX_Resource_VK__bindgen_ty_1 {
@@ -113,6 +124,60 @@ impl VkImageResourceInfo {
     }
 }
 
+/// Rejects a render subrect (`DLSS.Render.Subrect.Dimensions`) larger than the `Color` input it
+/// is read from.
+#[cfg(has_ngx_sdk)]
+fn validate_render_extent(
+    color: &VkImageResourceInfo,
+    render_width: u32,
+    render_height: u32,
+) -> Result<()> {
+    if render_width > color.width || render_height > color.height {
+        return Err(Error::InvalidArgument(
+            "render subrect must fit inside the color input extent",
+        ));
+    }
+    Ok(())
+}
+
+/// Overwrites resource pointer keys with null after an evaluation.
+///
+/// The `*_with_params` evaluators point these keys at stack locals that die when they return;
+/// clearing them keeps a reused bag from carrying dangling pointers into a later raw
+/// [`FeatureHandle::evaluate`].
+#[cfg(has_ngx_sdk)]
+fn clear_pointer_keys(params: &mut Parameters, names: &[&str]) -> Result<()> {
+    for name in names {
+        // SAFETY: null is the value the evaluators already pass for absent optional inputs
+        // (`GBuffer.Roughness`, matrices); nothing dereferences it.
+        unsafe { params.set_void_ptr(name, std::ptr::null_mut())? };
+    }
+    Ok(())
+}
+
+/// Maps a capability `Get` that failed with an NGX status (key not published by this runtime) to
+/// `None`; other errors propagate.
+#[cfg(has_ngx_sdk)]
+fn published<T>(res: Result<T>) -> Result<Option<T>> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(Error::Ngx { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Allocates a parameter bag owned by `session` (`NVSDK_NGX_VULKAN_AllocateParameters`).
+#[cfg(has_ngx_sdk)]
+fn allocate_session_parameters(session: &Arc<VulkanSession>) -> Result<Parameters> {
+    let mut ptr: *mut ngx_sys::NVSDK_NGX_Parameter = std::ptr::null_mut();
+    let rc = crate::ngx_call(|| {
+        // SAFETY: `session` keeps the NGX Vulkan session active and `ptr` is writable.
+        unsafe { ngx_sys::NVSDK_NGX_VULKAN_AllocateParameters(&mut ptr) }
+    });
+    check_sys("NVSDK_NGX_VULKAN_AllocateParameters", rc)?;
+    Parameters::from_raw(ptr, Arc::clone(session))
+}
+
 /// Returns `VK_IMAGE_ASPECT_DEPTH_BIT` (`2`) for Vulkan depth/stencil formats (`124..=130`) and
 /// `VK_IMAGE_ASPECT_COLOR_BIT` (`1`) for linear color formats such as `R32_SFLOAT` (`100`).
 #[cfg(has_ngx_sdk)]
@@ -128,22 +193,44 @@ fn depth_aspect_mask(format: u32) -> u32 {
 
 /// Optimal render dimensions and sharpness returned by `NGX_DLSS_GET_OPTIMAL_SETTINGS` and
 /// `NGX_DLSSD_GET_OPTIMAL_SETTINGS`.
+///
+/// The dynamic min/max fields follow the SDK helper (`nvsdk_ngx_helpers.h:103-111`): runtimes
+/// that do not publish the `DLSS.Get.Dynamic.*` keys report the optimal size, so
+/// `min == max == optimal` means "no dynamic range reported", not necessarily "unsupported".
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DlssOptimalSettings {
     /// Recommended render width in pixels.
     pub render_width: u32,
     /// Recommended render height in pixels.
     pub render_height: u32,
-    /// Minimum dynamic render width in pixels.
+    /// Minimum dynamic render width in pixels (`render_width` when the runtime reports none).
     pub min_width: u32,
-    /// Minimum dynamic render height in pixels.
+    /// Minimum dynamic render height in pixels (`render_height` when the runtime reports none).
     pub min_height: u32,
-    /// Maximum dynamic render width in pixels.
+    /// Maximum dynamic render width in pixels (`render_width` when the runtime reports none).
     pub max_width: u32,
-    /// Maximum dynamic render height in pixels.
+    /// Maximum dynamic render height in pixels (`render_height` when the runtime reports none).
     pub max_height: u32,
-    /// Recommended sharpening factor.
+    /// Sharpening factor reported by the runtime, `0.0` when it reports none. DLSS no longer
+    /// supports sharpening (`nvsdk_ngx_defs.h:296`), so this is informational only.
     pub sharpness: f32,
+}
+
+/// DLSS Ray Reconstruction availability read from the capability parameters
+/// (`SuperSamplingDenoising.*`, `nvsdk_ngx_defs_dlssd.h:151-155`).
+///
+/// A field is `None` when the runtime does not publish that key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DlssRrAvailability {
+    /// `SuperSamplingDenoising.Available` is non-zero (`false` when the key is not published).
+    pub available: bool,
+    /// `SuperSamplingDenoising.NeedsUpdatedDriver`: the installed driver is too old for RR.
+    pub needs_updated_driver: Option<bool>,
+    /// Minimum driver version `(major, minor)` RR requires
+    /// (`SuperSamplingDenoising.MinDriverVersionMajor` / `.MinDriverVersionMinor`).
+    pub min_driver_version: Option<(u32, u32)>,
+    /// `SuperSamplingDenoising.FeatureInitResult`: the runtime's feature initialization status.
+    pub feature_init_result: Option<ResultCode>,
 }
 
 /// Creation configuration for [`NgxVulkan::create_dlss_rr`] (`NVSDK_NGX_DLSSD_Create_Params`).
@@ -270,12 +357,15 @@ pub(crate) struct VulkanSession {
     device: ngx_sys::VkDevice,
 }
 
-// SAFETY: `VulkanSession` only stores the `VkDevice` handle for `NVSDK_NGX_VULKAN_Shutdown1`
-// on the final `Arc::drop`, which is synchronized by `Arc`'s atomic reference count.
+// SAFETY: NGX is not thread-safe (`nvsdk_ngx_vk.h:16-17`: "It is up to the client to ensure that
+// thread safety is enforced as needed"). `VulkanSession` only stores the opaque `VkDevice` handle,
+// and every NGX call made through any session, parameter bag or feature, including the final
+// `Shutdown1` in `Drop`, runs under the process-wide `crate::ngx_call` / `crate::ngx_locked`
+// lock, so moving the session to another thread cannot produce concurrent NGX calls.
 #[cfg(has_ngx_sdk)]
 unsafe impl Send for VulkanSession {}
-// SAFETY: `VulkanSession` exposes no interior mutability; `Shutdown1` runs exclusively on
-// last `Arc::drop`.
+// SAFETY: `VulkanSession` has no interior mutability, and every NGX call reachable through a
+// shared reference is serialised by the process-wide NGX lock (see the `Send` impl above).
 #[cfg(has_ngx_sdk)]
 unsafe impl Sync for VulkanSession {}
 
@@ -283,10 +373,15 @@ unsafe impl Sync for VulkanSession {}
 impl Drop for VulkanSession {
     fn drop(&mut self) {
         if !self.device.is_null() {
-            // SAFETY: `self.device` was initialized by `NVSDK_NGX_VULKAN_Init_with_ProjectID`
-            // and all `FeatureHandle` / `Parameters` children hold `Arc<VulkanSession>`, so this
-            // runs only after every child has been dropped.
-            let _ = unsafe { ngx_sys::NVSDK_NGX_VULKAN_Shutdown1(self.device) };
+            let device = self.device;
+            crate::ngx_locked(|g| {
+                // SAFETY: `device` was initialized by `NVSDK_NGX_VULKAN_Init*` and all
+                // `FeatureHandle` / `Parameters` children hold `Arc<VulkanSession>`, so this runs
+                // only after every child has been dropped.
+                let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_Shutdown1(device) };
+                g.record_teardown("NVSDK_NGX_VULKAN_Shutdown1", rc);
+                g.release_device(device.addr());
+            });
             self.device = std::ptr::null_mut();
         }
     }
@@ -295,7 +390,15 @@ impl Drop for VulkanSession {
 /// RAII handle to an initialized NGX Vulkan session.
 ///
 /// Cloning [`NgxVulkan`] shares the underlying `Arc` session; `NVSDK_NGX_VULKAN_Shutdown1` runs
-/// once when the last [`NgxVulkan`], [`Parameters`], and [`FeatureHandle`] are dropped.
+/// once when the last [`NgxVulkan`], [`Parameters`], and [`FeatureHandle`] are dropped. Only one
+/// session per `VkDevice` may be live at a time; share it by cloning.
+///
+/// The session may be shared across threads: every NGX call is serialised by a process-wide lock
+/// because NGX itself is not thread-safe.
+///
+/// Drop the last handle only after the GPU has finished every command buffer recorded with this
+/// session (for example after `vkDeviceWaitIdle` or a fence wait): `Shutdown1` and
+/// `ReleaseFeature` free NGX resources immediately (`nvsdk_ngx_vk.h:548-551`).
 #[derive(Clone)]
 pub struct NgxVulkan {
     #[cfg(has_ngx_sdk)]
@@ -305,6 +408,11 @@ pub struct NgxVulkan {
 impl NgxVulkan {
     /// Queries the Vulkan instance and device extensions required by NGX
     /// (`NVSDK_NGX_VULKAN_RequiredExtensions`).
+    ///
+    /// The SDK marks this query deprecated in favour of the per-feature
+    /// `NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements` /
+    /// `NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements` (`nvsdk_ngx_vk.h:87-96`), which
+    /// are not wrapped yet.
     pub fn required_extensions() -> Result<RequiredExtensions> {
         #[cfg(has_ngx_sdk)]
         {
@@ -312,15 +420,17 @@ impl NgxVulkan {
             let mut inst_exts: *mut *const std::os::raw::c_char = std::ptr::null_mut();
             let mut dev_count: u32 = 0;
             let mut dev_exts: *mut *const std::os::raw::c_char = std::ptr::null_mut();
-            // SAFETY: Output pointers are valid stack locals.
-            let rc = unsafe {
-                ngx_sys::NVSDK_NGX_VULKAN_RequiredExtensions(
-                    &mut inst_count,
-                    &mut inst_exts,
-                    &mut dev_count,
-                    &mut dev_exts,
-                )
-            };
+            let rc = crate::ngx_call(|| {
+                // SAFETY: Output pointers are valid stack locals.
+                unsafe {
+                    ngx_sys::NVSDK_NGX_VULKAN_RequiredExtensions(
+                        &mut inst_count,
+                        &mut inst_exts,
+                        &mut dev_count,
+                        &mut dev_exts,
+                    )
+                }
+            });
             check_sys("NVSDK_NGX_VULKAN_RequiredExtensions", rc)?;
             Ok(RequiredExtensions {
                 // SAFETY: NGX populates `inst_exts` with `inst_count` valid C strings.
@@ -338,6 +448,9 @@ impl NgxVulkan {
     }
 
     /// Initializes NGX on a Vulkan device using `NVSDK_NGX_VULKAN_Init_with_ProjectID` (PLAN D13).
+    ///
+    /// Returns [`Error::InvalidArgument`] while another [`NgxVulkan`] session for the same
+    /// `VkDevice` is alive; clone that session instead.
     ///
     /// # Safety
     ///
@@ -395,7 +508,7 @@ impl NgxVulkan {
     /// (`NVSDK_NGX_VULKAN_Init`).
     ///
     /// Prefer [`NgxVulkan::init`] with a [`ProjectId`] when no NVIDIA-issued application ID is
-    /// required.
+    /// required. Like [`NgxVulkan::init`], rejects a second live session on the same `VkDevice`.
     ///
     /// # Safety
     ///
@@ -447,11 +560,7 @@ impl NgxVulkan {
     pub fn allocate_parameters(&self) -> Result<Parameters> {
         #[cfg(has_ngx_sdk)]
         {
-            let mut ptr: *mut ngx_sys::NVSDK_NGX_Parameter = std::ptr::null_mut();
-            // SAFETY: NGX Vulkan session is active (`self.session`) and `ptr` is writable.
-            let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_AllocateParameters(&mut ptr) };
-            check_sys("NVSDK_NGX_VULKAN_AllocateParameters", rc)?;
-            Parameters::from_raw(ptr, Arc::clone(&self.session))
+            allocate_session_parameters(&self.session)
         }
         #[cfg(not(has_ngx_sdk))]
         {
@@ -466,8 +575,10 @@ impl NgxVulkan {
         #[cfg(has_ngx_sdk)]
         {
             let mut ptr: *mut ngx_sys::NVSDK_NGX_Parameter = std::ptr::null_mut();
-            // SAFETY: NGX Vulkan session is active (`self.session`) and `ptr` is writable.
-            let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut ptr) };
+            let rc = crate::ngx_call(|| {
+                // SAFETY: NGX Vulkan session is active (`self.session`) and `ptr` is writable.
+                unsafe { ngx_sys::NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut ptr) }
+            });
             check_sys("NVSDK_NGX_VULKAN_GetCapabilityParameters", rc)?;
             Parameters::from_raw(ptr, Arc::clone(&self.session))
         }
@@ -484,14 +595,16 @@ impl NgxVulkan {
         #[cfg(has_ngx_sdk)]
         {
             let mut size = 0usize;
-            // SAFETY: `params.as_ptr()` is a valid `NVSDK_NGX_Parameter` and `size` is writable.
-            let rc = unsafe {
-                ngx_sys::NVSDK_NGX_VULKAN_GetScratchBufferSize(
-                    ngx_sys::NVSDK_NGX_Feature::from_ne_bytes(feature.to_raw().to_ne_bytes()),
-                    params.as_ptr(),
-                    &mut size,
-                )
-            };
+            let rc = crate::ngx_call(|| {
+                // SAFETY: `params.as_ptr()` is a valid `NVSDK_NGX_Parameter` and `size` is writable.
+                unsafe {
+                    ngx_sys::NVSDK_NGX_VULKAN_GetScratchBufferSize(
+                        ngx_sys::NVSDK_NGX_Feature::from_ne_bytes(feature.to_raw().to_ne_bytes()),
+                        params.as_ptr(),
+                        &mut size,
+                    )
+                }
+            });
             check_sys("NVSDK_NGX_VULKAN_GetScratchBufferSize", rc)?;
             Ok(size)
         }
@@ -523,16 +636,19 @@ impl NgxVulkan {
             }
             let mut handle: *mut ngx_sys::NVSDK_NGX_Handle = std::ptr::null_mut();
             let vk_cmd = cmd_buffer.cast::<ngx_sys::VkCommandBuffer_T>();
-            // SAFETY: Caller guarantees `vk_cmd` is a valid recording `VkCommandBuffer`;
-            // `params.as_mut_ptr()` and `handle` are valid.
-            let rc = unsafe {
-                ngx_sys::NVSDK_NGX_VULKAN_CreateFeature(
-                    vk_cmd,
-                    ngx_sys::NVSDK_NGX_Feature::from_ne_bytes(feature.to_raw().to_ne_bytes()),
-                    params.as_mut_ptr(),
-                    &mut handle,
-                )
-            };
+            let params_ptr = params.as_mut_ptr();
+            let rc = crate::ngx_call(|| {
+                // SAFETY: Caller guarantees `vk_cmd` is a valid recording `VkCommandBuffer`;
+                // `params_ptr` and `handle` are valid.
+                unsafe {
+                    ngx_sys::NVSDK_NGX_VULKAN_CreateFeature(
+                        vk_cmd,
+                        ngx_sys::NVSDK_NGX_Feature::from_ne_bytes(feature.to_raw().to_ne_bytes()),
+                        params_ptr,
+                        &mut handle,
+                    )
+                }
+            });
             check_sys("NVSDK_NGX_VULKAN_CreateFeature", rc)?;
             if handle.is_null() {
                 return Err(Error::InvalidArgument("NGX returned null NVSDK_NGX_Handle"));
@@ -552,16 +668,37 @@ impl NgxVulkan {
     }
 
     /// Queries whether DLSS Ray Reconstruction (`SuperSamplingDenoising.Available`) is available
-    /// on this device and runtime.
+    /// on this device and runtime. See [`NgxVulkan::dlss_rr_availability`] for the reason when it
+    /// is not.
     pub fn is_dlss_rr_available(&self) -> Result<bool> {
+        Ok(self.dlss_rr_availability()?.available)
+    }
+
+    /// Queries DLSS Ray Reconstruction availability together with the reasons the runtime
+    /// publishes when it is unavailable (driver too old, minimum driver version, feature
+    /// initialization result).
+    pub fn dlss_rr_availability(&self) -> Result<DlssRrAvailability> {
         #[cfg(has_ngx_sdk)]
         {
             let params = self.capability_parameters()?;
-            match params.get_i32(keys::RAY_RECONSTRUCTION_AVAILABLE) {
-                Ok(avail) => Ok(avail != 0),
-                Err(Error::Ngx { .. }) => Ok(false),
-                Err(e) => Err(e),
-            }
+            let available = published(params.get_i32(keys::RAY_RECONSTRUCTION_AVAILABLE))?
+                .is_some_and(|v| v != 0);
+            let needs_updated_driver =
+                published(params.get_i32(keys::RAY_RECONSTRUCTION_NEEDS_UPDATED_DRIVER))?
+                    .map(|v| v != 0);
+            let min_major =
+                published(params.get_u32(keys::RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MAJOR))?;
+            let min_minor =
+                published(params.get_u32(keys::RAY_RECONSTRUCTION_MIN_DRIVER_VERSION_MINOR))?;
+            let feature_init_result =
+                published(params.get_i32(keys::RAY_RECONSTRUCTION_FEATURE_INIT_RESULT))?
+                    .map(ResultCode);
+            Ok(DlssRrAvailability {
+                available,
+                needs_updated_driver,
+                min_driver_version: min_major.zip(min_minor),
+                feature_init_result,
+            })
         }
         #[cfg(not(has_ngx_sdk))]
         {
@@ -600,10 +737,15 @@ impl NgxVulkan {
             let callback: unsafe extern "C" fn(
                 *mut ngx_sys::NVSDK_NGX_Parameter,
             ) -> ngx_sys::NVSDK_NGX_Result = unsafe { std::mem::transmute(cb_ptr) };
-            // SAFETY: `params.as_mut_ptr()` is a valid capability `NVSDK_NGX_Parameter` bag.
-            let rc = unsafe { callback(params.as_mut_ptr()) };
+            let params_ptr = params.as_mut_ptr();
+            let rc = crate::ngx_call(|| {
+                // SAFETY: `params_ptr` is a valid capability `NVSDK_NGX_Parameter` bag.
+                unsafe { callback(params_ptr) }
+            });
             check_sys(call_name, rc)?;
 
+            // A runtime that does not publish the dynamic-resolution keys reports the optimal
+            // size, exactly as the SDK helper does (`nvsdk_ngx_helpers.h:103-111`).
             let render_width = params.get_u32(keys::OUT_WIDTH)?;
             let render_height = params.get_u32(keys::OUT_HEIGHT)?;
             let max_width = params
@@ -680,7 +822,10 @@ impl NgxVulkan {
     ///
     /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` belonging to the `VkDevice` used
     /// to initialize this [`NgxVulkan`] session.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the NGX_VULKAN_CREATE_DLSS_EXT helper arguments"
+    )]
     pub unsafe fn create_dlss_sr(
         &self,
         cmd_buffer: *mut c_void,
@@ -764,7 +909,10 @@ impl NgxVulkan {
 
 /// RAII handle to a created NGX feature (`NVSDK_NGX_Handle`).
 ///
-/// Released automatically on [`Drop`] via `NVSDK_NGX_VULKAN_ReleaseFeature`.
+/// Released automatically on [`Drop`] via `NVSDK_NGX_VULKAN_ReleaseFeature`, which frees the
+/// feature's memory immediately (`nvsdk_ngx_vk.h:548-551`): drop it only after the GPU has
+/// finished every command buffer recorded by its `evaluate*` calls. A failed release is kept for
+/// [`crate::take_teardown_error`].
 pub struct FeatureHandle {
     #[cfg(has_ngx_sdk)]
     handle: *mut ngx_sys::NVSDK_NGX_Handle,
@@ -776,9 +924,13 @@ pub struct FeatureHandle {
 impl Drop for FeatureHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // SAFETY: `self.handle` was created by `NVSDK_NGX_VULKAN_CreateFeature` and
-            // `_session` keeps the NGX Vulkan device alive.
-            let _ = unsafe { ngx_sys::NVSDK_NGX_VULKAN_ReleaseFeature(self.handle) };
+            let handle = self.handle;
+            crate::ngx_locked(|g| {
+                // SAFETY: `handle` was created by `NVSDK_NGX_VULKAN_CreateFeature` and `_session`
+                // keeps the NGX Vulkan device alive.
+                let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_ReleaseFeature(handle) };
+                g.record_teardown("NVSDK_NGX_VULKAN_ReleaseFeature", rc);
+            });
             self.handle = std::ptr::null_mut();
         }
     }
@@ -798,16 +950,18 @@ impl FeatureHandle {
                 return Err(Error::InvalidArgument("cmd_buffer must not be null"));
             }
             let vk_cmd = cmd_buffer.cast::<ngx_sys::VkCommandBuffer_T>();
-            // SAFETY: `self.handle` and `params.as_ptr()` are valid; caller guarantees `vk_cmd`
-            // and referenced GPU resources are valid.
-            let rc = unsafe {
-                ngx_sys::NVSDK_NGX_VULKAN_EvaluateFeature_C(
-                    vk_cmd,
-                    self.handle,
-                    params.as_ptr(),
-                    None,
-                )
-            };
+            let rc = crate::ngx_call(|| {
+                // SAFETY: `self.handle` and `params.as_ptr()` are valid; caller guarantees
+                // `vk_cmd` and referenced GPU resources are valid.
+                unsafe {
+                    ngx_sys::NVSDK_NGX_VULKAN_EvaluateFeature_C(
+                        vk_cmd,
+                        self.handle,
+                        params.as_ptr(),
+                        None,
+                    )
+                }
+            });
             check_sys("NVSDK_NGX_VULKAN_EvaluateFeature_C", rc)
         }
         #[cfg(not(has_ngx_sdk))]
@@ -827,7 +981,16 @@ impl FeatureHandle {
     /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` and all `VkImage` / `VkImageView`
     /// handles in `color`, `depth`, `motion`, and `output` must remain valid until GPU execution
     /// completes.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `output` must have `read_write = true` and the render subrect must fit inside `color`;
+    /// otherwise this returns [`Error::InvalidArgument`]. `sharpness` is forwarded as `Sharpness`
+    /// like the SDK helper (`nvsdk_ngx_helpers_vk.h:178`), but current DLSS ignores it
+    /// (`nvsdk_ngx_defs.h:296`: "Sharpness is not supported"). The resource keys are reset to null
+    /// before returning, so `params` never keeps pointers to this call's stack.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the NGX_VULKAN_EVALUATE_DLSS_EXT helper arguments"
+    )]
     pub unsafe fn evaluate_dlss_sr_with_params(
         &self,
         cmd_buffer: *mut c_void,
@@ -853,7 +1016,8 @@ impl FeatureHandle {
             color.validate("color")?;
             depth.validate("depth")?;
             motion.validate("motion")?;
-            output.validate("output")?;
+            output.validate_output()?;
+            validate_render_extent(&color, render_width, render_height)?;
 
             let depth_aspect = depth_aspect_mask(depth.format);
             let mut color_res = color.into_ngx_resource(1);
@@ -861,7 +1025,8 @@ impl FeatureHandle {
             let mut motion_res = motion.into_ngx_resource(1);
             let mut output_res = output.into_ngx_resource(1);
 
-            // SAFETY: Each stack resource outlives `self.evaluate(cmd_buffer, params)`.
+            // SAFETY: Each stack resource outlives `self.evaluate(cmd_buffer, params)`, and
+            // `clear_pointer_keys` nulls the keys before they go out of scope.
             unsafe {
                 params.set_void_ptr(keys::COLOR, (&raw mut color_res).cast())?;
                 params.set_void_ptr(keys::OUTPUT, (&raw mut output_res).cast())?;
@@ -886,7 +1051,12 @@ impl FeatureHandle {
             params.set_f32(keys::DLSS_EXPOSURE_SCALE, 1.0)?;
 
             // SAFETY: Caller guarantees `cmd_buffer` and referenced GPU resources are valid.
-            unsafe { self.evaluate(cmd_buffer, params) }
+            let eval_res = unsafe { self.evaluate(cmd_buffer, params) };
+            let clear_res = clear_pointer_keys(
+                params,
+                &[keys::COLOR, keys::OUTPUT, keys::DEPTH, keys::MOTION_VECTORS],
+            );
+            eval_res.and(clear_res)
         }
         #[cfg(not(has_ngx_sdk))]
         {
@@ -919,7 +1089,10 @@ impl FeatureHandle {
     /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` and all `VkImage` / `VkImageView`
     /// handles in `color`, `depth`, `motion`, and `output` must remain valid until GPU execution
     /// completes.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the NGX_VULKAN_EVALUATE_DLSS_EXT helper arguments"
+    )]
     pub unsafe fn evaluate_dlss_sr(
         &self,
         cmd_buffer: *mut c_void,
@@ -938,11 +1111,7 @@ impl FeatureHandle {
     ) -> Result<()> {
         #[cfg(has_ngx_sdk)]
         {
-            let mut param_ptr: *mut ngx_sys::NVSDK_NGX_Parameter = std::ptr::null_mut();
-            // SAFETY: `_session` keeps the NGX Vulkan device alive and `param_ptr` is writable.
-            let rc = unsafe { ngx_sys::NVSDK_NGX_VULKAN_AllocateParameters(&mut param_ptr) };
-            check_sys("NVSDK_NGX_VULKAN_AllocateParameters", rc)?;
-            let mut params = Parameters::from_raw(param_ptr, Arc::clone(&self._session))?;
+            let mut params = allocate_session_parameters(&self._session)?;
 
             // SAFETY: Caller guarantees `cmd_buffer` and referenced GPU resources are valid.
             unsafe {
@@ -994,6 +1163,11 @@ impl FeatureHandle {
     ///
     /// `cmd_buffer` must be a valid, recording `VkCommandBuffer` and all `VkImage` / `VkImageView`
     /// handles in `eval` must remain valid until GPU execution completes.
+    ///
+    /// `eval.output` must have `read_write = true` and the render subrect must fit inside
+    /// `eval.color`; otherwise this returns [`Error::InvalidArgument`]. The resource and matrix
+    /// keys are reset to null before returning, so `params` never keeps pointers to this call's
+    /// stack.
     pub unsafe fn evaluate_dlss_rr_with_params(
         &self,
         cmd_buffer: *mut c_void,
@@ -1014,7 +1188,8 @@ impl FeatureHandle {
             if let Some(roughness) = eval.roughness {
                 roughness.validate("roughness")?;
             }
-            eval.output.validate("output")?;
+            eval.output.validate_output()?;
+            validate_render_extent(&eval.color, eval.render_width, eval.render_height)?;
 
             let mut color_res = eval.color.into_ngx_resource(1);
             let mut depth_res = eval
@@ -1039,15 +1214,22 @@ impl FeatureHandle {
                 .as_mut()
                 .map_or(std::ptr::null_mut(), |m| m.as_mut_ptr().cast());
 
-            // SAFETY: Every stack resource and optional matrix outlives `self.evaluate(cmd_buffer, params)`.
+            // SAFETY: Every stack resource and optional matrix outlives
+            // `self.evaluate(cmd_buffer, params)`, and `clear_pointer_keys` nulls the keys before
+            // they go out of scope.
             unsafe {
                 params.set_void_ptr(keys::COLOR, (&raw mut color_res).cast())?;
                 params.set_void_ptr(keys::OUTPUT, (&raw mut output_res).cast())?;
                 params.set_void_ptr(keys::DEPTH, (&raw mut depth_res).cast())?;
                 params.set_void_ptr(keys::MOTION_VECTORS, (&raw mut motion_res).cast())?;
-                params.set_void_ptr(keys::DLSS_INPUT_DIFFUSE_ALBEDO, (&raw mut diffuse_res).cast())?;
-                params
-                    .set_void_ptr(keys::DLSS_INPUT_SPECULAR_ALBEDO, (&raw mut specular_res).cast())?;
+                params.set_void_ptr(
+                    keys::DLSS_INPUT_DIFFUSE_ALBEDO,
+                    (&raw mut diffuse_res).cast(),
+                )?;
+                params.set_void_ptr(
+                    keys::DLSS_INPUT_SPECULAR_ALBEDO,
+                    (&raw mut specular_res).cast(),
+                )?;
                 params.set_void_ptr(keys::GBUFFER_NORMALS, (&raw mut normals_res).cast())?;
                 params.set_void_ptr(keys::GBUFFER_ROUGHNESS, roughness_ptr)?;
                 params.set_void_ptr(keys::WORLD_TO_VIEW_MATRIX, w2v_ptr)?;
@@ -1092,7 +1274,23 @@ impl FeatureHandle {
             )?;
 
             // SAFETY: Caller guarantees `cmd_buffer` and referenced GPU resources are valid.
-            unsafe { self.evaluate(cmd_buffer, params) }
+            let eval_res = unsafe { self.evaluate(cmd_buffer, params) };
+            let clear_res = clear_pointer_keys(
+                params,
+                &[
+                    keys::COLOR,
+                    keys::OUTPUT,
+                    keys::DEPTH,
+                    keys::MOTION_VECTORS,
+                    keys::DLSS_INPUT_DIFFUSE_ALBEDO,
+                    keys::DLSS_INPUT_SPECULAR_ALBEDO,
+                    keys::GBUFFER_NORMALS,
+                    keys::GBUFFER_ROUGHNESS,
+                    keys::WORLD_TO_VIEW_MATRIX,
+                    keys::VIEW_TO_CLIP_MATRIX,
+                ],
+            );
+            eval_res.and(clear_res)
         }
         #[cfg(not(has_ngx_sdk))]
         {
@@ -1138,8 +1336,9 @@ pub(crate) fn to_wchar_nul(path: &Path) -> Vec<NgxWchar> {
     }
 }
 
-/// Validates `handles`, encodes `app_data_path` as NUL-terminated `wchar_t`, invokes `init_fn`,
-/// and wraps the resulting `VkDevice` in an RAII [`NgxVulkan`] session.
+/// Validates `handles`, encodes `app_data_path` as NUL-terminated `wchar_t`, invokes `init_fn`
+/// under the NGX lock, and wraps the resulting `VkDevice` in an RAII [`NgxVulkan`] session.
+/// Returns [`Error::InvalidArgument`] if a session for the same `VkDevice` is still alive.
 ///
 /// # Safety
 ///
@@ -1187,8 +1386,15 @@ unsafe fn init_vulkan_session(
         },
     };
 
-    let rc = init_fn(wide_path.as_ptr(), &prepared);
-    check_sys(call_name, rc)?;
+    let device_addr = prepared.device.addr();
+    crate::ngx_locked(|g| -> Result<()> {
+        g.claim_device(device_addr)?;
+        let res = check_sys(call_name, init_fn(wide_path.as_ptr(), &prepared));
+        if res.is_err() {
+            g.release_device(device_addr);
+        }
+        res
+    })?;
     Ok(NgxVulkan {
         session: Arc::new(VulkanSession {
             device: prepared.device,
@@ -1214,4 +1420,65 @@ unsafe fn read_cstr_array(ptr: *mut *const std::os::raw::c_char, count: u32) -> 
         // SAFETY: Each non-null element is a NUL-terminated C string owned by NGX.
         .map(|&p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
         .collect()
+}
+
+#[cfg(all(test, has_ngx_sdk))]
+mod tests {
+    use super::*;
+
+    fn fake_image(width: u32, height: u32, read_write: bool) -> VkImageResourceInfo {
+        // Non-null placeholders: these tests only exercise host-side validation, never NGX.
+        VkImageResourceInfo {
+            image_view: std::ptr::dangling_mut::<u8>().cast(),
+            image: std::ptr::dangling_mut::<u8>().cast(),
+            format: 97,
+            width,
+            height,
+            read_write,
+        }
+    }
+
+    #[test]
+    fn output_without_read_write_is_rejected_before_ngx() {
+        assert!(matches!(
+            fake_image(1920, 1080, false).validate_output(),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(fake_image(1920, 1080, true).validate_output().is_ok());
+        let null_output = VkImageResourceInfo {
+            image_view: std::ptr::null_mut(),
+            ..fake_image(1920, 1080, true)
+        };
+        assert!(matches!(
+            null_output.validate_output(),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn render_subrect_larger_than_color_is_rejected() {
+        let color = fake_image(960, 540, false);
+        assert!(validate_render_extent(&color, 960, 540).is_ok());
+        assert!(validate_render_extent(&color, 640, 360).is_ok());
+        assert!(matches!(
+            validate_render_extent(&color, 961, 540),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate_render_extent(&color, 960, 541),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn unpublished_capability_key_maps_to_none_only_for_ngx_status() {
+        assert_eq!(published(Ok(7_i32)).ok(), Some(Some(7)));
+        let missing: Result<i32> = Err(Error::Ngx {
+            call: "NVSDK_NGX_Parameter_GetI",
+            code: ResultCode::OUT_OF_DATE,
+        });
+        assert!(matches!(published(missing), Ok(None)));
+        let invalid: Result<i32> = Err(Error::InvalidArgument("x"));
+        assert!(matches!(published(invalid), Err(Error::InvalidArgument(_))));
+    }
 }

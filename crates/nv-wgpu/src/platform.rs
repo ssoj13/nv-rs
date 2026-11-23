@@ -1,17 +1,23 @@
-//! Shared internal helpers for Vulkan/DX12 handles, usage mapping, and barriers.
+//! Shared internal helpers for Vulkan/DX12 handles, usage mapping, and raw command submission.
 //!
 //! Why: `buffer`, `texture`, and `sync` all need identical Vulkan memory-type
 //! selection, `wgpu::*Usages -> *Uses` conversion, Win32 `HANDLE` / POSIX `fd`
-//! RAII ownership across CUDA import boundaries, and queue-family ownership
-//! barriers. Centralizing them here removes duplication across modules.
+//! RAII ownership across CUDA import boundaries, and a way to put raw Vulkan
+//! commands (layout / queue-family ownership barriers, NGX evaluation) on `wgpu`'s
+//! queue. Centralizing them here removes duplication across modules.
 //!
-//! Used internally by `device`, `sync`, `buffer`, and `texture`.
+//! Raw commands are recorded into a `wgpu` command encoder (`CommandEncoder::as_hal_mut`)
+//! and submitted with `wgpu::Queue::submit` ([`submit_vulkan_raw`]): `vkQueueSubmit` requires
+//! the queue to be externally synchronized, and only `wgpu-core` holds the lock that its own
+//! submits and presents take.
+//!
+//! Used internally by `device`, `sync`, `buffer`, `texture`, and the crate root.
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ash::vk;
 use cuda_core::Context;
@@ -29,6 +35,7 @@ use windows::{
 };
 
 use crate::error::{Error, Result};
+use crate::sync::InteropSemaphore;
 
 /// Guarded OS handle produced when exporting Vulkan or DX12 external objects.
 ///
@@ -100,9 +107,8 @@ impl ExportedHandle {
             // SAFETY: `raw` is a live NT handle whose backing Vulkan/D3D12 allocation
             // matches `size` and `dedicated`, and `self` (`OwnedHandle`) keeps the handle valid.
             let mem = unsafe { ExternalMemory::import(cuda_ctx, handle, size, dedicated) }?;
-            // Keep NT handle closed cleanly now that CUDA duplicated its own reference?
-            // Note: keeping `OwnedHandle` only until import returns is valid for Vulkan/DX12,
-            // and callers also keep the underlying VkDeviceMemory / ID3D12Resource alive.
+            // `cuImportExternalMemory` does not consume a Win32 handle (it takes its own
+            // reference to the object), so the exported NT handle is closed right after import.
             drop(self);
             Ok(mem)
         }
@@ -336,7 +342,15 @@ pub(crate) fn map_vk_buffer_usage(usage: wgpu::BufferUsages) -> vk::BufferUsageF
         flags |= vk::BufferUsageFlags::STORAGE_BUFFER;
     }
     if usage.contains(wgpu::BufferUsages::INDIRECT) {
-        flags |= vk::BufferUsageFlags::INDIRECT_BUFFER;
+        // wgpu-core also binds indirect buffers as storage for indirect validation
+        // (`Device::create_buffer`: INDIRECT adds STORAGE_READ_ONLY | STORAGE_READ_WRITE).
+        flags |= vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER;
+    }
+    if usage.contains(wgpu::BufferUsages::QUERY_RESOLVE) {
+        // `resolve_query_set` is `vkCmdCopyQueryPoolResults` into this buffer, which needs
+        // TRANSFER_DST (VUID-vkCmdCopyQueryPoolResults-dstBuffer-00825); wgpu-core also binds it
+        // as storage for timestamp normalization (TIMESTAMP_NORMALIZATION_BUFFER_USES).
+        flags |= vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
     }
     flags
 }
@@ -411,8 +425,6 @@ pub(crate) fn vk_layout_for_texture_uses(uses: wgpu::TextureUses) -> vk::ImageLa
     }
 }
 
-static VK_QUEUE_SUBMIT_LOCK: Mutex<()> = Mutex::new(());
-
 /// Identifies the active `wgpu::Backend` behind a `wgpu::Queue` for diagnostics.
 pub(crate) fn queue_backend_kind(queue: &wgpu::Queue) -> wgpu::Backend {
     // SAFETY: Read-only inspection of the queue's HAL backend tag without modifying state.
@@ -427,59 +439,12 @@ pub(crate) fn queue_backend_kind(queue: &wgpu::Queue) -> wgpu::Backend {
     wgpu::Backend::Noop
 }
 
-/// Resolves a dedicated Vulkan barrier `vk::Queue` `(family, index)` on `device`.
-/// Submitting ownership/layout barriers on this queue (same family as `wgpu`, distinct
-/// `VkQueue` handle) avoids `VUID-vkQueueSubmit-queue-06445` races against
-/// `wgpu::Queue::submit` / `SurfaceTexture::present` on other threads.
-pub(crate) fn resolve_vulkan_barrier_queue(
-    device: &wgpu::Device,
-    family: u32,
-    index: u32,
-) -> Result<vk::Queue> {
-    // SAFETY: Read-only lookup of a queue created alongside `device`.
-    let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
-        expected: "Vulkan",
-        found: device.adapter_info().backend,
-    })?;
-    // SAFETY: Caller guarantees `(family, index)` was created with this logical Vulkan device.
-    Ok(unsafe { hal_dev.raw_device().get_device_queue(family, index) })
-}
-
-/// Acquires `nv-wgpu`'s internal Vulkan queue-submission serializer and invokes `f`
-/// with `dedicated` if provided, otherwise the raw `vk::Queue` extracted from `queue`.
-///
-/// This prevents concurrent `VkBarrierRunner` submissions across `SharedBuffer` /
-/// `SharedTexture` instances from racing on `vkQueueSubmit` (`VUID-vkQueueSubmit-queue-06445`).
-pub(crate) fn with_barrier_vk_queue<F, R>(
-    queue: &wgpu::Queue,
-    dedicated: Option<vk::Queue>,
-    f: F,
-) -> Result<R>
-where
-    F: FnOnce(vk::Queue) -> Result<R>,
-{
-    let _guard = VK_QUEUE_SUBMIT_LOCK
-        .lock()
-        .map_err(|_| Error::InvalidHandle {
-            source_api: "VK_QUEUE_SUBMIT_LOCK mutex poisoned",
-        })?;
-    if let Some(raw_q) = dedicated {
-        return f(raw_q);
-    }
-    // SAFETY: Inspects Vulkan HAL queue handle; caller serializes against external `wgpu::Queue::submit`.
-    let hal_q = unsafe { queue.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
-        expected: "Vulkan",
-        found: queue_backend_kind(queue),
-    })?;
-    f(hal_q.as_raw())
-}
-
 /// Flushes optional staged wait and signal operations through `wgpu::Queue::submit(empty)`
 /// so `wgpu`'s pending writes flush first and `wait` executes before `signal`.
 pub(crate) fn flush_wgpu_wait_signal(
     queue: &wgpu::Queue,
-    wait: Option<(&crate::sync::InteropSemaphore, u64)>,
-    signal: Option<(&crate::sync::InteropSemaphore, u64)>,
+    wait: Option<(&InteropSemaphore, u64)>,
+    signal: Option<(&InteropSemaphore, u64)>,
 ) -> Result<()> {
     if let Some((sem, val)) = wait {
         sem.stage_wait_in_wgpu(queue, val)?;
@@ -493,311 +458,116 @@ pub(crate) fn flush_wgpu_wait_signal(
     Ok(())
 }
 
-struct BarrierSlot {
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
-}
-
-/// Reusable command-buffer + fence pool for zero-allocation steady-state Vulkan
-/// layout and `VK_QUEUE_FAMILY_EXTERNAL` ownership transitions.
+/// Records raw Vulkan commands with `record` into a fresh `wgpu` command encoder and submits it
+/// with `wgpu::Queue::submit`, with `wait` staged before and `signal` after that submission.
 ///
-/// Pre-allocates two signaled `(VkCommandBuffer, VkFence)` slots so back-to-back
-/// acquire/release barriers never reset an in-flight command buffer and never
-/// stall the CPU in `vkWaitForFences`.
-pub(crate) struct VkBarrierRunner {
-    device: ash::Device,
-    pool: vk::CommandPool,
-    slots: Mutex<Vec<BarrierSlot>>,
-    queue_family: u32,
-}
-
-impl VkBarrierRunner {
-    const INITIAL_SLOTS: usize = 2;
-
-    /// Allocates one command pool and pre-seeds reusable signaled `(cmd, fence)` slots.
-    pub(crate) fn new(device: ash::Device, queue_family: u32) -> Result<Self> {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(queue_family)
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: `device` is a live logical Vulkan device and `queue_family` belongs to it.
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }
-            .map_err(|e| Error::vulkan("vkCreateCommandPool", e))?;
-
-        let mut slots = Vec::with_capacity(Self::INITIAL_SLOTS);
-        for _ in 0..Self::INITIAL_SLOTS {
-            match alloc_barrier_slot(&device, pool) {
-                Ok(slot) => slots.push(slot),
-                Err(err) => {
-                    for s in slots {
-                        // SAFETY: Each `s.fence` was created by `device` and never submitted.
-                        unsafe { device.destroy_fence(s.fence, None) };
-                    }
-                    // SAFETY: `pool` was created above and no command buffers escaped.
-                    unsafe { device.destroy_command_pool(pool, None) };
-                    return Err(err);
-                }
-            }
-        }
-
-        Ok(Self {
-            device,
-            pool,
-            slots: Mutex::new(slots),
-            queue_family,
+/// Why through `wgpu`: `vkQueueSubmit` requires its queue to be externally synchronized, and only
+/// `wgpu-core` holds the lock its own submits and presents take, so a raw submit on `wgpu`'s
+/// `VkQueue` races any other thread's `wgpu::Queue::submit`. The same submission also carries
+/// `wgpu`'s pending `write_buffer` / `write_texture` uploads ahead of the recorded commands.
+///
+/// Staging is not atomic with respect to other threads: a concurrent `submit` on the same queue
+/// can pick up the staged `wait` / `signal`. Serialize submissions that use them.
+///
+/// Returns `record`'s value and the submission index (for `wgpu::Device::poll`). Nothing is
+/// submitted or staged when `record` fails.
+pub(crate) fn submit_vulkan_raw<R>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    wait: Option<(&InteropSemaphore, u64)>,
+    signal: Option<(&InteropSemaphore, u64)>,
+    record: impl FnOnce(vk::CommandBuffer) -> Result<R>,
+) -> Result<(R, wgpu::SubmissionIndex)> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("nv-wgpu raw vulkan commands"),
+    });
+    let record_raw = |hal_enc: Option<&mut wgpu::hal::vulkan::CommandEncoder>| {
+        hal_enc.map(|hal_enc| {
+            // SAFETY: `wgpu-core` opens the encoder before handing it to this callback, so
+            // `raw_handle` is its command buffer in the recording state.
+            let cmd = unsafe { hal_enc.raw_handle() };
+            record(cmd)
         })
-    }
-
-    /// Returns the wgpu queue family index this runner targets.
-    #[inline]
-    pub(crate) fn queue_family(&self) -> u32 {
-        self.queue_family
-    }
-
-    /// Returns the underlying `ash::Device`.
-    #[inline]
-    pub(crate) fn vk_device(&self) -> &ash::Device {
-        &self.device
-    }
-
-    /// Submits a single `vk::ImageMemoryBarrier` with zero steady-state allocations.
-    pub(crate) fn submit_image_barrier(
-        &self,
-        queue: vk::Queue,
-        src_stage: vk::PipelineStageFlags,
-        dst_stage: vk::PipelineStageFlags,
-        barrier: &vk::ImageMemoryBarrier<'_>,
-        wait: Option<(vk::Semaphore, u64)>,
-        signal: Option<(vk::Semaphore, u64)>,
-    ) -> Result<()> {
-        self.record_and_submit(queue, wait, signal, |device, cmd| {
-            // SAFETY: `cmd` is freshly reset & begun; `barrier` borrows valid image handle.
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    cmd,
-                    src_stage,
-                    dst_stage,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    core::slice::from_ref(barrier),
-                );
-            }
-        })
-    }
-
-    /// Submits a single `vk::BufferMemoryBarrier` with zero steady-state allocations.
-    pub(crate) fn submit_buffer_barrier(
-        &self,
-        queue: vk::Queue,
-        src_stage: vk::PipelineStageFlags,
-        dst_stage: vk::PipelineStageFlags,
-        barrier: &vk::BufferMemoryBarrier<'_>,
-        wait: Option<(vk::Semaphore, u64)>,
-        signal: Option<(vk::Semaphore, u64)>,
-    ) -> Result<()> {
-        self.record_and_submit(queue, wait, signal, |device, cmd| {
-            // SAFETY: `cmd` is freshly reset & begun; `barrier` borrows valid buffer handle.
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    cmd,
-                    src_stage,
-                    dst_stage,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    core::slice::from_ref(barrier),
-                    &[],
-                );
-            }
-        })
-    }
-
-    /// Records a primary command buffer via `f`, submits it to `queue`, and waits
-    /// for fence completion before returning.
-    pub(crate) fn record_and_submit_wait<F, R>(&self, queue: vk::Queue, f: F) -> Result<R>
-    where
-        F: FnOnce(vk::CommandBuffer) -> Result<R>,
-    {
-        self.record_and_submit_inner(queue, None, None, true, |_, cmd| f(cmd))
-    }
-
-    fn record_and_submit<F>(
-        &self,
-        queue: vk::Queue,
-        wait: Option<(vk::Semaphore, u64)>,
-        signal: Option<(vk::Semaphore, u64)>,
-        record: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(&ash::Device, vk::CommandBuffer),
-    {
-        self.record_and_submit_inner(queue, wait, signal, false, |dev, cmd| {
-            record(dev, cmd);
-            Ok(())
-        })
-    }
-
-    fn record_and_submit_inner<F, R>(
-        &self,
-        queue: vk::Queue,
-        wait: Option<(vk::Semaphore, u64)>,
-        signal: Option<(vk::Semaphore, u64)>,
-        wait_for_completion: bool,
-        record: F,
-    ) -> Result<R>
-    where
-        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<R>,
-    {
-        let mut guard = self.slots.lock().map_err(|_| Error::InvalidHandle {
-            source_api: "VkBarrierRunner mutex poisoned",
-        })?;
-
-        let mut chosen = None;
-        for (idx, slot) in guard.iter().enumerate() {
-            // SAFETY: `slot.fence` is a valid `VkFence` owned by `self.device`.
-            if unsafe { self.device.get_fence_status(slot.fence) } == Ok(true) {
-                chosen = Some(idx);
-                break;
-            }
-        }
-        let idx = match chosen {
-            Some(i) => i,
-            None => {
-                let extra = alloc_barrier_slot(&self.device, self.pool)?;
-                guard.push(extra);
-                guard.len() - 1
-            }
-        };
-        let (slot_cmd, slot_fence) = (guard[idx].cmd, guard[idx].fence);
-
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `slot_fence` is signaled (retired on GPU) and `guard` serializes pool/cmd access.
-        unsafe {
-            self.device
-                .reset_command_buffer(slot_cmd, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| Error::vulkan("vkResetCommandBuffer", e))?;
-            self.device
-                .begin_command_buffer(slot_cmd, &begin_info)
-                .map_err(|e| Error::vulkan("vkBeginCommandBuffer", e))?;
-        }
-        // If `record` fails before `reset_fences`, `slot_fence` stays signaled for future reuse.
-        let result = record(&self.device, slot_cmd)?;
-        // SAFETY: `slot_cmd` is in recording state.
-        unsafe {
-            self.device
-                .end_command_buffer(slot_cmd)
-                .map_err(|e| Error::vulkan("vkEndCommandBuffer", e))?;
-            // Reset fence only right before `vkQueueSubmit` so pre-submit errors never leave
-            // a live slot fence stuck unsignaled.
-            self.device
-                .reset_fences(core::slice::from_ref(&slot_fence))
-                .map_err(|e| Error::vulkan("vkResetFences", e))?;
-        }
-        if let Err(err) = submit_single_cmd(&self.device, queue, slot_cmd, slot_fence, wait, signal)
-        {
-            // Discard and destroy the slot because `slot_fence` was reset and never submitted.
-            let dead = guard.swap_remove(idx);
-            // SAFETY: `dead.fence` and `dead.cmd` were never submitted after reset.
-            unsafe {
-                self.device.destroy_fence(dead.fence, None);
-                self.device
-                    .free_command_buffers(self.pool, core::slice::from_ref(&dead.cmd));
-            }
-            return Err(err);
-        }
-        if wait_for_completion {
-            // SAFETY: `slot_fence` was just submitted on `queue` and is owned by `self.device`.
-            unsafe {
-                self.device
-                    .wait_for_fences(core::slice::from_ref(&slot_fence), true, u64::MAX)
-            }
-            .map_err(|e| Error::vulkan("vkWaitForFences", e))?;
-        }
-        Ok(result)
-    }
-}
-
-fn alloc_barrier_slot(device: &ash::Device, pool: vk::CommandPool) -> Result<BarrierSlot> {
-    let alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-    // SAFETY: `pool` belongs to `device` and allocates 1 primary command buffer.
-    let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }
-        .map_err(|e| Error::vulkan("vkAllocateCommandBuffers", e))?[0];
-    let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-    // SAFETY: `device` is live and `fence_info` has valid flags.
-    let fence = match unsafe { device.create_fence(&fence_info, None) } {
-        Ok(f) => f,
-        Err(err) => {
-            // SAFETY: `cmd` was just allocated from `pool` and never submitted.
-            unsafe { device.free_command_buffers(pool, core::slice::from_ref(&cmd)) };
-            return Err(Error::vulkan("vkCreateFence", err));
+    };
+    // SAFETY: the callback only records commands into the active command buffer; it neither ends
+    // nor frees it, and `encoder` is not used again until the callback has returned.
+    let recorded = unsafe { encoder.as_hal_mut::<Vulkan, _, _>(record_raw) };
+    let value = match recorded {
+        Some(res) => res?,
+        None => {
+            return Err(Error::BackendMismatch {
+                expected: "Vulkan",
+                found: device.adapter_info().backend,
+            });
         }
     };
-    Ok(BarrierSlot { cmd, fence })
+    let commands = encoder.finish();
+    if let Some((sem, val)) = wait {
+        sem.stage_wait_in_wgpu(queue, val)?;
+    }
+    if let Some((sem, val)) = signal
+        && let Err(err) = sem.stage_signal_in_wgpu(queue, val)
+    {
+        if let Some((waited, _)) = wait {
+            waited.unstage_wait_in_wgpu(queue)?;
+        }
+        return Err(err);
+    }
+    let index = queue.submit([commands]);
+    Ok((value, index))
 }
 
-impl Drop for VkBarrierRunner {
-    fn drop(&mut self) {
-        if let Ok(slots) = self.slots.get_mut() {
-            for slot in slots.drain(..) {
-                // SAFETY: Wait for any still-pending barrier submission before destroying
-                // `slot.fence` or freeing `self.pool` (`VUID-vkDestroyFence-fence-01120` / `00041`).
-                unsafe {
-                    if self.device.get_fence_status(slot.fence) == Ok(false)
-                        && let Err(err) = self.device.wait_for_fences(
-                            core::slice::from_ref(&slot.fence),
-                            true,
-                            u64::MAX,
-                        )
-                    {
-                        eprintln!(
-                            "nv-wgpu: vkWaitForFences during VkBarrierRunner::drop failed: {err:?}"
-                        );
-                    }
-                    self.device.destroy_fence(slot.fence, None);
-                }
-            }
-        }
-        // SAFETY: All submitted barrier fences have completed above and `pool` belongs to `self.device`.
-        unsafe {
-            self.device.destroy_command_pool(self.pool, None);
-        }
+/// Blocks until submission `index` (if any) of `device` completes. For `Drop` impls that must
+/// not free native objects still referenced by in-flight raw commands; a failure is reported on
+/// stderr because `Drop` cannot return it.
+pub(crate) fn wait_for_submission(
+    device: &wgpu::Device,
+    index: Option<wgpu::SubmissionIndex>,
+    owner: &str,
+) {
+    let Some(index) = index else {
+        return;
+    };
+    if let Err(err) = device.poll(wgpu::PollType::Wait {
+        submission_index: Some(index),
+        timeout: None,
+    }) {
+        eprintln!(
+            "nv-wgpu: waiting for the last raw submission of {owner} during drop failed: {err}"
+        );
     }
 }
 
-/// Submits one primary command buffer with optional stack-allocated timeline semaphore wait/signal.
-fn submit_single_cmd(
-    device: &ash::Device,
-    queue: vk::Queue,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
-    wait: Option<(vk::Semaphore, u64)>,
-    signal: Option<(vk::Semaphore, u64)>,
-) -> Result<()> {
-    let wait_sems = [wait.map_or(vk::Semaphore::null(), |(s, _)| s)];
-    let wait_vals = [wait.map_or(0, |(_, v)| v)];
-    let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-    let signal_sems = [signal.map_or(vk::Semaphore::null(), |(s, _)| s)];
-    let signal_vals = [signal.map_or(0, |(_, v)| v)];
-    let cmds = [cmd];
+/// Every mip level and array layer of a colour image.
+pub(crate) fn full_color_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: vk::REMAINING_MIP_LEVELS,
+        base_array_layer: 0,
+        layer_count: vk::REMAINING_ARRAY_LAYERS,
+    }
+}
 
-    let wait_count = usize::from(wait.is_some());
-    let signal_count = usize::from(signal.is_some());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-        .wait_semaphore_values(&wait_vals[..wait_count])
-        .signal_semaphore_values(&signal_vals[..signal_count]);
+    #[test]
+    fn buffer_usage_mapping_covers_query_resolve_and_indirect() {
+        let resolve = map_vk_buffer_usage(wgpu::BufferUsages::QUERY_RESOLVE);
+        assert!(resolve.contains(vk::BufferUsageFlags::TRANSFER_DST));
+        assert!(resolve.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+        let indirect = map_vk_buffer_usage(wgpu::BufferUsages::INDIRECT);
+        assert!(indirect.contains(vk::BufferUsageFlags::INDIRECT_BUFFER));
+        assert!(indirect.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+    }
 
-    let submit = vk::SubmitInfo::default()
-        .command_buffers(&cmds)
-        .wait_semaphores(&wait_sems[..wait_count])
-        .wait_dst_stage_mask(&wait_stages[..wait_count])
-        .signal_semaphores(&signal_sems[..signal_count])
-        .push_next(&mut timeline);
-
-    // SAFETY: `cmd` is ended executable primary command buffer, `fence` is unsignaled, and slices match bounds.
-    unsafe { device.queue_submit(queue, core::slice::from_ref(&submit), fence) }
-        .map_err(|e| Error::vulkan("vkQueueSubmit", e))
+    #[test]
+    fn full_color_range_covers_every_level_and_layer() {
+        let range = full_color_subresource_range();
+        assert_eq!(range.level_count, vk::REMAINING_MIP_LEVELS);
+        assert_eq!(range.layer_count, vk::REMAINING_ARRAY_LAYERS);
+        assert_eq!((range.base_mip_level, range.base_array_layer), (0, 0));
+    }
 }

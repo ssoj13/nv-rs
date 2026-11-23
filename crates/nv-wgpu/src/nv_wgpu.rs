@@ -19,6 +19,11 @@
 //! - [`format`]: Explicit `wgpu::TextureFormat` <-> CUDA/Vulkan/DXGI mapping table
 //!   and 256-byte (`COPY_BYTES_PER_ROW_ALIGNMENT`) staging layout helpers.
 //!
+//! Raw Vulkan work (ownership/layout barriers, [`InteropContext::submit_vulkan_commands`]) is
+//! recorded into `wgpu` command encoders and submitted with `wgpu::Queue::submit`, never with a
+//! raw `vkQueueSubmit`, so it is safe next to other threads' `wgpu` submits and presents and is
+//! ordered after `wgpu`'s pending buffer/texture writes.
+//!
 //! Uses `cuda-core`, `cuda-core-ext`, `gpu-info-rs`, `wgpu`, `ash`, and OS handle APIs
 //! (`Win32` NT handles on Windows, `OPAQUE_FD` on Unix).
 
@@ -86,7 +91,9 @@ pub struct RawVulkanHandles {
     pub get_instance_proc_addr: *const c_void,
     /// Raw `PFN_vkGetDeviceProcAddr` function pointer.
     pub get_device_proc_addr: *const c_void,
-    /// Raw `VkQueue` handle (`wgpu` queue, or dedicated barrier queue if configured).
+    /// Raw `VkQueue` handle of `wgpu`'s queue (the only queue `wgpu-hal` creates). A raw
+    /// `vkQueueSubmit` on it races `wgpu::Queue::submit` on other threads; submit through
+    /// [`InteropContext::submit_vulkan_commands`] instead.
     pub queue: *mut c_void,
     /// Vulkan queue family index of `queue`.
     pub queue_family_index: u32,
@@ -100,8 +107,8 @@ pub struct InteropContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     cuda_ctx: Arc<Context>,
-    vulkan_barrier_queue: Option<ash::vk::Queue>,
-    vulkan_cmd_runner: Option<Arc<platform::VkBarrierRunner>>,
+    /// `ash` function table of the Vulkan device, for recording raw commands (`None` on DX12).
+    vk_device: Option<ash::Device>,
 }
 
 impl std::fmt::Debug for InteropContext {
@@ -113,21 +120,21 @@ impl std::fmt::Debug for InteropContext {
     }
 }
 
-fn build_vulkan_cmd_runner(
+/// The `ash` function table of `device` on Vulkan, `None` on other backends.
+fn vulkan_device_fns(
     backend: InteropBackend,
     device: &wgpu::Device,
-) -> Result<Option<Arc<platform::VkBarrierRunner>>> {
+) -> Result<Option<ash::Device>> {
     if backend != InteropBackend::Vulkan {
         return Ok(None);
     }
-    // SAFETY: Read-only inspection of Vulkan HAL device and queue family index.
+    // SAFETY: Read-only inspection of the Vulkan HAL device; the cloned `ash::Device` is a
+    // function table used only while `device` (held by the same `InteropContext`) is alive.
     let hal_dev = unsafe { device.as_hal::<Vulkan>() }.ok_or_else(|| Error::BackendMismatch {
         expected: "Vulkan",
         found: device.adapter_info().backend,
     })?;
-    let runner =
-        platform::VkBarrierRunner::new(hal_dev.raw_device().clone(), hal_dev.queue_family_index())?;
-    Ok(Some(Arc::new(runner)))
+    Ok(Some(hal_dev.raw_device().clone()))
 }
 
 impl InteropContext {
@@ -140,14 +147,13 @@ impl InteropContext {
     ) -> Result<Self> {
         let backend = verify_device_interop_support(&device)?;
         let cuda_ctx = find_matching_cuda_device(adapter, &device)?;
-        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &device)?;
+        let vk_device = vulkan_device_fns(backend, &device)?;
         Ok(Self {
             backend,
             device,
             queue,
             cuda_ctx,
-            vulkan_barrier_queue: None,
-            vulkan_cmd_runner,
+            vk_device,
         })
     }
 
@@ -161,14 +167,13 @@ impl InteropContext {
     ) -> Result<Self> {
         let backend = verify_device_interop_support(&device)?;
         verify_matching_cuda_device(adapter, &device, &cuda_ctx)?;
-        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &device)?;
+        let vk_device = vulkan_device_fns(backend, &device)?;
         Ok(Self {
             backend,
             device,
             queue,
             cuda_ctx,
-            vulkan_barrier_queue: None,
-            vulkan_cmd_runner,
+            vk_device,
         })
     }
 
@@ -212,23 +217,14 @@ impl InteropContext {
     /// open an interop-ready device from `&shared.adapter` via [`Self::open_vulkan`].
     pub fn from_shared_gpu(shared: &gpu_info::SharedGpu) -> Result<Self> {
         let (backend, cuda_ctx) = pair_shared_gpu(shared)?;
-        let vulkan_cmd_runner = build_vulkan_cmd_runner(backend, &shared.device)?;
+        let vk_device = vulkan_device_fns(backend, &shared.device)?;
         Ok(Self {
             backend,
             device: shared.device.clone(),
             queue: shared.queue.clone(),
             cuda_ctx,
-            vulkan_barrier_queue: None,
-            vulkan_cmd_runner,
+            vk_device,
         })
-    }
-
-    /// Configures a dedicated Vulkan barrier queue `(family, index)` (in `wgpu`'s
-    /// queue family, distinct from `wgpu`'s own queue) for ownership/layout barriers.
-    pub fn with_vulkan_barrier_queue(mut self, family: u32, index: u32) -> Result<Self> {
-        let vk_q = platform::resolve_vulkan_barrier_queue(&self.device, family, index)?;
-        self.vulkan_barrier_queue = Some(vk_q);
-        Ok(self)
     }
 
     /// Returns the verified graphics interop backend (`Vulkan` or Windows `Dx12`).
@@ -263,30 +259,12 @@ impl InteropContext {
 
     /// Creates a zero-copy [`SharedBuffer`] shared between `wgpu` and CUDA.
     pub fn create_buffer(&self, desc: &SharedBufferDescriptor<'_>) -> Result<SharedBuffer> {
-        SharedBuffer::create_with_barrier_queue(
-            &self.device,
-            &self.cuda_ctx,
-            desc,
-            self.vulkan_barrier_queue,
-        )
+        SharedBuffer::create(&self.device, &self.cuda_ctx, desc)
     }
 
     /// Creates a zero-copy [`SharedTexture`] shared between `wgpu` and CUDA.
     pub fn create_texture(&self, desc: &SharedTextureDescriptor<'_>) -> Result<SharedTexture> {
-        SharedTexture::create_with_barrier_queue(
-            &self.device,
-            &self.queue,
-            &self.cuda_ctx,
-            desc,
-            self.vulkan_barrier_queue,
-        )
-    }
-
-    /// Returns `true` when this context has a dedicated Vulkan barrier queue
-    /// configured so ownership barriers do not submit on `wgpu`'s queue.
-    #[must_use]
-    pub fn has_dedicated_vulkan_barrier_queue(&self) -> bool {
-        self.vulkan_barrier_queue.is_some()
+        SharedTexture::create(&self.device, &self.queue, &self.cuda_ctx, desc)
     }
 
     /// Flushes optional staged wait/signal semaphore operations on `wgpu`'s queue
@@ -310,13 +288,8 @@ impl InteropContext {
         let hal_dev = unsafe { self.device.as_hal::<Vulkan>() }?;
         let shared_inst = hal_dev.shared_instance();
         let raw_inst = shared_inst.raw_instance();
-        let raw_queue = if let Some(q) = self.vulkan_barrier_queue {
-            q
-        } else {
-            // SAFETY: Read-only HAL inspection of `wgpu`'s Vulkan queue handle.
-            let hal_q = unsafe { self.queue.as_hal::<Vulkan>() }?;
-            hal_q.as_raw()
-        };
+        // SAFETY: Read-only HAL inspection of `wgpu`'s Vulkan queue handle.
+        let raw_queue = unsafe { self.queue.as_hal::<Vulkan>() }?.as_raw();
         Some(RawVulkanHandles {
             instance: raw_inst.handle().as_raw() as usize as *mut c_void,
             physical_device: hal_dev.raw_physical_device().as_raw() as usize as *mut c_void,
@@ -329,9 +302,15 @@ impl InteropContext {
         })
     }
 
-    /// Allocates/reuses a primary `VkCommandBuffer`, lets `f` record commands into
-    /// it (`*mut c_void` = `VkCommandBuffer`), submits it to the device's Vulkan
-    /// queue, and waits for completion via fence.
+    /// Lets `f` record commands into the primary `VkCommandBuffer` of a fresh `wgpu` command
+    /// encoder (`*mut c_void` = `VkCommandBuffer`; `f` must not end or free it), submits it with
+    /// `wgpu::Queue::submit`, and blocks until that submission completes, so every resource the
+    /// commands reference may be dropped once this returns.
+    ///
+    /// The submission is ordered after `wgpu`'s pending `write_buffer` / `write_texture` uploads
+    /// and is safe next to other threads' `wgpu` submits and presents. `f` runs without any
+    /// `nv-wgpu` lock held, so it may call other `nv-wgpu` functions (they submit separately,
+    /// before this one). Nothing is submitted when `f` fails.
     pub fn submit_vulkan_commands<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(*mut c_void) -> Result<R>,
@@ -342,20 +321,24 @@ impl InteropContext {
                 found: self.device.adapter_info().backend,
             });
         }
-        let runner = self
-            .vulkan_cmd_runner
-            .as_deref()
-            .ok_or_else(|| Error::BackendMismatch {
-                expected: "Vulkan",
-                found: self.device.adapter_info().backend,
+        let (value, index) =
+            platform::submit_vulkan_raw(&self.device, &self.queue, None, None, |cmd| {
+                f(cmd.as_raw() as usize as *mut c_void)
             })?;
-        platform::with_barrier_vk_queue(&self.queue, self.vulkan_barrier_queue, |raw_q| {
-            runner.record_and_submit_wait(raw_q, |cmd| f(cmd.as_raw() as usize as *mut c_void))
-        })
+        self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: None,
+        })?;
+        Ok(value)
     }
 
     /// Records a `vkCmdPipelineBarrier` image layout transition into `cmd_buffer`
-    /// (`*mut c_void` = `VkCommandBuffer`) for `image` (`*mut c_void` = `VkImage`).
+    /// (`*mut c_void` = `VkCommandBuffer`) for every mip level and array layer of `image`
+    /// (`*mut c_void` = `VkImage`).
+    ///
+    /// `wgpu`'s resource tracker is not told about the new layout: when `image` is a
+    /// [`SharedTexture`] that `wgpu` also uses, pair transitions so the image is back in the
+    /// layout `wgpu` tracks before `wgpu` uses it again.
     ///
     /// # Safety
     ///
@@ -367,15 +350,9 @@ impl InteropContext {
         image: *mut c_void,
         transition: VkImageTransition,
     ) -> Result<()> {
-        if self.backend != InteropBackend::Vulkan {
-            return Err(Error::BackendMismatch {
-                expected: "Vulkan",
-                found: self.device.adapter_info().backend,
-            });
-        }
-        let runner = self
-            .vulkan_cmd_runner
-            .as_deref()
+        let vk_device = self
+            .vk_device
+            .as_ref()
             .ok_or_else(|| Error::BackendMismatch {
                 expected: "Vulkan",
                 found: self.device.adapter_info().backend,
@@ -425,16 +402,10 @@ impl InteropContext {
             .src_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED)
             .image(img)
-            .subresource_range(ash::vk::ImageSubresourceRange {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
+            .subresource_range(platform::full_color_subresource_range());
         // SAFETY: Caller guarantees `cmd` is a valid recording `VkCommandBuffer` and `img` is live.
         unsafe {
-            runner.vk_device().cmd_pipeline_barrier(
+            vk_device.cmd_pipeline_barrier(
                 cmd,
                 src_stage,
                 dst_stage,

@@ -75,6 +75,10 @@ pub struct ArrayDesc {
     /// Sparse (tiled) storage: no memory until tiles are mapped with [`crate::TilePool`]
     /// (`CUDA_ARRAY3D_SPARSE`; 2D, 2D layered or 3D, see [`crate::sparse_arrays_supported`]).
     pub sparse: bool,
+    /// The storage is bound as a colour target in an external graphics API
+    /// (`CUDA_ARRAY3D_COLOR_ATTACHMENT`); cuda.h requires it when mapping such an image with
+    /// `cuExternalMemoryGetMappedMipmappedArray`.
+    pub color_attachment: bool,
 }
 
 impl ArrayDesc {
@@ -90,6 +94,7 @@ impl ArrayDesc {
             layered: false,
             cubemap: false,
             sparse: false,
+            color_attachment: false,
         }
     }
 
@@ -108,7 +113,7 @@ impl ArrayDesc {
         self.row_bytes() * self.height.max(1) * self.depth.max(1)
     }
 
-    fn validate(&self) -> Result<(), DriverError> {
+    pub(crate) fn validate(&self) -> Result<(), DriverError> {
         if self.width == 0 || !matches!(self.channels, 1 | 2 | 4) {
             return Err(invalid_value());
         }
@@ -124,6 +129,44 @@ impl ArrayDesc {
         Ok(())
     }
 
+    /// Longest mip chain over this layout: `1 + floor(log2(largest extent))`, counting only the
+    /// extents that halve per level (layers and cube faces do not). The driver clamps a longer
+    /// request (cuda.h, `cuMipmappedArrayCreate`), so a longer chain is rejected instead of being
+    /// recorded with levels that do not exist.
+    pub(crate) fn max_mip_levels(&self) -> u32 {
+        let depth = if self.layered || self.cubemap {
+            0
+        } else {
+            self.depth
+        };
+        let largest = self.width.max(self.height).max(depth);
+        usize::BITS - largest.leading_zeros()
+    }
+
+    /// Rejects a mip level count of zero or above [`Self::max_mip_levels`].
+    pub(crate) fn check_levels(&self, levels: u32) -> Result<(), DriverError> {
+        if levels == 0 || levels > self.max_mip_levels() {
+            return Err(invalid_value());
+        }
+        Ok(())
+    }
+
+    /// The layout of mip level `level` (callers keep `level` below [`Self::max_mip_levels`]).
+    fn level_desc(&self, level: u32) -> ArrayDesc {
+        let shrink = |v: usize| if v == 0 { 0 } else { (v >> level).max(1) };
+        ArrayDesc {
+            width: shrink(self.width),
+            height: shrink(self.height),
+            // Layers and the six cube faces are not mip dimensions; only a 3D depth halves.
+            depth: if self.layered || self.cubemap {
+                self.depth
+            } else {
+                shrink(self.depth)
+            },
+            ..*self
+        }
+    }
+
     pub(crate) fn to_sys(self) -> sys::CUDA_ARRAY3D_DESCRIPTOR {
         let mut flags = 0;
         if self.surface {
@@ -137,6 +180,9 @@ impl ArrayDesc {
         }
         if self.layered {
             flags |= sys::CUDA_ARRAY3D_LAYERED;
+        }
+        if self.color_attachment {
+            flags |= sys::CUDA_ARRAY3D_COLOR_ATTACHMENT;
         }
         sys::CUDA_ARRAY3D_DESCRIPTOR {
             Width: self.width,
@@ -235,6 +281,10 @@ impl Array {
     }
 
     fn copy(&self, stream: &Stream, c: &sys::CUDA_MEMCPY3D) -> Result<(), DriverError> {
+        // A stream of another context (another GPU, a green context) cannot address this array.
+        if stream.context().cu_ctx() != self.ctx.cu_ctx() {
+            return Err(invalid_value());
+        }
         self.ctx.bind_to_thread()?;
         // SAFETY: the extents match the array and the host slice (checked by the callers); the
         // host memory stays borrowed until the stream is synchronized below.
@@ -271,12 +321,11 @@ unsafe impl Send for MipmappedArray {}
 unsafe impl Sync for MipmappedArray {}
 
 impl MipmappedArray {
-    /// Allocates a mipmapped array of `levels` levels (level 0 described by `desc`).
+    /// Allocates a mipmapped array of `levels` levels (level 0 described by `desc`); `levels`
+    /// must be in `1..=1 + floor(log2(largest halving extent))`.
     pub fn new(ctx: &Arc<Context>, desc: ArrayDesc, levels: u32) -> Result<Self, DriverError> {
         desc.validate()?;
-        if levels == 0 {
-            return Err(invalid_value());
-        }
+        desc.check_levels(levels)?;
         ctx.bind_to_thread()?;
         let d = desc.to_sys();
         let mut raw: sys::CUmipmappedArray = std::ptr::null_mut();
@@ -331,17 +380,7 @@ impl MipmappedArray {
         let mut raw: sys::CUarray = std::ptr::null_mut();
         // SAFETY: valid level index and out-pointer.
         unsafe { sys::cuMipmappedArrayGetLevel(&mut raw, self.raw, level) }.result()?;
-        let shrink = |v: usize| if v == 0 { 0 } else { (v >> level).max(1) };
-        let desc = ArrayDesc {
-            width: shrink(self.desc.width),
-            height: shrink(self.desc.height),
-            depth: if self.desc.layered {
-                self.desc.depth
-            } else {
-                shrink(self.desc.depth)
-            },
-            ..self.desc
-        };
+        let desc = self.desc.level_desc(level);
         Ok(LevelRef {
             array: Array {
                 raw,
@@ -389,6 +428,65 @@ mod tests {
         assert!(
             ArrayDesc { channels: 3, ..d }.validate().is_err(),
             "CUDA arrays take 1, 2 or 4 channels"
+        );
+    }
+
+    #[test]
+    fn mip_levels_keep_cube_faces_and_layers() {
+        let cube = ArrayDesc {
+            depth: 6,
+            cubemap: true,
+            ..ArrayDesc::d2(16, 16, ArrayFormat::U8, 4)
+        };
+        let l1 = cube.level_desc(1);
+        assert_eq!(
+            (l1.width, l1.height, l1.depth),
+            (8, 8, 6),
+            "six faces on every level"
+        );
+        let cube_array = ArrayDesc {
+            depth: 12,
+            layered: true,
+            ..cube
+        };
+        assert_eq!(cube_array.level_desc(2).depth, 12);
+        let volume = ArrayDesc {
+            depth: 8,
+            ..ArrayDesc::d2(16, 16, ArrayFormat::U8, 4)
+        };
+        assert_eq!(volume.level_desc(2).depth, 2, "a 3D depth halves");
+    }
+
+    #[test]
+    fn mip_level_count_is_bounded_by_the_largest_halving_extent() {
+        let d = ArrayDesc::d2(64, 16, ArrayFormat::F32, 1);
+        assert_eq!(d.max_mip_levels(), 7);
+        assert!(d.check_levels(7).is_ok());
+        assert!(d.check_levels(8).is_err(), "the driver would clamp to 7");
+        assert!(d.check_levels(0).is_err());
+        let layers = ArrayDesc {
+            depth: 64,
+            layered: true,
+            ..ArrayDesc::d2(4, 4, ArrayFormat::F32, 1)
+        };
+        assert_eq!(
+            layers.max_mip_levels(),
+            3,
+            "layers do not lengthen the chain"
+        );
+    }
+
+    #[test]
+    fn color_attachment_sets_the_driver_flag() {
+        let plain = ArrayDesc::d2(8, 8, ArrayFormat::U8, 4);
+        assert_eq!(plain.to_sys().Flags & sys::CUDA_ARRAY3D_COLOR_ATTACHMENT, 0);
+        let target = ArrayDesc {
+            color_attachment: true,
+            ..plain
+        };
+        assert_ne!(
+            target.to_sys().Flags & sys::CUDA_ARRAY3D_COLOR_ATTACHMENT,
+            0
         );
     }
 }

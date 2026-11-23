@@ -36,8 +36,8 @@ pub struct FormatMapping {
     pub is_bgra: bool,
     /// Vulkan `VkFormat` matching `wgpu`.
     pub vk_format: vk::Format,
-    /// DXGI raw format numeric code (`DXGI_FORMAT`), kept platform-independent as `u32`
-    /// so tables remain uniform across Windows and Linux tests.
+    /// DXGI raw format numeric code (`DXGI_FORMAT`, an `i32` newtype in `windows`), kept
+    /// platform-independent as a plain `i32` so tables remain uniform across Windows and Linux.
     pub dxgi_format_raw: i32,
 }
 
@@ -466,7 +466,8 @@ pub fn build_cuda_array_desc(
             if cubemap {
                 return Err(Error::InvalidInput("1D texture cannot be a cubemap"));
             }
-            (0usize, 1usize, false)
+            // cuda.h (`cuArray3DCreate`): a 1D array has Height and Depth both zero.
+            (0usize, 0usize, false)
         }
         wgpu::TextureDimension::D2 => {
             if cubemap
@@ -476,13 +477,18 @@ pub fn build_cuda_array_desc(
                     "cubemap texture must be square with depth_or_array_layers divisible by 6",
                 ));
             }
+            // cuda.h (`cuArray3DCreate`): Depth 0 is a 2D array; a non-zero Depth without
+            // LAYERED / CUBEMAP is a 3D array, so a single 2D image must use Depth 0. Arrays
+            // and cubemaps keep their layer count with the matching flag.
             let layers = size.depth_or_array_layers as usize;
-            let layered = if cubemap {
-                size.depth_or_array_layers > 6
+            let (depth, layered) = if cubemap {
+                (layers, layers > 6)
+            } else if layers > 1 {
+                (layers, true)
             } else {
-                size.depth_or_array_layers > 1
+                (0, false)
             };
-            (size.height as usize, layers.max(1), layered)
+            (size.height as usize, depth, layered)
         }
         wgpu::TextureDimension::D3 => {
             if cubemap {
@@ -506,6 +512,8 @@ pub fn build_cuda_array_desc(
         layered,
         cubemap,
         sparse: false,
+        // Set from the texture usage by `validate_texture_descriptor`.
+        color_attachment: false,
     };
 
     Ok((mapping, desc))
@@ -722,10 +730,43 @@ mod tests {
         assert_eq!(map.bytes_per_pixel, 8);
         assert_eq!(d2.width, 64);
         assert_eq!(d2.height, 32);
-        assert_eq!(d2.depth, 1);
+        assert_eq!(
+            d2.depth, 0,
+            "a single 2D image is a 2D CUDA array, not a depth-1 3D one"
+        );
         assert!(d2.surface);
         assert!(!d2.layered);
         assert!(!d2.cubemap);
+
+        let (_, d2_array) = build_cuda_array_desc(
+            wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 4,
+            },
+            wgpu::TextureDimension::D2,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!((d2_array.depth, d2_array.layered), (4, true));
+
+        let (_, d3) = build_cuda_array_desc(
+            wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 4,
+            },
+            wgpu::TextureDimension::D3,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!((d3.depth, d3.layered), (4, false));
 
         // 64x32 has max 7 mips; 8 must fail
         assert!(
@@ -825,6 +866,10 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!((d1.width, d1.height, d1.depth), (64, 0, 1));
+        assert_eq!(
+            (d1.width, d1.height, d1.depth),
+            (64, 0, 0),
+            "cuda.h: a 1D array has Height and Depth zero"
+        );
     }
 }

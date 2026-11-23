@@ -10,7 +10,7 @@
 //! (`tex2D` with `bool* isResident`, device crate `cuda-tex-device` `*_sparse`), so a renderer
 //! can stream in only the tiles it touches.
 //! **How.** Offsets and extents are in elements and must be multiples of the tile extent
-//! (checked here); the pool offset must be a multiple of the pool's granularity (checked). The
+//! (checked here); the pool offset must be a multiple of the pool's 64 KiB tile size (checked). The
 //! map call is stream-ordered; work that fetches the tiles must be ordered after it.
 //! **Used by** the sparse texture tests of `optix-device-tests` and texture streaming.
 
@@ -79,8 +79,7 @@ impl Array {
         pool: &TilePool,
         pool_offset: u64,
     ) -> Result<(), DriverError> {
-        let tiles = self.check_region(origin, extent)?;
-        let p = self.sparse_properties()?;
+        let (tiles, p) = self.check_region(origin, extent)?;
         let tile_bytes = u64::from(p.tile[0])
             * u64::from(p.tile[1])
             * u64::from(p.tile[2].max(1))
@@ -120,8 +119,13 @@ impl Array {
         self.map_call(stream, &mut info)
     }
 
-    /// Validates a tile-aligned level-0 region of a sparse 2D array; returns its tile count.
-    fn check_region(&self, origin: [u32; 2], extent: [u32; 2]) -> Result<u64, DriverError> {
+    /// Validates a tile-aligned level-0 region of a sparse 2D array; returns its tile count and
+    /// the tile geometry it was checked against (one driver query per map call).
+    fn check_region(
+        &self,
+        origin: [u32; 2],
+        extent: [u32; 2],
+    ) -> Result<(u64, SparseProperties), DriverError> {
         let d = self.desc();
         if d.layered || d.cubemap || d.depth != 0 || d.height == 0 {
             return Err(invalid_value());
@@ -142,7 +146,7 @@ impl Array {
             }
             tiles *= u64::from(extent[a] / t);
         }
-        Ok(tiles)
+        Ok((tiles, p))
     }
 
     fn map_info(&self, origin: [u32; 2], extent: [u32; 2]) -> sys::CUarrayMapInfo {

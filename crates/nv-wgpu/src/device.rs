@@ -62,6 +62,13 @@ pub fn detect_backend(device: &wgpu::Device) -> Result<InteropBackend> {
     })
 }
 
+/// The Vulkan version usable for device-level calls: the lower of the instance's requested
+/// `apiVersion` and the physical device's version (a 1.1 instance on a 1.3 GPU cannot call
+/// core 1.2 entry points such as `vkGetSemaphoreCounterValue`).
+pub(crate) fn effective_api_version(instance_api_version: u32, device_api_version: u32) -> u32 {
+    instance_api_version.min(device_api_version)
+}
+
 /// Returns the Vulkan device extensions required on top of `wgpu` defaults for
 /// external memory and timeline semaphore interop on the current OS.
 ///
@@ -125,16 +132,20 @@ pub fn verify_device_interop_support(device: &wgpu::Device) -> Result<InteropBac
 
         // Timeline semaphores are promoted to Vulkan 1.2 core, or provided by VK_KHR_timeline_semaphore.
         let phys = hal_dev.raw_physical_device();
-        let instance = hal_dev.shared_instance().raw_instance();
+        let shared_inst = hal_dev.shared_instance();
         // SAFETY: `phys` belongs to `instance`.
-        let props = unsafe { instance.get_physical_device_properties(phys) };
-        if props.api_version < vk::API_VERSION_1_2
-            && !enabled.contains(&khr::timeline_semaphore::NAME)
-        {
+        let props = unsafe {
+            shared_inst
+                .raw_instance()
+                .get_physical_device_properties(phys)
+        };
+        let api_version =
+            effective_api_version(shared_inst.instance_api_version(), props.api_version);
+        if api_version < vk::API_VERSION_1_2 && !enabled.contains(&khr::timeline_semaphore::NAME) {
             return Err(Error::Unsupported {
                 what: "vulkan timeline semaphore",
                 required: "Vulkan 1.2+ or VK_KHR_timeline_semaphore",
-                found: format!("api_version=0x{:x}", props.api_version),
+                found: format!("effective api_version=0x{api_version:x}"),
             });
         }
     }
@@ -248,8 +259,13 @@ pub fn verify_matching_cuda_device(
     Ok(())
 }
 
-/// Scans visible CUDA devices (`0..Context::device_count()`) and returns the
-/// [`Context`] whose hardware UUID (Vulkan) or LUID (DX12) matches `(adapter, device)`.
+/// Scans visible CUDA devices (`0..Context::device_count()`) and returns the primary
+/// [`Context`] of the one whose hardware UUID (Vulkan) or LUID (DX12) matches
+/// `(adapter, device)`.
+///
+/// Devices are identified without a context; only the match's primary context is retained.
+/// Driver errors are returned, except `CUDA_ERROR_NOT_SUPPORTED` from the LUID query: a device
+/// without a LUID (TCC mode) cannot be a DXGI adapter, so it is not a match.
 pub fn find_matching_cuda_device(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
@@ -257,20 +273,18 @@ pub fn find_matching_cuda_device(
     let id = wgpu_gpu_identity(adapter, device)?;
     let count = Context::device_count()?;
     for ordinal in 0..count {
-        let Ok(ctx) = Context::new(ordinal as usize) else {
-            continue;
-        };
+        let cu_device = cuda_core::Device::new(ordinal as usize)?;
         let matched = match id {
-            GpuIdentity::Uuid(wgpu_uuid) => {
-                cuda_device_uuid(&ctx).is_ok_and(|cu_uuid| cu_uuid == wgpu_uuid)
-            }
+            GpuIdentity::Uuid(wgpu_uuid) => cuda_device_uuid(&cu_device)? == wgpu_uuid,
             #[cfg(windows)]
-            GpuIdentity::Luid(wgpu_luid) => {
-                cuda_device_luid(&ctx).is_ok_and(|cu_luid| cu_luid.bytes == wgpu_luid)
-            }
+            GpuIdentity::Luid(wgpu_luid) => match cuda_device_luid(&cu_device) {
+                Ok(cu_luid) => cu_luid.bytes == wgpu_luid,
+                Err(e) if e.0 == cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_SUPPORTED => false,
+                Err(e) => return Err(e.into()),
+            },
         };
         if matched {
-            return Ok(ctx);
+            return Ok(cu_device.primary_context()?);
         }
     }
 
@@ -291,9 +305,9 @@ fn intern_cstr(name: &str) -> Result<&'static CStr> {
     static INTERNED: Mutex<Vec<&'static CStr>> = Mutex::new(Vec::new());
     let cstr = CString::new(name)
         .map_err(|_| Error::InvalidInput("vulkan extension name contains interior NUL"))?;
-    let mut guard = INTERNED.lock().map_err(|_| Error::InvalidHandle {
-        source_api: "INTERNED vulkan extension mutex poisoned",
-    })?;
+    let mut guard = INTERNED
+        .lock()
+        .map_err(|_| Error::Poisoned("INTERNED vulkan extension name list"))?;
     if let Some(&existing) = guard.iter().find(|&&s| s.to_bytes() == cstr.as_bytes()) {
         return Ok(existing);
     }
@@ -388,10 +402,17 @@ pub fn open_vulkan_device_with_interop_extensions(
     })?;
 
     let caps = hal_adapter.physical_device_capabilities();
-    let raw_inst = hal_adapter.shared_instance().raw_instance();
+    let shared_inst = hal_adapter.shared_instance();
     let phys = hal_adapter.raw_physical_device();
-    // SAFETY: `phys` is a valid physical device of `raw_inst`.
-    let api_version = unsafe { raw_inst.get_physical_device_properties(phys) }.api_version;
+    // SAFETY: `phys` is a valid physical device of the adapter's instance.
+    let device_api = unsafe {
+        shared_inst
+            .raw_instance()
+            .get_physical_device_properties(phys)
+    }
+    .api_version;
+    // Promoted extensions count as core only when both instance and device reach that version.
+    let api_version = effective_api_version(shared_inst.instance_api_version(), device_api);
     let mut required = required_vulkan_extensions(api_version);
     for ext in extra_cstrs {
         if !required.contains(&ext) {
@@ -481,6 +502,19 @@ mod tests {
         assert!(vk10.contains(&khr::external_memory::NAME));
         assert!(vk10.contains(&khr::external_semaphore::NAME));
         assert!(vk10.contains(&khr::timeline_semaphore::NAME));
+    }
+
+    #[test]
+    fn effective_api_version_is_capped_by_the_instance() {
+        assert_eq!(
+            effective_api_version(vk::API_VERSION_1_1, vk::API_VERSION_1_3),
+            vk::API_VERSION_1_1,
+            "a 1.1 instance cannot use core 1.2 device entry points"
+        );
+        assert_eq!(
+            effective_api_version(vk::API_VERSION_1_3, vk::API_VERSION_1_2),
+            vk::API_VERSION_1_2
+        );
     }
 
     #[cfg(windows)]

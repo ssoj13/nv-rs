@@ -9,13 +9,18 @@
 //!   wraps it via `wgpu::hal::dx12::Device::buffer_from_raw`, and imports via
 //!   `MemoryHandle::D3d12Resource`.
 //!
-//! Drop order guarantees `RawDeviceBuffer` -> `ExternalMemory` -> `wgpu::Buffer` ->
-//! native `VkBuffer`/`VkDeviceMemory` (via refcounted backing shared with `wgpu-hal`'s
-//! `DropCallback`) so Vulkan memory is never freed while either side holds a reference.
+//! Drop order: `SharedBuffer::drop` first waits for its last ownership-barrier submission, then
+//! `RawDeviceBuffer` -> `ExternalMemory` -> `wgpu::Buffer` -> native `VkBuffer`/`VkDeviceMemory`
+//! (via a refcounted backing shared with `wgpu-hal`'s `DropCallback`) -> `wgpu::Device`, so the
+//! native buffer is destroyed only after `SharedBuffer`'s own CUDA views and `wgpu::Buffer` are
+//! gone and while the `VkDevice` is still alive. CUDA views cloned out of it
+//! ([`SharedBuffer::cuda_buffer`], [`SharedBuffer::external_memory`]) keep the CUDA import alive
+//! but not the native allocation: drop them first, or finish their CUDA work before dropping
+//! the `SharedBuffer`.
 //!
 //! Used by callers and GPU interop tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ash::vk;
 use cuda_core::{Context, RawDeviceBuffer};
@@ -29,8 +34,8 @@ use windows::Win32::Graphics::{Direct3D12, Dxgi};
 use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
 use crate::platform::{
-    ExternalMemoryKind, VkBarrierRunner, export_vk_memory, find_vk_memory_type_index,
-    map_vk_buffer_usage, vk_external_memory_handle_type,
+    ExternalMemoryKind, export_vk_memory, find_vk_memory_type_index, map_vk_buffer_usage,
+    submit_vulkan_raw, vk_external_memory_handle_type, wait_for_submission,
 };
 use crate::sync::InteropSemaphore;
 
@@ -65,9 +70,14 @@ pub fn validate_buffer_descriptor(desc: &SharedBufferDescriptor<'_>) -> Result<(
             "externally shared buffers cannot combine MAP_READ or MAP_WRITE",
         ));
     }
-    if desc.usage.contains(wgpu::BufferUsages::UNIFORM) && !desc.size.is_multiple_of(256) {
+    // Acceleration-structure inputs need device-address memory and AS build usage flags, which
+    // this exporter does not allocate.
+    if desc
+        .usage
+        .intersects(wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::TLAS_INPUT)
+    {
         return Err(Error::InvalidInput(
-            "uniform shared buffer size must be a multiple of 256 bytes",
+            "externally shared buffers cannot be acceleration-structure build inputs",
         ));
     }
     Ok(())
@@ -95,8 +105,8 @@ impl Drop for VkBufferBacking {
 enum BufferNativeBacking {
     Vulkan {
         vk: Arc<VkBufferBacking>,
-        barrier_runner: Box<VkBarrierRunner>,
-        barrier_queue: Option<vk::Queue>,
+        /// `wgpu`'s queue family: the family side of ownership transfers.
+        queue_family: u32,
     },
     #[cfg(windows)]
     Dx12 {
@@ -107,17 +117,33 @@ enum BufferNativeBacking {
 /// Zero-copy GPU buffer accessible simultaneously as [`wgpu::Buffer`] and
 /// [`cuda_core::RawDeviceBuffer`].
 ///
-/// Field drop order is structural:
+/// `Drop` first waits for the last ownership barrier submitted for this buffer (it references
+/// the native buffer outside `wgpu`'s tracking), then fields drop in declaration order:
 /// 1. `cuda_buf` (`RawDeviceBuffer`)
 /// 2. `ext_mem` (`Arc<ExternalMemory>`)
 /// 3. `wgpu_buf` (`wgpu::Buffer`)
 /// 4. `backing` (`Arc<VkBufferBacking>` / COM `ID3D12Resource`)
+/// 5. `device` (`wgpu::Device`), which keeps the `VkDevice` alive for step 4
 pub struct SharedBuffer {
     cuda_buf: RawDeviceBuffer,
     ext_mem: Arc<ExternalMemory>,
     wgpu_buf: wgpu::Buffer,
     backing: BufferNativeBacking,
     size: u64,
+    last_barrier: Mutex<Option<wgpu::SubmissionIndex>>,
+    device: wgpu::Device,
+}
+
+impl Drop for SharedBuffer {
+    fn drop(&mut self) {
+        // Poisoning only means a panic elsewhere while storing an index; the value is intact.
+        let last = self
+            .last_barrier
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        wait_for_submission(&self.device, last, "SharedBuffer");
+    }
 }
 
 // SAFETY: `RawDeviceBuffer`, `ExternalMemory`, `wgpu::Buffer`, and Vulkan/DX12 handles are Send.
@@ -132,18 +158,9 @@ impl SharedBuffer {
         cuda_ctx: &Arc<Context>,
         desc: &SharedBufferDescriptor<'_>,
     ) -> Result<Self> {
-        Self::create_with_barrier_queue(device, cuda_ctx, desc, None)
-    }
-
-    pub(crate) fn create_with_barrier_queue(
-        device: &wgpu::Device,
-        cuda_ctx: &Arc<Context>,
-        desc: &SharedBufferDescriptor<'_>,
-        barrier_queue: Option<vk::Queue>,
-    ) -> Result<Self> {
         validate_buffer_descriptor(desc)?;
         match verify_device_interop_support(device)? {
-            InteropBackend::Vulkan => Self::create_vulkan(device, cuda_ctx, desc, barrier_queue),
+            InteropBackend::Vulkan => Self::create_vulkan(device, cuda_ctx, desc),
             #[cfg(windows)]
             InteropBackend::Dx12 => Self::create_dx12(device, cuda_ctx, desc),
         }
@@ -153,7 +170,6 @@ impl SharedBuffer {
         device: &wgpu::Device,
         cuda_ctx: &Arc<Context>,
         desc: &SharedBufferDescriptor<'_>,
-        barrier_queue: Option<vk::Queue>,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
         let hal_dev =
@@ -231,8 +247,6 @@ impl SharedBuffer {
             memory: vk_mem,
         });
 
-        let barrier_runner = Box::new(VkBarrierRunner::new(raw_dev.clone(), queue_family)?);
-
         let exported = export_vk_memory(instance, raw_dev, vk_mem)?;
         let ext_mem = exported.import_cuda_memory(
             cuda_ctx,
@@ -266,10 +280,11 @@ impl SharedBuffer {
             wgpu_buf,
             backing: BufferNativeBacking::Vulkan {
                 vk: vk_backing,
-                barrier_runner,
-                barrier_queue,
+                queue_family,
             },
             size: desc.size,
+            last_barrier: Mutex::new(None),
+            device: device.clone(),
         })
     }
 
@@ -294,7 +309,13 @@ impl SharedBuffer {
             VisibleNodeMask: 1,
         };
         let mut flags = Direct3D12::D3D12_RESOURCE_FLAG_NONE;
-        if desc.usage.contains(wgpu::BufferUsages::STORAGE) {
+        // wgpu-core binds INDIRECT (validation) and QUERY_RESOLVE (timestamp normalization)
+        // buffers as read-write storage too.
+        if desc.usage.intersects(
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::QUERY_RESOLVE,
+        ) {
             flags |= Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }
         let res_desc = Direct3D12::D3D12_RESOURCE_DESC {
@@ -369,6 +390,8 @@ impl SharedBuffer {
                 _resource: resource,
             },
             size: desc.size,
+            last_barrier: Mutex::new(None),
+            device: device.clone(),
         })
     }
 
@@ -408,11 +431,13 @@ impl SharedBuffer {
     /// On DX12 this routes `wait` and `signal` through `queue.submit(empty)` so pending
     /// `wgpu` writes flush and `wait` executes before `signal`.
     ///
-    /// # Vulkan Queue Synchronization
+    /// # Queue Synchronization
     ///
-    /// Calls `nv-wgpu`'s internal submission mutex (`VK_QUEUE_SUBMIT_LOCK`), but callers
-    /// must not concurrently call `wgpu::Queue::submit` or `SurfaceTexture::present` on the
-    /// same `queue` from another thread while a Vulkan ownership barrier executes.
+    /// On both backends the work goes through `wgpu::Queue::submit` (Vulkan: the barrier is
+    /// recorded into a `wgpu` command encoder), so it is safe next to other threads' submits and
+    /// presents, and `wgpu`'s pending `write_buffer` uploads are submitted before the barrier.
+    /// `wait` / `signal` are staged on `queue` just before that submit; a submit from another
+    /// thread in between would consume them, so serialize submits that use semaphores.
     pub fn release_to_cuda(
         &self,
         queue: &wgpu::Queue,
@@ -425,9 +450,9 @@ impl SharedBuffer {
     /// Submits an optional Vulkan queue-family ownership acquire barrier from
     /// `VK_QUEUE_FAMILY_EXTERNAL` back into `wgpu`'s queue family.
     ///
-    /// # Vulkan Queue Synchronization
+    /// # Queue Synchronization
     ///
-    /// See [`Self::release_to_cuda`] for external `wgpu::Queue` synchronization rules.
+    /// See [`Self::release_to_cuda`].
     pub fn acquire_from_cuda(
         &self,
         queue: &wgpu::Queue,
@@ -445,12 +470,8 @@ impl SharedBuffer {
         signal: Option<(&InteropSemaphore, u64)>,
     ) -> Result<()> {
         match &self.backing {
-            BufferNativeBacking::Vulkan {
-                vk,
-                barrier_runner,
-                barrier_queue,
-            } => {
-                let wgpu_family = barrier_runner.queue_family();
+            BufferNativeBacking::Vulkan { vk, queue_family } => {
+                let wgpu_family = *queue_family;
                 let (src_family, dst_family, src_access, dst_access) = if acquire_to_wgpu {
                     (
                         vk::QUEUE_FAMILY_EXTERNAL,
@@ -476,37 +497,27 @@ impl SharedBuffer {
                     .offset(0)
                     .size(self.size);
 
-                let wait_pair = match wait {
-                    Some((sem, val)) => Some((
-                        sem.vulkan_handle().ok_or_else(|| Error::BackendMismatch {
-                            expected: "Vulkan",
-                            found: sem.wgpu_backend(),
-                        })?,
-                        val,
-                    )),
-                    None => None,
-                };
-                let signal_pair = match signal {
-                    Some((sem, val)) => Some((
-                        sem.vulkan_handle().ok_or_else(|| Error::BackendMismatch {
-                            expected: "Vulkan",
-                            found: sem.wgpu_backend(),
-                        })?,
-                        val,
-                    )),
-                    None => None,
-                };
-
-                crate::platform::with_barrier_vk_queue(queue, *barrier_queue, |raw_q| {
-                    barrier_runner.submit_buffer_barrier(
-                        raw_q,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        &barrier,
-                        wait_pair,
-                        signal_pair,
-                    )
-                })
+                let ((), index) = submit_vulkan_raw(&self.device, queue, wait, signal, |cmd| {
+                    // SAFETY: `cmd` is recording, and `barrier` names this backing's live buffer,
+                    // which `Drop` keeps alive until this submission completes.
+                    unsafe {
+                        vk.device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            core::slice::from_ref(&barrier),
+                            &[],
+                        );
+                    }
+                    Ok(())
+                })?;
+                *self
+                    .last_barrier
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(index);
+                Ok(())
             }
             #[cfg(windows)]
             BufferNativeBacking::Dx12 { .. } => {
@@ -521,7 +532,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffer_descriptor_validation_rejects_zero_mappable_and_unaligned_uniform() {
+    fn buffer_descriptor_validation_rejects_zero_mappable_and_acceleration_inputs() {
         assert!(
             validate_buffer_descriptor(&SharedBufferDescriptor {
                 label: None,
@@ -558,11 +569,20 @@ mod tests {
             .is_err()
         );
 
+        // Neither WebGPU nor Vulkan constrains a uniform buffer's size to 256 bytes (only
+        // dynamic binding offsets are aligned).
+        validate_buffer_descriptor(&SharedBufferDescriptor {
+            label: None,
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+        .unwrap();
+
         assert!(
             validate_buffer_descriptor(&SharedBufferDescriptor {
                 label: None,
-                size: 128,
-                usage: wgpu::BufferUsages::UNIFORM,
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::BLAS_INPUT,
             })
             .is_err()
         );

@@ -185,12 +185,14 @@ impl TextureObject {
         channels: u32,
         desc: TextureDesc,
     ) -> Result<Self, DriverError> {
-        let row = width * format.bytes() * channels as usize;
         if !matches!(channels, 1 | 2 | 4)
-            || pitch_bytes < row
-            || pitch_bytes
-                .checked_mul(height)
-                .is_none_or(|n| n > buffer.len_bytes())
+            || !pitched_fits(
+                width,
+                height,
+                pitch_bytes,
+                format.bytes() * channels as usize,
+                buffer.len_bytes(),
+            )
         {
             return Err(invalid_value());
         }
@@ -282,6 +284,22 @@ impl TextureObject {
     }
 }
 
+/// Whether a non-empty `width` x `height` view of `elem_bytes`-byte texels at `pitch` bytes per
+/// row fits in `len` bytes. The last row needs only its own bytes, not a whole pitch.
+fn pitched_fits(width: usize, height: usize, pitch: usize, elem_bytes: usize, len: usize) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let Some(row) = width.checked_mul(elem_bytes) else {
+        return false;
+    };
+    pitch >= row
+        && pitch
+            .checked_mul(height - 1)
+            .and_then(|n| n.checked_add(row))
+            .is_some_and(|end| end <= len)
+}
+
 impl Drop for TextureObject {
     fn drop(&mut self) {
         let raw = self.raw;
@@ -335,5 +353,27 @@ impl Drop for SurfaceObject {
         let raw = self.raw;
         // SAFETY: owned handle; work using it must have completed (the caller's stream contract).
         teardown(&self.ctx, || unsafe { sys::cuSurfObjectDestroy(raw) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pitched_bounds_need_only_one_row_after_the_last_pitch() {
+        // 3 rows of 16 bytes at a 64-byte pitch end at 2 * 64 + 16 = 144.
+        assert!(pitched_fits(4, 3, 64, 4, 144));
+        assert!(!pitched_fits(4, 3, 64, 4, 143));
+        assert!(!pitched_fits(0, 3, 64, 4, 1024), "zero width");
+        assert!(!pitched_fits(4, 0, 64, 4, 1024), "zero height");
+        assert!(
+            !pitched_fits(32, 1, 64, 4, 1024),
+            "pitch shorter than a row"
+        );
+        assert!(
+            !pitched_fits(usize::MAX, 1, usize::MAX, 4, usize::MAX),
+            "row size overflow is rejected, not wrapped"
+        );
     }
 }

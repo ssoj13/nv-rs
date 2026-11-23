@@ -33,7 +33,7 @@ pub mod sparse;
 pub mod texture;
 
 pub use array::{Array, ArrayDesc, ArrayFormat, MipmappedArray};
-pub use device_id::{Luid, device_luid, device_uuid};
+pub use device_id::{DeviceRef, Luid, device_luid, device_uuid};
 pub use external::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 pub use green::{GreenContext, split_sms};
 pub use host::{HostRegistration, ManagedBuffer};

@@ -18,6 +18,7 @@ use cuda_core::sys;
 use cuda_core::{Context, DeviceAllocation, DriverError, IntoResult, RawDeviceBuffer, Stream};
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// An exported memory object, by the handle kind its exporter produced.
 #[derive(Clone, Copy, Debug)]
@@ -139,14 +140,17 @@ impl ExternalMemory {
     }
 
     /// The memory at `offset` as a mipmapped array of `levels` levels described by `desc`
-    /// (the layout must match how the exporter created its image).
+    /// (the layout must match how the exporter created its image; set
+    /// [`ArrayDesc::color_attachment`] when the image is a graphics colour target).
     pub fn mapped_mipmapped_array(
         self: &Arc<Self>,
         offset: u64,
         desc: &ArrayDesc,
         levels: u32,
     ) -> Result<MipmappedArray, DriverError> {
-        if levels == 0 || offset >= self.size {
+        desc.validate()?;
+        desc.check_levels(levels)?;
+        if offset >= self.size {
             return Err(invalid_value());
         }
         self.ctx.bind_to_thread()?;
@@ -222,10 +226,17 @@ pub enum SemaphoreHandle {
 }
 
 /// An imported semaphore, signalled and waited on from CUDA streams.
+///
+/// cuda.h (`cuDestroyExternalSemaphore`): "Any outstanding signals or waits must have completed
+/// before the semaphore is destroyed." Once a signal or wait has been enqueued, dropping
+/// therefore synchronizes the owning context first; a wait whose signal is never submitted
+/// blocks that drop forever.
 pub struct ExternalSemaphore {
     raw: sys::CUexternalSemaphore,
     /// Timeline semaphores and D3D12 fences carry a 64-bit value; binary semaphores do not.
     valued: bool,
+    /// Set before the first signal or wait is enqueued; `Drop` then waits for the context.
+    enqueued: AtomicBool,
     ctx: Arc<Context>,
 }
 
@@ -279,8 +290,18 @@ impl ExternalSemaphore {
         Ok(Arc::new(Self {
             raw,
             valued,
+            enqueued: AtomicBool::new(false),
             ctx: ctx.clone(),
         }))
+    }
+
+    /// Rejects a stream of another context and records that work will reference the semaphore.
+    fn prepare_enqueue(&self, stream: &Stream, value: u64) -> Result<(), DriverError> {
+        if (!self.valued && value != 0) || stream.context().cu_ctx() != self.ctx.cu_ctx() {
+            return Err(invalid_value());
+        }
+        self.enqueued.store(true, Ordering::Release);
+        self.ctx.bind_to_thread()
     }
 
     /// Whether the semaphore carries a value (timeline / fence) rather than a binary state.
@@ -288,13 +309,10 @@ impl ExternalSemaphore {
         self.valued
     }
 
-    /// Enqueues a signal on `stream`: sets a timeline / fence to `value`, or signals a binary
-    /// semaphore (`value` must then be 0).
+    /// Enqueues a signal on `stream` (a stream of this semaphore's context): sets a timeline /
+    /// fence to `value`, or signals a binary semaphore (`value` must then be 0).
     pub fn signal(&self, stream: &Stream, value: u64) -> Result<(), DriverError> {
-        if !self.valued && value != 0 {
-            return Err(invalid_value());
-        }
-        self.ctx.bind_to_thread()?;
+        self.prepare_enqueue(stream, value)?;
         // SAFETY: zeroed params, then the fence value.
         let mut p: sys::CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS = unsafe { std::mem::zeroed() };
         p.params.fence.value = value;
@@ -303,13 +321,10 @@ impl ExternalSemaphore {
             .result()
     }
 
-    /// Enqueues a wait on `stream` until a timeline / fence reaches `value`, or a binary
-    /// semaphore is signalled (`value` must then be 0).
+    /// Enqueues a wait on `stream` (a stream of this semaphore's context) until a timeline /
+    /// fence reaches `value`, or a binary semaphore is signalled (`value` must then be 0).
     pub fn wait(&self, stream: &Stream, value: u64) -> Result<(), DriverError> {
-        if !self.valued && value != 0 {
-            return Err(invalid_value());
-        }
-        self.ctx.bind_to_thread()?;
+        self.prepare_enqueue(stream, value)?;
         // SAFETY: zeroed params, then the fence value.
         let mut p: sys::CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS = unsafe { std::mem::zeroed() };
         p.params.fence.value = value;
@@ -320,9 +335,14 @@ impl ExternalSemaphore {
 
 impl Drop for ExternalSemaphore {
     fn drop(&mut self) {
+        // Every signal and wait ran on a stream of `ctx` (checked when enqueued), so one context
+        // synchronize retires all of them, as `cuDestroyExternalSemaphore` requires.
+        if *self.enqueued.get_mut() {
+            self.ctx.record_err(self.ctx.synchronize());
+        }
         let raw = self.raw;
-        // SAFETY: the semaphore is owned here; pending stream operations keep the driver object
-        // alive internally until they complete.
+        // SAFETY: the semaphore is owned here, and every signal or wait enqueued through it has
+        // completed (context synchronized above, or nothing was ever enqueued).
         teardown(&self.ctx, || unsafe {
             sys::cuDestroyExternalSemaphore(raw)
         });

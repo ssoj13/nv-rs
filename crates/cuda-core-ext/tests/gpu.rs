@@ -27,6 +27,67 @@ fn device_uuid_and_luid_are_reported() {
 
 #[test]
 #[ignore = "GPU"]
+fn device_identity_needs_no_context() {
+    let ctx = ctx();
+    let dev = cuda_core::Device::new(0).expect("device 0");
+    assert_eq!(
+        cuda_core_ext::device_uuid(&dev).expect("uuid from Device"),
+        cuda_core_ext::device_uuid(&ctx).expect("uuid from Context"),
+    );
+}
+
+#[test]
+#[ignore = "GPU"]
+fn cubemap_mip_levels_keep_six_faces() {
+    let ctx = ctx();
+    let stream = ctx.default_stream();
+    let cube = ArrayDesc {
+        depth: 6,
+        cubemap: true,
+        ..ArrayDesc::d2(8, 8, ArrayFormat::U8, 4)
+    };
+    let mips = MipmappedArray::new(&ctx, cube, 2).expect("cubemap mips");
+    let l1 = mips.level(1).expect("level 1");
+    assert_eq!(
+        (l1.desc().width, l1.desc().height, l1.desc().depth),
+        (4, 4, 6)
+    );
+    // Every face of level 1 round-trips: faces 3..5 were never copied before the fix.
+    let data: Vec<u8> = (0..l1.desc().total_bytes())
+        .map(|i| (i * 13 % 251) as u8)
+        .collect();
+    l1.upload(&stream, &data).expect("upload all faces");
+    let mut back = vec![0u8; data.len()];
+    l1.download(&stream, &mut back).expect("download all faces");
+    assert_eq!(back, data);
+    assert!(
+        MipmappedArray::new(&ctx, ArrayDesc::d2(64, 16, ArrayFormat::F32, 1), 20).is_err(),
+        "a chain longer than 1 + log2(64) is rejected, not clamped"
+    );
+}
+
+#[test]
+#[ignore = "GPU"]
+fn foreign_context_streams_are_rejected() {
+    let ctx = ctx();
+    let parts = cuda_core_ext::split_sms(&ctx, 8).expect("split");
+    let green = parts
+        .first()
+        .expect("one partition")
+        .stream()
+        .expect("green stream");
+    let desc = ArrayDesc::d2(4, 4, ArrayFormat::U8, 4);
+    let array = Array::new(&ctx, desc).expect("array");
+    assert!(
+        array
+            .upload(&green, &vec![0u8; desc.total_bytes()])
+            .is_err(),
+        "a stream of a green context is not a stream of the array's context"
+    );
+}
+
+#[test]
+#[ignore = "GPU"]
 fn array_round_trips_host_data() {
     let ctx = ctx();
     let stream = ctx.default_stream();

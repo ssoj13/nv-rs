@@ -8,7 +8,7 @@ use ash::vk;
 use cuda_core::{Context, IntoResult, sys};
 use cuda_core_ext::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 use gpu_info::external::{SharedBuffer, device_uuid};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 const N: usize = 4096;
 
@@ -55,7 +55,9 @@ fn vulkan_buffer_and_timeline_semaphore_round_trip() {
         )
     };
     let ty = vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32;
-    // SAFETY: standard timeline-semaphore creation and Win32 export on a live device.
+    // SAFETY: standard timeline-semaphore creation and Win32 export on a live device; the
+    // exported NT handle is fresh and owned by this test, so `OwnedHandle` may adopt it (CUDA does
+    // not consume Win32 handles, so it is closed when `sem_handle` drops).
     let (sem, sem_handle) = unsafe {
         let mut kind =
             vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
@@ -76,11 +78,17 @@ fn vulkan_buffer_and_timeline_semaphore_round_trip() {
                     .handle_type(ty),
             )
             .expect("export");
-        (sem, h)
+        (
+            sem,
+            OwnedHandle::from_raw_handle(h as *mut std::ffi::c_void),
+        )
     };
     // SAFETY: a live timeline semaphore exported as an NT handle on this GPU.
     let timeline = unsafe {
-        ExternalSemaphore::import(&ctx, SemaphoreHandle::TimelineWin32(sem_handle as *mut _))
+        ExternalSemaphore::import(
+            &ctx,
+            SemaphoreHandle::TimelineWin32(sem_handle.as_raw_handle()),
+        )
     }
     .expect("import semaphore");
     assert!(timeline.is_valued());

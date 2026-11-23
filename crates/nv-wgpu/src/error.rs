@@ -96,6 +96,21 @@ pub enum Error {
     /// Failed to request a `wgpu` adapter or device.
     #[error("wgpu request failed: {0}")]
     WgpuRequest(String),
+
+    /// A host wait ended at its timeout before the GPU reached the awaited value.
+    #[error("timed out in {what}")]
+    Timeout {
+        /// The wait that timed out.
+        what: &'static str,
+    },
+
+    /// A mutex guarding internal state was poisoned by a panic on another thread.
+    #[error("internal state poisoned: {0}")]
+    Poisoned(&'static str),
+
+    /// `wgpu::Device::poll` failed while waiting for a submission to complete.
+    #[error("wgpu device poll failed: {0}")]
+    Poll(#[from] wgpu::PollError),
 }
 
 impl Error {
@@ -160,5 +175,19 @@ mod tests {
 
         let vk_err = Error::vulkan("vkCreateImage", ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
         assert!(vk_err.to_string().contains("vkCreateImage"));
+
+        let timeout = Error::Timeout {
+            what: "vkWaitSemaphores",
+        };
+        assert!(
+            timeout
+                .to_string()
+                .contains("timed out in vkWaitSemaphores")
+        );
+        assert!(
+            Error::Poisoned("INTERNED")
+                .to_string()
+                .contains("poisoned: INTERNED")
+        );
     }
 }

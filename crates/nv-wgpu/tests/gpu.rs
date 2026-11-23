@@ -46,17 +46,22 @@ fn open_vulkan_interop() -> InteropContext {
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+    let mut failures = Vec::new();
     for adapter in adapters {
-        if let Ok(ctx) = InteropContext::open_vulkan(
+        match InteropContext::open_vulkan(
             &adapter,
             wgpu::Features::empty(),
             &wgpu::Limits::default(),
             Some("nv-wgpu-vulkan-test"),
         ) {
-            return ctx;
+            Ok(ctx) => return ctx,
+            Err(err) => failures.push(format!("{}: {err}", adapter.get_info().name)),
         }
     }
-    panic!("no Vulkan adapter matched an active NVIDIA CUDA device with external interop");
+    panic!(
+        "no Vulkan adapter matched an active NVIDIA CUDA device with external interop; \
+         per-adapter errors: {failures:?}"
+    );
 }
 
 #[cfg(windows)]
@@ -285,11 +290,12 @@ fn run_buffer_roundtrip(ctx: &InteropContext) {
     let got_a = readback_wgpu_buffer(ctx.device(), ctx.queue(), shared.wgpu_buffer(), len as u64);
     assert_eq!(got_a, pattern_a, "wgpu must see exact CUDA writes");
 
-    // 2. wgpu writes pattern_b -> releases & signals sem=2 -> CUDA waits on sem=2 & reads back
+    // 2. wgpu writes pattern_b -> releases & signals sem=2 -> CUDA waits on sem=2 & reads back.
+    // No manual `submit(empty)`: the release itself must carry wgpu's pending write ahead of the
+    // barrier and the signal on both backends.
     let pattern_b: Vec<u8> = (0..len).map(|i| ((i * 31 + 3) & 0xff) as u8).collect();
     ctx.queue()
         .write_buffer(shared.wgpu_buffer(), 0, &pattern_b);
-    ctx.queue().submit(std::iter::empty());
     shared
         .release_to_cuda(ctx.queue(), None, Some((&sem, 2)))
         .expect("release_to_cuda");
@@ -506,20 +512,311 @@ fn negative_validation_and_device_matching_on_gpu() {
             break;
         }
     }
-    if let Some((adapter, ic)) = tested_pair {
-        nv_wgpu::verify_matching_cuda_device(&adapter, ic.device(), ic.cuda_context())
-            .expect("matching CUDA context must pass");
-        let count = CudaContext::device_count().expect("device_count");
-        let active_ord = ic.cuda_context().ordinal();
-        for ord in 0..count {
-            let ord_usize = ord as usize;
-            if ord_usize != active_ord
-                && let Ok(other_ctx) = CudaContext::new(ord_usize)
-            {
-                let err = nv_wgpu::verify_matching_cuda_device(&adapter, ic.device(), &other_ctx)
-                    .expect_err("different CUDA ordinal must fail with DeviceMismatch");
-                assert!(matches!(err, Error::DeviceMismatch { .. }));
-            }
+    let (adapter, ic) =
+        tested_pair.expect("open_vulkan_interop succeeded above, so one adapter opens");
+    nv_wgpu::verify_matching_cuda_device(&adapter, ic.device(), ic.cuda_context())
+        .expect("matching CUDA context must pass");
+    let count = CudaContext::device_count().expect("device_count");
+    if count < 2 {
+        eprintln!("skipped: device-mismatch check needs a second CUDA device (found {count})");
+        return;
+    }
+    let active_ord = ic.cuda_context().ordinal();
+    for ord in 0..count {
+        let ord_usize = ord as usize;
+        if ord_usize != active_ord {
+            let other_ctx = CudaContext::new(ord_usize).expect("second CUDA device context");
+            let err = nv_wgpu::verify_matching_cuda_device(&adapter, ic.device(), &other_ctx)
+                .expect_err("different CUDA ordinal must fail with DeviceMismatch");
+            assert!(matches!(err, Error::DeviceMismatch { .. }));
         }
     }
+}
+
+/// NW-01 / CE-03: a dropped semaphore must leave nothing staged on `wgpu`'s queue (the next
+/// submit would otherwise wait on a destroyed `VkSemaphore`) and must not destroy the CUDA
+/// import under enqueued CUDA work.
+#[test]
+#[ignore = "GPU"]
+fn vulkan_semaphore_drop_unstages_and_waits() {
+    let ctx = open_vulkan_interop();
+    let stream = ctx.cuda_context().new_stream().expect("stream");
+    let sem = ctx.create_semaphore(0).expect("semaphore");
+    sem.signal_from_cuda(&stream, 1).expect("signal 1");
+    sem.wait_in_cuda(&stream, 1).expect("wait 1");
+    assert!(
+        sem.signal_from_host(1).is_err(),
+        "re-signalling a timeline value is rejected"
+    );
+    // Never signalled: if this wait stayed staged after the drop, the submit below would
+    // reference a destroyed semaphore and hang the queue.
+    sem.stage_wait_in_wgpu(ctx.queue(), 1_000)
+        .expect("stage wait");
+    drop(sem);
+    ctx.queue().submit(std::iter::empty());
+    ctx.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("queue drains without the dropped semaphore");
+    ctx.cuda_context()
+        .check_err()
+        .expect("no deferred CUDA teardown errors");
+}
+
+/// NW-11: `submit_vulkan_commands` holds no `nv-wgpu` lock while its closure runs, so nested
+/// `nv-wgpu` submissions do not deadlock.
+#[test]
+#[ignore = "GPU"]
+fn vulkan_raw_commands_allow_nested_barriers() {
+    let ctx = open_vulkan_interop();
+    let tex = ctx
+        .create_texture(&SharedTextureDescriptor::d2(
+            16,
+            16,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            false,
+        ))
+        .expect("texture");
+    ctx.submit_vulkan_commands(|_cmd| {
+        tex.release_to_cuda(ctx.queue(), wgpu::TextureUses::UNINITIALIZED, None, None)
+    })
+    .expect("nested barrier inside submit_vulkan_commands");
+    tex.acquire_from_cuda(ctx.queue(), wgpu::TextureUses::COPY_DST, None, None)
+        .expect("acquire back");
+    drop(tex);
+    ctx.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+}
+
+/// Uploads a byte pattern into CUDA level `level` of `tex` and reads it back through CUDA.
+fn cuda_level_round_trip(ctx: &InteropContext, tex: &nv_wgpu::SharedTexture, level: u32) {
+    let stream = ctx.cuda_context().new_stream().expect("stream");
+    let lvl = tex.cuda_level(level).expect("level");
+    let data: Vec<u8> = (0..lvl.desc().total_bytes())
+        .map(|i| (i * 7 % 253) as u8)
+        .collect();
+    lvl.upload(&stream, &data).expect("upload");
+    let mut back = vec![0u8; data.len()];
+    lvl.download(&stream, &mut back).expect("download");
+    assert_eq!(back, data, "level {level} round trip");
+}
+
+/// NW-06 / CE-01 / NW-24: 1D, 2D-array and cubemap-with-mips textures import with the CUDA
+/// array type their dimensions call for, and every level and face round-trips through CUDA.
+#[test]
+#[ignore = "GPU"]
+fn vulkan_texture_dimensions_import_as_matching_cuda_arrays() {
+    let ctx = open_vulkan_interop();
+    let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    let base = SharedTextureDescriptor::d2(16, 16, wgpu::TextureFormat::Rgba8Unorm, usage, false);
+
+    let d1 = ctx
+        .create_texture(&SharedTextureDescriptor {
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            dimension: wgpu::TextureDimension::D1,
+            format: wgpu::TextureFormat::R32Float,
+            ..base.clone()
+        })
+        .expect("1D texture imports");
+    let d = d1.array_desc();
+    assert_eq!((d.width, d.height, d.depth), (64, 0, 0));
+    cuda_level_round_trip(&ctx, &d1, 0);
+
+    let plain = ctx.create_texture(&base).expect("2D texture");
+    assert_eq!(
+        plain.array_desc().depth,
+        0,
+        "a 2D image is not a depth-1 3D array"
+    );
+    cuda_level_round_trip(&ctx, &plain, 0);
+
+    let layers = ctx
+        .create_texture(&SharedTextureDescriptor {
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 3,
+            },
+            ..base.clone()
+        })
+        .expect("2D array texture");
+    assert_eq!(
+        (layers.array_desc().depth, layers.array_desc().layered),
+        (3, true)
+    );
+    cuda_level_round_trip(&ctx, &layers, 0);
+
+    let cube = ctx
+        .create_texture(&SharedTextureDescriptor {
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 2,
+            cubemap: true,
+            ..base.clone()
+        })
+        .expect("cubemap with mips");
+    assert_eq!(cube.cuda_level(1).expect("level 1").desc().depth, 6);
+    cuda_level_round_trip(&ctx, &cube, 0);
+    cuda_level_round_trip(&ctx, &cube, 1);
+}
+
+/// NW-07: a render-target texture maps with `CUDA_ARRAY3D_COLOR_ATTACHMENT` and its CUDA view
+/// is usable.
+#[test]
+#[ignore = "GPU"]
+fn vulkan_render_attachment_texture_maps_as_color_attachment() {
+    let ctx = open_vulkan_interop();
+    let tex = ctx
+        .create_texture(&SharedTextureDescriptor::d2(
+            32,
+            32,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            false,
+        ))
+        .expect("render-target texture");
+    assert!(tex.array_desc().color_attachment);
+    cuda_level_round_trip(&ctx, &tex, 0);
+}
+
+/// NW-08 (decider, run under `compute-sanitizer --tool memcheck`): a CUDA view that outlives
+/// its `SharedTexture` reads memory whose `VkImage` / `VkDeviceMemory` were already freed. A
+/// sanitizer error or changed data shows that the exported payload does not survive
+/// `vkFreeMemory`.
+#[test]
+#[ignore = "GPU"]
+fn cuda_view_outliving_shared_texture() {
+    let ctx = open_vulkan_interop();
+    let tex = ctx
+        .create_texture(&SharedTextureDescriptor::d2(
+            16,
+            16,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            false,
+        ))
+        .expect("texture");
+    let stream = ctx.cuda_context().new_stream().expect("stream");
+    let data: Vec<u8> = (0..16 * 16 * 4).map(|i| (i % 251) as u8).collect();
+    tex.cuda_level(0)
+        .expect("level 0")
+        .upload(&stream, &data)
+        .expect("upload");
+    let mips = std::sync::Arc::clone(tex.cuda_mipmapped_array());
+    drop(tex);
+    ctx.device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("wgpu releases the image");
+    let mut back = vec![0u8; data.len()];
+    mips.level(0)
+        .expect("level 0")
+        .download(&stream, &mut back)
+        .expect("download after the SharedTexture is gone");
+    assert_eq!(back, data, "imported payload outlives vkFreeMemory");
+}
+
+/// NW-15 / NW-23: host waits that time out report a typed timeout on Vulkan.
+#[test]
+#[ignore = "GPU"]
+fn vulkan_wait_on_host_timeout_is_typed() {
+    let ctx = open_vulkan_interop();
+    let sem = ctx.create_semaphore(0).expect("semaphore");
+    assert!(matches!(
+        sem.wait_on_host(5, 1_000_000),
+        Err(Error::Timeout { .. })
+    ));
+    sem.signal_from_host(5).expect("signal");
+    sem.wait_on_host(5, 1_000_000).expect("reached");
+}
+
+/// NW-15 / NW-23: host waits that time out report a typed timeout on DX12.
+#[cfg(windows)]
+#[test]
+#[ignore = "GPU"]
+fn dx12_wait_on_host_timeout_is_typed() {
+    let ctx = open_dx12_interop();
+    let sem = ctx.create_semaphore(0).expect("semaphore");
+    assert!(matches!(
+        sem.wait_on_host(5, 1_000_000),
+        Err(Error::Timeout { .. })
+    ));
+    sem.signal_from_host(5).expect("signal");
+    sem.wait_on_host(5, 1_000_000).expect("reached");
+}
+
+/// CE-06 (decider): does the driver reject `CUDA_EXTERNAL_MEMORY_DEDICATED` for a D3D12 heap?
+/// cuda.h only requires the flag for D3D12 resources and says nothing about heaps.
+#[cfg(windows)]
+#[test]
+#[ignore = "GPU"]
+fn dx12_heap_import_dedicated_flag() {
+    use cuda_core_ext::{ExternalMemory, MemoryHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::GENERIC_ALL;
+    use windows::Win32::Graphics::Direct3D12;
+    use windows::core::{Interface, PCWSTR};
+
+    const SIZE: u64 = 64 * 1024;
+    let ctx = open_dx12_interop();
+    // SAFETY: read-only access to the DX12 device of a live `wgpu::Device`.
+    let hal = unsafe { ctx.device().as_hal::<wgpu::hal::api::Dx12>() }.expect("dx12 device");
+    let raw = hal.raw_device();
+    let desc = Direct3D12::D3D12_HEAP_DESC {
+        SizeInBytes: SIZE,
+        Properties: Direct3D12::D3D12_HEAP_PROPERTIES {
+            Type: Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
+            CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: Direct3D12::D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        },
+        Alignment: 0,
+        Flags: Direct3D12::D3D12_HEAP_FLAG_SHARED | Direct3D12::D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+    };
+    let mut heap: Option<Direct3D12::ID3D12Heap> = None;
+    // SAFETY: valid descriptor and out-pointer on a live device.
+    unsafe { raw.CreateHeap(&desc, &mut heap) }.expect("CreateHeap(SHARED)");
+    let heap = heap.expect("heap");
+    let child: Direct3D12::ID3D12DeviceChild = heap.cast().expect("heap is a device child");
+    // SAFETY: `child` belongs to `raw` and was created with D3D12_HEAP_FLAG_SHARED.
+    let handle = unsafe { raw.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null()) }
+        .expect("CreateSharedHandle(heap)");
+    // SAFETY: a fresh NT handle owned by this test (CUDA does not consume Win32 handles).
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    let cuda = ctx.cuda_context();
+    // SAFETY: a live shared heap of `SIZE` bytes on the GPU `cuda` belongs to.
+    let plain = unsafe {
+        ExternalMemory::import(
+            cuda,
+            MemoryHandle::D3d12Heap(handle.as_raw_handle()),
+            SIZE,
+            false,
+        )
+    };
+    assert!(
+        plain.is_ok(),
+        "heap import without DEDICATED: {:?}",
+        plain.err()
+    );
+    // SAFETY: as above.
+    let dedicated = unsafe {
+        ExternalMemory::import(
+            cuda,
+            MemoryHandle::D3d12Heap(handle.as_raw_handle()),
+            SIZE,
+            true,
+        )
+    };
+    assert!(
+        dedicated.is_err(),
+        "the driver accepted DEDICATED for a heap: CE-06 is refuted"
+    );
 }

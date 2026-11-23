@@ -10,12 +10,16 @@
 //!   (`D3D12_HEAP_FLAG_SHARED` + `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS`), wraps
 //!   via `wgpu::hal::dx12::Device::texture_from_raw`, and imports via `D3d12Resource`.
 //!
-//! Drop order ensures CUDA arrays release before `ExternalMemory`, before `wgpu::Texture`,
-//! before the underlying `VkImage`/`VkDeviceMemory` or `ID3D12Resource`.
+//! Drop order: `SharedTexture::drop` first waits for its last raw barrier submission, then CUDA
+//! arrays release before `ExternalMemory`, before `wgpu::Texture`, before the underlying
+//! `VkImage`/`VkDeviceMemory` or `ID3D12Resource`, before the `wgpu::Device` that keeps the
+//! `VkDevice` alive. CUDA views cloned out of a `SharedTexture` (mipmapped array, texture and
+//! surface objects, `ExternalMemory`) keep the CUDA import alive but not the native image:
+//! drop them first, or finish their CUDA work before dropping the `SharedTexture`.
 //!
 //! Used by callers and GPU interop tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ash::vk;
 use cuda_core::{Context, IntoResult};
@@ -31,9 +35,9 @@ use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
 use crate::format::{FormatMapping, build_cuda_array_desc};
 use crate::platform::{
-    ExternalMemoryKind, VkBarrierRunner, export_vk_memory, find_vk_memory_type_index,
-    map_hal_texture_uses, map_vk_image_usage, vk_external_memory_handle_type,
-    vk_layout_for_texture_uses,
+    ExternalMemoryKind, export_vk_memory, find_vk_memory_type_index, map_hal_texture_uses,
+    map_vk_image_usage, submit_vulkan_raw, vk_external_memory_handle_type,
+    vk_layout_for_texture_uses, wait_for_submission,
 };
 use crate::sync::InteropSemaphore;
 
@@ -60,12 +64,13 @@ pub struct SharedTextureDescriptor<'a> {
     pub cuda_surface: bool,
     /// Marks a 2D texture array with `6 * N` square faces as a CUDA/Vulkan cubemap.
     pub cubemap: bool,
-    /// Initial `wgpu` layout/usage state reported to `create_texture_from_hal`.
+    /// Initial `wgpu` layout/usage state reported to `create_texture_from_hal` (Vulkan).
     ///
     /// When set to anything other than [`wgpu::TextureUses::UNINITIALIZED`] on Vulkan,
     /// creation submits a one-time transition from `VK_IMAGE_LAYOUT_UNDEFINED` to the
     /// layout corresponding to `initial_state` so first-use barriers never discard prior
-    /// CUDA writes.
+    /// CUDA writes. On DX12 the shared resource is created in `D3D12_RESOURCE_STATE_COMMON`,
+    /// which `wgpu` tracks as `UNINITIALIZED`, so this field is not used there.
     pub initial_state: wgpu::TextureUses,
 }
 
@@ -119,21 +124,57 @@ pub fn validate_texture_descriptor(
             "texture layers and mip_level_count must fit in u16",
         ));
     }
-    build_cuda_array_desc(
+    let (mapping, mut array_desc) = build_cuda_array_desc(
         desc.size,
         desc.dimension,
         desc.format,
         desc.mip_level_count,
         desc.cuda_surface,
         desc.cubemap,
-    )
+    )?;
+    // cuda.h (`cuExternalMemoryGetMappedMipmappedArray`): a mipmapped array bound as a colour
+    // target in the graphics API must be mapped with `CUDA_ARRAY3D_COLOR_ATTACHMENT`.
+    array_desc.color_attachment = desc.usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT);
+    Ok((mapping, array_desc))
+}
+
+/// Rejects a format or usage that `wgpu` does not allow on this device, before any native object
+/// exists: `create_texture_from_hal` reports missing format features only through the device's
+/// error sink, after the image and the CUDA import were already made, and does not check usages.
+///
+/// With `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` enabled, `wgpu` takes allowed usages from the
+/// adapter, which a `wgpu::Device` does not expose; then only the required features are checked.
+fn check_format_support(
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+    features: wgpu::Features,
+) -> Result<()> {
+    let required = format.required_features();
+    if !features.contains(required) {
+        return Err(Error::Unsupported {
+            what: "texture format device feature",
+            required: "the wgpu::Features the format requires",
+            found: format!("{format:?} requires {required:?}, device has {features:?}"),
+        });
+    }
+    if !features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+        let allowed = format.guaranteed_format_features(features).allowed_usages;
+        if !allowed.contains(usage) {
+            return Err(Error::Unsupported {
+                what: "texture usage for format",
+                required: "usages within the format's guaranteed wgpu usages",
+                found: format!("{format:?} does not allow {:?}", usage.difference(allowed)),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// CUDA surface object bound to a single mip level of a [`SharedTexture`].
 ///
 /// Holds an [`Arc`] clone of the underlying [`MipmappedArray`] (which retains
-/// [`ExternalMemory`]) so the backing allocation cannot be freed while this
-/// surface view is alive.
+/// [`ExternalMemory`]), so the CUDA mapping stays valid while this surface view is alive. It
+/// does not retain the native image: see the module docs for the drop rule.
 pub struct SharedSurfaceObject {
     raw: cuda_bindings::CUsurfObject,
     ctx: Arc<Context>,
@@ -189,8 +230,8 @@ impl Drop for VkImageBacking {
 enum TextureNativeBacking {
     Vulkan {
         vk: Arc<VkImageBacking>,
-        barrier_runner: Box<VkBarrierRunner>,
-        barrier_queue: Option<vk::Queue>,
+        /// `wgpu`'s queue family: the family side of ownership transfers.
+        queue_family: u32,
         mip_level_count: u32,
         array_layers: u32,
     },
@@ -203,11 +244,13 @@ enum TextureNativeBacking {
 /// Zero-copy GPU texture accessible simultaneously as [`wgpu::Texture`] and
 /// [`cuda_core_ext::MipmappedArray`].
 ///
-/// Field drop order is structural:
+/// `Drop` first waits for the last raw barrier submitted for this texture (it references the
+/// native image outside `wgpu`'s tracking), then fields drop in declaration order:
 /// 1. `cuda_array` (`Arc<MipmappedArray>`)
 /// 2. `ext_mem` (`Arc<ExternalMemory>`)
 /// 3. `wgpu_tex` (`wgpu::Texture`)
 /// 4. `backing` (`Arc<VkImageBacking>` / COM `ID3D12Resource`)
+/// 5. `device` (`wgpu::Device`), which keeps the `VkDevice` alive for step 4
 pub struct SharedTexture {
     cuda_array: Arc<MipmappedArray>,
     ext_mem: Arc<ExternalMemory>,
@@ -215,6 +258,20 @@ pub struct SharedTexture {
     backing: TextureNativeBacking,
     mapping: FormatMapping,
     array_desc: ArrayDesc,
+    last_barrier: Mutex<Option<wgpu::SubmissionIndex>>,
+    device: wgpu::Device,
+}
+
+impl Drop for SharedTexture {
+    fn drop(&mut self) {
+        // Poisoning only means a panic elsewhere while storing an index; the value is intact.
+        let last = self
+            .last_barrier
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        wait_for_submission(&self.device, last, "SharedTexture");
+    }
 }
 
 // SAFETY: `MipmappedArray`, `ExternalMemory`, `wgpu::Texture`, and Vulkan/DX12 handles are Send.
@@ -225,39 +282,26 @@ unsafe impl Sync for SharedTexture {}
 impl SharedTexture {
     /// Creates a new device-local shared texture visible to both `wgpu` and `cuda_ctx`.
     ///
-    /// # Vulkan Queue Synchronization
+    /// Fails with [`Error::Unsupported`] before allocating anything when the format needs a
+    /// `wgpu::Features` the device lacks, or `desc.usage` exceeds the format's allowed usages.
     ///
-    /// When `desc.initial_state != wgpu::TextureUses::UNINITIALIZED`, creation submits
-    /// an initial Vulkan layout transition on `queue` guarded by `nv-wgpu`'s internal
-    /// submission mutex (`VK_QUEUE_SUBMIT_LOCK`). Callers must not concurrently invoke
-    /// `wgpu::Queue::submit` or `SurfaceTexture::present` on the same `queue`.
+    /// # Queue Synchronization
+    ///
+    /// When `desc.initial_state != wgpu::TextureUses::UNINITIALIZED` on Vulkan, creation
+    /// submits the initial layout transition through `wgpu::Queue::submit` on `queue`, which is
+    /// safe next to other threads' submits and presents.
     pub fn create(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         cuda_ctx: &Arc<Context>,
         desc: &SharedTextureDescriptor<'_>,
     ) -> Result<Self> {
-        Self::create_with_barrier_queue(device, queue, cuda_ctx, desc, None)
-    }
-
-    pub(crate) fn create_with_barrier_queue(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        cuda_ctx: &Arc<Context>,
-        desc: &SharedTextureDescriptor<'_>,
-        barrier_queue: Option<vk::Queue>,
-    ) -> Result<Self> {
         let (mapping, array_desc) = validate_texture_descriptor(desc)?;
+        check_format_support(desc.format, desc.usage, device.features())?;
         match verify_device_interop_support(device)? {
-            InteropBackend::Vulkan => Self::create_vulkan(
-                device,
-                queue,
-                cuda_ctx,
-                desc,
-                mapping,
-                array_desc,
-                barrier_queue,
-            ),
+            InteropBackend::Vulkan => {
+                Self::create_vulkan(device, queue, cuda_ctx, desc, mapping, array_desc)
+            }
             #[cfg(windows)]
             InteropBackend::Dx12 => Self::create_dx12(device, cuda_ctx, desc, mapping, array_desc),
         }
@@ -270,7 +314,6 @@ impl SharedTexture {
         desc: &SharedTextureDescriptor<'_>,
         mapping: FormatMapping,
         array_desc: ArrayDesc,
-        barrier_queue: Option<vk::Queue>,
     ) -> Result<Self> {
         // SAFETY: Read-only HAL access to `wgpu`'s Vulkan device handles.
         let hal_dev =
@@ -387,11 +430,22 @@ impl SharedTexture {
             image: vk_img,
             memory: vk_mem,
         });
-        let barrier_runner = Box::new(VkBarrierRunner::new(raw_dev.clone(), queue_family)?);
 
-        // Perform an initial layout transition from UNDEFINED -> target layout if caller
-        // specified a concrete `initial_state` (for instance `STORAGE_READ_WRITE` -> GENERAL
-        // before CUDA writes first).
+        let exported = export_vk_memory(instance, raw_dev, vk_mem)?;
+        let ext_mem = exported.import_cuda_memory(
+            cuda_ctx,
+            ExternalMemoryKind::VulkanOpaque,
+            mem_reqs.size,
+            true,
+        )?;
+        let cuda_array =
+            Arc::new(ext_mem.mapped_mipmapped_array(0, &array_desc, desc.mip_level_count)?);
+
+        // Initial layout transition UNDEFINED -> layout of `initial_state` (for instance
+        // `STORAGE_READ_WRITE` -> GENERAL before CUDA writes first). Submitted after every
+        // fallible step, so no early return can destroy the image while it is in flight; from
+        // here on `SharedTexture::drop` waits for it.
+        let mut initial_barrier = None;
         if desc.initial_state != wgpu::TextureUses::UNINITIALIZED {
             let dst_layout = vk_layout_for_texture_uses(desc.initial_state);
             let subresource = vk::ImageSubresourceRange::default()
@@ -409,27 +463,24 @@ impl SharedTexture {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(vk_img)
                 .subresource_range(subresource);
-            crate::platform::with_barrier_vk_queue(queue, barrier_queue, |raw_q| {
-                barrier_runner.submit_image_barrier(
-                    raw_q,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    &barrier,
-                    None,
-                    None,
-                )
+            let ((), index) = submit_vulkan_raw(device, queue, None, None, |cmd| {
+                // SAFETY: `cmd` is recording; `barrier` names `vk_img`, which stays alive until
+                // the returned `SharedTexture` has waited for this submission.
+                unsafe {
+                    raw_dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        core::slice::from_ref(&barrier),
+                    );
+                }
+                Ok(())
             })?;
+            initial_barrier = Some(index);
         }
-
-        let exported = export_vk_memory(instance, raw_dev, vk_mem)?;
-        let ext_mem = exported.import_cuda_memory(
-            cuda_ctx,
-            ExternalMemoryKind::VulkanOpaque,
-            mem_reqs.size,
-            true,
-        )?;
-        let cuda_array =
-            Arc::new(ext_mem.mapped_mipmapped_array(0, &array_desc, desc.mip_level_count)?);
 
         let hal_desc = wgpu::hal::TextureDescriptor {
             label: desc.label,
@@ -474,13 +525,14 @@ impl SharedTexture {
             wgpu_tex,
             backing: TextureNativeBacking::Vulkan {
                 vk: vk_backing,
-                barrier_runner,
-                barrier_queue,
+                queue_family,
                 mip_level_count: desc.mip_level_count,
                 array_layers,
             },
             mapping,
             array_desc,
+            last_barrier: Mutex::new(initial_barrier),
+            device: device.clone(),
         })
     }
 
@@ -595,9 +647,16 @@ impl SharedTexture {
             usage: desc.usage,
             view_formats: &[],
         };
-        // SAFETY: `hal_tex` belongs to `device` and starts in `D3D12_RESOURCE_STATE_COMMON`.
+        // SAFETY: `hal_tex` belongs to `device` and starts in `D3D12_RESOURCE_STATE_COMMON`, the
+        // state wgpu-hal DX12 maps `UNINITIALIZED` to (`conv::map_texture_usage_to_state`); any
+        // other tracked state would make wgpu's first barrier start from a state the resource
+        // is not in.
         let wgpu_tex = unsafe {
-            device.create_texture_from_hal::<Dx12>(hal_tex, &wgpu_desc, desc.initial_state)
+            device.create_texture_from_hal::<Dx12>(
+                hal_tex,
+                &wgpu_desc,
+                wgpu::TextureUses::UNINITIALIZED,
+            )
         };
 
         Ok(Self {
@@ -609,6 +668,8 @@ impl SharedTexture {
             },
             mapping,
             array_desc,
+            last_barrier: Mutex::new(None),
+            device: device.clone(),
         })
     }
 
@@ -727,11 +788,21 @@ impl SharedTexture {
     /// On DX12 this routes `wait` and `signal` through `queue.submit(empty)` so pending
     /// `wgpu` writes flush and `wait` executes before `signal`.
     ///
-    /// # Vulkan Queue Synchronization
+    /// # Layout contract (Vulkan)
     ///
-    /// Uses `nv-wgpu`'s internal submission mutex (`VK_QUEUE_SUBMIT_LOCK`), but callers
-    /// must not concurrently call `wgpu::Queue::submit` or `SurfaceTexture::present` on the
-    /// same `queue` from another thread while a Vulkan ownership barrier executes.
+    /// The barrier changes the real `VkImage` layout, but `wgpu`'s resource tracker is not told.
+    /// `from_uses` must be the state `wgpu` last tracked for this texture (the barrier's old
+    /// layout), and after a later [`Self::acquire_from_cuda`] the texture must be in the state
+    /// `wgpu` will assume next (its `to_uses`). A mismatch makes `wgpu`'s next barrier start from
+    /// a wrong layout.
+    ///
+    /// # Queue Synchronization
+    ///
+    /// On both backends the work goes through `wgpu::Queue::submit` (Vulkan: the barrier is
+    /// recorded into a `wgpu` command encoder), so it is safe next to other threads' submits and
+    /// presents, and `wgpu`'s pending `write_texture` uploads are submitted before the barrier.
+    /// `wait` / `signal` are staged on `queue` just before that submit; a submit from another
+    /// thread in between would consume them, so serialize submits that use semaphores.
     pub fn release_to_cuda(
         &self,
         queue: &wgpu::Queue,
@@ -752,9 +823,8 @@ impl SharedTexture {
     /// Submits a Vulkan layout + queue-family ownership acquire barrier from
     /// `VK_QUEUE_FAMILY_EXTERNAL` + `VK_IMAGE_LAYOUT_GENERAL` into `wgpu`'s `to_uses`.
     ///
-    /// # Vulkan Queue Synchronization
-    ///
-    /// See [`Self::release_to_cuda`] for external `wgpu::Queue` synchronization rules.
+    /// `to_uses` must be the state `wgpu`'s tracker holds for this texture (see the layout
+    /// contract and queue synchronization notes on [`Self::release_to_cuda`]).
     pub fn acquire_from_cuda(
         &self,
         queue: &wgpu::Queue,
@@ -784,12 +854,11 @@ impl SharedTexture {
         match &self.backing {
             TextureNativeBacking::Vulkan {
                 vk,
-                barrier_runner,
-                barrier_queue,
+                queue_family,
                 mip_level_count,
                 array_layers,
             } => {
-                let wgpu_family = barrier_runner.queue_family();
+                let wgpu_family = *queue_family;
                 let (src_family, dst_family, src_access, dst_access) = if acquire_to_wgpu {
                     (
                         vk::QUEUE_FAMILY_EXTERNAL,
@@ -822,37 +891,27 @@ impl SharedTexture {
                     .image(vk.image)
                     .subresource_range(subresource);
 
-                let wait_pair = match wait {
-                    Some((sem, val)) => Some((
-                        sem.vulkan_handle().ok_or_else(|| Error::BackendMismatch {
-                            expected: "Vulkan",
-                            found: sem.wgpu_backend(),
-                        })?,
-                        val,
-                    )),
-                    None => None,
-                };
-                let signal_pair = match signal {
-                    Some((sem, val)) => Some((
-                        sem.vulkan_handle().ok_or_else(|| Error::BackendMismatch {
-                            expected: "Vulkan",
-                            found: sem.wgpu_backend(),
-                        })?,
-                        val,
-                    )),
-                    None => None,
-                };
-
-                crate::platform::with_barrier_vk_queue(queue, *barrier_queue, |raw_q| {
-                    barrier_runner.submit_image_barrier(
-                        raw_q,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        &barrier,
-                        wait_pair,
-                        signal_pair,
-                    )
-                })
+                let ((), index) = submit_vulkan_raw(&self.device, queue, wait, signal, |cmd| {
+                    // SAFETY: `cmd` is recording, and `barrier` names this backing's live image,
+                    // which `Drop` keeps alive until this submission completes.
+                    unsafe {
+                        vk.device.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            core::slice::from_ref(&barrier),
+                        );
+                    }
+                    Ok(())
+                })?;
+                *self
+                    .last_barrier
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(index);
+                Ok(())
             }
             #[cfg(windows)]
             TextureNativeBacking::Dx12 { .. } => {
@@ -925,5 +984,56 @@ mod tests {
                 ..
             })
         ));
+
+        let render_target = SharedTextureDescriptor::d2(
+            16,
+            16,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            false,
+        );
+        let (_, rt) = validate_texture_descriptor(&render_target).unwrap();
+        assert!(
+            rt.color_attachment,
+            "colour targets map with COLOR_ATTACHMENT"
+        );
+        assert!(!array.color_attachment);
+    }
+
+    #[test]
+    fn format_support_follows_wgpu_feature_and_usage_rules() {
+        let none = wgpu::Features::empty();
+        assert!(
+            check_format_support(
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING,
+                none
+            )
+            .is_err(),
+            "R16Unorm requires TEXTURE_FORMAT_16BIT_NORM"
+        );
+        check_format_support(
+            wgpu::TextureFormat::R16Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+        )
+        .unwrap();
+        assert!(
+            check_format_support(
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::TextureUsages::STORAGE_BINDING,
+                none
+            )
+            .is_err(),
+            "sRGB formats are never storage-capable"
+        );
+        check_format_support(
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            none,
+        )
+        .unwrap();
     }
 }

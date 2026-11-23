@@ -43,6 +43,16 @@ Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before c
 - [ ] W1.6b One `Scratch` owner for `cublas`, `cufft`, `cudnn`, `cusolver`, `cusparse`, `nvcomp` (SOL:X3, SOL:N1, MED:CMP-6)
 - [ ] Remaining duplication inside wrappers: OPX:S1..S4, SOL:S5, SOL:N5, BLA:LT-09, MED:X-2, IOP:NW-20, IOP:CE-09
 
+## In flight right now (2026-11-23; edit-only workers, one gate per workspace after them)
+- [~] Wave 3 `nv-demo`, four workers on disjoint files: renderer + scene host (running); main / ui / buses / persist (running); shaders + crowd + bloom + export + profiler (edits done, pre-gate); rail + anim + MP4 muxer (edits done, pre-gate)
+- [~] Wave 5: `nv-loader` + `nv-bindgen` + all `*-sys` incl. the single `nv_loader::catalog` (running); `xtask` (edits done, pre-gate; catalog items X-2/X-3/X-4 wait for the loader worker)
+- [x] Wave 5 `bootstrap.py`, CI, `deny.toml` (`a246a6a`; workflows not executed, `cargo deny` not run)
+- [~] Wave 6 `python/nv-py`: foundation done (`072dd51`: DLPack validation, `check_buf`, `enqueue_leased`; corruption reproduced from Python 10/10 and 0/10 with the lease); three workers running on `video`/`gfx_img`, `compute`/`sparse_ai`/`nvjpeg`/`nvcomp`, `platform_ext`/`sys_ext`/`nvml`; the crate does not build until they land
+- [ ] Gate root workspace (Waves 3 + 5): clippy, tests, ignored GPU tests of touched crates, then START `nv-demo` (the shader compiles only at runtime) and check AOVs / recording
+- [ ] Gate `python/` workspace: clippy, `cargo test`, pytest, stub regeneration
+- [ ] Follow-ups already known for the Wave 3 gate: rail `duration_s` survives scene rebuild like `looping` / `ease_io` (lead decision); `main.rs` reports video-finish errors in the status line; `ui.rs` takes animation ranges from `demo_anim::anim_range`; previous classic transforms for object motion (`GPU:D03`); fractal shape parameters in probe / SDG launches (`GPU:D21`); `prev_camera` during SDG bursts; `nvrtc` `dlto()` passes `--dlto`, which NVRTC 13.3 rejects
+- [ ] After the loader worker: `nv-bindgen` writes an expected-files manifest and a prebuilt-fallback marker for `xtask` (today `xtask` infers both); `xtask` consumes `nv_loader::catalog`, adds `dlssd` and companion DLLs; `release.yml` Windows step must check `$LASTEXITCODE`
+
 ## Wave 3 - `nv-demo` (after Waves 1-2: depends on `optix`, `nv-wgpu`, `ngx`, `nvenc`, `nvjpeg` APIs)
 - [ ] W3.1 Render-thread failures as events + UI liveness check (RND:R5, APP:F12); remove `.ok()` on AOV buffers and bloom (RND:R6, RND:R7)
 - [ ] W3.2 RND:H1, RND:R3, GPU:D05, RND:H2

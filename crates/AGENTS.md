@@ -35,6 +35,9 @@ OptiX objects retain dependencies through owned handles and `Arc` references. Pr
 
 ## Review checklist
 
+- A finding from review or audit is a claim until re-read against the source and the native header, and, where reading cannot decide it, measured on hardware. In the 2026-11-23 audit a substantial number of re-verified findings were refuted or much narrower than reported; they are listed one by one in `plan2.md`, "Execution record".
+- Buffer lifetime: `cuda-core` frees a dropped buffer without waiting for GPU work. Synchronous buffers (`zeroed`, `from_host`) did not corrupt in measurement; a stream-ordered buffer (`uninitialized_async`) freed on its own stream while another stream still uses it did, 20/20. Keep internal scratch on one checked stream; lease caller buffers with `cuda_core_ext::lease::enqueue_leased` where they can cross streams.
+- Scratch budgets bound the whole allocation, and the old buffer is released before the new one is allocated.
 - Search sibling wrappers when a status, dimension, lifetime, overflow, or callback bug appears.
 - Validate sizes and layout before unsafe native calls; document why each pointer remains valid.
 - Read the actual target-specific handle ownership rules before closing exported handles.

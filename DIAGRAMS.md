@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Source map verified on 2026-11-23 (`5a58bab`, `csg-rs` `539f244`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), and [bughunt & acceleration plan](plan1.md).
+Doc sync 2026-11-23 against `072dd51` (`csg-rs` `f7c8474a`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
 
 ## Build architecture
 
@@ -77,9 +77,9 @@ flowchart TD
   UI["60 Hz winit + egui UI (PresentMode::Fifo + WaitUntil 16.667ms)"] --> Bus["appbus::AppBus (StateSlot + UiCommand / RenderControl / RenderEvent)"]
   Bus --> Worker["Async OptiX Worker (renderer.rs, live optix::LogFn)"]
   Worker --> Step["CsgGpuHost::step_dynamic (TrafficStateSoA + SceneBuilt::crowd, Freeze Pose zero-motion snap)"]
-  Step --> Sync["CsgGpuHost::sync (GrowDeviceBuffer + dual 256 KiB pinned DMA for instances & prev_xforms)"]
+  Step --> Sync["CsgGpuHost::sync (GrowDeviceBuffer + dual 2 MiB pinned DMA (grows to 16 MiB) for instances & prev_xforms)"]
   Sync --> IAS["Persistent Uncompacted IAS (Accel::instances_into, compact=false, allow_update=true)"]
-  IAS --> RT["OptiX 9 RT Cores (640 B Params, SBT 0..5, 11-GAS Crowd SBT 5, SER, OMM, Motion AOV 3x3 inv, 4x RGSS AA AOVs)"]
+  IAS --> RT["OptiX 9 RT Cores (640 B Params, SBT records 0..11 (CSG at 8/9 and 10/11), 11-GAS crowd on the single-primitive group, SER, OMM, Motion AOV 3x3 inv, 4x RGSS AA AOVs)"]
   RT --> Tensor["Tensor Cores (OptiX Aov/TemporalAov Denoiser or NGX DLSS SR/RR)"]
   Tensor --> Post["CUDA Compute (cuFFT Bloom -> Tonemap / HDR scRGB / DLSS-RR Pack)"]
   Post --> Fence["Single End-of-Frame stream.synchronize() + 3-slot cuEventQuery GpuPassProfiler"]
@@ -110,9 +110,11 @@ flowchart TD
   end
 ```
 
-## Open systemic defects found by the workspace audit (`plan2.md`, 2026-11-23)
+## Systemic defects found by the workspace audit (`plan2.md`, 2026-11-23)
 
-Async work outlives the buffers it uses (wrapper crates and `python/nv-py`):
+Status: the first diagram was measured on GPU and is real only for stream-ordered buffers (`DeviceBuffer::uninitialized_async`) used across streams; it is closed for `curand` and for `python/nv-py` bindings that go through `buf_util::enqueue_leased`. The second and third are being repaired in Waves 5 and 3.
+
+Async work outlives a stream-ordered buffer used on another stream:
 
 ```mermaid
 sequenceDiagram

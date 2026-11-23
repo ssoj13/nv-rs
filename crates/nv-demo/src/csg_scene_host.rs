@@ -980,15 +980,18 @@ impl CsgGpuHost {
             .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
 
         let tod = time_of_day_from_u32(time_of_day);
-        // `key.road_mode` (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`) is stored in `CsgSceneKey` to trigger
-        // clean scene rebuilds and will pass directly into `SceneBuildConfig::road_mode` once
-        // `Cargo.lock` syncs to Wave 8 `csg-rs`.
-        let _road_mode = key.road_mode.min(3);
+        let road_mode = match key.road_mode {
+            0 => csg_scene::RoadMode::Watertight3D,
+            1 => csg_scene::RoadMode::TangentPlaneC1,
+            3 => csg_scene::RoadMode::FRepTile,
+            _ => csg_scene::RoadMode::HybridC1Sdf,
+        };
         let build_cfg = SceneBuildConfig {
             seed: u64::from(key.seed).max(1),
             wetness: wetness.clamp(0.0, 1.0),
             time_of_day: tod,
             variant_idx: key.variant_idx,
+            road_mode,
             ..SceneBuildConfig::default()
         };
         let mut built = module.build(&build_cfg);

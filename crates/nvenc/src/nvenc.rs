@@ -4,7 +4,9 @@
 //! - [`EncodeSession`] — opens an NVENC session bound to a `cuda_core::Context`, queries
 //!   preset configs ([`EncodeSession::preset_config`]) and capabilities ([`EncodeSession::caps`]),
 //!   initializes the encoder ([`EncodeSession::initialize`]), and encodes frames or flushes EOS
-//!   with zero per-frame heap allocations.
+//!   with zero per-frame heap allocations. [`EncodeOutcome::NeedMoreInput`] reports a frame
+//!   buffered for B-frame reordering; its output bitstream refuses to lock until a later
+//!   [`EncodeOutcome::Ready`] or EOS releases it.
 //! - [`InputBuffer`] / [`InputLock`] — host-accessible driver-allocated input buffers with RAII
 //!   lock/unlock.
 //! - [`RegisteredResource`] / [`MappedResource`] — zero-copy CUDA device-pointer or CUDA-array
@@ -27,7 +29,9 @@ use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::zeroed;
+use std::ptr::NonNull;
 use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Raw `NVENCSTATUS` code wrapped as a `Copy` integer newtype so newer driver codes stay valid.
@@ -171,6 +175,19 @@ fn check(
         code: StatusCode(status),
         detail,
     })
+}
+
+/// Maps an `nvEncEncodePicture` status: `NV_ENC_ERR_NEED_MORE_INPUT` is not a failure
+/// (`nvEncodeAPI.h`: "this is not a fatal error ... buffering the input frame for re-ordering").
+fn encode_outcome(
+    status: sys::NVENCSTATUS,
+    encoder: Option<*mut c_void>,
+    list: &sys::NV_ENCODE_API_FUNCTION_LIST,
+) -> Result<EncodeOutcome> {
+    if status == sys::_NVENCSTATUS_NV_ENC_ERR_NEED_MORE_INPUT {
+        return Ok(EncodeOutcome::NeedMoreInput);
+    }
+    check("nvEncEncodePicture", status, encoder, list).map(|()| EncodeOutcome::Ready)
 }
 
 /// Supported video codecs.
@@ -339,6 +356,12 @@ impl BufferFormat {
 }
 
 /// Typed input surface passed to [`EncodeSession::encode_picture`].
+///
+/// The surface must stay mapped (a live [`MappedResource`]) and unmodified (no new
+/// [`InputBuffer::lock`]) until [`OutputBitstream::lock`] has returned for the frame it carries
+/// (`nvEncodeAPI.h`, `NvEncUnmapInputResource`: "The client must unmap the buffer after
+/// ::NvEncLockBitstream() API returns successfully"). After [`EncodeOutcome::NeedMoreInput`] that is
+/// until a later submission returns [`EncodeOutcome::Ready`] (or EOS) and the frame's output is locked.
 pub enum EncodeInput<'a> {
     /// Host-accessible driver input buffer.
     Buffer(&'a InputBuffer),
@@ -388,11 +411,28 @@ impl PictureType {
     }
 }
 
+/// Successful result of [`EncodeSession::encode_picture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeOutcome {
+    /// Encoded data is ready: lock every output bitstream still pending from earlier
+    /// [`Self::NeedMoreInput`] submissions, then this call's output, in submission order.
+    Ready,
+    /// `NV_ENC_ERR_NEED_MORE_INPUT`: the frame was accepted and buffered for B-frame reordering.
+    /// Do not lock this call's output bitstream yet (it refuses with [`Error::Invalid`]); keep its
+    /// input surface alive (see [`EncodeInput`]) and submit the next frame with another output
+    /// bitstream, or call [`EncodeSession::flush_eos`].
+    NeedMoreInput,
+}
+
 /// Wrapper around `NV_ENC_CONFIG` returned by [`EncodeSession::preset_config`].
 #[derive(Clone)]
 pub struct EncodeConfig {
     /// Raw `NV_ENC_CONFIG` struct; callers may tune codec-specific fields directly.
     pub raw: sys::NV_ENC_CONFIG,
+    /// Codec the preset was queried for; selects the active `encodeCodecConfig` union arm.
+    codec: Codec,
+    /// First codec-specific setter called for the wrong codec; reported by `initialize`.
+    misuse: Option<&'static str>,
 }
 
 impl EncodeConfig {
@@ -418,10 +458,15 @@ impl EncodeConfig {
 
     /// Configures H.264 High profile with BT.709 limited-range VUI color signaling.
     ///
-    /// Call only on an [`EncodeConfig`] created for [`Codec::H264`].
+    /// On an [`EncodeConfig`] created for another codec nothing is written and
+    /// [`EncodeSession::initialize`] fails with [`Error::Invalid`].
     pub fn set_h264_bt709_vui(&mut self) {
+        if self.codec != Codec::H264 {
+            self.misuse = Some("set_h264_bt709_vui called on a non-H.264 EncodeConfig");
+            return;
+        }
         self.raw.profileGUID = guid::H264_HIGH;
-        // SAFETY: Caller created this config for `Codec::H264`, so the `h264Config` union arm is active.
+        // SAFETY: `self.codec == Codec::H264` (checked above), so `preset_config` filled the `h264Config` arm.
         let h264 = unsafe { &mut self.raw.encodeCodecConfig.h264Config };
         h264.inputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
         h264.outputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_8;
@@ -439,10 +484,15 @@ impl EncodeConfig {
     /// Configures HEVC Main 10 profile (10-bit input/output) with HDR10 BT.2020 PQ (SMPTE ST 2084)
     /// limited-range VUI color signaling.
     ///
-    /// Call only on an [`EncodeConfig`] created for [`Codec::Hevc`].
+    /// On an [`EncodeConfig`] created for another codec nothing is written and
+    /// [`EncodeSession::initialize`] fails with [`Error::Invalid`].
     pub fn set_hevc_10bit_pq(&mut self) {
+        if self.codec != Codec::Hevc {
+            self.misuse = Some("set_hevc_10bit_pq called on a non-HEVC EncodeConfig");
+            return;
+        }
         self.raw.profileGUID = guid::HEVC_MAIN10;
-        // SAFETY: Caller created this config for `Codec::Hevc`, so the `hevcConfig` union arm is active.
+        // SAFETY: `self.codec == Codec::Hevc` (checked above), so `preset_config` filled the `hevcConfig` arm.
         let hevc = unsafe { &mut self.raw.encodeCodecConfig.hevcConfig };
         hevc.inputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_10;
         hevc.outputBitDepth = sys::_NV_ENC_BIT_DEPTH_NV_ENC_BIT_DEPTH_10;
@@ -455,6 +505,19 @@ impl EncodeConfig {
         vui.transferCharacteristics =
             sys::_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE2084;
         vui.colourMatrix = sys::_NV_ENC_VUI_MATRIX_COEFFS_NV_ENC_VUI_MATRIX_COEFFS_BT2020_NCL;
+    }
+
+    /// Rejects a config whose union arm does not belong to `codec` or that saw a misused setter.
+    fn check_codec(&self, codec: Codec) -> Result<()> {
+        if let Some(msg) = self.misuse {
+            return Err(Error::Invalid(msg));
+        }
+        if self.codec != codec {
+            return Err(Error::Invalid(
+                "encode_config was queried for a different codec than SessionConfig::codec",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -509,11 +572,13 @@ pub struct EncodeFlags {
     pub output_sps_pps: bool,
 }
 
+/// Bit-reinterprets a `NV_ENC_PIC_FLAGS` constant as the `u32` `encodePicFlags` field.
+///
+/// bindgen types the C enum as `c_int` on MSVC and `c_uint` on GCC/Clang targets; the
+/// byte round-trip is exact for both without a cast (which `clippy::unnecessary_cast` flags on
+/// `c_uint` targets only).
 const fn pic_flag(flag: sys::_NV_ENC_PIC_FLAGS) -> u32 {
-    #[allow(clippy::unnecessary_cast)]
-    {
-        flag as u32
-    }
+    u32::from_ne_bytes(flag.to_ne_bytes())
 }
 
 impl EncodeFlags {
@@ -556,13 +621,40 @@ pub struct EncodeSession {
     list: &'static sys::NV_ENCODE_API_FUNCTION_LIST,
     initialized: bool,
     lock: Mutex<()>,
+    /// Incremented (under `lock`) by every `Ready` encode and every EOS flush; an output buffered at
+    /// epoch `e` by `NeedMoreInput` becomes lockable once the epoch exceeds `e`.
+    ready_epoch: AtomicU64,
+    /// Streams passed to `nvEncSetIOCudaStreams`; dropped after the encoder is destroyed.
+    io_streams: Mutex<Option<IoStreams>>,
 }
 
 // SAFETY: Transferring ownership of `EncodeSession` between threads is safe because NVENC
-// session calls are serialized and the `Arc<Context>` / static function table are `Send + Sync`.
+// session calls are serialized and the `Arc<Context>` / static function table are `Send + Sync`;
+// `IoStreams` only owns `Arc<Stream>`s and a heap cell that is never read on the Rust side.
 unsafe impl Send for EncodeSession {}
-// SAFETY: Every NVENC API call using `self.raw` is serialized by `self.lock`.
+// SAFETY: Every NVENC API call using `self.raw` is serialized by `self.lock`; `io_streams` is behind
+// its own `Mutex` and `ready_epoch` is atomic.
 unsafe impl Sync for EncodeSession {}
+
+/// CUDA streams handed to `nvEncSetIOCudaStreams`, kept alive until the session is destroyed or
+/// a later successful call replaces them.
+///
+/// NVENC receives *pointers to* `CUstream` values (`NV_ENC_CUSTREAM_PTR`); the values live in an
+/// owned heap cell with a stable address, so the call is sound whether the driver copies the
+/// handles or keeps the pointers.
+struct IoStreams {
+    cells: NonNull<[*mut c_void; 2]>,
+    _input: Arc<Stream>,
+    _output: Arc<Stream>,
+}
+
+impl Drop for IoStreams {
+    fn drop(&mut self) {
+        // SAFETY: `cells` came from `Box::leak` in `set_io_streams` and is freed only here, after the
+        // encoder stopped using it (session destroyed, call failed, or streams replaced).
+        drop(unsafe { Box::from_raw(self.cells.as_ptr()) });
+    }
+}
 
 impl EncodeSession {
     /// Opens an NVENC encoder session on `cuda`.
@@ -602,6 +694,8 @@ impl EncodeSession {
             list,
             initialized: false,
             lock: Mutex::new(()),
+            ready_epoch: AtomicU64::new(0),
+            io_streams: Mutex::new(None),
         }))
     }
 
@@ -658,7 +752,11 @@ impl EncodeSession {
             Some(self.raw),
             self.list,
         )?;
-        Ok(EncodeConfig { raw: out.presetCfg })
+        Ok(EncodeConfig {
+            raw: out.presetCfg,
+            codec,
+            misuse: None,
+        })
     }
 
     /// Initializes the encoder with `cfg`. Must be called once before encoding frames.
@@ -670,6 +768,9 @@ impl EncodeSession {
             return Err(Error::Invalid(
                 "frame rate numerator and denominator must be non-zero",
             ));
+        }
+        if let Some(enc_cfg) = &cfg.encode_config {
+            enc_cfg.check_codec(cfg.codec)?;
         }
         let this = Arc::get_mut(self).ok_or(Error::Invalid(
             "cannot initialize session while child buffers exist",
@@ -710,23 +811,39 @@ impl EncodeSession {
     }
 
     /// Binds input and output CUDA streams for subsequent encode calls (`nvEncSetIOCudaStreams`).
-    pub fn set_io_streams(&self, input: &Stream, output: &Stream) -> Result<()> {
+    ///
+    /// The session keeps both streams alive until it is destroyed or this is called again, so the
+    /// driver never uses a destroyed (or pooled and reused) `CUstream` handle.
+    pub fn set_io_streams(&self, input: &Arc<Stream>, output: &Arc<Stream>) -> Result<()> {
         let set_streams = entry!(self.list, nvEncSetIOCudaStreams);
-        let mut in_stream = input.cu_stream().cast::<c_void>();
-        let mut out_stream = output.cu_stream().cast::<c_void>();
-        let _guard = self.lock_session();
-        // SAFETY: `self.raw` is a live session and both `CUstream` handles are valid.
-        let status = unsafe {
-            set_streams(
-                self.raw,
-                (&raw mut in_stream).cast(),
-                (&raw mut out_stream).cast(),
-            )
+        let streams = IoStreams {
+            cells: NonNull::from(Box::leak(Box::new([
+                input.cu_stream().cast::<c_void>(),
+                output.cu_stream().cast::<c_void>(),
+            ]))),
+            _input: input.clone(),
+            _output: output.clone(),
         };
-        check("nvEncSetIOCudaStreams", status, Some(self.raw), self.list)
+        let in_cell = streams.cells.as_ptr().cast::<*mut c_void>();
+        let _guard = self.lock_session();
+        // SAFETY: `self.raw` is a live session; `in_cell` and `in_cell.add(1)` point into the owned
+        // two-element cell, which holds valid `CUstream` handles retained by `streams` and stays
+        // allocated while NVENC may use it (stored in `self.io_streams` below on success).
+        let status = unsafe { set_streams(self.raw, in_cell.cast(), in_cell.add(1).cast()) };
+        check("nvEncSetIOCudaStreams", status, Some(self.raw), self.list)?;
+        // Replacing drops the previous streams only after NVENC accepted the new ones.
+        *self
+            .io_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(streams);
+        Ok(())
     }
 
     /// Encodes one typed input surface into `output` with zero heap allocations.
+    ///
+    /// Returns [`EncodeOutcome::NeedMoreInput`] when NVENC buffered the frame for B-frame
+    /// reordering (`frameIntervalP > 1`). The input surface must outlive the frame's bitstream
+    /// lock; see [`EncodeInput`].
     pub fn encode_picture(
         &self,
         input: EncodeInput<'_>,
@@ -734,7 +851,7 @@ impl EncodeSession {
         frame_idx: u32,
         timestamp: u64,
         flags: EncodeFlags,
-    ) -> Result<()> {
+    ) -> Result<EncodeOutcome> {
         if !self.initialized {
             return Err(Error::Invalid("encode session is not initialized"));
         }
@@ -745,10 +862,10 @@ impl EncodeSession {
         }
         let (input_ptr, format, width, height, pitch, input_session) = match input {
             EncodeInput::Buffer(b) => {
-                let p = b
-                    .format
-                    .tight_pitch(b.width)
-                    .ok_or(Error::Invalid("input pitch overflow"))?;
+                // The driver chose the allocation pitch; pass what `nvEncLockInputBuffer` reported.
+                let p = b.locked_pitch.ok_or(Error::Invalid(
+                    "input buffer must be locked and filled before encoding",
+                ))?;
                 (b.raw, b.format, b.width, b.height, p, b.session.raw)
             }
             EncodeInput::Mapped(m) => (
@@ -788,7 +905,17 @@ impl EncodeSession {
         let _guard = self.lock_session();
         // SAFETY: `self.raw` is initialized and `input_ptr`/`output` belong to this session.
         let status = unsafe { encode_fn(self.raw, &mut pic) };
-        check("nvEncEncodePicture", status, Some(self.raw), self.list)
+        let outcome = encode_outcome(status, Some(self.raw), self.list)?;
+        match outcome {
+            EncodeOutcome::Ready => {
+                self.ready_epoch.fetch_add(1, Ordering::Relaxed);
+                output.buffered_at = None;
+            }
+            EncodeOutcome::NeedMoreInput => {
+                output.buffered_at = Some(self.ready_epoch.load(Ordering::Relaxed));
+            }
+        }
+        Ok(outcome)
     }
 
     /// Sends an End-of-Stream (EOS) notification to flush any buffered frames.
@@ -804,7 +931,10 @@ impl EncodeSession {
         let _guard = self.lock_session();
         // SAFETY: `self.raw` is initialized; EOS requires no input/output buffers.
         let status = unsafe { encode_fn(self.raw, &mut pic) };
-        check("nvEncEncodePicture(EOS)", status, Some(self.raw), self.list)
+        check("nvEncEncodePicture(EOS)", status, Some(self.raw), self.list)?;
+        // EOS drains the reorder queue: every output still pending becomes lockable.
+        self.ready_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -813,9 +943,11 @@ impl Drop for EncodeSession {
         if self.raw.is_null() {
             return;
         }
+        // A failed bind (for example a sticky error recorded by a child drop) must not leak the
+        // hardware session, a scarce per-GPU resource: record it and still attempt the destroy,
+        // whose own status reports any real failure.
         if let Err(e) = self.cuda.bind_to_thread() {
             self.cuda.record_err(Err::<(), _>(e));
-            return;
         }
         if let Some(destroy_fn) = self.list.nvEncDestroyEncoder {
             let _guard = self.lock_session();
@@ -837,6 +969,8 @@ pub struct InputBuffer {
     width: u32,
     height: u32,
     format: BufferFormat,
+    /// Row pitch reported by the last successful `nvEncLockInputBuffer` (`None` until locked).
+    locked_pitch: Option<u32>,
 }
 
 impl InputBuffer {
@@ -872,6 +1006,7 @@ impl InputBuffer {
             width,
             height,
             format,
+            locked_pitch: None,
         })
     }
 
@@ -893,6 +1028,7 @@ impl InputBuffer {
                 self.session.list,
             )?;
         }
+        self.locked_pitch = Some(params.pitch);
         Ok(InputLock {
             buf: self,
             ptr: params.bufferDataPtr.cast::<u8>(),
@@ -989,6 +1125,20 @@ impl Drop for InputLock<'_> {
     }
 }
 
+/// Rejects a byte `pitch` shorter than one row of `format`: NVENC reads
+/// `format.tight_pitch(width)` bytes per row, past the `pitch * rows` region the caller vouched for.
+fn check_row_pitch(format: BufferFormat, width: u32, pitch: u32) -> Result<()> {
+    let row_bytes = format
+        .tight_pitch(width)
+        .ok_or(Error::Invalid("input row size overflow"))?;
+    if pitch < row_bytes {
+        return Err(Error::Invalid(
+            "pitch is smaller than one row of the buffer format",
+        ));
+    }
+    Ok(())
+}
+
 /// Registered external CUDA device pointer or CUDA array (`nvEncRegisterResource`).
 pub struct RegisteredResource {
     raw: sys::NV_ENC_REGISTERED_PTR,
@@ -1002,9 +1152,12 @@ pub struct RegisteredResource {
 impl RegisteredResource {
     /// Registers a CUDA device pointer (`CUdeviceptr`) with NVENC for zero-copy encoding.
     ///
+    /// `pitch` is in bytes and must cover one row of `format` (`>= format.tight_pitch(width)`).
+    ///
     /// # Safety
     /// `device_ptr` must remain valid and allocated on `session.cuda()` for the lifetime of this
-    /// [`RegisteredResource`], with at least `pitch * height` (or `pitch * height * 3 / 2` for NV12) bytes.
+    /// [`RegisteredResource`], with at least `pitch * format.locked_rows(height)` bytes
+    /// (`pitch * height * 3 / 2` for 4:2:0 formats).
     pub unsafe fn from_cuda_ptr(
         session: &Arc<EncodeSession>,
         device_ptr: cuda_core::sys::CUdeviceptr,
@@ -1018,6 +1171,7 @@ impl RegisteredResource {
                 "CUDA pointer, dimensions, and 4-byte-aligned pitch must be valid",
             ));
         }
+        check_row_pitch(format, width, pitch)?;
         let reg_fn = entry!(session.list, nvEncRegisterResource);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_REGISTER_RESOURCE`.
         let mut params: sys::NV_ENC_REGISTER_RESOURCE = unsafe { zeroed() };
@@ -1188,6 +1342,8 @@ impl Drop for MappedResource<'_> {
 pub struct OutputBitstream {
     raw: sys::NV_ENC_OUTPUT_PTR,
     session: Arc<EncodeSession>,
+    /// Session `ready_epoch` at which the last submission returned `NeedMoreInput`.
+    buffered_at: Option<u64>,
 }
 
 impl OutputBitstream {
@@ -1209,12 +1365,25 @@ impl OutputBitstream {
         Ok(Self {
             raw: params.bitstreamBuffer,
             session: session.clone(),
+            buffered_at: None,
         })
     }
 
     /// Locks the bitstream buffer, blocking until hardware encoding finishes, and returns an RAII guard.
+    ///
+    /// Fails with [`Error::Invalid`] while the buffer holds a frame reported as
+    /// [`EncodeOutcome::NeedMoreInput`] that no later `Ready` submission or EOS has released
+    /// (`nvEncodeAPI.h`: the client "cannot call ::NvEncLockBitstream()" on such a buffer).
     pub fn lock(&mut self) -> Result<BitstreamLock<'_>> {
+        if let Some(at) = self.buffered_at
+            && self.session.ready_epoch.load(Ordering::Relaxed) <= at
+        {
+            return Err(Error::Invalid(
+                "output bitstream holds a frame buffered for B-frame reordering; submit more frames or flush_eos first",
+            ));
+        }
         let lock_fn = entry!(self.session.list, nvEncLockBitstream);
+        let unlock_fn = entry!(self.session.list, nvEncUnlockBitstream);
         // SAFETY: all-zero bit pattern is valid for `NV_ENC_LOCK_BITSTREAM`.
         let mut params: sys::NV_ENC_LOCK_BITSTREAM = unsafe { zeroed() };
         params.version = VER_LOCK_BITSTREAM;
@@ -1232,17 +1401,24 @@ impl OutputBitstream {
             let size_bytes = params.bitstreamSizeInBytes as usize;
             let ptr = params.bitstreamBufferPtr.cast::<u8>();
             if size_bytes > 0 && ptr.is_null() {
-                // Unlock before returning error so the buffer doesn't stay locked.
-                if let Some(unlock_fn) = self.session.list.nvEncUnlockBitstream {
-                    // SAFETY: `self.raw` was just locked.
-                    let _ = unsafe { unlock_fn(self.session.raw, self.raw) };
-                }
+                // Unlock before returning error so the buffer doesn't stay locked. A failed unlock
+                // is reported instead of the null pointer: the buffer is then still locked, which
+                // is what the caller has to know first.
+                // SAFETY: `self.raw` was just locked.
+                let unlock_status = unsafe { unlock_fn(self.session.raw, self.raw) };
+                check(
+                    "nvEncUnlockBitstream",
+                    unlock_status,
+                    Some(self.session.raw),
+                    self.session.list,
+                )?;
                 return Err(Error::Invalid(
                     "locked bitstream pointer is null for non-empty payload",
                 ));
             }
             (size_bytes, ptr)
         };
+        self.buffered_at = None;
         let info = PacketInfo {
             frame_idx: params.frameIdx,
             timestamp: params.outputTimeStamp,
@@ -1334,14 +1510,99 @@ mod tests {
         assert_eq!(guid::AV1_MAIN.Data1, 0x5f2a39f5);
     }
 
+    /// Literals evaluated from the `*_VER` macros of Video Codec SDK 13.1 `nvEncodeAPI.h`
+    /// (`NVENCAPI_STRUCT_VERSION(ver) = 13 | 1 << 24 | ver << 16 | 7 << 28`). A header bump fails
+    /// the version assertion first: re-read every `*_VER` macro and update both sides.
     #[test]
-    fn struct_versions_match_header_macros() {
-        assert_eq!(VER_OPEN_SESSION_EX, sys::struct_version(1));
-        assert_eq!(VER_CONFIG, sys::struct_version(9) | (1u32 << 31));
-        assert_eq!(VER_INITIALIZE_PARAMS, sys::struct_version(7) | (1u32 << 31));
-        assert_eq!(VER_PRESET_CONFIG, sys::struct_version(5) | (1u32 << 31));
-        assert_eq!(VER_PIC_PARAMS, sys::struct_version(7) | (1u32 << 31));
-        assert_eq!(VER_LOCK_BITSTREAM, sys::struct_version(2) | (1u32 << 31));
+    fn struct_versions_match_header_literals() {
+        assert_eq!(
+            (sys::NVENCAPI_MAJOR_VERSION, sys::NVENCAPI_MINOR_VERSION),
+            (13, 1),
+            "NVENC header changed: re-check every VER_* constant against nvEncodeAPI.h"
+        );
+        assert_eq!(VER_OPEN_SESSION_EX, 0x7101_000D); // NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER (1)
+        assert_eq!(VER_CREATE_INPUT_BUFFER, 0x7102_000D); // NV_ENC_CREATE_INPUT_BUFFER_VER (2)
+        assert_eq!(VER_CREATE_BITSTREAM_BUFFER, 0x7101_000D); // NV_ENC_CREATE_BITSTREAM_BUFFER_VER (1)
+        assert_eq!(VER_REGISTER_RESOURCE, 0x7105_000D); // NV_ENC_REGISTER_RESOURCE_VER (5)
+        assert_eq!(VER_MAP_INPUT_RESOURCE, 0x7104_000D); // NV_ENC_MAP_INPUT_RESOURCE_VER (4)
+        assert_eq!(VER_LOCK_INPUT_BUFFER, 0x7101_000D); // NV_ENC_LOCK_INPUT_BUFFER_VER (1)
+        assert_eq!(VER_CAPS_PARAM, 0x7101_000D); // NV_ENC_CAPS_PARAM_VER (1)
+        assert_eq!(VER_CONFIG, 0xF109_000D); // NV_ENC_CONFIG_VER (9 | 1 << 31)
+        assert_eq!(VER_INITIALIZE_PARAMS, 0xF107_000D); // NV_ENC_INITIALIZE_PARAMS_VER (7 | 1 << 31)
+        assert_eq!(VER_PRESET_CONFIG, 0xF105_000D); // NV_ENC_PRESET_CONFIG_VER (5 | 1 << 31)
+        assert_eq!(VER_PIC_PARAMS, 0xF107_000D); // NV_ENC_PIC_PARAMS_VER (7 | 1 << 31)
+        assert_eq!(VER_LOCK_BITSTREAM, 0xF102_000D); // NV_ENC_LOCK_BITSTREAM_VER (2 | 1 << 31)
+    }
+
+    #[test]
+    fn need_more_input_is_a_typed_outcome_not_an_error() {
+        // SAFETY: all-zero is valid for the function list (every entry point `None`).
+        let list: sys::NV_ENCODE_API_FUNCTION_LIST = unsafe { zeroed() };
+        assert_eq!(
+            encode_outcome(sys::_NVENCSTATUS_NV_ENC_ERR_NEED_MORE_INPUT, None, &list).ok(),
+            Some(EncodeOutcome::NeedMoreInput)
+        );
+        assert_eq!(
+            encode_outcome(sys::_NVENCSTATUS_NV_ENC_SUCCESS, None, &list).ok(),
+            Some(EncodeOutcome::Ready)
+        );
+        match encode_outcome(sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PARAM, None, &list) {
+            Err(Error::Status { code, .. }) => {
+                assert_eq!(code.raw(), sys::_NVENCSTATUS_NV_ENC_ERR_INVALID_PARAM);
+            }
+            other => panic!("expected Error::Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_pitch_shorter_than_a_row_is_rejected() {
+        assert!(matches!(
+            check_row_pitch(BufferFormat::Argb, 1920, 256),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            check_row_pitch(BufferFormat::Yuv420_10Bit, 1920, 1920),
+            Err(Error::Invalid(_))
+        ));
+        assert!(check_row_pitch(BufferFormat::Argb, 1920, 1920 * 4).is_ok());
+        assert!(check_row_pitch(BufferFormat::Nv12, 1920, 2048).is_ok());
+        assert!(matches!(
+            check_row_pitch(BufferFormat::Argb, u32::MAX, u32::MAX),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn codec_specific_setters_refuse_other_codecs() {
+        let fresh = |codec| EncodeConfig {
+            // SAFETY: all-zero is a valid `NV_ENC_CONFIG` (plain C data) for this host-only test.
+            raw: unsafe { zeroed() },
+            codec,
+            misuse: None,
+        };
+
+        let mut hevc = fresh(Codec::Hevc);
+        hevc.set_h264_bt709_vui();
+        assert_eq!(hevc.raw.profileGUID.Data1, 0, "HEVC config must not be written");
+        assert!(matches!(hevc.check_codec(Codec::Hevc), Err(Error::Invalid(_))));
+
+        let mut hevc = fresh(Codec::Hevc);
+        hevc.set_hevc_10bit_pq();
+        assert_eq!(hevc.raw.profileGUID.Data1, guid::HEVC_MAIN10.Data1);
+        assert!(hevc.check_codec(Codec::Hevc).is_ok());
+        assert!(matches!(hevc.check_codec(Codec::H264), Err(Error::Invalid(_))));
+
+        let mut h264 = fresh(Codec::H264);
+        h264.set_hevc_10bit_pq();
+        assert!(matches!(h264.check_codec(Codec::H264), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn pic_flags_keep_header_bit_values() {
+        assert_eq!(pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEINTRA), 0x1);
+        assert_eq!(pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_FORCEIDR), 0x2);
+        assert_eq!(pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_OUTPUT_SPSPPS), 0x4);
+        assert_eq!(pic_flag(sys::_NV_ENC_PIC_FLAGS_NV_ENC_PIC_FLAG_EOS), 0x8);
     }
 
     #[test]

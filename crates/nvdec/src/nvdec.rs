@@ -22,7 +22,8 @@ use std::ffi::{c_int, c_ulong, c_void};
 use std::fmt;
 use std::mem::zeroed;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Raw `CUresult` status code wrapped as a `Copy` integer newtype.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -424,7 +425,11 @@ impl DisplayInfo {
 pub trait ParserHandler {
     /// Called on initial sequence header or format change.
     ///
-    /// Return `Ok(surface_count)` (`> 1` overrides the parser's DPB size; `1` keeps default).
+    /// Return `Ok(surface_count)`: `> 1` overrides the parser's DPB size, `1` keeps
+    /// [`ParserConfig::max_num_decode_surfaces`] (`nvcuvid.h`, `PFNVIDSEQUENCECALLBACK`). The parser
+    /// hands out picture indices below that count, so a handler that creates a [`VideoDecoder`]
+    /// must return that decoder's [`DecoderConfig::num_decode_surfaces`]; returning `1` with a
+    /// decoder smaller than the parser default makes `cuvidDecodePicture` index past its surfaces.
     fn on_sequence(&mut self, fmt: &VideoFormat) -> Result<u32>;
     /// Called when a picture is ready to be decoded (decode order).
     fn on_decode(&mut self, pic: &sys::CUVIDPICPARAMS) -> Result<()>;
@@ -475,6 +480,25 @@ fn panic_payload_msg(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
+/// Keeps the first callback error of a parse call; later ones are usually its consequences.
+fn record_first_error<H: ParserHandler>(inner: &mut ParserInner<H>, err: Error) {
+    if inner.pending_error.is_none() {
+        inner.pending_error = Some(err);
+    }
+}
+
+/// Converts `on_sequence`'s surface count to the callback's `int` (`1` = keep parser default).
+fn sequence_return(count: u32) -> Result<c_int> {
+    c_int::try_from(count.max(1)).map_err(|_| {
+        Error::Invalid("on_sequence surface count exceeds the parser's int range")
+    })
+}
+
+/// Converts a packet length to `CUVIDSOURCEDATAPACKET::payload_size` (`c_ulong`, 32-bit on Windows).
+fn payload_size(len: usize) -> Result<c_ulong> {
+    c_ulong::try_from(len).map_err(|_| Error::Invalid("packet payload exceeds the c_ulong range"))
+}
+
 unsafe extern "C" fn on_sequence_cb<H: ParserHandler>(
     user_data: *mut c_void,
     fmt: *mut sys::CUVIDEOFORMAT,
@@ -487,13 +511,19 @@ unsafe extern "C" fn on_sequence_cb<H: ParserHandler>(
     let (inner, fmt_ref) = unsafe { (&mut *user_data.cast::<ParserInner<H>>(), &*fmt) };
     let vf = VideoFormat::from_sys(fmt_ref);
     match catch_unwind(AssertUnwindSafe(|| inner.handler.on_sequence(&vf))) {
-        Ok(Ok(n)) => n.max(1) as c_int,
+        Ok(Ok(n)) => match sequence_return(n) {
+            Ok(v) => v,
+            Err(e) => {
+                record_first_error(inner, e);
+                0
+            }
+        },
         Ok(Err(e)) => {
-            inner.pending_error = Some(e);
+            record_first_error(inner, e);
             0
         }
         Err(p) => {
-            inner.pending_error = Some(Error::CallbackPanic(panic_payload_msg(p)));
+            record_first_error(inner, Error::CallbackPanic(panic_payload_msg(p)));
             0
         }
     }
@@ -511,11 +541,11 @@ unsafe extern "C" fn on_decode_cb<H: ParserHandler>(
     match catch_unwind(AssertUnwindSafe(|| inner.handler.on_decode(pic_ref))) {
         Ok(Ok(())) => 1,
         Ok(Err(e)) => {
-            inner.pending_error = Some(e);
+            record_first_error(inner, e);
             0
         }
         Err(p) => {
-            inner.pending_error = Some(Error::CallbackPanic(panic_payload_msg(p)));
+            record_first_error(inner, Error::CallbackPanic(panic_payload_msg(p)));
             0
         }
     }
@@ -535,11 +565,11 @@ unsafe extern "C" fn on_display_cb<H: ParserHandler>(
     match catch_unwind(AssertUnwindSafe(|| inner.handler.on_display(info.as_ref()))) {
         Ok(Ok(())) => 1,
         Ok(Err(e)) => {
-            inner.pending_error = Some(e);
+            record_first_error(inner, e);
             0
         }
         Err(p) => {
-            inner.pending_error = Some(Error::CallbackPanic(panic_payload_msg(p)));
+            record_first_error(inner, Error::CallbackPanic(panic_payload_msg(p)));
             0
         }
     }
@@ -549,7 +579,10 @@ unsafe extern "C" fn on_display_cb<H: ParserHandler>(
 pub struct VideoParser<H: ParserHandler> {
     raw: sys::CUvideoparser,
     cuda: Arc<Context>,
-    inner: Box<ParserInner<H>>,
+    /// Owned `Box<ParserInner<H>>` held as a raw pointer: the parser's callbacks write through the
+    /// same pointer (`pUserData`), so no `Box` (unique, retagged on every move) may own it while
+    /// the parser exists. Created by `Box::leak` in `new`, freed by `Box::from_raw` in `Drop`.
+    inner: NonNull<ParserInner<H>>,
 }
 
 impl<H: ParserHandler> VideoParser<H> {
@@ -557,10 +590,10 @@ impl<H: ParserHandler> VideoParser<H> {
     pub fn new(cuda: &Arc<Context>, cfg: &ParserConfig, handler: H) -> Result<Self> {
         ensure_loaded()?;
         cuda.bind_to_thread()?;
-        let mut inner = Box::new(ParserInner {
+        let inner = NonNull::from(Box::leak(Box::new(ParserInner {
             handler,
             pending_error: None,
-        });
+        })));
         // SAFETY: all-zero bit pattern is valid for `CUVIDPARSERPARAMS`.
         let mut params: sys::CUVIDPARSERPARAMS = unsafe { zeroed() };
         params.CodecType = cfg.codec.to_sys();
@@ -568,15 +601,20 @@ impl<H: ParserHandler> VideoParser<H> {
         params.ulClockRate = cfg.clock_rate;
         params.ulErrorThreshold = cfg.error_threshold.min(100);
         params.ulMaxDisplayDelay = cfg.max_display_delay;
-        params.pUserData = (&raw mut *inner).cast::<c_void>();
+        params.pUserData = inner.as_ptr().cast::<c_void>();
         params.pfnSequenceCallback = Some(on_sequence_cb::<H>);
         params.pfnDecodePicture = Some(on_decode_cb::<H>);
         params.pfnDisplayPicture = Some(on_display_cb::<H>);
 
         let mut raw: sys::CUvideoparser = std::ptr::null_mut();
-        // SAFETY: `params` points to `inner` at a stable heap address and `raw` is a valid out-pointer.
+        // SAFETY: `params.pUserData` is the leaked heap allocation `inner`, which outlives the parser;
+        // `raw` is a valid out-pointer.
         let status = unsafe { sys::cuvidCreateVideoParser(&mut raw, &mut params) };
-        check("cuvidCreateVideoParser", status)?;
+        if let Err(e) = check("cuvidCreateVideoParser", status) {
+            // SAFETY: `inner` came from `Box::leak` above and no parser exists that could use it.
+            drop(unsafe { Box::from_raw(inner.as_ptr()) });
+            return Err(e);
+        }
         Ok(Self {
             raw,
             cuda: cuda.clone(),
@@ -584,15 +622,22 @@ impl<H: ParserHandler> VideoParser<H> {
         })
     }
 
+    /// Takes the error recorded by a callback, if any.
+    fn take_pending_error(&mut self) -> Option<Error> {
+        // SAFETY: `self.inner` is live until `Drop`; callbacks run only inside `cuvidParseVideoData`,
+        // which is never executing while this `&mut self` method runs, so this access is exclusive.
+        unsafe { (*self.inner.as_ptr()).pending_error.take() }
+    }
+
     /// Parses one compressed bitstream packet with zero heap allocations.
     pub fn parse_packet(&mut self, payload: &[u8], timestamp: Option<i64>) -> Result<()> {
-        if let Some(err) = self.inner.pending_error.take() {
+        if let Some(err) = self.take_pending_error() {
             return Err(err);
         }
         self.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUVIDSOURCEDATAPACKET`.
         let mut pkt: sys::CUVIDSOURCEDATAPACKET = unsafe { zeroed() };
-        pkt.payload_size = payload.len() as c_ulong;
+        pkt.payload_size = payload_size(payload.len())?;
         pkt.payload = if payload.is_empty() {
             std::ptr::null()
         } else {
@@ -602,9 +647,10 @@ impl<H: ParserHandler> VideoParser<H> {
             pkt.flags |= sys::CUvideopacketflags_CUVID_PKT_TIMESTAMP as c_ulong;
             pkt.timestamp = ts;
         }
-        // SAFETY: `self.raw` is a live parser and `pkt.payload` is valid for the synchronous call.
+        // SAFETY: `self.raw` is a live parser and `pkt.payload` is valid for the synchronous call;
+        // no Rust reference to `*self.inner` is live while the callbacks write through it.
         let status = unsafe { sys::cuvidParseVideoData(self.raw, &mut pkt) };
-        if let Some(err) = self.inner.pending_error.take() {
+        if let Some(err) = self.take_pending_error() {
             return Err(err);
         }
         check("cuvidParseVideoData", status)
@@ -612,7 +658,7 @@ impl<H: ParserHandler> VideoParser<H> {
 
     /// Signals End-of-Stream to flush all remaining display callbacks.
     pub fn flush_eos(&mut self) -> Result<()> {
-        if let Some(err) = self.inner.pending_error.take() {
+        if let Some(err) = self.take_pending_error() {
             return Err(err);
         }
         self.cuda.bind_to_thread()?;
@@ -620,9 +666,10 @@ impl<H: ParserHandler> VideoParser<H> {
         let mut pkt: sys::CUVIDSOURCEDATAPACKET = unsafe { zeroed() };
         pkt.flags = (sys::CUvideopacketflags_CUVID_PKT_ENDOFSTREAM
             | sys::CUvideopacketflags_CUVID_PKT_NOTIFY_EOS) as c_ulong;
-        // SAFETY: `self.raw` is a live parser; EOS packet carries null/0 payload.
+        // SAFETY: `self.raw` is a live parser; EOS packet carries null/0 payload; no Rust reference
+        // to `*self.inner` is live while the callbacks write through it.
         let status = unsafe { sys::cuvidParseVideoData(self.raw, &mut pkt) };
-        if let Some(err) = self.inner.pending_error.take() {
+        if let Some(err) = self.take_pending_error() {
             return Err(err);
         }
         check("cuvidParseVideoData(EOS)", status)
@@ -630,29 +677,37 @@ impl<H: ParserHandler> VideoParser<H> {
 
     /// Shared reference to the inner [`ParserHandler`].
     pub fn handler(&self) -> &H {
-        &self.inner.handler
+        // SAFETY: `self.inner` is live until `Drop`; callbacks (the only writers besides `&mut self`
+        // methods) run only inside `parse_packet` / `flush_eos`, which need `&mut self` and so
+        // cannot overlap this shared borrow.
+        unsafe { &self.inner.as_ref().handler }
     }
 
     /// Mutable reference to the inner [`ParserHandler`].
     pub fn handler_mut(&mut self) -> &mut H {
-        &mut self.inner.handler
+        // SAFETY: as in `handler`; `&mut self` makes this the only access for the borrow's lifetime.
+        unsafe { &mut self.inner.as_mut().handler }
     }
 }
 
 impl<H: ParserHandler> Drop for VideoParser<H> {
     fn drop(&mut self) {
-        if self.raw.is_null() {
-            return;
+        if !self.raw.is_null() {
+            match self.cuda.bind_to_thread() {
+                Err(e) => self.cuda.record_err(Err::<(), _>(e)),
+                Ok(()) => {
+                    // SAFETY: `self.raw` is owned by this `VideoParser`.
+                    let status = unsafe { sys::cuvidDestroyVideoParser(self.raw) };
+                    if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
+                        self.cuda.record_err(Err::<(), _>(DriverError(status)));
+                    }
+                }
+            }
         }
-        if let Err(e) = self.cuda.bind_to_thread() {
-            self.cuda.record_err(Err::<(), _>(e));
-            return;
-        }
-        // SAFETY: `self.raw` is owned by this `VideoParser`.
-        let status = unsafe { sys::cuvidDestroyVideoParser(self.raw) };
-        if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
-            self.cuda.record_err(Err::<(), _>(DriverError(status)));
-        }
+        // SAFETY: `self.inner` came from `Box::leak` in `new` and is freed only here. The parser can
+        // no longer call back: it is destroyed, or (failed bind) its handle is unreachable, and
+        // callbacks only run inside `cuvidParseVideoData` on that handle.
+        drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
     }
 }
 
@@ -675,6 +730,9 @@ pub struct DecoderConfig {
     pub output_format: SurfaceFormat,
     /// Deinterlacing mode.
     pub deinterlace_mode: DeinterlaceMode,
+    /// Crop rectangle of the coded frame that is scaled into the target size
+    /// (`CUVIDDECODECREATEINFO::display_area`); all-zero selects the full coded frame.
+    pub display_area: DisplayArea,
     /// Post-processed output width (aligned to 2).
     pub target_width: u32,
     /// Post-processed output height (aligned to 2).
@@ -685,6 +743,10 @@ pub struct DecoderConfig {
 
 impl DecoderConfig {
     /// Builds a [`DecoderConfig`] from a [`VideoFormat`] reported by [`ParserHandler::on_sequence`].
+    ///
+    /// The output is the display rectangle cropped from the coded frame (for example 1920x1080 out
+    /// of a 1920x1088 H.264 frame), not the coded frame rescaled. Return the resulting
+    /// `num_decode_surfaces` from `on_sequence` (see [`ParserHandler::on_sequence`]).
     pub fn from_video_format(fmt: &VideoFormat, output_format: SurfaceFormat) -> Result<Self> {
         let codec = fmt.codec.ok_or(Error::Invalid(
             "unsupported or unknown codec in sequence header",
@@ -694,6 +756,22 @@ impl DecoderConfig {
             .ok_or(Error::Invalid("unsupported or unknown chroma format"))?;
         let w = fmt.display_width();
         let h = fmt.display_height();
+        // Same fallback as `display_width` / `display_height`: a degenerate axis uses the coded extent.
+        let area = fmt.display_area;
+        let (left, right) = if area.right > area.left {
+            (area.left, area.right)
+        } else {
+            let coded = i32::try_from(fmt.coded_width)
+                .map_err(|_| Error::Invalid("coded width exceeds the i32 range"))?;
+            (0, coded)
+        };
+        let (top, bottom) = if area.bottom > area.top {
+            (area.top, area.bottom)
+        } else {
+            let coded = i32::try_from(fmt.coded_height)
+                .map_err(|_| Error::Invalid("coded height exceeds the i32 range"))?;
+            (0, coded)
+        };
         Ok(Self {
             width: fmt.coded_width,
             height: fmt.coded_height,
@@ -703,6 +781,12 @@ impl DecoderConfig {
             bit_depth_minus8: u32::from(fmt.bit_depth_luma_minus8),
             output_format,
             deinterlace_mode: DeinterlaceMode::Weave,
+            display_area: DisplayArea {
+                left,
+                top,
+                right,
+                bottom,
+            },
             target_width: w + (w & 1),
             target_height: h + (h & 1),
             num_output_surfaces: 2,
@@ -717,11 +801,15 @@ pub struct VideoDecoder {
     target_width: u32,
     target_height: u32,
     output_format: SurfaceFormat,
+    /// Serializes `cuvidDecodePicture` / `cuvidMapVideoFrame64` / `cuvidUnmapVideoFrame64` on `raw`:
+    /// `nvcuvid.h` documents no thread safety for concurrent calls on one decoder handle.
+    calls: Mutex<()>,
 }
 
-// SAFETY: `CUvideodecoder` is thread-safe when bound to a `cuda_core::Context` (driver-synchronized).
+// SAFETY: the decoder handle is not tied to the creating thread; every call binds `cuda` first.
 unsafe impl Send for VideoDecoder {}
-// SAFETY: see `Send` above.
+// SAFETY: every nvcuvid call on `raw` through `&self` is serialized by `calls`; destruction needs
+// exclusive ownership (`Drop`).
 unsafe impl Sync for VideoDecoder {}
 
 impl VideoDecoder {
@@ -749,6 +837,13 @@ impl VideoDecoder {
         info.ulMaxHeight = cfg.height as c_ulong;
         info.OutputFormat = cfg.output_format.to_sys();
         info.DeinterlaceMode = cfg.deinterlace_mode.to_sys();
+        let short = |v: i32| {
+            i16::try_from(v).map_err(|_| Error::Invalid("display_area exceeds the 16-bit range"))
+        };
+        info.display_area.left = short(cfg.display_area.left)?;
+        info.display_area.top = short(cfg.display_area.top)?;
+        info.display_area.right = short(cfg.display_area.right)?;
+        info.display_area.bottom = short(cfg.display_area.bottom)?;
         info.ulTargetWidth = cfg.target_width as c_ulong;
         info.ulTargetHeight = cfg.target_height as c_ulong;
         info.ulNumOutputSurfaces = cfg.num_output_surfaces.max(1) as c_ulong;
@@ -763,7 +858,12 @@ impl VideoDecoder {
             target_width: cfg.target_width,
             target_height: cfg.target_height,
             output_format: cfg.output_format,
+            calls: Mutex::new(()),
         }))
+    }
+
+    fn lock_calls(&self) -> MutexGuard<'_, ()> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Submits one parsed picture (`CUVIDPICPARAMS`) for hardware decoding.
@@ -774,6 +874,7 @@ impl VideoDecoder {
     /// received from [`ParserHandler::on_decode`]).
     pub unsafe fn decode_picture(&self, pic: &sys::CUVIDPICPARAMS) -> Result<()> {
         self.cuda.bind_to_thread()?;
+        let _guard = self.lock_calls();
         // SAFETY: `self.raw` is a live decoder and `pic` (plus its internal pointers) is valid per caller contract.
         let status =
             unsafe { sys::cuvidDecodePicture(self.raw, std::ptr::from_ref(pic).cast_mut()) };
@@ -781,11 +882,14 @@ impl VideoDecoder {
     }
 
     /// Maps a decoded display surface for CUDA access; unmapped automatically on `Drop`.
-    pub fn map_frame(
-        &self,
+    ///
+    /// Post-processing is enqueued on `stream` (`None` = the legacy NULL stream). The frame keeps
+    /// that stream so the `copy_*_to_host` methods wait for it when they copy on another stream.
+    pub fn map_frame<'a>(
+        &'a self,
         disp: &DisplayInfo,
-        stream: Option<&Stream>,
-    ) -> Result<MappedFrame<'_>> {
+        stream: Option<&'a Stream>,
+    ) -> Result<MappedFrame<'a>> {
         self.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUVIDPROCPARAMS`.
         let mut proc_params: sys::CUVIDPROCPARAMS = unsafe { zeroed() };
@@ -797,19 +901,23 @@ impl VideoDecoder {
         }
         let mut dev_ptr: u64 = 0;
         let mut pitch: u32 = 0;
-        // SAFETY: `self.raw` is live and `dev_ptr`/`pitch` are valid out-pointers.
-        let status = unsafe {
-            sys::cuvidMapVideoFrame64(
-                self.raw,
-                disp.picture_index,
-                &mut dev_ptr,
-                &mut pitch,
-                &mut proc_params,
-            )
+        let status = {
+            let _guard = self.lock_calls();
+            // SAFETY: `self.raw` is live and `dev_ptr`/`pitch` are valid out-pointers.
+            unsafe {
+                sys::cuvidMapVideoFrame64(
+                    self.raw,
+                    disp.picture_index,
+                    &mut dev_ptr,
+                    &mut pitch,
+                    &mut proc_params,
+                )
+            }
         };
         check("cuvidMapVideoFrame64", status)?;
         Ok(MappedFrame {
             decoder: self,
+            map_stream: stream,
             dev_ptr,
             pitch,
         })
@@ -851,6 +959,8 @@ impl Drop for VideoDecoder {
 /// RAII guard for a mapped NVDEC output surface (`cuvidMapVideoFrame64` / `cuvidUnmapVideoFrame64`).
 pub struct MappedFrame<'a> {
     decoder: &'a VideoDecoder,
+    /// Stream the post-processing was enqueued on (`None` = legacy NULL stream).
+    map_stream: Option<&'a Stream>,
     dev_ptr: u64,
     pitch: u32,
 }
@@ -921,6 +1031,17 @@ impl MappedFrame<'_> {
         dst_host: *mut c_void,
     ) -> Result<()> {
         self.decoder.cuda.bind_to_thread()?;
+        // `cuvidMapVideoFrame64` post-processes on the map stream; a copy on any other stream
+        // (cuda-core streams are non-blocking, so not even the legacy NULL stream orders them)
+        // must wait for it. The copy below is synchronous anyway, so a host wait costs nothing extra.
+        let map_handle = self
+            .map_stream
+            .map_or(std::ptr::null_mut(), |s| s.cu_stream());
+        if map_handle != stream.cu_stream() {
+            // SAFETY: `map_handle` is the legacy NULL stream or a stream borrowed for `'a`, so it is
+            // live, and it belongs to the decoder's context, which is current.
+            unsafe { cuda_core::sys::cuStreamSynchronize(map_handle) }.result()?;
+        }
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
         let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
         copy.srcMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
@@ -945,6 +1066,7 @@ impl Drop for MappedFrame<'_> {
             self.decoder.cuda.record_err(Err::<(), _>(e));
             return;
         }
+        let _guard = self.decoder.lock_calls();
         // SAFETY: `self.dev_ptr` was mapped by `cuvidMapVideoFrame64` on `self.decoder.raw`.
         let status = unsafe { sys::cuvidUnmapVideoFrame64(self.decoder.raw, self.dev_ptr) };
         if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
@@ -1056,5 +1178,117 @@ mod tests {
             Some(Error::CallbackPanic(msg)) => assert!(msg.contains("boom in display")),
             other => panic!("expected CallbackPanic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn first_callback_error_is_kept() {
+        let mut inner = Box::new(ParserInner {
+            handler: PanicHandler,
+            pending_error: None,
+        });
+        let user_data = (&raw mut *inner).cast::<c_void>();
+        // SAFETY: all-zero bit patterns are valid for these plain C structs in this unit test.
+        let mut pic: sys::CUVIDPICPARAMS = unsafe { zeroed() };
+        // SAFETY: see above.
+        let mut disp: sys::CUVIDPARSERDISPINFO = unsafe { zeroed() };
+        // SAFETY: `user_data` points to `inner`; `pic` and `disp` are valid structs.
+        let (rc_decode, rc_display) = unsafe {
+            (
+                on_decode_cb::<PanicHandler>(user_data, &mut pic),
+                on_display_cb::<PanicHandler>(user_data, &mut disp),
+            )
+        };
+        assert_eq!((rc_decode, rc_display), (0, 0));
+        match inner.pending_error.take() {
+            Some(Error::CallbackPanic(msg)) => assert!(msg.contains("boom in decode"), "{msg}"),
+            other => panic!("expected the decode panic, got {other:?}"),
+        }
+    }
+
+    struct HugeSurfaceCount;
+    impl ParserHandler for HugeSurfaceCount {
+        fn on_sequence(&mut self, _fmt: &VideoFormat) -> Result<u32> {
+            Ok(u32::MAX)
+        }
+        fn on_decode(&mut self, _pic: &sys::CUVIDPICPARAMS) -> Result<()> {
+            Ok(())
+        }
+        fn on_display(&mut self, _disp: Option<&DisplayInfo>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn out_of_range_surface_count_fails_the_sequence_callback() {
+        let mut inner = Box::new(ParserInner {
+            handler: HugeSurfaceCount,
+            pending_error: None,
+        });
+        let user_data = (&raw mut *inner).cast::<c_void>();
+        // SAFETY: all-zero bit pattern is valid for `CUVIDEOFORMAT` in this unit test.
+        let mut fmt: sys::CUVIDEOFORMAT = unsafe { zeroed() };
+        // SAFETY: `user_data` points to `inner` and `fmt` is a valid struct.
+        let rc = unsafe { on_sequence_cb::<HugeSurfaceCount>(user_data, &mut fmt) };
+        assert_eq!(rc, 0, "u32::MAX must not wrap to a negative int");
+        assert!(matches!(inner.pending_error.take(), Some(Error::Invalid(_))));
+        assert_eq!(sequence_return(0).ok(), Some(1));
+        assert_eq!(sequence_return(8).ok(), Some(8));
+    }
+
+    #[test]
+    fn payload_size_rejects_lengths_beyond_c_ulong() {
+        assert_eq!(payload_size(4096).ok(), Some(4096));
+        let fits = std::mem::size_of::<c_ulong>() >= std::mem::size_of::<usize>();
+        assert_eq!(payload_size(usize::MAX).is_ok(), fits);
+    }
+
+    fn format(coded: (u32, u32), area: DisplayArea) -> VideoFormat {
+        VideoFormat {
+            codec: Some(Codec::H264),
+            coded_width: coded.0,
+            coded_height: coded.1,
+            display_area: area,
+            chroma_format: Some(ChromaFormat::Yuv420),
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            min_num_decode_surfaces: 5,
+            progressive_sequence: true,
+            fps_num: 30,
+            fps_den: 1,
+        }
+    }
+
+    #[test]
+    fn decoder_config_crops_to_the_display_area() {
+        let crop = DisplayArea {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let cfg = DecoderConfig::from_video_format(&format((1920, 1088), crop), SurfaceFormat::Nv12)
+            .expect("config");
+        assert_eq!((cfg.width, cfg.height), (1920, 1088));
+        assert_eq!(cfg.display_area, crop);
+        assert_eq!((cfg.target_width, cfg.target_height), (1920, 1080));
+
+        let empty = DisplayArea {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        let cfg = DecoderConfig::from_video_format(&format((256, 144), empty), SurfaceFormat::Nv12)
+            .expect("config");
+        assert_eq!(
+            cfg.display_area,
+            DisplayArea {
+                left: 0,
+                top: 0,
+                right: 256,
+                bottom: 144
+            }
+        );
+        assert_eq!((cfg.target_width, cfg.target_height), (256, 144));
     }
 }

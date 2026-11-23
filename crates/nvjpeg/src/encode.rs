@@ -6,6 +6,7 @@
 
 use crate::{
     ChromaSubsampling, Error, Handle, ImagePlanes, InputFormat, JpegEncoding, Result, check, sys,
+    validate_yuv_source,
 };
 use cuda_core::Stream;
 use std::ffi::c_int;
@@ -119,6 +120,7 @@ impl EncoderParams {
 impl Drop for EncoderParams {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegEncoderParamsDestroy(self.raw) };
             self.handle.record_drop_err(code);
@@ -204,9 +206,10 @@ impl EncoderState {
             .ok()
             .filter(|&v| v > 0)
             .ok_or(Error::InvalidInput("height must be 1..=i32::MAX"))?;
-        InputFormat::Yuv.validate_layout(src.layout(), width, height)?;
+        validate_yuv_source(src.layout(), subsampling, width, height)?;
         self.handle.cuda().bind_to_thread()?;
-        // SAFETY: `src` has validated planar YUV device pointers, and `params`/`stream` are live.
+        // SAFETY: `src` planes cover the Y and chroma extents nvJPEG reads for `subsampling`
+        // (checked above), and `params`/`stream` are live.
         check("nvjpegEncodeYUV", unsafe {
             sys::nvjpegEncodeYUV(
                 self.handle.raw(),
@@ -235,21 +238,32 @@ impl EncoderState {
                 stream.cu_stream(),
             )
         })?;
-        out.resize(len, 0);
+        // The bytes are initialized before the call, not left to nvJPEG: a repeated retrieval of
+        // the same encode succeeds with the same length but writes nothing (measured on cuda 13,
+        // sm_86), so `set_len` over nvJPEG's output would expose uninitialized memory.
+        out.clear();
         if len == 0 {
             return Ok(());
         }
-        // SAFETY: `out` has `len` bytes matching the query above.
+        out.resize(len, 0);
+        let mut written = len;
+        // SAFETY: `out` holds `len` initialized bytes and nvJPEG writes at most `written == len`
+        // bytes into it.
         check("nvjpegEncodeRetrieveBitstream", unsafe {
             sys::nvjpegEncodeRetrieveBitstream(
                 self.handle.raw(),
                 self.raw,
                 out.as_mut_ptr(),
-                &mut len,
+                &mut written,
                 stream.cu_stream(),
             )
         })?;
-        out.truncate(len);
+        if written > len {
+            return Err(Error::InvalidInput(
+                "nvjpegEncodeRetrieveBitstream reported more bytes than it was given",
+            ));
+        }
+        out.truncate(written);
         Ok(())
     }
 
@@ -264,6 +278,7 @@ impl EncoderState {
 impl Drop for EncoderState {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegEncoderStateDestroy(self.raw) };
             self.handle.record_drop_err(code);

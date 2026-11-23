@@ -2,14 +2,20 @@
 //!
 //! **Ownership.** `Handle` holds `Arc<cuda_core::Context>` and destroys `nvjpegHandle_t` on
 //! `Drop`, recording any teardown error on `Context::record_err`. All child handles hold
-//! `Arc<Handle>` so the library handle always outlives them.
+//! `Arc<Handle>` so the library handle always outlives them. Every constructor and `Drop` binds
+//! the handle's CUDA context first.
+//!
+//! **Validation.** `decode` / `decode_jpeg` check the output planes against the geometry parsed
+//! from the bitstream. `JpegStream::parse` always lets nvJPEG copy the bitstream, and pinned /
+//! device scratch buffers attach to one `JpegState` at a time.
 
 use crate::{
-    Backend, ChromaSubsampling, Error, ExifOrientation, ImageInfo, ImagePlanesMut, JpegEncoding,
-    OutputFormat, Result, check, ensure_loaded, sys,
+    Backend, ChromaSubsampling, DecodeGeometry, Error, ExifOrientation, ImageInfo, ImagePlanesMut,
+    JpegEncoding, OutputFormat, Result, check, ensure_loaded, sys,
 };
 use cuda_core::{Context, DriverError, Stream};
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Top-level nvJPEG library handle (`nvjpegHandle_t`).
@@ -128,6 +134,17 @@ impl Handle {
         })
     }
 
+    /// Binds the owning CUDA context before a `Drop` teardown, because nvJPEG destroy calls
+    /// free CUDA memory and the dropping thread may have no (or another) current context.
+    ///
+    /// A bind failure is recorded on the context; the destroy call still runs so that one sticky
+    /// error (which makes `bind_to_thread` fail) does not leak every later handle.
+    pub(crate) fn bind_for_drop(&self) {
+        if let Err(e) = self.cuda.bind_to_thread() {
+            self.cuda.record_err(Err::<(), _>(e));
+        }
+    }
+
     /// Records a teardown error on the CUDA context during `Drop`.
     pub(crate) fn record_drop_err(&self, code: sys::nvjpegStatus_t) {
         if code != sys::nvjpegStatus_t_NVJPEG_STATUS_SUCCESS {
@@ -141,6 +158,7 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.bind_for_drop();
             // SAFETY: `self.raw` was created by `nvjpegCreate*` and is destroyed once here.
             let code = unsafe { sys::nvjpegDestroy(self.raw) };
             self.record_drop_err(code);
@@ -148,36 +166,65 @@ impl Drop for Handle {
     }
 }
 
+/// Claims exclusive attachment of a scratch buffer to one [`JpegState`].
+///
+/// nvJPEG lists its pinned and device buffers among the objects to "instantiate separately for
+/// each thread", so one buffer must never back two states that may decode concurrently. The
+/// claim is taken under the buffer's `Mutex`, the same lock `resize` holds, so a resize can never
+/// overlap a decode through an attached state.
+fn claim_attachment<T>(raw: &Mutex<T>, attached: &AtomicBool, what: &'static str) -> Result<()> {
+    let _guard = raw.lock().unwrap_or_else(|e| e.into_inner());
+    attached
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+        .map_err(|_| Error::InvalidInput(what))
+}
+
 /// Reusable pinned host buffer (`nvjpegBufferPinned_t`).
+///
+/// A buffer can be attached to one [`JpegState`] at a time; it is released when that state is
+/// dropped or attaches another buffer. Resize it before attaching.
 pub struct PinnedBuffer {
     raw: Mutex<sys::nvjpegBufferPinned_t>,
+    attached: AtomicBool,
     handle: Arc<Handle>,
 }
 
 // SAFETY: `PinnedBuffer` owns its `nvjpegBufferPinned_t` behind a `Mutex`.
 unsafe impl Send for PinnedBuffer {}
-// SAFETY: `Mutex` serializes access to `nvjpegBufferPinned_t`.
+// SAFETY: `resize` runs under the `Mutex` and is refused while the buffer is attached; attachment
+// is exclusive (`claim_attachment`), so nvJPEG never uses the buffer from two states or threads.
 unsafe impl Sync for PinnedBuffer {}
 
 impl PinnedBuffer {
     /// Allocates a new pinned buffer handle (`nvjpegBufferPinnedCreate`).
     pub fn new(handle: &Arc<Handle>) -> Result<Arc<Self>> {
+        handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegBufferPinned_t = std::ptr::null_mut();
-        // SAFETY: `handle` is live; null allocator uses default pinned allocator.
+        // SAFETY: `handle` is live on the bound context; null allocator uses default pinned allocator.
         check("nvjpegBufferPinnedCreate", unsafe {
             sys::nvjpegBufferPinnedCreate(handle.raw(), std::ptr::null_mut(), &mut raw)
         })?;
         Ok(Arc::new(Self {
             raw: Mutex::new(raw),
+            attached: AtomicBool::new(false),
             handle: handle.clone(),
         }))
     }
 
     /// Pre-allocates or resizes the pinned buffer to `size` bytes (`nvjpegBufferPinnedResize`).
+    ///
+    /// Fails with [`Error::InvalidInput`] while the buffer is attached to a [`JpegState`].
     pub fn resize(&self, size: usize, stream: &Stream) -> Result<()> {
         self.handle.cuda().bind_to_thread()?;
         let raw = self.raw.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context.
+        if self.attached.load(Ordering::Acquire) {
+            return Err(Error::InvalidInput(
+                "resize a PinnedBuffer before attaching it to a JpegState",
+            ));
+        }
+        // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context, and no state
+        // uses the buffer (not attached, and attaching waits for this lock).
         check("nvjpegBufferPinnedResize", unsafe {
             sys::nvjpegBufferPinnedResize(*raw, size, stream.cu_stream())
         })
@@ -186,12 +233,25 @@ impl PinnedBuffer {
     pub(crate) fn raw(&self) -> sys::nvjpegBufferPinned_t {
         *self.raw.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn claim(&self) -> Result<()> {
+        claim_attachment(
+            &self.raw,
+            &self.attached,
+            "PinnedBuffer is already attached to another JpegState",
+        )
+    }
+
+    fn release(&self) {
+        self.attached.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for PinnedBuffer {
     fn drop(&mut self) {
         let raw = *self.raw.get_mut().unwrap_or_else(|e| e.into_inner());
         if !raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegBufferPinnedDestroy(raw) };
             self.handle.record_drop_err(code);
@@ -200,35 +260,50 @@ impl Drop for PinnedBuffer {
 }
 
 /// Reusable device buffer (`nvjpegBufferDevice_t`).
+///
+/// A buffer can be attached to one [`JpegState`] at a time; it is released when that state is
+/// dropped or attaches another buffer. Resize it before attaching.
 pub struct NvjpegDeviceBuffer {
     raw: Mutex<sys::nvjpegBufferDevice_t>,
+    attached: AtomicBool,
     handle: Arc<Handle>,
 }
 
 // SAFETY: `NvjpegDeviceBuffer` owns its `nvjpegBufferDevice_t` behind a `Mutex`.
 unsafe impl Send for NvjpegDeviceBuffer {}
-// SAFETY: `Mutex` serializes access to `nvjpegBufferDevice_t`.
+// SAFETY: `resize` runs under the `Mutex` and is refused while the buffer is attached; attachment
+// is exclusive (`claim_attachment`), so nvJPEG never uses the buffer from two states or threads.
 unsafe impl Sync for NvjpegDeviceBuffer {}
 
 impl NvjpegDeviceBuffer {
     /// Allocates a new device buffer handle (`nvjpegBufferDeviceCreate`).
     pub fn new(handle: &Arc<Handle>) -> Result<Arc<Self>> {
+        handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegBufferDevice_t = std::ptr::null_mut();
-        // SAFETY: `handle` is live; null allocator uses default device allocator.
+        // SAFETY: `handle` is live on the bound context; null allocator uses default device allocator.
         check("nvjpegBufferDeviceCreate", unsafe {
             sys::nvjpegBufferDeviceCreate(handle.raw(), std::ptr::null_mut(), &mut raw)
         })?;
         Ok(Arc::new(Self {
             raw: Mutex::new(raw),
+            attached: AtomicBool::new(false),
             handle: handle.clone(),
         }))
     }
 
     /// Pre-allocates or resizes the device buffer to `size` bytes (`nvjpegBufferDeviceResize`).
+    ///
+    /// Fails with [`Error::InvalidInput`] while the buffer is attached to a [`JpegState`].
     pub fn resize(&self, size: usize, stream: &Stream) -> Result<()> {
         self.handle.cuda().bind_to_thread()?;
         let raw = self.raw.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context.
+        if self.attached.load(Ordering::Acquire) {
+            return Err(Error::InvalidInput(
+                "resize an NvjpegDeviceBuffer before attaching it to a JpegState",
+            ));
+        }
+        // SAFETY: `raw` and `stream.cu_stream()` are valid on the bound context, and no state
+        // uses the buffer (not attached, and attaching waits for this lock).
         check("nvjpegBufferDeviceResize", unsafe {
             sys::nvjpegBufferDeviceResize(*raw, size, stream.cu_stream())
         })
@@ -237,12 +312,25 @@ impl NvjpegDeviceBuffer {
     pub(crate) fn raw(&self) -> sys::nvjpegBufferDevice_t {
         *self.raw.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn claim(&self) -> Result<()> {
+        claim_attachment(
+            &self.raw,
+            &self.attached,
+            "NvjpegDeviceBuffer is already attached to another JpegState",
+        )
+    }
+
+    fn release(&self) {
+        self.attached.store(false, Ordering::Release);
+    }
 }
 
 impl Drop for NvjpegDeviceBuffer {
     fn drop(&mut self) {
         let raw = *self.raw.get_mut().unwrap_or_else(|e| e.into_inner());
         if !raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegBufferDeviceDestroy(raw) };
             self.handle.record_drop_err(code);
@@ -288,6 +376,7 @@ impl JpegDecoder {
 impl Drop for JpegDecoder {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegDecoderDestroy(self.raw) };
             self.handle.record_drop_err(code);
@@ -308,8 +397,9 @@ unsafe impl Send for DecodeParams {}
 impl DecodeParams {
     /// Creates decode parameters (`nvjpegDecodeParamsCreate`).
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
+        handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegDecodeParams_t = std::ptr::null_mut();
-        // SAFETY: `handle` is live and `raw` is a valid out-pointer.
+        // SAFETY: `handle` is live on the bound context and `raw` is a valid out-pointer.
         check("nvjpegDecodeParamsCreate", unsafe {
             sys::nvjpegDecodeParamsCreate(handle.raw(), &mut raw)
         })?;
@@ -338,6 +428,7 @@ impl DecodeParams {
 impl Drop for DecodeParams {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegDecodeParamsDestroy(self.raw) };
             self.handle.record_drop_err(code);
@@ -360,8 +451,9 @@ unsafe impl Send for JpegState {}
 impl JpegState {
     /// Creates a new legacy v1 decode state (`nvjpegJpegStateCreate`) for [`Self::decode`].
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
+        handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegJpegState_t = std::ptr::null_mut();
-        // SAFETY: `handle` is live and `raw` is a valid out-pointer.
+        // SAFETY: `handle` is live on the bound context and `raw` is a valid out-pointer.
         check("nvjpegJpegStateCreate", unsafe {
             sys::nvjpegJpegStateCreate(handle.raw(), &mut raw)
         })?;
@@ -377,8 +469,10 @@ impl JpegState {
     /// Creates a decoupled v2 decoder state (`nvjpegDecoderStateCreate`) that supports
     /// [`Self::attach_pinned`], [`Self::attach_device`], and [`Self::decode_jpeg`].
     pub fn with_decoder(decoder: &Arc<JpegDecoder>) -> Result<Self> {
+        decoder.handle().cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegJpegState_t = std::ptr::null_mut();
-        // SAFETY: `decoder` and its owning `handle` are live and `raw` is a valid out-pointer.
+        // SAFETY: `decoder` and its owning `handle` are live on the bound context and `raw` is a
+        // valid out-pointer.
         check("nvjpegDecoderStateCreate", unsafe {
             sys::nvjpegDecoderStateCreate(decoder.handle().raw(), decoder.raw(), &mut raw)
         })?;
@@ -393,33 +487,57 @@ impl JpegState {
 
     /// Attaches a reusable pinned buffer (`nvjpegStateAttachPinnedBuffer`) to a decoder-bound
     /// state and retains an `Arc` so the buffer cannot be dropped while attached.
+    ///
+    /// The buffer is attached exclusively: attaching one already attached to another live
+    /// `JpegState` fails with [`Error::InvalidInput`]. A previously attached buffer is released.
     pub fn attach_pinned(&mut self, buf: &Arc<PinnedBuffer>) -> Result<()> {
         if self.decoder.is_none() {
             return Err(Error::InvalidInput(
                 "attach_pinned requires a JpegState created with JpegState::with_decoder",
             ));
         }
-        // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong to live `nvjpegHandle_t`.
-        check("nvjpegStateAttachPinnedBuffer", unsafe {
-            sys::nvjpegStateAttachPinnedBuffer(self.raw, buf.raw())
-        })?;
-        self._pinned = Some(buf.clone());
+        if self._pinned.as_ref().is_some_and(|p| Arc::ptr_eq(p, buf)) {
+            return Ok(());
+        }
+        buf.claim()?;
+        // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong
+        // to a live `nvjpegHandle_t`, and `buf` is now attached to this state only.
+        let status = unsafe { sys::nvjpegStateAttachPinnedBuffer(self.raw, buf.raw()) };
+        if let Err(e) = check("nvjpegStateAttachPinnedBuffer", status) {
+            buf.release();
+            return Err(e);
+        }
+        if let Some(old) = self._pinned.replace(buf.clone()) {
+            old.release();
+        }
         Ok(())
     }
 
     /// Attaches a reusable device buffer (`nvjpegStateAttachDeviceBuffer`) to a decoder-bound
     /// state and retains an `Arc` so the buffer cannot be dropped while attached.
+    ///
+    /// The buffer is attached exclusively: attaching one already attached to another live
+    /// `JpegState` fails with [`Error::InvalidInput`]. A previously attached buffer is released.
     pub fn attach_device(&mut self, buf: &Arc<NvjpegDeviceBuffer>) -> Result<()> {
         if self.decoder.is_none() {
             return Err(Error::InvalidInput(
                 "attach_device requires a JpegState created with JpegState::with_decoder",
             ));
         }
-        // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong to live `nvjpegHandle_t`.
-        check("nvjpegStateAttachDeviceBuffer", unsafe {
-            sys::nvjpegStateAttachDeviceBuffer(self.raw, buf.raw())
-        })?;
-        self._device = Some(buf.clone());
+        if self._device.as_ref().is_some_and(|d| Arc::ptr_eq(d, buf)) {
+            return Ok(());
+        }
+        buf.claim()?;
+        // SAFETY: both `self.raw` (created via `nvjpegDecoderStateCreate`) and `buf.raw()` belong
+        // to a live `nvjpegHandle_t`, and `buf` is now attached to this state only.
+        let status = unsafe { sys::nvjpegStateAttachDeviceBuffer(self.raw, buf.raw()) };
+        if let Err(e) = check("nvjpegStateAttachDeviceBuffer", status) {
+            buf.release();
+            return Err(e);
+        }
+        if let Some(old) = self._device.replace(buf.clone()) {
+            old.release();
+        }
         Ok(())
     }
 
@@ -439,10 +557,12 @@ impl JpegState {
         if data.is_empty() {
             return Err(Error::InvalidInput("JPEG bitstream is empty"));
         }
-        format.validate_layout(dst.layout())?;
+        let geom = DecodeGeometry::from_info(&self.handle.image_info(data)?)?;
+        format.validate_layout(dst.layout(), &geom)?;
         self.handle.cuda().bind_to_thread()?;
-        // SAFETY: `data` is valid for `data.len()` bytes, `dst` has validated device plane pointers
-        // matching `format`, and `stream` is valid on the bound context.
+        // SAFETY: `data` is valid for `data.len()` bytes, `dst` has device planes that cover the
+        // image `data` decodes to in `format` (checked against its parsed geometry), and
+        // `stream` is valid on the bound context.
         check("nvjpegDecode", unsafe {
             sys::nvjpegDecode(
                 self.handle.raw(),
@@ -470,10 +590,16 @@ impl JpegState {
         let format = params
             .output_format
             .ok_or(Error::InvalidInput("DecodeParams output format not set"))?;
-        format.validate_layout(dst.layout())?;
+        if !jpeg_stream.decodable {
+            return Err(Error::InvalidInput(
+                "decode_jpeg requires a JpegStream filled by a successful JpegStream::parse",
+            ));
+        }
+        format.validate_layout(dst.layout(), &jpeg_stream.geometry()?)?;
         self.handle.cuda().bind_to_thread()?;
-        // SAFETY: `self.raw` is a decoder-bound state, `jpeg_stream` is parsed, `params` has
-        // matching output format, `dst` has validated device plane pointers, and `stream` is bound.
+        // SAFETY: `self.raw` is a decoder-bound state, `jpeg_stream` holds its own copy of a fully
+        // parsed bitstream, `params` has the checked output format, `dst` has device planes that
+        // cover the stream's image in that format, and `stream` is bound.
         check("nvjpegDecodeJpeg", unsafe {
             sys::nvjpegDecodeJpeg(
                 self.handle.raw(),
@@ -491,9 +617,16 @@ impl JpegState {
 impl Drop for JpegState {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegJpegStateDestroy(self.raw) };
             self.handle.record_drop_err(code);
+        }
+        if let Some(p) = &self._pinned {
+            p.release();
+        }
+        if let Some(d) = &self._device {
+            d.release();
         }
     }
 }
@@ -502,6 +635,9 @@ impl Drop for JpegState {
 pub struct JpegStream {
     raw: sys::nvjpegJpegStream_t,
     handle: Arc<Handle>,
+    /// `true` only after a successful [`Self::parse`], which copies the whole bitstream into
+    /// nvJPEG's internal storage; a header-only parse is never decoded.
+    pub(crate) decodable: bool,
 }
 
 // SAFETY: `nvjpegJpegStream_t` is host-side state owned exclusively by `JpegStream`.
@@ -510,37 +646,57 @@ unsafe impl Send for JpegStream {}
 impl JpegStream {
     /// Creates a new stream parser (`nvjpegJpegStreamCreate`).
     pub fn new(handle: &Arc<Handle>) -> Result<Self> {
+        handle.cuda().bind_to_thread()?;
         let mut raw: sys::nvjpegJpegStream_t = std::ptr::null_mut();
-        // SAFETY: `handle` is live and `raw` is a valid out-pointer.
+        // SAFETY: `handle` is live on the bound context and `raw` is a valid out-pointer.
         check("nvjpegJpegStreamCreate", unsafe {
             sys::nvjpegJpegStreamCreate(handle.raw(), &mut raw)
         })?;
         Ok(Self {
             raw,
             handle: handle.clone(),
+            decodable: false,
         })
     }
 
     /// Parses a JPEG bitstream (`nvjpegJpegStreamParse`).
+    ///
+    /// `save_stream` must be `true`. nvJPEG documents that with `save_stream == 0` the stream
+    /// "will just save the pointers" to `data` and reads them again during decode, which would
+    /// let a later [`JpegState::decode_jpeg`] read `data` after this borrow ended. `false` is
+    /// therefore rejected with [`Error::InvalidInput`].
     pub fn parse(&mut self, data: &[u8], save_metadata: bool, save_stream: bool) -> Result<()> {
+        self.decodable = false;
         if data.is_empty() {
             return Err(Error::InvalidInput("JPEG bitstream is empty"));
         }
-        // SAFETY: `self.handle` and `self.raw` are live and `data` is valid for `data.len()` bytes.
+        if !save_stream {
+            return Err(Error::InvalidInput(
+                "JpegStream::parse requires save_stream = true: nvJPEG would keep a pointer to the borrowed bitstream",
+            ));
+        }
+        // SAFETY: `self.handle` and `self.raw` are live, `data` is valid for `data.len()` bytes,
+        // and `save_stream = 1` makes nvJPEG copy the bitstream instead of retaining `data`.
         check("nvjpegJpegStreamParse", unsafe {
             sys::nvjpegJpegStreamParse(
                 self.handle.raw(),
                 data.as_ptr(),
                 data.len(),
                 c_int::from(save_metadata),
-                c_int::from(save_stream),
+                1,
                 self.raw,
             )
-        })
+        })?;
+        self.decodable = true;
+        Ok(())
     }
 
     /// Parses only the JPEG header (`nvjpegJpegStreamParseHeader`).
+    ///
+    /// The stream then answers metadata queries but cannot be passed to
+    /// [`JpegState::decode_jpeg`] until [`Self::parse`] succeeds.
     pub fn parse_header(&mut self, data: &[u8]) -> Result<()> {
+        self.decodable = false;
         if data.is_empty() {
             return Err(Error::InvalidInput("JPEG bitstream is empty"));
         }
@@ -610,6 +766,24 @@ impl JpegStream {
         Ok(JpegEncoding::from_sys(enc))
     }
 
+    /// Per-component dimensions of the parsed frame
+    /// (`nvjpegJpegStreamGetComponentsNum` + `nvjpegJpegStreamGetComponentDimensions`).
+    pub(crate) fn geometry(&self) -> Result<DecodeGeometry> {
+        let components = usize::try_from(self.components_num()?)
+            .map_err(|_| Error::InvalidInput("JPEG component count exceeds usize"))?;
+        let mut dims = [(0u32, 0u32); 4];
+        for (component, d) in (0u32..).zip(dims.iter_mut()).take(components) {
+            let (mut w, mut h) = (0u32, 0u32);
+            // SAFETY: `self.raw` is parsed, `component < components_num`, and `w`, `h` are valid
+            // out-pointers.
+            check("nvjpegJpegStreamGetComponentDimensions", unsafe {
+                sys::nvjpegJpegStreamGetComponentDimensions(self.raw, component, &mut w, &mut h)
+            })?;
+            *d = (w, h);
+        }
+        DecodeGeometry::new(components, dims)
+    }
+
     pub(crate) fn raw(&self) -> sys::nvjpegJpegStream_t {
         self.raw
     }
@@ -618,6 +792,7 @@ impl JpegStream {
 impl Drop for JpegStream {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            self.handle.bind_for_drop();
             // SAFETY: `self.raw` is owned by `self` and `self.handle` is still alive.
             let code = unsafe { sys::nvjpegJpegStreamDestroy(self.raw) };
             self.handle.record_drop_err(code);

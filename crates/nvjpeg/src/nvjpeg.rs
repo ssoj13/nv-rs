@@ -11,7 +11,9 @@
 //! - [`EncoderParams`], [`EncoderState`] — JPEG compression parameters, encoding from planar
 //!   or interleaved device buffers, and zero-alloc bitstream retrieval (`retrieve_bitstream_into`).
 //! - [`ImagePlanes`] / [`ImagePlanesMut`] — validated planar/interleaved `nvjpegImage_t` views
-//!   over `cuda_core::DeviceBuffer<u8>`.
+//!   over `cuda_core::DeviceBuffer<u8>`. Decoding checks the output planes against the
+//!   dimensions and subsampling parsed from the bitstream; `encode_yuv` checks the source planes
+//!   against the requested chroma subsampling.
 //!
 //! **Used by** `nvjpeg` GPU tests and imaging pipelines.
 
@@ -163,6 +165,30 @@ impl ChromaSubsampling {
                 "cannot encode with Unknown chroma subsampling",
             )),
         }
+    }
+
+    /// Chroma plane `(width, height)` that an `nvjpegEncodeYUV` source must provide for a
+    /// `width x height` frame, or `None` for [`Self::Gray`], which reads only the Y plane.
+    ///
+    /// nvJPEG documents that chroma planes are "aligned to the corresponding subsamplings"
+    /// with rounding up (its 4:1:0 example: a 123x321 frame has 31x161 Cb/Cr planes).
+    /// [`Self::Yuv410v`] has no documented plane geometry, so it is rejected rather than guessed.
+    pub(crate) fn encode_chroma_dims(self, width: u32, height: u32) -> Result<Option<(u32, u32)>> {
+        let (div_x, div_y) = match self {
+            Self::Yuv444 => (1, 1),
+            Self::Yuv422 => (2, 1),
+            Self::Yuv420 => (2, 2),
+            Self::Yuv440 => (1, 2),
+            Self::Yuv411 => (4, 1),
+            Self::Yuv410 => (4, 2),
+            Self::Gray => return Ok(None),
+            Self::Yuv410v | Self::Unknown => {
+                return Err(Error::InvalidInput(
+                    "encode_yuv supports 444, 422, 420, 440, 411, 410 and Gray chroma subsampling",
+                ));
+            }
+        };
+        Ok(Some((width.div_ceil(div_x), height.div_ceil(div_y))))
     }
 }
 
@@ -375,53 +401,154 @@ pub(crate) enum PlaneLayout {
     },
 }
 
-impl OutputFormat {
-    pub(crate) fn validate_layout(self, layout: PlaneLayout) -> Result<()> {
-        match (self, layout) {
-            (Self::Rgbi | Self::Bgri, PlaneLayout::Interleaved { bpp: 3, .. }) => Ok(()),
-            (Self::UnchangedI, PlaneLayout::Interleaved { .. }) => Ok(()),
-            (
-                Self::Rgb | Self::Bgr,
-                PlaneLayout::Planar3 {
-                    width,
-                    height,
-                    plane_dims,
-                },
-            ) if plane_dims
-                .iter()
-                .all(|&(pw, ph)| pw >= width && ph >= height) =>
-            {
-                Ok(())
-            }
-            (
-                Self::Yuv | Self::Unchanged,
-                PlaneLayout::Planar3 {
-                    width,
-                    height,
-                    plane_dims,
-                },
-            ) if plane_dims[0].0 >= width
-                && plane_dims[0].1 >= height
-                && plane_dims[1].0 >= width.div_ceil(2)
-                && plane_dims[1].1 >= height.div_ceil(2)
-                && plane_dims[2].0 >= width.div_ceil(2)
-                && plane_dims[2].1 >= height.div_ceil(2) =>
-            {
-                Ok(())
-            }
-            (Self::Y, PlaneLayout::SingleY { .. }) => Ok(()),
-            (
-                Self::Y,
-                PlaneLayout::Planar3 {
-                    width,
-                    height,
-                    plane_dims,
-                },
-            ) if plane_dims[0].0 >= width && plane_dims[0].1 >= height => Ok(()),
-            _ => Err(Error::InvalidInput(
-                "output format or plane dimensions do not match ImagePlanesMut layout",
-            )),
+/// Returns `true` when a `plane` of `(width, height)` covers the `need`ed extent.
+fn fits(plane: (u32, u32), need: (u32, u32)) -> bool {
+    plane.0 >= need.0 && plane.1 >= need.1
+}
+
+/// Per-component geometry read from the JPEG bitstream itself, used to bound nvJPEG's output
+/// writes. The caller-supplied plane sizes cannot be trusted for this: nvJPEG writes the
+/// bitstream's dimensions, whatever `ImagePlanesMut` claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DecodeGeometry {
+    /// Encoded component count (`1..=4`).
+    pub(crate) components: usize,
+    /// `(width, height)` of each component; component 0 is the full frame, unused entries are 0.
+    pub(crate) dims: [(u32, u32); 4],
+}
+
+impl DecodeGeometry {
+    pub(crate) fn new(components: usize, dims: [(u32, u32); 4]) -> Result<Self> {
+        if !(1..=4).contains(&components) {
+            return Err(Error::InvalidInput("JPEG component count must be 1..=4"));
         }
+        if dims[0].0 == 0 || dims[0].1 == 0 {
+            return Err(Error::InvalidInput(
+                "JPEG frame dimensions must be non-zero",
+            ));
+        }
+        Ok(Self { components, dims })
+    }
+
+    pub(crate) fn from_info(info: &ImageInfo) -> Result<Self> {
+        let mut dims = [(0u32, 0u32); 4];
+        for (d, (&w, &h)) in dims
+            .iter_mut()
+            .zip(info.widths.iter().zip(info.heights.iter()))
+        {
+            *d = (w, h);
+        }
+        Self::new(info.components, dims)
+    }
+}
+
+impl OutputFormat {
+    /// Checks that `layout` can hold the image nvJPEG writes for `geom` in this format.
+    ///
+    /// Plane extents follow the `nvjpegOutputFormat_t` table of the nvJPEG documentation:
+    /// RGB/BGR planes and interleaved rows use component 0 (the frame); `UNCHANGED` writes each
+    /// component at its own size; `YUV` writes all three components at their own sizes, or only
+    /// `channel[0]` for a single-component (grayscale) bitstream.
+    pub(crate) fn validate_layout(self, layout: PlaneLayout, geom: &DecodeGeometry) -> Result<()> {
+        let frame = geom.dims[0];
+        let ok = match (self, layout) {
+            (
+                Self::Rgbi | Self::Bgri,
+                PlaneLayout::Interleaved {
+                    width,
+                    height,
+                    bpp: 3,
+                },
+            ) => fits((width, height), frame),
+            (Self::UnchangedI, PlaneLayout::Interleaved { width, height, bpp }) => {
+                usize::try_from(bpp).is_ok_and(|b| b == geom.components)
+                    && fits((width, height), frame)
+            }
+            (Self::Rgb | Self::Bgr, PlaneLayout::Planar3 { plane_dims, .. }) => {
+                plane_dims.iter().all(|&p| fits(p, frame))
+            }
+            (Self::Yuv, PlaneLayout::Planar3 { plane_dims, .. }) => match geom.components {
+                1 => fits(plane_dims[0], frame),
+                3 => plane_dims
+                    .iter()
+                    .zip(geom.dims.iter())
+                    .all(|(&p, &c)| fits(p, c)),
+                _ => false,
+            },
+            // Only three output channels exist in `ImagePlanesMut`, so a 4-component bitstream
+            // would make nvJPEG write through the null `channel[3]`.
+            (Self::Unchanged, PlaneLayout::Planar3 { plane_dims, .. }) => {
+                geom.components <= 3
+                    && plane_dims
+                        .iter()
+                        .zip(geom.dims.iter())
+                        .take(geom.components)
+                        .all(|(&p, &c)| fits(p, c))
+            }
+            (Self::Y, PlaneLayout::SingleY { width, height }) => fits((width, height), frame),
+            (Self::Y, PlaneLayout::Planar3 { plane_dims, .. }) => fits(plane_dims[0], frame),
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput(
+                "output format or plane dimensions do not cover the JPEG bitstream's image",
+            ))
+        }
+    }
+}
+
+/// Checks an `nvjpegEncodeYUV` source against the plane sizes `subsampling` makes nvJPEG read.
+///
+/// [`ChromaSubsampling::Gray`] reads only the Y plane, so a single plane
+/// ([`ImagePlanes::interleaved`] with `bpp = 1`) or the first plane of a planar image suffices.
+pub(crate) fn validate_yuv_source(
+    layout: PlaneLayout,
+    subsampling: ChromaSubsampling,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let chroma = subsampling.encode_chroma_dims(width, height)?;
+    let frame = (width, height);
+    let ok = match (chroma, layout) {
+        (
+            None,
+            PlaneLayout::Interleaved {
+                width: w,
+                height: h,
+                bpp: 1,
+            },
+        ) => (w, h) == frame,
+        (
+            None,
+            PlaneLayout::Planar3 {
+                width: w,
+                height: h,
+                plane_dims,
+            },
+        ) => (w, h) == frame && fits(plane_dims[0], frame),
+        (
+            Some(c),
+            PlaneLayout::Planar3 {
+                width: w,
+                height: h,
+                plane_dims,
+            },
+        ) => {
+            (w, h) == frame
+                && fits(plane_dims[0], frame)
+                && fits(plane_dims[1], c)
+                && fits(plane_dims[2], c)
+        }
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(
+            "YUV planes do not match the dimensions and chroma subsampling",
+        ))
     }
 }
 
@@ -693,20 +820,37 @@ mod tests {
             width: 64,
             height: 64,
         };
+        let g420 = DecodeGeometry::new(3, [(64, 64), (32, 32), (32, 32), (0, 0)]).expect("420");
 
-        assert!(OutputFormat::Rgbi.validate_layout(interleaved).is_ok());
-        assert!(OutputFormat::Rgb.validate_layout(interleaved).is_err());
-        assert!(OutputFormat::Rgb.validate_layout(planar).is_ok());
+        assert!(
+            OutputFormat::Rgbi
+                .validate_layout(interleaved, &g420)
+                .is_ok()
+        );
         assert!(
             OutputFormat::Rgb
-                .validate_layout(planar_undersized)
+                .validate_layout(interleaved, &g420)
                 .is_err()
         );
-        assert!(OutputFormat::Yuv.validate_layout(planar_yuv420).is_ok());
-        assert!(OutputFormat::Rgb.validate_layout(planar_yuv420).is_err());
-        assert!(OutputFormat::Rgbi.validate_layout(planar).is_err());
-        assert!(OutputFormat::Y.validate_layout(single_y).is_ok());
-        assert!(OutputFormat::Rgb.validate_layout(single_y).is_err());
+        assert!(OutputFormat::Rgb.validate_layout(planar, &g420).is_ok());
+        assert!(
+            OutputFormat::Rgb
+                .validate_layout(planar_undersized, &g420)
+                .is_err()
+        );
+        assert!(
+            OutputFormat::Yuv
+                .validate_layout(planar_yuv420, &g420)
+                .is_ok()
+        );
+        assert!(
+            OutputFormat::Rgb
+                .validate_layout(planar_yuv420, &g420)
+                .is_err()
+        );
+        assert!(OutputFormat::Rgbi.validate_layout(planar, &g420).is_err());
+        assert!(OutputFormat::Y.validate_layout(single_y, &g420).is_ok());
+        assert!(OutputFormat::Rgb.validate_layout(single_y, &g420).is_err());
 
         assert!(
             InputFormat::Rgbi
@@ -738,6 +882,167 @@ mod tests {
             InputFormat::Yuv
                 .validate_layout(planar_undersized, 64, 64)
                 .is_err()
+        );
+    }
+
+    /// JPG-1: output planes are checked against the bitstream's geometry, not the caller's
+    /// `ImagePlanesMut` width/height.
+    #[test]
+    fn decode_layout_validation_uses_bitstream_geometry() {
+        let big = DecodeGeometry::new(3, [(4000, 3000), (2000, 1500), (2000, 1500), (0, 0)])
+            .expect("big");
+        let small_rgbi = PlaneLayout::Interleaved {
+            width: 64,
+            height: 64,
+            bpp: 3,
+        };
+        assert!(
+            OutputFormat::Rgbi
+                .validate_layout(small_rgbi, &big)
+                .is_err()
+        );
+
+        // 4:4:4 bitstream decoded to YUV needs full-size chroma planes.
+        let g444 = DecodeGeometry::new(3, [(64, 64); 4]).expect("444");
+        let planes_420 = PlaneLayout::Planar3 {
+            width: 64,
+            height: 64,
+            plane_dims: [(64, 64), (32, 32), (32, 32)],
+        };
+        assert!(
+            OutputFormat::Yuv
+                .validate_layout(planes_420, &g444)
+                .is_err()
+        );
+        assert!(
+            OutputFormat::Unchanged
+                .validate_layout(planes_420, &g444)
+                .is_err()
+        );
+
+        // 4:1:1 chroma is a quarter wide and full height: valid although narrower than 4:2:0.
+        let g411 = DecodeGeometry::new(3, [(64, 64), (16, 64), (16, 64), (0, 0)]).expect("411");
+        let planes_411 = PlaneLayout::Planar3 {
+            width: 64,
+            height: 64,
+            plane_dims: [(64, 64), (16, 64), (16, 64)],
+        };
+        assert!(OutputFormat::Yuv.validate_layout(planes_411, &g411).is_ok());
+        assert!(
+            OutputFormat::Yuv
+                .validate_layout(planes_420, &g411)
+                .is_err()
+        );
+
+        // Grayscale YUV/UNCHANGED output populates only channel[0].
+        let gray = DecodeGeometry::new(1, [(64, 64), (0, 0), (0, 0), (0, 0)]).expect("gray");
+        let y_only = PlaneLayout::Planar3 {
+            width: 64,
+            height: 64,
+            plane_dims: [(64, 64), (1, 1), (1, 1)],
+        };
+        assert!(OutputFormat::Yuv.validate_layout(y_only, &gray).is_ok());
+        assert!(
+            OutputFormat::Unchanged
+                .validate_layout(y_only, &gray)
+                .is_ok()
+        );
+
+        // UNCHANGEDI rows hold one byte per component.
+        assert!(
+            OutputFormat::UnchangedI
+                .validate_layout(small_rgbi, &g444)
+                .is_ok()
+        );
+        assert!(
+            OutputFormat::UnchangedI
+                .validate_layout(small_rgbi, &gray)
+                .is_err()
+        );
+
+        // Four components cannot fit the three output channels.
+        let cmyk = DecodeGeometry::new(4, [(64, 64); 4]).expect("cmyk");
+        let full = PlaneLayout::Planar3 {
+            width: 64,
+            height: 64,
+            plane_dims: [(64, 64); 3],
+        };
+        assert!(
+            OutputFormat::Unchanged
+                .validate_layout(full, &cmyk)
+                .is_err()
+        );
+        assert!(OutputFormat::Yuv.validate_layout(full, &cmyk).is_err());
+
+        assert!(DecodeGeometry::new(0, [(64, 64); 4]).is_err());
+        assert!(DecodeGeometry::new(5, [(64, 64); 4]).is_err());
+        assert!(DecodeGeometry::new(3, [(0, 64); 4]).is_err());
+    }
+
+    /// JPG-2: `encode_yuv` plane requirements follow the requested chroma subsampling.
+    #[test]
+    fn encode_yuv_validation_follows_subsampling() {
+        let planar = |c: (u32, u32)| PlaneLayout::Planar3 {
+            width: 123,
+            height: 321,
+            plane_dims: [(123, 321), c, c],
+        };
+        // nvJPEG documentation example: 4:1:0 at 123x321 has 31x161 chroma planes.
+        assert_eq!(
+            ChromaSubsampling::Yuv410
+                .encode_chroma_dims(123, 321)
+                .expect("410"),
+            Some((31, 161))
+        );
+        assert!(
+            validate_yuv_source(planar((31, 161)), ChromaSubsampling::Yuv410, 123, 321).is_ok()
+        );
+        assert!(
+            validate_yuv_source(planar((30, 161)), ChromaSubsampling::Yuv410, 123, 321).is_err()
+        );
+
+        // 4:4:4 with 4:2:0-sized chroma would make nvJPEG read past the chroma planes.
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Yuv444, 123, 321).is_err()
+        );
+        assert!(
+            validate_yuv_source(planar((123, 321)), ChromaSubsampling::Yuv444, 123, 321).is_ok()
+        );
+        assert!(
+            validate_yuv_source(planar((62, 321)), ChromaSubsampling::Yuv422, 123, 321).is_ok()
+        );
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Yuv422, 123, 321).is_err()
+        );
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Yuv420, 123, 321).is_ok()
+        );
+        assert!(
+            validate_yuv_source(planar((123, 161)), ChromaSubsampling::Yuv440, 123, 321).is_ok()
+        );
+        assert!(
+            validate_yuv_source(planar((31, 321)), ChromaSubsampling::Yuv411, 123, 321).is_ok()
+        );
+
+        // Gray reads only the Y plane: a single plane is enough.
+        let y_plane = PlaneLayout::Interleaved {
+            width: 123,
+            height: 321,
+            bpp: 1,
+        };
+        assert!(validate_yuv_source(y_plane, ChromaSubsampling::Gray, 123, 321).is_ok());
+        assert!(validate_yuv_source(planar((1, 1)), ChromaSubsampling::Gray, 123, 321).is_ok());
+        assert!(validate_yuv_source(y_plane, ChromaSubsampling::Yuv420, 123, 321).is_err());
+
+        // Dimensions must match and undocumented geometries are rejected.
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Yuv420, 124, 321).is_err()
+        );
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Yuv410v, 123, 321).is_err()
+        );
+        assert!(
+            validate_yuv_source(planar((62, 161)), ChromaSubsampling::Unknown, 123, 321).is_err()
         );
     }
 

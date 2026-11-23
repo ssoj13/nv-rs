@@ -2,7 +2,7 @@
 //! 1D signal operations.
 
 use cuda_core::{Context, DeviceBuffer};
-use npp::image::{self, CmpOp, ImageView, ImageViewMut, Interpolation, Rect, Size};
+use npp::image::{self, CmpOp, ImageView, ImageViewMut, Interpolation, MaskSize, Rect, Size};
 use npp::{NppContext, signal};
 
 #[test]
@@ -137,4 +137,183 @@ fn filter_threshold_and_signal_ops() {
         (sum_val - 320.0).abs() < 1e-3,
         "expected 320.0, got {sum_val}"
     );
+}
+
+/// Linear gradient `x * 7 + y * 3 + c * 10` (max 160 for a 16x16, 3-channel image).
+fn gradient(w: u32, h: u32, ch: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * ch) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..ch {
+                out.push((x * 7 + y * 3 + c * 10) as u8);
+            }
+        }
+    }
+    out
+}
+
+/// NPP-4: box and Gaussian filters on an interior subview read the border pixels the
+/// anchor/padding logic promises. On a linear gradient a centred 3x3 average (box) and any
+/// symmetric kernel (Gauss) reproduce the centre pixel, so an anchor or border mismatch shows up
+/// as an offset of 3 (row) or 7 (column) levels.
+#[test]
+#[ignore = "GPU"]
+fn filters_on_interior_subview_match_host_reference() {
+    let cuda = Context::new(0).expect("CUDA device 0");
+    let stream = cuda.default_stream();
+    let ctx = NppContext::new(&stream).expect("NppContext");
+    let full = Size {
+        width: 16,
+        height: 16,
+    };
+    let inner = Rect {
+        x: 1,
+        y: 1,
+        width: 14,
+        height: 14,
+    };
+    let inner_size = Size {
+        width: 14,
+        height: 14,
+    };
+
+    for ch in [1u32, 3] {
+        let src_host = gradient(16, 16, ch);
+        let src_dev = DeviceBuffer::from_host(&stream, &src_host).expect("src");
+        let src_full = ImageView::packed(&src_dev, full, ch).expect("src view");
+        let src_inner = src_full.subview(inner).expect("subview");
+        let n = (14 * 14 * ch) as usize;
+
+        let mut box_dev = DeviceBuffer::<u8>::zeroed(&stream, n).expect("box dst");
+        let mut box_m = ImageViewMut::packed(&mut box_dev, inner_size, ch).expect("box view");
+        let mask = Size {
+            width: 3,
+            height: 3,
+        };
+        if ch == 1 {
+            image::filter_box_8u_c1(&ctx, &src_inner, &mut box_m, mask, (1, 1)).expect("box c1");
+        } else {
+            image::filter_box_8u_c3(&ctx, &src_inner, &mut box_m, mask, (1, 1)).expect("box c3");
+        }
+
+        let mut gauss_dev = DeviceBuffer::<u8>::zeroed(&stream, n).expect("gauss dst");
+        let mut gauss_m = ImageViewMut::packed(&mut gauss_dev, inner_size, ch).expect("gauss view");
+        if ch == 1 {
+            image::filter_gauss_8u_c1(&ctx, &src_inner, &mut gauss_m, MaskSize::X3x3)
+                .expect("gauss c1");
+        } else {
+            image::filter_gauss_8u_c3(&ctx, &src_inner, &mut gauss_m, MaskSize::X3x3)
+                .expect("gauss c3");
+        }
+        stream.synchronize().expect("sync");
+
+        let box_host = box_dev.to_host_vec(&stream).expect("box readback");
+        let gauss_host = gauss_dev.to_host_vec(&stream).expect("gauss readback");
+        for y in 0..14u32 {
+            for x in 0..14u32 {
+                for c in 0..ch {
+                    let i = ((y * 14 + x) * ch + c) as usize;
+                    let expected = ((x + 1) * 7 + (y + 1) * 3 + c * 10) as u8;
+                    assert!(
+                        box_host[i].abs_diff(expected) <= 1,
+                        "box ch={ch} ({x},{y},{c}): {} vs {expected}",
+                        box_host[i]
+                    );
+                    assert!(
+                        gauss_host[i].abs_diff(expected) <= 1,
+                        "gauss ch={ch} ({x},{y},{c}): {} vs {expected}",
+                        gauss_host[i]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// NPP-4: `resize_8u_c1`, `resize_8u_c4`, `resize_32f_c3` and `threshold_val_32f_c1` run on
+/// hardware; a constant image must stay constant under any interpolation.
+#[test]
+#[ignore = "GPU"]
+fn resize_variants_and_float_threshold() {
+    let cuda = Context::new(0).expect("CUDA device 0");
+    let stream = cuda.default_stream();
+    let ctx = NppContext::new(&stream).expect("NppContext");
+    let src_size = Size {
+        width: 16,
+        height: 16,
+    };
+    let dst_size = Size {
+        width: 8,
+        height: 8,
+    };
+
+    for ch in [1u32, 4] {
+        let src_dev =
+            DeviceBuffer::from_host(&stream, &vec![77u8; (16 * 16 * ch) as usize]).expect("src");
+        let mut dst_dev = DeviceBuffer::<u8>::zeroed(&stream, (8 * 8 * ch) as usize).expect("dst");
+        let src_v = ImageView::packed(&src_dev, src_size, ch).expect("src view");
+        let mut dst_m = ImageViewMut::packed(&mut dst_dev, dst_size, ch).expect("dst view");
+        if ch == 1 {
+            image::resize_8u_c1(
+                &ctx,
+                &src_v,
+                Rect::full(src_size),
+                &mut dst_m,
+                Rect::full(dst_size),
+                Interpolation::Linear,
+            )
+            .expect("resize c1");
+        } else {
+            image::resize_8u_c4(
+                &ctx,
+                &src_v,
+                Rect::full(src_size),
+                &mut dst_m,
+                Rect::full(dst_size),
+                Interpolation::Linear,
+            )
+            .expect("resize c4");
+        }
+        stream.synchronize().expect("sync");
+        let out = dst_dev.to_host_vec(&stream).expect("readback");
+        assert!(out.iter().all(|&v| v == 77), "resize ch={ch}: {out:?}");
+    }
+
+    let src_f = DeviceBuffer::from_host(&stream, &[0.25f32; 16 * 16 * 3]).expect("src f32");
+    let mut dst_f = DeviceBuffer::<f32>::zeroed(&stream, 8 * 8 * 3).expect("dst f32");
+    let src_fv = ImageView::packed(&src_f, src_size, 3).expect("src f32 view");
+    let mut dst_fm = ImageViewMut::packed(&mut dst_f, dst_size, 3).expect("dst f32 view");
+    image::resize_32f_c3(
+        &ctx,
+        &src_fv,
+        Rect::full(src_size),
+        &mut dst_fm,
+        Rect::full(dst_size),
+        Interpolation::Linear,
+    )
+    .expect("resize 32f c3");
+
+    let thr_size = Size {
+        width: 16,
+        height: 1,
+    };
+    let thr_host: Vec<f32> = (0..16u8).map(f32::from).collect();
+    let thr_src = DeviceBuffer::from_host(&stream, &thr_host).expect("thr src");
+    let mut thr_dst = DeviceBuffer::<f32>::zeroed(&stream, 16).expect("thr dst");
+    let thr_v = ImageView::packed(&thr_src, thr_size, 1).expect("thr view");
+    let mut thr_m = ImageViewMut::packed(&mut thr_dst, thr_size, 1).expect("thr dst view");
+    image::threshold_val_32f_c1(&ctx, &thr_v, &mut thr_m, 7.5, 100.0, CmpOp::Greater)
+        .expect("threshold 32f");
+    stream.synchronize().expect("sync");
+
+    let resized = dst_f.to_host_vec(&stream).expect("f32 readback");
+    assert!(
+        resized.iter().all(|&v| (v - 0.25).abs() < 1e-5),
+        "resize 32f: {resized:?}"
+    );
+    let thr = thr_dst.to_host_vec(&stream).expect("thr readback");
+    for (i, &v) in thr.iter().enumerate() {
+        let expected = if i > 7 { 100.0 } else { i as f32 };
+        assert_eq!(v, expected, "threshold 32f at {i}");
+    }
 }

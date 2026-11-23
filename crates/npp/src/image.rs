@@ -3,7 +3,8 @@
 //!
 //! **What.** [`ImageView`] and [`ImageViewMut`] borrow `cuda_core::DeviceBuffer<T>` with
 //! explicit dimensions, channel count, and row byte stride (`step`), validating that `step`
-//! covers every row, fits in `i32`, and that any [`Rect`] ROI lies within the image bounds.
+//! covers every row, is a multiple of the element size, fits in `i32`, and that any [`Rect`]
+//! ROI lies within the image bounds.
 //! Neighborhood filters ([`filter_box_8u_c1`], [`filter_gauss_8u_c1`], etc.) require an
 //! interior [`ImageView::subview`] with sufficient [`BorderPad`] so out-of-bounds GPU reads
 //! are impossible in safe Rust.
@@ -105,15 +106,18 @@ pub enum Interpolation {
 }
 
 impl Interpolation {
-    #[allow(clippy::unnecessary_cast)]
     fn to_sys(self) -> i32 {
-        match self {
-            Self::Nearest => sys::NppiInterpolationMode_NPPI_INTER_NN as i32,
-            Self::Linear => sys::NppiInterpolationMode_NPPI_INTER_LINEAR as i32,
-            Self::Cubic => sys::NppiInterpolationMode_NPPI_INTER_CUBIC as i32,
-            Self::Super => sys::NppiInterpolationMode_NPPI_INTER_SUPER as i32,
-            Self::Lanczos => sys::NppiInterpolationMode_NPPI_INTER_LANCZOS as i32,
-        }
+        let mode = match self {
+            Self::Nearest => sys::NppiInterpolationMode_NPPI_INTER_NN,
+            Self::Linear => sys::NppiInterpolationMode_NPPI_INTER_LINEAR,
+            Self::Cubic => sys::NppiInterpolationMode_NPPI_INTER_CUBIC,
+            Self::Super => sys::NppiInterpolationMode_NPPI_INTER_SUPER,
+            Self::Lanczos => sys::NppiInterpolationMode_NPPI_INTER_LANCZOS,
+        };
+        // The resize entry points take `int eInterpolation`, but bindgen types the enum as `i32`
+        // on MSVC and `u32` on GCC/Clang. Every mode is a small positive flag, so reinterpreting
+        // the 4-byte pattern is exact on both targets without a target-specific cast.
+        i32::from_ne_bytes(mode.to_ne_bytes())
     }
 }
 
@@ -175,6 +179,14 @@ pub fn validate_image_layout<T>(
     let _ = size.to_sys()?;
     if channels == 0 || channels > 4 {
         return Err(Error::InvalidInput("channel count must be 1..=4"));
+    }
+    // Every row must start on an element boundary: a step that is not a multiple of
+    // `size_of::<T>()` makes NPP issue misaligned loads (e.g. `f32`), raising the sticky
+    // `CUDA_ERROR_MISALIGNED_ADDRESS` that poisons the whole context.
+    if !step.is_multiple_of(size_of::<T>()) {
+        return Err(Error::InvalidInput(
+            "row stride (step) must be a multiple of the element size",
+        ));
     }
     let row_bytes = (size.width as usize)
         .checked_mul(channels as usize)
@@ -914,6 +926,40 @@ mod tests {
             validate_image_layout::<u8>(usize::MAX, size, 3, (i32::MAX as usize) + 1),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    /// NPP-1: a row stride that is not a whole number of elements is rejected.
+    #[test]
+    fn image_layout_validation_rejects_misaligned_step() {
+        let size = Size {
+            width: 4,
+            height: 2,
+        };
+        // 4 px * 3 ch * 4 B = 48 B rows; 2 rows with a 52 B step need 100 B = 25 f32.
+        assert_eq!(
+            validate_image_layout::<f32>(25, size, 3, 52).expect("aligned padded step"),
+            52
+        );
+        assert!(matches!(
+            validate_image_layout::<f32>(1024, size, 3, 49),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_image_layout::<f32>(1024, size, 3, 50),
+            Err(Error::InvalidInput(_))
+        ));
+        // Any byte step is element-aligned for `u8`.
+        assert!(validate_image_layout::<u8>(1024, size, 3, 13).is_ok());
+    }
+
+    /// NPP-3: interpolation modes map to the `NppiInterpolationMode` values in `nppdefs.h`.
+    #[test]
+    fn interpolation_maps_to_npp_values() {
+        assert_eq!(Interpolation::Nearest.to_sys(), 1);
+        assert_eq!(Interpolation::Linear.to_sys(), 2);
+        assert_eq!(Interpolation::Cubic.to_sys(), 4);
+        assert_eq!(Interpolation::Super.to_sys(), 8);
+        assert_eq!(Interpolation::Lanczos.to_sys(), 16);
     }
 
     #[test]

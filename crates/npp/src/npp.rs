@@ -40,6 +40,18 @@ impl NppStatus {
     pub const fn is_error(self) -> bool {
         self.0 < 0
     }
+
+    /// Returns `true` for the warnings that mean NPP performed no operation and left the
+    /// destination unwritten (`NPP_NO_OPERATION_WARNING`, `NPP_WRONG_INTERSECTION_ROI_WARNING`,
+    /// `NPP_WRONG_INTERSECTION_QUAD_WARNING`).
+    pub const fn is_no_operation(self) -> bool {
+        matches!(
+            self.0,
+            sys::NppStatus_NPP_NO_OPERATION_WARNING
+                | sys::NppStatus_NPP_WRONG_INTERSECTION_ROI_WARNING
+                | sys::NppStatus_NPP_WRONG_INTERSECTION_QUAD_WARNING
+        )
+    }
 }
 
 impl fmt::Display for NppStatus {
@@ -54,7 +66,8 @@ pub enum Error {
     /// One of the NPP DLLs could not be loaded from the CUDA Toolkit.
     #[error("NPP unavailable: {0}")]
     Unavailable(String),
-    /// An NPP function returned a negative error status.
+    /// An NPP function returned a negative error status, or a warning meaning no operation was
+    /// performed ([`NppStatus::is_no_operation`]).
     #[error("{call} failed with {code}")]
     Status {
         /// The NPP entry point.
@@ -81,10 +94,11 @@ pub enum Error {
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Maps a raw `NppStatus` to [`Error::Status`] when negative (NPP warnings `> 0` succeed).
+/// Maps a raw `NppStatus` to [`Error::Status`] when negative or when it reports that no operation
+/// was performed; other warnings (`> 0`, e.g. the misaligned-ROI performance hint) succeed.
 pub(crate) fn check(call: &'static str, code: sys::NppStatus) -> Result<()> {
     let status = NppStatus(code);
-    if status.is_error() {
+    if status.is_error() || status.is_no_operation() {
         Err(Error::Status { call, code: status })
     } else {
         Ok(())
@@ -101,5 +115,24 @@ mod tests {
         assert!(!NppStatus(1).is_error());
         assert!(NppStatus(-37).is_error());
         assert_eq!(NppStatus(-37).to_string(), "NppStatus(-37)");
+    }
+
+    /// NPP-2: "no operation performed" warnings are surfaced; harmless warnings still succeed.
+    #[test]
+    fn check_surfaces_no_operation_warnings() {
+        assert!(check("t", sys::NppStatus_NPP_SUCCESS).is_ok());
+        assert!(check("t", sys::NppStatus_NPP_MISALIGNED_DST_ROI_WARNING).is_ok());
+        assert!(check("t", sys::NppStatus_NPP_DOUBLE_SIZE_WARNING).is_ok());
+        for code in [
+            sys::NppStatus_NPP_NO_OPERATION_WARNING,
+            sys::NppStatus_NPP_WRONG_INTERSECTION_ROI_WARNING,
+            sys::NppStatus_NPP_WRONG_INTERSECTION_QUAD_WARNING,
+        ] {
+            assert!(matches!(
+                check("t", code),
+                Err(Error::Status { code: c, .. }) if c == NppStatus(code)
+            ));
+        }
+        assert!(check("t", -2).is_err());
     }
 }

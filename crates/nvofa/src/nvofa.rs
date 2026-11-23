@@ -3,11 +3,14 @@
 //! **What.**
 //! - [`OpticalFlowSession`] — opens a CUDA optical-flow handle (`nvCreateOpticalFlowCuda`),
 //!   queries hardware capabilities (`nvOFGetCaps`), initializes the session (`nvOFInit` with
-//!   output/hint grid sizes, cost output, and ROI support), binds input/output CUDA streams, and
-//!   executes flow estimation (`nvOFExecute`) with zero per-frame allocations.
+//!   output/hint grid sizes, cost output, and ROI support), binds and retains input/output CUDA
+//!   streams, and executes flow estimation (`nvOFExecute`) with zero per-frame allocations after
+//!   checking every buffer against the `InitConfig`. A mutex serializes all `&self` calls into
+//!   the session handle, which the Optical Flow SDK does not document as thread-safe.
 //! - [`OfBuffer`] — wraps `NvOFGPUBufferHandle` (`CUdeviceptr` or `CUarray`), queries plane
 //!   strides (`nvOFGPUBufferGetStrideInfo`), and provides zero-allocation 2D upload/download and
-//!   flow-vector readback.
+//!   flow-vector readback; these first wait for the session's I/O streams (or the context when
+//!   none are bound), because the caller's copy stream is not ordered against `nvOFExecute`.
 //! - [`FlowVector`] — S10.5 fixed-point `(flow_x, flow_y)` vector with pixel conversion.
 //! - [`RoiRect`] — Region-of-Interest rectangle with hardware alignment validation.
 //!
@@ -21,7 +24,7 @@ use cuda_core::{Context, DriverError, IntoResult, Stream};
 use std::ffi::CStr;
 use std::fmt;
 use std::mem::zeroed;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Raw `NV_OF_STATUS` code wrapped as a `Copy` integer newtype.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -451,18 +454,95 @@ pub struct ExecuteParams<'a> {
     pub rois: &'a [RoiRect],
 }
 
+/// CUDA streams bound by [`OpticalFlowSession::set_io_streams`], retained so the raw handles
+/// NVOFA keeps stay valid and so host copies can wait for the work queued on them.
+type IoStreams = Option<(Arc<Stream>, Arc<Stream>)>;
+
+/// Checks the buffers of one [`OpticalFlowSession::execute`] call against the session config,
+/// so a wrong usage, format or size fails here with a specific message instead of inside the
+/// driver with a generic `NV_OF_ERR_INVALID_PARAM`.
+fn validate_execute_descs(
+    cfg: &InitConfig,
+    input: BufferDesc,
+    reference: BufferDesc,
+    output: BufferDesc,
+    hints: Option<BufferDesc>,
+    cost: Option<BufferDesc>,
+) -> Result<()> {
+    let dims = |d: BufferDesc| (d.width, d.height);
+    for frame in [input, reference] {
+        if frame.usage != BufferUsage::Input
+            || frame.format != cfg.input_format
+            || dims(frame) != (cfg.width, cfg.height)
+        {
+            return Err(Error::Invalid(
+                "input and reference frames must be Input buffers of the InitConfig size and input_format",
+            ));
+        }
+    }
+    let out_grid = cfg.out_grid.grid_dims(cfg.width, cfg.height);
+    if output.usage != BufferUsage::Output
+        || output.format != BufferFormat::Short2
+        || dims(output) != out_grid
+    {
+        return Err(Error::Invalid(
+            "output buffer must be a Short2 Output buffer of out_grid dimensions",
+        ));
+    }
+    match (hints, cfg.hint_grid) {
+        (None, _) => {}
+        (Some(_), None) => {
+            return Err(Error::Invalid(
+                "external hints passed but hint_grid was None at init",
+            ));
+        }
+        (Some(h), Some(hint_grid)) => {
+            let g = hint_grid as u32;
+            if h.usage != BufferUsage::Hint
+                || h.format != BufferFormat::Short2
+                || dims(h) != (cfg.width.div_ceil(g), cfg.height.div_ceil(g))
+            {
+                return Err(Error::Invalid(
+                    "hint buffer must be a Short2 Hint buffer of hint_grid dimensions",
+                ));
+            }
+        }
+    }
+    if let Some(c) = cost {
+        if !cfg.enable_output_cost {
+            return Err(Error::Invalid(
+                "output cost buffer passed but enable_output_cost was false at init",
+            ));
+        }
+        if c.usage != BufferUsage::Cost
+            || !matches!(c.format, BufferFormat::Uint8 | BufferFormat::Uint)
+            || dims(c) != out_grid
+        {
+            return Err(Error::Invalid(
+                "cost buffer must be a Uint8 or Uint Cost buffer of out_grid dimensions",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// An NVOFA optical flow session in CUDA mode (`NvOFHandle`).
 pub struct OpticalFlowSession {
     raw: sys::NvOFHandle,
     cuda: Arc<Context>,
     list: &'static sys::NV_OF_CUDA_API_FUNCTION_LIST,
     config: Option<InitConfig>,
+    /// Maximum ROI count reported by `NV_OF_CAPS_SUPPORT_ROI_MAX_NUM` (0 unless `enable_roi`).
+    max_rois: u32,
+    /// Serializes every `&self` call into the session handle; also holds the bound I/O streams.
+    io: Mutex<IoStreams>,
 }
 
-// SAFETY: NVOFA session calls are synchronized by the caller / driver and bound to the
-// thread-safe `cuda_core::Context`.
+// SAFETY: the session owns its `NvOFHandle`; parent `Context` and retained `Stream`s are `Send`.
 unsafe impl Send for OpticalFlowSession {}
-// SAFETY: see `Send` above.
+// SAFETY: the Optical Flow SDK does not document `NvOFHandle` as thread-safe, so every `&self`
+// entry point that passes the handle to NVOFA (`caps`, `set_io_streams`, `execute`) holds the
+// `io` mutex for the duration of the native call.
 unsafe impl Sync for OpticalFlowSession {}
 
 impl OpticalFlowSession {
@@ -480,6 +560,8 @@ impl OpticalFlowSession {
             cuda: cuda.clone(),
             list,
             config: None,
+            max_rois: 0,
+            io: Mutex::new(None),
         }))
     }
 
@@ -492,7 +574,9 @@ impl OpticalFlowSession {
         } else {
             out_vals.as_mut_ptr()
         };
-        // SAFETY: `self.raw` is live and `ptr` has `size` writable `u32` elements.
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `self.raw` is live, access is serialized by `io`, and `ptr` has `size` writable
+        // `u32` elements.
         let status = unsafe { caps_fn(self.raw, cap, ptr, &mut size) };
         check("nvOFGetCaps", status, Some(self.raw), self.list)?;
         Ok(size)
@@ -543,19 +627,54 @@ impl OpticalFlowSession {
         // SAFETY: `this.raw` is live and `params` is populated.
         let status = unsafe { init_fn(this.raw, &params) };
         check("nvOFInit", status, Some(this.raw), this.list)?;
+        // The ROI count limit is hardware-reported; read it once so `execute` stays query-free.
+        this.max_rois = if cfg.enable_roi {
+            let mut max = [0u32; 1];
+            this.caps(sys::_NV_OF_CAPS_NV_OF_CAPS_SUPPORT_ROI_MAX_NUM, &mut max)?;
+            max[0]
+        } else {
+            0
+        };
         this.config = Some(*cfg);
         Ok(())
     }
 
     /// Sets the input and output CUDA streams for subsequent [`Self::execute`] calls.
-    pub fn set_io_streams(&self, input: &Stream, output: &Stream) -> Result<()> {
+    ///
+    /// The session retains both streams: NVOFA keeps their raw handles, and
+    /// [`OfBuffer::upload_plane0`] / [`OfBuffer::download_plane0`] wait for the work queued on
+    /// them before copying.
+    pub fn set_io_streams(&self, input: &Arc<Stream>, output: &Arc<Stream>) -> Result<()> {
         let set_fn = entry!(self.list, nvOFSetIOCudaStreams);
-        // SAFETY: `self.raw` is live and both CUDA stream handles are valid.
+        let mut io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `self.raw` is live, access is serialized by `io`, and both CUDA stream handles
+        // are valid; they are retained below for as long as the session may use them.
         let status = unsafe { set_fn(self.raw, input.cu_stream(), output.cu_stream()) };
-        check("nvOFSetIOCudaStreams", status, Some(self.raw), self.list)
+        check("nvOFSetIOCudaStreams", status, Some(self.raw), self.list)?;
+        *io = Some((input.clone(), output.clone()));
+        Ok(())
+    }
+
+    /// Blocks until NVOFA work that may touch session buffers has finished: the bound I/O
+    /// streams, or the whole context when none were set (NVOFA then uses the legacy default
+    /// stream, which non-blocking caller streams do not order against).
+    fn wait_io(&self) -> Result<()> {
+        let streams = self.io.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match streams {
+            Some((input, output)) => {
+                input.synchronize()?;
+                output.synchronize()?;
+            }
+            None => self.cuda.synchronize()?,
+        }
+        Ok(())
     }
 
     /// Executes optical flow estimation on `params` with zero heap allocations.
+    ///
+    /// Buffers are checked against the [`InitConfig`] first: frames must be `Input` buffers of
+    /// the configured size and format, the output a `Short2` `Output` buffer of the output grid,
+    /// hints and cost buffers must be enabled at init and sized to their grids.
     pub fn execute(&self, params: &mut ExecuteParams<'_>) -> Result<()> {
         let cfg = self
             .config
@@ -575,11 +694,28 @@ impl OpticalFlowSession {
                 "all OfBuffer handles must belong to this OpticalFlowSession",
             ));
         }
-        if !params.rois.is_empty() {
+        validate_execute_descs(
+            &cfg,
+            params.input_frame.desc,
+            params.reference_frame.desc,
+            params.output_buffer.desc,
+            params.external_hints.map(|b| b.desc),
+            params.output_cost.as_ref().map(|b| b.desc),
+        )?;
+        let num_rois = u32::try_from(params.rois.len())
+            .map_err(|_| Error::Invalid("ROI count exceeds u32::MAX"))?;
+        if num_rois > 0 {
             if !cfg.enable_roi {
                 return Err(Error::Invalid(
                     "ROIs passed but enable_roi was false at init",
                 ));
+            }
+            if num_rois > self.max_rois {
+                return Err(Error::Unsupported {
+                    what: "ROI count",
+                    required: num_rois,
+                    found: self.max_rois,
+                });
             }
             for roi in params.rois {
                 roi.validate(cfg.out_grid, cfg.width, cfg.height)?;
@@ -599,7 +735,7 @@ impl OpticalFlowSession {
         } else {
             sys::_NV_OF_BOOL_NV_OF_FALSE
         };
-        in_params.numRois = params.rois.len() as u32;
+        in_params.numRois = num_rois;
         in_params.roiData = if params.rois.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -619,7 +755,9 @@ impl OpticalFlowSession {
             .as_ref()
             .map_or(std::ptr::null_mut(), |b| b.raw);
 
-        // SAFETY: `self.raw` is initialized and all buffer handles belong to this session.
+        let _io = self.io.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `self.raw` is initialized, access is serialized by `io`, and all buffer handles
+        // belong to this session and match its `InitConfig` (validated above).
         let status = unsafe { exec_fn(self.raw, &in_params, &mut out_params) };
         check("nvOFExecute", status, Some(self.raw), self.list)
     }
@@ -801,6 +939,8 @@ impl OfBuffer {
             .cu_deviceptr()
             .ok_or(Error::Invalid("upload_plane0 requires CuDevicePtr buffer"))?;
         let stride = self.validate_plane0_bounds(width_bytes, height, src.len())?;
+        // A previous `execute` on the session's input stream may still read this buffer.
+        self.session.wait_io()?;
         self.session.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
         let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
@@ -830,6 +970,9 @@ impl OfBuffer {
             "download_plane0 requires CuDevicePtr buffer",
         ))?;
         let stride = self.validate_plane0_bounds(width_bytes, height, dst.len())?;
+        // `execute` writes this buffer on the session's output stream, which `stream` is not
+        // ordered against.
+        self.session.wait_io()?;
         self.session.cuda.bind_to_thread()?;
         // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
         let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
@@ -878,6 +1021,12 @@ impl OfBuffer {
 
 impl Drop for OfBuffer {
     fn drop(&mut self) {
+        // Bind the context as the session's `Drop` does: the buffer owns CUDA memory and may drop
+        // on a thread with no current context. A bind failure is recorded; the destroy still
+        // runs so that one sticky error does not leak every remaining buffer.
+        if let Err(e) = self.session.cuda.bind_to_thread() {
+            self.session.cuda.record_err(Err::<(), _>(e));
+        }
         if let Some(destroy_fn) = self.session.list.nvOFDestroyGPUBufferCuda {
             // SAFETY: `self.raw` was created on `self.session`.
             let status = unsafe { destroy_fn(self.raw) };
@@ -938,6 +1087,43 @@ mod tests {
         assert!(out_of_bounds.validate(GridSize::Four, 256, 256).is_err());
 
         assert_eq!(size_of::<RoiRect>(), size_of::<sys::NV_OF_ROI_RECT>());
+    }
+
+    /// OFA-3: execute buffers are checked against usage, format and grid size before NVOFA.
+    #[test]
+    fn execute_desc_validation_rejects_mismatched_buffers() {
+        let mut cfg = InitConfig::new(129, 65, GridSize::Four, BufferFormat::Grayscale8);
+        let desc = |width, height, usage, format| BufferDesc {
+            width,
+            height,
+            usage,
+            format,
+        };
+        let frame = desc(129, 65, BufferUsage::Input, BufferFormat::Grayscale8);
+        let out = desc(33, 17, BufferUsage::Output, BufferFormat::Short2);
+        let cost = desc(33, 17, BufferUsage::Cost, BufferFormat::Uint8);
+        assert!(validate_execute_descs(&cfg, frame, frame, out, None, None).is_ok());
+
+        let wrong_format = desc(129, 65, BufferUsage::Input, BufferFormat::Nv12);
+        assert!(validate_execute_descs(&cfg, wrong_format, frame, out, None, None).is_err());
+        let wrong_size = desc(128, 65, BufferUsage::Input, BufferFormat::Grayscale8);
+        assert!(validate_execute_descs(&cfg, frame, wrong_size, out, None, None).is_err());
+        assert!(validate_execute_descs(&cfg, frame, frame, cost, None, None).is_err());
+        let small_out = desc(32, 17, BufferUsage::Output, BufferFormat::Short2);
+        assert!(validate_execute_descs(&cfg, frame, frame, small_out, None, None).is_err());
+
+        // Cost needs `enable_output_cost`; hints need `hint_grid` and its grid size.
+        assert!(validate_execute_descs(&cfg, frame, frame, out, None, Some(cost)).is_err());
+        cfg.enable_output_cost = true;
+        assert!(validate_execute_descs(&cfg, frame, frame, out, None, Some(cost)).is_ok());
+        assert!(validate_execute_descs(&cfg, frame, frame, out, None, Some(out)).is_err());
+
+        let hint = desc(17, 9, BufferUsage::Hint, BufferFormat::Short2);
+        assert!(validate_execute_descs(&cfg, frame, frame, out, Some(hint), None).is_err());
+        cfg.hint_grid = Some(HintGridSize::Eight);
+        assert!(validate_execute_descs(&cfg, frame, frame, out, Some(hint), None).is_ok());
+        let wrong_hint = desc(33, 17, BufferUsage::Hint, BufferFormat::Short2);
+        assert!(validate_execute_descs(&cfg, frame, frame, out, Some(wrong_hint), None).is_err());
     }
 
     #[test]

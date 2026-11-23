@@ -1986,9 +1986,22 @@ impl UiContext<'_> {
                         let max_idx = (desc.variant_labels.len() - 1) as u32;
                         s.csg_asset_idx = s.csg_asset_idx.min(max_idx);
                         prop_row(ui, "Kit Asset", |ui| {
-                            let gap = 4.0;
-                            let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
+                            let gap = 3.0;
+                            let btn_w = ROW_H;
+                            let combo_w =
+                                (ui.available_width() - 2.0 * btn_w - 2.0 * gap).max(32.0);
                             ui.spacing_mut().item_spacing.x = gap;
+                            if ui
+                                .add_sized([btn_w, ROW_H], egui::Button::new(ic::CARET_LEFT))
+                                .on_hover_text("Previous asset")
+                                .clicked()
+                            {
+                                s.csg_asset_idx = if s.csg_asset_idx == 0 {
+                                    max_idx
+                                } else {
+                                    s.csg_asset_idx - 1
+                                };
+                            }
                             let cur_label = desc
                                 .variant_labels
                                 .get(s.csg_asset_idx as usize)
@@ -2003,7 +2016,17 @@ impl UiContext<'_> {
                                         ui.selectable_value(&mut s.csg_asset_idx, i as u32, *label);
                                     }
                                 });
-                            anim_toggle_btn_disabled(ui);
+                            if ui
+                                .add_sized([btn_w, ROW_H], egui::Button::new(ic::CARET_RIGHT))
+                                .on_hover_text("Next asset")
+                                .clicked()
+                            {
+                                s.csg_asset_idx = if s.csg_asset_idx >= max_idx {
+                                    0
+                                } else {
+                                    s.csg_asset_idx + 1
+                                };
+                            }
                         });
                         if s.csg_asset_idx != prev_var {
                             request_auto_frame = true;

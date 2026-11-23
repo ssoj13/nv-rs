@@ -1,30 +1,263 @@
-//! GPU/CPU frame timing ring buffers, NVML telemetry, and graceful CUPTI/NGX probing.
+//! GPU/CPU frame timing ring buffers, non-stalling 3-slot CUDA pass profiler, NVML telemetry,
+//! and graceful CUPTI/NGX probing.
 //!
 //! **What.**
-//! - [`RingBuffer`] and [`FrameTimings`] — fixed-capacity `[f32; 120]` ring buffers for
-//!   `rt_ms`, `denoise_ms`, `bloom_ms`, `tonemap_ms`, and `fps` with zero per-frame heap
+//! - [`RingBuffer`] and [`FrameTimings`] — fixed-capacity `[f32; 120]` ring buffers for per-pass
+//!   timings (`rt_ms`, `denoise_ms`, `bloom_ms`, `tonemap_ms`, `fps`) and per-hardware-engine
+//!   timings (`rt_cores_ms`, `tensor_cores_ms`, `cuda_compute_ms`) with zero per-frame heap
 //!   allocations and zero panics.
+//! - [`GpuPassProfiler`] — non-stalling 3-slot ring of hardware CUDA events (`cuEventQuery`,
+//!   never `cuEventSynchronize`) measuring exact GPU durations for **RT Cores (OptiX)**,
+//!   **Tensor Cores (Denoiser / DLSS)**, and **CUDA Compute (IAS / cuFFT / Tonemap)**.
 //! - [`GpuTelemetry`] — extended GPU telemetry snapshot (NVML thermals, utilization, VRAM,
 //!   power, graphics/memory clocks, plus CUPTI kernel time and CUPTI/NGX availability strings).
 //! - [`Profiler`] — probes `cupti` (`ActivityProfiler` + `Subscriber`) and `ngx`
 //!   (`NgxVulkan::required_extensions`) gracefully at startup without panicking on non-admin
 //!   Windows or missing runtimes, and polls NVML + CUPTI telemetry.
 //!
-//! **Why.** Keeps per-frame profiling strictly allocation-free while surfacing rich hardware
-//! telemetry and optional CUPTI/NGX diagnostics in the `nv-demo` UI.
-//! **How.** All FFI is delegated to the safe `nvml`, `cupti`, and `ngx` crates (zero `unsafe` in
-//! this module); CUPTI activity records drain into a pre-allocated `Vec` reused across polls.
-//! **Used by** `nv-demo` (`main.rs`, `ui.rs`).
+//! **Why.** Eliminates blocking mid-frame stream syncs while surfacing exact hardware GPU pass
+//! timings across RTX RT Cores, Tensor Cores, and CUDA Compute SMs in the `nv-demo` UI.
+//! **Used by** `nv-demo` (`main.rs`, `renderer.rs`, `ui.rs`).
 
 use std::sync::Arc;
 
-use cuda_core::Context as CudaContext;
+use cuda_bindings as cu;
+use cuda_core::{Context as CudaContext, Stream};
 use cupti::{ActivityKind, ActivityProfiler, ActivityRecord, CallbackDomain, Subscriber};
 use ngx::NgxVulkan;
 use nvml::{ClockDomain, Device as NvmlDevice};
 
 /// Fixed history capacity (frames) for [`FrameTimings`] ring buffers.
 pub const HISTORY_LEN: usize = 120;
+
+/// Number of buffered frame event slots in [`GpuPassProfiler`].
+pub const GPU_PROFILER_SLOTS: usize = 3;
+
+/// Hardware GPU durations (milliseconds) resolved from one completed [`GpuPassProfiler`] slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuPassSample {
+    /// Acceleration structure update / traffic upload duration in milliseconds.
+    pub accel_ms: f32,
+    /// OptiX ray-tracing launch duration (**RT Cores**) in milliseconds.
+    pub rt_cores_ms: f32,
+    /// OptiX AI denoiser duration (**Tensor Cores**, before any Vulkan DLSS addition) in milliseconds.
+    pub tensor_cores_ms: f32,
+    /// cuFFT 2D diffraction bloom duration in milliseconds.
+    pub bloom_ms: f32,
+    /// Tonemap / HDR scRGB / DLSS-RR AOV pack duration in milliseconds.
+    pub tonemap_ms: f32,
+}
+
+impl GpuPassSample {
+    /// Combined **CUDA Compute** SM time (`IAS/Traffic + cuFFT Bloom + Tonemap/Pack`) in milliseconds.
+    #[inline]
+    pub fn cuda_compute_ms(self) -> f32 {
+        sanitize_ms(self.accel_ms) + sanitize_ms(self.bloom_ms) + sanitize_ms(self.tonemap_ms)
+    }
+}
+
+#[inline]
+fn sanitize_ms(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 { v } else { 0.0 }
+}
+
+/// Six hardware CUDA timing events capturing all stage boundaries for one in-flight frame.
+struct FrameEventSlot {
+    start: cu::CUevent,
+    accel_end: cu::CUevent,
+    rt_end: cu::CUevent,
+    denoise_end: cu::CUevent,
+    bloom_end: cu::CUevent,
+    frame_end: cu::CUevent,
+    pending: bool,
+}
+
+impl FrameEventSlot {
+    fn new() -> Result<Self, String> {
+        let create = |label: &str| -> Result<cu::CUevent, String> {
+            let mut ev: cu::CUevent = std::ptr::null_mut();
+            // SAFETY: active CUDA context is bound; `CU_EVENT_DEFAULT` enables hardware timing.
+            let res = unsafe { cu::cuEventCreate(&mut ev, cu::CUevent_flags_enum_CU_EVENT_DEFAULT) };
+            if res != cu::cudaError_enum_CUDA_SUCCESS || ev.is_null() {
+                return Err(format!("cuEventCreate({label}) failed ({res:?})"));
+            }
+            Ok(ev)
+        };
+        Ok(Self {
+            start: create("start")?,
+            accel_end: create("accel_end")?,
+            rt_end: create("rt_end")?,
+            denoise_end: create("denoise_end")?,
+            bloom_end: create("bloom_end")?,
+            frame_end: create("frame_end")?,
+            pending: false,
+        })
+    }
+
+    fn destroy(&mut self) {
+        for ev in [
+            &mut self.start,
+            &mut self.accel_end,
+            &mut self.rt_end,
+            &mut self.denoise_end,
+            &mut self.bloom_end,
+            &mut self.frame_end,
+        ] {
+            if !ev.is_null() {
+                // SAFETY: each handle was created by `cuEventCreate` on the owning CUDA context.
+                unsafe {
+                    let _ = cu::cuEventDestroy_v2(*ev);
+                }
+                *ev = std::ptr::null_mut();
+            }
+        }
+        self.pending = false;
+    }
+}
+
+/// Non-stalling 3-slot ring of hardware CUDA events (`cuEventQuery`, never `cuEventSynchronize`)
+/// recording per-engine GPU execution time for RT Cores, Tensor Cores, and CUDA Compute.
+pub struct GpuPassProfiler {
+    ctx: Arc<CudaContext>,
+    slots: [FrameEventSlot; GPU_PROFILER_SLOTS],
+    write_idx: usize,
+    latest: GpuPassSample,
+}
+
+// SAFETY: CUDA event handles belong to `ctx` and are accessed exclusively from the render worker.
+unsafe impl Send for GpuPassProfiler {}
+
+impl GpuPassProfiler {
+    /// Pre-allocates all 3 frame event slots (`18` hardware `CUevent`s) with zero steady-state churn.
+    pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
+        cuda.bind_to_thread()
+            .map_err(|e| format!("GpuPassProfiler bind_to_thread failed: {e}"))?;
+        let s0 = FrameEventSlot::new()?;
+        let s1 = FrameEventSlot::new()?;
+        let s2 = FrameEventSlot::new()?;
+        Ok(Self {
+            ctx: cuda.clone(),
+            slots: [s0, s1, s2],
+            write_idx: 0,
+            latest: GpuPassSample::default(),
+        })
+    }
+
+    /// Records the frame-start event on `stream` in the active ring slot and returns its slot index.
+    #[inline]
+    pub fn begin_frame(&mut self, stream: &Stream) -> usize {
+        let slot = self.write_idx;
+        self.slots[slot].pending = false;
+        record_event(self.slots[slot].start, stream);
+        slot
+    }
+
+    /// Marks completion of IAS build/update and launch-parameter upload on `stream`.
+    #[inline]
+    pub fn mark_accel_end(&self, slot: usize, stream: &Stream) {
+        if let Some(s) = self.slots.get(slot) {
+            record_event(s.accel_end, stream);
+        }
+    }
+
+    /// Marks completion of the OptiX ray-tracing launch (**RT Cores**) on `stream`.
+    #[inline]
+    pub fn mark_rt_end(&self, slot: usize, stream: &Stream) {
+        if let Some(s) = self.slots.get(slot) {
+            record_event(s.rt_end, stream);
+        }
+    }
+
+    /// Marks completion of the OptiX AI denoiser (**Tensor Cores**) on `stream`.
+    #[inline]
+    pub fn mark_denoise_end(&self, slot: usize, stream: &Stream) {
+        if let Some(s) = self.slots.get(slot) {
+            record_event(s.denoise_end, stream);
+        }
+    }
+
+    /// Marks completion of the cuFFT 2D diffraction bloom pass (**CUDA Compute**) on `stream`.
+    #[inline]
+    pub fn mark_bloom_end(&self, slot: usize, stream: &Stream) {
+        if let Some(s) = self.slots.get(slot) {
+            record_event(s.bloom_end, stream);
+        }
+    }
+
+    /// Marks end-of-frame tonemap/AOV packing on `stream`, seals `slot` as pending, and advances
+    /// the ring index for the next frame.
+    #[inline]
+    pub fn mark_frame_end(&mut self, slot: usize, stream: &Stream) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            record_event(s.frame_end, stream);
+            s.pending = true;
+        }
+        self.write_idx = (slot + 1) % GPU_PROFILER_SLOTS;
+    }
+
+    /// Polls all completed pending slots using non-blocking `cuEventQuery` (never blocks or calls
+    /// `cuEventSynchronize`) and returns the latest resolved [`GpuPassSample`].
+    pub fn poll_completed(&mut self) -> GpuPassSample {
+        // Walk chronologically from oldest slot (`write_idx`) to newest so `self.latest` always
+        // reflects the most recent completed frame.
+        for offset in 0..GPU_PROFILER_SLOTS {
+            let idx = (self.write_idx + offset) % GPU_PROFILER_SLOTS;
+            let slot = &mut self.slots[idx];
+            if !slot.pending {
+                continue;
+            }
+            // SAFETY: `slot.frame_end` is a valid `CUevent` created on `self.ctx`.
+            let status = unsafe { cu::cuEventQuery(slot.frame_end) };
+            if status == cu::cudaError_enum_CUDA_SUCCESS {
+                self.latest = GpuPassSample {
+                    accel_ms: elapsed_ms(slot.start, slot.accel_end),
+                    rt_cores_ms: elapsed_ms(slot.accel_end, slot.rt_end),
+                    tensor_cores_ms: elapsed_ms(slot.rt_end, slot.denoise_end),
+                    bloom_ms: elapsed_ms(slot.denoise_end, slot.bloom_end),
+                    tonemap_ms: elapsed_ms(slot.bloom_end, slot.frame_end),
+                };
+                slot.pending = false;
+            }
+        }
+        self.latest
+    }
+}
+
+impl Drop for GpuPassProfiler {
+    fn drop(&mut self) {
+        if self.ctx.bind_to_thread().is_ok() {
+            for slot in &mut self.slots {
+                slot.destroy();
+            }
+        }
+    }
+}
+
+#[inline]
+fn record_event(ev: cu::CUevent, stream: &Stream) {
+    if !ev.is_null() {
+        // SAFETY: `ev` is a valid timing event on the active context and `stream` is live.
+        unsafe {
+            let _ = cu::cuEventRecord(ev, stream.cu_stream());
+        }
+    }
+}
+
+#[inline]
+fn elapsed_ms(start: cu::CUevent, end: cu::CUevent) -> f32 {
+    if start.is_null() || end.is_null() {
+        return 0.0;
+    }
+    let mut ms = 0.0f32;
+    // SAFETY: caller verified `frame_end` completed via `cuEventQuery == CUDA_SUCCESS`, so both
+    // `start` and `end` (recorded earlier on the same stream) are complete.
+    let res = unsafe { cu::cuEventElapsedTime_v2(&mut ms, start, end) };
+    if res == cu::cudaError_enum_CUDA_SUCCESS {
+        sanitize_ms(ms)
+    } else {
+        0.0
+    }
+}
 
 /// Fixed-capacity, stack-allocated ring buffer for scalar `f32` frame metrics.
 #[derive(Clone, Debug)]
@@ -118,10 +351,10 @@ impl<const N: usize> RingBuffer<N> {
     }
 }
 
-/// Per-frame CPU/GPU pass timings stored in fixed-capacity `[f32; 120]` ring buffers.
+/// Per-frame CPU/GPU pass & hardware engine timings stored in fixed-capacity `[f32; 120]` ring buffers.
 #[derive(Clone, Debug, Default)]
 pub struct FrameTimings {
-    /// Ray-tracing / OptiX kernel pass duration in milliseconds.
+    /// Ray-tracing / OptiX kernel pass duration in milliseconds (**RT Cores**).
     pub rt_ms: RingBuffer<HISTORY_LEN>,
     /// Denoiser pass duration in milliseconds.
     pub denoise_ms: RingBuffer<HISTORY_LEN>,
@@ -129,6 +362,12 @@ pub struct FrameTimings {
     pub bloom_ms: RingBuffer<HISTORY_LEN>,
     /// Tonemap / composite pass duration in milliseconds.
     pub tonemap_ms: RingBuffer<HISTORY_LEN>,
+    /// Hardware **RT Cores (OptiX)** execution duration in milliseconds.
+    pub rt_cores_ms: RingBuffer<HISTORY_LEN>,
+    /// Hardware **Tensor Cores (Denoiser / DLSS)** execution duration in milliseconds.
+    pub tensor_cores_ms: RingBuffer<HISTORY_LEN>,
+    /// Hardware **CUDA Compute (IAS / cuFFT / Tonemap)** execution duration in milliseconds.
+    pub cuda_compute_ms: RingBuffer<HISTORY_LEN>,
     /// Instantaneous frames per second.
     pub fps: RingBuffer<HISTORY_LEN>,
 }
@@ -141,25 +380,38 @@ impl FrameTimings {
             denoise_ms: RingBuffer::new(),
             bloom_ms: RingBuffer::new(),
             tonemap_ms: RingBuffer::new(),
+            rt_cores_ms: RingBuffer::new(),
+            tensor_cores_ms: RingBuffer::new(),
+            cuda_compute_ms: RingBuffer::new(),
             fps: RingBuffer::new(),
         }
     }
 
-    /// Records one frame's pass timings and FPS without allocating.
+    /// Records one frame's pass timings, hardware engine breakdown, and FPS without allocating.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors flat per-pass and per-engine timing ring buffers with zero allocation"
+    )]
     #[inline]
-    pub fn record(
+    pub fn record_with_engines(
         &mut self,
         rt_ms: f32,
         denoise_ms: f32,
         bloom_ms: f32,
         tonemap_ms: f32,
+        rt_cores_ms: f32,
+        tensor_cores_ms: f32,
+        cuda_compute_ms: f32,
         fps: f32,
     ) {
-        self.rt_ms.push(rt_ms);
-        self.denoise_ms.push(denoise_ms);
-        self.bloom_ms.push(bloom_ms);
-        self.tonemap_ms.push(tonemap_ms);
-        self.fps.push(fps);
+        self.rt_ms.push(sanitize_ms(rt_ms));
+        self.denoise_ms.push(sanitize_ms(denoise_ms));
+        self.bloom_ms.push(sanitize_ms(bloom_ms));
+        self.tonemap_ms.push(sanitize_ms(tonemap_ms));
+        self.rt_cores_ms.push(sanitize_ms(rt_cores_ms));
+        self.tensor_cores_ms.push(sanitize_ms(tensor_cores_ms));
+        self.cuda_compute_ms.push(sanitize_ms(cuda_compute_ms));
+        self.fps.push(sanitize_ms(fps));
     }
 }
 
@@ -259,18 +511,33 @@ impl Profiler {
         }
     }
 
-    /// Records one frame's pass timings and FPS with zero heap allocations.
+    /// Records one frame's pass timings, per-engine hardware GPU breakdown, and FPS with zero heap allocations.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "forwards per-pass and per-engine timing scalars without heap allocation"
+    )]
     #[inline]
-    pub fn record_frame(
+    pub fn record_frame_engines(
         &mut self,
         rt_ms: f32,
         denoise_ms: f32,
         bloom_ms: f32,
         tonemap_ms: f32,
+        rt_cores_ms: f32,
+        tensor_cores_ms: f32,
+        cuda_compute_ms: f32,
         fps: f32,
     ) {
-        self.timings
-            .record(rt_ms, denoise_ms, bloom_ms, tonemap_ms, fps);
+        self.timings.record_with_engines(
+            rt_ms,
+            denoise_ms,
+            bloom_ms,
+            tonemap_ms,
+            rt_cores_ms,
+            tensor_cores_ms,
+            cuda_compute_ms,
+            fps,
+        );
     }
 
     /// Flushes and drains pending CUPTI activity records into the pre-allocated scratch buffer,
@@ -422,13 +689,35 @@ mod tests {
     }
 
     #[test]
-    fn frame_timings_records_all_passes() {
+    fn frame_timings_records_all_passes_and_engines() {
         let mut ft = FrameTimings::new();
-        ft.record(1.5, 0.5, 0.25, 0.25, 60.0);
-        assert_eq!(ft.rt_ms.latest(), 1.5);
-        assert_eq!(ft.denoise_ms.latest(), 0.5);
-        assert_eq!(ft.bloom_ms.latest(), 0.25);
-        assert_eq!(ft.tonemap_ms.latest(), 0.25);
-        assert_eq!(ft.fps.latest(), 60.0);
+        ft.record_with_engines(2.4, 0.8, 0.35, 0.15, 2.4, 1.1, 0.65, 120.0);
+        assert_eq!(ft.rt_ms.latest(), 2.4);
+        assert_eq!(ft.denoise_ms.latest(), 0.8);
+        assert_eq!(ft.bloom_ms.latest(), 0.35);
+        assert_eq!(ft.tonemap_ms.latest(), 0.15);
+        assert_eq!(ft.rt_cores_ms.latest(), 2.4);
+        assert_eq!(ft.tensor_cores_ms.latest(), 1.1);
+        assert_eq!(ft.cuda_compute_ms.latest(), 0.65);
+        assert_eq!(ft.fps.latest(), 120.0);
+
+        let sample = GpuPassSample {
+            accel_ms: 0.15,
+            rt_cores_ms: 3.2,
+            tensor_cores_ms: 0.75,
+            bloom_ms: 0.40,
+            tonemap_ms: 0.20,
+        };
+        assert!((sample.cuda_compute_ms() - 0.75).abs() < 1e-5);
+
+        // Non-finite or negative CUDA event deltas clamp safely to 0.0.
+        let bad = GpuPassSample {
+            accel_ms: f32::NAN,
+            rt_cores_ms: -1.0,
+            tensor_cores_ms: f32::INFINITY,
+            bloom_ms: 0.25,
+            tonemap_ms: -0.5,
+        };
+        assert!((bad.cuda_compute_ms() - 0.25).abs() < 1e-5);
     }
 }

@@ -12,9 +12,8 @@
 //!
 //! **Used by** `nv-demo` post-processing pipeline.
 
-use cuda_bindings::CUevent_flags_enum_CU_EVENT_DEFAULT;
 use cuda_core::{
-    Context as CudaContext, DeviceBuffer, Event, Function, Module, Stream, launch_kernel_on_stream,
+    Context as CudaContext, DeviceBuffer, Function, Module, Stream, launch_kernel_on_stream,
 };
 use cufft::{Complex32, FftType, ManyDesc, Plan, Scratch};
 use std::ffi::c_void;
@@ -189,13 +188,11 @@ pub struct FftBloomPass {
     fn_gen_psf: Function,
     fn_freq_mul: Function,
     fn_composite: Function,
-    ev_start: Event,
-    ev_end: Event,
     state: Option<BloomState>,
 }
 
 impl FftBloomPass {
-    /// Compiles the NVRTC bloom kernels and initializes reusable CUDA timing events.
+    /// Compiles the NVRTC bloom kernels and initializes the cuFFT workspace scratch pool.
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
         let opts = nvrtc::CompileOptions::new()
             .arch("compute_75")
@@ -225,13 +222,6 @@ impl FftBloomPass {
             .load_function("composite_bloom")
             .map_err(|e| format!("load_function composite_bloom failed: {e}"))?;
 
-        let ev_start = cuda
-            .new_event_with_flags(Some(CUevent_flags_enum_CU_EVENT_DEFAULT))
-            .map_err(|e| format!("create start event failed: {e}"))?;
-        let ev_end = cuda
-            .new_event_with_flags(Some(CUevent_flags_enum_CU_EVENT_DEFAULT))
-            .map_err(|e| format!("create end event failed: {e}"))?;
-
         let scratch = Scratch::new(&cuda.default_stream());
 
         Ok(Self {
@@ -242,8 +232,6 @@ impl FftBloomPass {
             fn_gen_psf,
             fn_freq_mul,
             fn_composite,
-            ev_start,
-            ev_end,
             state: None,
         })
     }
@@ -365,8 +353,9 @@ impl FftBloomPass {
             .ok_or_else(|| "bloom state missing after ensure_size".to_owned())
     }
 
-    /// Runs the 2D FFT diffraction bloom pass in-place on `color_ptr` (`float4` RGBA, `w * h`)
-    /// and returns the elapsed GPU time in milliseconds.
+    /// Enqueues the 2D FFT diffraction bloom pass in-place on `color_ptr` (`float4` RGBA, `w * h`)
+    /// strictly asynchronously on `stream` (zero mid-frame host synchronization; hardware timing
+    /// is recorded by [`crate::profiler::GpuPassProfiler`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "public API signature matches renderer pass parameters"
@@ -380,9 +369,9 @@ impl FftBloomPass {
         threshold: f32,
         intensity: f32,
         blades: u32,
-    ) -> Result<f32, String> {
+    ) -> Result<(), String> {
         if w == 0 || h == 0 || color_ptr == 0 || intensity <= 0.0 {
-            return Ok(0.0);
+            return Ok(());
         }
 
         self.ensure_size(stream, w, h)?;
@@ -390,10 +379,6 @@ impl FftBloomPass {
             .state
             .as_mut()
             .ok_or_else(|| "bloom state missing".to_owned())?;
-
-        self.ev_start
-            .record(stream)
-            .map_err(|e| format!("record start event failed: {e}"))?;
 
         let fft_w = state.fft_w;
         let fft_h = state.fft_h;
@@ -515,12 +500,6 @@ impl FftBloomPass {
             }
         }
 
-        self.ev_end
-            .record(stream)
-            .map_err(|e| format!("record end event failed: {e}"))?;
-
-        self.ev_start
-            .elapsed_ms(&self.ev_end)
-            .map_err(|e| format!("elapsed_ms failed: {e}"))
+        Ok(())
     }
 }

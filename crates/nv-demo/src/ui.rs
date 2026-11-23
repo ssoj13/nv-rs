@@ -310,6 +310,10 @@ pub struct UiContext<'a> {
     pub denoise_ms: f32,
     pub bloom_ms: f32,
     pub tonemap_ms: f32,
+    /// Hardware **Tensor Cores (Denoiser / DLSS)** execution time in milliseconds.
+    pub tensor_cores_ms: f32,
+    /// Hardware **CUDA Compute (IAS / cuFFT / Tonemap)** execution time in milliseconds.
+    pub cuda_compute_ms: f32,
     pub ui_fps: f32,
     pub rt_fps: f32,
     pub fast_preview: bool,
@@ -3089,24 +3093,36 @@ impl UiContext<'_> {
         });
 
         collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", true, |ui| {
+            stat_row(ui, "RT Cores", &format!("{:.2} ms (OptiX)", self.rt_ms));
+            stat_row(
+                ui,
+                "Tensor Cores",
+                &format!("{:.2} ms (Den/DLSS)", self.tensor_cores_ms),
+            );
+            stat_row(
+                ui,
+                "CUDA Compute",
+                &format!("{:.2} ms (IAS/FFT/TM)", self.cuda_compute_ms),
+            );
+            ui.add_space(2.0);
             sparkline_row(
                 ui,
-                "RT ms",
-                &self.timings.rt_ms,
+                "RT Cores",
+                &self.timings.rt_cores_ms,
                 Color32::from_rgb(138, 173, 244),
                 "ms",
             );
             sparkline_row(
                 ui,
-                "Denoise ms",
-                &self.timings.denoise_ms,
+                "Tensor",
+                &self.timings.tensor_cores_ms,
                 Color32::from_rgb(166, 209, 137),
                 "ms",
             );
             sparkline_row(
                 ui,
-                "Bloom ms",
-                &self.timings.bloom_ms,
+                "CUDA SM",
+                &self.timings.cuda_compute_ms,
                 Color32::from_rgb(238, 212, 159),
                 "ms",
             );

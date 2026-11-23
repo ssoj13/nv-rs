@@ -13,9 +13,9 @@ use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 use optix::{
     Aabb, Accel, AovType, BuildOptions, CustomPrimitives, Denoiser, DenoiserModel, DenoiserOptions,
-    DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, Layer, LinkOptions,
-    MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions, MicromapUse,
-    Module, ModuleOptions, OpacityMicromapArray, Params as DenoiserParams, Pipeline,
+    DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, InstanceBuffer, Layer,
+    LinkOptions, MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions,
+    MicromapUse, Module, ModuleOptions, OpacityMicromapArray, Params as DenoiserParams, Pipeline,
     PipelineOptions, ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
     micro_to_base_bary,
 };
@@ -23,9 +23,12 @@ use optix::{
 use crate::app_events::{
     AppBus, PossessInfo, RenderControl, RenderEvent, SmartViewResult, fast_preview_budget,
 };
-use crate::csg_scene_host::{CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, csg_flags};
+use crate::csg_scene_host::{
+    CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
+};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
+use crate::profiler::GpuPassProfiler;
 use csg_scene::{
     CpuViewProber, PackedGpuScene, ProbeBackendKind, ProbeSample, SmartViewSelector,
     ViewCandidate, ViewProbeBackend, ViewScore, WgpuViewProber, WorldScene, score_probe_grid,
@@ -694,10 +697,16 @@ pub struct FrameReady {
     pub accum_count: u32,
     pub total_samples: u32,
     pub jitter: [f32; 2],
+    /// Hardware **RT Cores (OptiX)** pass duration in milliseconds.
     pub rt_ms: f32,
+    /// Hardware **Tensor Cores (OptiX AI Denoiser)** pass duration in milliseconds.
     pub denoise_ms: f32,
+    /// Hardware **cuFFT 2D Bloom** pass duration in milliseconds.
     pub bloom_ms: f32,
+    /// Hardware **Tonemap / HDR / DLSS-RR Pack** pass duration in milliseconds.
     pub tonemap_ms: f32,
+    /// Hardware **CUDA Compute** total (`IAS/Traffic + cuFFT + Tonemap`) in milliseconds.
+    pub cuda_compute_ms: f32,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
     pub fast_preview: bool,
@@ -733,7 +742,9 @@ struct OptixRig {
     neon_gas: Arc<Accel>,
     omm_gas: Arc<Accel>,
     omm_anyhit_gas: Arc<Accel>,
-    ias: Arc<Accel>,
+    ias: Option<Arc<Accel>>,
+    d_optix_instances: InstanceBuffer,
+    ias_classic_count: usize,
     pipeline: Pipeline,
     sbt: ShaderBindingTable,
     probe_sbt: ShaderBindingTable,
@@ -753,8 +764,10 @@ struct OptixRig {
     params_buf: DeviceBuffer<u8>,
     tonemap: TonemapKernel,
     bloom: Option<FftBloomPass>,
+    gpu_profiler: Option<GpuPassProfiler>,
     csg_host: CsgGpuHost,
     ias_instances_scratch: Vec<Instance>,
+    ias_dyn_scratch: Vec<Instance>,
     probe_candidates_buf: Option<DeviceBuffer<u8>>,
     probe_samples_buf: Option<DeviceBuffer<u8>>,
     probe_candidates_host: Vec<GpuProbeCandidate>,
@@ -1319,15 +1332,31 @@ fn splitmix32(mut x: u32) -> f32 {
     (x >> 8) as f32 * (1.0 / 16_777_216.0)
 }
 
-fn build_ias(
+/// OptiX build options for the persistent top-level IAS (`ALLOW_UPDATE` enables zero-churn
+/// in-place `OPTIX_BUILD_OPERATION_UPDATE` on traffic-only frames).
+fn ias_build_opts() -> BuildOptions {
+    BuildOptions {
+        allow_update: true,
+        prefer_fast_trace: true,
+        ..Default::default()
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "coordinates persistent IAS buffer, scratch, GAS handles, and scene state with zero alloc"
+)]
+fn build_ias_into(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Arc<Stream>,
     scratch: &mut Scratch,
+    d_instances: &mut InstanceBuffer,
+    target_ias: &mut Option<Arc<Accel>>,
     gas: SceneGas<'_>,
     csg_host: &CsgGpuHost,
     instances: &mut Vec<Instance>,
     state: SceneState,
-) -> Arc<Accel> {
+) -> usize {
     instances.clear();
     if state.show_classic {
         let count = state.sat_count.min(24) as usize;
@@ -1429,6 +1458,7 @@ fn build_ias(
         }
     }
 
+    let classic_count = instances.len();
     csg_host.append_optix_instances(instances);
 
     if instances.is_empty() {
@@ -1437,14 +1467,23 @@ fn build_ias(
         instances.push(dummy);
     }
 
-    Accel::instances(
-        optix_ctx,
-        stream,
-        scratch,
-        instances,
-        BuildOptions::default(),
-    )
-    .expect("IAS")
+    d_instances
+        .upload_all(stream, instances)
+        .expect("IAS instance upload");
+    // SAFETY: all ray-tracing launches on `stream` are strictly ordered before this build.
+    let _ = unsafe {
+        Accel::instances_into(
+            optix_ctx,
+            stream,
+            scratch,
+            d_instances,
+            ias_build_opts(),
+            true,
+            target_ias,
+        )
+    }
+    .expect("IAS");
+    classic_count
 }
 
 #[cfg(has_embedded_ptx)]
@@ -1634,12 +1673,17 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         eprintln!("nv-demo: initial CSG scene sync failed: {err}");
     }
     let mut ias_instances_scratch = Vec::with_capacity(4096);
+    let ias_dyn_scratch = Vec::with_capacity(1024);
+    let mut d_optix_instances = InstanceBuffer::new(&optix_ctx, &stream);
+    let mut ias: Option<Arc<Accel>> = None;
     let show_classic = initial_settings.csg_mode == 0 || initial_settings.csg_show_fractal;
 
-    let ias = build_ias(
+    let ias_classic_count = build_ias_into(
         &optix_ctx,
         &stream,
         &mut scratch,
+        &mut d_optix_instances,
+        &mut ias,
         SceneGas {
             floor: &floor_gas,
             fractal: &fractal_gas,
@@ -1715,6 +1759,7 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
     let params_buf =
         DeviceBuffer::zeroed(&stream, std::mem::size_of::<LaunchParams>()).expect("params");
     let bloom = FftBloomPass::new(cuda).ok();
+    let gpu_profiler = GpuPassProfiler::new(cuda).ok();
     stream.synchronize().expect("init sync");
 
     OptixRig {
@@ -1730,6 +1775,8 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         omm_gas,
         omm_anyhit_gas,
         ias,
+        d_optix_instances,
+        ias_classic_count,
         pipeline,
         sbt,
         probe_sbt,
@@ -1749,8 +1796,10 @@ fn init_optix(cuda: &Arc<CudaContext>, initial_settings: &DemoSettings) -> Optix
         params_buf,
         tonemap,
         bloom,
+        gpu_profiler,
         csg_host,
         ias_instances_scratch,
+        ias_dyn_scratch,
         probe_candidates_buf: None,
         probe_samples_buf: None,
         probe_candidates_host: Vec::with_capacity(128),
@@ -2717,13 +2766,18 @@ pub fn spawn_render_thread(
                 };
                 last_rendered_camera = active_camera;
 
+                let prof_slot = rig
+                    .gpu_profiler
+                    .as_mut()
+                    .map(|p| p.begin_frame(&rig.stream));
+
                 let csg_key = CsgSceneKey {
                     scene_idx: settings.csg_mode,
                     variant_idx: settings.csg_asset_idx,
                     seed: settings.csg_seed,
                 };
                 let vfov_rad = 2.0 * active_camera.tan_half_fov.max(0.05).atan();
-                let csg_ias_dirty = match rig.csg_host.sync(
+                let csg_sync = match rig.csg_host.sync(
                     &rig._optix_ctx,
                     &rig.stream,
                     &mut rig._scratch,
@@ -2742,12 +2796,12 @@ pub fn spawn_render_thread(
                     },
                     traffic_time,
                 ) {
-                    Ok(dirty) => dirty,
+                    Ok(sync_res) => sync_res,
                     Err(e) => {
                         bus.emit_render_event(RenderEvent::StatusMessage(format!(
                             "CSG sync error: {e}"
                         )));
-                        false
+                        CsgSyncResult::Unchanged
                     }
                 };
                 let is_possessing_now = rig.csg_host.is_possessing();
@@ -2809,45 +2863,91 @@ pub fn spawn_render_thread(
                     ],
                     fractal_transform,
                 );
-                if csg_ias_dirty || ias_state != last_ias_state {
-                    rig.ias = build_ias(
-                        &rig._optix_ctx,
-                        &rig.stream,
-                        &mut rig._scratch,
-                        SceneGas {
-                            floor: &rig.floor_gas,
-                            fractal: &rig.fractal_gas,
-                            glass_analytic: &rig.glass_analytic_gas,
-                            glass_mesh: &rig.glass_mesh_gas,
-                            neon: &rig.neon_gas,
-                            omm: &rig.omm_gas,
-                            omm_anyhit: &rig.omm_anyhit_gas,
-                        },
-                        &rig.csg_host,
-                        &mut rig.ias_instances_scratch,
-                        SceneState {
-                            sat_angle,
-                            sat_count: settings.sat_count,
-                            sat_seed: settings.sat_seed,
-                            sat_size_range: [settings.sat_size_min, settings.sat_size_max],
-                            sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
-                            sat_height_range: [settings.sat_height_min, settings.sat_height_max],
-                            sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
-                            sat_bob_amp_range: [settings.sat_bob_amp_min, settings.sat_bob_amp_max],
-                            sat_bob_freq_range: [
-                                settings.sat_bob_freq_min,
-                                settings.sat_bob_freq_max,
-                            ],
-                            sat_hue_spread: settings.sat_hue_spread,
-                            sat_on: settings.sat_on,
-                            glass_analytic: settings.glass_analytic,
-                            neon_on: settings.neon_on,
-                            omm_mode: settings.omm_mode,
-                            show_classic,
-                            fractal_transform,
-                        },
-                    );
-                    last_ias_state = ias_state;
+                let classic_changed = ias_state != last_ias_state;
+                match (classic_changed, csg_sync) {
+                    (false, CsgSyncResult::Unchanged) => {}
+                    (false, CsgSyncResult::TrafficOnly { dynamic_count })
+                        if rig.ias.is_some()
+                            && rig.ias_classic_count + dynamic_count
+                                <= rig.d_optix_instances.len() =>
+                    {
+                        // Zero-churn fast path: stream ONLY `dynamic_instances[0..D]` via the
+                        // reusable 256 KiB pinned host buffer + `OPTIX_BUILD_OPERATION_UPDATE`.
+                        rig.csg_host
+                            .fill_dynamic_optix_instances(dynamic_count, &mut rig.ias_dyn_scratch);
+                        if !rig.ias_dyn_scratch.is_empty()
+                            && rig
+                                .d_optix_instances
+                                .update_prefix(
+                                    &rig.stream,
+                                    rig.ias_classic_count,
+                                    &rig.ias_dyn_scratch,
+                                )
+                                .is_ok()
+                        {
+                            // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
+                            let _ = unsafe {
+                                Accel::instances_into(
+                                    &rig._optix_ctx,
+                                    &rig.stream,
+                                    &mut rig._scratch,
+                                    &rig.d_optix_instances,
+                                    ias_build_opts(),
+                                    false,
+                                    &mut rig.ias,
+                                )
+                            }
+                            .expect("IAS traffic update");
+                        }
+                    }
+                    _ => {
+                        rig.ias_classic_count = build_ias_into(
+                            &rig._optix_ctx,
+                            &rig.stream,
+                            &mut rig._scratch,
+                            &mut rig.d_optix_instances,
+                            &mut rig.ias,
+                            SceneGas {
+                                floor: &rig.floor_gas,
+                                fractal: &rig.fractal_gas,
+                                glass_analytic: &rig.glass_analytic_gas,
+                                glass_mesh: &rig.glass_mesh_gas,
+                                neon: &rig.neon_gas,
+                                omm: &rig.omm_gas,
+                                omm_anyhit: &rig.omm_anyhit_gas,
+                            },
+                            &rig.csg_host,
+                            &mut rig.ias_instances_scratch,
+                            SceneState {
+                                sat_angle,
+                                sat_count: settings.sat_count,
+                                sat_seed: settings.sat_seed,
+                                sat_size_range: [settings.sat_size_min, settings.sat_size_max],
+                                sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
+                                sat_height_range: [
+                                    settings.sat_height_min,
+                                    settings.sat_height_max,
+                                ],
+                                sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
+                                sat_bob_amp_range: [
+                                    settings.sat_bob_amp_min,
+                                    settings.sat_bob_amp_max,
+                                ],
+                                sat_bob_freq_range: [
+                                    settings.sat_bob_freq_min,
+                                    settings.sat_bob_freq_max,
+                                ],
+                                sat_hue_spread: settings.sat_hue_spread,
+                                sat_on: settings.sat_on,
+                                glass_analytic: settings.glass_analytic,
+                                neon_on: settings.neon_on,
+                                omm_mode: settings.omm_mode,
+                                show_classic,
+                                fractal_transform,
+                            },
+                        );
+                        last_ias_state = ias_state;
+                    }
                 }
 
                 if settings.temporal_denoise != rig.denoiser_is_temporal {
@@ -2968,7 +3068,7 @@ pub fn spawn_render_thread(
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
                     out_normal_f32: rig.normal_f32.cu_deviceptr(),
-                    handle: rig.ias.handle(),
+                    handle: rig.ias.as_ref().map_or(0, |a| a.handle()),
                     width: cur_w,
                     height: cur_h,
                     frame_index,
@@ -3108,11 +3208,16 @@ pub fn spawn_render_thread(
                 rig.params_buf
                     .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
                     .expect("params upload");
+                if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
+                    prof.mark_accel_end(slot, &rig.stream);
+                }
 
-                let rt_ms = {
+                // Single uninterrupted GPU stream burst: [IAS/Traffic] -> [RT Cores] ->
+                // [Tensor Denoiser] -> [cuFFT Bloom] -> [Tonemap/Pack], with ONE end-of-frame fence.
+                let t_burst = Instant::now();
+                {
                     let _nvtx = crate::nvtx::NvtxRange::new(c"OptiX RT", crate::nvtx::COLOR_RT);
-                    let t_rt = Instant::now();
-                    // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive `synchronize`.
+                    // SAFETY: `params_buf` matches `LaunchParams` layout; all output buffers outlive the end-of-frame fence.
                     unsafe {
                         rig.pipeline.launch(
                             &rig.stream,
@@ -3122,23 +3227,28 @@ pub fn spawn_render_thread(
                         )
                     }
                     .expect("optix launch");
-                    rig.stream.synchronize().expect("rt sync");
-                    t_rt.elapsed().as_secs_f32() * 1000.0
-                };
+                }
+                if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
+                    prof.mark_rt_end(slot, &rig.stream);
+                }
 
                 if !publish_frame {
+                    if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_mut(), prof_slot) {
+                        prof.mark_denoise_end(slot, &rig.stream);
+                        prof.mark_bloom_end(slot, &rig.stream);
+                        prof.mark_frame_end(slot, &rig.stream);
+                    }
                     accum_count = accum_count.saturating_add(1);
                     frame_index = frame_index.wrapping_add(1);
                     continue;
                 }
 
-                let (mut final_f32_ptr, denoise_ms) = if settings.denoiser_on
+                let mut final_f32_ptr = if settings.denoiser_on
                     && !dlss_any
                     && settings.aov_mode == 0
                 {
                     let _nvtx =
                         crate::nvtx::NvtxRange::new(c"OptiX Denoise", crate::nvtx::COLOR_DENOISE);
-                    let t_den = Instant::now();
                     let flow_img = if rig.denoiser_is_temporal {
                         Some(Image::new(&rig.motion_f32, cur_w, cur_h).expect("flow"))
                     } else {
@@ -3166,7 +3276,7 @@ pub fn spawn_render_thread(
                         previous: prev_img,
                         aov: AovType::Beauty,
                     };
-                    // SAFETY: all denoiser input/output/guide images outlive `synchronize`.
+                    // SAFETY: all denoiser input/output/guide images outlive the end-of-frame fence.
                     unsafe {
                         rig.denoiser.invoke(
                             &rig.stream,
@@ -3190,21 +3300,19 @@ pub fn spawn_render_thread(
                             rig.temporal_has_prev = true;
                         }
                     }
-                    rig.stream.synchronize().expect("den sync");
-                    (
-                        rig.denoised_f32.cu_deviceptr(),
-                        t_den.elapsed().as_secs_f32() * 1000.0,
-                    )
+                    rig.denoised_f32.cu_deviceptr()
                 } else {
-                    (rig.color_f32.cu_deviceptr(), 0.0)
+                    rig.color_f32.cu_deviceptr()
                 };
+                if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
+                    prof.mark_denoise_end(slot, &rig.stream);
+                }
 
-                let bloom_ms =
-                    if settings.bloom_on && !rr_export && settings.aov_mode == 0 {
-                        let _nvtx =
-                            crate::nvtx::NvtxRange::new(c"cuFFT Bloom", crate::nvtx::COLOR_BLOOM);
-                        if let Some(ref mut bloom) = rig.bloom {
-                            let bloom_ready = if !settings.denoiser_on || dlss_any {
+                if settings.bloom_on && !rr_export && settings.aov_mode == 0 {
+                    let _nvtx =
+                        crate::nvtx::NvtxRange::new(c"cuFFT Bloom", crate::nvtx::COLOR_BLOOM);
+                    if let Some(ref mut bloom) = rig.bloom {
+                        let bloom_ready = if !settings.denoiser_on || dlss_any {
                             // SAFETY: `color_f32` and `denoised_f32` have identical byte size on `rig.stream`.
                             let cp_res = unsafe {
                                 cu::cuMemcpyDtoDAsync_v2(
@@ -3223,32 +3331,30 @@ pub fn spawn_render_thread(
                         } else {
                             true
                         };
-                        if bloom_ready {
-                            bloom
-                                .apply(
-                                    &rig.stream,
-                                    final_f32_ptr,
-                                    cur_w,
-                                    cur_h,
-                                    settings.bloom_threshold,
-                                    settings.bloom_intensity,
-                                    settings.bloom_blades,
-                                )
-                                .unwrap_or(0.0)
-                        } else {
-                            0.0
+                        if bloom_ready
+                            && let Err(err) = bloom.apply(
+                                &rig.stream,
+                                final_f32_ptr,
+                                cur_w,
+                                cur_h,
+                                settings.bloom_threshold,
+                                settings.bloom_intensity,
+                                settings.bloom_blades,
+                            )
+                        {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "cuFFT bloom error: {err}"
+                            )));
                         }
-                    } else {
-                        0.0
                     }
-                } else {
-                    0.0
-                };
+                }
+                if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
+                    prof.mark_bloom_end(slot, &rig.stream);
+                }
 
-                let tonemap_ms = {
+                {
                     let _nvtx =
                         crate::nvtx::NvtxRange::new(c"Tonemap", crate::nvtx::COLOR_TONEMAP);
-                    let t_tm = Instant::now();
                     let mut src_ptr = match settings.aov_mode {
                         1 => rig.albedo_f32.cu_deviceptr(),
                         2 => rig.normal_f32.cu_deviceptr(),
@@ -3288,7 +3394,7 @@ pub fn spawn_render_thread(
                     let gx = cur_w.div_ceil(16);
                     let gy = cur_h.div_ceil(16);
                     // SAFETY: `rig.tonemap.func` takes `(float4*, uchar4*, u32, u32, f32, u32, float4*, f32, i32)`
-                    // and all pointers/buffers remain valid through `stream.synchronize()`.
+                    // and all pointers/buffers remain valid through the single end-of-frame fence.
                     let res = unsafe {
                         cu::cuLaunchKernel(
                             rig.tonemap.func,
@@ -3323,7 +3429,7 @@ pub fn spawn_render_thread(
                             (&raw mut right_is_aov).cast(),
                         ];
                         // SAFETY: `tonemap_f32_to_scrgb_f16` writes `cur_w * cur_h * 8` bytes of
-                        // scRGB FP16 into `hdr_dsts[buf_idx]`, valid through `stream.synchronize()`.
+                        // scRGB FP16 into `hdr_dsts[buf_idx]`, valid through the end-of-frame fence.
                         let hdr_res = unsafe {
                             cu::cuLaunchKernel(
                                 rig.tonemap.scrgb_func,
@@ -3396,7 +3502,7 @@ pub fn spawn_render_thread(
                         ];
                         // SAFETY: `pack_dlss_rr_aovs_f16` takes 4 `float4*` inputs, 4 `ushort4*`
                         // outputs (`cur_w * cur_h * 8` bytes each), and `(u32, u32)`; all buffers
-                        // remain alive through `rig.stream.synchronize()`.
+                        // remain alive through the single end-of-frame fence.
                         let pack_res = unsafe {
                             cu::cuLaunchKernel(
                                 rig.tonemap.pack_rr_func,
@@ -3418,9 +3524,28 @@ pub fn spawn_render_thread(
                             )));
                         }
                     }
-                    rig.stream.synchronize().expect("tonemap sync");
-                    t_tm.elapsed().as_secs_f32() * 1000.0
-                };
+                }
+                if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_mut(), prof_slot) {
+                    prof.mark_frame_end(slot, &rig.stream);
+                }
+
+                // Single end-of-frame fence ensuring shared RGBA8 / HDR / DLSS buffers are complete
+                // before handing `buf_idx` to the Vulkan/wgpu UI thread.
+                rig.stream.synchronize().expect("frame fence sync");
+
+                let (rt_ms, denoise_ms, bloom_ms, tonemap_ms, cuda_compute_ms) =
+                    if let Some(prof) = rig.gpu_profiler.as_mut() {
+                        let s = prof.poll_completed();
+                        (
+                            s.rt_cores_ms,
+                            s.tensor_cores_ms,
+                            s.bloom_ms,
+                            s.tonemap_ms,
+                            s.cuda_compute_ms(),
+                        )
+                    } else {
+                        (t_burst.elapsed().as_secs_f32() * 1000.0, 0.0, 0.0, 0.0, 0.0)
+                    };
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
                     let msg = match save_jpeg_from_rgba8(
@@ -3451,6 +3576,7 @@ pub fn spawn_render_thread(
                     denoise_ms,
                     bloom_ms,
                     tonemap_ms,
+                    cuda_compute_ms,
                     ser_supported: rig.ser_supported,
                     csg_stats: rig.csg_host.stats(),
                     fast_preview: frame_is_fast_preview,

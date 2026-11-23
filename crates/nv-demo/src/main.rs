@@ -1130,6 +1130,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         denoise_ms: f32,
         bloom_ms: f32,
         tonemap_ms: f32,
+        cuda_compute_ms: f32,
+        dlss_ms: f32,
         ui_fps: f32,
         rt_fps: f32,
         fast_preview: bool,
@@ -1519,6 +1521,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 denoise_ms: 0.0,
                 bloom_ms: 0.0,
                 tonemap_ms: 0.0,
+                cuda_compute_ms: 0.0,
+                dlss_ms: 0.0,
                 ui_fps: 60.0,
                 rt_fps: 0.0,
                 fast_preview: false,
@@ -1693,23 +1697,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.denoise_ms = msg.denoise_ms;
                         self.bloom_ms = msg.bloom_ms;
                         self.tonemap_ms = msg.tonemap_ms;
+                        self.cuda_compute_ms = msg.cuda_compute_ms;
+                        if !self.settings.dlss_on && !self.settings.dlss_rr_on {
+                            self.dlss_ms = 0.0;
+                        }
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
                         self.fast_preview = msg.fast_preview;
                         self.last_possess_camera = msg.possess_camera;
+                        let tensor_cores_ms = msg.denoise_ms + self.dlss_ms;
                         let total_gpu_ms =
-                            (msg.rt_ms + msg.denoise_ms + msg.bloom_ms + msg.tonemap_ms).max(0.1);
+                            (msg.rt_ms + tensor_cores_ms + msg.cuda_compute_ms).max(0.1);
                         let inst_rt_fps = 1000.0 / total_gpu_ms;
                         self.rt_fps = if self.rt_fps <= 0.01 {
                             inst_rt_fps
                         } else {
                             self.rt_fps * 0.85 + inst_rt_fps * 0.15
                         };
-                        self.profiler.record_frame(
+                        self.profiler.record_frame_engines(
                             msg.rt_ms,
                             msg.denoise_ms,
                             msg.bloom_ms,
                             msg.tonemap_ms,
+                            msg.rt_ms,
+                            tensor_cores_ms,
+                            msg.cuda_compute_ms,
                             self.rt_fps,
                         );
                         self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
@@ -1843,6 +1855,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 denoise_ms: self.denoise_ms,
                 bloom_ms: self.bloom_ms,
                 tonemap_ms: self.tonemap_ms,
+                tensor_cores_ms: self.denoise_ms + self.dlss_ms,
+                cuda_compute_ms: self.cuda_compute_ms,
                 ui_fps: self.ui_fps,
                 rt_fps: self.rt_fps,
                 fast_preview: self.fast_preview,
@@ -2950,6 +2964,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.cam_pose.zfar.max(10.0),
                         )
                         .to_cols_array();
+                        let t_rr = Instant::now();
                         if let Err(e) = rr.evaluate(
                             &self.interop,
                             self.last_jitter,
@@ -2957,8 +2972,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             view_to_clip,
                         ) {
                             rr_failed = true;
+                            self.dlss_ms = 0.0;
                             self.last_saved_msg = Some(format!("DLSS-RR evaluate failed: {e}"));
                         } else {
+                            self.dlss_ms = t_rr.elapsed().as_secs_f32() * 1000.0;
                             ran_rr = true;
                         }
                     }
@@ -3071,12 +3088,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             8,
                         );
                         self.interop.queue().submit(Some(copy_enc.finish()));
+                        let t_dlss = Instant::now();
                         if let Err(e) = dlss.evaluate(
                             &self.interop,
                             self.last_jitter,
                             self.settings.dlss_sharpness,
                         ) {
                             self.settings.dlss_on = false;
+                            self.dlss_ms = 0.0;
                             if self.using_dlss_tex {
                                 let base_v = if hdr_active {
                                     self.display_view_hdr.as_ref().unwrap_or(&self.display_view)
@@ -3096,6 +3115,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             }
                             self.dlss_pass = None;
                             self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
+                        } else {
+                            self.dlss_ms = t_dlss.elapsed().as_secs_f32() * 1000.0;
                         }
                     }
                 } else if self.viewport_tex_dirty {

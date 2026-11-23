@@ -9,7 +9,7 @@
 //! OptiX's intersection module for curves and spheres ([`BuiltinIs`]). Program groups name entry
 //! points by their `__raygen__*`, `__miss__*`, `__closesthit__*`, `__anyhit__*`,
 //! `__intersection__*`, `__direct_callable__*` and `__continuation_callable__*` symbols.
-//! **How.** [`CompileOpts`] turns both option sets into the raw structs and owns copies of every
+//! **How.** `CompileOpts` turns both option sets into the raw structs and owns copies of every
 //! array they point at, so the pointers stay valid as long as it lives (the task-based compile in
 //! `task.rs` keeps it alive across parallel task execution).
 //! **Lifetimes.** A program group holds `Arc`s of its modules; a module holds the context and

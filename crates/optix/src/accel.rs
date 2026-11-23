@@ -31,6 +31,7 @@ use crate::micromap::{MicromapUse, OpacityMicromapArray};
 use crate::xform::{Child, MotionOptions};
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -869,6 +870,244 @@ impl DeviceInstances {
     }
 }
 
+/// Default pinned host staging capacity (`256 KiB` = 3,276 `OptixInstance` records) for
+/// asynchronous H2D DMA transfers in [`InstanceBuffer`].
+pub const INSTANCE_STAGING_BYTES: usize = 256 * 1024;
+
+/// Reusable page-locked host staging buffer (`cuMemAllocHost_v2` / `cuMemFreeHost`).
+struct PinnedHostStaging {
+    ptr: *mut c_void,
+    bytes: usize,
+    ctx: Arc<cuda_core::Context>,
+}
+
+// SAFETY: page-locked CUDA host memory is context-owned and not bound to a single OS thread;
+// mutable access is exclusively serialized through `&mut InstanceBuffer`.
+unsafe impl Send for PinnedHostStaging {}
+
+impl PinnedHostStaging {
+    fn try_new(ctx: &Arc<cuda_core::Context>, bytes: usize) -> Option<Self> {
+        if bytes == 0 || ctx.bind_to_thread().is_err() {
+            return None;
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `ctx` is current on this thread and `ptr` is a valid out-pointer.
+        let res = unsafe { cuda_core::sys::cuMemAllocHost_v2(&mut ptr, bytes) };
+        if res == cuda_core::sys::cudaError_enum_CUDA_SUCCESS && !ptr.is_null() {
+            Some(Self {
+                ptr,
+                bytes,
+                ctx: ctx.clone(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for PinnedHostStaging {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.ctx.bind_to_thread().is_ok() {
+            // SAFETY: `self.ptr` was allocated by `cuMemAllocHost_v2` on `self.ctx`.
+            unsafe {
+                let _ = cuda_core::sys::cuMemFreeHost(self.ptr);
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Persistent, grow-only device `OptixInstance` array paired with a reusable `256 KiB` pinned
+/// host staging buffer for zero-churn per-frame IAS builds and partial dynamic updates.
+pub struct InstanceBuffer {
+    ctx: Arc<DeviceContext>,
+    stream: Arc<Stream>,
+    device: Option<DeviceBuffer<u8>>,
+    cap_instances: usize,
+    len_instances: usize,
+    raw_scratch: Vec<sys::OptixInstance>,
+    children: Vec<Child>,
+    pinned: Option<PinnedHostStaging>,
+}
+
+impl InstanceBuffer {
+    /// Creates an empty persistent instance buffer bound to `ctx` and `stream`, pre-allocating
+    /// a `256 KiB` page-locked host staging buffer for async DMA uploads.
+    pub fn new(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>) -> Self {
+        let pinned = PinnedHostStaging::try_new(ctx.cuda(), INSTANCE_STAGING_BYTES);
+        Self {
+            ctx: ctx.clone(),
+            stream: stream.clone(),
+            device: None,
+            cap_instances: 0,
+            len_instances: 0,
+            raw_scratch: Vec::new(),
+            children: Vec::new(),
+            pinned,
+        }
+    }
+
+    /// Number of active instances currently resident in the device buffer.
+    pub fn len(&self) -> usize {
+        self.len_instances
+    }
+
+    /// Returns `true` when zero instances are uploaded.
+    pub fn is_empty(&self) -> bool {
+        self.len_instances == 0
+    }
+
+    /// Base `CUdeviceptr` of the persistent `OptixInstance` device array (`0` if unallocated).
+    pub fn device_ptr(&self) -> u64 {
+        self.device.as_ref().map_or(0, DeviceBuffer::cu_deviceptr)
+    }
+
+    /// Allocated device buffer capacity in bytes.
+    pub fn capacity_bytes(&self) -> usize {
+        self.device.as_ref().map_or(0, DeviceBuffer::len)
+    }
+
+    /// Uploads a full slice of `instances`, growing the persistent device buffer only when
+    /// `instances.len()` exceeds capacity (**zero** VRAM allocations/frees in steady state).
+    pub fn upload_all(&mut self, stream: &Arc<Stream>, instances: &[Instance]) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        if !Arc::ptr_eq(stream, &self.stream) {
+            return Err(Error::Invalid(
+                "instance buffer used on a different stream than it was created for",
+            ));
+        }
+        if instances.is_empty() {
+            return Err(Error::Invalid(
+                "an instance structure needs at least one instance",
+            ));
+        }
+        check_children(&self.ctx, instances)?;
+        let _ = count(instances.len(), "too many instances")?;
+
+        if instances.len() > self.cap_instances {
+            let new_cap = instances
+                .len()
+                .max(self.cap_instances.saturating_mul(2))
+                .max(64);
+            let new_bytes = new_cap
+                .checked_mul(size_of::<sys::OptixInstance>())
+                .ok_or(Error::Invalid("instance buffer byte size overflow"))?;
+            // Drop old buffer before allocating so stream-ordered async free precedes reuse.
+            self.device = None;
+            // SAFETY: overwritten by the H2D copy below before OptiX reads it.
+            let buf = unsafe { alloc(stream, new_bytes, sys::OPTIX_INSTANCE_BYTE_ALIGNMENT) }?;
+            self.device = Some(buf);
+            self.cap_instances = new_cap;
+        }
+
+        self.raw_scratch.clear();
+        self.raw_scratch.reserve(instances.len());
+        self.children.clear();
+        self.children.reserve(instances.len());
+        for inst in instances {
+            self.raw_scratch.push(inst.raw());
+            self.children.push(inst.child.clone());
+        }
+        self.len_instances = instances.len();
+
+        let dst = self.device_ptr();
+        self.copy_raw_range_to_device(stream, dst, 0)?;
+        Ok(())
+    }
+
+    /// Updates a contiguous subrange `[offset .. offset + instances.len()]` in place via the
+    /// reusable `256 KiB` pinned host staging buffer (**zero** VRAM allocations, **zero** frees,
+    /// and **zero** host `Vec` allocations once warm).
+    pub fn update_prefix(
+        &mut self,
+        stream: &Arc<Stream>,
+        offset: usize,
+        instances: &[Instance],
+    ) -> Result<()> {
+        same_ctx(stream, &self.ctx)?;
+        if !Arc::ptr_eq(stream, &self.stream) {
+            return Err(Error::Invalid(
+                "instance buffer used on a different stream than it was created for",
+            ));
+        }
+        if instances.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(instances.len())
+            .ok_or(Error::Invalid("instance update range overflow"))?;
+        if end > self.len_instances {
+            return Err(Error::Invalid(
+                "instance prefix update exceeds uploaded instance count",
+            ));
+        }
+        check_children(&self.ctx, instances)?;
+
+        self.raw_scratch.clear();
+        self.raw_scratch.reserve(instances.len());
+        for (i, inst) in instances.iter().enumerate() {
+            self.raw_scratch.push(inst.raw());
+            if let Some(slot) = self.children.get_mut(offset + i) {
+                *slot = inst.child.clone();
+            }
+        }
+
+        let base_ptr = self.device_ptr();
+        let byte_offset = (offset * size_of::<sys::OptixInstance>()) as u64;
+        self.copy_raw_range_to_device(stream, base_ptr, byte_offset)?;
+        Ok(())
+    }
+
+    /// Streams `self.raw_scratch` to `base_ptr + byte_offset`, using the pinned `256 KiB` host
+    /// staging buffer when the payload fits in one async DMA transfer (or direct H2D otherwise).
+    fn copy_raw_range_to_device(
+        &self,
+        stream: &Arc<Stream>,
+        base_ptr: u64,
+        byte_offset: u64,
+    ) -> Result<()> {
+        let total_bytes = size_of_val(self.raw_scratch.as_slice());
+        if total_bytes == 0 {
+            return Ok(());
+        }
+        let dst_ptr = base_ptr + byte_offset;
+        if let Some(ref pinned) = self.pinned
+            && total_bytes <= pinned.bytes
+        {
+            // SAFETY: `OptixInstance` is 80 B with no padding (const-asserted above);
+            // `pinned.ptr` holds `pinned.bytes >= total_bytes` page-locked host bytes;
+            // `dst_ptr` points within `self.device` with at least `total_bytes` remaining.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.raw_scratch.as_ptr().cast::<u8>(),
+                    pinned.ptr.cast::<u8>(),
+                    total_bytes,
+                );
+                cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr,
+                    pinned.ptr,
+                    total_bytes,
+                    stream.cu_stream(),
+                )
+            }
+            .result()?;
+            return Ok(());
+        }
+        // SAFETY: `OptixInstance` has no padding; CUDA stages pageable host sources synchronously
+        // before returning from `cuMemcpyHtoDAsync_v2`; `dst_ptr` holds `>= total_bytes` bytes.
+        unsafe {
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                dst_ptr,
+                self.raw_scratch.as_ptr().cast(),
+                total_bytes,
+                stream.cu_stream(),
+            )
+        }
+        .result()?;
+        Ok(())
+    }
+}
+
 /// What one build input was, recorded so refits and relocations can be checked against it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
@@ -1486,6 +1725,208 @@ impl Accel {
         let cx = Self::cx(ctx, stream, &opts)?;
         let inputs = pointer_inputs(&cx, instances)?;
         Self::build(ctx, stream, scratch, inputs, &opts)
+    }
+
+    /// Builds or updates an instance acceleration structure directly into `target`, reading from
+    /// a persistent [`InstanceBuffer`] with zero steady-state VRAM allocations or frees.
+    ///
+    /// - When `target` is `Some(existing)`, `!force_rebuild`, `existing` was built with
+    ///   [`BuildOptions::allow_update`], and `d_instances.len()` matches the built instance count,
+    ///   executes `OPTIX_BUILD_OPERATION_UPDATE` in place and returns `Ok(true)`.
+    /// - Otherwise executes `OPTIX_BUILD_OPERATION_BUILD` and returns `Ok(false)`. When `target`
+    ///   is uniquely owned (`Arc::strong_count == 1`), has matching build flags/motion, and its
+    ///   device buffer already has capacity `>= sizes.outputSizeInBytes`, the build reuses
+    ///   `existing`'s device buffer in place with zero `cuMemAlloc`/`cuMemFree`.
+    ///
+    /// # Safety
+    ///
+    /// No launch on another stream may read `target` while this build or update runs: order all
+    /// launches and updates on `stream` or synchronize before calling.
+    pub unsafe fn instances_into(
+        ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        d_instances: &InstanceBuffer,
+        opts: BuildOptions,
+        force_rebuild: bool,
+        target: &mut Option<Arc<Self>>,
+    ) -> Result<bool> {
+        same_ctx(stream, ctx)?;
+        if !Arc::ptr_eq(&d_instances.ctx, ctx) {
+            return Err(Error::Invalid(
+                "instance buffer belongs to another OptiX device context",
+            ));
+        }
+        if !Arc::ptr_eq(&d_instances.stream, stream) {
+            return Err(Error::Invalid(
+                "instance buffer was uploaded on a different stream than the build",
+            ));
+        }
+        if d_instances.is_empty() {
+            return Err(Error::Invalid(
+                "an instance structure needs at least one instance",
+            ));
+        }
+        if opts.compact {
+            return Err(Error::Invalid(
+                "Accel::instances_into does not support compaction (use persistent uncompacted IAS)",
+            ));
+        }
+        let n = count(d_instances.len(), "too many instances")?;
+        let flags = opts.flags();
+        let motion = opts.motion_sys()?;
+        let keys = usize::from(opts.motion_keys);
+
+        let mut build_input = sys::OptixBuildInput {
+            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES,
+            ..Default::default()
+        };
+        build_input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray {
+            instances: d_instances.device_ptr(),
+            numInstances: n,
+            instanceStride: 0,
+        };
+        let inputs_slice = [build_input];
+        let want_shape = Item::Instances(n);
+
+        // Fast path: in-place `OPTIX_BUILD_OPERATION_UPDATE` when count & topology are unchanged.
+        if !force_rebuild
+            && let Some(existing) = target.as_ref()
+            && (existing.flags & sys::OptixBuildFlags_OPTIX_BUILD_FLAG_ALLOW_UPDATE as u32) != 0
+            && existing.shape.as_slice() == [want_shape.clone()]
+        {
+            let accel_opts = sys::OptixAccelBuildOptions {
+                buildFlags: existing.flags,
+                operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_UPDATE,
+                motionOptions: existing.motion,
+            };
+            let sizes = Self::sizes(ctx, &accel_opts, &inputs_slice)?;
+            let (temp, temp_len) = scratch.reserve(stream, sizes.tempUpdateSizeInBytes)?;
+            let mut handle = existing.handle();
+            // SAFETY: `d_instances` holds `n` aligned `OptixInstance`s on `stream`; `existing.buffer`
+            // holds the previously built IAS; caller orders all readers on `stream`.
+            check("optixAccelBuild(instances_into update)", unsafe {
+                entry!(ctx.table(), optixAccelBuild)(
+                    ctx.raw(),
+                    stream.cu_stream(),
+                    &accel_opts,
+                    inputs_slice.as_ptr(),
+                    1,
+                    temp,
+                    temp_len,
+                    existing.buffer.cu_deviceptr(),
+                    existing.buffer.len(),
+                    &mut handle,
+                    std::ptr::null(),
+                    0,
+                )
+            })?;
+            existing.handle.store(handle, Ordering::Release);
+            let mut refs = existing
+                .refs
+                .lock()
+                .map_err(|_| Error::Invalid("reference list poisoned by a panic"))?;
+            refs.children.clear();
+            refs.children.extend_from_slice(&d_instances.children);
+            return Ok(true);
+        }
+
+        // Full BUILD path: reuse `target`'s device buffer in place whenever uniquely owned & large enough.
+        let accel_opts = sys::OptixAccelBuildOptions {
+            buildFlags: flags,
+            operation: sys::OptixBuildOperation_OPTIX_BUILD_OPERATION_BUILD,
+            motionOptions: motion,
+        };
+        let sizes = Self::sizes(ctx, &accel_opts, &inputs_slice)?;
+        let (temp, temp_len) = scratch.reserve(stream, sizes.tempSizeInBytes)?;
+
+        let reused_cap = target.as_ref().map_or(0, |a| a.buffer.len());
+        let can_reuse_in_place = target.as_mut().is_some_and(|arc| {
+            Arc::get_mut(arc).is_some() && arc.buffer.len() >= sizes.outputSizeInBytes
+        });
+
+        if can_reuse_in_place && let Some(arc) = target.as_mut()
+            && let Some(existing) = Arc::get_mut(arc)
+        {
+            let mut handle = 0;
+            // SAFETY: `existing` is uniquely owned, its buffer is `OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT`
+            // aligned with length `>= sizes.outputSizeInBytes`, and all readers are stream-ordered.
+            check("optixAccelBuild(instances_into reuse)", unsafe {
+                entry!(ctx.table(), optixAccelBuild)(
+                    ctx.raw(),
+                    stream.cu_stream(),
+                    &accel_opts,
+                    inputs_slice.as_ptr(),
+                    1,
+                    temp,
+                    temp_len,
+                    existing.buffer.cu_deviceptr(),
+                    existing.buffer.len(),
+                    &mut handle,
+                    std::ptr::null(),
+                    0,
+                )
+            })?;
+            existing.handle.store(handle, Ordering::Release);
+            existing.flags = flags;
+            existing.motion = motion;
+            existing.keys = keys;
+            existing.shape.clear();
+            existing.shape.push(want_shape);
+            let mut refs = existing
+                .refs
+                .lock()
+                .map_err(|_| Error::Invalid("reference list poisoned by a panic"))?;
+            refs.children.clear();
+            refs.children.extend_from_slice(&d_instances.children);
+            refs.micromaps.clear();
+            return Ok(false);
+        }
+
+        // Grow-only allocation (2x geometric growth) to avoid future reallocations.
+        let alloc_bytes = sizes
+            .outputSizeInBytes
+            .max(reused_cap.saturating_mul(2));
+        within(
+            opts.budget,
+            scratch
+                .growth(sizes.tempSizeInBytes)
+                .saturating_add(alloc_bytes),
+        )?;
+        // SAFETY: OptiX writes the output buffer before any launch reads it on `stream`.
+        let output = unsafe { alloc(stream, alloc_bytes, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
+        let mut handle = 0;
+        // SAFETY: `output` has `alloc_bytes >= sizes.outputSizeInBytes` aligned bytes on `stream`.
+        check("optixAccelBuild(instances_into alloc)", unsafe {
+            entry!(ctx.table(), optixAccelBuild)(
+                ctx.raw(),
+                stream.cu_stream(),
+                &accel_opts,
+                inputs_slice.as_ptr(),
+                1,
+                temp,
+                temp_len,
+                output.cu_deviceptr(),
+                output.len(),
+                &mut handle,
+                std::ptr::null(),
+                0,
+            )
+        })?;
+        *target = Some(Arc::new(Self {
+            handle: AtomicU64::new(handle),
+            buffer: output,
+            flags,
+            motion,
+            keys,
+            shape: vec![want_shape],
+            refs: Mutex::new(Refs {
+                children: d_instances.children.clone(),
+                micromaps: Vec::new(),
+            }),
+            ctx: ctx.clone(),
+        }));
+        Ok(false)
     }
 
     fn cx<'a>(

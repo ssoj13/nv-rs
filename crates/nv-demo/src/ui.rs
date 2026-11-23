@@ -754,9 +754,8 @@ impl UiContext<'_> {
 
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
-        // Vendored floating ViewportToolbar (bottom edge above HUD strip) with input gating.
+        // Vendored edge-docked ViewportToolbar (flush to viewport edge) with input gating.
         let toolbar_resp = crate::viewport_toolbar::ViewportToolbar::new("nv_demo_viewport_toolbar")
-            .bottom_margin(34.0)
             .show(ui.ctx(), rect, self.viewport_toolbar, |ui| {
                 // 1. AOV quick selector
                 let aov_cur = AOV_HUD_TAGS
@@ -849,7 +848,7 @@ impl UiContext<'_> {
                 }
                 ui.separator();
 
-                // 5. Compact Exposure EV drag
+                // 5. Compact Exposure EV & LOD Bias controls
                 ui.add(
                     egui::DragValue::new(&mut self.settings.exposure)
                         .range(0.05..=8.0)
@@ -857,6 +856,18 @@ impl UiContext<'_> {
                         .prefix("EV "),
                 )
                 .on_hover_text("Exposure multiplier");
+                if self.settings.csg_mode > 0 {
+                    ui.separator();
+                    ui.label(RichText::new("LOD").small().weak());
+                    ui.spacing_mut().slider_width = 68.0;
+                    ui.add(
+                        egui::Slider::new(&mut self.settings.csg_lod_bias, 0.25..=4.0)
+                            .logarithmic(true)
+                            .fixed_decimals(2)
+                            .suffix("x"),
+                    )
+                    .on_hover_text("CSG geometric LOD detail bias (higher = more detail at distance)");
+                }
 
                 // 6. Save PNG & SDG EXR Burst
                 if ui

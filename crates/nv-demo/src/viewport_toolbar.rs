@@ -21,14 +21,14 @@ use serde::{Deserialize, Serialize};
 /// Which edge of the viewport the floating [`ViewportToolbar`] is anchored to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolbarEdge {
-    /// Bottom edge of the viewport (above the HUD status line).
-    #[default]
+    /// Bottom edge of the viewport (flush to the bottom frame).
     Bottom,
-    /// Top edge of the viewport.
+    /// Top edge of the viewport (flush to the top frame, default).
+    #[default]
     Top,
-    /// Left edge of the viewport.
+    /// Left edge of the viewport (flush to the left frame).
     Left,
-    /// Right edge of the viewport.
+    /// Right edge of the viewport (flush to the right frame).
     Right,
 }
 
@@ -73,9 +73,9 @@ pub struct ToolbarState {
 impl Default for ToolbarState {
     fn default() -> Self {
         Self {
-            edge: ToolbarEdge::Bottom,
+            edge: ToolbarEdge::Top,
             expanded: true,
-            measured_extent: 440.0,
+            measured_extent: 560.0,
         }
     }
 }
@@ -87,34 +87,24 @@ pub struct ToolbarResponse {
     pub contains_pointer: bool,
 }
 
-/// Collapsible, edge-dockable floating glass-pill viewport toolbar.
+/// Collapsible, edge-dockable glass-pill viewport toolbar anchored flush to any viewport edge.
 pub struct ViewportToolbar {
     id: Id,
-    margin_bottom: f32,
-    margin_other: f32,
     thickness: f32,
     toggle_size: f32,
 }
 
 impl ViewportToolbar {
-    /// Create a new floating toolbar identified by `id_source`.
+    /// Create a new edge-docked viewport toolbar identified by `id_source`.
     pub fn new(id_source: impl std::hash::Hash + std::fmt::Debug) -> Self {
         Self {
             id: Id::new(id_source),
-            margin_bottom: 34.0,
-            margin_other: 10.0,
             thickness: 30.0,
             toggle_size: 24.0,
         }
     }
 
-    /// Override the bottom clearance above the viewport's bottom HUD strip.
-    pub const fn bottom_margin(mut self, margin: f32) -> Self {
-        self.margin_bottom = margin;
-        self
-    }
-
-    /// Render the floating toolbar over `viewport` and populate its interior with `add_contents`.
+    /// Render the edge-docked toolbar flush against `viewport` and populate its interior with `add_contents`.
     pub fn show(
         self,
         ctx: &egui::Context,
@@ -123,8 +113,8 @@ impl ViewportToolbar {
         add_contents: impl FnOnce(&mut Ui),
     ) -> ToolbarResponse {
         let collapsed_extent = self.toggle_size + 8.0;
-        let max_horiz = (viewport.width() - 24.0).max(collapsed_extent);
-        let max_vert = (viewport.height() - 64.0).max(collapsed_extent);
+        let max_horiz = (viewport.width() - 8.0).max(collapsed_extent);
+        let max_vert = (viewport.height() - 48.0).max(collapsed_extent);
         let target_extent = if state.expanded {
             if state.edge.is_horizontal() {
                 state.measured_extent.clamp(collapsed_extent, max_horiz)
@@ -142,22 +132,44 @@ impl ViewportToolbar {
             (self.thickness, anim_extent.min(max_vert))
         };
 
-        let min = match state.edge {
-            ToolbarEdge::Bottom => Pos2::new(
-                viewport.center().x - 0.5 * w,
-                viewport.bottom() - self.margin_bottom - h,
+        // Anchor flush against the chosen viewport edge (and aligned to the top-right / edge
+        // so it never floats mid-viewport or collides with the top-left RIDING overlay).
+        let (min, radius) = match state.edge {
+            ToolbarEdge::Top => (
+                Pos2::new(viewport.right() - w, viewport.top()),
+                CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 8,
+                    se: 0,
+                },
             ),
-            ToolbarEdge::Top => Pos2::new(
-                viewport.center().x - 0.5 * w,
-                viewport.top() + self.margin_other,
+            ToolbarEdge::Bottom => (
+                Pos2::new(viewport.right() - w, viewport.bottom() - h),
+                CornerRadius {
+                    nw: 8,
+                    ne: 0,
+                    sw: 0,
+                    se: 0,
+                },
             ),
-            ToolbarEdge::Left => Pos2::new(
-                viewport.left() + self.margin_other,
-                viewport.center().y - 0.5 * h,
+            ToolbarEdge::Left => (
+                Pos2::new(viewport.left(), viewport.center().y - 0.5 * h),
+                CornerRadius {
+                    nw: 0,
+                    ne: 8,
+                    sw: 0,
+                    se: 8,
+                },
             ),
-            ToolbarEdge::Right => Pos2::new(
-                viewport.right() - self.margin_other - w,
-                viewport.center().y - 0.5 * h,
+            ToolbarEdge::Right => (
+                Pos2::new(viewport.right() - w, viewport.center().y - 0.5 * h),
+                CornerRadius {
+                    nw: 8,
+                    ne: 0,
+                    sw: 8,
+                    se: 0,
+                },
             ),
         };
         let rect = Rect::from_min_size(min, Vec2::new(w, h));
@@ -174,9 +186,8 @@ impl ViewportToolbar {
 
                 // Absorb pointer clicks/drags on the backdrop first so they never leak to the viewport.
                 let bg_resp = ui.allocate_rect(rect, Sense::click_and_drag());
-                let fill = Color32::from_rgba_unmultiplied(15, 19, 26, 224);
-                let border = Stroke::new(1.0, Color32::from_rgba_unmultiplied(92, 108, 132, 125));
-                let radius = CornerRadius::same(8);
+                let fill = Color32::from_rgba_unmultiplied(15, 19, 26, 228);
+                let border = Stroke::new(1.0, Color32::from_rgba_unmultiplied(92, 108, 132, 135));
                 ui.painter()
                     .rect(rect, radius, fill, border, StrokeKind::Inside);
 

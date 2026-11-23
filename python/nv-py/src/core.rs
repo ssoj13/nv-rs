@@ -476,6 +476,34 @@ impl PyDeviceBuffer {
         }
         Ok(())
     }
+
+    /// Waits for leased writes still queued on streams other than this buffer's own stream
+    /// (for example a native call enqueued on another stream through `buf_util::enqueue_leased`)
+    /// before the buffer is handed to a DLPack consumer.
+    ///
+    /// `cuda-core` keeps the completion events of leased accesses private, so the only public
+    /// probe is a read lease: it fails with `CUDA_ERROR_NOT_READY` exactly when an unfinished
+    /// write on another stream overlaps the allocation. Work on the buffer's own stream is
+    /// ordered by [`Self::sync_for_consumer_stream`]; a buffer without a stream probes with a
+    /// fresh stream, which conflicts with an unfinished write on any stream. On a conflict the
+    /// whole context is synchronised, the only wait the public API offers. Blocks the calling
+    /// thread: call it without the GIL.
+    fn wait_for_foreign_writes(&self) -> Result<(), cuda_core::DriverError> {
+        let storage = self.storage();
+        let ctx = storage.context();
+        let probe = match &self.stream {
+            Some(s) => s.clone(),
+            None => ctx.new_stream()?,
+        };
+        match storage.acquire(&probe, false, false) {
+            // The probe lease is released here: it only tested for conflicting writes.
+            Ok(_lease) => Ok(()),
+            Err(e) if e.0 == cuda_bindings::cudaError_enum_CUDA_ERROR_NOT_READY => {
+                ctx.synchronize()
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 #[pymethods]
@@ -858,6 +886,12 @@ impl PyDeviceBuffer {
             ));
         }
         self.sync_for_consumer_stream(py, stream)?;
+        // DLPack: `stream=-1` asks the producer not to synchronise at all.
+        let no_sync = matches!(stream.map(|s| s.extract::<i64>()), Some(Ok(-1)));
+        if !no_sync {
+            py.detach(|| self.wait_for_foreign_writes())
+                .map_err(|e| record_and_err("core", "__dlpack__", e, ErrorKind::Cuda))?;
+        }
 
         let (dl_dtype, _, _) = parse_dtype(&self.dtype)
             .map_err(|e| record_and_err("core", "__dlpack__", e, ErrorKind::InvalidArgument))?;
@@ -1275,6 +1309,40 @@ mod tests {
             1,
             "deleter must run once after completion"
         );
+    }
+
+    #[test]
+    #[ignore = "GPU: needs a CUDA driver"]
+    fn gpu_dlpack_export_waits_for_leased_write_on_another_stream() {
+        // `__dlpack__` must not hand out a buffer that a leased native call on another stream is
+        // still writing: stream A is held busy for BUSY, a leased write to a buffer owned by
+        // stream B is queued behind it, and the export wait must last until A drains.
+        const BUSY: std::time::Duration = std::time::Duration::from_millis(200);
+        let ctx = Context::new(0).expect("cuda context");
+        let a = ctx.new_stream().expect("stream A");
+        let b = ctx.new_stream().expect("stream B");
+        // SAFETY: zero-filled on its allocation stream, which is synchronized before any use.
+        let mut raw = unsafe { CudaDeviceBuffer::<u8>::uninitialized_async(&b, 64) }.expect("alloc");
+        raw.zero_async(&b).expect("zero");
+        b.synchronize().expect("sync B");
+        let buf = PyDeviceBuffer::from_owned_cuda(raw, "u8", vec![64], &b).expect("wrap");
+
+        let t0 = Instant::now();
+        buf.wait_for_foreign_writes().expect("idle wait");
+        assert!(t0.elapsed() < BUSY / 4, "idle buffer must not wait");
+
+        a.launch_host_function(move || std::thread::sleep(BUSY))
+            .expect("busy");
+        // The enqueue queues no device access; the lease alone marks the pending write on A.
+        enqueue_leased("test", "write", &a, [(&buf, Access::Write)], || Ok(())).expect("lease");
+        let t0 = Instant::now();
+        buf.wait_for_foreign_writes().expect("wait");
+        assert!(
+            t0.elapsed() >= BUSY / 2,
+            "export did not wait for the leased write on stream A ({:?})",
+            t0.elapsed()
+        );
+        a.synchronize().expect("sync A");
     }
 
     static DELETER_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);

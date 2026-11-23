@@ -1037,7 +1037,7 @@ impl PyCufileDriver {
                 Level::Info,
                 "cufile",
                 "driver_open",
-                format!("device={}", context.device_id()),
+                format!("device={}", context.inner.ordinal()),
                 t0.elapsed().as_nanos() as u64,
                 true,
             );

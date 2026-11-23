@@ -382,14 +382,22 @@ def test_npp_image_and_signal_ops_match_numpy():
 
 
 def test_ngx_capabilities_and_queries():
-    dlss = nv_rs.ngx.is_dlss_supported()
-    assert isinstance(dlss, bool)
-
-    req_ext = nv_rs.ngx.required_extensions()
+    # There is no boolean support probe any more: the queries raise a typed error when NGX or its
+    # Vulkan runtime is unavailable, and the result is the requirement data itself.
+    try:
+        req_ext = nv_rs.ngx.required_extensions()
+        feat_req = nv_rs.ngx.feature_requirements("super_sampling")
+    except nv_rs.errors.NvError as exc:
+        _skip_if_missing_runtime(exc, "ngx")
+        return
     assert isinstance(req_ext, dict)
-
-    feat_req = nv_rs.ngx.feature_requirements("super_sampling")
     assert isinstance(feat_req, dict)
+    assert feat_req["feature"] == "super_sampling"
+    assert feat_req["instance_extensions"] == req_ext["instance_extensions"]
+    assert feat_req["device_extensions"] == req_ext["device_extensions"]
+
+    with pytest.raises(nv_rs.errors.NvInvalidArgumentError):
+        nv_rs.ngx.feature_requirements("no_such_feature")
 
     proj = nv_rs.ngx.validate_project_id(
         "12345678-1234-1234-1234-123456789abc",
@@ -404,11 +412,10 @@ def test_ngx_capabilities_and_queries():
         _skip_if_missing_runtime(exc, "ngx")
         return
 
-    assert isinstance(caps.supported, bool)
     assert isinstance(caps.instance_extensions, list)
     assert isinstance(caps.device_extensions, list)
-    assert caps.status_message is None or isinstance(caps.status_message, str)
-    assert isinstance(caps.is_dlss_supported(), bool)
+    for removed in ("supported", "status_message", "is_dlss_supported"):
+        assert not hasattr(caps, removed), removed
 
     inst_ext, dev_ext = caps.required_extensions()
     assert isinstance(inst_ext, list) and isinstance(dev_ext, list)

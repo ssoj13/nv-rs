@@ -28,8 +28,7 @@ use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased};
-use crate::compute::typed_view;
+use crate::buf_util::{Access, check_buf, enqueue_leased, typed_view};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 

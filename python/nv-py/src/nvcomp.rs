@@ -13,8 +13,7 @@ use nv_loader::diag::{self, Level};
 use nvcomp::{CompressedBuffer, CompressionManager, Format, FormatKind};
 use pyo3::prelude::*;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased};
-use crate::compute::typed_view;
+use crate::buf_util::{Access, check_buf, enqueue_leased, typed_view};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 

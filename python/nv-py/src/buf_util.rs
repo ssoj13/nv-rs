@@ -1,10 +1,13 @@
 //! Shared `PyDeviceBuffer` argument validation and completion leases for native calls.
 //!
-//! **What.** Two entry points every binding that hands a `PyDeviceBuffer` to a native library
+//! **What.** The entry points every binding that hands a `PyDeviceBuffer` to a native library
 //! uses:
 //! - [`check_buf`] validates one buffer argument (dtype, dense layout, element count, null
 //!   pointer, CUDA context of the call) and returns its `(ptr, nbytes)` span;
-//! - [`enqueue_leased`] runs the FFI enqueue with completion leases on the Python-owned buffers.
+//! - [`typed_view`] lends a checked buffer to a safe wrapper crate as a typed
+//!   `cuda_core::DeviceBuffer<T>` over the same allocation (no copy; `T: AnyBits`);
+//! - [`enqueue_leased`] runs the FFI enqueue with completion leases on the Python-owned buffers;
+//! - [`poisoned`] is the error for a handle mutex poisoned by an earlier panic.
 //!
 //! **Why.** A native library receives raw pointers, so nothing in `cuda-core` keeps the memory
 //! alive or checks it: `del buf` right after an asynchronous call frees the allocation while
@@ -33,51 +36,73 @@
 //! **How.** A thin adapter over `cuda_core_ext::enqueue_leased` (acquire -> bind -> enqueue ->
 //! retain on `cuda_core::RawDeviceBuffer`): [`PyDeviceBuffer::storage`] supplies the allocation
 //! for owned buffers and DLPack imports alike, and errors are mapped to Python exceptions.
-//! **Used by** `core.rs` (`DeviceBuffer.to_bytes`) and, as they migrate, the native bindings
-//! (`compute`, `sparse_ai`, `gfx_img`, `video`, `nvjpeg`, `nvcomp`, `platform_ext`).
+//! **Used by** `core.rs` (`DeviceBuffer.to_bytes`) and the native bindings (`compute`,
+//! `sparse_ai`, `gfx_img`, `video`, `nvjpeg`, `nvcomp`, `platform_ext`).
 
-use cuda_core::{Context, DriverError, Stream};
+use cuda_core::{Context, DeviceBuffer as CudaDeviceBuffer, DriverError, Stream};
 pub(crate) use cuda_core_ext::Access;
+use cufft::Complex32;
 use pyo3::prelude::*;
 
 use crate::core::PyDeviceBuffer;
 use crate::errors::{ErrorKind, record_and_err};
 
-/// Extracts `(raw_device_ptr, byte_len)` from a `PyDeviceBuffer`, supporting both
-/// `nv_rs`-owned buffers and borrowed DLPack tensors.
+/// Element types for which every bit pattern is a valid value, so a typed view over arbitrary
+/// device bytes cannot produce an invalid `T` (`cuda_core::DeviceBuffer::from_storage` contract).
 ///
-/// Performs no validation; [`check_buf`] supersedes this for native calls.
-pub(crate) fn buf_ptr_and_bytes(buf: &Bound<'_, PyDeviceBuffer>) -> (u64, usize) {
-    let borrowed = buf.borrow();
-    (borrowed.raw_device_ptr(), borrowed.byte_len())
-}
+/// # Safety
+/// Implementors must accept every bit pattern of `size_of::<Self>()` bytes.
+pub(crate) unsafe trait AnyBits: Sized {}
+// SAFETY: every bit pattern is a valid `u8`.
+unsafe impl AnyBits for u8 {}
+// SAFETY: every bit pattern is a valid `i32`.
+unsafe impl AnyBits for i32 {}
+// SAFETY: every bit pattern is a valid `f32` (NaN payloads included).
+unsafe impl AnyBits for f32 {}
+// SAFETY: `Complex32` is `#[repr(C, align(8))]` over `[f32; 2]`, valid for every bit pattern.
+unsafe impl AnyBits for Complex32 {}
 
-/// Validates that `nbytes >= min_bytes` and `ptr != 0` when `min_bytes > 0`.
-pub(crate) fn validate_dev_buf(
+/// Typed view of the first `len` elements of `buf`, sharing its allocation owner and access
+/// tracker (no copy), so a safe wrapper crate can be called on a Python buffer.
+///
+/// Call [`check_buf`] first (dtype, layout, context). Fails with `NvInvalidArgumentError` when
+/// `buf` holds fewer than `len * size_of::<T>()` bytes or is not aligned for `T`.
+pub(crate) fn typed_view<T: AnyBits>(
     category: &str,
     op: &str,
     name: &str,
-    ptr: u64,
-    nbytes: usize,
-    min_bytes: usize,
-) -> PyResult<()> {
-    if nbytes < min_bytes {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} buffer too small: got {nbytes} bytes, need at least {min_bytes} bytes"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    if min_bytes > 0 && ptr == 0 {
-        return Err(record_and_err(
-            category,
-            op,
-            format!("{name} device pointer is null"),
-            ErrorKind::InvalidArgument,
-        ));
-    }
-    Ok(())
+    buf: &PyDeviceBuffer,
+    len: usize,
+) -> PyResult<CudaDeviceBuffer<T>> {
+    let invalid = |msg: String| record_and_err(category, op, msg, ErrorKind::InvalidArgument);
+    let bytes = len
+        .checked_mul(size_of::<T>())
+        .ok_or_else(|| invalid(format!("{name} byte size overflow")))?;
+    let storage = buf.storage().slice_bytes(0, bytes).map_err(|e| {
+        invalid(format!(
+            "{name} holds {} bytes, need {bytes} ({e})",
+            buf.byte_len()
+        ))
+    })?;
+    // SAFETY: `T: AnyBits` accepts every bit pattern, so bytes written through any alias of this
+    // storage (including uninitialized device memory) are valid `T`s; the view only lends the span
+    // to one wrapper call whose accesses are covered by `enqueue_leased`.
+    unsafe { CudaDeviceBuffer::<T>::from_storage(storage, len) }.map_err(|e| {
+        invalid(format!(
+            "{name} is not aligned to {} bytes ({e})",
+            align_of::<T>()
+        ))
+    })
+}
+
+/// Error for a handle whose mutex was poisoned by a panic in an earlier call.
+pub(crate) fn poisoned(category: &str, op: &str) -> PyErr {
+    record_and_err(
+        category,
+        op,
+        format!("{category} handle mutex poisoned"),
+        ErrorKind::InvalidArgument,
+    )
 }
 
 /// Validates buffer argument `name` of native call `category`/`op` and returns its dense

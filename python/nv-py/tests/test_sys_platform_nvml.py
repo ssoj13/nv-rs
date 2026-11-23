@@ -29,7 +29,7 @@ def test_nvml_optional_telemetry_records_no_errors():
     except nv_rs.errors.NvLibraryNotFoundError as exc:
         pytest.skip(f"NVML unavailable: {exc}")
     dev = session.device(0)
-    with nv_rs.trace("nvml-optional", print_on_exit=False) as tr:
+    with nv_rs.trace("trace", print_on_exit=False) as tr:
         clocks = dev.clocks_mhz()
         summary = dev.summary()
     assert set(clocks) == {"graphics", "sm", "memory"}
@@ -91,7 +91,7 @@ def test_cupti_subscriber_event_buffer_is_bounded():
     sub = _subscriber(context=ctx)
     try:
         sub.enable_domain("driver_api", True)
-        with nv_rs.trace("cupti-bound", print_on_exit=False) as tr:
+        with nv_rs.trace("trace", print_on_exit=False) as tr:
             # Every synchronize issues at least one driver API call (the context bind check
             # included), so this overflows the 65536-event buffer.
             for _ in range(70_000):

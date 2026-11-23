@@ -9,9 +9,6 @@
 //! workspace lock across exec, context bind, pointer mode, even-count rule) is the only codepath.
 //! The wrapper call runs inside `buf_util::enqueue_leased`, which keeps the Python buffers alive
 //! until the queued work completes.
-//! **Also here** [`typed_view`] (used by `sparse_ai.rs`, `nvjpeg.rs`, `nvcomp.rs`) and
-//! [`poisoned`] (used by `sparse_ai.rs`); both belong next to `check_buf` in `buf_util.rs`, which
-//! this wave does not edit.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -23,71 +20,9 @@ use curand::{Generator as CurandInnerGenerator, RngType};
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased};
+use crate::buf_util::{Access, check_buf, enqueue_leased, poisoned, typed_view};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
-
-// ---------------------------------------------------------------------------
-// Typed views over Python buffers
-// ---------------------------------------------------------------------------
-
-/// Element types for which every bit pattern is a valid value, so a typed view over arbitrary
-/// device bytes cannot produce an invalid `T` (`cuda_core::DeviceBuffer::from_storage` contract).
-///
-/// # Safety
-/// Implementors must accept every bit pattern of `size_of::<Self>()` bytes.
-pub(crate) unsafe trait AnyBits: Sized {}
-// SAFETY: every bit pattern is a valid `u8`.
-unsafe impl AnyBits for u8 {}
-// SAFETY: every bit pattern is a valid `i32`.
-unsafe impl AnyBits for i32 {}
-// SAFETY: every bit pattern is a valid `f32` (NaN payloads included).
-unsafe impl AnyBits for f32 {}
-// SAFETY: `Complex32` is `#[repr(C, align(8))]` over `[f32; 2]`, valid for every bit pattern.
-unsafe impl AnyBits for Complex32 {}
-
-/// Typed view of the first `len` elements of `buf`, sharing its allocation owner and access
-/// tracker (no copy), so a safe wrapper crate can be called on a Python buffer.
-///
-/// Call [`check_buf`] first (dtype, layout, context). Fails with `NvInvalidArgumentError` when
-/// `buf` holds fewer than `len * size_of::<T>()` bytes or is not aligned for `T`.
-pub(crate) fn typed_view<T: AnyBits>(
-    category: &str,
-    op: &str,
-    name: &str,
-    buf: &PyDeviceBuffer,
-    len: usize,
-) -> PyResult<CudaDeviceBuffer<T>> {
-    let invalid = |msg: String| record_and_err(category, op, msg, ErrorKind::InvalidArgument);
-    let bytes = len
-        .checked_mul(size_of::<T>())
-        .ok_or_else(|| invalid(format!("{name} byte size overflow")))?;
-    let storage = buf.storage().slice_bytes(0, bytes).map_err(|e| {
-        invalid(format!(
-            "{name} holds {} bytes, need {bytes} ({e})",
-            buf.byte_len()
-        ))
-    })?;
-    // SAFETY: `T: AnyBits` accepts every bit pattern, so bytes written through any alias of this
-    // storage (including uninitialized device memory) are valid `T`s; the view only lends the span
-    // to one wrapper call whose accesses are covered by `enqueue_leased`.
-    unsafe { CudaDeviceBuffer::<T>::from_storage(storage, len) }.map_err(|e| {
-        invalid(format!(
-            "{name} is not aligned to {} bytes ({e})",
-            align_of::<T>()
-        ))
-    })
-}
-
-/// Error for a handle whose mutex was poisoned by a panic in an earlier call.
-pub(crate) fn poisoned(category: &str, op: &str) -> PyErr {
-    record_and_err(
-        category,
-        op,
-        format!("{category} handle mutex poisoned"),
-        ErrorKind::InvalidArgument,
-    )
-}
 
 // ---------------------------------------------------------------------------
 // nv_rs.cublas

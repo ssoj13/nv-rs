@@ -1793,10 +1793,48 @@ extern "C" __global__ void __raygen__render() {
     float prev_tan_fov = params.prev_cam_up[3];
     bool has_prev_cam = (prev_tan_fov > 1e-5f) && (proj == 0u);
 
-    for (unsigned int s = 0; s < spp; ++s) {
-        bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
-        float jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
-        float jy = use_dlss_jitter ? params.jitter_y : (rand01(seed) - 0.5f + params.jitter_y);
+    const bool aov_aa = (params.aov_mode != 0u);
+    const unsigned int loop_spp = aov_aa ? 4u : spp;
+    float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
+    float aov_w_accum = 0.0f;
+    float2 s0_motion = make_float2(0.0f, 0.0f);
+    float s0_depth = 1e6f;
+    unsigned int s0_sem_id = 0u;
+    unsigned int s0_inst_id = 0u;
+    bool s0_has_hit = false;
+    float3 s0_albedo = make_float3(0.0f, 0.0f, 0.0f);
+    float3 s0_normal = make_float3(0.0f, 1.0f, 0.0f);
+    float s0_roughness = 0.5f;
+    float3 s0_diffuse = make_float3(0.0f, 0.0f, 0.0f);
+    float3 s0_specular = make_float3(0.0f, 0.0f, 0.0f);
+
+    for (unsigned int s = 0; s < loop_spp; ++s) {
+        if (aov_aa) {
+            first_has_hit = false;
+            first_sem_id = 0u;
+            first_inst_id = 0u;
+            first_part_id = 0u;
+            first_depth = 1e6f;
+            first_range = 1e6f;
+            first_motion = make_float2(0.0f, 0.0f);
+            first_albedo = make_float3(0.0f, 0.0f, 0.0f);
+            first_normal = make_float3(0.0f, 1.0f, 0.0f);
+            first_world_pos = make_float3(0.0f, 0.0f, 0.0f);
+            first_mat_pbr = make_float3(0.0f, 0.0f, 0.0f);
+        }
+        float jx, jy;
+        if (aov_aa) {
+            // Deterministic 4x Rotated-Grid Supersampling (RGSS): zero frame-to-frame subpixel
+            // jitter and clean 4x anti-aliased edges on every non-Beauty AOV pass.
+            const float rgss_x[4] = {-0.375f,  0.125f, -0.125f, 0.375f};
+            const float rgss_y[4] = {-0.125f, -0.375f,  0.375f, 0.125f};
+            jx = rgss_x[s & 3u];
+            jy = rgss_y[s & 3u];
+        } else {
+            bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
+            jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
+            jy = use_dlss_jitter ? params.jitter_y : (rand01(seed) - 0.5f + params.jitter_y);
+        }
         float px = (float)idx.x + 0.5f + jx;
         float py = (float)idx.y + 0.5f + jy;
         float u01 = px / (float)params.width;
@@ -1846,7 +1884,7 @@ extern "C" __global__ void __raygen__render() {
         }
 
         if (masked) {
-            if (s == 0u) {
+            if (s == 0u || aov_aa) {
                 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
                 first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
                 first_specular = make_float3(0.0f, 0.0f, 0.0f);
@@ -1893,7 +1931,7 @@ extern "C" __global__ void __raygen__render() {
             if (p0 == 0u) {
                 float3 sky = sky_color(dir, sun_dir, bounce == 0);
                 sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
-                if (bounce == 0 && s == 0) {
+                if (bounce == 0 && (s == 0u || aov_aa)) {
                     first_albedo = make_float3(
                         fmaxf(0.0f, fminf(1.0f, sky.x)),
                         fmaxf(0.0f, fminf(1.0f, sky.y)),
@@ -1943,7 +1981,7 @@ extern "C" __global__ void __raygen__render() {
             unsigned int inst_id = is_csg ? 0xFFFFu : (p6 & 0xFFu);
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
-            if (bounce == 0 && s == 0) {
+            if (bounce == 0 && (s == 0u || aov_aa)) {
                 first_has_hit = true;
                 first_world_pos = hit_pos;
                 first_range = f3_len(f3_sub(hit_pos, cam_pos));
@@ -2007,7 +2045,7 @@ extern "C" __global__ void __raygen__render() {
                 if (max_em > 1e-4f) {
                     sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
                     if (max_em > 1.5f) {
-                        if (bounce == 0 && s == 0) {
+                        if (bounce == 0 && (s == 0u || aov_aa)) {
                             first_albedo = make_float3(
                                 fminf(1.0f, emission.x * 0.35f),
                                 fminf(1.0f, emission.y * 0.35f),
@@ -2036,7 +2074,7 @@ extern "C" __global__ void __raygen__render() {
                     }
                     float r0 = (1.0f - ior) / (1.0f + ior);
                     r0 = r0 * r0;
-                    if (bounce == 0 && s == 0) {
+                    if (bounce == 0 && (s == 0u || aov_aa)) {
                         first_albedo = base_col;
                         first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
                         first_specular = make_float3(r0, r0, r0);
@@ -2074,7 +2112,7 @@ extern "C" __global__ void __raygen__render() {
                     continue;
                 }
 
-                if (bounce == 0 && s == 0) {
+                if (bounce == 0 && (s == 0u || aov_aa)) {
                     float inv_m = 1.0f - metallic;
                     first_albedo = base_col;
                     first_diffuse = f3_mul(base_col, inv_m);
@@ -2131,7 +2169,10 @@ extern "C" __global__ void __raygen__render() {
                 float p_coat = clearcoat * (0.12f + 0.78f * schlick);
                 float p_spec = (1.0f - p_coat) * (0.12f + 0.78f * metallic + (1.0f - rough) * 0.25f * schlick);
                 float u_lobe = rand01(seed);
-                float3 diff_dir = sample_cosine_hemisphere(n, seed);
+                if (aov_aa) {
+                break;
+            }
+            float3 diff_dir = sample_cosine_hemisphere(n, seed);
                 float3 refl_dir = f3_reflect(dir, n);
                 if (u_lobe < p_coat) {
                     dir = f3_norm(f3_add(refl_dir, f3_mul(diff_dir, cc_rough)));
@@ -2180,7 +2221,7 @@ extern "C" __global__ void __raygen__render() {
                 }
                 float r0 = (1.0f - ior) / (1.0f + ior);
                 r0 = r0 * r0;
-                if (bounce == 0 && s == 0) {
+                if (bounce == 0 && (s == 0u || aov_aa)) {
                     first_albedo = make_float3(0.92f, 0.97f, 1.0f);
                     first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
                     first_specular = make_float3(r0, r0, r0);
@@ -2222,7 +2263,7 @@ extern "C" __global__ void __raygen__render() {
                 float3 neon_b = make_float3(1.65f, 0.35f, 1.85f);
                 float3 emission = f3_mul(f3_add(f3_mul(neon_a, 1.0f - mix_t), f3_mul(neon_b, mix_t)), pulse * 2.2f);
                 sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
-                if (bounce == 0 && s == 0) {
+                if (bounce == 0 && (s == 0u || aov_aa)) {
                     first_albedo = make_float3(
                         fminf(1.0f, emission.x * 0.45f),
                         fminf(1.0f, emission.y * 0.45f),
@@ -2291,7 +2332,7 @@ extern "C" __global__ void __raygen__render() {
                 break;
             }
 
-            if (bounce == 0 && s == 0) {
+            if (bounce == 0 && (s == 0u || aov_aa)) {
                 float inv_m = 1.0f - metallic;
                 first_albedo = base_col;
                 first_diffuse = f3_mul(base_col, inv_m);
@@ -2357,39 +2398,70 @@ extern "C" __global__ void __raygen__render() {
             throughput = f3_mul3(throughput, base_col);
         }
 
-        accum_col = f3_add(accum_col, sample_col);
+        if (aov_aa) {
+            if (s == 0u) {
+                s0_motion = first_motion;
+                s0_depth = first_depth;
+                s0_sem_id = first_sem_id;
+                s0_inst_id = first_inst_id;
+                s0_has_hit = first_has_hit;
+                s0_albedo = first_albedo;
+                s0_normal = first_normal;
+                s0_roughness = first_roughness;
+                s0_diffuse = first_diffuse;
+                s0_specular = first_specular;
+            }
+            float3 sc = make_float3(0.0f, 0.0f, 0.0f);
+            float sw = 1.0f;
+            if (params.aov_mode == 1u) {
+                sc = first_albedo;
+            } else if (params.aov_mode == 2u) {
+                sc = first_normal;
+            } else if (params.aov_mode == 3u) {
+                float dv = (first_depth > 1e5f) ? 0.0f : (1.0f / (1.0f + first_depth * 0.15f));
+                sc = make_float3(dv, dv, dv);
+            } else if (params.aov_mode == 4u) {
+                float mag = sqrtf(first_motion.x * first_motion.x + first_motion.y * first_motion.y);
+                sc = make_float3(
+                    fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.x * 0.05f)),
+                    fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.y * 0.05f)),
+                    fminf(1.0f, mag * 0.05f)
+                );
+            } else if (params.aov_mode == 5u) {
+                sc = semantic_aov_color(first_sem_id);
+            } else if (params.aov_mode == 6u) {
+                sc = instance_aov_color(first_inst_id);
+            } else if (params.aov_mode == 7u) {
+                sc = first_has_hit ? first_world_pos : make_float3(0.0f, 0.0f, 0.0f);
+                sw = first_has_hit ? 1.0f : 0.0f;
+            } else if (params.aov_mode == 8u) {
+                sc = range_lidar_aov_color(first_range);
+            } else if (params.aov_mode == 9u) {
+                sc = first_has_hit ? first_mat_pbr : make_float3(0.0f, 0.0f, 0.0f);
+            } else if (params.aov_mode == 10u) {
+                sc = cryptomatte_aov_color(first_inst_id, first_part_id, first_sem_id, first_has_hit);
+            }
+            aov_accum = f3_add(aov_accum, sc);
+            aov_w_accum += sw;
+        } else {
+            accum_col = f3_add(accum_col, sample_col);
+        }
     }
 
     float inv_spp = 1.0f / (float)spp;
-    float3 final_col = f3_mul(accum_col, inv_spp);
-    float final_w = 1.0f;
-    if (params.aov_mode == 1u) {
-        final_col = first_albedo;
-    } else if (params.aov_mode == 2u) {
-        final_col = first_normal;
-    } else if (params.aov_mode == 3u) {
-        float dv = (first_depth > 1e5f) ? 0.0f : (1.0f / (1.0f + first_depth * 0.15f));
-        final_col = make_float3(dv, dv, dv);
-    } else if (params.aov_mode == 4u) {
-        float mag = sqrtf(first_motion.x * first_motion.x + first_motion.y * first_motion.y);
-        final_col = make_float3(
-            fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.x * 0.05f)),
-            fmaxf(0.0f, fminf(1.0f, 0.5f + first_motion.y * 0.05f)),
-            fminf(1.0f, mag * 0.05f)
-        );
-    } else if (params.aov_mode == 5u) {
-        final_col = semantic_aov_color(first_sem_id);
-    } else if (params.aov_mode == 6u) {
-        final_col = instance_aov_color(first_inst_id);
-    } else if (params.aov_mode == 7u) {
-        final_col = first_has_hit ? first_world_pos : make_float3(0.0f, 0.0f, 0.0f);
-        final_w = first_has_hit ? 1.0f : 0.0f;
-    } else if (params.aov_mode == 8u) {
-        final_col = range_lidar_aov_color(first_range);
-    } else if (params.aov_mode == 9u) {
-        final_col = first_has_hit ? first_mat_pbr : make_float3(0.0f, 0.0f, 0.0f);
-    } else if (params.aov_mode == 10u) {
-        final_col = cryptomatte_aov_color(first_inst_id, first_part_id, first_sem_id, first_has_hit);
+    float3 final_col = aov_aa ? f3_mul(aov_accum, 0.25f) : f3_mul(accum_col, inv_spp);
+    float final_w = aov_aa ? (aov_w_accum * 0.25f) : 1.0f;
+    if (aov_aa) {
+        first_motion = s0_motion;
+        first_depth = s0_depth;
+        first_sem_id = s0_sem_id;
+        first_inst_id = s0_inst_id;
+        first_has_hit = s0_has_hit;
+        first_albedo = s0_albedo;
+        first_normal = s0_normal;
+        first_roughness = s0_roughness;
+        first_diffuse = s0_diffuse;
+        first_specular = s0_specular;
     }
 
     unsigned int out_idx = idx.y * params.width + idx.x;

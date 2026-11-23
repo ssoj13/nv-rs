@@ -3322,7 +3322,10 @@ pub fn spawn_render_thread(
                     possess_zoom_offset = snap.possess_zoom_offset;
                 }
 
-                let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes > 1;
+                // Strict 1-to-1 deterministic lockstep for ANY Smooth 60 FPS recording
+                // (`rec_shutter_subframes >= 1`): render thread advances traffic, crowd, and
+                // encodes exactly one frame per `RenderShutterSubframe` batch from UI.
+                let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes >= 1;
                 let burst_active = active_burst.is_some();
                 let now_preview = Instant::now();
                 let fast_preview = !rec_active
@@ -3988,7 +3991,7 @@ pub fn spawn_render_thread(
 
                 let rr_export = settings.dlss_rr_on || rr_ptrs.is_some();
                 let dlss_any = settings.dlss_on || rr_export;
-                let jitter = if dlss_any {
+                let jitter = if dlss_any && settings.aov_mode == 0 {
                     if !preserve_shutter_accum {
                         accum_count = 0;
                     }

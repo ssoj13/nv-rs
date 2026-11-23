@@ -2179,13 +2179,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let prev_theme = self.theme;
             let cam_fixed_dt = if self.is_recording && self.settings.record_fixed_fps {
-                let shutter_n = self.settings.record_shutter_subframes.clamp(1, 4);
-                let ts = self.settings.time_scale.clamp(0.05, 2.0);
-                if shutter_n > 1 {
-                    Some(0.0)
-                } else {
-                    Some((frames_received as f32 / 60.0) * ts)
-                }
+                // Lockstep recording steps camera strictly inside `RenderShutterSubframe` batches.
+                Some(0.0)
             } else {
                 None
             };
@@ -3146,7 +3141,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.cam_damper.snap(self.cam_pose);
             }
 
-            if shutter_n > 1 {
+            if self.is_recording && self.settings.record_fixed_fps {
                 if !self.shutter_in_flight {
                     let frame_dt = (1.0 / 60.0) * time_scale;
                     for sub_idx in 0..shutter_n {

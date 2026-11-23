@@ -367,10 +367,16 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
     // 1. Update walkway patrol steering intent in-place on GPU (matches `SceneBuilt::step_crowd`).
     if (num_walkways > 0u && walkway_pts != nullptr && walkway_spans != nullptr) {
         ActorIntentPod intent = intents[i];
-        if ((intent.flags & ACTOR_INTENT_FREEZE_POSE) == 0u && intent.target_id != 0xFFFFFFFFu) {
-            const uint32_t w_idx = (intent.target_id >> 16u) & 0x7FFFu;
-            uint32_t wp_idx = (intent.target_id >> 1u) & 0x7FFFu;
-            bool reverse = (intent.target_id & 1u) != 0u;
+        const uint32_t tid = intent.target_id;
+        // Same handle layout as `csg_scene::scene_module::encode_walkway_target`; the bit widths
+        // and sentinels come from the generated `ACTOR_WALKWAY_*` block (see
+        // `walkway_target_defines`). `0` is the zeroed `IntentPod` default and means "free".
+        if ((intent.flags & ACTOR_INTENT_FREEZE_POSE) == 0u && tid != 0u
+            && tid != ACTOR_WALKWAY_TARGET_NONE && tid != ACTOR_WALKWAY_TARGET_INVALID) {
+            const uint32_t packed = tid - 1u;
+            const uint32_t w_idx = packed >> (ACTOR_WALKWAY_WP_BITS + 1u);
+            uint32_t wp_idx = (packed >> 1u) & ACTOR_WALKWAY_WP_MASK;
+            bool reverse = (packed & 1u) != 0u;
             if (w_idx < num_walkways) {
                 const uint2 span = walkway_spans[w_idx];
                 const uint32_t start = span.x;
@@ -411,10 +417,11 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
                         intent.move_cmd[3] = speed;
                         intent.flags |= ACTOR_INTENT_MASK_VEL | ACTOR_INTENT_MASK_HEADING;
                     }
-                    if (w_idx < 32767u && wp_idx < 32767u) {
-                        intent.target_id = (w_idx << 16u) | (wp_idx << 1u) | (reverse ? 1u : 0u);
+                    if (w_idx <= ACTOR_WALKWAY_MAX_IDX && wp_idx <= ACTOR_WALKWAY_WP_MASK) {
+                        intent.target_id = ((w_idx << (ACTOR_WALKWAY_WP_BITS + 1u))
+                            | (wp_idx << 1u) | (reverse ? 1u : 0u)) + 1u;
                     } else {
-                        intent.target_id = 0xFFFFFFFFu;
+                        intent.target_id = ACTOR_WALKWAY_TARGET_INVALID;
                     }
                     intents[i] = intent;
                 }
@@ -756,6 +763,28 @@ fn check_scatter_topology(
     Ok(())
 }
 
+/// `#define` block giving the GPU steering kernel the walkway patrol-handle layout of
+/// `csg_scene::scene_module::encode_walkway_target`, generated from csg-scene's public constants so
+/// the CUDA copy cannot drift from the encoder (it did once: the layout changed and the kernel kept
+/// decoding the old one).
+fn walkway_target_defines() -> String {
+    use csg_scene::scene_module::{
+        MAX_WALKWAY_INDEX, MAX_WAYPOINT_INDEX, WALKWAY_TARGET_INVALID, WALKWAY_TARGET_NONE,
+    };
+    // `MAX_WAYPOINT_INDEX` is `2^bits - 1`, so its popcount is the field width.
+    const _: () = assert!((MAX_WAYPOINT_INDEX + 1).is_power_of_two());
+    format!(
+        "#define ACTOR_WALKWAY_WP_BITS {}u\n#define ACTOR_WALKWAY_WP_MASK {}u\n\
+         #define ACTOR_WALKWAY_MAX_IDX {}u\n#define ACTOR_WALKWAY_TARGET_NONE {}u\n\
+         #define ACTOR_WALKWAY_TARGET_INVALID {}u\n",
+        MAX_WAYPOINT_INDEX.count_ones(),
+        MAX_WAYPOINT_INDEX,
+        MAX_WALKWAY_INDEX,
+        WALKWAY_TARGET_NONE,
+        WALKWAY_TARGET_INVALID,
+    )
+}
+
 /// Parameter count of `step_and_emit_actors_cuda` (`csg-actors/shaders/actor_sim.cuh`).
 const STEP_KERNEL_ARG_COUNT: usize = 19;
 
@@ -779,8 +808,10 @@ impl CudaCrowdBackend {
         // The header refuses to compile without the generated `#define` block that carries the
         // Rust-side layout and gait constants, so the kernel can never drift from `csg_actors::pod`.
         let mut full_src = actor_sim_cuh_source();
-        full_src.reserve(SCATTER_KERNEL_CU.len() + 1);
+        let walkway_defines = walkway_target_defines();
+        full_src.reserve(walkway_defines.len() + SCATTER_KERNEL_CU.len() + 2);
         full_src.push('\n');
+        full_src.push_str(&walkway_defines);
         full_src.push_str(SCATTER_KERNEL_CU);
 
         let module = crate::gpu_export::load_ptx_cached(
@@ -1519,17 +1550,16 @@ impl CudaCrowdBackend {
     }
 }
 
-/// Unpack a walkway patrol handle matching `csg_scene::encode_walkway_target`.
+/// Unpack a walkway patrol handle with csg-scene's own decoder (single source of the layout).
 #[cfg(test)]
 #[inline]
 const fn decode_walkway_target(target_id: u32) -> Option<(usize, usize, bool)> {
-    if target_id == u32::MAX {
-        None
-    } else {
-        let walkway_idx = ((target_id >> 16) & 0x7FFF) as usize;
-        let wp_idx = ((target_id >> 1) & 0x7FFF) as usize;
-        let reverse = (target_id & 1) != 0;
-        Some((walkway_idx, wp_idx, reverse))
+    match csg_scene::scene_module::decode_walkway_target(target_id) {
+        csg_scene::scene_module::WalkwayTarget::Patrol { walkway, wp, reverse } => {
+            Some((walkway, wp, reverse))
+        }
+        csg_scene::scene_module::WalkwayTarget::Free
+        | csg_scene::scene_module::WalkwayTarget::Invalid => None,
     }
 }
 

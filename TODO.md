@@ -80,7 +80,7 @@ Each worker re-verifies every finding (CONFIRMED / REFUTED / UNDECIDED) before c
 - [ ] W5.4 CI and config: SYS:B-3..B-6, B-9; GPU:D26
 
 ## Wave 6 - `device/` and `python/`
-- [ ] W6.1 `device/`: DPY:D1 (`[patch]` to the fork inside `device/`, then build and run the 15 GPU cases), D2..D9
+- [x] W6.1 `device/` (done 2026-11-23, report `audit/2026-11-23/wave_6_device.md`): `[patch]` to the fork inside `device/` only, one `cuda-core` in the graph, `cargo oxide build/run --arch sm_86` green, all 15 GPU cases pass; D2 (u16/i16 params now passed as `.b32`), D4, D5, D6, D7, D8, D9 fixed, D3 documented (cannot be removed: `ptx_asm!` expands to `cuda_device::ptx`). Open: CI job that builds `device/`; refresh the fork when the root needs an NVIDIA-only API. Original item: DPY:D1 (`[patch]` to the fork inside `device/`, then build and run the 15 GPU cases), D2..D9
 - [ ] W6.2 `python/nv-py`: DPY:P1..P17, V1..V22, G1..G7, X1..X3, C1..C20, PE-01..PE-08, SE-01..SE-13, NV-01
 
 ## Wave 7 - documentation

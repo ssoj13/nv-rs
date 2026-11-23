@@ -52,7 +52,6 @@ pub use payload::Payload;
 pub type Float3 = [f32; 3];
 
 /// One wrapper per `_optix_*` intrinsic, named without the `_optix_` prefix (generated).
-#[allow(missing_docs, clippy::all)]
 pub mod raw {
     include!(concat!(env!("OUT_DIR"), "/optix_raw.rs"));
 }
@@ -62,7 +61,7 @@ pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/optix_device
 
 /// OptiX types and constants (`optix_types.h`, generated, `no_std`): transform structs, enums,
 /// flags — the same definitions the host `optix-sys` crate uses.
-#[allow(missing_docs, non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, clippy::all, clippy::undocumented_unsafe_blocks)]
+#[expect(missing_docs, non_camel_case_types, non_upper_case_globals, non_snake_case, clippy::all, clippy::undocumented_unsafe_blocks, reason = "bindgen output")]
 pub mod sys {
     include!(concat!(env!("OUT_DIR"), "/optix_types.rs"));
 }

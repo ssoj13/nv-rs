@@ -64,6 +64,7 @@ macro_rules! each_word {
 /// size the pipeline (or the payload type) declares.
 #[inline(always)]
 pub unsafe fn word<const I: u32>() -> u32 {
+    const { assert!(I < 32, "OptiX has 32 payload registers") };
     // SAFETY: forwarded contract.
     unsafe { raw::get_payload(I) }
 }
@@ -75,6 +76,7 @@ pub unsafe fn word<const I: u32>() -> u32 {
 /// As [`word`].
 #[inline(always)]
 pub unsafe fn set_word<const I: u32>(v: u32) {
+    const { assert!(I < 32, "OptiX has 32 payload registers") };
     // SAFETY: forwarded contract.
     unsafe { raw::set_payload(I, v) }
 }

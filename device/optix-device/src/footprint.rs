@@ -155,10 +155,9 @@ impl TexInfo {
 /// and 7..6 vertical `CUaddress_mode`, 5 mip filter (`CUfilter_mode`), 4..0 maximum anisotropy.
 /// `single_mip_level` receives non-zero when the footprint spans one mip level.
 ///
-/// The intrinsic stores through addresses, so the result goes to caller memory instead of a
-/// returned local: a local would sit in a `.local` depot, which cuda-oxide addresses through
-/// 32-bit registers and OptiX programs fault on. Point `out` and `single_mip_level` at global
-/// memory (or anything not stack-allocated in the program).
+/// The intrinsic stores through generic addresses, so the result goes to caller memory: global
+/// memory or stack locals both work, given the crate-wide 64-bit pointer build (a stack local sits
+/// in a `.local` depot; case `footprint` stores to locals).
 ///
 /// # Safety
 ///

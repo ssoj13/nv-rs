@@ -20,6 +20,17 @@ nv-bindgen = { path = "../crates/nv-bindgen" }
 vcv-rs = { version = "0.1.2", default-features = false, features = ["cuda", "optix", "nvsdk"] }
 bytemuck = { version = "1", features = ["derive"] }
 
+# The host crates `optix-device-tests` links by path (`crates/optix`, `crates/cuda-core-ext`) take
+# `cuda-core` from NVIDIA/cuda-rust, while the device crates need the fork (cuda-oxide patches, see
+# its FORK.md). Redirect every NVIDIA/cuda-rust crate in this graph to the fork so there is exactly
+# one `cuda-core`: two of them make the harness pass one fork's `Context` where the other's is
+# expected (E0308). The root workspace keeps NVIDIA upstream.
+[patch."https://github.com/NVIDIA/cuda-rust.git"]
+cuda-bindings = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-core = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-core-derive = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+cuda-repr = { git = "https://github.com/ssoj13/cuda-rust_b.git", branch = "main" }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"

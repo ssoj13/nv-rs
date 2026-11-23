@@ -148,19 +148,6 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
-dependencies = [
- "bindgen",
- "libloading",
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "cuda-bindings"
-version = "0.5.0"
 source = "git+https://github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "libloading",
@@ -170,39 +157,15 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cuda-bindings 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
- "cuda-core-derive 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
- "cuda-repr 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
- "half",
- "oxide-artifacts",
-]
-
-[[package]]
-name = "cuda-core"
-version = "0.5.0"
 source = "git+https://github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "anyhow",
  "bytemuck",
- "cuda-bindings 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
- "cuda-core-derive 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
- "cuda-repr 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
+ "cuda-bindings",
+ "cuda-core-derive",
+ "cuda-repr",
  "half",
  "oxide-artifacts",
-]
-
-[[package]]
-name = "cuda-core-derive"
-version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -219,8 +182,8 @@ dependencies = [
 name = "cuda-core-ext"
 version = "0.1.0"
 dependencies = [
- "cuda-bindings 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
- "cuda-core 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
+ "cuda-bindings",
+ "cuda-core",
 ]
 
 [[package]]
@@ -230,7 +193,7 @@ source = "git+https://github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd
 dependencies = [
  "bytemuck",
  "cuda-macros",
- "cuda-repr 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
+ "cuda-repr",
 ]
 
 [[package]]
@@ -239,7 +202,7 @@ version = "0.4.0"
 source = "git+https://github.com/ssoj13/cuda-rust_b.git?branch=main#42cc04edaacd59e2e2a11008b9137c1807370cbb"
 dependencies = [
  "cuda-artifact-finalizer",
- "cuda-core 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
+ "cuda-core",
  "cuda-device",
  "cuda-macros",
  "half",
@@ -261,11 +224,6 @@ dependencies = [
  "reserved-oxide-symbols",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "cuda-repr"
-version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
 
 [[package]]
 name = "cuda-repr"
@@ -500,7 +458,7 @@ dependencies = [
 name = "optix"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
+ "cuda-core",
  "optix-sys",
  "thiserror",
 ]
@@ -530,7 +488,7 @@ name = "optix-device-tests"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
- "cuda-core 0.5.0 (git+https://github.com/ssoj13/cuda-rust_b.git?branch=main)",
+ "cuda-core",
  "cuda-core-ext",
  "cuda-device",
  "cuda-host",
@@ -543,7 +501,7 @@ dependencies = [
 name = "optix-sys"
 version = "0.1.0"
 dependencies = [
- "cuda-bindings 0.5.0 (git+https://github.com/NVIDIA/cuda-rust.git?branch=main)",
+ "cuda-bindings",
  "libloading",
  "nv-bindgen",
  "nv-loader",

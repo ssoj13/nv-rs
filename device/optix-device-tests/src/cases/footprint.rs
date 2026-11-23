@@ -51,22 +51,25 @@ mod kernels {
     pub fn __raygen__fp() {
         // SAFETY: raygen; `params_fp` holds a live texture, its info word and one probe and eight
         // output words (32 bytes, 16-byte aligned) per launch index. The footprint and the
-        // single-mip-level flag are stored straight into the global output, never to a local.
+        // single-mip-level flag go to stack locals first (a `.local` depot: the intrinsic stores
+        // through their addresses), then to the global output.
         unsafe {
             let i = state::launch_index()[0] as usize;
             let p = PARAMS.get();
             let q = (p.probes as *const [f32; 8]).add(i).read();
             let o = (p.out as *mut u32).add(8 * i);
-            let single = &mut *o.add(4);
-            let f = &mut *o.cast::<Footprint2d>();
+            let mut single = 0u32;
+            let mut f = Footprint2d { mask: 0, word2: 0, word3: 0 };
             let coarse = q[4] != 0.0;
             if q[0] == 0.0 {
-                fp::tex_footprint_2d(p.tex, p.info, q[1], q[2], single, f);
+                fp::tex_footprint_2d(p.tex, p.info, q[1], q[2], &mut single, &mut f);
             } else if q[0] == 1.0 {
-                fp::tex_footprint_2d_lod(p.tex, p.info, q[1], q[2], q[3], coarse, single, f);
+                fp::tex_footprint_2d_lod(p.tex, p.info, q[1], q[2], q[3], coarse, &mut single, &mut f);
             } else {
-                fp::tex_footprint_2d_grad(p.tex, p.info, q[1], q[2], [q[5], 0.0], [0.0, q[5]], coarse, single, f);
+                fp::tex_footprint_2d_grad(p.tex, p.info, q[1], q[2], [q[5], 0.0], [0.0, q[5]], coarse, &mut single, &mut f);
             }
+            o.cast::<Footprint2d>().write(f);
+            *o.add(4) = single;
         }
     }
 

@@ -12,6 +12,11 @@
 //! **Signatures:** scalars (`u16 i16 u32 i32 f32 u64 i64 f64 usize isize`) and raw pointers, any
 //! number of arguments, an optional scalar return — the callee is a `#[cuda_device::device] fn
 //! __direct_callable__name(...)` (or `__continuation_callable__`) with the same signature.
+//! 16-bit values cross the call as `.b32`, as NVPTX declares them on the callee (case `callables`).
+//! **Requires** the calling crate to depend on `optix-device` and `cuda-device` under those names
+//! (every OptiX program crate does, for `#[kernel]`): the expansion names `::optix_device::raw`
+//! and `::cuda_device::ptx_asm!`, and `ptx_asm!`'s own expansion names `cuda_device::ptx`, so a
+//! re-export through `optix_device` would not remove the `cuda-device` dependency.
 //! **Used by** `optix_device::{direct_call, continuation_call}`.
 
 use proc_macro::TokenStream;
@@ -44,7 +49,15 @@ impl Parse for Call {
     }
 }
 
-/// PTX register class of a scalar type: (constraint letter, bit width).
+/// Whether a scalar type is 16 bits wide. NVPTX declares 16-bit parameters and results of a
+/// `.func` as `.param .b32` (it promotes integers narrower than 32 bits), so the call site must
+/// pass them as `.b32` too: a `.b16` prototype mismatches the callee and the value arrives wrong.
+fn is_16bit(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.qself.is_none() && p.path.segments.last().is_some_and(|s| s.ident == "u16" || s.ident == "i16"))
+}
+
+/// PTX register class of a scalar type as it crosses the call: (constraint letter, bit width).
+/// 16-bit types travel in a 32-bit register (see [`is_16bit`]).
 fn class(ty: &Type) -> syn::Result<(char, u32)> {
     if let Type::Ptr(_) = ty {
         return Ok(('l', 64));
@@ -54,8 +67,7 @@ fn class(ty: &Type) -> syn::Result<(char, u32)> {
         _ => String::new(),
     };
     Ok(match name.as_str() {
-        "u16" | "i16" => ('h', 16),
-        "u32" | "i32" => ('r', 32),
+        "u16" | "i16" | "u32" | "i32" => ('r', 32),
         "f32" => ('f', 32),
         "u64" | "i64" | "usize" | "isize" => ('l', 64),
         "f64" => ('d', 64),
@@ -112,17 +124,21 @@ fn build(call: &Call, raw_fn: &str) -> syn::Result<proc_macro2::TokenStream> {
         .map(|((a, (c, _)), p)| {
             let c = syn::LitStr::new(&c.to_string(), Span::call_site());
             let ty = &p.ty;
-            quote! { in(#c) { let __nvrs_arg: #ty = #a; __nvrs_arg } }
+            // `as u32` zero-extends `u16` and sign-extends `i16`, as the callee's ABI expects.
+            let widen = is_16bit(ty).then(|| quote! { as u32 });
+            quote! { in(#c) { let __nvrs_arg: #ty = #a; __nvrs_arg #widen } }
         })
         .collect();
     Ok(match ret {
         Some(((c, _), ty)) => {
             let c = syn::LitStr::new(&format!("={c}"), Span::call_site());
+            // A 16-bit result comes back in a 32-bit register; truncate it to the declared type.
+            let (reg_ty, narrow) = if is_16bit(&ty) { (quote! { u32 }, Some(quote! { as #ty })) } else { (quote! { #ty }, None) };
             quote! {{
                 let __nvrs_f: u64 = ::optix_device::raw::#raw(#index);
-                let __nvrs_r: #ty;
+                let __nvrs_r: #reg_ty;
                 ::cuda_device::ptx_asm!(#template, out(#c) __nvrs_r, in("l") __nvrs_f, #(#args),*);
-                __nvrs_r
+                __nvrs_r #narrow
             }}
         }
         None => quote! {{

@@ -10,9 +10,6 @@
 # `device/cuda-tex-device/src/cuda_tex_device.rs`. The item must be a `pub fn`, a `macro_rules!`, a
 # `pub use`, or a row of a function-generating macro table (`name -> ty = raw;` or
 # `name = raw, conv -> ty;`) in that module's file.
-#
-# optixGetGASPointerFromHandle (raw::get_gas_ptr_from_handle) has no typed wrapper yet, so it is
-# deliberately absent: the gate reports it until one exists.
 
 # --- callable programs (proc macros)
 optixDirectCall = "macros::direct_call"

@@ -468,8 +468,12 @@ pub fn run(g: &Gpu) -> R {
         if *k == 4 {
             // Observed with OptiX 9.1 / driver 621.24: the current-hit query on a motion GAS
             // returns key 0 at every ray time, although optix_device.h documents "at the current
-            // ray time" (the from-handle query above interpolates). Pinned so a driver change shows.
-            chk("current-hit vertices on a motion GAS (driver returns key 0)", 49, TRI.as_flattened())?;
+            // ray time" (the from-handle query above interpolates). Both are accepted so a driver
+            // fix does not fail the case; the switch to the documented behaviour is printed.
+            if chk("current-hit vertices on a motion GAS (driver returns key 0)", 49, TRI.as_flattened()).is_err() {
+                chk("current-hit vertices on a motion GAS (neither key 0 nor at the ray time)", 49, verts.as_flattened())?;
+                println!("transform: current-hit vertices on a motion GAS follow the ray time (documented behaviour; key-0 driver quirk gone)");
+            }
         } else {
             chk("vertices at the ray time", 49, verts.as_flattened())?;
         }

@@ -1,3 +1,5 @@
 /target
 /*.ll
 /*.ptx
+/.*.oxide-pipeline.lock
+/.oxide-artifacts

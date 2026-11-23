@@ -9,8 +9,9 @@
 //!
 //! **`callables`.** The raygen calls direct callables with `u32`, `f32`, `u64` (a pointer the
 //! callee reads through) and `f64` arguments and an `f32` result, and a void one that stores
-//! through a pointer; the closest-hit calls a continuation callable (`continuation_call!`) that
-//! returns a value computed from its arguments. Stack sizes come from the stack helpers
+//! through a pointer, and one with `u16`/`i16` arguments and a `u16` result; the closest-hit
+//! calls a continuation callable (`continuation_call!`) that returns a value computed from its
+//! arguments. Stack sizes come from the stack helpers
 //! (`StackSizes::accumulate` + `compute` + `Pipeline::set_stack`). The host checks every value.
 
 use super::common::{Ctx, Gpu, R, close, opts, same};
@@ -61,6 +62,12 @@ pub fn __direct_callable__mix(a: u32, b: f32, p: u64, d: f64) -> f32 {
 pub fn __direct_callable__store(p: u64, v: u32) {
     // SAFETY: the raygen passes a pointer to a live `u32`.
     unsafe { (p as *mut u32).write(v * 3) }
+}
+
+/// `fn(u16, i16) -> u16`: `a + b` (wrapping); checks that 16-bit values cross the call intact.
+#[device]
+pub fn __direct_callable__narrow(a: u16, b: i16) -> u16 {
+    a.wrapping_add(b as u16)
 }
 
 /// `fn(u32, f32) -> f32`: `x * 0.5 + y`.
@@ -141,16 +148,17 @@ mod kernels {
 
     #[kernel]
     pub fn __raygen__call() {
-        // SAFETY: raygen of the callables pipeline: direct callables 0 (mix) and 1 (store);
-        // `out` holds 4 words per thread.
+        // SAFETY: raygen of the callables pipeline: direct callables 0 (mix), 1 (store) and
+        // 3 (narrow); `out` holds 5 words per thread.
         unsafe {
             let x = state::launch_index()[0];
             let p = CALL.get();
-            let o = (p.out as *mut u32).add(4 * x as usize);
+            let o = (p.out as *mut u32).add(5 * x as usize);
             *o = (x as f32 * 0.25).to_bits();
             let m = optix_device::direct_call!(0, fn(u32, f32, u64, f64) -> f32, (x, 1.5f32, o as u64, 0.125f64 * x as f64));
             *o = m.to_bits();
             optix_device::direct_call!(1, fn(u64, u32), (o.add(1) as u64, x + 1));
+            *o.add(4) = u32::from(optix_device::direct_call!(3, fn(u16, i16) -> u16, (0xFFF0 ^ x as u16, -3i16)));
             let mut w = [x, 0u32];
             trace::trace(p.handle, &ray(x), &TraceOptions::default(), &mut w);
             *o.add(2) = w[0];
@@ -214,14 +222,15 @@ pub fn payload_types(g: &Gpu) -> R {
 pub fn callables(g: &Gpu) -> R {
     let mut o = opts("params_call", size_of::<Params>())?;
     o.single_gas = true;
-    let module = g.module(&Default::default(), &o, &["__raygen__call", "__closesthit__call", "__miss__call", "__direct_callable__mix", "__direct_callable__store", "__continuation_callable__cc"])?;
+    let module = g.module(&Default::default(), &o, &["__raygen__call", "__closesthit__call", "__miss__call", "__direct_callable__mix", "__direct_callable__store", "__continuation_callable__cc", "__direct_callable__narrow"])?;
     let raygen = ProgramGroup::raygen(&module, "__raygen__call").ctx("raygen")?;
     let miss = ProgramGroup::miss(&module, "__miss__call").ctx("miss")?;
     let hit = ProgramGroup::hit_group(&g.ctx, HitGroup { closest_hit: Some((&module, "__closesthit__call")), ..Default::default() }).ctx("hit group")?;
     let mix = ProgramGroup::callables(&g.ctx, Some((&module, "__direct_callable__mix")), None).ctx("dc mix")?;
     let store = ProgramGroup::callables(&g.ctx, Some((&module, "__direct_callable__store")), None).ctx("dc store")?;
     let cc = ProgramGroup::callables(&g.ctx, None, Some((&module, "__continuation_callable__cc"))).ctx("cc")?;
-    let groups = [raygen.clone(), miss.clone(), hit.clone(), mix.clone(), store.clone(), cc.clone()];
+    let narrow = ProgramGroup::callables(&g.ctx, Some((&module, "__direct_callable__narrow")), None).ctx("dc narrow")?;
+    let groups = [raygen.clone(), miss.clone(), hit.clone(), mix.clone(), store.clone(), cc.clone(), narrow.clone()];
     let link = LinkOptions { max_trace_depth: 1, max_cc_depth: 1, max_dc_depth_from_state: 1, max_dc_depth_from_traversal: 0, max_graph_depth: 1 };
     let pipeline = g.pipeline(&o, link, &groups)?;
     let mut acc = StackSizes::default();
@@ -231,21 +240,23 @@ pub fn callables(g: &Gpu) -> R {
     let stack = acc.compute(1, 1, 1).ctx("compute stack")?;
     pipeline.set_stack(stack, 1).ctx("set_stack")?;
     let sbt = ShaderBindingTable::new(&g.stream, &SbtRecord::new(&raygen, 0u32).ctx("rg")?, &[SbtRecord::new(&miss, 0u32).ctx("ms")?], &[SbtRecord::new(&hit, 0u32).ctx("hg")?])
-        .and_then(|s| s.with_callables(&g.stream, &[SbtRecord::new(&mix, 0u32)?, SbtRecord::new(&store, 0u32)?, SbtRecord::new(&cc, 0u32)?]))
+        .and_then(|s| s.with_callables(&g.stream, &[SbtRecord::new(&mix, 0u32)?, SbtRecord::new(&store, 0u32)?, SbtRecord::new(&cc, 0u32)?, SbtRecord::new(&narrow, 0u32)?]))
         .ctx("SBT")?;
     let gas = tri_gas(g)?;
-    let out = g.zeros::<u32>(4 * N as usize)?;
+    let out = g.zeros::<u32>(5 * N as usize)?;
     let params = Params { out: out.cu_deviceptr(), handle: gas.handle() };
-    // SAFETY: `params` matches the device struct; `out` holds 4 words per thread; no SBT data.
+    // SAFETY: `params` matches the device struct; `out` holds 5 words per thread; no SBT data.
     unsafe { g.launch(&pipeline, &sbt, &params, [N, 1, 1]) }?;
     let got = g.down(&out)?;
     for x in 0..N {
-        let r = &got[4 * x as usize..][..4];
+        let r = &got[5 * x as usize..][..5];
         let f = |w: u32| f32::from_bits(w);
         let mix = x as f32 + 1.5 + x as f32 * 0.25 + (0.125f64 * f64::from(x)) as f32;
         close(&format!("thread {x} direct callable (u32, f32, u64, f64) -> f32"), &[f(r[0])], &[mix], 1e-5, |_| String::new())?;
         let cc = if x % 2 == 0 { (x as f32 * 0.5 + 0.75).to_bits() } else { 0xDEAD };
         same(&format!("thread {x} (void callable store, payload x, continuation result / miss)"), &r[1..4], &[(x + 1) * 3, x, cc], |j| format!("[{j}]"))?;
+        let narrow = (0xFFF0 ^ x as u16).wrapping_add(-3i16 as u16);
+        same(&format!("thread {x} direct callable (u16, i16) -> u16"), &r[4..5], &[u32::from(narrow)], |_| String::new())?;
     }
     println!("callables: {N} threads, stack {stack:?}");
     Ok(())

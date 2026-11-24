@@ -1,3 +1,5 @@
+> 2026-11-23: csg-rs adoption merged (`csg-rs` `24b22f5`, branch `csg-rs-adoption-v2`): gate green (clippy clean, 467 passed / 0 failed / 205 ignored, nv-demo ignored GPU tests 5/5, release app renders Marina with CUDA crowd 180 and DLSS RR, empty logs). Next on the csg-rs side: R00 (GPU crowd steering into a csg-rs-owned kernel), R00b (GPU traffic).
+
 # TODO - execution tracker for `plan2.md`
 
 Source of truth for findings, IDs and verification status: [`plan2.md`](plan2.md) (see its Status block) and the ledgers in `audit/2026-11-23/`. This file tracks execution only. An item is ticked when its fix is merged AND verified by the gate (targeted tests + `cargo clippy` on the touched crates), never on a worker's self-report.

@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Doc sync 2026-11-23 against `a807624` (`csg-rs` `24b22f5`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
+Doc sync 2026-11-23 against `a807624` (`csg-rs` `24b22f5`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the [single plan](PLAN.md) (status, open items, decisions), the closed [`nv-demo` acceleration plan](audit/2026-11-23/plan1_nvdemo.md) and the archived [workspace remediation plan](audit/2026-11-23/plan2_full.md).
 
 ## Build architecture
 
@@ -89,7 +89,7 @@ flowchart TD
 
 The render worker submits `[IAS/Traffic/Crowd] -> [RT] -> [Denoiser] -> [cuFFT] -> [Tonemap]` in one uninterrupted stream burst with a single end-of-frame fence while `Runner::about_to_wait` paces UI redraws to 60 Hz.
 
-## `nv-demo` audited hot-path bottlenecks vs target zero-stall architecture (`plan1.md`)
+## `nv-demo` audited hot-path bottlenecks vs target zero-stall architecture (`plan1_nvdemo.md`)
 
 ```mermaid
 flowchart TD
@@ -110,7 +110,7 @@ flowchart TD
   end
 ```
 
-## Systemic defects found by the workspace audit (`plan2.md`, 2026-11-23)
+## Systemic defects found by the workspace audit (`plan2_full.md`, 2026-11-23)
 
 Status (HEAD `1467778`): all three diagrams below are closed. They show the state at audit time; the fixed flows are given after each one. Gates: root workspace clippy clean, 467 passed / 0 failed / 205 ignored (`wave_1b.md`); `python/` clippy clean, pytest 80 passed / 1 failed (NVAPI sees 0 displays, environment) / 1 skipped. Not verified: Linux-only code, CI workflows, interactive `nv-demo` features (see `TODO.md`).
 
@@ -130,7 +130,7 @@ sequenceDiagram
     S1--xS1: kernel reads/writes freed device memory
 ```
 
-Fixed: `curand` and every `python/nv-py` binding take a `cuda-core` access lease (`cuda_core_ext::lease::enqueue_leased`); wrapper-internal scratch stays on one checked stream; `cusparse` SpSV/SpSM/SpGEMM own their buffers. Other wrappers deliberately take no lease (decision in `plan2.md`).
+Fixed: `curand` and every `python/nv-py` binding take a `cuda-core` access lease (`cuda_core_ext::lease::enqueue_leased`); wrapper-internal scratch stays on one checked stream; `cusparse` SpSV/SpSM/SpGEMM own their buffers. Other wrappers deliberately take no lease (decision in `plan2_full.md`).
 
 Binding generation (`nv-bindgen::generate`), current flow. Before the repair any generator failure silently used prebuilt output and the fallback was sticky:
 

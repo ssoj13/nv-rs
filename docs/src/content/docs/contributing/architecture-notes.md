@@ -11,7 +11,7 @@ sidebar:
 
 | Document | Role |
 |---|---|
-| `PLAN.md` | Consolidated master plan, completed milestone ledger (`M1`–`M6`), and prioritized backlog (`P2`/`P3` future work). |
+| `PLAN.md` | Single authoritative plan: status, open items, decisions (ADR), done history, refuted findings, verification gates. Old plans and milestones `M1`–`M6` are archived under `audit/`. |
 | `AGENTS.md` / `DIAGRAMS.md` | Repository engineering guide, workspace boundaries, and architecture dataflow diagrams. |
 | `COVERAGE.md` | Generated symbol inventory and coverage matrix produced by `cargo xtask coverage generate` from `coverage/`, recording **bound**, **wrapped**, and **tested-on-gpu** status per library. Do not edit manually. |
 

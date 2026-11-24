@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Doc sync 2026-11-23 against `1467778` (`csg-rs` `f7c8474a`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
+Doc sync 2026-11-23 against `a807624` (`csg-rs` `24b22f5`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
 
 ## Build architecture
 

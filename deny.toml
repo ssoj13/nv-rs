@@ -28,7 +28,27 @@ exceptions = [
     { crate = "smartstring", allow = ["MPL-2.0"] },
     # egui default fonts: the code is MIT OR Apache-2.0, the bundled fonts OFL-1.1 and Ubuntu-font-1.0.
     { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+    # Private, unpublished ssoj13 crates (git dependencies, no `license` field): proprietary.
+    { crate = "flex-geom", allow = ["LicenseRef-Proprietary"] },
+    { crate = "nodes-core", allow = ["LicenseRef-Proprietary"] },
+    { crate = "ui-theme", allow = ["LicenseRef-Proprietary"] },
 ]
+
+# The private crates above declare no license; state it here instead of guessing one.
+[[licenses.clarify]]
+crate = "flex-geom"
+expression = "LicenseRef-Proprietary"
+license-files = []
+
+[[licenses.clarify]]
+crate = "nodes-core"
+expression = "LicenseRef-Proprietary"
+license-files = []
+
+[[licenses.clarify]]
+crate = "ui-theme"
+expression = "LicenseRef-Proprietary"
+license-files = []
 
 [bans]
 # Duplicate versions come from transitive dependencies and are reported, not blocking.

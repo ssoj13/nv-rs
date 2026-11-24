@@ -16,6 +16,7 @@
 //! Pipelines tracing motion transforms need `PipelineOptions::motion_blur` and a traversable
 //! graph depth that counts each transform as one level.
 
+use crate::accel::same_ctx;
 use crate::{Accel, DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, Stream};
 use std::mem::offset_of;
@@ -426,11 +427,7 @@ impl Transform {
                 "transform child from another device context",
             ));
         }
-        if !cuda_core_ext::same_context(stream.context(), ctx.cuda()) {
-            return Err(Error::Invalid(
-                "stream belongs to another CUDA context than the device context",
-            ));
-        }
+        same_ctx(stream, ctx)?;
         let buffer = DeviceBuffer::from_host(stream, &bytes.0)?;
         if buffer.cu_deviceptr() % u64::from(sys::OPTIX_TRANSFORM_BYTE_ALIGNMENT) != 0 {
             return Err(Error::Invalid(

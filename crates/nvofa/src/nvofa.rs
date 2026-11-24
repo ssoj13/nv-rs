@@ -22,7 +22,8 @@
 
 pub use nvofa_sys as sys;
 
-use cuda_core::{Context, DriverError, IntoResult, Stream};
+use cuda_core::{Context, DriverError, Stream};
+use cuda_core_ext::media;
 use cuda_core_ext::teardown::{self, Library};
 use std::ffi::CStr;
 use std::fmt;
@@ -60,7 +61,7 @@ pub enum Error {
     #[error("NVOFA unavailable: {0}")]
     Unavailable(String),
     /// An NVOFA entry point returned a non-success status.
-    #[error("{call} failed with {code}{}", detail_suffix(.detail))]
+    #[error("{call} failed with {code}{}", media::detail_suffix(.detail))]
     Status {
         /// The NVOFA function-list entry point.
         call: &'static str,
@@ -85,14 +86,6 @@ pub enum Error {
     /// An argument was rejected before reaching NVOFA.
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
-}
-
-fn detail_suffix(detail: &str) -> String {
-    if detail.is_empty() {
-        String::new()
-    } else {
-        format!(" ({detail})")
-    }
 }
 
 /// Result alias for this crate.
@@ -937,19 +930,18 @@ impl OfBuffer {
         // A previous `execute` on the session's input stream may still read this buffer.
         self.session.wait_io()?;
         self.session.cuda.bind_to_thread()?;
-        // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
-        let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
-        copy.srcMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
-        copy.srcHost = src.as_ptr().cast();
-        copy.srcPitch = width_bytes;
-        copy.dstMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
-        copy.dstDevice = dev_ptr;
-        copy.dstPitch = stride;
-        copy.WidthInBytes = width_bytes;
-        copy.Height = height;
-        // SAFETY: `src` and `dev_ptr` cover `height` rows of `width_bytes` (`<= stride`) and `stream.synchronize()` waits for completion.
-        unsafe { cuda_core::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }.result()?;
-        stream.synchronize()?;
+        // SAFETY: `src` and `dev_ptr` cover `height` rows of `width_bytes` (`<= stride`); the copy
+        // waits for `stream`.
+        unsafe {
+            media::copy_2d_host_to_device(
+                stream,
+                src.as_ptr().cast(),
+                dev_ptr,
+                stride,
+                width_bytes,
+                height,
+            )
+        }?;
         Ok(())
     }
 
@@ -969,19 +961,18 @@ impl OfBuffer {
         // ordered against.
         self.session.wait_io()?;
         self.session.cuda.bind_to_thread()?;
-        // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
-        let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
-        copy.srcMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
-        copy.srcDevice = dev_ptr;
-        copy.srcPitch = stride;
-        copy.dstMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
-        copy.dstHost = dst.as_mut_ptr().cast();
-        copy.dstPitch = width_bytes;
-        copy.WidthInBytes = width_bytes;
-        copy.Height = height;
-        // SAFETY: `dev_ptr` and `dst` cover `height` rows of `width_bytes` (`<= stride`) and `stream.synchronize()` waits for completion.
-        unsafe { cuda_core::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }.result()?;
-        stream.synchronize()?;
+        // SAFETY: `dev_ptr` and `dst` cover `height` rows of `width_bytes` (`<= stride`); the copy
+        // waits for `stream`.
+        unsafe {
+            media::copy_2d_device_to_host(
+                stream,
+                dev_ptr,
+                stride,
+                dst.as_mut_ptr().cast(),
+                width_bytes,
+                height,
+            )
+        }?;
         Ok(())
     }
 

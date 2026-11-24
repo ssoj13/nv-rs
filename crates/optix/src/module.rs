@@ -15,7 +15,7 @@
 //! **Lifetimes.** A program group holds `Arc`s of its modules; a module holds the context and
 //! its base module.
 
-use crate::{DeviceContext, Error, LOG_BYTES, Result, check, check_log, entry, sys};
+use crate::{DeviceContext, Error, LOG_BYTES, Result, check, check_log, entry, log_text, sys};
 use cuda_core::bytemuck::{self, Pod};
 use std::ffi::{CStr, CString, c_char};
 use std::ops::BitOr;
@@ -446,8 +446,19 @@ pub enum Primitive {
 }
 
 impl Primitive {
-    /// `(OptixPrimitiveType, OptixPrimitiveTypeFlags bit)`.
-    fn to_sys(self) -> (sys::OptixPrimitiveType, u32) {
+    /// The `OptixPrimitiveType` of this primitive.
+    pub(crate) fn raw(self) -> sys::OptixPrimitiveType {
+        self.table().0
+    }
+
+    /// The `OptixPrimitiveTypeFlags` bit for [`crate::PipelineOptions::primitive_types`].
+    pub fn flag(self) -> u32 {
+        self.table().1
+    }
+
+    /// `(OptixPrimitiveType, OptixPrimitiveTypeFlags bit)`: the one table behind [`Self::raw`],
+    /// [`Self::flag`] and [`CurveType::primitive`](crate::CurveType::primitive).
+    fn table(self) -> (sys::OptixPrimitiveType, u32) {
         use Primitive::*;
         let (t, f) = match self {
             RoundQuadraticBspline => (
@@ -556,7 +567,7 @@ impl Module {
         pipeline: &PipelineOptions,
         is: BuiltinIs,
     ) -> Result<Arc<Self>> {
-        let (kind, flag) = is.primitive.to_sys();
+        let (kind, flag) = (is.primitive.raw(), is.primitive.flag());
         if pipeline.primitive_types != 0 && pipeline.primitive_types & flag == 0 {
             return Err(Error::Invalid(
                 "PipelineOptions::primitive_types lacks the built-in primitive",
@@ -627,13 +638,6 @@ impl Drop for Module {
             self.ctx.record("optixModuleDestroy", code);
         }
     }
-}
-
-pub(crate) fn log_text(log: &[u8], len: usize) -> String {
-    let text = &log[..len.min(log.len())];
-    String::from_utf8_lossy(text.split(|b| *b == 0).next().unwrap_or_default())
-        .trim()
-        .to_owned()
 }
 
 /// The programs of a hit group; any may be absent (built-in triangles need no intersection).

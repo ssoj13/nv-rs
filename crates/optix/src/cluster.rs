@@ -825,11 +825,7 @@ impl ClusterAccel {
         if index >= self.handles.len() {
             return Err(Error::Invalid("cluster GAS index out of range"));
         }
-        if !cuda_core_ext::same_context(stream.context(), self.ctx.cuda()) {
-            return Err(Error::Invalid(
-                "stream belongs to another CUDA context than the cluster GAS",
-            ));
-        }
+        crate::accel::same_ctx(stream, &self.ctx)?;
         // Only this one handle is read back, not the whole array.
         let offset = (index * size_of::<u64>()) as u64;
         let mut out = Box::new(0u64);

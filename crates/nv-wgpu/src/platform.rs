@@ -11,6 +11,15 @@
 //! the queue to be externally synchronized, and only `wgpu-core` holds the lock that its own
 //! submits and presents take.
 //!
+//! Every blocking `wgpu` poll goes through [`wait_submission_bounded`] (limit
+//! [`VULKAN_SUBMIT_TIMEOUT`](crate::VULKAN_SUBMIT_TIMEOUT)). A `Drop` impl that times out or fails
+//! reports it to `cuda_core_ext::teardown` under `Library::NvWgpu` ([`record_drop_failure`]; status
+//! [`TEARDOWN_WAIT_TIMEOUT`] or [`TEARDOWN_STEP_FAILED`]) instead of waiting forever or
+//! swallowing it; a timeout means the device must be treated as lost. The Vulkan dedicated
+//! allocation sequence, ownership-transfer masks and the DX12 shared committed resource are
+//! single sources here too ([`alloc_bind_exportable_dedicated`], [`ownership_transfer`],
+//! `create_shared_committed_resource`).
+//!
 //! Used internally by `device`, `sync`, `buffer`, `texture`, and the crate root.
 
 #[cfg(unix)]
@@ -21,6 +30,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use cuda_core::Context;
+use cuda_core_ext::teardown::{self, Library};
 use cuda_core_ext::{ExternalMemory, ExternalSemaphore, MemoryHandle, SemaphoreHandle};
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
@@ -320,6 +330,182 @@ pub(crate) fn find_vk_memory_type_index(
     })
 }
 
+/// A freshly created Vulkan resource that gets a dedicated, exportable memory allocation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DedicatedResource {
+    Buffer(vk::Buffer),
+    Image(vk::Image),
+}
+
+impl DedicatedResource {
+    /// Destroys the resource.
+    ///
+    /// # Safety
+    /// The resource must belong to `device`, must not be destroyed already, and no GPU work may
+    /// reference it.
+    unsafe fn destroy(self, device: &ash::Device) {
+        match self {
+            // SAFETY: forwarded from this function's contract.
+            Self::Buffer(b) => unsafe { device.destroy_buffer(b, None) },
+            // SAFETY: forwarded from this function's contract.
+            Self::Image(i) => unsafe { device.destroy_image(i, None) },
+        }
+    }
+
+    /// The Vulkan entry point name for allocation errors.
+    fn alloc_op(self) -> &'static str {
+        match self {
+            Self::Buffer(_) => "vkAllocateMemory(Buffer)",
+            Self::Image(_) => "vkAllocateMemory(Image)",
+        }
+    }
+
+    /// The Vulkan entry point name for bind errors.
+    fn bind_op(self) -> &'static str {
+        match self {
+            Self::Buffer(_) => "vkBindBufferMemory",
+            Self::Image(_) => "vkBindImageMemory",
+        }
+    }
+}
+
+/// Allocates one dedicated `DEVICE_LOCAL` allocation exportable as an OS handle for `resource`
+/// and binds it at offset 0: the single sequence behind `SharedBuffer` and `SharedTexture`.
+///
+/// Takes ownership of `resource`: on any failure it is destroyed (and a partial allocation freed)
+/// before the error is returned. On success the caller owns both `resource` and the returned
+/// memory (typically through a backing whose `Drop` destroys them), together with the memory
+/// requirements the allocation was sized from (needed for the CUDA import size).
+pub(crate) fn alloc_bind_exportable_dedicated(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    resource: DedicatedResource,
+) -> Result<(vk::DeviceMemory, vk::MemoryRequirements)> {
+    // SAFETY: `resource` was just created on `device`.
+    let reqs = unsafe {
+        match resource {
+            DedicatedResource::Buffer(b) => device.get_buffer_memory_requirements(b),
+            DedicatedResource::Image(i) => device.get_image_memory_requirements(i),
+        }
+    };
+    let type_index = match find_vk_memory_type_index(
+        instance,
+        physical_device,
+        reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) {
+        Ok(idx) => idx,
+        Err(err) => {
+            // SAFETY: `resource` is unbound and unused by any GPU work.
+            unsafe { resource.destroy(device) };
+            return Err(err);
+        }
+    };
+
+    let mut export_info =
+        vk::ExportMemoryAllocateInfo::default().handle_types(vk_external_memory_handle_type());
+    let mut dedicated_info = match resource {
+        DedicatedResource::Buffer(b) => vk::MemoryDedicatedAllocateInfo::default().buffer(b),
+        DedicatedResource::Image(i) => vk::MemoryDedicatedAllocateInfo::default().image(i),
+    };
+    let alloc_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(type_index)
+        .push_next(&mut export_info)
+        .push_next(&mut dedicated_info);
+    // SAFETY: `type_index` and `reqs.size` come from the resource's own memory requirements.
+    let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+        Ok(m) => m,
+        Err(err) => {
+            // SAFETY: `resource` is unbound and unused by any GPU work.
+            unsafe { resource.destroy(device) };
+            return Err(Error::vulkan(resource.alloc_op(), err));
+        }
+    };
+
+    // SAFETY: `resource` is unbound and `memory` matches its requirements.
+    let bound = unsafe {
+        match resource {
+            DedicatedResource::Buffer(b) => device.bind_buffer_memory(b, memory, 0),
+            DedicatedResource::Image(i) => device.bind_image_memory(i, memory, 0),
+        }
+    };
+    if let Err(err) = bound {
+        // SAFETY: nothing references the unbound resource or the unused memory.
+        unsafe {
+            resource.destroy(device);
+            device.free_memory(memory, None);
+        }
+        return Err(Error::vulkan(resource.bind_op(), err));
+    }
+    Ok((memory, reqs))
+}
+
+/// Queue families and access masks of an ownership transfer between `wgpu`'s queue family and
+/// `VK_QUEUE_FAMILY_EXTERNAL` (CUDA): the single source for buffer and image barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnershipTransfer {
+    pub src_family: u32,
+    pub dst_family: u32,
+    pub src_access: vk::AccessFlags,
+    pub dst_access: vk::AccessFlags,
+}
+
+/// The transfer that acquires a resource from CUDA into `wgpu_family` (`acquire_to_wgpu`), or
+/// releases it from `wgpu_family` to CUDA.
+pub(crate) fn ownership_transfer(acquire_to_wgpu: bool, wgpu_family: u32) -> OwnershipTransfer {
+    if acquire_to_wgpu {
+        OwnershipTransfer {
+            src_family: vk::QUEUE_FAMILY_EXTERNAL,
+            dst_family: wgpu_family,
+            src_access: vk::AccessFlags::empty(),
+            dst_access: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+        }
+    } else {
+        OwnershipTransfer {
+            src_family: wgpu_family,
+            dst_family: vk::QUEUE_FAMILY_EXTERNAL,
+            src_access: vk::AccessFlags::MEMORY_WRITE,
+            dst_access: vk::AccessFlags::empty(),
+        }
+    }
+}
+
+/// Creates a committed resource in a shared `DEFAULT` heap (`D3D12_HEAP_FLAG_SHARED`, initial
+/// state `COMMON`): the single DX12 creation path behind `SharedBuffer` and `SharedTexture`.
+#[cfg(windows)]
+pub(crate) fn create_shared_committed_resource(
+    raw_device: &Direct3D12::ID3D12Device,
+    res_desc: &Direct3D12::D3D12_RESOURCE_DESC,
+    call_name: &'static str,
+) -> Result<Direct3D12::ID3D12Resource> {
+    let heap_props = Direct3D12::D3D12_HEAP_PROPERTIES {
+        Type: Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
+        CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: Direct3D12::D3D12_MEMORY_POOL_UNKNOWN,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+    };
+    let mut resource: Option<Direct3D12::ID3D12Resource> = None;
+    // SAFETY: creates a committed resource described by `res_desc` in a shared default heap;
+    // `resource` receives the new COM object.
+    unsafe {
+        raw_device.CreateCommittedResource(
+            &heap_props,
+            Direct3D12::D3D12_HEAP_FLAG_SHARED,
+            res_desc,
+            Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut resource,
+        )
+    }
+    .map_err(|e| Error::dx12(call_name, e))?;
+    resource.ok_or(Error::InvalidHandle {
+        source_api: "ID3D12Device::CreateCommittedResource",
+    })
+}
+
 /// Translates [`wgpu::BufferUsages`] into Vulkan buffer usage flags.
 pub(crate) fn map_vk_buffer_usage(usage: wgpu::BufferUsages) -> vk::BufferUsageFlags {
     let mut flags = vk::BufferUsageFlags::empty();
@@ -408,21 +594,13 @@ pub(crate) fn map_vk_image_usage(usage: wgpu::TextureUsages) -> vk::ImageUsageFl
     flags
 }
 
-/// Maps a [`wgpu::TextureUses`] state to the [`vk::ImageLayout`] expected by `wgpu-hal`.
-pub(crate) fn vk_layout_for_texture_uses(uses: wgpu::TextureUses) -> vk::ImageLayout {
-    if uses == wgpu::TextureUses::UNINITIALIZED {
-        vk::ImageLayout::UNDEFINED
-    } else if uses == wgpu::TextureUses::COPY_SRC {
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
-    } else if uses == wgpu::TextureUses::COPY_DST {
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL
-    } else if uses == wgpu::TextureUses::RESOURCE {
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-    } else if uses == wgpu::TextureUses::COLOR_TARGET {
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-    } else {
-        vk::ImageLayout::GENERAL
-    }
+/// Maps a [`wgpu::TextureUses`] state of a `format` texture to the [`vk::ImageLayout`] `wgpu-hal`
+/// tracks for it. Delegates to `wgpu-hal` itself so the two cannot drift apart.
+pub(crate) fn vk_layout_for_texture_uses(
+    uses: wgpu::TextureUses,
+    format: wgpu::TextureFormat,
+) -> vk::ImageLayout {
+    wgpu::hal::vulkan::conv::derive_image_layout(uses, format)
 }
 
 /// Identifies the active `wgpu::Backend` behind a `wgpu::Queue` for diagnostics.
@@ -517,24 +695,66 @@ pub(crate) fn submit_vulkan_raw<R>(
     Ok((value, index))
 }
 
-/// Blocks until submission `index` (if any) of `device` completes. For `Drop` impls that must
-/// not free native objects still referenced by in-flight raw commands; a failure is reported on
-/// stderr because `Drop` cannot return it.
+/// Teardown status for a bounded wait that hit [`VULKAN_SUBMIT_TIMEOUT`](crate::VULKAN_SUBMIT_TIMEOUT).
+pub(crate) const TEARDOWN_WAIT_TIMEOUT: i64 = 1;
+/// Teardown status for a wait or unstage step that failed for any other reason.
+pub(crate) const TEARDOWN_STEP_FAILED: i64 = 2;
+
+/// The error a bounded submission wait reports: a timeout is [`Error::Timeout`] naming `what`,
+/// everything else stays [`Error::Poll`].
+pub(crate) fn poll_wait_error(what: &'static str, err: wgpu::PollError) -> Error {
+    match err {
+        wgpu::PollError::Timeout => Error::Timeout { what },
+        other => Error::Poll(other),
+    }
+}
+
+/// Waits for submission `index` of `device` (`None`: the most recent one), at most
+/// [`VULKAN_SUBMIT_TIMEOUT`](crate::VULKAN_SUBMIT_TIMEOUT). The single bounded-wait path for every
+/// blocking `wgpu` poll in this crate.
+pub(crate) fn wait_submission_bounded(
+    device: &wgpu::Device,
+    index: Option<wgpu::SubmissionIndex>,
+    what: &'static str,
+) -> Result<()> {
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: index,
+            timeout: Some(crate::VULKAN_SUBMIT_TIMEOUT),
+        })
+        .map(|_| ())
+        .map_err(|err| poll_wait_error(what, err))
+}
+
+/// The teardown status [`record_drop_failure`] stores for `err`.
+pub(crate) fn teardown_status(err: &Error) -> i64 {
+    match err {
+        Error::Timeout { .. } => TEARDOWN_WAIT_TIMEOUT,
+        _ => TEARDOWN_STEP_FAILED,
+    }
+}
+
+/// Reports a failed step of a `Drop` impl (`op`) to the typed teardown sink
+/// (`cuda_core_ext::teardown`, [`Library::NvWgpu`]): `Drop` cannot return it, and it must not be
+/// swallowed.
+pub(crate) fn record_drop_failure(op: &'static str, err: &Error) {
+    teardown::record(Library::NvWgpu, op, teardown_status(err));
+}
+
+/// Waits (bounded) until submission `index` (if any) of `device` completes. For `Drop` impls that
+/// must not free native objects still referenced by in-flight raw commands. A timeout or poll
+/// failure goes to the teardown sink under `op`; the caller then drops the native objects anyway
+/// (a hung GPU never completes), so such an error means the device must be treated as lost.
 pub(crate) fn wait_for_submission(
     device: &wgpu::Device,
     index: Option<wgpu::SubmissionIndex>,
-    owner: &str,
+    op: &'static str,
 ) {
-    let Some(index) = index else {
+    if index.is_none() {
         return;
-    };
-    if let Err(err) = device.poll(wgpu::PollType::Wait {
-        submission_index: Some(index),
-        timeout: None,
-    }) {
-        eprintln!(
-            "nv-wgpu: waiting for the last raw submission of {owner} during drop failed: {err}"
-        );
+    }
+    if let Err(err) = wait_submission_bounded(device, index, op) {
+        record_drop_failure(op, &err);
     }
 }
 
@@ -561,6 +781,62 @@ mod tests {
         let indirect = map_vk_buffer_usage(wgpu::BufferUsages::INDIRECT);
         assert!(indirect.contains(vk::BufferUsageFlags::INDIRECT_BUFFER));
         assert!(indirect.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+    }
+
+    /// A bounded wait that hits the timeout is a typed `Timeout` carrying the wait name, every other
+    /// poll failure stays `Poll`, and the teardown sink gets distinct codes for the two.
+    #[test]
+    fn bounded_wait_errors_are_typed_and_map_to_teardown_codes() {
+        let timeout = poll_wait_error("SharedBuffer drop", wgpu::PollError::Timeout);
+        assert!(matches!(timeout, Error::Timeout { what } if what == "SharedBuffer drop"));
+        assert_eq!(teardown_status(&timeout), TEARDOWN_WAIT_TIMEOUT);
+
+        let other = poll_wait_error("x", wgpu::PollError::WrongSubmissionIndex(3, 2));
+        assert!(matches!(
+            other,
+            Error::Poll(wgpu::PollError::WrongSubmissionIndex(3, 2))
+        ));
+        assert_eq!(teardown_status(&other), TEARDOWN_STEP_FAILED);
+        assert_ne!(TEARDOWN_WAIT_TIMEOUT, TEARDOWN_STEP_FAILED);
+
+        // Only this test records `Library::NvWgpu` in this crate's test binary.
+        let _ = teardown::take(Some(Library::NvWgpu));
+        record_drop_failure("SharedBuffer::drop", &timeout);
+        let drained = teardown::take(Some(Library::NvWgpu));
+        assert_eq!(drained.errors.len(), 1);
+        assert_eq!(drained.errors[0].op, "SharedBuffer::drop");
+        assert_eq!(drained.errors[0].status, TEARDOWN_WAIT_TIMEOUT);
+    }
+
+    #[test]
+    fn layout_mapping_follows_wgpu_hal() {
+        let fmt = wgpu::TextureFormat::Rgba8Unorm;
+        assert_eq!(
+            vk_layout_for_texture_uses(wgpu::TextureUses::UNINITIALIZED, fmt),
+            vk::ImageLayout::UNDEFINED
+        );
+        assert_eq!(
+            vk_layout_for_texture_uses(wgpu::TextureUses::COPY_SRC, fmt),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        );
+        assert_eq!(
+            vk_layout_for_texture_uses(wgpu::TextureUses::STORAGE_READ_WRITE, fmt),
+            vk::ImageLayout::GENERAL
+        );
+    }
+
+    #[test]
+    fn ownership_transfer_release_and_acquire_are_mirror_images() {
+        let release = ownership_transfer(false, 3);
+        let acquire = ownership_transfer(true, 3);
+        assert_eq!(release.src_family, 3);
+        assert_eq!(release.dst_family, vk::QUEUE_FAMILY_EXTERNAL);
+        assert_eq!(acquire.src_family, vk::QUEUE_FAMILY_EXTERNAL);
+        assert_eq!(acquire.dst_family, 3);
+        assert_eq!(release.src_access, vk::AccessFlags::MEMORY_WRITE);
+        assert_eq!(release.dst_access, vk::AccessFlags::empty());
+        assert_eq!(acquire.src_access, vk::AccessFlags::empty());
+        assert!(acquire.dst_access.contains(vk::AccessFlags::MEMORY_READ));
     }
 
     #[test]

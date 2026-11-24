@@ -343,6 +343,171 @@ fn make_virtual_tensor_desc(
     Ok(d)
 }
 
+/// The finalized convolution descriptor of `spec` (mode, padding, dilation, stride).
+fn make_conv_desc(ctx: &Arc<Context>, spec: &GraphConvSpec) -> Result<BackendDesc> {
+    let mut conv_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR)?;
+    conv_desc.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_COMP_TYPE, spec.compute_dtype)?;
+    conv_desc.set_conv_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_CONV_MODE, ConvMode::CrossCorrelation)?;
+    conv_desc.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, 2)?;
+    conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, &spec.pad)?;
+    conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, &spec.pad)?;
+    conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_DILATIONS, &spec.dilation)?;
+    conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, &spec.stride)?;
+    conv_desc.finalize()?;
+    Ok(conv_desc)
+}
+
+/// The tensors bound to the three roles of a convolution operation: `x`, `w` and `y` are the
+/// spec's input, filter and output, except that a fused plan substitutes a virtual tensor for the
+/// role the convolution writes.
+struct ConvTensors<'a> {
+    x: &'a BackendDesc,
+    w: &'a BackendDesc,
+    y: &'a BackendDesc,
+}
+
+/// The finalized forward / backward-data / backward-filter operation over `t` (alpha 1, beta 0).
+fn make_conv_op(
+    ctx: &Arc<Context>,
+    direction: GraphConvDirection,
+    conv_desc: &BackendDesc,
+    t: &ConvTensors<'_>,
+) -> Result<BackendDesc> {
+    let mut o = match direction {
+        GraphConvDirection::Forward => {
+            let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, t.x)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, t.w)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, t.y)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, conv_desc)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0)?;
+            o
+        }
+        GraphConvDirection::BackwardData => {
+            let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, t.x)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, t.w)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, t.y)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, conv_desc)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0)?;
+            o
+        }
+        GraphConvDirection::BackwardFilter => {
+            let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X, t.x)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW, t.w)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY, t.y)?;
+            o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC, conv_desc)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0)?;
+            o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0)?;
+            o
+        }
+    };
+    o.finalize()?;
+    Ok(o)
+}
+
+/// The finalized operation graph of `ops` (finalized operation descriptors) on `handle`.
+fn make_op_graph(
+    ctx: &Arc<Context>,
+    handle: &Handle,
+    ops: &[sys::cudnnBackendDescriptor_t],
+) -> Result<BackendDesc> {
+    let mut op_graph = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR)?;
+    op_graph.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_HANDLE, handle)?;
+    op_graph.set_descs(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_OPS, ops)?;
+    op_graph.finalize()?;
+    Ok(op_graph)
+}
+
+/// Picks the first execution plan of `op_graph` whose workspace fits `max_workspace_bytes`, trying
+/// every heuristic mode and every ranked engine config (a lower-ranked one may be the only fit
+/// for the budget). Returns the plan, the engine config it was finalized from and its workspace
+/// size; the last failure (or `NOT_SUPPORTED` naming `call`) when nothing fits.
+fn select_plan(
+    ctx: &Arc<Context>,
+    handle: &Handle,
+    op_graph: &BackendDesc,
+    max_workspace_bytes: usize,
+    call: &'static str,
+) -> Result<(BackendDesc, BackendDesc, usize)> {
+    let mut last_err: Option<Error> = None;
+    for mode in [HeurMode::ModeA, HeurMode::ModeB, HeurMode::Fallback] {
+        let mut heur = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR)?;
+        heur.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, op_graph)?;
+        heur.set_heur_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_MODE, mode)?;
+        if let Err(e) = heur.finalize() {
+            last_err = Some(e);
+            continue;
+        }
+        let mut total_cfgs: i64 = 0;
+        // SAFETY: querying count with `max_elements = 0` and null output buffer is standard cuDNN API.
+        let st_cnt = unsafe {
+            sys::cudnnBackendGetAttribute(
+                heur.raw,
+                sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                0,
+                &mut total_cfgs,
+                ptr::null_mut(),
+            )
+        };
+        if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
+            continue;
+        }
+        let want = total_cfgs as usize;
+        let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
+        let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
+        for _ in 0..want {
+            let d = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINECFG_DESCRIPTOR)?;
+            raw_cfgs.push(d.raw);
+            cfgs.push(d);
+        }
+        let mut returned: i64 = 0;
+        // SAFETY: `raw_cfgs` holds `want` valid unfinalized ENGINECFG descriptors.
+        let st_get = unsafe {
+            sys::cudnnBackendGetAttribute(
+                heur.raw,
+                sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
+                sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                want as i64,
+                &mut returned,
+                raw_cfgs.as_mut_ptr().cast(),
+            )
+        };
+        if let Err(e) = check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS)", st_get) {
+            last_err = Some(e);
+            continue;
+        }
+        for cfg in cfgs.into_iter().take(returned.max(0) as usize) {
+            let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
+            plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
+            plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, &cfg)?;
+            if let Err(e) = plan.finalize() {
+                last_err = Some(e);
+                continue;
+            }
+            let ws_i64 = match plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let ws = ws_i64.max(0) as usize;
+            if ws <= max_workspace_bytes {
+                return Ok((plan, cfg, ws));
+            }
+        }
+    }
+    Err(last_err.unwrap_or(Error::Status {
+        call,
+        code: CudnnStatus::NOT_SUPPORTED,
+    }))
+}
+
 /// Finalized cuDNN 9 Backend Execution Plan for a single 2D convolution (`fwd`, `bwd_data`, or
 /// `bwd_filter`), reusable across steps. Each execution builds one variant-pack descriptor.
 pub struct GraphConvPlan {
@@ -372,134 +537,27 @@ impl GraphConvPlan {
         let w_desc = make_tensor_desc(ctx, UID_W, spec.w_dtype, &spec.w_dims, &spec.w_strides, spec.alignment_bytes)?;
         let y_desc = make_tensor_desc(ctx, UID_Y, spec.y_dtype, &spec.y_dims, &spec.y_strides, spec.alignment_bytes)?;
 
-        let mut conv_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR)?;
-        conv_desc.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_COMP_TYPE, spec.compute_dtype)?;
-        conv_desc.set_conv_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_CONV_MODE, ConvMode::CrossCorrelation)?;
-        conv_desc.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, 2)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, &spec.pad)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, &spec.pad)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_DILATIONS, &spec.dilation)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, &spec.stride)?;
-        conv_desc.finalize()?;
-
-        let mut op = match spec.direction {
-            GraphConvDirection::Forward => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0)?;
-                o
-            }
-            GraphConvDirection::BackwardData => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &x_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &y_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0)?;
-                o
-            }
-            GraphConvDirection::BackwardFilter => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X, &x_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW, &w_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY, &y_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0)?;
-                o
-            }
-        };
-        op.finalize()?;
-
-        let mut op_graph = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR)?;
-        op_graph.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_HANDLE, handle)?;
-        op_graph.set_descs(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_OPS, &[op.raw])?;
-        op_graph.finalize()?;
-
-        let mut last_err: Option<Error> = None;
-        for mode in [HeurMode::ModeA, HeurMode::ModeB, HeurMode::Fallback] {
-            let mut heur = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR)?;
-            heur.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, &op_graph)?;
-            heur.set_heur_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_MODE, mode)?;
-            if let Err(e) = heur.finalize() {
-                last_err = Some(e);
-                continue;
-            }
-            let mut total_cfgs: i64 = 0;
-            // SAFETY: querying count with `max_elements = 0` and null output buffer is standard cuDNN API.
-            let st_cnt = unsafe {
-                sys::cudnnBackendGetAttribute(
-                    heur.raw,
-                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                    0,
-                    &mut total_cfgs,
-                    ptr::null_mut(),
-                )
-            };
-            if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
-                continue;
-            }
-            // Try every ranked config: a lower-ranked one may be the only fit for the budget.
-            let want = total_cfgs as usize;
-            let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
-            let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
-            for _ in 0..want {
-                let d = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINECFG_DESCRIPTOR)?;
-                raw_cfgs.push(d.raw);
-                cfgs.push(d);
-            }
-            let mut returned: i64 = 0;
-            // SAFETY: `raw_cfgs` holds `want` valid unfinalized ENGINECFG descriptors.
-            let st_get = unsafe {
-                sys::cudnnBackendGetAttribute(
-                    heur.raw,
-                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                    want as i64,
-                    &mut returned,
-                    raw_cfgs.as_mut_ptr().cast(),
-                )
-            };
-            if let Err(e) = check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS)", st_get) {
-                last_err = Some(e);
-                continue;
-            }
-            for cfg in cfgs.into_iter().take(returned.max(0) as usize) {
-                let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
-                plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
-                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, &cfg)?;
-                if let Err(e) = plan.finalize() {
-                    last_err = Some(e);
-                    continue;
-                }
-                let ws_i64 = match plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                };
-                let ws = ws_i64.max(0) as usize;
-                if ws <= max_workspace_bytes {
-                    return Ok(Self {
-                        plan,
-                        workspace_size: ws,
-                        ctx: Arc::clone(ctx),
-                        _deps: vec![cfg, op_graph, op, conv_desc, x_desc, w_desc, y_desc],
-                    });
-                }
-            }
-        }
-        Err(last_err.unwrap_or(Error::Status {
-            call: "cudnn::graph::GraphConvPlan::build",
-            code: CudnnStatus::NOT_SUPPORTED,
-        }))
+        let conv_desc = make_conv_desc(ctx, spec)?;
+        let op = make_conv_op(
+            ctx,
+            spec.direction,
+            &conv_desc,
+            &ConvTensors { x: &x_desc, w: &w_desc, y: &y_desc },
+        )?;
+        let op_graph = make_op_graph(ctx, handle, &[op.raw])?;
+        let (plan, cfg, ws) = select_plan(
+            ctx,
+            handle,
+            &op_graph,
+            max_workspace_bytes,
+            "cudnn::graph::GraphConvPlan::build",
+        )?;
+        Ok(Self {
+            plan,
+            workspace_size: ws,
+            ctx: Arc::clone(ctx),
+            _deps: vec![cfg, op_graph, op, conv_desc, x_desc, w_desc, y_desc],
+        })
     }
 
     /// Builds a fused 2-op cuDNN 9 Backend Execution Plan (`Conv -> PointwiseMul(scale_f32)`) for
@@ -524,49 +582,16 @@ impl GraphConvPlan {
         };
         let v_out = make_virtual_tensor_desc(ctx, UID_VIRTUAL_CONV, DataType::F32, v_dims, v_strides, spec.alignment_bytes)?;
 
-        let mut conv_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR)?;
-        conv_desc.set_dtype(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_COMP_TYPE, spec.compute_dtype)?;
-        conv_desc.set_conv_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_CONV_MODE, ConvMode::CrossCorrelation)?;
-        conv_desc.set_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS, 2)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, &spec.pad)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_POST_PADDINGS, &spec.pad)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_DILATIONS, &spec.dilation)?;
-        conv_desc.set_i64_slice(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, &spec.stride)?;
-        conv_desc.finalize()?;
+        let conv_desc = make_conv_desc(ctx, spec)?;
 
-        let (mut op_conv, real_out_desc) = match spec.direction {
-            GraphConvDirection::Forward => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &v_out)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, 0.0)?;
-                (o, &y_desc)
-            }
-            GraphConvDirection::BackwardData => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &v_out)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &y_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA, 0.0)?;
-                (o, &x_desc)
-            }
-            GraphConvDirection::BackwardFilter => {
-                let mut o = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_FILTER_DESCRIPTOR)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_X, &x_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DW, &v_out)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_DY, &y_desc)?;
-                o.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_CONV_DESC, &conv_desc)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_ALPHA, 1.0)?;
-                o.set_f32(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_FILTER_BETA, 0.0)?;
-                (o, &w_desc)
-            }
+        // The convolution writes the virtual tensor in its output role; the pointwise multiply
+        // then writes the real tensor of that role.
+        let (tensors, real_out_desc) = match spec.direction {
+            GraphConvDirection::Forward => (ConvTensors { x: &x_desc, w: &w_desc, y: &v_out }, &y_desc),
+            GraphConvDirection::BackwardData => (ConvTensors { x: &v_out, w: &w_desc, y: &y_desc }, &x_desc),
+            GraphConvDirection::BackwardFilter => (ConvTensors { x: &x_desc, w: &v_out, y: &y_desc }, &w_desc),
         };
-        op_conv.finalize()?;
+        let op_conv = make_conv_op(ctx, spec.direction, &conv_desc, &tensors)?;
 
         let mut pw_desc = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_POINTWISE_DESCRIPTOR)?;
         pw_desc.set_pointwise_mode(
@@ -583,93 +608,23 @@ impl GraphConvPlan {
         op_mul.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATION_POINTWISE_YDESC, real_out_desc)?;
         op_mul.finalize()?;
 
-        let mut op_graph = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR)?;
-        op_graph.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_HANDLE, handle)?;
-        op_graph.set_descs(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_OPERATIONGRAPH_OPS, &[op_conv.raw, op_mul.raw])?;
-        op_graph.finalize()?;
-
-        let mut last_err: Option<Error> = None;
-        for mode in [HeurMode::ModeA, HeurMode::ModeB, HeurMode::Fallback] {
-            let mut heur = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR)?;
-            heur.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH, &op_graph)?;
-            heur.set_heur_mode(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_MODE, mode)?;
-            if let Err(e) = heur.finalize() {
-                last_err = Some(e);
-                continue;
-            }
-            let mut total_cfgs: i64 = 0;
-            // SAFETY: querying count with `max_elements = 0` and null output buffer is standard cuDNN API.
-            let st_cnt = unsafe {
-                sys::cudnnBackendGetAttribute(
-                    heur.raw,
-                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                    0,
-                    &mut total_cfgs,
-                    ptr::null_mut(),
-                )
-            };
-            if check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS count)", st_cnt).is_err() || total_cfgs <= 0 {
-                continue;
-            }
-            // Try every ranked config: a lower-ranked one may be the only fit for the budget.
-            let want = total_cfgs as usize;
-            let mut cfgs: Vec<BackendDesc> = Vec::with_capacity(want);
-            let mut raw_cfgs: Vec<sys::cudnnBackendDescriptor_t> = Vec::with_capacity(want);
-            for _ in 0..want {
-                let d = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_ENGINECFG_DESCRIPTOR)?;
-                raw_cfgs.push(d.raw);
-                cfgs.push(d);
-            }
-            let mut returned: i64 = 0;
-            // SAFETY: `raw_cfgs` holds `want` valid unfinalized ENGINECFG descriptors.
-            let st_get = unsafe {
-                sys::cudnnBackendGetAttribute(
-                    heur.raw,
-                    sys::cudnnBackendAttributeName_t_CUDNN_ATTR_ENGINEHEUR_RESULTS,
-                    sys::cudnnBackendAttributeType_t_CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                    want as i64,
-                    &mut returned,
-                    raw_cfgs.as_mut_ptr().cast(),
-                )
-            };
-            if let Err(e) = check("cudnnBackendGetAttribute(ENGINEHEUR_RESULTS)", st_get) {
-                last_err = Some(e);
-                continue;
-            }
-            for cfg in cfgs.into_iter().take(returned.max(0) as usize) {
-                let mut plan = BackendDesc::new(ctx, sys::cudnnBackendDescriptorType_t_CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR)?;
-                plan.set_handle(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_HANDLE, handle)?;
-                plan.set_desc(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG, &cfg)?;
-                if let Err(e) = plan.finalize() {
-                    last_err = Some(e);
-                    continue;
-                }
-                let ws_i64 = match plan.get_i64(sys::cudnnBackendAttributeName_t_CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                };
-                let ws = ws_i64.max(0) as usize;
-                if ws <= max_workspace_bytes {
-                    return Ok(Self {
-                        plan,
-                        workspace_size: ws,
-                        ctx: Arc::clone(ctx),
-                        _deps: vec![
-                            cfg, op_graph, op_mul, op_conv, pw_desc, conv_desc, v_out, scale_desc,
-                            x_desc, w_desc, y_desc,
-                        ],
-                    });
-                }
-            }
-        }
-        Err(last_err.unwrap_or(Error::Status {
-            call: "cudnn::graph::GraphConvPlan::build_scaled",
-            code: CudnnStatus::NOT_SUPPORTED,
-        }))
+        let op_graph = make_op_graph(ctx, handle, &[op_conv.raw, op_mul.raw])?;
+        let (plan, cfg, ws) = select_plan(
+            ctx,
+            handle,
+            &op_graph,
+            max_workspace_bytes,
+            "cudnn::graph::GraphConvPlan::build_scaled",
+        )?;
+        Ok(Self {
+            plan,
+            workspace_size: ws,
+            ctx: Arc::clone(ctx),
+            _deps: vec![
+                cfg, op_graph, op_mul, op_conv, pw_desc, conv_desc, v_out, scale_desc, x_desc,
+                w_desc, y_desc,
+            ],
+        })
     }
 
     /// Required device workspace size in bytes for [`Self::execute_on_bound_stream`].

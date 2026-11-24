@@ -43,7 +43,8 @@ use windows::Win32::{
 use crate::device::{InteropBackend, effective_api_version, verify_device_interop_support};
 use crate::error::{Error, Result};
 use crate::platform::{
-    ExternalSemaphoreKind, export_vk_semaphore, vk_external_semaphore_handle_type,
+    ExternalSemaphoreKind, export_vk_semaphore, record_drop_failure, vk_external_semaphore_handle_type,
+    wait_submission_bounded,
 };
 
 #[cfg(windows)]
@@ -52,7 +53,8 @@ use crate::platform::export_d3d12_shared_handle;
 /// Cross-API GPU timeline semaphore shared between CUDA and `wgpu`.
 ///
 /// Teardown order is structural: `Drop::drop` unstages it from every queue it was staged on
-/// and waits for `wgpu`'s submissions; then the fields drop in declaration order:
+/// and waits (bounded by `VULKAN_SUBMIT_TIMEOUT`; a failure goes to `cuda_core_ext::teardown`) for
+/// `wgpu`'s submissions; then the fields drop in declaration order:
 /// `cuda` (synchronizes its CUDA context if CUDA work used it, then releases the import),
 /// `native` (`vkDestroySemaphore` / `ID3D12Fence` release), and last `_device`, which keeps the
 /// `VkDevice` / `ID3D12Device` alive for `native`. A CUDA wait whose signal is never submitted
@@ -117,13 +119,17 @@ impl Drop for InteropSemaphore {
                 .unstage_wait_in_wgpu(queue)
                 .and_then(|_| self.unstage_signal_in_wgpu(queue))
             {
-                eprintln!("nv-wgpu: unstaging InteropSemaphore during drop failed: {err}");
+                record_drop_failure("InteropSemaphore::drop (unstage from wgpu queue)", &err);
             }
         }
         // Every submission that used this semaphore went through `wgpu::Queue::submit`, so one
         // wait for the most recent submission covers all of them.
-        if let Err(err) = self._device.poll(wgpu::PollType::wait_indefinitely()) {
-            eprintln!("nv-wgpu: waiting for wgpu during InteropSemaphore drop failed: {err}");
+        if let Err(err) = wait_submission_bounded(
+            &self._device,
+            None,
+            "InteropSemaphore::drop (wait for wgpu submissions)",
+        ) {
+            record_drop_failure("InteropSemaphore::drop (wait for wgpu submissions)", &err);
         }
     }
 }

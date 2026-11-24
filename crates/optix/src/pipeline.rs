@@ -15,7 +15,7 @@
 use crate::accel::same_ctx;
 use crate::{
     DeviceContext, Error, LOG_BYTES, PipelineOptions, ProgramGroup, Result, ShaderBindingTable,
-    check, check_log, entry, module::log_text, sys,
+    check, check_log, entry, log_text, sys,
 };
 use cuda_core::bytemuck::Pod;
 use cuda_core::{DeviceBuffer, Stream};
@@ -237,11 +237,7 @@ impl Pipeline {
         if size == 0 {
             return Err(Error::Invalid("symbol copy of zero bytes"));
         }
-        if !cuda_core_ext::same_context(stream.context(), self.ctx.cuda()) {
-            return Err(Error::Invalid(
-                "stream belongs to another CUDA context than the pipeline",
-            ));
-        }
+        same_ctx(stream, &self.ctx)?;
         let name = CString::new(name).map_err(|_| Error::Invalid("symbol name contains NUL"))?;
         self.ctx.cuda().bind_to_thread()?;
         // SAFETY: owned pipeline; NUL-terminated name alive for the call; `mem` per the caller.

@@ -724,7 +724,7 @@ fn builtin_intersection_rejects_mismatched_options() {
         "sphere intersector in a triangle-only pipeline",
     );
     let mut sphere_opts = opts.clone();
-    sphere_opts.primitive_types = primitive_flag(Primitive::Sphere);
+    sphere_opts.primitive_types = Primitive::Sphere.flag();
     invalid(
         Module::builtin_intersection(
             &ctx,

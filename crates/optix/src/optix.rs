@@ -47,7 +47,7 @@ pub mod xform;
 
 pub use accel::{
     Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit,
-    GeometryFlags, INSTANCE_STAGING_BYTES, INSTANCE_STAGING_MAX_BYTES, Indices, Instance, InstanceBuffer, Keys, Radii, Relink,
+    GeometryFlags, INSTANCE_FLAG_DISABLE_ANYHIT, INSTANCE_STAGING_BYTES, INSTANCE_STAGING_MAX_BYTES, Indices, Instance, InstanceBuffer, Keys, Radii, Relink,
     RelocationInfo, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices,
 };
 pub use cluster::{
@@ -136,13 +136,20 @@ pub(crate) fn check_log(
     if code == sys::OptixResult_OPTIX_SUCCESS {
         return Ok(());
     }
-    let text = &log[..len.min(log.len())];
-    let text = text.split(|b| *b == 0).next().unwrap_or_default();
     Err(Error::Optix {
         call,
         code,
-        log: String::from_utf8_lossy(text).trim().to_owned(),
+        log: log_text(log, len),
     })
+}
+
+/// The first `len` bytes of an OptiX log buffer (OptiX reports the size it wanted, which may
+/// exceed the buffer) up to the first NUL, trimmed.
+pub(crate) fn log_text(log: &[u8], len: usize) -> String {
+    let text = &log[..len.min(log.len())];
+    String::from_utf8_lossy(text.split(|b| *b == 0).next().unwrap_or_default())
+        .trim()
+        .to_owned()
 }
 
 /// Size of the log buffers handed to compile and link calls.

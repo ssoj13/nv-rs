@@ -60,16 +60,8 @@ fn check_cusparse(call: &'static str, code: cusparse_sys::cusparseStatus_t) -> R
     if code == cusparse_sys::cusparseStatus_t_CUSPARSE_STATUS_SUCCESS {
         return Ok(());
     }
-    // SAFETY: `cusparseGetErrorName` returns a static NUL-terminated string when loaded.
-    let ptr = unsafe { cusparse_sys::cusparseGetErrorName(code) };
-    let name = if ptr.is_null() {
-        "CUSPARSE_STATUS_UNKNOWN"
-    } else {
-        // SAFETY: `ptr` is non-null and points to a static C string in `cusparse`.
-        unsafe { std::ffi::CStr::from_ptr(ptr) }
-            .to_str()
-            .unwrap_or("CUSPARSE_STATUS_UNKNOWN")
-    };
+    // The cuSPARSE crate owns the status-name lookup.
+    let name = cusparse::Status(code).name();
     Err(Error::Cusparse { call, code, name })
 }
 

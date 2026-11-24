@@ -27,9 +27,9 @@ use cuda_core::{Context, DeviceBuffer as CudaDeviceBuffer, IntoResult, Stream};
 use nv_loader::diag::{self, Level};
 use nvdec::{
     ChromaFormat as DecChromaFormat, Codec as DecCodec, DecoderConfig, DisplayInfo, ParserConfig,
-    ParserHandler, SurfaceFormat, VideoDecoder, VideoFormat, VideoParser, nv12_frame_bytes,
-    p016_frame_u16s,
+    ParserHandler, SurfaceFormat, VideoDecoder, VideoFormat, VideoParser,
 };
+use cuda_core_ext::media::yuv420_frame_bytes;
 use nvenc::{
     BufferFormat as EncBufferFormat, Codec as EncCodec, EncodeFlags, EncodeInput, EncodeOutcome,
     EncodeSession, MappedResource, OutputBitstream, Preset, RegisteredResource, SessionConfig,
@@ -42,7 +42,7 @@ use nvofa::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-use crate::buf_util::{Access, check_buf, enqueue_leased};
+use crate::buf_util::{Access, check_buf, drain_stream, enqueue_leased};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -881,13 +881,22 @@ impl PyNvencEncoder {
 
     /// Explicitly releases the NVENC session and bitstream resources, discarding frames whose
     /// packets were not retrieved (call `flush()` first to keep them).
-    fn close(&self, py: Python<'_>) {
+    ///
+    /// Waits for the encoder stream first (pending frames are unmapped on release), raising that
+    /// failure after the session is released anyway. Closing again is a no-op.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         let state = &self.state;
+        let stream = &self.stream;
         py.detach(|| {
             // A poisoned lock still holds the session; teardown proceeds without the GIL.
-            let inner = state.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let taken = state.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let Some(inner) = taken else {
+                return Ok(());
+            };
+            let drained = drain_stream("nvenc", stream);
             drop(inner);
-        });
+            drained
+        })
     }
 
     #[getter]
@@ -932,10 +941,10 @@ impl PyNvencEncoder {
         exc_type: Option<&Bound<'_, PyAny>>,
         exc_val: Option<&Bound<'_, PyAny>>,
         exc_tb: Option<&Bound<'_, PyAny>>,
-    ) -> bool {
+    ) -> PyResult<bool> {
         let _ = (exc_type, exc_val, exc_tb);
-        self.close(py);
-        false
+        self.close(py)?;
+        Ok(false)
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {
@@ -1110,8 +1119,8 @@ impl ParserHandler for FrameCollector {
             SurfaceFormat::Yuv444_16Bit => (w_us * 2, h_us * 3, "u16", "yuv444_16bit"),
         };
         let total_bytes = match dec.output_format() {
-            SurfaceFormat::Nv12 => nv12_frame_bytes(w, h),
-            SurfaceFormat::P016 => p016_frame_u16s(w, h).and_then(|n| n.checked_mul(2)),
+            SurfaceFormat::Nv12 => yuv420_frame_bytes(w_us, h),
+            SurfaceFormat::P016 => w_us.checked_mul(2).and_then(|rb| yuv420_frame_bytes(rb, h)),
             SurfaceFormat::Yuv444 | SurfaceFormat::Yuv444_16Bit => row_bytes.checked_mul(rows),
         }
         .ok_or(nvdec::Error::Invalid("decoded frame byte size overflow"))?;
@@ -1624,7 +1633,7 @@ impl PyNvofa {
             OfBufferFormat::Grayscale8 | OfBufferFormat::Abgr8 => (self.width as usize)
                 .checked_mul(self.height as usize)
                 .and_then(|p| p.checked_mul(self.input_format.plane0_elem_bytes())),
-            OfBufferFormat::Nv12 => nv12_frame_bytes(self.width, self.height),
+            OfBufferFormat::Nv12 => yuv420_frame_bytes(self.width as usize, self.height),
             _ => {
                 return Err(record_and_err(
                     "nvofa",
@@ -1788,13 +1797,22 @@ impl PyNvofa {
     }
 
     /// Explicitly releases the NVOFA session and internal GPU buffers.
-    fn close(&self, py: Python<'_>) {
+    ///
+    /// Waits for the session stream first, raising that failure after the session is released
+    /// anyway. Closing again is a no-op.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         let state = &self.state;
+        let stream = &self.stream;
         py.detach(|| {
             // A poisoned lock still holds the session; teardown proceeds without the GIL.
-            let inner = state.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let taken = state.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let Some(inner) = taken else {
+                return Ok(());
+            };
+            let drained = drain_stream("nvofa", stream);
             drop(inner);
-        });
+            drained
+        })
     }
 
     #[getter]
@@ -1844,10 +1862,10 @@ impl PyNvofa {
         exc_type: Option<&Bound<'_, PyAny>>,
         exc_val: Option<&Bound<'_, PyAny>>,
         exc_tb: Option<&Bound<'_, PyAny>>,
-    ) -> bool {
+    ) -> PyResult<bool> {
         let _ = (exc_type, exc_val, exc_tb);
-        self.close(py);
-        false
+        self.close(py)?;
+        Ok(false)
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {

@@ -13,6 +13,7 @@ path = "src/nvdec.rs"
 [dependencies]
 nvcuvid-sys = { path = "../nvcuvid-sys" }
 cuda-core.workspace = true
+cuda-core-ext.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -2,29 +2,13 @@
 //! metadata/EXIF parsing, and reusable pinned/device buffer attachment.
 
 use cuda_core::{Context, DeviceBuffer, Stream};
+use cuda_core_ext::media::psnr_u8;
 use nvjpeg::{
     Backend, ChromaSubsampling, DecodeParams, EncoderParams, EncoderState, ExifOrientation, Handle,
     ImagePlanes, ImagePlanesMut, InputFormat, JpegDecoder, JpegEncoding, JpegState, JpegStream,
     NvjpegDeviceBuffer, OutputFormat, PinnedBuffer,
 };
 use std::sync::Arc;
-
-fn psnr_u8(a: &[u8], b: &[u8]) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let mse: f64 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = f64::from(x) - f64::from(y);
-            d * d
-        })
-        .sum::<f64>()
-        / a.len() as f64;
-    if mse == 0.0 {
-        return f64::INFINITY;
-    }
-    10.0 * (255.0 * 255.0 / mse).log10()
-}
 
 #[test]
 #[ignore = "GPU"]
@@ -114,7 +98,7 @@ fn encode_decode_psnr_interleaved_and_planar() {
     stream.synchronize().expect("sync");
 
     let decoded_rgbi = dst_rgbi.to_host_vec(&stream).expect("readback rgbi");
-    let psnr = psnr_u8(&rgb_host, &decoded_rgbi);
+    let psnr = psnr_u8(&rgb_host, &decoded_rgbi).expect("psnr over equal-length buffers");
     assert!(psnr > 35.0, "interleaved decode PSNR {psnr:.2} dB too low");
 
     // Decode planar RGB.

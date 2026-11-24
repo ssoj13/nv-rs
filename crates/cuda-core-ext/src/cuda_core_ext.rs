@@ -17,6 +17,8 @@
 //! - [`lease`] — keeps buffers allocated until work a native library queued on them completes.
 //! - [`identity`] — the one context / stream identity rule (by value, not by `Arc`).
 //! - [`scratch`] — the one reusable, budget-bounded, stream-ordered device workspace.
+//! - [`media`] — 4:2:0 frame geometry, pitched 2D copies, PSNR and error-detail text shared by the
+//!   video and image wrapper crates.
 //! - [`teardown`] — the process-wide sink for native teardown failures in `Drop`.
 //!
 //! **Conventions (shared with `cuda-core`).** Every handle owns its driver object and destroys it
@@ -25,7 +27,8 @@
 //! `DriverError`. Everything takes `&Arc<Context>`.
 //!
 //! **Used by** `nv-wgpu` (interop), `curand` (leases), every wrapper crate (identity, teardown;
-//! scratch for `cublas`, `cudnn`, `cufft`, `cusolver`, `cusparse`, `nvcomp`) and render-rs.
+//! scratch for `cublas`, `cudnn`, `cufft`, `cusolver`, `cusparse`, `nvcomp`; media helpers for
+//! `nvenc`, `nvdec`, `nvofa`, `nvjpeg`) and render-rs.
 
 pub mod array;
 pub mod device_id;
@@ -34,6 +37,7 @@ pub mod green;
 pub mod host;
 pub mod identity;
 pub mod lease;
+pub mod media;
 pub mod scratch;
 pub mod sparse;
 pub mod teardown;

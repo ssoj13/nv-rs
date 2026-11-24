@@ -3,9 +3,10 @@
 //! Run with `cargo test -p nvdec -- --include-ignored`.
 
 use cuda_core::Context;
+use cuda_core_ext::media::{psnr_u8, yuv420_frame_bytes};
 use nvdec::{
     DecoderConfig, DisplayInfo, ParserConfig, ParserHandler, SurfaceFormat, VideoDecoder,
-    VideoFormat, VideoParser, nv12_frame_bytes, psnr_u8,
+    VideoFormat, VideoParser,
 };
 use nvenc::{
     BufferFormat, Codec as EncCodec, EncodeFlags, EncodeInput, EncodeOutcome, EncodeSession,
@@ -26,7 +27,7 @@ impl ParserHandler for RoundTripCollector {
         let cfg = DecoderConfig::from_video_format(fmt, SurfaceFormat::Nv12)?;
         self.decoder = Some(VideoDecoder::new(&self.cuda, &cfg)?);
         let frame_bytes =
-            nv12_frame_bytes(cfg.target_width, cfg.target_height).expect("frame bytes");
+            yuv420_frame_bytes(cfg.target_width as usize, cfg.target_height).expect("frame bytes");
         self.scratch_host.resize(frame_bytes, 0);
         Ok(cfg.num_decode_surfaces)
     }
@@ -80,7 +81,7 @@ fn encode_h264(
     let w = width as usize;
 
     for frame_idx in 0..num_frames {
-        let mut ref_nv12 = vec![128u8; nv12_frame_bytes(width, height).expect("size")];
+        let mut ref_nv12 = vec![128u8; yuv420_frame_bytes(width as usize, height).expect("size")];
         for y in 0..height as usize {
             for x in 0..w {
                 ref_nv12[y * w + x] = ((x * 2 + y + frame_idx as usize * 12) & 0xff) as u8;

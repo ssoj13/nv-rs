@@ -17,6 +17,7 @@
 pub use nvcuvid_sys as sys;
 
 use cuda_core::{Context, DriverError, IntoResult, Stream};
+use cuda_core_ext::media;
 use std::any::Any;
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fmt;
@@ -973,14 +974,15 @@ impl MappedFrame<'_> {
         if self.decoder.output_format != SurfaceFormat::Nv12 {
             return Err(Error::Invalid("surface format is not NV12"));
         }
-        let expected = nv12_frame_bytes(self.width(), self.height())
+        let expected = media::yuv420_frame_bytes(self.width() as usize, self.height())
             .ok_or(Error::Invalid("NV12 frame size overflow"))?;
         if dst.len() != expected {
             return Err(Error::Invalid(
                 "destination slice length does not match NV12 frame size",
             ));
         }
-        let rows = (self.height() as usize) + (self.height() as usize) / 2;
+        let rows = media::yuv420_rows(self.height())
+            .ok_or(Error::Invalid("NV12 frame size overflow"))? as usize;
         self.copy_2d_to_host(stream, self.width() as usize, rows, dst.as_mut_ptr().cast())
     }
 
@@ -989,14 +991,18 @@ impl MappedFrame<'_> {
         if self.decoder.output_format != SurfaceFormat::P016 {
             return Err(Error::Invalid("surface format is not P016"));
         }
-        let expected = p016_frame_u16s(self.width(), self.height())
-            .ok_or(Error::Invalid("P016 frame size overflow"))?;
+        let expected = (self.width() as usize)
+            .checked_mul(2)
+            .and_then(|row_bytes| media::yuv420_frame_bytes(row_bytes, self.height()))
+            .ok_or(Error::Invalid("P016 frame size overflow"))?
+            / 2;
         if dst.len() != expected {
             return Err(Error::Invalid(
                 "destination slice length does not match P016 frame size",
             ));
         }
-        let rows = (self.height() as usize) + (self.height() as usize) / 2;
+        let rows = media::yuv420_rows(self.height())
+            .ok_or(Error::Invalid("P016 frame size overflow"))? as usize;
         self.copy_2d_to_host(
             stream,
             (self.width() as usize) * 2,
@@ -1024,20 +1030,18 @@ impl MappedFrame<'_> {
             // live, and it belongs to the decoder's context, which is current.
             unsafe { cuda_core::sys::cuStreamSynchronize(map_handle) }.result()?;
         }
-        // SAFETY: all-zero bit pattern is valid for `CUDA_MEMCPY2D`.
-        let mut copy: cuda_core::sys::CUDA_MEMCPY2D = unsafe { zeroed() };
-        copy.srcMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
-        copy.srcDevice = self.dev_ptr;
-        copy.srcPitch = self.pitch as usize;
-        copy.dstMemoryType = cuda_core::sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
-        copy.dstHost = dst_host;
-        copy.dstPitch = width_bytes;
-        copy.WidthInBytes = width_bytes;
-        copy.Height = rows;
-        // SAFETY: `self.dev_ptr` is mapped for `rows` of `self.pitch` bytes, `dst_host` holds `width_bytes * rows`
-        // bytes, and `stream.synchronize()` completes before returning.
-        unsafe { cuda_core::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }.result()?;
-        stream.synchronize()?;
+        // SAFETY: `self.dev_ptr` is mapped for `rows` of `self.pitch` bytes, `dst_host` holds
+        // `width_bytes * rows` bytes, and the copy waits for `stream` before returning.
+        unsafe {
+            media::copy_2d_device_to_host(
+                stream,
+                self.dev_ptr,
+                self.pitch as usize,
+                dst_host,
+                width_bytes,
+                rows,
+            )
+        }?;
         Ok(())
     }
 }
@@ -1059,69 +1063,9 @@ impl Drop for MappedFrame<'_> {
     }
 }
 
-/// Tight NV12 byte count for `width x height` pixels (`width * height * 3 / 2`).
-pub const fn nv12_frame_bytes(width: u32, height: u32) -> Option<usize> {
-    let w = width as usize;
-    let h = height as usize;
-    match w.checked_mul(h) {
-        Some(p) => match p.checked_mul(3) {
-            Some(n) => Some(n / 2),
-            None => None,
-        },
-        None => None,
-    }
-}
-
-/// Tight P016 `u16` element count for `width x height` pixels (`width * height * 3 / 2`).
-pub const fn p016_frame_u16s(width: u32, height: u32) -> Option<usize> {
-    nv12_frame_bytes(width, height)
-}
-
-/// Computes Peak Signal-to-Noise Ratio (dB) between two equal-length 8-bit buffers.
-///
-/// Returns `f64::INFINITY` when identical and `None` when empty or mismatched in length.
-pub fn psnr_u8(a: &[u8], b: &[u8]) -> Option<f64> {
-    if a.is_empty() || a.len() != b.len() {
-        return None;
-    }
-    let mse: f64 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let d = f64::from(x) - f64::from(y);
-            d * d
-        })
-        .sum::<f64>()
-        / (a.len() as f64);
-    if mse == 0.0 {
-        Some(f64::INFINITY)
-    } else {
-        Some(10.0 * (255.0_f64 * 255.0_f64 / mse).log10())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_size_math_and_overflow() {
-        assert_eq!(nv12_frame_bytes(1920, 1080), Some(1920 * 1080 * 3 / 2));
-        assert_eq!(p016_frame_u16s(1920, 1080), Some(1920 * 1080 * 3 / 2));
-        assert_eq!(nv12_frame_bytes(u32::MAX, u32::MAX), None);
-    }
-
-    #[test]
-    fn psnr_u8_behaves_correctly() {
-        let a = [100u8; 16];
-        assert_eq!(psnr_u8(&a, &a), Some(f64::INFINITY));
-        assert_eq!(psnr_u8(&[], &[]), None);
-        assert_eq!(psnr_u8(&a, &[100u8; 8]), None);
-        let mut b = a;
-        b[0] = 101;
-        let p = psnr_u8(&a, &b).expect("valid psnr");
-        assert!(p > 50.0 && p < 70.0, "unexpected psnr {p}");
-    }
 
     #[test]
     fn status_code_is_copy_and_displays() {

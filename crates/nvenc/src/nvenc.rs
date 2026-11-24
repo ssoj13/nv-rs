@@ -26,6 +26,7 @@ pub mod guid;
 pub use nvenc_sys as sys;
 
 use cuda_core::{Context, DriverError, Stream};
+use cuda_core_ext::media;
 use cuda_core_ext::teardown::{self, Library};
 use std::ffi::{CStr, c_void};
 use std::fmt;
@@ -67,7 +68,7 @@ pub enum Error {
     #[error("NVENC unavailable: {0}")]
     Unavailable(String),
     /// An NVENC entry point returned a non-success status.
-    #[error("{call} failed with {code}{}", detail_suffix(.detail))]
+    #[error("{call} failed with {code}{}", media::detail_suffix(.detail))]
     Status {
         /// The NVENC function-list entry point.
         call: &'static str,
@@ -82,14 +83,6 @@ pub enum Error {
     /// An argument was rejected before reaching NVENC.
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
-}
-
-fn detail_suffix(detail: &str) -> String {
-    if detail.is_empty() {
-        String::new()
-    } else {
-        format!(" ({detail})")
-    }
 }
 
 /// Result alias for this crate.
@@ -299,22 +292,28 @@ impl BufferFormat {
     }
 
     /// Minimum tight byte size for a frame of `width x height` pixels, or `None` on overflow.
+    /// 4:2:0 formats keep an odd height's last chroma row ([`media::yuv420_frame_bytes`]).
     pub const fn tight_frame_bytes(self, width: u32, height: u32) -> Option<usize> {
         let w = width as usize;
         let h = height as usize;
-        let pixels = match w.checked_mul(h) {
-            Some(p) => p,
-            None => return None,
-        };
         match self {
-            Self::Nv12 | Self::Yv12 | Self::Iyuv => match pixels.checked_mul(3) {
-                Some(n) => Some(n / 2),
+            Self::Nv12 | Self::Yv12 | Self::Iyuv => media::yuv420_frame_bytes(w, height),
+            Self::Yuv420_10Bit => match w.checked_mul(2) {
+                Some(row_bytes) => media::yuv420_frame_bytes(row_bytes, height),
                 None => None,
             },
-            Self::Yuv420_10Bit => pixels.checked_mul(3),
-            Self::Yuv444 => pixels.checked_mul(3),
-            Self::Yuv444_10Bit => pixels.checked_mul(6),
-            Self::Argb | Self::Abgr | Self::Argb10 | Self::Abgr10 => pixels.checked_mul(4),
+            Self::Yuv444 => match w.checked_mul(h) {
+                Some(p) => p.checked_mul(3),
+                None => None,
+            },
+            Self::Yuv444_10Bit => match w.checked_mul(h) {
+                Some(p) => p.checked_mul(6),
+                None => None,
+            },
+            Self::Argb | Self::Abgr | Self::Argb10 | Self::Abgr10 => match w.checked_mul(h) {
+                Some(p) => p.checked_mul(4),
+                None => None,
+            },
         }
     }
 
@@ -330,9 +329,7 @@ impl BufferFormat {
     /// Maximum number of `pitch`-byte rows in a locked [`InputBuffer`] of `height` pixels.
     pub const fn locked_rows(self, height: u32) -> Option<u32> {
         match self {
-            Self::Nv12 | Self::Yv12 | Self::Iyuv | Self::Yuv420_10Bit => {
-                height.checked_add(height / 2)
-            }
+            Self::Nv12 | Self::Yv12 | Self::Iyuv | Self::Yuv420_10Bit => media::yuv420_rows(height),
             Self::Yuv444 | Self::Yuv444_10Bit => height.checked_mul(3),
             Self::Argb | Self::Abgr | Self::Argb10 | Self::Abgr10 => Some(height),
         }
@@ -1612,6 +1609,10 @@ mod tests {
             BufferFormat::Nv12.tight_frame_bytes(u32::MAX, u32::MAX),
             None
         );
+        // An odd height keeps its last chroma row: 4-wide, 5 luma + 3 chroma rows.
+        assert_eq!(BufferFormat::Nv12.tight_frame_bytes(4, 5), Some(4 * 8));
+        assert_eq!(BufferFormat::Nv12.locked_rows(5), Some(8));
+        assert_eq!(BufferFormat::Yuv420_10Bit.tight_frame_bytes(4, 5), Some(8 * 8));
         assert_eq!(BufferFormat::Abgr.tight_pitch(64), Some(256));
         assert_eq!(BufferFormat::Abgr.tight_pitch(u32::MAX), None);
     }

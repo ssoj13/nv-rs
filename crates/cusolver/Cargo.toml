@@ -13,6 +13,7 @@ path = "src/cusolver.rs"
 [dependencies]
 cusolver-sys = { path = "../cusolver-sys" }
 cusolvermg-sys = { path = "../cusolvermg-sys" }
+cusparse = { path = "../cusparse" }
 cusparse-sys = { path = "../cusparse-sys" }
 cuda-core.workspace = true
 cuda-core-ext.workspace = true

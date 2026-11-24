@@ -13,7 +13,7 @@
 //!   UUID/LUID against CUDA, and composes cleanly with `gpu_info::SharedGpu`.
 //! - [`buffer`]: Zero-copy [`SharedBuffer`] (`wgpu::Buffer` <-> `cuda_core::RawDeviceBuffer`).
 //! - [`texture`]: Zero-copy [`SharedTexture`] (`wgpu::Texture` <-> `cuda_core_ext::MipmappedArray`),
-//!   exposing [`SharedSurfaceObject`] and [`cuda_core_ext::TextureObject`] views.
+//!   exposing [`cuda_core_ext::SurfaceObject`] and [`cuda_core_ext::TextureObject`] views.
 //! - [`sync`]: GPU-side timeline [`InteropSemaphore`] (Vulkan timeline semaphore
 //!   & DX12 shared `ID3D12Fence`).
 //! - [`format`]: Explicit `wgpu::TextureFormat` <-> CUDA/Vulkan/DXGI mapping table
@@ -60,24 +60,12 @@ pub use format::{
 };
 pub use sync::InteropSemaphore;
 pub use texture::{
-    SharedSurfaceObject, SharedTexture, SharedTextureDescriptor, validate_texture_descriptor,
-    vk_image_view_raw,
+    SharedTexture, SharedTextureDescriptor, validate_texture_descriptor, vk_image_view_raw,
 };
 
 /// Longest [`InteropContext::submit_vulkan_commands`] waits for its submission. Windows resets a
 /// GPU that does not respond for 2 s (TDR), so a submission still running after this is hung.
 pub const VULKAN_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The error a bounded submission wait reports: a timeout is [`Error::Timeout`], everything else
-/// stays [`Error::Poll`].
-fn submit_wait_error(err: wgpu::PollError) -> Error {
-    match err {
-        wgpu::PollError::Timeout => Error::Timeout {
-            what: "submit_vulkan_commands (VULKAN_SUBMIT_TIMEOUT)",
-        },
-        other => Error::Poll(other),
-    }
-}
 
 /// Vulkan image layout transitions recorded via [`InteropContext::vk_image_barrier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,12 +333,11 @@ impl InteropContext {
             platform::submit_vulkan_raw(&self.device, &self.queue, None, None, |cmd| {
                 f(cmd.as_raw() as usize as *mut c_void)
             })?;
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(index),
-                timeout: Some(VULKAN_SUBMIT_TIMEOUT),
-            })
-            .map_err(submit_wait_error)?;
+        platform::wait_submission_bounded(
+            &self.device,
+            Some(index),
+            "submit_vulkan_commands (VULKAN_SUBMIT_TIMEOUT)",
+        )?;
         Ok(value)
     }
 
@@ -438,24 +425,5 @@ impl InteropContext {
             );
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A submission wait that hits `VULKAN_SUBMIT_TIMEOUT` is a typed `Timeout`, not a generic
-    /// poll failure, so callers can tell a hung GPU from a bad submission index.
-    #[test]
-    fn submit_wait_timeout_is_typed() {
-        assert!(matches!(
-            submit_wait_error(wgpu::PollError::Timeout),
-            Error::Timeout { what } if what.contains("submit_vulkan_commands")
-        ));
-        assert!(matches!(
-            submit_wait_error(wgpu::PollError::WrongSubmissionIndex(3, 2)),
-            Error::Poll(wgpu::PollError::WrongSubmissionIndex(3, 2))
-        ));
     }
 }

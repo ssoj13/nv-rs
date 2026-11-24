@@ -16,10 +16,10 @@
 //! **Used by** applications compiling large modules on a thread pool.
 
 use crate::context::creation_flags;
-use crate::module::{CompileOpts, log_text};
+use crate::module::CompileOpts;
 use crate::{
     DeviceContext, Error, LOG_BYTES, Module, ModuleOptions, PipelineOptions, Result, check, entry,
-    sys,
+    log_text, sys,
 };
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};

@@ -297,6 +297,16 @@ pub struct LtHandle {
 // SAFETY: `cublasLtHandle_t` can be moved across threads; concurrent use requires external sync (`!Sync`).
 unsafe impl Send for LtHandle {}
 
+/// The descriptors every heuristic query takes.
+struct HeuristicQuery<'a> {
+    desc: &'a MatmulDesc,
+    a: &'a MatrixLayout,
+    b: &'a MatrixLayout,
+    c: &'a MatrixLayout,
+    d: &'a MatrixLayout,
+    pref: &'a Preference,
+}
+
 impl LtHandle {
     /// Creates a new cuBLASLt handle on `cuda`.
     pub fn new(cuda: &Arc<Context>) -> Result<Self> {
@@ -325,6 +335,109 @@ impl LtHandle {
         &self.cuda
     }
 
+    /// Rejects a stream of another CUDA context than this handle's.
+    fn check_stream(&self, stream: &Stream) -> Result<()> {
+        if !same_context(stream.context(), &self.cuda) {
+            return Err(Error::Invalid(
+                "stream belongs to a different CUDA context than LtHandle",
+            ));
+        }
+        Ok(())
+    }
+
+    /// One `cublasLtMatmulAlgoGetHeuristic` (no stream) or `...ForStream` call writing up to `req`
+    /// entries at `out`; returns the count cuBLASLt reports.
+    ///
+    /// `out` must be valid for `req` writable entries.
+    fn heuristic_raw(
+        &self,
+        stream: Option<&Stream>,
+        q: &HeuristicQuery<'_>,
+        req: i32,
+        out: *mut lt_sys::cublasLtMatmulHeuristicResult_t,
+    ) -> Result<i32> {
+        self.cuda.bind_to_thread()?;
+        let mut count = 0i32;
+        match stream {
+            // SAFETY: all handles and descriptors are live and non-null; `out` holds `req` entries
+            // (the callers' contract).
+            None => check_lt("cublasLtMatmulAlgoGetHeuristic", unsafe {
+                lt_sys::cublasLtMatmulAlgoGetHeuristic(
+                    self.raw,
+                    q.desc.raw,
+                    q.a.raw,
+                    q.b.raw,
+                    q.c.raw,
+                    q.d.raw,
+                    q.pref.raw,
+                    req,
+                    out,
+                    &mut count,
+                )
+            })?,
+            // SAFETY: as above, and `stream` is live on this handle's context (`check_stream`).
+            Some(stream) => check_lt("cublasLtMatmulAlgoGetHeuristicForStream", unsafe {
+                lt_sys::cublasLtMatmulAlgoGetHeuristicForStream(
+                    self.raw,
+                    q.desc.raw,
+                    q.a.raw,
+                    q.b.raw,
+                    q.c.raw,
+                    q.d.raw,
+                    q.pref.raw,
+                    req,
+                    out,
+                    &mut count,
+                    stream.cu_stream(),
+                )
+            })?,
+        }
+        Ok(count)
+    }
+
+    /// The single best valid heuristic entry, or an error when none is supported.
+    fn heuristic_best(
+        &self,
+        stream: Option<&Stream>,
+        q: &HeuristicQuery<'_>,
+    ) -> Result<HeuristicResult> {
+        let mut result = HeuristicResult::zeroed();
+        let count = self.heuristic_raw(stream, q, 1, &mut result.raw)?;
+        if count <= 0 || !result.is_valid() {
+            return Err(Error::Invalid(if stream.is_some() {
+                "cublasLtMatmulAlgoGetHeuristicForStream found no supported algorithm"
+            } else {
+                "cublasLtMatmulAlgoGetHeuristic found no supported algorithm"
+            }));
+        }
+        Ok(result)
+    }
+
+    /// Up to `max_results` valid heuristic entries in `out`; returns how many.
+    fn heuristic_list(
+        &self,
+        stream: Option<&Stream>,
+        q: &HeuristicQuery<'_>,
+        max_results: usize,
+        out: &mut Vec<HeuristicResult>,
+    ) -> Result<usize> {
+        if max_results == 0 {
+            out.clear();
+            return Ok(0);
+        }
+        let req = i32::try_from(max_results)
+            .map_err(|_| Error::Invalid("max_results exceeds i32::MAX"))?;
+        out.resize(max_results, HeuristicResult::zeroed());
+        // SAFETY of the pointer: `HeuristicResult` is `#[repr(transparent)]` over
+        // `cublasLtMatmulHeuristicResult_t`, so `out.as_mut_ptr().cast()` is valid for
+        // `max_results` elements.
+        let count = self.heuristic_raw(stream, q, req, out.as_mut_ptr().cast())?;
+        let n = (count.max(0) as usize).min(max_results);
+        out.truncate(n);
+        out.retain(HeuristicResult::is_valid);
+        Ok(out.len())
+    }
+
     /// Queries the single best heuristic algorithm for the given matmul descriptors.
     pub fn matmul_heuristic(
         &self,
@@ -335,30 +448,7 @@ impl LtHandle {
         d: &MatrixLayout,
         pref: &Preference,
     ) -> Result<HeuristicResult> {
-        self.cuda.bind_to_thread()?;
-        let mut result = HeuristicResult::zeroed();
-        let mut count = 0i32;
-        // SAFETY: all handles and descriptors are live and non-null; `result` receives 1 entry.
-        check_lt("cublasLtMatmulAlgoGetHeuristic", unsafe {
-            lt_sys::cublasLtMatmulAlgoGetHeuristic(
-                self.raw,
-                desc.raw,
-                a.raw,
-                b.raw,
-                c.raw,
-                d.raw,
-                pref.raw,
-                1,
-                &mut result.raw,
-                &mut count,
-            )
-        })?;
-        if count <= 0 || result.raw.state != lt_sys::cublasStatus_t_CUBLAS_STATUS_SUCCESS {
-            return Err(Error::Invalid(
-                "cublasLtMatmulAlgoGetHeuristic found no supported algorithm",
-            ));
-        }
-        Ok(result)
+        self.heuristic_best(None, &HeuristicQuery { desc, a, b, c, d, pref })
     }
 
     /// Queries up to `out.capacity()` heuristic algorithms into `out` (or resizes `out` to
@@ -378,35 +468,12 @@ impl LtHandle {
         max_results: usize,
         out: &mut Vec<HeuristicResult>,
     ) -> Result<usize> {
-        if max_results == 0 {
-            out.clear();
-            return Ok(0);
-        }
-        self.cuda.bind_to_thread()?;
-        let req = i32::try_from(max_results)
-            .map_err(|_| Error::Invalid("max_results exceeds i32::MAX"))?;
-        out.resize(max_results, HeuristicResult::zeroed());
-        let mut count = 0i32;
-        // SAFETY: `HeuristicResult` is `#[repr(transparent)]` over `cublasLtMatmulHeuristicResult_t`,
-        // so `out.as_mut_ptr().cast()` is valid for `max_results` elements.
-        check_lt("cublasLtMatmulAlgoGetHeuristic", unsafe {
-            lt_sys::cublasLtMatmulAlgoGetHeuristic(
-                self.raw,
-                desc.raw,
-                a.raw,
-                b.raw,
-                c.raw,
-                d.raw,
-                pref.raw,
-                req,
-                out.as_mut_ptr().cast(),
-                &mut count,
-            )
-        })?;
-        let n = (count.max(0) as usize).min(max_results);
-        out.truncate(n);
-        out.retain(HeuristicResult::is_valid);
-        Ok(out.len())
+        self.heuristic_list(
+            None,
+            &HeuristicQuery { desc, a, b, c, d, pref },
+            max_results,
+            out,
+        )
     }
 
     /// Executes `D = alpha * op(A) * op(B) + beta * C` using `heuristic` and a caller-owned
@@ -439,11 +506,7 @@ impl LtHandle {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<()> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
+        self.check_stream(stream)?;
         if !same_stream(stream, scratch.stream()) {
             return Err(Error::Invalid(
                 "scratch stream does not match matmul execution stream",
@@ -502,11 +565,7 @@ impl LtHandle {
         scratch: &mut Scratch,
         budget: usize,
     ) -> Result<()> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
+        self.check_stream(stream)?;
         if !same_stream(stream, scratch.stream()) {
             return Err(Error::Invalid(
                 "scratch stream does not match matmul execution stream",
@@ -579,36 +638,11 @@ impl LtHandle {
         d: &MatrixLayout,
         pref: &Preference,
     ) -> Result<HeuristicResult> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
-        self.cuda.bind_to_thread()?;
-        let mut result = HeuristicResult::zeroed();
-        let mut count = 0i32;
-        // SAFETY: all handles, descriptors, and `stream` are live on the same context; `result` receives 1 entry.
-        check_lt("cublasLtMatmulAlgoGetHeuristicForStream", unsafe {
-            lt_sys::cublasLtMatmulAlgoGetHeuristicForStream(
-                self.raw,
-                desc.raw,
-                a.raw,
-                b.raw,
-                c.raw,
-                d.raw,
-                pref.raw,
-                1,
-                &mut result.raw,
-                &mut count,
-                stream.cu_stream(),
-            )
-        })?;
-        if count <= 0 || !result.is_valid() {
-            return Err(Error::Invalid(
-                "cublasLtMatmulAlgoGetHeuristicForStream found no supported algorithm",
-            ));
-        }
-        Ok(result)
+        self.check_stream(stream)?;
+        self.heuristic_best(
+            Some(stream),
+            &HeuristicQuery { desc, a, b, c, d, pref },
+        )
     }
 
     /// Queries up to `max_results` heuristic algorithms for a specific CUDA stream into `out`
@@ -629,41 +663,13 @@ impl LtHandle {
         max_results: usize,
         out: &mut Vec<HeuristicResult>,
     ) -> Result<usize> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
-        if max_results == 0 {
-            out.clear();
-            return Ok(0);
-        }
-        self.cuda.bind_to_thread()?;
-        let req = i32::try_from(max_results)
-            .map_err(|_| Error::Invalid("max_results exceeds i32::MAX"))?;
-        out.resize(max_results, HeuristicResult::zeroed());
-        let mut count = 0i32;
-        // SAFETY: `HeuristicResult` is `#[repr(transparent)]` over `cublasLtMatmulHeuristicResult_t`,
-        // so `out.as_mut_ptr().cast()` is valid for `max_results` elements.
-        check_lt("cublasLtMatmulAlgoGetHeuristicForStream", unsafe {
-            lt_sys::cublasLtMatmulAlgoGetHeuristicForStream(
-                self.raw,
-                desc.raw,
-                a.raw,
-                b.raw,
-                c.raw,
-                d.raw,
-                pref.raw,
-                req,
-                out.as_mut_ptr().cast(),
-                &mut count,
-                stream.cu_stream(),
-            )
-        })?;
-        let n = (count.max(0) as usize).min(max_results);
-        out.truncate(n);
-        out.retain(HeuristicResult::is_valid);
-        Ok(out.len())
+        self.check_stream(stream)?;
+        self.heuristic_list(
+            Some(stream),
+            &HeuristicQuery { desc, a, b, c, d, pref },
+            max_results,
+            out,
+        )
     }
 
     /// Lists up to `max_results` supported algorithm IDs for the given type signature into `out`
@@ -794,11 +800,7 @@ impl LtHandle {
         d: &MatrixLayout,
         algo: &MatmulAlgo,
     ) -> Result<HeuristicResult> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
+        self.check_stream(stream)?;
         self.cuda.bind_to_thread()?;
         let mut result = HeuristicResult::zeroed();
         // SAFETY: all handles, descriptors, and `stream` are live on the same context.
@@ -843,11 +845,7 @@ impl LtHandle {
         c: &mut DeviceBuffer<u8>,
         c_desc: &MatrixLayout,
     ) -> Result<()> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
+        self.check_stream(stream)?;
         if alpha.is_null() || beta.is_null() {
             return Err(Error::Invalid("alpha and beta pointers must be non-null"));
         }
@@ -891,11 +889,7 @@ impl LtHandle {
         c: &mut DeviceBuffer<f32>,
         c_desc: &MatrixLayout,
     ) -> Result<()> {
-        if !same_context(stream.context(), &self.cuda) {
-            return Err(Error::Invalid(
-                "stream belongs to a different CUDA context than LtHandle",
-            ));
-        }
+        self.check_stream(stream)?;
         if desc.pointer_mode != PointerMode::Host || desc.scale != DataType::F32 {
             return Err(Error::Invalid(
                 "matrix_transform_f32 requires PointerMode::Host and DataType::F32 scale",
@@ -2774,7 +2768,8 @@ impl MatmulAlgo {
 
     /// Sets the reduction scheme (`CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME`).
     pub fn set_reduction_scheme(&mut self, scheme: ReductionScheme) -> Result<()> {
-        let v = scheme.raw() as u32;
+        // The C enum is `int` under MSVC and `unsigned int` under GCC; the attribute is 4 bytes.
+        let v = u32::from_ne_bytes(scheme.raw().to_ne_bytes());
         self.set_config_bytes(AlgoConfigAttr::ReductionScheme, &v.to_ne_bytes())
     }
 

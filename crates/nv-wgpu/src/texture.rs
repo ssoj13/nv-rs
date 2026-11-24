@@ -22,9 +22,11 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ash::vk;
-use cuda_core::{Context, IntoResult};
+use cuda_core::Context;
 use cuda_core_ext::array::LevelRef;
-use cuda_core_ext::{ArrayDesc, ExternalMemory, MipmappedArray, TextureDesc, TextureObject};
+use cuda_core_ext::{
+    ArrayDesc, ExternalMemory, MipmappedArray, SurfaceObject, TextureDesc, TextureObject,
+};
 #[cfg(windows)]
 use wgpu::hal::api::Dx12;
 use wgpu::hal::api::Vulkan;
@@ -35,14 +37,14 @@ use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
 use crate::format::{FormatMapping, build_cuda_array_desc};
 use crate::platform::{
-    ExternalMemoryKind, export_vk_memory, find_vk_memory_type_index, map_hal_texture_uses,
-    map_vk_image_usage, submit_vulkan_raw, vk_external_memory_handle_type,
-    vk_layout_for_texture_uses, wait_for_submission,
+    DedicatedResource, ExternalMemoryKind, alloc_bind_exportable_dedicated, export_vk_memory,
+    map_hal_texture_uses, map_vk_image_usage, ownership_transfer, submit_vulkan_raw,
+    vk_external_memory_handle_type, vk_layout_for_texture_uses, wait_for_submission,
 };
 use crate::sync::InteropSemaphore;
 
 #[cfg(windows)]
-use crate::platform::export_d3d12_shared_handle;
+use crate::platform::{create_shared_committed_resource, export_d3d12_shared_handle};
 
 /// Descriptor for creating a zero-copy shared texture between `wgpu` and CUDA.
 #[derive(Debug, Clone)]
@@ -60,7 +62,7 @@ pub struct SharedTextureDescriptor<'a> {
     /// `wgpu` texture usage flags.
     pub usage: wgpu::TextureUsages,
     /// Enables `CU_ARRAY3D_SURFACE_LDST` on the CUDA array so CUDA kernels can bind a
-    /// [`SharedSurfaceObject`] (`surf2Dwrite`/`surf2Dread`).
+    /// [`SurfaceObject`] (`surf2Dwrite`/`surf2Dread`).
     pub cuda_surface: bool,
     /// Marks a 2D texture array with `6 * N` square faces as a CUDA/Vulkan cubemap.
     pub cubemap: bool,
@@ -170,44 +172,6 @@ fn check_format_support(
     Ok(())
 }
 
-/// CUDA surface object bound to a single mip level of a [`SharedTexture`].
-///
-/// Holds an [`Arc`] clone of the underlying [`MipmappedArray`] (which retains
-/// [`ExternalMemory`]), so the CUDA mapping stays valid while this surface view is alive. It
-/// does not retain the native image: see the module docs for the drop rule.
-pub struct SharedSurfaceObject {
-    raw: cuda_bindings::CUsurfObject,
-    ctx: Arc<Context>,
-    _backing: Arc<MipmappedArray>,
-}
-
-// SAFETY: A `CUsurfObject` is an immutable 64-bit CUDA driver handle usable from
-// any thread whose active context matches `ctx`.
-unsafe impl Send for SharedSurfaceObject {}
-// SAFETY: As above; `SharedSurfaceObject` has no interior mutability.
-unsafe impl Sync for SharedSurfaceObject {}
-
-impl SharedSurfaceObject {
-    /// Returns the raw 64-bit `CUsurfObject` handle passed to CUDA kernels.
-    #[inline]
-    pub fn handle(&self) -> u64 {
-        self.raw
-    }
-}
-
-impl Drop for SharedSurfaceObject {
-    fn drop(&mut self) {
-        if let Err(e) = self.ctx.bind_to_thread() {
-            self.ctx.record_err(Err::<(), _>(e));
-            return;
-        }
-        // SAFETY: `self.raw` was created on `self.ctx` and has not been destroyed;
-        // callers must ensure all CUDA stream work referencing it has completed.
-        let res = unsafe { cuda_bindings::cuSurfObjectDestroy(self.raw) }.result();
-        self.ctx.record_err(res);
-    }
-}
-
 /// Refcounted Vulkan image + dedicated `VkDeviceMemory` owner shared between
 /// [`SharedTexture`] and `wgpu-hal`'s `DropCallback` (zero `wgpu::Device` cycle).
 struct VkImageBacking {
@@ -270,7 +234,7 @@ impl Drop for SharedTexture {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        wait_for_submission(&self.device, last, "SharedTexture");
+        wait_for_submission(&self.device, last, "SharedTexture::drop (wait for last ownership barrier)");
     }
 }
 
@@ -381,49 +345,12 @@ impl SharedTexture {
         let vk_img = unsafe { raw_dev.create_image(&img_info, None) }
             .map_err(|e| Error::vulkan("vkCreateImage", e))?;
 
-        // SAFETY: `vk_img` was just created on `raw_dev`.
-        let mem_reqs = unsafe { raw_dev.get_image_memory_requirements(vk_img) };
-        let mem_type_idx = match find_vk_memory_type_index(
+        let (vk_mem, mem_reqs) = alloc_bind_exportable_dedicated(
             instance,
+            raw_dev,
             phys,
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        ) {
-            Ok(idx) => idx,
-            Err(err) => {
-                // SAFETY: Clean up `vk_img` on early failure before allocation.
-                unsafe { raw_dev.destroy_image(vk_img, None) };
-                return Err(err);
-            }
-        };
-
-        let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
-        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(vk_img);
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type_idx)
-            .push_next(&mut export_info)
-            .push_next(&mut dedicated_info);
-
-        // SAFETY: `mem_type_idx` and `mem_reqs.size` come directly from `get_image_memory_requirements`.
-        let vk_mem = match unsafe { raw_dev.allocate_memory(&alloc_info, None) } {
-            Ok(m) => m,
-            Err(err) => {
-                // SAFETY: Destroy unbacked image before propagating error.
-                unsafe { raw_dev.destroy_image(vk_img, None) };
-                return Err(Error::vulkan("vkAllocateMemory(Image)", err));
-            }
-        };
-
-        // SAFETY: `vk_img` has not been bound yet and `vk_mem` matches `mem_reqs`.
-        if let Err(err) = unsafe { raw_dev.bind_image_memory(vk_img, vk_mem, 0) } {
-            // SAFETY: Destroy unbound image and free memory.
-            unsafe {
-                raw_dev.destroy_image(vk_img, None);
-                raw_dev.free_memory(vk_mem, None);
-            }
-            return Err(Error::vulkan("vkBindImageMemory", err));
-        }
+            DedicatedResource::Image(vk_img),
+        )?;
 
         let vk_backing = Arc::new(VkImageBacking {
             device: raw_dev.clone(),
@@ -447,7 +374,7 @@ impl SharedTexture {
         // here on `SharedTexture::drop` waits for it.
         let mut initial_barrier = None;
         if desc.initial_state != wgpu::TextureUses::UNINITIALIZED {
-            let dst_layout = vk_layout_for_texture_uses(desc.initial_state);
+            let dst_layout = vk_layout_for_texture_uses(desc.initial_state, desc.format);
             let subresource = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
@@ -551,13 +478,6 @@ impl SharedTexture {
         })?;
         let raw_device = hal_dev.raw_device();
 
-        let heap_props = Direct3D12::D3D12_HEAP_PROPERTIES {
-            Type: Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
-            CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-            MemoryPoolPreference: Direct3D12::D3D12_MEMORY_POOL_UNKNOWN,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-        };
         let d3d_dim = match desc.dimension {
             wgpu::TextureDimension::D1 => Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE1D,
             wgpu::TextureDimension::D2 => Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -598,22 +518,11 @@ impl SharedTexture {
             ));
         }
 
-        let mut resource: Option<Direct3D12::ID3D12Resource> = None;
-        // SAFETY: Creates a committed D3D12 texture in a shared default heap.
-        unsafe {
-            raw_device.CreateCommittedResource(
-                &heap_props,
-                Direct3D12::D3D12_HEAP_FLAG_SHARED,
-                &res_desc,
-                Direct3D12::D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut resource,
-            )
-        }
-        .map_err(|e| Error::dx12("ID3D12Device::CreateCommittedResource(Texture)", e))?;
-        let resource = resource.ok_or(Error::InvalidHandle {
-            source_api: "ID3D12Device::CreateCommittedResource",
-        })?;
+        let resource = create_shared_committed_resource(
+            raw_device,
+            &res_desc,
+            "ID3D12Device::CreateCommittedResource(Texture)",
+        )?;
 
         let exported =
             export_d3d12_shared_handle(raw_device, &resource, "ID3D12Resource->ID3D12DeviceChild")?;
@@ -696,31 +605,17 @@ impl SharedTexture {
         Ok(TextureObject::from_mipmapped(&self.cuda_array, tex_desc)?)
     }
 
-    /// Creates a [`SharedSurfaceObject`] bound to mip level `level`.
+    /// Creates a [`SurfaceObject`] bound to mip level `level`. It keeps the mipmapped array
+    /// alive, not the native image: see the module docs for the drop rule.
     ///
-    /// Note: requires [`SharedTextureDescriptor::cuda_surface`] = `true` at creation time.
-    pub fn cuda_surface_object(&self, level: u32) -> Result<SharedSurfaceObject> {
+    /// Requires [`SharedTextureDescriptor::cuda_surface`] = `true` at creation time.
+    pub fn cuda_surface_object(&self, level: u32) -> Result<SurfaceObject> {
         if !self.array_desc.surface {
             return Err(Error::InvalidInput(
                 "cuda_surface_object requires cuda_surface = true in SharedTextureDescriptor",
             ));
         }
-        let lvl = self.cuda_array.level(level)?;
-        let ctx = self.cuda_array.context();
-        ctx.bind_to_thread()?;
-        // SAFETY: zeroed descriptor is required by CUDA before populating `resType` and `res.array`.
-        let mut res: cuda_bindings::CUDA_RESOURCE_DESC = unsafe { std::mem::zeroed() };
-        res.resType = cuda_bindings::CUresourcetype_enum_CU_RESOURCE_TYPE_ARRAY;
-        res.res.array.hArray = lvl.cu_array();
-        let mut raw: cuda_bindings::CUsurfObject = 0;
-        // SAFETY: `res` references the live mip level `CUarray` whose owning `MipmappedArray`
-        // is retained inside the returned `SharedSurfaceObject`.
-        unsafe { cuda_bindings::cuSurfObjectCreate(&mut raw, &res) }.result()?;
-        Ok(SharedSurfaceObject {
-            raw,
-            ctx: Arc::clone(ctx),
-            _backing: Arc::clone(&self.cuda_array),
-        })
+        Ok(SurfaceObject::from_level(&self.cuda_array, level)?)
     }
 
     /// Returns the format mapping metadata for this texture.
@@ -858,22 +753,7 @@ impl SharedTexture {
                 mip_level_count,
                 array_layers,
             } => {
-                let wgpu_family = *queue_family;
-                let (src_family, dst_family, src_access, dst_access) = if acquire_to_wgpu {
-                    (
-                        vk::QUEUE_FAMILY_EXTERNAL,
-                        wgpu_family,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                    )
-                } else {
-                    (
-                        wgpu_family,
-                        vk::QUEUE_FAMILY_EXTERNAL,
-                        vk::AccessFlags::MEMORY_WRITE,
-                        vk::AccessFlags::empty(),
-                    )
-                };
+                let xfer = ownership_transfer(acquire_to_wgpu, *queue_family);
 
                 let subresource = vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -882,12 +762,12 @@ impl SharedTexture {
                     .base_array_layer(0)
                     .layer_count(*array_layers);
                 let barrier = vk::ImageMemoryBarrier::default()
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access)
-                    .old_layout(vk_layout_for_texture_uses(from_uses))
-                    .new_layout(vk_layout_for_texture_uses(to_uses))
-                    .src_queue_family_index(src_family)
-                    .dst_queue_family_index(dst_family)
+                    .src_access_mask(xfer.src_access)
+                    .dst_access_mask(xfer.dst_access)
+                    .old_layout(vk_layout_for_texture_uses(from_uses, self.mapping.wgpu))
+                    .new_layout(vk_layout_for_texture_uses(to_uses, self.mapping.wgpu))
+                    .src_queue_family_index(xfer.src_family)
+                    .dst_queue_family_index(xfer.dst_family)
                     .image(vk.image)
                     .subresource_range(subresource);
 

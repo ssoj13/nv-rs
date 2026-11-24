@@ -100,45 +100,9 @@ pub fn options(cfg: &Cfg, payload: u32) -> PipelineOptions {
     opts.opacity_micromaps = cfg.omm;
     opts.clustered_geometry = cfg.clusters;
     if let Some(is) = cfg.builtin {
-        opts.primitive_types = primitive_flag(is.primitive);
+        opts.primitive_types = is.primitive.flag();
     }
     opts
-}
-
-/// The `OptixPrimitiveTypeFlags` bit of a built-in primitive.
-pub fn primitive_flag(p: optix::Primitive) -> u32 {
-    use optix::Primitive::*;
-    use optix::sys;
-    (match p {
-        RoundQuadraticBspline => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE
-        }
-        RoundCubicBspline => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE
-        }
-        RoundLinear => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_LINEAR,
-        RoundCatmullRom => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM,
-        FlatQuadraticBspline => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_FLAT_QUADRATIC_BSPLINE
-        }
-        Sphere => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_SPHERE,
-        RoundCubicBezier => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER
-        }
-        RoundQuadraticBsplineRocaps => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS
-        }
-        RoundCubicBsplineRocaps => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE_ROCAPS
-        }
-        RoundCatmullRomRocaps => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM_ROCAPS
-        }
-        RoundCubicBezierRocaps => {
-            sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER_ROCAPS
-        }
-        Triangle => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE,
-    }) as u32
 }
 
 /// Raygen, miss and hit groups over `module` (hit group: the fixture's closest hit plus the

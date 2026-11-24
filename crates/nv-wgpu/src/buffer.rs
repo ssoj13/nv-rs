@@ -34,13 +34,14 @@ use windows::Win32::Graphics::{Direct3D12, Dxgi};
 use crate::device::{InteropBackend, verify_device_interop_support};
 use crate::error::{Error, Result};
 use crate::platform::{
-    ExternalMemoryKind, export_vk_memory, find_vk_memory_type_index, map_vk_buffer_usage,
-    submit_vulkan_raw, vk_external_memory_handle_type, wait_for_submission,
+    DedicatedResource, ExternalMemoryKind, alloc_bind_exportable_dedicated, export_vk_memory,
+    map_vk_buffer_usage, ownership_transfer, submit_vulkan_raw, vk_external_memory_handle_type,
+    wait_for_submission,
 };
 use crate::sync::InteropSemaphore;
 
 #[cfg(windows)]
-use crate::platform::export_d3d12_shared_handle;
+use crate::platform::{create_shared_committed_resource, export_d3d12_shared_handle};
 
 /// Descriptor for creating a zero-copy shared buffer between `wgpu` and CUDA.
 #[derive(Debug, Clone, Copy)]
@@ -142,7 +143,7 @@ impl Drop for SharedBuffer {
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        wait_for_submission(&self.device, last, "SharedBuffer");
+        wait_for_submission(&self.device, last, "SharedBuffer::drop (wait for last ownership barrier)");
     }
 }
 
@@ -196,49 +197,12 @@ impl SharedBuffer {
         let vk_buf = unsafe { raw_dev.create_buffer(&buf_info, None) }
             .map_err(|e| Error::vulkan("vkCreateBuffer", e))?;
 
-        // SAFETY: `vk_buf` was just created on `raw_dev`.
-        let mem_reqs = unsafe { raw_dev.get_buffer_memory_requirements(vk_buf) };
-        let mem_type_idx = match find_vk_memory_type_index(
+        let (vk_mem, mem_reqs) = alloc_bind_exportable_dedicated(
             instance,
+            raw_dev,
             phys,
-            mem_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        ) {
-            Ok(idx) => idx,
-            Err(err) => {
-                // SAFETY: Clean up `vk_buf` on early failure before allocation.
-                unsafe { raw_dev.destroy_buffer(vk_buf, None) };
-                return Err(err);
-            }
-        };
-
-        let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
-        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().buffer(vk_buf);
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_reqs.size)
-            .memory_type_index(mem_type_idx)
-            .push_next(&mut export_info)
-            .push_next(&mut dedicated_info);
-
-        // SAFETY: `mem_type_idx` and `mem_reqs.size` come directly from `get_buffer_memory_requirements`.
-        let vk_mem = match unsafe { raw_dev.allocate_memory(&alloc_info, None) } {
-            Ok(m) => m,
-            Err(err) => {
-                // SAFETY: Destroy unbacked buffer before propagating error.
-                unsafe { raw_dev.destroy_buffer(vk_buf, None) };
-                return Err(Error::vulkan("vkAllocateMemory", err));
-            }
-        };
-
-        // SAFETY: `vk_buf` has never been bound yet and `vk_mem` matches `mem_reqs`.
-        if let Err(err) = unsafe { raw_dev.bind_buffer_memory(vk_buf, vk_mem, 0) } {
-            // SAFETY: Clean up unbound buffer and memory on error.
-            unsafe {
-                raw_dev.destroy_buffer(vk_buf, None);
-                raw_dev.free_memory(vk_mem, None);
-            }
-            return Err(Error::vulkan("vkBindBufferMemory", err));
-        }
+            DedicatedResource::Buffer(vk_buf),
+        )?;
 
         // Wrap into `VkBufferBacking` immediately so any subsequent error cleans up via Drop.
         let vk_backing = Arc::new(VkBufferBacking {
@@ -301,13 +265,6 @@ impl SharedBuffer {
         })?;
         let raw_device = hal_dev.raw_device();
 
-        let heap_props = Direct3D12::D3D12_HEAP_PROPERTIES {
-            Type: Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
-            CPUPageProperty: Direct3D12::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-            MemoryPoolPreference: Direct3D12::D3D12_MEMORY_POOL_UNKNOWN,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-        };
         let mut flags = Direct3D12::D3D12_RESOURCE_FLAG_NONE;
         // wgpu-core binds INDIRECT (validation) and QUERY_RESOLVE (timestamp normalization)
         // buffers as read-write storage too.
@@ -343,22 +300,11 @@ impl SharedBuffer {
             ));
         }
 
-        let mut resource: Option<Direct3D12::ID3D12Resource> = None;
-        // SAFETY: Creates a committed D3D12 buffer in a shared default heap.
-        unsafe {
-            raw_device.CreateCommittedResource(
-                &heap_props,
-                Direct3D12::D3D12_HEAP_FLAG_SHARED,
-                &res_desc,
-                Direct3D12::D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut resource,
-            )
-        }
-        .map_err(|e| Error::dx12("ID3D12Device::CreateCommittedResource(Buffer)", e))?;
-        let resource = resource.ok_or(Error::InvalidHandle {
-            source_api: "ID3D12Device::CreateCommittedResource",
-        })?;
+        let resource = create_shared_committed_resource(
+            raw_device,
+            &res_desc,
+            "ID3D12Device::CreateCommittedResource(Buffer)",
+        )?;
 
         let exported =
             export_d3d12_shared_handle(raw_device, &resource, "ID3D12Resource->ID3D12DeviceChild")?;
@@ -471,28 +417,13 @@ impl SharedBuffer {
     ) -> Result<()> {
         match &self.backing {
             BufferNativeBacking::Vulkan { vk, queue_family } => {
-                let wgpu_family = *queue_family;
-                let (src_family, dst_family, src_access, dst_access) = if acquire_to_wgpu {
-                    (
-                        vk::QUEUE_FAMILY_EXTERNAL,
-                        wgpu_family,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                    )
-                } else {
-                    (
-                        wgpu_family,
-                        vk::QUEUE_FAMILY_EXTERNAL,
-                        vk::AccessFlags::MEMORY_WRITE,
-                        vk::AccessFlags::empty(),
-                    )
-                };
+                let xfer = ownership_transfer(acquire_to_wgpu, *queue_family);
 
                 let barrier = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(src_access)
-                    .dst_access_mask(dst_access)
-                    .src_queue_family_index(src_family)
-                    .dst_queue_family_index(dst_family)
+                    .src_access_mask(xfer.src_access)
+                    .dst_access_mask(xfer.dst_access)
+                    .src_queue_family_index(xfer.src_family)
+                    .dst_queue_family_index(xfer.dst_family)
                     .buffer(vk.buffer)
                     .offset(0)
                     .size(self.size);

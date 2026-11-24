@@ -29,7 +29,7 @@ Device identity helpers (`wgpu_gpu_identity`, `wgpu_vulkan_uuid`, `wgpu_dx12_lui
 
 `InteropContext::create_texture(&SharedTextureDescriptor)` (or `SharedTexture::create`) creates a `wgpu::Texture` backed by exportable memory and imports it into CUDA as a `cuda_core_ext::MipmappedArray`:
 
-- Accessors: `wgpu_texture()`, `cuda_mipmapped_array()`, `cuda_level(level)`, `cuda_texture_object(tex_desc)` -> `TextureObject`, and `cuda_surface_object(level)` -> `SharedSurfaceObject`.
+- Accessors: `wgpu_texture()`, `cuda_mipmapped_array()`, `cuda_level(level)`, `cuda_texture_object(tex_desc)` -> `TextureObject`, and `cuda_surface_object(level)` -> `cuda_core_ext::SurfaceObject` (built with `SurfaceObject::from_level`, keeps the mipmapped array alive).
 - Ownership handoff helpers: `release_to_cuda` and `acquire_from_cuda`.
 - `format` provides an explicit `wgpu::TextureFormat` <-> CUDA/Vulkan/DXGI mapping table (`SUPPORTED_FORMATS`, `format_mapping`, `build_cuda_array_desc`) and 256-byte (`COPY_BYTES_PER_ROW_ALIGNMENT`) staging layout helpers (`aligned_row_pitch`, `aligned_staging_bytes`, `validate_copy_layout`).
 

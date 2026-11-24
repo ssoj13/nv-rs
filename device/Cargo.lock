@@ -459,6 +459,7 @@ name = "optix"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "cuda-core-ext",
  "optix-sys",
  "thiserror",
 ]

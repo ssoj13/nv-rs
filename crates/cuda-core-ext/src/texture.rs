@@ -2,7 +2,7 @@
 //!
 //! **What.** [`TextureObject`] over an [`Array`], a [`MipmappedArray`], a linear device buffer
 //! (`tex1Dfetch`) or a pitched 2D device
-//! buffer; [`SurfaceObject`] over a surface-capable [`Array`]. Each object holds an `Arc` of its
+//! buffer; [`SurfaceObject`] over a surface-capable [`Array`] or one level of a [`MipmappedArray`]. Each object holds an `Arc` of its
 //! storage, so the storage cannot be freed while a kernel may still read it through the handle.
 //! [`TextureObject::handle`] / [`SurfaceObject::handle`] are the 64-bit values a kernel receives.
 //! **Why.** Environment maps and OptiX material textures need hardware filtering and mipmaps;
@@ -308,11 +308,22 @@ impl Drop for TextureObject {
     }
 }
 
-/// A surface object over a surface-capable array.
+/// What a surface reads and writes (kept alive by the surface).
+#[expect(
+    dead_code,
+    reason = "held only to keep the storage alive while the surface handle exists"
+)]
+enum SurfaceSource {
+    Array(Arc<Array>),
+    /// One level of a mipmapped array: the level array is owned by the parent.
+    Level(Arc<MipmappedArray>),
+}
+
+/// A surface object over a surface-capable array or one level of a mipmapped array.
 pub struct SurfaceObject {
     raw: sys::CUsurfObject,
     ctx: Arc<Context>,
-    _array: Arc<Array>,
+    _source: SurfaceSource,
 }
 
 // SAFETY: a CUsurfObject is an immutable 64-bit driver handle.
@@ -326,6 +337,20 @@ impl SurfaceObject {
         if !array.desc().surface {
             return Err(invalid_value());
         }
+        Self::create(array, SurfaceSource::Array(array.clone()))
+    }
+
+    /// A surface over mip level `level` of `array`, which must have been created with
+    /// `ArrayDesc::surface`. The surface holds the parent, which owns the level's storage.
+    pub fn from_level(array: &Arc<MipmappedArray>, level: u32) -> Result<Self, DriverError> {
+        let lvl = array.level(level)?;
+        if !lvl.desc().surface {
+            return Err(invalid_value());
+        }
+        Self::create(&lvl, SurfaceSource::Level(array.clone()))
+    }
+
+    fn create(array: &Array, source: SurfaceSource) -> Result<Self, DriverError> {
         let ctx = array.context();
         ctx.bind_to_thread()?;
         // SAFETY: zeroed resource descriptor, then the array.
@@ -333,12 +358,13 @@ impl SurfaceObject {
         res.resType = sys::CUresourcetype_enum_CU_RESOURCE_TYPE_ARRAY;
         res.res.array.hArray = array.cu_array();
         let mut raw: sys::CUsurfObject = 0;
-        // SAFETY: valid descriptor; the array is kept alive by `_array`.
+        // SAFETY: valid descriptor; the array (or the mipmapped array owning the level) is kept
+        // alive by `source`.
         unsafe { sys::cuSurfObjectCreate(&mut raw, &res) }.result()?;
         Ok(Self {
             raw,
             ctx: ctx.clone(),
-            _array: array.clone(),
+            _source: source,
         })
     }
 

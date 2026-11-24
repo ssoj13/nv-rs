@@ -35,6 +35,7 @@
 //! [`Scratch`]), render-rs and the nv-rs OptiX tests.
 
 use crate::micromap::{MicromapUse, OpacityMicromapArray};
+use crate::module::Primitive;
 use crate::xform::{Child, MotionOptions};
 use crate::{DeviceContext, Error, Result, check, entry, sys};
 use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, Stream};
@@ -324,51 +325,30 @@ pub enum CurveType {
 }
 
 impl CurveType {
-    fn raw(self) -> sys::OptixPrimitiveType {
+    /// The built-in primitive of this curve type: the one mapping to OptiX's primitive type and
+    /// pipeline flag ([`Primitive::raw`], [`Primitive::flag`]).
+    pub fn primitive(self) -> Primitive {
         match self {
-            Self::RoundLinear => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_LINEAR,
-            Self::RoundQuadraticBspline => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE
-            }
-            Self::RoundCubicBspline => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE
-            }
-            Self::RoundCatmullRom => sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM,
-            Self::RoundCubicBezier => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER
-            }
-            Self::RoundQuadraticBsplineRocaps => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_QUADRATIC_BSPLINE_ROCAPS
-            }
-            Self::RoundCubicBsplineRocaps => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BSPLINE_ROCAPS
-            }
-            Self::RoundCatmullRomRocaps => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CATMULLROM_ROCAPS
-            }
-            Self::RoundCubicBezierRocaps => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_ROUND_CUBIC_BEZIER_ROCAPS
-            }
-            Self::FlatQuadraticBspline => {
-                sys::OptixPrimitiveType_OPTIX_PRIMITIVE_TYPE_FLAT_QUADRATIC_BSPLINE
-            }
+            Self::RoundLinear => Primitive::RoundLinear,
+            Self::RoundQuadraticBspline => Primitive::RoundQuadraticBspline,
+            Self::RoundCubicBspline => Primitive::RoundCubicBspline,
+            Self::RoundCatmullRom => Primitive::RoundCatmullRom,
+            Self::RoundCubicBezier => Primitive::RoundCubicBezier,
+            Self::RoundQuadraticBsplineRocaps => Primitive::RoundQuadraticBsplineRocaps,
+            Self::RoundCubicBsplineRocaps => Primitive::RoundCubicBsplineRocaps,
+            Self::RoundCatmullRomRocaps => Primitive::RoundCatmullRomRocaps,
+            Self::RoundCubicBezierRocaps => Primitive::RoundCubicBezierRocaps,
+            Self::FlatQuadraticBspline => Primitive::FlatQuadraticBspline,
         }
+    }
+
+    fn raw(self) -> sys::OptixPrimitiveType {
+        self.primitive().raw()
     }
 
     /// The `OptixPrimitiveTypeFlags` bit for [`crate::PipelineOptions::primitive_types`].
     pub fn flag(self) -> u32 {
-        (match self {
-            Self::RoundLinear => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_LINEAR,
-            Self::RoundQuadraticBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE,
-            Self::RoundCubicBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE,
-            Self::RoundCatmullRom => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM,
-            Self::RoundCubicBezier => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER,
-            Self::RoundQuadraticBsplineRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_QUADRATIC_BSPLINE_ROCAPS,
-            Self::RoundCubicBsplineRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BSPLINE_ROCAPS,
-            Self::RoundCatmullRomRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CATMULLROM_ROCAPS,
-            Self::RoundCubicBezierRocaps => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_ROUND_CUBIC_BEZIER_ROCAPS,
-            Self::FlatQuadraticBspline => sys::OptixPrimitiveTypeFlags_OPTIX_PRIMITIVE_TYPE_FLAGS_FLAT_QUADRATIC_BSPLINE,
-        }) as u32
+        self.primitive().flag()
     }
 
     /// Polynomial degree: a segment spans `degree + 1` consecutive vertices.
@@ -785,9 +765,15 @@ pub struct Instance {
     pub sbt_offset: u32,
     /// Visibility mask (8 bits); a ray hits the instance when `ray_mask & mask != 0`.
     pub mask: u8,
-    /// `OptixInstanceFlags`.
+    /// `OptixInstanceFlags` bits, e.g. [`INSTANCE_FLAG_DISABLE_ANYHIT`].
     pub flags: u32,
 }
+
+/// `OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT` as the `u32` [`Instance::flags`] takes. C enums are `int`
+/// under MSVC and `unsigned int` under GCC, so the generated constant's type depends on the
+/// target; the bit-preserving conversion is the same on both.
+pub const INSTANCE_FLAG_DISABLE_ANYHIT: u32 =
+    u32::from_ne_bytes(sys::OptixInstanceFlags_OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT.to_ne_bytes());
 
 impl Instance {
     /// The identity transform.
@@ -1624,6 +1610,77 @@ fn gas_inputs<G: Gas>(items: &[G], cx: &Cx<'_>) -> Result<Inputs> {
     Ok(out)
 }
 
+/// The `OptixBuildInput` of `n` instances (or instance pointers) of `kind` at device address
+/// `instances`: the single packing of `OptixBuildInputInstanceArray`.
+fn instance_array_input(
+    kind: sys::OptixBuildInputType,
+    instances: sys::CUdeviceptr,
+    n: u32,
+) -> sys::OptixBuildInput {
+    let mut input = sys::OptixBuildInput {
+        type_: kind,
+        ..Default::default()
+    };
+    input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray {
+        instances,
+        numInstances: n,
+        instanceStride: 0,
+    };
+    input
+}
+
+/// The arguments of one `optixAccelBuild` call (see [`accel_build`]).
+struct BuildCall<'a> {
+    /// The call name in errors.
+    call: &'static str,
+    opts: &'a sys::OptixAccelBuildOptions,
+    inputs: &'a [sys::OptixBuildInput],
+    /// Temp memory: device address and byte length.
+    temp: (sys::CUdeviceptr, usize),
+    /// Output range: device address and byte length.
+    out: (sys::CUdeviceptr, usize),
+    /// Post-build property to write, if any.
+    emit: Option<&'a sys::OptixAccelEmitDesc>,
+    /// The traversable an update rebuilds in place; `0` for a fresh build.
+    handle: sys::OptixTraversableHandle,
+}
+
+/// One `optixAccelBuild` call: the single FFI site of every build, update and refit. Returns the
+/// (possibly new) traversable.
+///
+/// # Safety
+///
+/// `inputs` and everything they point at stay alive for the call; `temp` and `out` are ranges on
+/// `stream` of at least the sizes `optixAccelComputeMemoryUsage` reported for `opts` and
+/// `inputs`, aligned for OptiX; `emit`, when given, points at a writable property result; the
+/// caller orders every reader of `out` on `stream`.
+unsafe fn accel_build(
+    ctx: &DeviceContext,
+    stream: &Stream,
+    call: BuildCall<'_>,
+) -> Result<sys::OptixTraversableHandle> {
+    let n = count(call.inputs.len(), "too many build inputs")?;
+    let mut handle = call.handle;
+    // SAFETY: forwarded contract; `handle` is a live local.
+    check(call.call, unsafe {
+        entry!(ctx.table(), optixAccelBuild)(
+            ctx.raw(),
+            stream.cu_stream(),
+            call.opts,
+            call.inputs.as_ptr(),
+            n,
+            call.temp.0,
+            call.temp.1,
+            call.out.0,
+            call.out.1,
+            &mut handle,
+            call.emit.map_or(std::ptr::null(), |e| e as *const _),
+            u32::from(call.emit.is_some()),
+        )
+    })?;
+    Ok(handle)
+}
+
 /// One instance-array input over `raw` instances of `kind`'s device array `device`.
 fn instance_input(
     kind: sys::OptixBuildInputType,
@@ -1632,15 +1689,7 @@ fn instance_input(
     item: Item,
     children: Vec<Child>,
 ) -> Inputs {
-    let mut input = sys::OptixBuildInput {
-        type_: kind,
-        ..Default::default()
-    };
-    input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray {
-        instances: device.cu_deviceptr(),
-        numInstances: n,
-        instanceStride: 0,
-    };
+    let input = instance_array_input(kind, device.cu_deviceptr(), n);
     Inputs {
         inputs: vec![input],
         shape: vec![item],
@@ -1908,16 +1957,11 @@ impl Accel {
         let motion = opts.motion_sys()?;
         let keys = usize::from(opts.motion_keys);
 
-        let mut build_input = sys::OptixBuildInput {
-            type_: sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES,
-            ..Default::default()
-        };
-        build_input.__bindgen_anon_1.instanceArray = sys::OptixBuildInputInstanceArray {
-            instances: d_instances.device_ptr(),
-            numInstances: n,
-            instanceStride: 0,
-        };
-        let inputs_slice = [build_input];
+        let inputs_slice = [instance_array_input(
+            sys::OptixBuildInputType_OPTIX_BUILD_INPUT_TYPE_INSTANCES,
+            d_instances.device_ptr(),
+            n,
+        )];
         let want_shape = Item::Instances(n);
         // A structure of another device context is never updated or reused: its handle and
         // buffer belong to that context.
@@ -1942,25 +1986,23 @@ impl Accel {
             let sizes = Self::sizes(ctx, &accel_opts, &inputs_slice)?;
             within(opts.budget, scratch.growth(sizes.tempUpdateSizeInBytes))?;
             let (temp, temp_len) = scratch.reserve(stream, sizes.tempUpdateSizeInBytes)?;
-            let mut handle = existing.handle();
             // SAFETY: `d_instances` holds `n` aligned `OptixInstance`s on `stream`; `existing.buffer`
             // holds the previously built IAS; caller orders all readers on `stream`.
-            check("optixAccelBuild(instances_into update)", unsafe {
-                entry!(ctx.table(), optixAccelBuild)(
-                    ctx.raw(),
-                    stream.cu_stream(),
-                    &accel_opts,
-                    inputs_slice.as_ptr(),
-                    1,
-                    temp,
-                    temp_len,
-                    existing.buffer.cu_deviceptr(),
-                    existing.buffer.len(),
-                    &mut handle,
-                    std::ptr::null(),
-                    0,
+            let handle = unsafe {
+                accel_build(
+                    ctx,
+                    stream,
+                    BuildCall {
+                        call: "optixAccelBuild(instances_into update)",
+                        opts: &accel_opts,
+                        inputs: &inputs_slice,
+                        temp: (temp, temp_len),
+                        out: (existing.buffer.cu_deviceptr(), existing.buffer.len()),
+                        emit: None,
+                        handle: existing.handle(),
+                    },
                 )
-            })?;
+            }?;
             existing.handle.store(handle, Ordering::Release);
             let mut refs = existing
                 .refs
@@ -2008,25 +2050,23 @@ impl Accel {
         if can_reuse_in_place && let Some(arc) = target.as_mut()
             && let Some(existing) = Arc::get_mut(arc)
         {
-            let mut handle = 0;
             // SAFETY: `existing` is uniquely owned, its buffer is `OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT`
             // aligned with length `>= sizes.outputSizeInBytes`, and all readers are stream-ordered.
-            check("optixAccelBuild(instances_into reuse)", unsafe {
-                entry!(ctx.table(), optixAccelBuild)(
-                    ctx.raw(),
-                    stream.cu_stream(),
-                    &accel_opts,
-                    inputs_slice.as_ptr(),
-                    1,
-                    temp,
-                    temp_len,
-                    existing.buffer.cu_deviceptr(),
-                    existing.buffer.len(),
-                    &mut handle,
-                    std::ptr::null(),
-                    0,
+            let handle = unsafe {
+                accel_build(
+                    ctx,
+                    stream,
+                    BuildCall {
+                        call: "optixAccelBuild(instances_into reuse)",
+                        opts: &accel_opts,
+                        inputs: &inputs_slice,
+                        temp: (temp, temp_len),
+                        out: (existing.buffer.cu_deviceptr(), existing.buffer.len()),
+                        emit: None,
+                        handle: 0,
+                    },
                 )
-            })?;
+            }?;
             existing.handle.store(handle, Ordering::Release);
             if !same_stream(&existing.stream, stream) {
                 existing.stream = stream.clone();
@@ -2048,24 +2088,22 @@ impl Accel {
 
         // SAFETY: OptiX writes the output buffer before any launch reads it on `stream`.
         let output = unsafe { alloc(stream, alloc_bytes, sys::OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT) }?;
-        let mut handle = 0;
         // SAFETY: `output` has `alloc_bytes >= sizes.outputSizeInBytes` aligned bytes on `stream`.
-        check("optixAccelBuild(instances_into alloc)", unsafe {
-            entry!(ctx.table(), optixAccelBuild)(
-                ctx.raw(),
-                stream.cu_stream(),
-                &accel_opts,
-                inputs_slice.as_ptr(),
-                1,
-                temp,
-                temp_len,
-                output.cu_deviceptr(),
-                output.len(),
-                &mut handle,
-                std::ptr::null(),
-                0,
+        let handle = unsafe {
+            accel_build(
+                ctx,
+                stream,
+                BuildCall {
+                    call: "optixAccelBuild(instances_into alloc)",
+                    opts: &accel_opts,
+                    inputs: &inputs_slice,
+                    temp: (temp, temp_len),
+                    out: (output.cu_deviceptr(), output.len()),
+                    emit: None,
+                    handle: 0,
+                },
             )
-        })?;
+        }?;
         *target = Some(Arc::new(Self {
             handle: AtomicU64::new(handle),
             buffer: output,
@@ -2139,7 +2177,6 @@ impl Accel {
         inputs: Inputs,
         opts: &BuildOptions,
     ) -> Result<Arc<Self>> {
-        let t = ctx.table();
         let flags = opts.flags();
         let motion = opts.motion_sys()?;
         let keys = usize::from(opts.motion_keys);
@@ -2186,26 +2223,23 @@ impl Accel {
             result: b.cu_deviceptr(),
             type_: sys::OptixAccelPropertyType_OPTIX_PROPERTY_TYPE_COMPACTED_SIZE,
         });
-        let n = inputs.inputs.len() as u32; // bounded by `sizes` above
-        let mut handle = 0;
         // SAFETY: buffers are sized by OptiX above and ordered on `stream` (their frees come after
         // the build); `inputs` and what they point at live for the call.
-        check("optixAccelBuild", unsafe {
-            entry!(t, optixAccelBuild)(
-                ctx.raw(),
-                stream.cu_stream(),
-                &accel_opts,
-                inputs.inputs.as_ptr(),
-                n,
-                temp,
-                temp_len,
-                output.cu_deviceptr(),
-                sizes.outputSizeInBytes,
-                &mut handle,
-                emit.as_ref().map_or(std::ptr::null(), |e| e as *const _),
-                u32::from(emit.is_some()),
+        let handle = unsafe {
+            accel_build(
+                ctx,
+                stream,
+                BuildCall {
+                    call: "optixAccelBuild",
+                    opts: &accel_opts,
+                    inputs: &inputs.inputs,
+                    temp: (temp, temp_len),
+                    out: (output.cu_deviceptr(), sizes.outputSizeInBytes),
+                    emit: emit.as_ref(),
+                    handle: 0,
+                },
             )
-        })?;
+        }?;
         let (shape, refs) = (inputs.shape, inputs.refs);
         let make = |handle, buffer| {
             Arc::new(Self {
@@ -2240,7 +2274,7 @@ impl Accel {
         // SAFETY: `handle` was built with ALLOW_COMPACTION; `compact` holds `size` bytes on
         // `stream`; the source buffer's free is ordered after this call.
         check("optixAccelCompact", unsafe {
-            entry!(t, optixAccelCompact)(
+            entry!(ctx.table(), optixAccelCompact)(
                 ctx.raw(),
                 stream.cu_stream(),
                 handle,
@@ -2402,26 +2436,23 @@ impl Accel {
         };
         let sizes = Self::sizes(&self.ctx, &accel_opts, &inputs.inputs)?;
         let (temp, temp_len) = scratch.reserve(stream, sizes.tempUpdateSizeInBytes)?;
-        let mut handle = self.handle();
-        let n = inputs.inputs.len() as u32; // bounded by `sizes` above
         // SAFETY: updates in place into the structure's own buffer (its full, possibly compacted,
         // size); the caller keeps readers off it; inputs live for the call.
-        check("optixAccelBuild(update)", unsafe {
-            entry!(self.ctx.table(), optixAccelBuild)(
-                self.ctx.raw(),
-                stream.cu_stream(),
-                &accel_opts,
-                inputs.inputs.as_ptr(),
-                n,
-                temp,
-                temp_len,
-                self.buffer.cu_deviceptr(),
-                self.buffer.len(),
-                &mut handle,
-                std::ptr::null(),
-                0,
+        let handle = unsafe {
+            accel_build(
+                &self.ctx,
+                stream,
+                BuildCall {
+                    call: "optixAccelBuild(update)",
+                    opts: &accel_opts,
+                    inputs: &inputs.inputs,
+                    temp: (temp, temp_len),
+                    out: (self.buffer.cu_deviceptr(), self.buffer.len()),
+                    emit: None,
+                    handle: self.handle(),
+                },
             )
-        })?;
+        }?;
         self.handle.store(handle, Ordering::Release);
         let mut refs = self
             .refs
@@ -2702,5 +2733,40 @@ impl Accel {
     /// The device context the structure was built on.
     pub fn context(&self) -> &Arc<DeviceContext> {
         &self.ctx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CURVES: [CurveType; 10] = [
+        CurveType::RoundLinear,
+        CurveType::RoundQuadraticBspline,
+        CurveType::RoundCubicBspline,
+        CurveType::RoundCatmullRom,
+        CurveType::RoundCubicBezier,
+        CurveType::RoundQuadraticBsplineRocaps,
+        CurveType::RoundCubicBsplineRocaps,
+        CurveType::RoundCatmullRomRocaps,
+        CurveType::RoundCubicBezierRocaps,
+        CurveType::FlatQuadraticBspline,
+    ];
+
+    /// Every curve type maps to its own built-in primitive: distinct `OptixPrimitiveType` values,
+    /// distinct single-bit pipeline flags, and `CurveType` agrees with `Primitive` (one table).
+    #[test]
+    fn curve_types_map_to_distinct_primitives_through_one_table() {
+        for (i, a) in CURVES.iter().enumerate() {
+            assert_eq!(a.flag(), a.primitive().flag());
+            assert_eq!(a.raw(), a.primitive().raw());
+            assert_eq!(a.flag().count_ones(), 1, "{a:?} flag is one bit");
+            for b in &CURVES[i + 1..] {
+                assert_ne!(a.raw(), b.raw(), "{a:?} vs {b:?}");
+                assert_ne!(a.flag(), b.flag(), "{a:?} vs {b:?}");
+            }
+        }
+        assert_ne!(Primitive::Sphere.flag(), Primitive::Triangle.flag());
+        assert!(CURVES.iter().all(|c| c.flag() != Primitive::Sphere.flag()));
     }
 }

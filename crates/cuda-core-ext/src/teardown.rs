@@ -14,7 +14,7 @@
 //! `bind_to_thread`) stay on `Context::record_err`, the convention `cuda-core`'s own `Drop` impls
 //! use for the context they belong to; [`bind`] restores such an error on the context.
 //! **Used by** the `Drop` impls of `cublas`, `cudnn`, `cufft`, `cufile`, `cupti`, `curand`,
-//! `cusolver`, `cusparse`, `nccl`, `ngx`, `nvcomp`, `nvenc`, `nvjpeg`, `nvofa` and `optix`;
+//! `cusolver`, `cusparse`, `nccl`, `ngx`, `nvcomp`, `nvenc`, `nvjpeg`, `nvofa`, `nv-wgpu` and `optix`;
 //! `ngx::take_teardown_errors` is [`take`] for [`Library::Ngx`].
 
 use std::collections::VecDeque;
@@ -62,10 +62,13 @@ pub enum Library {
     Nvofa,
     /// OptiX.
     Optix,
+    /// `nv-wgpu` (bounded waits for `wgpu` submissions in `Drop`; the status is an
+    /// `nv_wgpu` wait code, not a native driver status).
+    NvWgpu,
 }
 
 impl Library {
-    const ALL: [Library; 16] = [
+    const ALL: [Library; 17] = [
         Library::Cublas,
         Library::CublasLt,
         Library::Cudnn,
@@ -82,6 +85,7 @@ impl Library {
         Library::Nvjpeg,
         Library::Nvofa,
         Library::Optix,
+        Library::NvWgpu,
     ];
 
     fn index(self) -> usize {
@@ -107,6 +111,7 @@ impl Library {
             Library::Nvjpeg => "nvjpeg",
             Library::Nvofa => "nvofa",
             Library::Optix => "optix",
+            Library::NvWgpu => "nv-wgpu",
         }
     }
 }

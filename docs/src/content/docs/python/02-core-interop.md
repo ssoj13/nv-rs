@@ -86,6 +86,10 @@ assert d_in.to_bytes(stream) == payload
 
 `DeviceBuffer` implements both the **DLPack** protocol (`__dlpack__`, `__dlpack_device__`, `from_dlpack`) and **`__cuda_array_interface__` v3**, enabling zero-copy sharing with PyTorch, CuPy, JAX, and other CUDA-aware Python libraries.
 
+:::caution[Import `torch` before `nv_rs` (Windows)]
+PyTorch ships its own cuDNN 9 build, and two different cuDNN builds cannot share one Windows process. If `torch` is imported first, `nv_rs` adopts the cuDNN copy that is already loaded (reported as loader diagnostic `cudnn`/`adopt`). If `nv_rs` loads cuDNN first, a later `import torch` can fail with `WinError 127`, and this cannot be fixed from Rust. In scripts, plugins and DCC sessions that use both, import `torch` first; where you do not control module load order, import it at startup.
+:::
+
 ```python
 import torch
 import cupy as cp

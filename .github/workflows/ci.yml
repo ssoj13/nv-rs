@@ -89,6 +89,87 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
+  # `device/` is a separate cargo workspace (Rust -> PTX through cuda-oxide), so the jobs above never
+  # compile it. Decision: BUILD-ONLY on a hosted runner. `cargo oxide build --arch sm_86` needs the
+  # CUDA Toolkit and the OptiX headers (host crates `optix` / `cuda-core-ext` are path deps) but no
+  # GPU or driver, so it runs on ubuntu-26.04 (the image setup-cuda targets). `cargo oxide run`
+  # (the 15 GPU cases, wave_6_device.md D1) needs an RTX GPU and stays a manual check on hardware.
+  # The cuda-oxide fork `ssoj13/cuda-rust_b` is private, so this job needs a repository secret
+  # CUDA_RUST_B_TOKEN (fine-grained PAT, Contents: read on that repo). It is skipped for fork PRs,
+  # which cannot read secrets; everywhere else a missing token fails the job instead of skipping it.
+  device:
+    name: device build (cargo oxide)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      CUDA_RUST_B_TOKEN: ${{ secrets.CUDA_RUST_B_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Require fork access token
+        shell: bash
+        run: |
+          if [ -z "${CUDA_RUST_B_TOKEN}" ]; then
+            echo "::error::secret CUDA_RUST_B_TOKEN is not set; device/ depends on the private ssoj13/cuda-rust_b fork"
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${CUDA_RUST_B_TOKEN}@github.com/ssoj13/cuda-rust_b".insteadOf "https://github.com/ssoj13/cuda-rust_b"
+
+      # device/rust-toolchain.toml is the pin for this workspace (cuda-oxide refuses other
+      # toolchains and needs rust-src, rustc-dev and llvm-tools); rustup installs exactly it,
+      # components included, when run from device/.
+      - name: Install device toolchain
+        shell: bash
+        working-directory: device
+        run: |
+          rustup toolchain install --profile minimal
+          rustup show active-toolchain
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: device
+
+      - name: Install libclang for bindgen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config clang libclang-dev
+
+      - name: Setup CUDA Toolkit
+        uses: ./.github/actions/setup-cuda
+
+      - name: Fetch pinned OptiX headers
+        shell: bash
+        run: |
+          python bootstrap.py deps dl --only optix
+          echo "OPTIX_ROOT=${GITHUB_WORKSPACE}/.sdk/optix" >> "$GITHUB_ENV"
+
+      # Install cargo-oxide from the same fork revision device/Cargo.lock builds against, so the
+      # driver and the cuda-device/cuda-core crates it compiles with cannot drift apart.
+      - name: Install cargo-oxide (revision from device/Cargo.lock)
+        shell: bash
+        working-directory: device
+        run: |
+          rev="$(python -c "import re; print(re.search(r'cuda-rust_b\.git\?branch=main#([0-9a-f]{40})', open('Cargo.lock').read()).group(1))")"
+          echo "cargo-oxide revision: ${rev}"
+          cargo install --locked --git https://github.com/ssoj13/cuda-rust_b.git --rev "${rev}" cargo-oxide
+
+      - name: Build device code (PTX)
+        working-directory: device/optix-device-tests
+        run: cargo oxide build --arch sm_86
+
+      - name: Clippy (device workspace)
+        working-directory: device
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   # Licenses, advisories, bans and git/registry sources from deny.toml.
   deny:
     name: cargo deny

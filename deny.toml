@@ -19,6 +19,16 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.8
+# Crates in Cargo.lock whose only license is outside the allow list (read from their registry
+# Cargo.toml). Scoped per crate so the global list stays permissive-only.
+exceptions = [
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
+    { crate = "tiny-keccak", allow = ["CC0-1.0"] },
+    { crate = "smartstring", allow = ["MPL-2.0"] },
+    # egui default fonts: the code is MIT OR Apache-2.0, the bundled fonts OFL-1.1 and Ubuntu-font-1.0.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
 
 [bans]
 # Duplicate versions come from transitive dependencies and are reported, not blocking.

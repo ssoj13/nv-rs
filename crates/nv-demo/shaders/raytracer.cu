@@ -2,7 +2,8 @@
 #include "csg_eval.cuh"
 
 // Hidden-line wireframe G-buffer pass (`wireframe.rs`): one pixel-centre primary ray per pixel.
-// out_normal_f32 = (octahedral normal, depth, instance key bits; WIRE_MISS_KEY on a miss),
+// out_normal_f32 = (packed octahedral normal, object diameter, depth, instance key bits;
+// WIRE_MISS_KEY on a miss),
 // out_color_f32.w = this frame's ambient occlusion. tonemap.cu `wire_*` kernels extract and draw
 // the contour lines and accumulate the display colour into out_color_f32.xyz.
 #define AOV_WIREFRAME 11u
@@ -19,6 +20,14 @@ static __forceinline__ __device__ float2 wire_oct_encode(float3 n) {
         e = make_float2(ex, ey);
     }
     return e;
+}
+
+// Packs an octahedral normal into one 32-bit word (two 16-bit snorm halves) so the wireframe
+// G-buffer texel has room for the object diameter (`wire_load` in tonemap.cu unpacks it).
+static __forceinline__ __device__ unsigned int wire_oct_pack(float2 e) {
+    int x = __float2int_rn(fmaxf(-1.0f, fminf(1.0f, e.x)) * 32767.0f);
+    int y = __float2int_rn(fmaxf(-1.0f, fminf(1.0f, e.y)) * 32767.0f);
+    return ((unsigned int)x & 0xFFFFu) | (((unsigned int)y & 0xFFFFu) << 16u);
 }
 
 struct Params {
@@ -2062,6 +2071,9 @@ extern "C" __global__ void __raygen__render() {
     // wireframe G-buffer needs only the pixel-centre tap (s = 0, one primary ray per pixel).
     const bool aov_wire = (params.aov_mode == AOV_WIREFRAME);
     float wire_occ = 0.0f;
+    // World diameter of the hit object for the wireframe line LOD (1e6 = unknown / unbounded:
+    // never faded).
+    float wire_diam = 1e6f;
     const unsigned int ctr_tap = aov_wire ? 0u : 4u;
     const unsigned int loop_spp = aov_wire ? 1u : (aov_aa ? 5u : spp);
     float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
@@ -2633,6 +2645,24 @@ extern "C" __global__ void __raygen__render() {
                     if (trace_shadow(ao_org, sample_cosine_hemisphere(n, ao_seed), ao_r)) ++occ;
                 }
                 wire_occ = (float)occ / (float)WIRE_AO_RAYS;
+                if (is_csg && params.csg_instances != 0ull && params.csg_compounds != 0ull
+                    && p6 < params.csg_instance_count) {
+                    const uint4 meta = load_csg_instance_meta(p6);
+                    if (meta.x < params.csg_compound_count) {
+                        const CsgGpuCompound cmp = ((const CsgGpuCompound*)params.csg_compounds)[meta.x];
+                        if ((cmp.flags & 1u) == 0u) {
+                            // Local AABB diagonal times the largest axis scale of the instance.
+                            const float* m = ((const CsgGpuInstance*)params.csg_instances)[p6].xform;
+                            float sx = sqrtf(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+                            float sy = sqrtf(m[1] * m[1] + m[5] * m[5] + m[9] * m[9]);
+                            float sz = sqrtf(m[2] * m[2] + m[6] * m[6] + m[10] * m[10]);
+                            float dx = cmp.aabb_max[0] - cmp.aabb_min[0];
+                            float dy = cmp.aabb_max[1] - cmp.aabb_min[1];
+                            float dz = cmp.aabb_max[2] - cmp.aabb_min[2];
+                            wire_diam = sqrtf(dx * dx + dy * dy + dz * dz) * fmaxf(sx, fmaxf(sy, sz));
+                        }
+                    }
+                }
             }
             if (aov_aa) {
                 break;
@@ -2763,12 +2793,13 @@ extern "C" __global__ void __raygen__render() {
 
     unsigned int out_idx = idx.y * params.width + idx.x;
     if (aov_wire) {
-        // This frame's G-buffer, overwritten every frame; `wire_draw` accumulates the display
+        // This frame's G-buffer, overwritten every frame; `wire_faces` accumulates the display
         // colour into out_color_f32.xyz and only reads this frame's AO from .w.
         unsigned int key = first_has_hit ? first_inst_id : WIRE_MISS_KEY;
         float2 o1 = wire_oct_encode(first_has_hit ? f3_norm(first_normal) : make_float3(0.0f, 0.0f, 1.0f));
-        ((float4*)params.out_normal_f32)[out_idx] =
-            make_float4(o1.x, o1.y, first_depth, __uint_as_float(key));
+        ((float4*)params.out_normal_f32)[out_idx] = make_float4(
+            __uint_as_float(wire_oct_pack(o1)), first_has_hit ? wire_diam : 1e6f, first_depth,
+            __uint_as_float(key));
         ((float*)params.out_color_f32)[4ull * out_idx + 3ull] = wire_occ;
     }
     if (params.out_motion_f32 != 0ull) {

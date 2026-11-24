@@ -537,7 +537,10 @@ const CSG_PINNED_STAGING_BYTES: usize = 2 * 1024 * 1024;
 const CSG_PINNED_STAGING_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Reusable grow-on-demand page-locked host staging buffer (`cuMemAllocHost_v2` / `cuMemFreeHost`).
-struct PinnedStagingBuffer {
+///
+/// Why: `cuMemcpyHtoDAsync` from pageable memory synchronises the stream first; uploads from
+/// this block stay asynchronous. Shared with the overlay upload (`renderer::OverlayRig`).
+pub(crate) struct PinnedStagingBuffer {
     ptr: *mut c_void,
     bytes: usize,
     ctx: Arc<CudaContext>,
@@ -548,7 +551,8 @@ struct PinnedStagingBuffer {
 unsafe impl Send for PinnedStagingBuffer {}
 
 impl PinnedStagingBuffer {
-    fn try_new(ctx: &Arc<CudaContext>, bytes: usize) -> Option<Self> {
+    /// Allocates `bytes` of page-locked host memory on `ctx`; `None` on failure.
+    pub(crate) fn try_new(ctx: &Arc<CudaContext>, bytes: usize) -> Option<Self> {
         if bytes == 0 || ctx.bind_to_thread().is_err() {
             return None;
         }
@@ -564,6 +568,11 @@ impl PinnedStagingBuffer {
         } else {
             None
         }
+    }
+
+    /// Start of the page-locked block (valid for its allocated size while `self` lives).
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr
     }
 
     /// Ensures this page-locked staging buffer holds at least `needed_bytes`, growing power-of-two

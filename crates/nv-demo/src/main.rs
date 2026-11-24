@@ -15,6 +15,7 @@ mod gpu_export;
 mod mp4_muxer;
 mod nvtx;
 mod optix_sdk;
+mod overlay;
 mod perf_log;
 mod persist;
 mod profiler;
@@ -3345,6 +3346,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 frames,
                 warmup: run.args.warmup,
                 image: run.args.image.clone(),
+                png_dir: run.args.png_dir.clone(),
             };
             run.phase = crate::bench::BenchPhase::Running;
             self.tod_transition = None;
@@ -4018,6 +4020,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Wireframe lines are drawn at the native viewport resolution: no DLSS input scale, no
             // render scale (a reduced internal resolution upscaled to the viewport blurs them).
             let wire = self.settings.display_mode == crate::wireframe::DisplayMode::Wireframe;
+            // The renderer leaves the overlay out of recorded frames when captures exclude it.
+            self.settings.capture_active = self.video_recorder.is_some();
             let dlss_any = !wire && (self.settings.dlss_on || self.settings.dlss_rr_on);
             let (out_w, out_h) =
                 align_render_size(self.desired_vp_size.0, self.desired_vp_size.1, 1.0);

@@ -235,6 +235,8 @@ pub enum RenderControl {
         frames: u32,
         warmup: u32,
         image: Option<std::path::PathBuf>,
+        /// Directory for every frame's displayed image as PNG (`bench::BenchRailArgs::png_dir`).
+        png_dir: Option<std::path::PathBuf>,
     },
     /// Gracefully terminate the render worker thread.
     Shutdown,

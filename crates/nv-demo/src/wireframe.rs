@@ -8,20 +8,21 @@
 //!   of each pixel is used, so geometry behind a surface never contributes a line.
 //! - **How**: in wireframe mode `main.rs` renders at the native viewport resolution (no DLSS
 //!   input scale, no render scale) and the raygen runs with `aov_mode == AOV_WIREFRAME`: one
-//!   pixel-centre primary ray, `(octahedral normal, depth, instance key)` into `normal_f32`, the
-//!   frame's AO into `color_f32.w`. Three CUDA kernels in `shaders/tonemap.cu` then build vector
+//!   pixel-centre primary ray, `(packed octahedral normal, object diameter, depth, instance key)`
+//!   into `normal_f32`, the frame's AO into `color_f32.w`. `shaders/tonemap.cu` then builds vector
 //!   contours on the pixel-centre lattice: `wire_classify` marks every lattice edge whose two
 //!   pixels differ (sky / depth jump = silhouette; other instance or crease angle = crease) with
 //!   a crossing vertex (marching squares), `wire_smooth` runs `WIRE_SMOOTH_STEPS` Laplacian passes
 //!   that pull each vertex towards its two contour neighbours unless the contour turns sharply
-//!   there (corners, junctions and line ends stay), and `wire_draw` strokes each cell's segments
-//!   with a constant screen width and an analytic distance falloff, composited in linear light.
-//!   The tonemap applies the sRGB transfer, so captures contain the lines.
+//!   there (corners, junctions and line ends stay), and `wire_faces` shades flat light-grey faces
+//!   with slight AO. The lines themselves are not drawn here: `wire_emit` is the contour provider
+//!   of the generic overlay renderer (`overlay.rs`), which strokes them after the tonemap with a
+//!   constant screen width, line LOD by projected object size and temporal stabilisation.
 //! - **Memory**: no per-frame allocation. The G-buffer and first vertex buffer reuse
 //!   `normal_f32` / `albedo_f32`; `wire_cls_u32` and `wire_pos_f32` are allocated once on first
 //!   use (and on resize) by `renderer::ensure_lazy_aovs`.
-//! - **Used by**: `renderer.rs` (`launch_wireframe`), `ui.rs` (viewport selector and line width),
-//!   `main.rs` (native resolution, DLSS off, capture decisions via
+//! - **Used by**: `renderer.rs` (`launch_wireframe`, `run_overlay`), `ui.rs` (viewport selector and
+//!   line width), `main.rs` (native resolution, DLSS off, capture decisions via
 //!   `DemoSettings::launch_aov_mode`). The settings persist with the rest of `DemoSettings`.
 //! - **Voxel view**: pending; csg-scene exposes no voxel volume / ESDF yet (`PLAN.md` `DEMO:VIEWS`).
 
@@ -43,8 +44,8 @@ pub const WIRE_CREASE_COS: f32 = 0.82;
 pub const WIRE_LINE_PX_DEFAULT: f32 = 1.5;
 /// Smallest selectable silhouette stroke width.
 pub const WIRE_LINE_PX_MIN: f32 = 0.75;
-/// Largest selectable silhouette stroke width; `wire_draw` gathers cells within 4 px
-/// (`WIRE_HALO`), which covers a stroke of this width plus the smoothing drift.
+/// Largest selectable silhouette stroke width (a drawing aid, not a thickness: wider strokes
+/// merge neighbouring contours).
 pub const WIRE_LINE_PX_MAX: f32 = 2.5;
 /// Crease strokes are this fraction of the silhouette width.
 pub const WIRE_CREASE_WIDTH_RATIO: f32 = 2.0 / 3.0;
@@ -93,7 +94,7 @@ impl DisplayMode {
 
 #[cfg(test)]
 mod tests {
-    //! CPU mirror of the `wire_classify` / `wire_smooth` / `wire_draw` rules in
+    //! CPU mirror of the `wire_classify` / `wire_smooth` rules and `ovl_coverage` in
     //! `shaders/tonemap.cu`; keep both identical.
 
     use super::*;
@@ -155,7 +156,7 @@ mod tests {
         if d < WIRE_CREASE_COS { CREASE } else { NONE }
     }
 
-    /// `wire_coverage`.
+    /// `ovl_coverage`.
     fn coverage(dist: f32, width: f32) -> f32 {
         let t = (0.5 * width + 0.5 - dist).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t) * width.min(1.0)

@@ -23,6 +23,7 @@ use crate::renderer::{
 };
 use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
 use crate::viewport_toolbar::{self as vt, TbTone, tb_icon_button, tb_separator};
+use crate::overlay::{OverlayKind, OverlayScope};
 use crate::wireframe::DisplayMode;
 
 /// Possession-toolbar icons of camera mounts by index (the label is the tooltip).
@@ -1009,6 +1010,69 @@ impl UiContext<'_> {
                     })
                     .response
                     .on_hover_text("Lens / sensor projection");
+                tb_separator(ui);
+
+                // 1b. Overlay (overlay.rs): master switch, kinds, scope, screen-size cull, captures
+                let ov = &mut self.settings.overlay;
+                if tb_icon_button(ui, ic::LINE_SEGMENTS, ov.enabled, TbTone::Normal, "Overlay: draw overlay lines")
+                    .clicked()
+                {
+                    ov.enabled = !ov.enabled;
+                }
+                ui.add_enabled_ui(ov.enabled, |ui| {
+                    for kind in OverlayKind::ALL {
+                        let icon = match kind {
+                            OverlayKind::Contours => ic::POLYGON,
+                        };
+                        if tb_icon_button(ui, icon, ov.kinds & kind.bit() != 0, TbTone::Normal, kind.label())
+                            .clicked()
+                        {
+                            ov.kinds ^= kind.bit();
+                        }
+                    }
+                    for scope in OverlayScope::ALL {
+                        let icon = match scope {
+                            OverlayScope::All => ic::GLOBE,
+                            OverlayScope::Selected => ic::CURSOR_CLICK,
+                            OverlayScope::WithinRadius => ic::CIRCLE_DASHED,
+                        };
+                        if tb_icon_button(ui, icon, ov.scope == scope, TbTone::Normal, scope.label()).clicked() {
+                            ov.scope = scope;
+                        }
+                    }
+                    if ov.scope == OverlayScope::WithinRadius {
+                        ui.add(egui::DragValue::new(&mut ov.radius_m).range(1.0..=5000.0).speed(1.0).suffix(" m"))
+                            .on_hover_text("Overlay radius around the camera");
+                    }
+                    ui.add_sized(vt::TB_BUTTON_SIZE, egui::Label::new(RichText::new(ic::FUNNEL).size(vt::TB_ICON_SIZE)))
+                        .on_hover_text("Screen-size cull");
+                    ui.add(egui::DragValue::new(&mut ov.min_screen_px).range(0.0..=64.0).speed(0.1).suffix(" px"))
+                        .on_hover_text(
+                            "Line LOD: shapes smaller than this on screen are not drawn; contour                              lines fade in between this and 3x this projected object size",
+                        );
+                    if tb_icon_button(
+                        ui,
+                        ic::WAVES,
+                        ov.temporal,
+                        TbTone::Normal,
+                        "Temporal stabilisation: reproject and blend the line coverage so lines do not flicker",
+                    )
+                    .clicked()
+                    {
+                        ov.temporal = !ov.temporal;
+                    }
+                    if tb_icon_button(
+                        ui,
+                        ic::FILM_SLATE,
+                        ov.in_captures,
+                        TbTone::Normal,
+                        "Include the overlay in video recordings (stills always show the viewport image)",
+                    )
+                    .clicked()
+                    {
+                        ov.in_captures = !ov.in_captures;
+                    }
+                });
                 tb_separator(ui);
 
                 // 2. Day / Sunset / Night (routed through the smooth transition)

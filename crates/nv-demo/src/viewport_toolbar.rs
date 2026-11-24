@@ -286,8 +286,12 @@ pub const fn possess_bar_expanded(
 /// persisted user choices and last frame's possession flag.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PossessToolbar {
+    /// The bar's own state; its edge is copied from the viewport toolbar every frame so the two
+    /// always share a corner.
     pub bar: ToolbarState,
+    /// The user's persisted choices (manual collapse, pin).
     pub prefs: PossessBarPrefs,
+    /// Last frame's possession state, to detect entering / leaving possession.
     pub was_possessing: bool,
 }
 

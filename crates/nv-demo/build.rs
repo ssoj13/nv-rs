@@ -174,6 +174,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_embedded_ptx)");
     println!("cargo:rerun-if-changed=shaders/raytracer.cu");
     println!("cargo:rerun-if-changed=shaders/tonemap.cu");
+    println!("cargo:rerun-if-changed=shaders/overlay_segment.cuh");
     println!("cargo:rerun-if-changed=src/optix_sdk.rs");
     println!("cargo:rerun-if-env-changed=OPTIX_ROOT");
     println!("cargo:rerun-if-env-changed=ProgramData");

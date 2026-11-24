@@ -264,6 +264,269 @@ extern "C" __global__ void tonemap_f32_to_scrgb_f16(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Overlay raster (overlay.rs). One device-resident segment list (`overlay_segment.cuh`: CPU
+// primitives uploaded first, GPU providers append with `nv_overlay_push`), one antialiased line
+// pass, one composite with temporal stabilisation:
+//   ovl_splat      one block per segment: world segments are projected with the pinhole camera
+//                  (other lenses count an UNPROJECTABLE fault), the shared filter is applied
+//                  (selected instance, radius), then every pixel near the segment gets the
+//                  analytic coverage of a constant-width stroke (dashes, fade, optional depth
+//                  test against the primary-hit depth) as `coverage << 24 | style` (max wins).
+//   ovl_composite  temporal stabilisation (the previous frame's coverage reprojected with the
+//                  motion vectors, clamped to the current 3x3 coverage range, exponentially
+//                  blended) and a linear-light blend into the tonemapped outputs.
+// ---------------------------------------------------------------------------------------------
+
+#if !defined(NV_DEMO_OVERLAY_SEGMENT_CUH)
+#include "overlay_segment.cuh"
+#endif
+
+struct OvlStyle {
+    float r, g, b, a;
+    float width;
+    float dash_on;
+    float dash_off;
+    unsigned int depth_mode;
+};
+
+// Camera of the frame, for projecting world-space segments (pinhole only).
+struct OvlCamera {
+    float eye[3];
+    float tan_half_fov;
+    float fwd[3];
+    float aspect;
+    float right[3];
+    unsigned int pinhole;
+    float up[3];
+    unsigned int selected;  // instance key of the Selected scope, 0xFFFFFFFF = all
+    float radius;           // WithinRadius scope (view depth / distance), <= 0 = off
+    float min_px;           // line LOD: records whose proj_size_px is below this are not drawn
+    float pad[2];
+};
+
+#define OVL_DEPTH_ALWAYS 0u
+#define OVL_DEPTH_SKIP_HIDDEN 1u
+#define OVL_DEPTH_FADE_HIDDEN 2u
+#define OVL_NO_SELECTION 0xFFFFFFFFu
+
+// Coverage of a stroke `width` px wide whose centre line is `dist` px from the pixel centre:
+// smoothstep over one pixel of falloff; strokes thinner than a pixel fade in opacity instead.
+static __forceinline__ __device__ float ovl_coverage(float dist, float width) {
+    float t = fminf(1.0f, fmaxf(0.0f, 0.5f * width + 0.5f - dist));
+    return t * t * (3.0f - 2.0f * t) * fminf(1.0f, width);
+}
+
+// World point -> (x px, y px, planar depth); false behind the camera.
+static __forceinline__ __device__ bool ovl_project(
+    const OvlCamera& c, const float* p, float w, float h, float3& out
+) {
+    float v0 = p[0] - c.eye[0], v1 = p[1] - c.eye[1], v2 = p[2] - c.eye[2];
+    float z = v0 * c.fwd[0] + v1 * c.fwd[1] + v2 * c.fwd[2];
+    if (z <= 1e-3f) return false;
+    float xn = (v0 * c.right[0] + v1 * c.right[1] + v2 * c.right[2]) / (z * c.tan_half_fov * c.aspect);
+    float yn = (v0 * c.up[0] + v1 * c.up[1] + v2 * c.up[2]) / (z * c.tan_half_fov);
+    out = make_float3((xn * 0.5f + 0.5f) * w, (0.5f - 0.5f * yn) * h, z);
+    return true;
+}
+
+extern "C" __global__ void ovl_splat(
+    const NvOverlaySegment* segs,
+    unsigned int* counter,
+    unsigned int cap,
+    const OvlStyle* styles,
+    unsigned int style_count,
+    const OvlCamera* cam,
+    const float* depth,
+    unsigned int* cov,
+    unsigned int width,
+    unsigned int height
+) {
+    const unsigned int n = min(counter[0], cap);
+    const OvlCamera c = *cam;
+    for (unsigned int si = blockIdx.x; si < n; si += gridDim.x) {
+        const NvOverlaySegment s = segs[si];
+        if (s.style >= style_count) continue;
+        // Kind dispatch: straight kinds share the segment raster; analytic kinds (arc, ellipse,
+        // conic) slot in here with their own exact distance, until then they are a fault.
+        if (s.kind != NV_OVERLAY_KIND_SEGMENT && s.kind != NV_OVERLAY_KIND_POLYLINE_CHUNK) {
+            if (threadIdx.x == 0) atomicAdd(&counter[3], 1u);
+            continue;
+        }
+        if (c.selected != OVL_NO_SELECTION && s.inst_id != c.selected) continue;
+        const OvlStyle st = styles[s.style];
+        float3 pa, pb;
+        if ((s.flags & NV_OVERLAY_FLAG_WORLD) != 0u) {
+            bool ok = c.pinhole != 0u
+                && ovl_project(c, s.a, (float)width, (float)height, pa)
+                && ovl_project(c, s.b, (float)width, (float)height, pb);
+            if (!ok) {
+                if (c.pinhole == 0u && threadIdx.x == 0) atomicAdd(&counter[2], 1u);
+                continue;
+            }
+        } else {
+            pa = make_float3(s.a[0], s.a[1], s.a[2]);
+            pb = make_float3(s.b[0], s.b[1], s.b[2]);
+        }
+        if (c.radius > 0.0f && fminf(pa.z, pb.z) > c.radius && pa.z > 0.0f) continue;
+        // Line LOD (why: features smaller than a couple of pixels are undersampled and would
+        // shimmer): fade from 0 at `min_px` to full at `3 * min_px` of projected feature size.
+        float fade = 1.0f;
+        if (c.min_px > 0.0f && s.proj_size_px > 0.0f) {
+            const float lt = fminf(1.0f, fmaxf(0.0f, (s.proj_size_px - c.min_px) / (2.0f * c.min_px)));
+            fade = lt * lt * (3.0f - 2.0f * lt);
+        }
+        const bool selected = (s.flags & NV_OVERLAY_FLAG_SELECTED) != 0u;
+        if (selected) fade = 1.0f;
+        if (fade <= 0.0f) continue;
+        const bool flag_hidden = (s.flags & NV_OVERLAY_FLAG_HIDDEN) != 0u;
+        const bool depth_test = (s.flags & NV_OVERLAY_FLAG_NO_DEPTH_TEST) == 0u;
+        // Width in px; world-width styles are projected at the nearer end (constant along the
+        // segment, which is short for every world provider).
+        float width_px = st.width;
+        if ((s.flags & NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH) == 0u) {
+            const float zn = fmaxf(fminf(pa.z, pb.z), 1e-3f);
+            width_px = st.width * (float)height / (2.0f * fmaxf(c.tan_half_fov, 1e-4f) * zn);
+        }
+        if (selected) width_px *= 1.5f;
+        const float reach = 0.5f * width_px + 0.5f;
+        const float dx = pb.x - pa.x, dy = pb.y - pa.y;
+        const float len = sqrtf(dx * dx + dy * dy);
+        // Walk the major axis; each column / row covers the band around the segment there.
+        const bool xmajor = fabsf(dx) >= fabsf(dy);
+        const float a0 = xmajor ? pa.x : pa.y, a1 = xmajor ? pb.x : pb.y;
+        const float b0 = xmajor ? pa.y : pa.x, b1 = xmajor ? pb.y : pb.x;
+        const float da = a1 - a0;
+        const float slope = (fabsf(da) > 1e-6f) ? (b1 - b0) / da : 0.0f;
+        const float band = (len > 1e-6f) ? reach * len / fmaxf(fabsf(da), 1e-6f) : reach;
+        const int c0 = (int)floorf(fminf(a0, a1) - reach);
+        const int c1 = (int)ceilf(fmaxf(a0, a1) + reach);
+        if (c1 - c0 > 8192) continue;  // degenerate projection (point near the eye plane)
+        const int rows = 2 * (int)ceilf(band + 1.0f) + 1;
+        const long long total = (long long)(c1 - c0 + 1) * (long long)rows;
+        for (long long k = threadIdx.x; k < total; k += blockDim.x) {
+            const int ci = c0 + (int)(k / rows);
+            const float cc = (float)ci + 0.5f;
+            const float tc = (fabsf(da) > 1e-6f) ? fminf(1.0f, fmaxf(0.0f, (cc - a0) / da)) : 0.0f;
+            const float bc = b0 + slope * (tc * da);
+            const int ri = (int)floorf(bc) - rows / 2 + (int)(k % rows);
+            const int px = xmajor ? ci : ri, py = xmajor ? ri : ci;
+            if (px < 0 || py < 0 || px >= (int)width || py >= (int)height) continue;
+            const float pcx = (float)px + 0.5f, pcy = (float)py + 0.5f;
+            float t = 0.0f;
+            if (len > 1e-6f) {
+                t = fminf(1.0f, fmaxf(0.0f, ((pcx - pa.x) * dx + (pcy - pa.y) * dy) / (len * len)));
+            }
+            const float ex = pcx - (pa.x + t * dx), ey = pcy - (pa.y + t * dy);
+            float cv = ovl_coverage(sqrtf(ex * ex + ey * ey), width_px) * st.a * fade;
+            if (cv <= 0.0f) continue;
+            float dash_on = st.dash_on, dash_off = st.dash_off;
+            bool hidden = flag_hidden;
+            if (!hidden && depth_test && st.depth_mode != OVL_DEPTH_ALWAYS && depth != nullptr
+                && pa.z > 0.0f && pb.z > 0.0f) {
+                // Perspective-correct view depth along the segment vs. the primary hit.
+                const float z = 1.0f / ((1.0f - t) / pa.z + t / pb.z) - s.depth_bias;
+                const float d = depth[(unsigned int)py * width + (unsigned int)px];
+                hidden = z > d * 1.002f + 1e-3f;
+                if (hidden && st.depth_mode == OVL_DEPTH_SKIP_HIDDEN) continue;
+            }
+            if (hidden || (s.flags & NV_OVERLAY_FLAG_DASHED) != 0u) {
+                if (hidden) cv *= 0.35f;
+                if (dash_on <= 0.0f) {
+                    dash_on = 4.0f;
+                    dash_off = 3.0f;
+                }
+            }
+            if (dash_on > 0.0f && dash_off > 0.0f) {
+                const float sp = s.s0 + t * len;
+                const float period = dash_on + dash_off;
+                if (sp - floorf(sp / period) * period > dash_on) continue;
+            }
+            const unsigned int q = (unsigned int)(fminf(1.0f, cv) * 255.0f + 0.5f);
+            if (q == 0u) continue;
+            atomicMax(&cov[(unsigned int)py * width + (unsigned int)px], (q << 24u) | (s.style & 0xFFFFFFu));
+        }
+    }
+}
+
+static __forceinline__ __device__ float ovl_f16_to_f32(unsigned short h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+// Temporal stabilisation + composite. `hist_in` is the previous frame's stabilised coverage
+// (same packing as `cov`), reprojected with `motion` (backward flow in pixels: previous =
+// current + motion); its alpha is clamped to the current 3x3 coverage range (no ghosting) and
+// blended with weight `blend` for the new frame (exponential history, like a TAA resolve).
+// `hist_out` receives the result (ping-pong, never the same buffer as `hist_in`). RGBA8 is
+// sRGB-encoded (the tonemap's 1/2.2 curve): decoded, blended in linear light, re-encoded;
+// scRGB is linear (1.0 = 80 nits, lines at paper white). `motion` / `hist_in` may be null
+// (no stabilisation).
+extern "C" __global__ void ovl_composite(
+    const unsigned int* cov,
+    const unsigned int* hist_in,
+    unsigned int* hist_out,
+    const float2* motion,
+    float blend,
+    const OvlStyle* styles,
+    unsigned int style_count,
+    uchar4* dst8,
+    ushort4* dst16,
+    unsigned int width,
+    unsigned int height
+) {
+    const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const unsigned int i = y * width + x;
+    const unsigned int v = cov[i];
+    float a = (float)(v >> 24u) / 255.0f;
+    unsigned int si = v & 0xFFFFFFu;
+    if (hist_in != nullptr && motion != nullptr && hist_out != nullptr) {
+        float lo = 1.0f, hi = 0.0f;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = min(max((int)x + dx, 0), (int)width - 1);
+                int ny = min(max((int)y + dy, 0), (int)height - 1);
+                float na = (float)(cov[(unsigned int)ny * width + (unsigned int)nx] >> 24u) / 255.0f;
+                lo = fminf(lo, na);
+                hi = fmaxf(hi, na);
+            }
+        }
+        const float2 m = motion[i];
+        const int hx = (int)floorf((float)x + 0.5f + m.x);
+        const int hy = (int)floorf((float)y + 0.5f + m.y);
+        if (hx >= 0 && hy >= 0 && hx < (int)width && hy < (int)height) {
+            const unsigned int hv = hist_in[(unsigned int)hy * width + (unsigned int)hx];
+            const float ha = fminf(hi, fmaxf(lo, (float)(hv >> 24u) / 255.0f));
+            if (v == 0u && ha > 0.0f) si = hv & 0xFFFFFFu;
+            a = ha + (a - ha) * blend;
+        }
+        hist_out[i] = ((unsigned int)(fminf(1.0f, a) * 255.0f + 0.5f) << 24u) | si;
+    }
+    if (a <= 0.0f || si >= style_count) return;
+    const OvlStyle st = styles[si];
+    if (dst8 != nullptr) {
+        uchar4 d = dst8[i];
+        auto mix8 = [&](unsigned char c, float l) -> unsigned char {
+            float lin = powf((float)c / 255.0f, 2.2f);
+            float o = lin + (l - lin) * a;
+            return (unsigned char)(powf(fmaxf(0.0f, fminf(1.0f, o)), 1.0f / 2.2f) * 255.0f + 0.5f);
+        };
+        dst8[i] = make_uchar4(mix8(d.x, st.r), mix8(d.y, st.g), mix8(d.z, st.b), d.w);
+    }
+    if (dst16 != nullptr) {
+        const float pw = 203.0f / 80.0f;
+        ushort4 d = dst16[i];
+        auto mix16 = [&](unsigned short hh, float l) -> float {
+            float c = ovl_f16_to_f32(hh);
+            return c + (l * pw - c) * a;
+        };
+        dst16[i] = pack_f16_4(mix16(d.x, st.r), mix16(d.y, st.g), mix16(d.z, st.b), ovl_f16_to_f32(d.w));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Hidden-line wireframe (`DisplayMode::Wireframe`, wireframe.rs): vector contour lines at native
 // resolution. Input is this frame's visible-hit G-buffer (raytracer.cu, `aov_mode` 11):
 // `gbuf` = (octahedral normal, depth, instance key bits; WIRE_MISS_KEY = sky), `accum.w` = AO.
@@ -276,10 +539,10 @@ extern "C" __global__ void tonemap_f32_to_scrgb_f16(
 //                  edge); vertices whose contour turns sharply over two vertices on each side,
 //                  junctions and line ends stay put, so corners survive while the pixel
 //                  staircase becomes the smooth contour.
-//   wire_draw      each cell's segments (marching-squares pairing of its crossings) are drawn as
-//                  antialiased strokes of constant screen width (analytic distance to the segment,
-//                  smoothstep falloff), composited in linear light over flat light-grey faces with
-//                  slight AO, and accumulated through `accum_count` (only the AO varies).
+//   wire_emit      the contour provider: each cell's segments (marching-squares pairing of its
+//                  crossings) are appended to the overlay segment list, which `ovl_splat` draws
+//                  as antialiased strokes of constant screen width after the tonemap.
+//   wire_faces     flat light-grey faces with slight AO, accumulated through `accum_count`.
 //
 // Hidden lines never appear: only the visible primary hit of each pixel exists in the G-buffer.
 // Keep the pair rule, cell pairing, smoothing and coverage identical to the CPU mirror in
@@ -292,12 +555,10 @@ extern "C" __global__ void tonemap_f32_to_scrgb_f16(
 #define WIRE_CREASE 2u
 // Smoothing never moves a vertex whose two-ring contour turns by more than ~55 degrees.
 #define WIRE_CORNER_COS 0.57f
-#define WIRE_TILE 16
-#define WIRE_HALO 4
-#define WIRE_SPAN (WIRE_TILE + 2 * WIRE_HALO + 1)
 
 struct WirePx {
     float3 n;
+    float diam;
     float depth;
     unsigned int id;
     bool hit;
@@ -315,12 +576,16 @@ static __forceinline__ __device__ float3 wire_oct_decode(float ex, float ey) {
     return make_float3(n.x * inv, n.y * inv, n.z * inv);
 }
 
+// G-buffer texel: x = octahedral normal as two 16-bit snorm halves (`wire_oct_pack` in
+// raytracer.cu), y = world diameter of the hit object (line LOD), z = depth, w = instance key.
 static __forceinline__ __device__ WirePx wire_load(const float4* g, int x, int y, int w, int h) {
     x = max(0, min(w - 1, x));
     y = max(0, min(h - 1, y));
     float4 v = g[(unsigned int)y * (unsigned int)w + (unsigned int)x];
     WirePx p;
-    p.n = wire_oct_decode(v.x, v.y);
+    const unsigned int on = __float_as_uint(v.x);
+    p.n = wire_oct_decode((float)(short)(on & 0xFFFFu) / 32767.0f, (float)(short)(on >> 16u) / 32767.0f);
+    p.diam = v.y;
     p.depth = fmaxf(v.z, 1e-4f);
     p.id = __float_as_uint(v.w);
     p.hit = (p.id != WIRE_MISS_KEY);
@@ -568,129 +833,126 @@ extern "C" __global__ void wire_smooth(
     pos_out[i] = out;
 }
 
-// Distance from `p` to the segment `a`-`b`.
-static __forceinline__ __device__ float wire_seg_dist(float2 p, float2 a, float2 b) {
-    float2 ab = make_float2(b.x - a.x, b.y - a.y);
-    float2 ap = make_float2(p.x - a.x, p.y - a.y);
-    float l2 = ab.x * ab.x + ab.y * ab.y;
-    float t = (l2 > 1e-12f) ? fminf(1.0f, fmaxf(0.0f, (ap.x * ab.x + ap.y * ab.y) / l2)) : 0.0f;
-    float dx = ap.x - t * ab.x, dy = ap.y - t * ab.y;
-    return sqrtf(dx * dx + dy * dy);
-}
-
-// Coverage of a stroke `width` px wide whose centre line is `dist` px from the pixel centre:
-// smoothstep over one pixel of falloff; strokes thinner than a pixel fade in opacity instead.
-static __forceinline__ __device__ float wire_coverage(float dist, float width) {
-    float t = fminf(1.0f, fmaxf(0.0f, 0.5f * width + 0.5f - dist));
-    return t * t * (3.0f - 2.0f * t) * fminf(1.0f, width);
-}
-
-static __forceinline__ __device__ void wire_stroke(
-    float2 p, float2 a, float2 b, unsigned int ca, unsigned int cb, float sil_px, float crease_px,
-    float& a_sil, float& a_cr
-) {
-    float d = wire_seg_dist(p, a, b);
-    if (ca == WIRE_SILHOUETTE && cb == WIRE_SILHOUETTE) {
-        a_sil = fmaxf(a_sil, wire_coverage(d, sil_px));
-    } else {
-        a_cr = fmaxf(a_cr, wire_coverage(d, crease_px));
-    }
-}
-
-extern "C" __global__ void wire_draw(
+// Contour provider (`overlay::ContourProvider`): one thread per lattice cell appends the cell's
+// smoothed segments (marching-squares pairing of its crossings; junctions and line ends join the
+// crossing centroid / cell centre) to the overlay list as screen-space `NvOverlaySegment`s.
+// Silhouette style + CONTOUR class when both ends are silhouette crossings, crease style +
+// CREASE class otherwise.
+// Line LOD (why: a 1-spp G-buffer undersamples far features, whose pixel pattern changes every
+// frame; no edge filter can make that stable): each record carries the projected diameter of
+// its foreground object (`diam * height / (2 tan(fov/2) depth)`) as `proj_size_px`, and
+// `ovl_splat` fades it between `min_px` and `3 * min_px`.
+extern "C" __global__ void wire_emit(
     const float4* gbuf,
     const unsigned int* cls,
     const float4* pos,
-    float4* accum,
+    NvOverlaySegment* segs,
+    unsigned int* counter,
+    unsigned int cap,
     unsigned int width,
     unsigned int height,
-    unsigned int accum_count,
-    float sil_px,
-    float crease_px
+    unsigned int style_sil,
+    unsigned int style_crease,
+    float tan_half_fov
 ) {
-    // Tile of crossings covering every cell whose strokes can reach this block's pixels.
-    __shared__ unsigned int s_cls[WIRE_SPAN][WIRE_SPAN];
-    __shared__ float4 s_pos[WIRE_SPAN][WIRE_SPAN];
+    const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     const int w = (int)width, h = (int)height;
-    const int ox = (int)(blockIdx.x * WIRE_TILE) - WIRE_HALO;
-    const int oy = (int)(blockIdx.y * WIRE_TILE) - WIRE_HALO;
-    for (int t = (int)(threadIdx.y * WIRE_TILE + threadIdx.x); t < WIRE_SPAN * WIRE_SPAN;
-         t += WIRE_TILE * WIRE_TILE) {
-        int sx = t % WIRE_SPAN, sy = t / WIRE_SPAN;
-        int gx = ox + sx, gy = oy + sy;
-        bool in = gx >= 0 && gy >= 0 && gx < w && gy < h;
-        unsigned int gi = in ? (unsigned int)gy * width + (unsigned int)gx : 0u;
-        s_cls[sy][sx] = in ? cls[gi] : 0u;
-        s_pos[sy][sx] = in ? pos[gi] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    __syncthreads();
-
-    const unsigned int x = blockIdx.x * WIRE_TILE + threadIdx.x;
-    const unsigned int y = blockIdx.y * WIRE_TILE + threadIdx.y;
-    if (x >= width || y >= height) return;
+    if ((int)x + 1 >= w || (int)y + 1 >= h) return;
     auto fetch = [&](int px, int py, unsigned int& c, float4& p) {
-        int sx = px - ox, sy = py - oy;
-        if (sx < 0 || sy < 0 || sx >= WIRE_SPAN || sy >= WIRE_SPAN || px >= w || py >= h) {
-            c = 0u;
-            p = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            return;
-        }
-        c = s_cls[sy][sx];
-        p = s_pos[sy][sx];
+        unsigned int i = (unsigned int)py * width + (unsigned int)px;
+        c = cls[i];
+        p = pos[i];
     };
-
-    const float2 pc = make_float2((float)x + 0.5f, (float)y + 0.5f);
-    float a_sil = 0.0f, a_cr = 0.0f;
-    for (int cy = (int)y - WIRE_HALO; cy < (int)y + WIRE_HALO; ++cy) {
-        for (int cx = (int)x - WIRE_HALO; cx < (int)x + WIRE_HALO; ++cx) {
-            if (cx < 0 || cy < 0 || cx + 1 >= w || cy + 1 >= h) continue;
-            WireCell k = wire_cell(cx, cy, fetch);
-            if (k.n == 0u) continue;
-            if (k.n == 2u || k.n == 4u) {
-                for (int e = 0; e < 4; ++e) {
-                    int o = wire_partner(k, e);
-                    if (o > e) wire_stroke(pc, k.v[e], k.v[o], k.c[e], k.c[o], sil_px, crease_px, a_sil, a_cr);
-                }
-            } else {
-                // Junction (3 crossings) or line end (1): every crossing joins the cell centroid
-                // of its crossings (the cell centre for a line end).
-                float2 m = make_float2((float)cx + 1.0f, (float)cy + 1.0f);
-                if (k.n == 3u) {
-                    m = make_float2(0.0f, 0.0f);
-                    for (int e = 0; e < 4; ++e) {
-                        if (k.c[e] != WIRE_NONE) {
-                            m.x += k.v[e].x / 3.0f;
-                            m.y += k.v[e].y / 3.0f;
-                        }
-                    }
-                }
-                for (int e = 0; e < 4; ++e) {
-                    if (k.c[e] != WIRE_NONE) wire_stroke(pc, k.v[e], m, k.c[e], k.c[e], sil_px, crease_px, a_sil, a_cr);
-                }
+    const WireCell k = wire_cell((int)x, (int)y, fetch);
+    if (k.n == 0u) return;
+    // The nearest hit corner is the foreground object of the feature.
+    float z = 1e30f, diam = 1e6f;
+    unsigned int inst = 0xFFFFFFFFu;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            WirePx p = wire_load(gbuf, (int)x + dx, (int)y + dy, w, h);
+            if (p.hit && p.depth < z) {
+                z = p.depth;
+                diam = p.diam;
+                inst = p.id;
             }
         }
     }
+    if (z > 1e29f) z = 1e6f;
+    const float proj_px = diam * (float)height / (2.0f * fmaxf(tan_half_fov, 1e-4f) * z);
+    auto emit = [&](float2 a, float2 b, unsigned int ca, unsigned int cb) {
+        const bool sil = ca == WIRE_SILHOUETTE && cb == WIRE_SILHOUETTE;
+        NvOverlaySegment s;
+        s.a[0] = a.x;
+        s.a[1] = a.y;
+        s.a[2] = z;
+        s.flags = NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH | NV_OVERLAY_FLAG_NO_DEPTH_TEST;
+        s.b[0] = b.x;
+        s.b[1] = b.y;
+        s.b[2] = z;
+        s.kind = NV_OVERLAY_KIND_SEGMENT;
+        s.cls = sil ? NV_OVERLAY_CLASS_CONTOUR : NV_OVERLAY_CLASS_CREASE;
+        s.inst_id = inst;
+        s.part_id = 0xFFFFFFFFu;
+        s.style = sil ? style_sil : style_crease;
+        s.s0 = 0.0f;
+        s.depth_bias = 0.0f;
+        s.proj_size_px = proj_px;
+        s.reserved = 0u;
+        nv_overlay_push(segs, counter, cap, s);
+    };
+    if (k.n == 2u || k.n == 4u) {
+        for (int e = 0; e < 4; ++e) {
+            int o = wire_partner(k, e);
+            if (o > e) emit(k.v[e], k.v[o], k.c[e], k.c[o]);
+        }
+        return;
+    }
+    float2 m = make_float2((float)x + 1.0f, (float)y + 1.0f);
+    if (k.n == 3u) {
+        m = make_float2(0.0f, 0.0f);
+        for (int e = 0; e < 4; ++e) {
+            if (k.c[e] != WIRE_NONE) {
+                m.x += k.v[e].x / 3.0f;
+                m.y += k.v[e].y / 3.0f;
+            }
+        }
+    }
+    for (int e = 0; e < 4; ++e) {
+        if (k.c[e] != WIRE_NONE) emit(k.v[e], m, k.c[e], k.c[e]);
+    }
+}
 
-    // Linear light: light paper sky, flat light-grey faces with slight AO, crease lines mid grey,
-    // silhouettes near black. The tonemap applies the sRGB transfer.
+// Wireframe faces: flat light-grey shading from a fixed view-independent key light with slight
+// AO (this frame's AO in `accum.w`), sky as light paper, accumulated through `accum_count`. The
+// lines are overlay segments drawn after the tonemap.
+extern "C" __global__ void wire_faces(
+    const float4* gbuf,
+    float4* accum,
+    unsigned int width,
+    unsigned int height,
+    unsigned int accum_count
+) {
+    const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
     const unsigned int idx = y * width + x;
     const float4 prev = accum[idx];
-    WirePx c = wire_load(gbuf, (int)x, (int)y, w, h);
+    const WirePx c = wire_load(gbuf, (int)x, (int)y, (int)width, (int)height);
     float v;
     if (!c.hit) {
         v = 0.92f;
     } else {
         const float3 key = make_float3(0.37f, 0.84f, 0.40f);
-        float ndl = fabsf(c.n.x * key.x + c.n.y * key.y + c.n.z * key.z);
+        const float ndl = fabsf(c.n.x * key.x + c.n.y * key.y + c.n.z * key.z);
         v = (0.50f + 0.30f * ndl) * (1.0f - 0.30f * prev.w);
     }
-    v = v + (0.06f - v) * (0.85f * a_cr);
-    v = v + (0.010f - v) * a_sil;
     float3 o;
     if (accum_count == 0u) {
         o = make_float3(v, v, v);
     } else {
-        float kf = 1.0f / (float)(accum_count + 1u);
+        const float kf = 1.0f / (float)(accum_count + 1u);
         o = make_float3(prev.x + (v - prev.x) * kf, prev.y + (v - prev.y) * kf, prev.z + (v - prev.z) * kf);
     }
     accum[idx] = make_float4(o.x, o.y, o.z, 1.0f);

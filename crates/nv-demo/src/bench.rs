@@ -20,11 +20,11 @@ use std::path::PathBuf;
 
 /// Usage text printed on a command-line error.
 pub const USAGE: &str = "usage: nv-demo [--bench-rail <rail-id> --out <csv> [--scene <scene-id>] \
-[--frames <n>] [--warmup <n>] [--image <pfm>]]\n  --bench-rail  scene rail cassette id (e.g. road_cruise); unknown \
+[--frames <n>] [--warmup <n>] [--image <pfm>] [--png-dir <dir>]]\n  --bench-rail  scene rail cassette id (e.g. road_cruise); unknown \
 ids list the available ones\n  --out         CSV written when the run ends (atomic rename)\n  \
 --scene       scene descriptor id (default: the saved scene)\n  --frames      measured frames \
 (default: one rail loop at 60 fps * time_scale)\n  --warmup      frames rendered and discarded \
-before measuring (default 60)\n  --image       linear colour of the last frame as PFM (pixel A/B)";
+before measuring (default 60)\n  --image       linear colour of the last frame as PFM (pixel A/B)\n  --png-dir     every frame's displayed image as PNG (temporal A/B)";
 
 /// Default number of discarded frames at the start of the rail.
 pub const DEFAULT_WARMUP: u32 = 60;
@@ -44,6 +44,9 @@ pub struct BenchRailArgs {
     pub warmup: u32,
     /// PFM written with the last measured frame's linear colour.
     pub image: Option<PathBuf>,
+    /// Directory receiving every rendered frame's displayed image (tonemap + overlay) as
+    /// `frame_NNNNN.png`: temporal artefacts such as line shimmer need a sequence, not one frame.
+    pub png_dir: Option<PathBuf>,
 }
 
 /// Parses the process arguments after the program name. `Ok(None)` = no arguments (normal
@@ -57,6 +60,7 @@ pub fn parse_args(
     let mut frames = None;
     let mut warmup = DEFAULT_WARMUP;
     let mut image = None;
+    let mut png_dir = None;
     let mut it = args.into_iter();
     let mut any = false;
     while let Some(flag) = it.next() {
@@ -78,6 +82,7 @@ pub fn parse_args(
             }
             "--warmup" => warmup = count(value("--warmup")?, "--warmup")?,
             "--image" => image = Some(PathBuf::from(value("--image")?)),
+            "--png-dir" => png_dir = Some(PathBuf::from(value("--png-dir")?)),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -96,6 +101,7 @@ pub fn parse_args(
         frames,
         warmup,
         image,
+        png_dir,
     }))
 }
 
@@ -191,6 +197,7 @@ mod tests {
                 frames: Some(120),
                 warmup: 10,
                 image: None,
+                png_dir: None,
             }
         );
         let d = args(&["--out", "y.csv", "--bench-rail", "r"])

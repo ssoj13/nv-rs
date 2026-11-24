@@ -2,6 +2,11 @@
 //!
 //! Explicit input headers keep coverage hashes and rebuild triggers tied to all public
 //! declarations. CUDA device implementations remain in NCCL's device library.
+//!
+//! Policy (L-32, see `nv-bindgen`): NCCL is *required* on Linux targets (a missing SDK is a build
+//! error naming `NCCL_ROOT`; there is no prebuilt set), and other targets build nothing. A cross
+//! build (for example a Linux target from Windows) names the SDK roots explicitly with
+//! `NCCL_ROOT` and `CUDA_PATH`, and supplies its sysroot through `BINDGEN_EXTRA_CLANG_ARGS_<target>`.
 use nv_bindgen::{Kind, LibSpec, ReturnPolicy, Sdk, Shape};
 
 const SPEC: LibSpec = LibSpec {

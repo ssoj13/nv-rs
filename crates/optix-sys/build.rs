@@ -15,6 +15,7 @@ const SPEC: LibSpec = LibSpec {
     opaque_types: &[],
     shape: Shape::FunctionTable {
         table_type: "OptixFunctionTable",
+        probes: &[],
     },
 };
 

@@ -50,11 +50,20 @@ pub use types::*;
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/ngx_inventory.json"));
 
 /// Build-time NGX SDK runtime DLL/DSO directory discovered by `vcv-rs` (`None` when empty).
-#[cfg(has_ngx_sdk)]
+///
+/// Debug builds only, like `nv_loader::DllSpec::with_hint` (L-36): a release binary neither embeds
+/// nor searches the build machine's SDK path, so a planted DLL there cannot be loaded on an end
+/// user's machine. Release applications ship `nvngx_dlss*.dll` next to the executable
+/// (`xtask stage-dlls`).
+#[cfg(all(has_ngx_sdk, debug_assertions))]
 pub const SDK_BIN: Option<&str> = match option_env!("NV_RS_SDK_BIN") {
     Some(s) if s.is_empty() => None,
     some => some,
 };
+
+/// Release builds carry no build-machine path (see the debug variant).
+#[cfg(all(has_ngx_sdk, not(debug_assertions)))]
+pub const SDK_BIN: Option<&str> = None;
 
 #[cfg(all(test, has_ngx_sdk))]
 mod tests {

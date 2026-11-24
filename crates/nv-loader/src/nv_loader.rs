@@ -46,8 +46,10 @@ pub enum Group {
     DriverStore,
     /// Part of the CUDA Toolkit (`cufft64_12`, `nvrtc64_130_0`). Windows: the executable's
     /// directory, `bin\x64`, `bin` and `extras\CUPTI\lib64` of each `CUDA_PATH`-style root and of
-    /// every installed toolkit (newest first), then `PATH`. Linux: `lib64`/`lib` of each root, then
-    /// the dynamic linker.
+    /// every installed toolkit (newest first), then `PATH`. Linux: `lib64`, `lib` and
+    /// `extras/CUPTI/lib64` of each root, then the dynamic linker. In every Linux directory a
+    /// versioned soname (`libcufft.so.12`) is followed by the versioned files it stands for
+    /// (`libcufft.so.12.*`, newest first), so a missing soname link does not hide a library.
     Toolkit,
     /// A separately installed SDK (cuDNN, nvCOMP, ...). Windows: the directory next to the running
     /// executable (how applications ship these DLLs); `bin\x64`, `bin`, `lib\Windows_x86_64\rel`
@@ -611,6 +613,83 @@ fn search_plan(probe: &dyn Probe, spec: &DllSpec) -> SearchPlan {
     }
 }
 
+/// Whether `name` matches `pattern`, where `*` stands for any run of characters (possibly none)
+/// and every other character matches itself, ASCII case-insensitively (Windows file names; NVIDIA
+/// ships no Linux libraries that differ only by case). The one matcher for [`DllSpec`] patterns,
+/// Linux directory expansion and `xtask stage-dlls` companion files.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Position of the last `*` in the pattern and the name index it currently swallows up to.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some((star_pi, star_ni)) = star {
+            pi = star_pi + 1;
+            ni = star_ni + 1;
+            star = Some((star_pi, star_ni + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// The digit runs of a file name as numbers (`libcufft.so.12.0.0.61` -> `[12, 0, 0, 61]`), for
+/// ordering versioned files newest first.
+fn name_version_key(name: &str) -> Vec<u64> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
+/// Whether a Linux name is a versioned soname (`libfoo.so.12`): its real file is usually named
+/// `libfoo.so.12.0.0.61` and the soname symlink may be missing (pip wheels, unpacked archives).
+fn is_versioned_soname(name: &str) -> bool {
+    name.rsplit_once(".so.")
+        .is_some_and(|(_, ver)| ver.chars().next().is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// Appends the candidates for `names` inside `dir` (Linux): a name with `*` expands to the files
+/// of `dir` that match it, newest version first; any other name is tried as is and, when it is a
+/// versioned soname, followed by the versioned files it stands for (`libfoo.so.12` then
+/// `libfoo.so.12.*`). Only existing files are ever expanded, so a missing directory adds just the
+/// plain names.
+fn push_linux_dir(probe: &dyn Probe, out: &mut Vec<PathBuf>, dir: &Path, names: &[&str]) {
+    let mut listing: Option<Vec<String>> = None;
+    let mut matching = |pattern: &str| -> Vec<String> {
+        let files = listing.get_or_insert_with(|| probe.list_dir(dir));
+        let mut found: Vec<String> = files
+            .iter()
+            .filter(|f| glob_match(pattern, f))
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| name_version_key(b).cmp(&name_version_key(a)).then_with(|| b.cmp(a)));
+        found
+    };
+    for &name in names {
+        if name.contains('*') {
+            for file in matching(name) {
+                push_unique_dir(out, dir.join(file));
+            }
+        } else {
+            push_unique_dir(out, dir.join(name));
+            if is_versioned_soname(name) {
+                for file in matching(&format!("{name}.*")) {
+                    push_unique_dir(out, dir.join(file));
+                }
+            }
+        }
+    }
+}
+
 /// Linux candidate paths: extra search dirs, runtime env roots, build hints, then bare sonames.
 fn linux_candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
     const TOOLKIT_VARS: [&str; 4] = [
@@ -621,9 +700,7 @@ fn linux_candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
     ];
     let mut out = Vec::new();
     for dir in extra_search_dirs(probe) {
-        for soname in spec.linux {
-            push_unique_dir(&mut out, dir.join(soname));
-        }
+        push_linux_dir(probe, &mut out, &dir, spec.linux);
     }
     match spec.group {
         Group::Sdk { root_var, hint } => {
@@ -635,33 +712,32 @@ fn linux_candidates_with(probe: &dyn Probe, spec: &DllSpec) -> Vec<PathBuf> {
                     dirs.push(root.join("lib").join("Linux_x86_64").join("rel"));
                 }
                 for dir in dirs {
-                    for soname in spec.linux {
-                        push_unique_dir(&mut out, dir.join(soname));
-                    }
+                    push_linux_dir(probe, &mut out, &dir, spec.linux);
                 }
             }
             if let Some(dir) = hint {
-                for soname in spec.linux {
-                    push_unique_dir(&mut out, Path::new(dir).join(soname));
-                }
+                push_linux_dir(probe, &mut out, Path::new(dir), spec.linux);
             }
         }
         Group::Toolkit => {
             for var in TOOLKIT_VARS {
                 if let Some(root) = probe.env(var) {
                     let root = Path::new(&root);
-                    for sub in ["lib64", "lib"] {
-                        let dir = root.join(sub);
-                        for soname in spec.linux {
-                            push_unique_dir(&mut out, dir.join(soname));
-                        }
+                    // CUPTI ships under `extras/CUPTI/lib64`, as on Windows.
+                    for dir in [
+                        root.join("lib64"),
+                        root.join("lib"),
+                        root.join("extras").join("CUPTI").join("lib64"),
+                    ] {
+                        push_linux_dir(probe, &mut out, &dir, spec.linux);
                     }
                 }
             }
         }
         Group::Driver | Group::DriverStore => {}
     }
-    for soname in spec.linux {
+    // A pattern cannot go to `dlopen`: only plain sonames reach the dynamic linker's own search.
+    for soname in spec.linux.iter().filter(|s| !s.contains('*')) {
         push_unique_dir(&mut out, PathBuf::from(soname));
     }
     out
@@ -1130,6 +1206,12 @@ macro_rules! exports_sys {
         pub const INVENTORY: &str =
             include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
 
+        /// The `nv-bindgen` generation manifest (JSON `nv_bindgen::Manifest`): the files these
+        /// bindings consist of and whether they were generated from the installed SDK
+        /// (`"origin": "generated"`) or copied from the committed prebuilt set (`"prebuilt"`).
+        pub const BINDINGS_MANIFEST: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_manifest.json"));
+
         $crate::cached_loader! {
             dll: DLL,
             value: $crate::ExportsBundle<api::$api>,
@@ -1238,6 +1320,10 @@ macro_rules! query_interface_sys {
         pub const INVENTORY: &str =
             include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
 
+        /// The `nv-bindgen` generation manifest (see `exports_sys!`).
+        pub const BINDINGS_MANIFEST: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_manifest.json"));
+
         $crate::cached_loader! {
             dll: DLL,
             value: $crate::QueryInterface,
@@ -1271,6 +1357,9 @@ macro_rules! split_exports_sys {
 
         /// Entry points and header sha256 of the generated bindings (coverage evidence).
         pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_inventory.json"));
+
+        /// The `nv-bindgen` generation manifest (see `exports_sys!`).
+        pub const BINDINGS_MANIFEST: &str = include_str!(concat!(env!("OUT_DIR"), "/", $lib, "_manifest.json"));
 
         $(
             #[doc = concat!("The `", stringify!($part), "` DLL: its loader, `DLL` spec and shims.")]
@@ -1536,7 +1625,86 @@ mod linux_tests {
                 PathBuf::from("/custom/lib/libcufft.so.11"),
                 PathBuf::from("/usr/local/cuda/lib64/libcufft.so.11"),
                 PathBuf::from("/usr/local/cuda/lib/libcufft.so.11"),
+                PathBuf::from("/usr/local/cuda/extras/CUPTI/lib64/libcufft.so.11"),
                 PathBuf::from("libcufft.so.11"),
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_match_handles_stars_anywhere_and_ignores_case() {
+        assert!(glob_match("cudnn_*64_*.dll", "cudnn_engines_precompiled64_9.dll"));
+        assert!(glob_match("cudnn_*64_*.dll", "CUDNN_GRAPH64_9.DLL"));
+        assert!(!glob_match("cudnn_*64_*.dll", "cudnn64_9.dll"));
+        assert!(glob_match("libnvidia-ngx-dlss.so.*", "libnvidia-ngx-dlss.so.310.1.0"));
+        assert!(!glob_match("libnvidia-ngx-dlss.so.*", "libnvidia-ngx-dlssd.so.310.1.0"));
+        assert!(glob_match("a*b*c", "axxbyyc") && !glob_match("a*b*c", "axxbyy"));
+        assert!(glob_match("*", "") && glob_match("exact.dll", "exact.dll"));
+        assert!(!glob_match("exact.dll", "exact.dll.bak"));
+    }
+
+    #[test]
+    fn linux_versioned_files_follow_a_missing_soname_link_newest_first() {
+        let _gate = read_extra_dirs_gate();
+        let mut fake = Fake::default();
+        fake.env.insert("CUDA_HOME", "/cuda");
+        fake.dirs.insert(
+            PathBuf::from("/cuda/lib64"),
+            vec![
+                "libcufft.so.12.0.0.9",
+                "libcufft.so.12.0.0.61",
+                "libcufft.so.11.4.1",
+                "libcufftw.so.12",
+            ],
+        );
+        let spec = DllSpec {
+            lib: "cufft",
+            group: Group::Toolkit,
+            windows: &[],
+            linux: &["libcufft.so.12"],
+        };
+        // The exact soname first, then only its own versioned files, highest version first.
+        assert_eq!(
+            linux_candidates_with(&fake, &spec),
+            vec![
+                PathBuf::from("/cuda/lib64/libcufft.so.12"),
+                PathBuf::from("/cuda/lib64/libcufft.so.12.0.0.61"),
+                PathBuf::from("/cuda/lib64/libcufft.so.12.0.0.9"),
+                PathBuf::from("/cuda/lib/libcufft.so.12"),
+                PathBuf::from("/cuda/extras/CUPTI/lib64/libcufft.so.12"),
+                PathBuf::from("libcufft.so.12"),
+            ]
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linux_pattern_names_expand_in_the_ngx_runtime_dir_and_never_reach_dlopen() {
+        let _gate = read_extra_dirs_gate();
+        let mut fake = Fake::default();
+        fake.env.insert("NGX_SDK_ROOT", "/ngx");
+        fake.dirs.insert(
+            PathBuf::from("/ngx/lib/Linux_x86_64/rel"),
+            vec![
+                "libnvidia-ngx-dlss.so.2.5.1",
+                "libnvidia-ngx-dlss.so.310.4.0",
+                "libnvidia-ngx-dlssd.so.310.4.0",
+            ],
+        );
+        let spec = DllSpec {
+            lib: "dlss",
+            group: Group::Sdk {
+                root_var: "NGX_SDK_ROOT",
+                hint: None,
+            },
+            windows: &[],
+            linux: &["libnvidia-ngx-dlss.so.*"],
+        };
+        assert_eq!(
+            linux_candidates_with(&fake, &spec),
+            vec![
+                PathBuf::from("/ngx/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.4.0"),
+                PathBuf::from("/ngx/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.2.5.1"),
             ]
         );
     }

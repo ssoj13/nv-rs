@@ -59,6 +59,21 @@ mod tests {
     use nv_loader::CallError;
 
     #[test]
+    fn the_manifest_lists_every_promised_file_and_says_generated() {
+        // The generator wrote the manifest after checking that each file exists (a missing one
+        // is a build error), and the fixture builds from headers, never from prebuilt bindings.
+        assert!(BINDINGS_MANIFEST.contains("\"origin\": \"generated\""), "{BINDINGS_MANIFEST}");
+        for file in ["fake_types.rs", "fake_inventory.json", "fake_api.rs", "fake_shims.rs"] {
+            assert!(BINDINGS_MANIFEST.contains(file), "{file} not listed: {BINDINGS_MANIFEST}");
+        }
+        assert!(
+            !BINDINGS_MANIFEST.contains("manifest.json"),
+            "the manifest does not list itself"
+        );
+        assert!(qi::BINDINGS_MANIFEST.contains("qi_shims.rs"), "{}", qi::BINDINGS_MANIFEST);
+    }
+
+    #[test]
     fn a_missing_library_is_a_typed_load_error() {
         assert!(matches!(
             load(),

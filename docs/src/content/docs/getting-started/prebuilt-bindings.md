@@ -25,6 +25,8 @@ For a library with `LibSpec::name` = `{name}`, `nv-bindgen` expects the followin
 | `{name}_api.rs` | Exported function table bindings (for `Exports` shapes; split shapes use `{name}_{part}_api.rs`) |
 | `{name}_inventory.json` | Symbol inventory and header SHA-256 metadata (always required) |
 
+Every build also writes `{name}_manifest.json` into `OUT_DIR` after all other files: `{"lib": "...", "origin": "generated" | "prebuilt", "files": [...]}`. `nv-bindgen` fails the build if a promised file is missing, a build that used the committed prebuilt set prints a `cargo:warning` and records `origin: prebuilt`, and each sys crate exposes the manifest path as `BINDINGS_MANIFEST`. The manifest itself is never staged.
+
 ## Directory Resolution
 
 `nv-bindgen` resolves the prebuilt directory in this order:
@@ -51,7 +53,7 @@ On a machine that has the NVIDIA SDKs and `libclang` installed, build the `*-sys
 cargo xtask prebuilt
 ```
 
-`cargo xtask prebuilt` (alias `stage-prebuilt`) resolves the Cargo target directory from `CARGO_TARGET_DIR` (resolving relative paths against the workspace root, defaulting to `target/`) and scans for the newest `*_types.rs`, `*_api.rs`, `*_shims.rs`, and `*_inventory.json` files of each `crates/*-sys` crate, copying them into `crates/<crate>/prebuilt/<target_triple>/`.
+`cargo xtask prebuilt` (alias `stage-prebuilt`) resolves the Cargo target directory from `CARGO_TARGET_DIR` (resolving relative paths against the workspace root, defaulting to `target/`) and, for each `crates/*-sys` crate, picks the most recent out dir whose `{name}_manifest.json` says `origin: generated` and lists only files that exist; exactly those files are copied all-or-nothing into `crates/<crate>/prebuilt/<target_triple>/`. Out dirs without a manifest or built from the prebuilt set are rejected with the reason, and the command fails if a built crate has no complete set.
 
 Target isolation rules:
 - **Target-qualified builds** (`<target_dir>/<target>/<profile>/build/*/out/`): always scanned for the requested `--target`.

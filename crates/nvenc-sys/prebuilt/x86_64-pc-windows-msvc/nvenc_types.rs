@@ -11152,3 +11152,6 @@ impl Default for _NV_ENCODE_API_FUNCTION_LIST {
     }
 }
 pub type NV_ENCODE_API_FUNCTION_LIST = _NV_ENCODE_API_FUNCTION_LIST;
+pub const NV_RS_PROBE_API_VERSION: ::std::os::raw::c_uint = 16777229;
+pub const NV_RS_PROBE_STRUCT_VERSION_BASE: ::std::os::raw::c_uint = 1895825421;
+pub const NV_RS_PROBE_FUNCTION_LIST_VER: ::std::os::raw::c_uint = 1895956493;

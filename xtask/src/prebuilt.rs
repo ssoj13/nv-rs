@@ -10,14 +10,17 @@
 //! without hand-copying hashed `OUT_DIR` paths. A committed set mixing files of two generations
 //! binds mismatched layouts, so staging is chosen by completeness, never by mtime alone.
 //!
-//! **How.** An out dir is a complete generated set for library `<lib>` (the crate name without
-//! `-sys`) when it holds the files every `nv-bindgen` shape emits (`<lib>_types.rs`,
-//! `<lib>_inventory.json`), a `*_shims.rs` for every `*_api.rs`, an inventory that parses and
-//! names `<lib>`, and no artifact newer than the inventory (`nv_bindgen::generate` writes the
-//! inventory last, so a newer file means an interrupted or mixed generation). Builds that fell
-//! back to the committed prebuilt bindings (marker in the build script output) hold copies, not a
-//! generation, and are not candidates. Incomplete
-//! candidates are rejected with the reason; among complete ones the most recently generated wins.
+//! **How.** `nv_bindgen::generate` writes `<lib>_manifest.json` ([`nv_bindgen::Manifest`]) into
+//! `OUT_DIR` after every other file: the library name, the exact files its shape promises and
+//! whether they were generated or copied from the committed prebuilt set. Nothing is inferred
+//! here. An out dir is a complete generated set for library `<lib>` (the crate name without
+//! `-sys`) when that manifest exists, names `<lib>`, lists the inventory, every listed file
+//! exists and the inventory parses and names `<lib>`; the manifest's time is the generation time.
+//! File times are not compared (a `build.rs` may post-process a generated file). Only the
+//! manifest's files are staged, so a stale artifact an older recipe left in `OUT_DIR` is never
+//! shipped. Builds whose manifest says `prebuilt` hold copies, not a generation, and are not
+//! candidates. Incomplete candidates (no manifest included) are rejected with the reason; among
+//! complete ones the most recently generated wins.
 //! When a built crate has no complete candidate the command fails and stages nothing. Each set is
 //! copied all-or-nothing (every file to a synced temp file first, then renamed, see
 //! [`crate::atomic_io`]), and binding artifacts in the destination that the new set does not
@@ -227,37 +230,76 @@ fn crate_lib_name(crate_name: &str) -> &str {
 /// One complete generated binding set.
 struct CompleteSet {
     files: Vec<PathBuf>,
-    /// Modification time of the inventory, the file `nv_bindgen::generate` writes last.
+    /// Modification time of the inventory, the last file `nv_bindgen::generate` writes before the
+    /// manifest.
     generated: SystemTime,
+}
+
+/// What an out dir's `<lib>_manifest.json` says.
+enum ManifestState {
+    /// No manifest: the generation never finished, or nv-bindgen predates the manifest.
+    Absent,
+    /// The file exists but is not a manifest.
+    Invalid(String),
+    Valid(nv_bindgen::Manifest),
+}
+
+/// Reads `<lib>_manifest.json` from `out_dir`. The `Err` is an I/O failure other than "not found".
+fn load_manifest(out_dir: &Path, lib: &str) -> Result<ManifestState, String> {
+    let path = out_dir.join(nv_bindgen::Manifest::file_name(lib));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(match serde_json::from_str::<nv_bindgen::Manifest>(&text) {
+            Ok(manifest) => ManifestState::Valid(manifest),
+            Err(e) => ManifestState::Invalid(format!("{} does not parse: {e}", path.display())),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ManifestState::Absent),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
+    }
 }
 
 /// Checks whether `out_dir` holds a complete generated set for `lib`. The outer `Err` is an I/O
 /// failure (aborts the command); the inner `Err` explains why this candidate is rejected.
 fn complete_set(out_dir: &Path, lib: &str) -> Result<Result<CompleteSet, String>, String> {
-    let files = collect_binding_files(out_dir)?;
-    let names: BTreeSet<String> = files
-        .iter()
-        .filter_map(|f| f.file_name().and_then(|n| n.to_str()).map(str::to_string))
-        .collect();
-
-    // Every shape emits types and inventory; Exports / SplitExports emit api + shims pairs.
-    let types = format!("{lib}_types.rs");
+    let manifest_name = nv_bindgen::Manifest::file_name(lib);
+    let manifest = match load_manifest(out_dir, lib)? {
+        ManifestState::Valid(manifest) => manifest,
+        ManifestState::Absent => {
+            return Ok(Err(format!(
+                "no {manifest_name} (nv-bindgen writes it last: the generation was interrupted or predates the manifest)"
+            )));
+        }
+        ManifestState::Invalid(why) => return Ok(Err(why)),
+    };
+    if manifest.lib != lib {
+        return Ok(Err(format!(
+            "{manifest_name} names library `{}`, expected `{lib}`",
+            manifest.lib
+        )));
+    }
+    if manifest.origin != nv_bindgen::Origin::Generated {
+        return Ok(Err(format!(
+            "{manifest_name} says the files were copied from the prebuilt set, not generated"
+        )));
+    }
     let inventory = format!("{lib}_inventory.json");
-    let mut missing: Vec<String> = [&types, &inventory]
-        .into_iter()
-        .filter(|req| !names.contains(*req))
-        .cloned()
-        .collect();
-    for name in &names {
-        if let Some(stem) = name.strip_suffix("_api.rs") {
-            let shims = format!("{stem}_shims.rs");
-            if !names.contains(&shims) {
-                missing.push(shims);
-            }
+    if !manifest.files.contains(&inventory) {
+        return Ok(Err(format!("{manifest_name} does not list {inventory}")));
+    }
+    let mut files: Vec<PathBuf> = Vec::with_capacity(manifest.files.len());
+    let mut missing: Vec<&str> = Vec::new();
+    for name in &manifest.files {
+        let path = out_dir.join(name);
+        if path.is_file() {
+            files.push(path);
+        } else {
+            missing.push(name);
         }
     }
     if !missing.is_empty() {
-        return Ok(Err(format!("incomplete, missing {}", missing.join(", "))));
+        return Ok(Err(format!(
+            "incomplete: {manifest_name} lists missing file(s) {}",
+            missing.join(", ")
+        )));
     }
 
     let inv_path = out_dir.join(&inventory);
@@ -274,21 +316,11 @@ fn complete_set(out_dir: &Path, lib: &str) -> Result<Result<CompleteSet, String>
         Err(e) => return Ok(Err(format!("{inventory} does not parse: {e}"))),
     }
 
-    let generated = modified(&inv_path)?;
-    let mut newer = Vec::new();
-    for f in &files {
-        if modified(f)? > generated
-            && let Some(n) = f.file_name().and_then(|n| n.to_str())
-        {
-            newer.push(n.to_string());
-        }
-    }
-    if !newer.is_empty() {
-        return Ok(Err(format!(
-            "{} newer than {inventory}, which nv-bindgen writes last (interrupted or mixed generation)",
-            newer.join(", ")
-        )));
-    }
+    // The manifest is deleted when a generation starts and written after every other file, so
+    // its time is the generation time. A `build.rs` may legitimately post-process a generated file
+    // after `generate` returns (`cupti-sys` appends `CUpti_ActivityKernelLatest`), so file times
+    // relative to each other prove nothing.
+    let generated = modified(&out_dir.join(&manifest_name))?;
     Ok(Ok(CompleteSet { files, generated }))
 }
 
@@ -376,29 +408,19 @@ fn scan_build_dir(
             continue;
         };
         let out_dir = build.join("out");
-        if collect_binding_files(&out_dir)?.is_empty() || built_from_prebuilt(&build)? {
+        if collect_binding_files(&out_dir)?.is_empty() {
+            continue;
+        }
+        // A build that fell back to the committed prebuilt bindings holds copies (with copy-time
+        // mtimes), not a generation, so there is nothing to stage from it.
+        if let ManifestState::Valid(manifest) = load_manifest(&out_dir, crate_lib_name(&crate_name))?
+            && manifest.origin == nv_bindgen::Origin::Prebuilt
+        {
             continue;
         }
         candidates.entry(crate_name).or_default().push(out_dir);
     }
     Ok(())
-}
-
-/// The line `nv_bindgen::generate` prints (as a `cargo::warning`) when it copied the committed
-/// prebuilt bindings instead of generating; cargo keeps build-script stdout in `<build>/output`.
-const PREBUILT_FALLBACK_MARKER: &[u8] = b"nv-bindgen: using prebuilt bindings";
-
-/// The build at `build` fell back to the committed prebuilt bindings: its out dir holds copies of
-/// them (with copy-time mtimes), not a generation, so there is nothing to stage from it.
-fn built_from_prebuilt(build: &Path) -> Result<bool, String> {
-    let output = build.join("output");
-    match std::fs::read(&output) {
-        Ok(bytes) => Ok(bytes
-            .windows(PREBUILT_FALLBACK_MARKER.len())
-            .any(|w| w == PREBUILT_FALLBACK_MARKER)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("reading {}: {e}", output.display())),
-    }
 }
 
 fn match_sys_crate(dir_name: &str, sys_crates: &BTreeSet<String>) -> Option<String> {
@@ -495,13 +517,36 @@ mod tests {
         format!(r#"{{"lib":"{lib}","headers":[],"symbols":[]}}"#)
     }
 
-    /// Writes a complete `Exports`-shape set (inventory last, as `nv_bindgen::generate` does).
+    const NVML_FILES: [&str; 4] = [
+        "nvml_types.rs",
+        "nvml_inventory.json",
+        "nvml_api.rs",
+        "nvml_shims.rs",
+    ];
+
+    /// Writes `<lib>_manifest.json` the way `nv_bindgen::generate` does (after the other files).
+    fn write_manifest(out_dir: &Path, lib: &str, origin: nv_bindgen::Origin, files: &[&str]) {
+        let manifest = nv_bindgen::Manifest {
+            lib: lib.to_string(),
+            origin,
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+        };
+        std::fs::write(
+            out_dir.join(nv_bindgen::Manifest::file_name(lib)),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+    }
+
+    /// Writes a complete `Exports`-shape set: inventory, then the manifest, as
+    /// `nv_bindgen::generate` does.
     fn write_complete_set(out_dir: &Path, tag: &str) {
         std::fs::create_dir_all(out_dir).expect("out dir");
         for name in ["nvml_types.rs", "nvml_api.rs", "nvml_shims.rs"] {
             std::fs::write(out_dir.join(name), format!("// {tag} {name}")).expect("write");
         }
         std::fs::write(out_dir.join("nvml_inventory.json"), inventory_json("nvml")).expect("write");
+        write_manifest(out_dir, "nvml", nv_bindgen::Origin::Generated, &NVML_FILES);
     }
 
     fn set_mtime(path: &Path, secs: u64) {
@@ -530,9 +575,7 @@ mod tests {
         std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
         let complete = build_out(&root, "debug", "aaaa0000aaaa0000");
         write_complete_set(&complete, "complete");
-        for name in ["nvml_types.rs", "nvml_api.rs", "nvml_shims.rs", "nvml_inventory.json"] {
-            set_mtime(&complete.join(name), 1_700_000_000);
-        }
+        set_mtime(&complete.join("nvml_manifest.json"), 1_700_000_000);
         // A newer, interrupted build that wrote only the types file.
         let partial = build_out(&root, "release", "bbbb1111bbbb1111");
         std::fs::create_dir_all(&partial).expect("partial dir");
@@ -542,10 +585,7 @@ mod tests {
         let msg = stage_dir_internal(&root, &root.join("target"), &staged_root, HOST, Some(HOST))
             .expect("stage");
         assert!(msg.contains("nvml-sys (4 files)"), "{msg}");
-        assert!(
-            msg.contains("incomplete, missing nvml_inventory.json"),
-            "{msg}"
-        );
+        assert!(msg.contains("no nvml_manifest.json"), "{msg}");
         let dst = staged_root.join("nvml-sys").join("prebuilt").join(HOST);
         assert_eq!(
             std::fs::read_to_string(dst.join("nvml_types.rs")).expect("read"),
@@ -555,30 +595,19 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_or_partial_generation_fails_and_stages_nothing() {
+    fn a_promised_file_missing_from_the_out_dir_fails_and_stages_nothing() {
         let root = unique_test_dir("nv_rs_xtask_prebuilt_interrupted");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
         let out = build_out(&root, "debug", "cccc2222cccc2222");
-        write_complete_set(&out, "mixed");
-        // The types file of a newer run, the rest (inventory included) left from an older one.
-        set_mtime(&out.join("nvml_inventory.json"), 1_700_000_000);
-        set_mtime(&out.join("nvml_api.rs"), 1_700_000_000);
-        set_mtime(&out.join("nvml_shims.rs"), 1_700_000_000);
-        set_mtime(&out.join("nvml_types.rs"), 1_800_000_000);
-
+        write_complete_set(&out, "partial");
         let staged_root = root.join("staged");
-        let err = stage_dir_internal(&root, &root.join("target"), &staged_root, HOST, Some(HOST))
-            .expect_err("mixed generation must fail");
-        assert!(err.contains("nvml_types.rs newer than nvml_inventory.json"), "{err}");
-        assert!(!staged_root.join("nvml-sys").exists(), "{err}");
-
-        // An api file without its shims is incomplete too.
+        // A file the manifest promises but the out dir lacks is incomplete too.
         std::fs::remove_file(out.join("nvml_shims.rs")).expect("remove shims");
-        set_mtime(&out.join("nvml_types.rs"), 1_700_000_000);
         let err = stage_dir_internal(&root, &root.join("target"), &staged_root, HOST, Some(HOST))
             .expect_err("missing shims must fail");
-        assert!(err.contains("incomplete, missing nvml_shims.rs"), "{err}");
+        assert!(err.contains("lists missing file(s) nvml_shims.rs"), "{err}");
+        assert!(!staged_root.join("nvml-sys").exists(), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -589,19 +618,37 @@ mod tests {
         std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
         let out = build_out(&root, "debug", "ffff5555ffff5555");
         write_complete_set(&out, "copied");
-        // Copies with arbitrary mtimes would otherwise look like a mixed generation.
-        set_mtime(&out.join("nvml_inventory.json"), 1_700_000_000);
-        let output = out.parent().expect("build dir").join("output");
-        std::fs::write(
-            &output,
-            "cargo::warning=nv-bindgen: using prebuilt bindings for nvml (x86_64-pc-windows-msvc) from C:/x (NV_RS_USE_PREBUILT=1)\n",
-        )
-        .expect("write output");
+        write_manifest(&out, "nvml", nv_bindgen::Origin::Prebuilt, &NVML_FILES);
 
         let staged_root = root.join("staged");
         let msg = stage_dir_internal(&root, &root.join("target"), &staged_root, HOST, Some(HOST))
             .expect("fallback builds are skipped, not errors");
         assert!(msg.contains("none (build the *-sys crates first)"), "{msg}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_the_files_the_manifest_lists_are_staged() {
+        let root = unique_test_dir("nv_rs_xtask_prebuilt_manifest_files");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("crates").join("nvml-sys")).expect("crate dir");
+        let out = build_out(&root, "debug", "1111aaaa1111aaaa");
+        write_complete_set(&out, "current");
+        // A leftover of an older recipe: a binding artifact the manifest does not promise.
+        std::fs::write(out.join("nvml_old_api.rs"), "// stale").expect("write");
+        std::fs::write(out.join("nvml_old_shims.rs"), "// stale").expect("write");
+
+        let staged_root = root.join("staged");
+        let msg = stage_dir_internal(&root, &root.join("target"), &staged_root, HOST, Some(HOST))
+            .expect("stage");
+        assert!(msg.contains("nvml-sys (4 files)"), "{msg}");
+        let dst = staged_root.join("nvml-sys").join("prebuilt").join(HOST);
+        assert!(!dst.join("nvml_old_api.rs").exists(), "{msg}");
+        assert!(!dst.join("nvml_old_shims.rs").exists(), "{msg}");
+        assert!(
+            !dst.join("nvml_manifest.json").exists(),
+            "the manifest describes one build and is not staged"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -749,6 +796,7 @@ mod tests {
         .expect("write");
         std::fs::write(foreign_out.join("nvml_inventory.json"), inventory_json("nvml"))
             .expect("write");
+        write_manifest(&foreign_out, "nvml", nv_bindgen::Origin::Generated, &NVML_FILES);
 
         // Ensure host build files have newer timestamps
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -766,6 +814,7 @@ mod tests {
         std::fs::write(host_out.join("nvml_shims.rs"), "// host shims newer").expect("write");
         std::fs::write(host_out.join("nvml_inventory.json"), inventory_json("nvml"))
             .expect("write");
+        write_manifest(&host_out, "nvml", nv_bindgen::Origin::Generated, &NVML_FILES);
 
         let staged_root = root.join("staged");
         let msg = stage_dir_internal(
@@ -852,6 +901,7 @@ mod tests {
         std::fs::write(out_dir.join("nvml_shims.rs"), "// shims").expect("write");
         std::fs::write(out_dir.join("nvml_inventory.json"), inventory_json("nvml"))
             .expect("write");
+        write_manifest(&out_dir, "nvml", nv_bindgen::Origin::Generated, &NVML_FILES);
 
         let staged_root = root.join("staged");
         let host = "x86_64-pc-windows-msvc";

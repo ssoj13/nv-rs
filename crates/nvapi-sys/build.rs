@@ -32,11 +32,7 @@ const SPEC: LibSpec = LibSpec {
 };
 
 fn main() {
-    let result = nv_bindgen::target_os(SPEC.name).and_then(|os| match os.as_str() {
-        "windows" => nv_bindgen::generate(&SPEC).map(drop),
-        _ => Ok(()),
-    });
-    if let Err(e) = result {
+    if let Err(e) = nv_bindgen::generate_on_os(&SPEC, "windows") {
         println!("cargo::error={e}");
         std::process::exit(1);
     }

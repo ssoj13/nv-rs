@@ -58,7 +58,7 @@ cargo xtask coverage check
 
 ## Staging Runtime DLLs (`cargo xtask stage-dlls`)
 
-`xtask` can collect NVIDIA runtime libraries discovered via `nv_loader::candidates` into a staging directory for application bundles or wheels:
+`xtask` collects the NVIDIA runtime libraries of `nv_loader::catalog::ALL` (the single DLL list shared with the sys crates and `nv-loader::diag`), found via `nv_loader::candidates`, into a staging directory for application bundles or wheels. Each catalog entry also ships its companion files (cuDNN sub-libraries, NVRTC builtins, `nvJitLink` for cuSOLVER / cuSPARSE, `nvngx_dlssd` is its own entry `dlssd`):
 
 ```bash
 cargo xtask stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]
@@ -68,6 +68,7 @@ cargo xtask stage-dlls --out <dir> [--libs <csv>] [--include-driver] [--dry-run]
 - `--libs <csv>`: Comma-separated subset of library names to stage (defaults to all redistributable `Group::Toolkit` and `Group::Sdk` libraries).
 - `--include-driver`: Also include `Group::Driver` and `Group::DriverStore` libraries.
 - `--dry-run`: Print planned copies without writing files. Existing destination files with matching size and modification time are skipped.
+- A library named in `--libs` that is not found, or a missing required companion, fails the command with a non-zero exit naming the library.
 
 ## Workspace Lints
 

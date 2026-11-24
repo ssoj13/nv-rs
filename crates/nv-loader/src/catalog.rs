@@ -9,12 +9,39 @@
 //!
 //! **How.** Plain `const` data. SDK entries carry no build hint: a sys crate adds its own
 //! build-time SDK directory with [`DllSpec::with_hint`] (debug builds only), which nv-loader cannot
-//! know. Linux sonames list the major version the bindings are generated for first.
+//! know. Linux sonames list the major version the bindings are generated for first. An entry may
+//! also list [`Companion`] files (cuDNN's sub-libraries, NVRTC's builtins) that must ship in the
+//! same directory as its main file; `xtask stage-dlls` bundles them, so the loader and the bundler
+//! agree on what a library consists of.
 //!
 //! **Used by** every `*-sys` crate (`pub const DLL`), [`crate::diag::probe_all`] and
 //! `xtask stage-dlls`.
 
 use crate::{DllSpec, Group};
+
+/// A file that must ship in the same directory as a library's main file (cuDNN's sub-libraries,
+/// NVRTC's builtins), named by a [`crate::glob_match`] pattern.
+#[derive(Clone, Copy, Debug)]
+pub struct Companion {
+    /// File-name pattern (`"cudnn_*64_*.dll"`), matched against the main file's directory.
+    pub pattern: &'static str,
+    /// Whether a bundle without a match is broken (`true`) or merely older (`false`).
+    pub required: bool,
+}
+
+const fn required(pattern: &'static str) -> Companion {
+    Companion {
+        pattern,
+        required: true,
+    }
+}
+
+const fn optional(pattern: &'static str) -> Companion {
+    Companion {
+        pattern,
+        required: false,
+    }
+}
 
 /// One runtime library: its catalog name (equal to `spec.lib`) and how it is found.
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +50,33 @@ pub struct CatalogEntry {
     pub name: &'static str,
     /// Where it ships and what its files are called.
     pub spec: DllSpec,
+    /// Windows files that must be bundled with the main file (same directory).
+    pub companions_windows: &'static [Companion],
+    /// Linux files that must be bundled with the main file (same directory).
+    pub companions_linux: &'static [Companion],
+}
+
+impl CatalogEntry {
+    /// The companion files for the OS this binary runs on.
+    pub const fn companions(&self) -> &'static [Companion] {
+        if cfg!(windows) {
+            self.companions_windows
+        } else {
+            self.companions_linux
+        }
+    }
+
+    const fn with_companions(
+        self,
+        windows: &'static [Companion],
+        linux: &'static [Companion],
+    ) -> Self {
+        Self {
+            companions_windows: windows,
+            companions_linux: linux,
+            ..self
+        }
+    }
 }
 
 const fn entry(
@@ -39,6 +93,8 @@ const fn entry(
             windows,
             linux,
         },
+        companions_windows: &[],
+        companions_linux: &[],
     }
 }
 
@@ -146,7 +202,8 @@ pub const CUSOLVER: CatalogEntry = entry(
     Group::Toolkit,
     &["cusolver64_*"],
     &["libcusolver.so.12", "libcusolver.so"],
-);
+)
+.with_companions(&[required("nvJitLink_*.dll")], &[required("libnvJitLink.so.*")]);
 /// cuSOLVERMg (`cusolvermg-sys`).
 pub const CUSOLVERMG: CatalogEntry = entry(
     "cusolvermg",
@@ -160,7 +217,8 @@ pub const CUSPARSE: CatalogEntry = entry(
     Group::Toolkit,
     &["cusparse64_*"],
     &["libcusparse.so.12", "libcusparse.so"],
-);
+)
+.with_companions(&[required("nvJitLink_*.dll")], &[required("libnvJitLink.so.*")]);
 /// nvJPEG (`nvjpeg-sys`).
 pub const NVJPEG: CatalogEntry = entry(
     "nvjpeg",
@@ -174,6 +232,10 @@ pub const NVRTC: CatalogEntry = entry(
     Group::Toolkit,
     &["nvrtc64_*"],
     &["libnvrtc.so.13", "libnvrtc.so"],
+)
+.with_companions(
+    &[required("nvrtc-builtins64_*.dll")],
+    &[required("libnvrtc-builtins.so.*")],
 );
 /// NPP core (`npp-sys::nppc`).
 pub const NPPC: CatalogEntry = entry(
@@ -261,6 +323,12 @@ pub const CUDNN: CatalogEntry = entry(
     sdk("CUDNN_ROOT"),
     &["cudnn64_*"],
     &["libcudnn.so.9", "libcudnn.so"],
+)
+// The dispatcher loads its sub-libraries (graph, ops, cnn, adv, engines, ...) by bare file name;
+// older builds also import zlib from the same directory.
+.with_companions(
+    &[required("cudnn_*64_*.dll"), optional("zlibwapi.dll")],
+    &[required("libcudnn_*.so.*")],
 );
 /// nvCOMP (`nvcomp-sys`).
 pub const NVCOMP: CatalogEntry = entry(
@@ -277,11 +345,22 @@ pub const NCCL: CatalogEntry = entry(
     &["libnccl.so.2", "libnccl.so"],
 );
 /// DLSS Super Resolution runtime of the NGX SDK (no sys crate loads it: NGX loads it itself;
-/// staged next to applications by `xtask stage-dlls`). The Linux runtime has a versioned file name
-/// that is not known here, so no Linux name is listed.
-pub const DLSS: CatalogEntry = entry("dlss", sdk("NGX_SDK_ROOT"), &["nvngx_dlss.dll"], &[]);
+/// staged next to applications by `xtask stage-dlls`). The Linux file carries the runtime version
+/// (`libnvidia-ngx-dlss.so.310.4.0`), so its name is a pattern that the loader expands against the
+/// SDK directories and that is never passed to `dlopen`.
+pub const DLSS: CatalogEntry = entry(
+    "dlss",
+    sdk("NGX_SDK_ROOT"),
+    &["nvngx_dlss.dll"],
+    &["libnvidia-ngx-dlss.so.*"],
+);
 /// DLSS Ray Reconstruction runtime of the NGX SDK (see [`DLSS`]).
-pub const DLSSD: CatalogEntry = entry("dlssd", sdk("NGX_SDK_ROOT"), &["nvngx_dlssd.dll"], &[]);
+pub const DLSSD: CatalogEntry = entry(
+    "dlssd",
+    sdk("NGX_SDK_ROOT"),
+    &["nvngx_dlssd.dll"],
+    &["libnvidia-ngx-dlssd.so.*"],
+);
 
 /// Every library in the catalog: driver, then toolkit, then SDK libraries.
 pub const ALL: &[CatalogEntry] = &[
@@ -321,10 +400,44 @@ mod tests {
     }
 
     #[test]
-    fn linux_names_are_sonames_not_patterns() {
+    fn linux_names_are_sonames_except_the_ngx_runtimes() {
+        // A pattern is never passed to `dlopen`, so only libraries without a stable soname (the NGX
+        // runtimes, whose file name carries the runtime version) may use one.
         for e in ALL {
             for name in e.spec.linux {
-                assert!(!name.contains('*'), "{}: {name} is not a soname", e.name);
+                let is_ngx = matches!(e.name, "dlss" | "dlssd");
+                assert_eq!(name.contains('*'), is_ngx, "{}: {name}", e.name);
+            }
+        }
+    }
+
+    #[test]
+    fn companions_match_siblings_and_never_the_main_file() {
+        use crate::glob_match;
+        let cudnn = CUDNN.companions_windows;
+        assert!(cudnn.iter().any(|c| c.required && glob_match(c.pattern, "cudnn_graph64_9.dll")));
+        assert!(
+            cudnn
+                .iter()
+                .any(|c| c.required && glob_match(c.pattern, "cudnn_engines_precompiled64_9.dll"))
+        );
+        assert!(!cudnn.iter().any(|c| glob_match(c.pattern, "cudnn64_9.dll")));
+        assert!(
+            CUDNN
+                .companions_windows
+                .iter()
+                .any(|c| !c.required && c.pattern == "zlibwapi.dll")
+        );
+        assert!(NVRTC.companions_windows.iter().any(|c| glob_match(c.pattern, "nvrtc-builtins64_130.dll")));
+        assert!(!NVRTC.companions_windows.iter().any(|c| glob_match(c.pattern, "nvrtc64_130_0.dll")));
+        // Every companion of every entry is a non-empty pattern that does not match the entry's own
+        // Windows name (a library is not its own companion).
+        for e in ALL {
+            for c in e.companions_windows.iter().chain(e.companions_linux) {
+                assert!(!c.pattern.is_empty(), "{}", e.name);
+                for own in e.spec.windows.iter().chain(e.spec.linux) {
+                    assert!(!glob_match(c.pattern, own), "{}: {} matches {own}", e.name, c.pattern);
+                }
             }
         }
     }

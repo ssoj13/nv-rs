@@ -8,7 +8,27 @@
 //!   `<name>_shims.rs` (one panic-free `extern "C"` wrapper per entry point, returning the
 //!   library's own status code when the library or the symbol is missing);
 //! - `<name>_inventory.json` — every entry-point name plus the sha256 of each header, the input of
-//!   the coverage matrix (names and hashes only, never header text).
+//!   the coverage matrix (names and hashes only, never header text);
+//! - `<name>_manifest.json` — written last ([`Manifest`]): the exact files the library's shape
+//!   promises (all verified to exist, otherwise a build error naming the missing one) and whether
+//!   they were [`Origin::Generated`] or copied from the committed prebuilt set
+//!   ([`Origin::Prebuilt`], which also prints a `cargo::warning`). `xtask prebuilt` stages from
+//!   the manifest instead of inferring completeness, and the sys crates expose it as
+//!   `BINDINGS_MANIFEST`.
+//!
+//! **Cross builds.** SDK discovery (vcv-rs) covers the host OS only. When the Cargo target OS
+//! differs from the host, `Sdk::CudaToolkit*` and `Sdk::Nv` take the SDK root from the
+//! discovery's root variables (`CUDA_PATH`, `NCCL_ROOT`, ...; `<root>/include`), and the MSVC
+//! include directories are added only for `*-windows-msvc` targets: a Linux target gets its
+//! sysroot from `BINDGEN_EXTRA_CLANG_ARGS` / `BINDGEN_EXTRA_CLANG_ARGS_<target>`, which bindgen
+//! reads itself.
+//!
+//! **Optional-SDK policy (L-32).** A library that exists only on some targets and needs a
+//! separately installed SDK (NCCL, cuFile: Linux) *requires* that SDK on its target: a missing SDK
+//! is a build error naming the variable to set (there is no prebuilt set for them), and on other
+//! targets the crate compiles to nothing without any SDK ([`generate_on_os`]). NGX is the one
+//! deliberate exception: its sys crate gates every item on `cfg(has_ngx_sdk)` and the `ngx`
+//! wrapper has a complete stub path, so a missing SDK degrades to a warning there.
 //!
 //! **Why.** Twenty-odd NVIDIA libraries need the same pipeline; without one generator every sys
 //! crate grows its own bindgen setup and loader and they drift. Bindgen's own dynamic-loading
@@ -117,6 +137,11 @@ pub enum Shape {
     FunctionTable {
         /// The table struct whose fields are the entry points (`"OptixFunctionTable"`).
         table_type: &'static str,
+        /// `(name, C expression)` pairs evaluated by clang and emitted as
+        /// `pub const NV_RS_PROBE_<name>: c_uint`. For values bindgen cannot compute from a header
+        /// itself, such as the function-like version macro `NVENCAPI_STRUCT_VERSION(2)`, so a sys
+        /// crate never hand-copies them. A probe clang cannot fold to a constant is a build error.
+        probes: &'static [(&'static str, &'static str)],
     },
 }
 
@@ -301,6 +326,39 @@ pub struct Inventory {
     pub unshimmed: Vec<String>,
 }
 
+/// How the files in a build's `OUT_DIR` came to be.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Written by the generator from the installed SDK headers.
+    Generated,
+    /// Copied from the committed prebuilt bindings (explicit request, absent SDK or no libclang).
+    Prebuilt,
+}
+
+/// The record `generate` writes last into `OUT_DIR` as `<lib>_manifest.json`.
+///
+/// `files` is exactly the set of binding files the library's [`Shape`] promises (types, inventory,
+/// api and shims), all of which existed when the manifest was written; the manifest itself is not
+/// listed. `xtask prebuilt` stages `files` and nothing else, and skips any build whose `origin` is
+/// [`Origin::Prebuilt`]. A missing manifest means the generation never finished.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Manifest {
+    /// The library's short name.
+    pub lib: String,
+    /// Whether the files were generated or copied from the committed prebuilt set.
+    pub origin: Origin,
+    /// File names relative to `OUT_DIR`, in promise order.
+    pub files: Vec<String>,
+}
+
+impl Manifest {
+    /// The manifest's file name for library `lib`.
+    pub fn file_name(lib: &str) -> String {
+        format!("{lib}_manifest.json")
+    }
+}
+
 /// A header and the sha256 of its contents.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeaderHash {
@@ -331,12 +389,26 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
     for var in LIBCLANG_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    emit_target_clang_arg_reruns(&target);
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| Error::Generated {
         lib: spec.name,
         msg: "OUT_DIR is unset: generate() runs from build.rs".into(),
     })?);
-    let target = std::env::var("TARGET").unwrap_or_default();
+    // A manifest left by an earlier run must never vouch for this one.
+    let stale = out_dir.join(Manifest::file_name(spec.name));
+    match std::fs::remove_file(&stale) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(Error::Io {
+                lib: spec.name,
+                path: stale,
+                source,
+            });
+        }
+    }
     let use_prebuilt = std::env::var("NV_RS_USE_PREBUILT")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let static_libs = match spec.shape {
@@ -473,6 +545,7 @@ pub fn generate(spec: &LibSpec) -> Result<Inventory, Error> {
         msg: e.to_string(),
     })?;
     write("inventory.json", &json)?;
+    write_manifest(spec, &out_dir, Origin::Generated)?;
     // Umbrella headers (`cudnn.h`, `npp.h`, `nvapi.h`) hide most of the API in sub-headers.
     for path in &out.includes {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -541,6 +614,18 @@ fn warn_header_drift(spec: &LibSpec, include_dirs: &[PathBuf], inventory: &Inven
             spec.name,
             drift.join(", ")
         );
+    }
+}
+
+/// [`generate`] only when the Cargo target OS is `os`, else `Ok(None)`: the one OS gate for sys
+/// crates of single-OS libraries (NVAPI on Windows, cuFile on Linux), which compile to nothing
+/// elsewhere and need no SDK there. An unset target OS is an error ([`Error::CargoEnv`]), never
+/// "not this OS".
+pub fn generate_on_os(spec: &LibSpec, os: &str) -> Result<Option<Inventory>, Error> {
+    if target_os(spec.name)? == os {
+        generate(spec).map(Some)
+    } else {
+        Ok(None)
     }
 }
 
@@ -622,6 +707,50 @@ fn expected_output_files(spec: &LibSpec) -> Vec<String> {
         Shape::FunctionTable { .. } => {}
     }
     files
+}
+
+/// Checks that every file `spec`'s shape promises exists in `out_dir`, then writes the
+/// [`Manifest`] naming them. A missing file is a hard build error naming it, so a generator that
+/// forgot to write a promised file fails here and not as an `include!` error in the sys crate.
+fn write_manifest(spec: &LibSpec, out_dir: &Path, origin: Origin) -> Result<(), Error> {
+    let files = expected_output_files(spec);
+    for file in &files {
+        let path = out_dir.join(file);
+        if !path.is_file() {
+            return Err(Error::Generated {
+                lib: spec.name,
+                msg: format!("promised output file is missing: {}", path.display()),
+            });
+        }
+    }
+    let manifest = Manifest {
+        lib: spec.name.to_string(),
+        origin,
+        files,
+    };
+    let text = serde_json::to_string_pretty(&manifest).map_err(|e| Error::Generated {
+        lib: spec.name,
+        msg: e.to_string(),
+    })?;
+    let path = out_dir.join(Manifest::file_name(spec.name));
+    std::fs::write(&path, text).map_err(|source| Error::Io {
+        lib: spec.name,
+        path,
+        source,
+    })
+}
+
+/// bindgen also reads `BINDGEN_EXTRA_CLANG_ARGS_<target>` (target with `-` or `_`), so a
+/// cross-compiling caller can supply a sysroot per target; changing it reruns generation.
+fn emit_target_clang_arg_reruns(target: &str) {
+    if target.is_empty() {
+        return;
+    }
+    println!(
+        "cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_{}",
+        target.replace('-', "_")
+    );
+    println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_{target}");
 }
 
 fn resolve_prebuilt_dir(
@@ -706,6 +835,7 @@ fn use_prebuilt_bindings(
         msg: "cannot resolve prebuilt directory (TARGET or CARGO_MANIFEST_DIR unset)".into(),
     })?;
     let (sources, inventory) = copy_prebuilt_bindings(spec, &prebuilt_dir, out_dir)?;
+    write_manifest(spec, out_dir, Origin::Prebuilt)?;
     for src in &sources {
         println!("cargo::rerun-if-changed={}", src.display());
     }
@@ -729,6 +859,7 @@ pub fn core_types(spec: &LibSpec) -> Result<String, Error> {
     for var in LIBCLANG_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
+    emit_target_clang_arg_reruns(&std::env::var("TARGET").unwrap_or_default());
     let include_dirs = sdk_paths(spec)?.includes;
     let mut wrapper = String::new();
     for name in spec.headers {
@@ -799,6 +930,15 @@ pub fn bindings(
             sha256: hex(&Sha256::digest(&bytes)),
         });
         wrapper.push_str(&format!("#include <{name}>\n"));
+    }
+    let probes: &[(&str, &str)] = match spec.shape {
+        Shape::FunctionTable { probes, .. } => probes,
+        _ => &[],
+    };
+    for (name, expr) in probes {
+        wrapper.push_str(&format!(
+            "static const unsigned int NV_RS_PROBE_{name} = ({expr});\n"
+        ));
     }
 
     let base = || {
@@ -940,10 +1080,21 @@ pub fn bindings(
     for v in spec.allow_var {
         tb = tb.allowlist_var(*v);
     }
+    if !probes.is_empty() {
+        tb = tb.allowlist_var("^NV_RS_PROBE_.*");
+    }
     for t in spec.reuse_cuda_types {
         tb = tb.blocklist_type(*t);
     }
     let mut types = normalize_positive_enums(spec.name, &run(tb)?, spec.positive_enums)?;
+    for (name, expr) in probes {
+        if !types.contains(&format!("pub const NV_RS_PROBE_{name}:")) {
+            return Err(Error::Generated {
+                lib: spec.name,
+                msg: format!("probe `{name}` = `{expr}` did not fold to a constant"),
+            });
+        }
+    }
     if !spec.reuse_cuda_types.is_empty() {
         types = format!(
             "pub use cuda_bindings::{{{}}};\n{types}",
@@ -996,7 +1147,9 @@ pub fn bindings(
                 });
             }
         }
-        Shape::FunctionTable { table_type } => symbols = inventory(spec.name, &types, table_type)?,
+        Shape::FunctionTable { table_type, .. } => {
+            symbols = inventory(spec.name, &types, table_type)?;
+        }
         Shape::StaticLink { .. } => {
             let src = externs.unwrap_or_default();
             symbols = extern_fns(spec.name, &src)?.0;
@@ -1240,11 +1393,14 @@ pub fn query_shims(
                 // remains loaded for the process; the caller upholds the native call contract.
                 match #loader() {
                     Ok(__nv_qi) => {
-                        let __nv_ptr = unsafe { (__nv_qi.query)(#id_lit) };
-                        if __nv_ptr.is_null() {
+                        // Resolved once per id (0 = the driver lacks it): the query is a hash
+                        // lookup inside the driver and the loaded library never changes.
+                        static __NV_ADDR: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
+                        let __nv_addr = *__NV_ADDR.get_or_init(|| unsafe { (__nv_qi.query)(#id_lit) } as usize);
+                        if __nv_addr == 0 {
                             #on_missing
                         } else {
-                            let __nv_fn = unsafe { ::core::mem::transmute::<*mut ::core::ffi::c_void, #fn_ty>(__nv_ptr) };
+                            let __nv_fn = unsafe { ::core::mem::transmute::<usize, #fn_ty>(__nv_addr) };
                             #result
                         }
                     }
@@ -1260,7 +1416,7 @@ pub fn query_shims(
     unshimmed.sort();
     let source = document_unsafe_blocks(
         &prettyplease::unparse(&parsed),
-        "the header declares this exact id's signature and the query's library remains loaded for the process; the caller upholds the native call contract.",
+        "the header declares this exact id's signature, the address was returned by the query for that id and its library remains loaded for the process; the caller upholds the native call contract.",
     );
     Ok(QueryShims {
         source,
@@ -1825,8 +1981,18 @@ fn sdk_paths(spec: &LibSpec) -> Result<SdkPaths, Error> {
     let mut dirs = Vec::new();
     let mut nvidia = Vec::new();
     let cargo_arch = std::env::var_os("CARGO_CFG_TARGET_ARCH");
+    let cross = is_cross_os();
     for sdk in spec.sdks {
         let dir = match sdk {
+            Sdk::CudaToolkit if cross => {
+                cross_root(spec.name, "CUDA Toolkit", vcv_rs::cuda::root_vars())?.join("include")
+            }
+            Sdk::CudaToolkitSubdir(rel) if cross => {
+                cross_root(spec.name, "CUDA Toolkit", vcv_rs::cuda::root_vars())?.join(rel)
+            }
+            Sdk::Nv(kind) if cross => {
+                cross_include_dir(&cross_root(spec.name, kind.name(), kind.root_vars())?, *kind)
+            }
             Sdk::CudaToolkit => {
                 vcv_rs::detect_cuda()
                     .map(|c| c.include_dir())
@@ -1910,10 +2076,67 @@ fn sdk_paths(spec: &LibSpec) -> Result<SdkPaths, Error> {
     })
 }
 
+/// Whether the Cargo target's OS differs from the OS running the build script (a cross build).
+/// False outside a build script, where Cargo's target variables are unset.
+fn is_cross_os() -> bool {
+    std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os != std::env::consts::OS)
+}
+
+/// The SDK root a cross build names explicitly through one of `vars` (vcv-rs discovers SDKs of the
+/// host OS only), as a `SdkNotFound` naming the variables when none is set.
+fn cross_root(lib: &'static str, sdk: &str, vars: &[&str]) -> Result<PathBuf, Error> {
+    vars.iter()
+        .find_map(|v| std::env::var_os(v).filter(|x| !x.is_empty()))
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::SdkNotFound {
+            lib,
+            sdk: sdk.to_string(),
+            hint: format!(
+                "cross build: SDK discovery covers the host OS only, set one of {vars:?} to the target SDK root"
+            ),
+        })
+}
+
+/// The header directory of a cross build's explicit SDK root: the first existing layout of that
+/// SDK (vcv-rs keeps its own table private; these are the published SDK layouts: the Video Codec
+/// SDK ships `Interface/`, the Optical Flow SDK `NvOFInterface/`, NVAPI headers at the root).
+fn cross_include_dir(root: &Path, kind: vcv_rs::nvsdk::Kind) -> PathBuf {
+    use vcv_rs::nvsdk::Kind;
+    let subdirs: &[&str] = match kind {
+        Kind::VideoCodec => &["Interface", "include"],
+        Kind::OpticalFlow => &["NvOFInterface", "include"],
+        Kind::Nvapi => &[""],
+        _ => &["include"],
+    };
+    subdirs
+        .iter()
+        .map(|sub| root.join(sub))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| root.join("include"))
+}
+
+/// Whether the Cargo target uses the MSVC/Windows SDK headers. Outside a build script (unit
+/// tests) the host decides.
+fn targets_msvc() -> bool {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| std::env::consts::OS.into());
+    let env = std::env::var("CARGO_CFG_TARGET_ENV")
+        .unwrap_or_else(|_| if cfg!(target_env = "msvc") { "msvc" } else { "" }.into());
+    is_msvc_target(&os, &env)
+}
+
+fn is_msvc_target(os: &str, env: &str) -> bool {
+    os == "windows" && env == "msvc"
+}
+
 /// MSVC + Windows SDK + UCRT include directories from vcv-rs, so libclang finds `stddef.h` & co.
-/// from any shell, for the host running the build and the Cargo target's architecture. Empty when
-/// no Visual Studio is installed (libclang then uses its own search).
+/// from any shell, for the host running the build and the Cargo target's architecture. Only
+/// MSVC targets get them: any other target gets none, and a cross build supplies its sysroot
+/// through `BINDGEN_EXTRA_CLANG_ARGS` / `BINDGEN_EXTRA_CLANG_ARGS_<target>`, which bindgen reads
+/// itself. Empty when no Visual Studio is installed (libclang then uses its own search).
 fn system_include_dirs(lib: &'static str) -> Result<Vec<PathBuf>, Error> {
+    if !targets_msvc() {
+        return Ok(Vec::new());
+    }
     #[cfg(windows)]
     {
         let (host, target) = msvc_arches(lib, std::env::var_os("CARGO_CFG_TARGET_ARCH").as_deref())?;
@@ -2501,6 +2724,14 @@ pub type signedErr = ::std::os::raw::c_int;\n";
             part.shims.contains("_qiStatus_QI_NO_IMPLEMENTATION")
                 && part.shims.contains("_qiStatus_QI_LIBRARY_NOT_FOUND")
         );
+        // L-30: the id is resolved once per shim, never per call.
+        for f in ["qiStore", "qiMissingStore"] {
+            let body = fn_slice(&part.shims, f);
+            assert!(
+                body.contains("OnceLock") && body.matches("(__nv_qi.query)").count() == 1,
+                "{f} must cache its query result: {body}"
+            );
+        }
         for void_fn in ["qiStore", "qiMissingStore"] {
             let body = fn_slice(&part.shims, void_fn);
             assert!(
@@ -2710,7 +2941,10 @@ pub type signedErr = ::std::os::raw::c_int;\n";
         );
         let table = LibSpec {
             name: "optix",
-            shape: Shape::FunctionTable { table_type: "T" },
+            shape: Shape::FunctionTable {
+                table_type: "T",
+                probes: &[],
+            },
             ..FAKE
         };
         assert_eq!(
@@ -2782,6 +3016,66 @@ pub type signedErr = ::std::os::raw::c_int;\n";
         assert!(copy_prebuilt_bindings(&FAKE, &prebuilt, &out).is_err());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn unique_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nv_bindgen_{label}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn manifest_requires_every_promised_file_and_records_the_origin() {
+        let out = unique_dir("manifest");
+        let promised = expected_output_files(&FAKE);
+        // The generator forgot the last promised file: a hard error naming it, and no manifest.
+        for f in &promised[..promised.len() - 1] {
+            std::fs::write(out.join(f), "// x").expect("write");
+        }
+        let missing = promised.last().expect("promises files");
+        let err = write_manifest(&FAKE, &out, Origin::Generated).expect_err("a file is missing");
+        assert!(err.to_string().contains(missing.as_str()), "{err}");
+        assert!(!out.join(Manifest::file_name("fake")).exists());
+
+        std::fs::write(out.join(missing), "// x").expect("write");
+        write_manifest(&FAKE, &out, Origin::Prebuilt).expect("complete set");
+        let text = std::fs::read_to_string(out.join("fake_manifest.json")).expect("manifest");
+        let manifest: Manifest = serde_json::from_str(&text).expect("manifest parses");
+        assert_eq!(
+            manifest,
+            Manifest {
+                lib: "fake".into(),
+                origin: Origin::Prebuilt,
+                files: promised,
+            }
+        );
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn msvc_includes_belong_to_msvc_targets_only() {
+        assert!(is_msvc_target("windows", "msvc"));
+        assert!(!is_msvc_target("linux", "gnu"));
+        assert!(!is_msvc_target("windows", "gnu"));
+        assert!(!is_msvc_target("macos", ""));
+    }
+
+    #[test]
+    fn a_cross_build_without_an_sdk_root_names_the_variables() {
+        let err = cross_root("nccl", "NCCL", &["NV_RS_TEST_CROSS_ROOT_NEVER_SET"])
+            .expect_err("the variable is unset");
+        let Error::SdkNotFound { lib, hint, .. } = &err else {
+            panic!("expected SdkNotFound, got {err}");
+        };
+        assert_eq!(*lib, "nccl");
+        assert!(hint.contains("NV_RS_TEST_CROSS_ROOT_NEVER_SET"), "{hint}");
     }
 
     #[test]

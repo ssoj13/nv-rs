@@ -6,8 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Build jobs only read the repository; the publish job below raises this to write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,15 +91,15 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
+          # pwsh only propagates the exit code of the LAST command, so a failing native command
+          # mid-script would go unnoticed. These two lines make every native non-zero exit throw
+          # (PowerShell 7.4+, which the hosted Windows runners ship).
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force -Path dist/crates/nv-demo/shaders | Out-Null
           Copy-Item target/release/nv-demo.exe dist/
-          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss
-          foreach ($dir in @("$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin")) {
-            if (Test-Path $dir) {
-              Get-ChildItem -Path $dir -Filter "nvrtc-builtins64_*.dll" -ErrorAction SilentlyContinue |
-                Copy-Item -Destination dist/ -Force
-            }
-          }
+          # Companion DLLs (NVRTC builtins, ...) come from nv_loader::catalog; a missing one fails.
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss,dlssd
           Copy-Item crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
           Copy-Item README.md dist/
           Get-ChildItem -Path . -Filter "LICENSE*" | Copy-Item -Destination dist/
@@ -110,14 +111,9 @@ jobs:
         run: |
           mkdir -p dist/crates/nv-demo/shaders
           cp target/release/nv-demo dist/
-          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss
-          for dir in "${CUDA_PATH}/lib64" "${CUDA_PATH}/targets/x86_64-linux/lib"; do
-            if [ -d "$dir" ]; then
-              cp -L "$dir"/libnvrtc-builtins.so* dist/ 2>/dev/null || true
-            fi
-          done
+          cargo run -p xtask -- stage-dlls --out dist --libs cufft,nvjpeg,nvrtc,cupti,dlss,dlssd
           cp crates/nv-demo/shaders/* dist/crates/nv-demo/shaders/
-          cp README.md LICENSE* dist/ 2>/dev/null || true
+          cp README.md LICENSE dist/
           cat << 'EOF' > dist/run-nv-demo.sh
           #!/usr/bin/env bash
           set -euo pipefail
@@ -139,6 +135,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8

@@ -21,6 +21,12 @@ const SPEC: LibSpec = LibSpec {
     opaque_types: &[],
     shape: Shape::FunctionTable {
         table_type: "_NV_ENCODE_API_FUNCTION_LIST",
+        // Function-like version macros bindgen cannot fold: evaluated by clang from the header.
+        probes: &[
+            ("API_VERSION", "NVENCAPI_VERSION"),
+            ("STRUCT_VERSION_BASE", "NVENCAPI_STRUCT_VERSION(0)"),
+            ("FUNCTION_LIST_VER", "NV_ENCODE_API_FUNCTION_LIST_VER"),
+        ],
     },
 };
 

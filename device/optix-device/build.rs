@@ -47,7 +47,10 @@ fn main() {
         positive_enums: &[],
         clang_args: &[],
         opaque_types: &[],
-        shape: nv_bindgen::Shape::FunctionTable { table_type: "OptixFunctionTable" },
+        shape: nv_bindgen::Shape::FunctionTable {
+            table_type: "OptixFunctionTable",
+            probes: &[],
+        },
     };
     match nv_bindgen::core_types(&spec) {
         Ok(src) => std::fs::write(out.join("optix_types.rs"), src).expect("write optix_types.rs"),

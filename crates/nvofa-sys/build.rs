@@ -20,6 +20,7 @@ const SPEC: LibSpec = LibSpec {
     opaque_types: &[],
     shape: Shape::FunctionTable {
         table_type: "_NV_OF_CUDA_API_FUNCTION_LIST",
+        probes: &[],
     },
 };
 

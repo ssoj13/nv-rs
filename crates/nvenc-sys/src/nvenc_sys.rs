@@ -34,17 +34,19 @@ pub const DLL: DllSpec = nv_loader::catalog::NVENC.spec;
 /// Entry points (function-list fields) and header sha256 (coverage evidence).
 pub const INVENTORY: &str = include_str!(concat!(env!("OUT_DIR"), "/nvenc_inventory.json"));
 
-/// `NVENCAPI_VERSION` from the header (`major | minor << 24`).
-pub const API_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
+/// `NVENCAPI_VERSION`, evaluated by clang from the header (`nvenc-sys/build.rs` probe).
+pub const API_VERSION: u32 = NV_RS_PROBE_API_VERSION;
 
-/// `NVENCAPI_STRUCT_VERSION(ver)`: the header macro bindgen cannot evaluate. Every NVENC struct
-/// carries this in its `version` field; the driver rejects a mismatch with `NV_ENC_ERR_INVALID_VERSION`.
+/// `NVENCAPI_STRUCT_VERSION(ver)`: the function-like header macro, derived from the probe
+/// `NVENCAPI_STRUCT_VERSION(0)` (the macro is `API_VERSION | ver << 16 | tag`, so only `ver << 16`
+/// is added here). Every NVENC struct carries this in its `version` field; the driver rejects a
+/// mismatch with `NV_ENC_ERR_INVALID_VERSION`.
 pub const fn struct_version(ver: u32) -> u32 {
-    API_VERSION | (ver << 16) | (0x7 << 28)
+    NV_RS_PROBE_STRUCT_VERSION_BASE | (ver << 16)
 }
 
-/// `NV_ENCODE_API_FUNCTION_LIST_VER`.
-pub const FUNCTION_LIST_VERSION: u32 = struct_version(2);
+/// `NV_ENCODE_API_FUNCTION_LIST_VER`, evaluated by clang from the header.
+pub const FUNCTION_LIST_VERSION: u32 = NV_RS_PROBE_FUNCTION_LIST_VER;
 
 /// The driver's NVENC function list plus the library that backs it (kept loaded for the process).
 pub struct NvencApi {
@@ -132,6 +134,17 @@ mod tests {
                 "{f} missing from the inventory"
             );
         }
+    }
+
+    #[test]
+    fn probed_versions_agree_with_the_header_constants() {
+        // Three separate clang evaluations of the header: a drift between them (or a wrong
+        // reconstruction of the struct-version formula) fails here.
+        assert_eq!(
+            API_VERSION,
+            NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24)
+        );
+        assert_eq!(FUNCTION_LIST_VERSION, struct_version(2));
     }
 
     #[test]

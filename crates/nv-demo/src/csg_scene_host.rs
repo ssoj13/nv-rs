@@ -32,7 +32,7 @@ use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
 use csg_scene::{
-    CROWD_USER_ID_BASE, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
+    CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
     GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec,
     SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
     SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
@@ -842,6 +842,8 @@ fn pack_dynamic_prefix_only(
         if part_end == 0 {
             continue;
         }
+        // Same projection of the kind tag as `WorldScene::pack_visible` (`inst_flags::CROWD_BONE`).
+        let packed_flags = inst_flags::with_crowd_bone(inst.flags, is_crowd_bone);
 
         let scale_max = xform_max_scale(inst.xform);
         let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
@@ -901,7 +903,7 @@ fn pack_dynamic_prefix_only(
                         compound_id: proxy.compound_id.0,
                         user_id: inst.user_id,
                         mat_override: mat_ov,
-                        flags: inst.flags,
+                        flags: packed_flags,
                     });
                     out_prev.push(part_prev.0);
                 }
@@ -924,7 +926,7 @@ fn pack_dynamic_prefix_only(
                     compound_id: cid.0,
                     user_id: inst.user_id,
                     mat_override: mat_ov,
-                    flags: inst.flags,
+                    flags: packed_flags,
                 });
                 out_prev.push(part_prev.0);
             }
@@ -1321,7 +1323,9 @@ impl CsgGpuHost {
 
         let mut gidx = 0usize;
         for (slot, gpu_inst) in slice[..dyn_count].iter().enumerate() {
-            if gpu_inst.user_id < CROWD_USER_ID_BASE {
+            // The packer derives this bit from the world's kind tag; `user_id` ranges are not
+            // guaranteed unique across generators.
+            if (gpu_inst.flags & inst_flags::CROWD_BONE) == 0 {
                 continue;
             }
             let target_bits = xform_to_bits(gpu_inst.xform);
@@ -2134,7 +2138,7 @@ impl CsgGpuHost {
                 let mut crowd_tail_contiguous = true;
                 for (i, inst) in slice[..dyn_count].iter().enumerate() {
                     self.prev_dyn_sig.push((inst.compound_id, inst.user_id));
-                    if inst.user_id >= CROWD_USER_ID_BASE {
+                    if (inst.flags & inst_flags::CROWD_BONE) != 0 {
                         if !saw_crowd {
                             first_crowd = i;
                             saw_crowd = true;
@@ -3299,7 +3303,7 @@ mod tests {
         // Verify `skip_crowd_bones = true` emits strictly the non-crowd traffic prefix.
         let expected_non_crowd = full_packed.instances_slice()[..full_dyn_count]
             .iter()
-            .filter(|inst| inst.user_id < CROWD_USER_ID_BASE)
+            .filter(|inst| (inst.flags & inst_flags::CROWD_BONE) == 0)
             .count();
         let mut traffic_lods = Vec::new();
         let mut traffic_insts = Vec::new();
@@ -3316,7 +3320,7 @@ mod tests {
         assert!(
             traffic_insts
                 .iter()
-                .all(|inst| inst.user_id < CROWD_USER_ID_BASE),
+                .all(|inst| (inst.flags & inst_flags::CROWD_BONE) == 0),
             "skip_crowd_bones must omit all GPU-scattered crowd bones"
         );
 

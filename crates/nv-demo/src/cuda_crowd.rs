@@ -28,10 +28,13 @@ use csg_scene::encode_walkway_target;
 
 use crate::csg_scene_host::CSG_SBT_PRIM_OFFSET;
 
-/// Extra `CsgGpuInstance::flags` bits OR'd onto visible scattered crowd bone instances so shadows
-/// and `Motion` AOV optical flow match CPU-packed dynamic actors identically.
-const SCATTER_VISIBLE_EXTRA_FLAGS: u32 =
-    inst_flags::DYNAMIC | inst_flags::CAST_SHADOW | inst_flags::MOTION_BLUR;
+/// Extra `CsgGpuInstance::flags` bits OR'd onto visible scattered crowd bone instances so the
+/// GPU-written slot carries the same flags `WorldScene::pack_visible` gives a crowd bone: shadows,
+/// `Motion` AOV optical flow and the `CROWD_BONE` marker that slot mapping and repacks test.
+const SCATTER_VISIBLE_EXTRA_FLAGS: u32 = inst_flags::DYNAMIC
+    | inst_flags::CAST_SHADOW
+    | inst_flags::MOTION_BLUR
+    | inst_flags::CROWD_BONE;
 
 /// OptiX instance flag disabling any-hit programs on opaque crowd bone instances.
 const OPTIX_INST_DISABLE_ANYHIT: u32 =

@@ -23,6 +23,7 @@ State as of `a33d21f` (`docs: final wave report and changelog`), 2026-11-23; the
 | W7 (partial) | docs sync | `d8dce5f`, `c441ac3`, `3bdc5a6` |
 | csg-rs adoption | `csg-rs` `24b22f5` merged | `ea2161d`, `a807624`, `csg_rs_125b870_adoption.md`; gate: clippy clean, 467 / 0 / 205, nv-demo ignored GPU tests 5/5, release app renders Marina with CUDA crowd 180 and DLSS RR |
 | nv-demo follow-ups | GPU:D03 (ABI 648 B), GPU:D21, RND:R10, `anim_range` sliders, async launch upload, APP:F19, RND:H13, `nv-wgpu` submit timeout | `ee08ade`, `wave_nvdemo_followups.md` |
+| csg-rs bump | `csg-rs` `fa5e170` adopted: typed `SceneBuildError` to the status line, `SceneDescriptor::geo_origin` (closes `APP:F24`), `FIRST_HIT_UNION` stays on RPN, explicit pipeline stack sizing | `9b6e178`, `csg_fa5e170_adoption.md`; gate: clippy clean, 500 / 0 / 208, nv-demo ignored GPU tests 6/6; RT pass +12 % (see `PERF:RT`) |
 | Final wave | `W5.2` catalog-driven `xtask` + bindings manifest + loader leftovers + Linux loader search + cross-build fixes (`208e628`); `W4.3` wrapper duplicates + bounded `nv-wgpu` waits (`0508d75`); `nv-demo` OptiX SDK discovery, PTX cache key, `perf_log`, single-source tables, `main()` `ExitCode` (`0714f65`); `DPY:C20` `close()` / context managers (`473e1fe`); device CI job, `deny.toml`, `url` 2.5.9 / RUSTSEC-2026-0592 (`a7b7b49`); report and changelog (`a33d21f`) | `wave_final.md`; gate: clippy clean, **500 passed / 0 failed / 207 ignored** |
 
 Final wave GPU tests (`-- --ignored --test-threads=1`, passed / failed): cuda-core-ext 12/0, nv-wgpu 13/0, optix 68/0, cublas 9/0, cudnn 5/0, cusolver 9/0, cusparse 11/0, nvenc 4/0, nvdec 2/0, nvofa 4/0, nvjpeg 7/0, nvenc-sys 1/0, nvapi-sys 1/0, nv-demo 5/0. `python/nv-py`: clippy clean, `cargo test --lib` 19 / 0 / 5 ignored (+ 5 ignored passed), **pytest 118 passed / 2 skipped**. `device/`: **15/15** cases. Linux cross: `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings` clean except `nvcomp-sys` / `nvcomp` (compile only, nothing ran on Linux). `cargo deny check`: advisories, bans, sources ok; licenses FAILED (`DENY:LIC`).
@@ -69,14 +70,13 @@ Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `APP:F24` | Narrowed: AOV / DLSS quality / time scale / shutter / sky tables are single-source now (`0714f65`). The scene geo-origin table stays: it needs a `SceneDescriptor` field in csg-rs. | csg-rs | `wave_final.md` W4.3 |
 | `APP:F21` | `persist.rs:313-374` and `ui.rs:145-164` keep hand-written string tables although `serde` derives are available; left to keep the on-disk config format unchanged. | lead | `11_demo_main_ui.md` |
 
 ### `nv-demo`
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `PERF:RT` | RT shader speed-up. Measured (release, 5 runs x 600 frames, 4 spp, 6 bounces): frame 51.17 ms median, OptiX RT pass 50.12 ms = 98 % of the frame; host prep 0.74 ms + CUDA compute 0.68 ms are under 3 %. No before/after pair exists: no speed-up was made. Needs Nsight Compute on `__raygen__` / `hit_csg*`; a shader change can alter the image. | lead | `wave_final.md` Performance |
+| `PERF:RT` | RT shader speed. Final wave (release, 5 runs x 600 frames, 4 spp, 6 bounces): frame 51.17 ms median, OptiX RT pass 50.12 ms = 98 % of the frame (clean figure ~45.6 ms); host prep + CUDA compute under 3 %. csg-rs `fa5e170` adoption, alternating A/B, 5 kept pairs: RT pass 44.11 -> **49.40 ms (+12 %)**, frame 45.31 -> 50.12 ms; cause not isolated (likely the evaluator / `FIRST_HIT_UNION` compounds leaving the multi-AABB GAS), reported to csg-rs. Needs Nsight Compute on `__raygen__` / `hit_csg*`; a shader change can alter the image. | lead + csg-rs | `wave_final.md` Performance; `csg_fa5e170_adoption.md` |
 | `GPU:D04` | Cryptomatte id per pixel on road tiles needs the `csg-rs` `part_id` road-UV packing decision. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
 | `CSG:RPN-FLAG` | `csg-rs` RPN stack overflow flag. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
 | `CSG:R00` | GPU crowd steering moves out of `nv-demo` `cuda_crowd.rs` into a csg-rs-owned CUDA kernel; branch review by the lead pending. | csg-rs | chat `Mullis-16-3934` |
@@ -99,7 +99,9 @@ Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer
 | `BK:PY-DTYPE` | P3: reuse `dlpack::find_dtype_entry` in `python/nv-py/src/core.rs` dtype inference. | lead | same |
 | `BK:PROFILE` | Narrowed: `nv-demo` frame time is profiled (`perf_log.rs`, `NV_DEMO_PERF_CSV`, see `PERF:RT`). Wrapper hot paths (`criterion`, A/B release) are not. | lead | same; `wave_final.md` Performance |
 
-Item count: 28 open rows: 8 verification/review, 5 build/release/CI, 2 SSOT, 6 `nv-demo` (2 lead, 4 csg-rs), 3 python/docs, 4 old backlog (`APP:F24` residual is also csg-rs-owned).
+Item count: 27 open rows: 8 verification/review, 5 build/release/CI, 1 SSOT, 6 `nv-demo` (2 lead, 4 csg-rs), 3 python/docs, 4 old backlog.
+
+Closed by the csg-rs `fa5e170` adoption (`9b6e178`): `APP:F24` (the WGS84 HUD reads `SceneDescriptor::geo_origin`; the per-scene table in `ui.rs` is deleted; synthetic scenes show no coordinates).
 
 Closed by the final wave (`ee08ade..a33d21f`, 7 items, plus `W5.4` split into `CI:EXEC` and `DENY:LIC`): `W5.2` (`208e628`; catalog-driven `xtask`, `dlssd`, companions, manifest and prebuilt marker, `release.yml` exit codes), `W4.3` (`0508d75`, `0714f65`; geo-origin part stays as `APP:F24`), `DEV:CI` (`a7b7b49`, written, not executed), `DPY:C20` (`473e1fe`, nine classes), `GPU:D07` and `GPU:D08` (`0714f65`), `APP:F27` (`0508d75`, `0714f65`). Closed earlier and absent here: `W4.1`, `W1.1..W1.6`, `W2.1..W2.3`, `W3.1..W3.6`, `W4.2`, `W5.1`, `W5.3`, `W6.1`, `W6.2`, GPU:D03, GPU:D21, RND:R10, RND:H13, APP:F19, `anim_range` sliders, async params upload, `nv-wgpu` submit timeout.
 

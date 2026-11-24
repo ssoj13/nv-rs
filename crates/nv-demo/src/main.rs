@@ -22,6 +22,7 @@ mod renderer;
 mod sdg_export;
 mod ui;
 mod viewport_toolbar;
+mod wireframe;
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -2584,6 +2585,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         possess_zoom_offset: f32,
         possess_saved_projection: Option<crate::renderer::CameraProjection>,
         viewport_toolbar: crate::viewport_toolbar::ToolbarState,
+        possess_toolbar: crate::viewport_toolbar::PossessToolbar,
         tod_transition: Option<TodTransition>,
         /// Set once the render worker reported `Fatal` or ended; no render work is sent after it.
         render_fatal: Option<String>,
@@ -3247,6 +3249,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     expanded: persisted.viewport_toolbar.expanded,
                     ..crate::viewport_toolbar::ToolbarState::default()
                 },
+                possess_toolbar: crate::viewport_toolbar::PossessToolbar::new(
+                    persisted.viewport_toolbar.possess_bar,
+                ),
                 tod_transition: None,
                 render_fatal: None,
                 resize_acked: true,
@@ -3401,6 +3406,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 viewport_toolbar: crate::persist::PersistedToolbar {
                     edge: self.viewport_toolbar.edge,
                     expanded: self.viewport_toolbar.expanded,
+                    possess_bar: self.possess_toolbar.prefs,
                 },
                 dock: match crate::persist::dock_state_to_value(&self.dock_state) {
                     Ok(v) => Some(v),
@@ -3848,6 +3854,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 possess_auto_level: &mut self.possess_auto_level,
                 possess_zoom_offset: &mut self.possess_zoom_offset,
                 viewport_toolbar: &mut self.viewport_toolbar,
+                possess_toolbar: &mut self.possess_toolbar,
                 pick_possess_mode: &mut self.pick_possess_mode,
                 smart_view_seed: &mut self.smart_view_seed,
                 last_smart_view: self.last_smart_view,
@@ -4008,7 +4015,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 );
             }
 
-            let dlss_any = self.settings.dlss_on || self.settings.dlss_rr_on;
+            // Wireframe lines are drawn at the native viewport resolution: no DLSS input scale, no
+            // render scale (a reduced internal resolution upscaled to the viewport blurs them).
+            let wire = self.settings.display_mode == crate::wireframe::DisplayMode::Wireframe;
+            let dlss_any = !wire && (self.settings.dlss_on || self.settings.dlss_rr_on);
             let (out_w, out_h) =
                 align_render_size(self.desired_vp_size.0, self.desired_vp_size.1, 1.0);
             let (target_w, target_h) = if dlss_any {
@@ -4058,7 +4068,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 align_render_size(
                     self.desired_vp_size.0,
                     self.desired_vp_size.1,
-                    self.settings.render_scale,
+                    if wire { 1.0 } else { self.settings.render_scale },
                 )
             };
 
@@ -4083,7 +4093,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 hdr_active,
                 recording_vp_pq10,
                 self.settings.dlss_rr_on,
-                self.settings.aov_mode,
+                self.settings.launch_aov_mode(),
                 self.dlss_rr_pass.is_some(),
             );
             let dlss_toggled = self.settings.dlss_on != self.last_sent_settings.dlss_on
@@ -4211,7 +4221,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            if self.settings.dlss_rr_on {
+            if self.settings.dlss_rr_on && !wire {
                 self.dlss_pass = None;
                 let needs_rebuild = self.dlss_rr_pass.as_ref().is_none_or(|p| {
                     p.render_w != self.render_w
@@ -4250,7 +4260,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.settings.dlss_quality,
                         ) {
                             Ok(pass) => {
-                                if self.settings.aov_mode == 0 {
+                                if self.settings.launch_aov_mode() == 0 {
                                     let rr_v = if hdr_active {
                                         &pass.display_hdr_view
                                     } else {
@@ -4278,7 +4288,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
                 if let Some(ref mut pass) = self.dlss_rr_pass {
-                    if self.settings.aov_mode == 0 {
+                    if self.settings.launch_aov_mode() == 0 {
                         if !self.using_dlss_tex || self.bound_hdr_tex != hdr_active {
                             let rr_v = if hdr_active {
                                 &pass.display_hdr_view
@@ -4319,7 +4329,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.viewport_tex_dirty = self.has_frame;
                     }
                 }
-            } else if self.settings.dlss_on {
+            } else if self.settings.dlss_on && !wire {
                 self.dlss_rr_pass = None;
                 let needs_rebuild = self.dlss_pass.as_ref().is_none_or(|p| {
                     p.render_w != self.render_w
@@ -4413,7 +4423,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut companion_sdg_requested = false;
             let still_src = viewport_still_source(
                 self.settings.dlss_rr_on,
-                self.settings.aov_mode,
+                self.settings.launch_aov_mode(),
                 self.dlss_rr_pass.is_some(),
                 self.settings.dlss_on,
                 self.dlss_pass.is_some(),
@@ -4686,7 +4696,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             let (src_w, src_h, uses_dlss_tex) =
                                 if viewport_uses_dlss_rr_output(
                                     self.settings.dlss_rr_on,
-                                    self.settings.aov_mode,
+                                    self.settings.launch_aov_mode(),
                                     self.dlss_rr_pass.is_some(),
                                 ) && let Some(ref rr) = self.dlss_rr_pass
                                 {
@@ -5080,7 +5090,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             if self.has_frame {
                 if self.settings.dlss_rr_on
-                    && self.settings.aov_mode == 0
+                    && self.settings.launch_aov_mode() == 0
                     && let Some(ref mut rr) = self.dlss_rr_pass
                     && let Some(ref rr_bufs) = self.rr_shared
                 {
@@ -5594,7 +5604,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let is_pq = active.profile == crate::gpu_export::VideoProfile::Hdr10Pq;
                 let src_tex: Option<(&wgpu::Texture, u32, u32, u32)> =
                     if self.settings.dlss_rr_on
-                        && self.settings.aov_mode == 0
+                        && self.settings.launch_aov_mode() == 0
                         && let Some(ref rr) = self.dlss_rr_pass
                     {
                         let tex = if is_pq {

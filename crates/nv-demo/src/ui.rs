@@ -22,6 +22,21 @@ use crate::renderer::{
     TIME_SCALE_MIN, dlss_quality_index,
 };
 use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
+use crate::viewport_toolbar::{self as vt, TbTone, tb_icon_button, tb_separator};
+use crate::wireframe::DisplayMode;
+
+/// Possession-toolbar icons of camera mounts by index (the label is the tooltip).
+const MOUNT_ICONS: [&str; 9] = [
+    ic::NUMBER_CIRCLE_ONE,
+    ic::NUMBER_CIRCLE_TWO,
+    ic::NUMBER_CIRCLE_THREE,
+    ic::NUMBER_CIRCLE_FOUR,
+    ic::NUMBER_CIRCLE_FIVE,
+    ic::NUMBER_CIRCLE_SIX,
+    ic::NUMBER_CIRCLE_SEVEN,
+    ic::NUMBER_CIRCLE_EIGHT,
+    ic::NUMBER_CIRCLE_NINE,
+];
 use csg_scene::{ProbeBackendKind, SceneDescriptor, SceneViewpoint, TimeOfDay};
 
 /// One selectable output pass: `label` for combo boxes, `tag` for the viewport HUD and its toolbar.
@@ -570,6 +585,7 @@ pub struct UiContext<'a> {
     pub possess_auto_level: &'a mut bool,
     pub possess_zoom_offset: &'a mut f32,
     pub viewport_toolbar: &'a mut crate::viewport_toolbar::ToolbarState,
+    pub possess_toolbar: &'a mut crate::viewport_toolbar::PossessToolbar,
     pub pick_possess_mode: &'a mut bool,
     pub smart_view_seed: &'a mut u64,
     pub last_smart_view: Option<SmartViewResult>,
@@ -928,33 +944,60 @@ impl UiContext<'_> {
 
         let resp = ui.interact(rect, ui.id().with("optix-vp"), Sense::click_and_drag());
         *self.viewport_focused = (resp.hovered() || resp.dragged()) && !split_dragging;
-        // Vendored edge-docked ViewportToolbar (flush to viewport edge) with input gating.
-        let toolbar_resp = crate::viewport_toolbar::ViewportToolbar::new("nv_demo_viewport_toolbar")
+        // Viewport toolbar, plus the possession toolbar stacked on its inner side in the same
+        // corner (viewport_toolbar.rs); both share one frame and one set of design tokens.
+        let wire_mode = self.settings.display_mode == DisplayMode::Wireframe;
+        let toolbar_resp = vt::ViewportToolbar::new("nv_demo_viewport_toolbar")
             .show(ui.ctx(), rect, self.viewport_toolbar, |ui| {
-                // 1. AOV quick selector
-                let aov_cur = aov_pass(self.settings.aov_mode).tag;
-                egui::ComboBox::from_id_salt("vt_aov")
-                    .selected_text(format!("{} {aov_cur}", ic::STACK))
-                    .width(96.0)
+                // 1. Display mode (DEMO:VIEWS), AOV / line width, lens
+                egui::ComboBox::from_id_salt("vt_display")
+                    .selected_text(format!("{} {}", ic::CUBE, self.settings.display_mode.label()))
+                    .width(vt::TB_COMBO_WIDTH)
                     .show_ui(ui, |ui| {
-                        for (idx, pass) in AOV_PASSES.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut self.settings.aov_mode,
-                                idx as u32,
-                                pass.tag,
-                            );
+                        for mode in DisplayMode::ALL {
+                            ui.selectable_value(&mut self.settings.display_mode, mode, mode.label());
                         }
-                    });
-                ui.separator();
-
-                // 2. Optical Lens selector
+                    })
+                    .response
+                    .on_hover_text(
+                        "Display mode: CSG = shaded path-traced render; Wireframe = smooth \
+                         hidden-line contours (silhouettes, creases, instance borders).",
+                    );
+                if wire_mode {
+                    ui.add_sized(
+                        vt::TB_BUTTON_SIZE,
+                        egui::Label::new(RichText::new(ic::PEN_NIB).size(vt::TB_ICON_SIZE)),
+                    )
+                    .on_hover_text("Wireframe line width");
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.settings.wire_line_px,
+                            crate::wireframe::WIRE_LINE_PX_MIN..=crate::wireframe::WIRE_LINE_PX_MAX,
+                        )
+                        .fixed_decimals(2)
+                        .suffix(" px"),
+                    )
+                    .on_hover_text("Silhouette stroke width in screen pixels (creases are 2/3 of it)");
+                } else {
+                    let aov_cur = aov_pass(self.settings.aov_mode).tag;
+                    egui::ComboBox::from_id_salt("vt_aov")
+                        .selected_text(format!("{} {aov_cur}", ic::STACK))
+                        .width(vt::TB_COMBO_WIDTH)
+                        .show_ui(ui, |ui| {
+                            for (idx, pass) in AOV_PASSES.iter().enumerate() {
+                                ui.selectable_value(&mut self.settings.aov_mode, idx as u32, pass.tag);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Output pass (AOV)");
+                }
                 egui::ComboBox::from_id_salt("vt_lens")
                     .selected_text(format!(
                         "{} {}",
                         ic::APERTURE,
                         self.settings.camera_projection.label()
                     ))
-                    .width(94.0)
+                    .width(vt::TB_COMBO_WIDTH)
                     .show_ui(ui, |ui| {
                         for proj in CameraProjection::ALL {
                             ui.selectable_value(
@@ -963,38 +1006,35 @@ impl UiContext<'_> {
                                 proj.label(),
                             );
                         }
-                    });
-                ui.separator();
+                    })
+                    .response
+                    .on_hover_text("Lens / sensor projection");
+                tb_separator(ui);
 
-                // 3. Day / Sunset / Night quick pills (routed through smooth transition)
+                // 2. Day / Sunset / Night (routed through the smooth transition)
                 for (tod, icon, tip) in [
                     (0u32, ic::SUN, "Daylight"),
                     (1u32, ic::SUN_HORIZON, "Golden Sunset"),
                     (2u32, ic::MOON_STARS, "Coastal Night"),
                 ] {
-                    if ui
-                        .add(egui::Button::selectable(self.settings.csg_time_of_day == tod, icon).small())
-                        .on_hover_text(tip)
+                    if tb_icon_button(ui, icon, self.settings.csg_time_of_day == tod, TbTone::Normal, tip)
                         .clicked()
                     {
                         self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
                     }
                 }
-                ui.separator();
+                tb_separator(ui);
 
-                // 4. Pick / Poke / Freeze quick actions
-                if ui
-                    .add(egui::Button::selectable(*self.pick_possess_mode, ic::CROSSHAIR).small())
-                    .on_hover_text("Pick object to possess (or double-click / double-tap in viewport)")
-                    .clicked()
-                {
-                    *self.pick_possess_mode = !*self.pick_possess_mode;
-                }
+                // 3. Poke / Freeze
                 if self.settings.csg_mode > 0
-                    && ui
-                        .add(egui::Button::new(ic::HAND_POINTING).small())
-                        .on_hover_text("Poke nearest articulated actor (P)")
-                        .clicked()
+                    && tb_icon_button(
+                        ui,
+                        ic::HAND_POINTING,
+                        false,
+                        TbTone::Normal,
+                        "Poke nearest articulated actor (P)",
+                    )
+                    .clicked()
                 {
                     let is_inspector_109 = is_inspector_crowd_showcase(
                         self.scene_descriptors,
@@ -1006,16 +1046,20 @@ impl UiContext<'_> {
                         all: is_inspector_109,
                     });
                 }
-                if ui
-                    .add(egui::Button::selectable(self.settings.csg_freeze_pose, ic::PAUSE).small())
-                    .on_hover_text("Freeze dynamic traffic & crowd poses for clean accumulation")
-                    .clicked()
+                if tb_icon_button(
+                    ui,
+                    ic::PAUSE,
+                    self.settings.csg_freeze_pose,
+                    TbTone::Normal,
+                    "Freeze dynamic traffic & crowd poses for clean accumulation",
+                )
+                .clicked()
                 {
                     self.bus.emit_ui(UiCommand::ToggleFreezePose);
                 }
-                ui.separator();
+                tb_separator(ui);
 
-                // 5. Compact Exposure EV & LOD Bias controls
+                // 4. Exposure EV & LOD bias
                 ui.add(
                     egui::DragValue::new(&mut self.settings.exposure)
                         .range(EXPOSURE_RANGE)
@@ -1024,9 +1068,11 @@ impl UiContext<'_> {
                 )
                 .on_hover_text("Exposure multiplier");
                 if self.settings.csg_mode > 0 {
-                    ui.separator();
-                    ui.label(RichText::new("LOD").small().weak());
-                    ui.spacing_mut().slider_width = 68.0;
+                    ui.add_sized(
+                        vt::TB_BUTTON_SIZE,
+                        egui::Label::new(RichText::new(ic::GAUGE).size(vt::TB_ICON_SIZE)),
+                    )
+                    .on_hover_text("CSG LOD bias");
                     ui.add_enabled(
                         self.settings.csg_lod_enabled,
                         egui::Slider::new(&mut self.settings.csg_lod_bias, 0.25..=4.0)
@@ -1036,36 +1082,144 @@ impl UiContext<'_> {
                     )
                     .on_hover_text("CSG geometric LOD detail bias (higher = more detail at distance)");
                 }
+                tb_separator(ui);
 
-                // 6. Save PNG & SDG EXR Burst
-                if ui
-                    .add(egui::Button::new(ic::CAMERA).small())
-                    .on_hover_text("Save PNG snapshot")
-                    .clicked()
-                {
+                // 5. Save PNG & SDG EXR burst
+                if tb_icon_button(ui, ic::CAMERA, false, TbTone::Normal, "Save PNG snapshot").clicked() {
                     self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
                 }
-                if self.settings.csg_mode > 0
-                    && ui
-                        .add(egui::Button::new(ic::FILM_STRIP).small())
-                        .on_hover_text("Export multi-frame 9-channel OpenEXR + SDG JSON burst")
-                        .clicked()
-                {
-                    self.bus.emit_ui(UiCommand::StartSdgBurst {
-                        frames: self.settings.sdg_burst_frames,
-                    });
-                }
-                if self.settings.csg_mode > 0
-                    && ui
-                        .add(egui::Button::new(ic::STOP_CIRCLE).small())
-                        .on_hover_text("Cancel the running SDG burst")
-                        .clicked()
-                {
-                    self.bus.emit_ui(UiCommand::CancelSdgBurst);
+                if self.settings.csg_mode > 0 {
+                    if tb_icon_button(
+                        ui,
+                        ic::FILM_STRIP,
+                        false,
+                        TbTone::Normal,
+                        "Export multi-frame 9-channel OpenEXR + SDG JSON burst",
+                    )
+                    .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::StartSdgBurst {
+                            frames: self.settings.sdg_burst_frames,
+                        });
+                    }
+                    if tb_icon_button(
+                        ui,
+                        ic::STOP_CIRCLE,
+                        false,
+                        TbTone::Normal,
+                        "Cancel the running SDG burst",
+                    )
+                    .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::CancelSdgBurst);
+                    }
                 }
             });
 
-        let toolbar_blocking = toolbar_resp.contains_pointer;
+        // Possession toolbar: collapsed to its handle while not possessing, auto-expanded on
+        // entering possession unless the user collapsed it, collapsed on leaving unless pinned.
+        let possessing = self.possess_info.is_some();
+        let possess_toolbar = &mut *self.possess_toolbar;
+        possess_toolbar.sync(possessing);
+        possess_toolbar.bar.edge = self.viewport_toolbar.edge;
+        let stack = vt::stack_offset(self.viewport_toolbar.edge, rect, toolbar_resp.rect);
+        let prefs = &mut possess_toolbar.prefs;
+        let possess_resp = vt::ViewportToolbar::new("nv_demo_possess_toolbar")
+            .stack(stack)
+            .show(ui.ctx(), rect, &mut possess_toolbar.bar, |ui| {
+                if let Some(pinfo) = self.possess_info {
+                    let (icon, tag) = if pinfo.is_dynamic {
+                        (ic::STEERING_WHEEL, "Riding")
+                    } else {
+                        (ic::CAR, "Possessing")
+                    };
+                    ui.add_sized(
+                        vt::TB_BUTTON_SIZE,
+                        egui::Label::new(
+                            RichText::new(icon)
+                                .size(vt::TB_ICON_SIZE)
+                                .color(Color32::from_rgb(174, 236, 194)),
+                        ),
+                    )
+                    .on_hover_ui(|ui| {
+                        ui.label(format!("{tag}: {}", pinfo.assembly_name));
+                    });
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&pinfo.assembly_name)
+                                .small()
+                                .color(Color32::from_rgb(174, 236, 194)),
+                        )
+                        .truncate(),
+                    );
+                    tb_separator(ui);
+                    for (idx, mount) in pinfo.mounts.iter().enumerate() {
+                        let icon = MOUNT_ICONS.get(idx).copied().unwrap_or(ic::DOTS_THREE);
+                        if tb_icon_button(ui, icon, idx == pinfo.mount_idx, TbTone::Normal, &mount.label)
+                            .clicked()
+                        {
+                            self.bus.emit_ui(UiCommand::SelectPossessMount { mount_idx: idx });
+                        }
+                    }
+                    tb_separator(ui);
+                    if tb_icon_button(
+                        ui,
+                        ic::ALIGN_CENTER_HORIZONTAL,
+                        *self.possess_auto_level,
+                        TbTone::Normal,
+                        "Level: keep the horizon level while riding vehicles",
+                    )
+                    .clicked()
+                    {
+                        *self.possess_auto_level = !*self.possess_auto_level;
+                    }
+                    if tb_icon_button(ui, ic::EJECT, false, TbTone::Danger, "Eject (Esc)").clicked() {
+                        self.bus.emit_ui(UiCommand::EjectPossess);
+                    }
+                } else {
+                    let csg = self.settings.csg_mode != 0;
+                    ui.add_enabled_ui(csg, |ui| {
+                        if tb_icon_button(
+                            ui,
+                            ic::CROSSHAIR_SIMPLE,
+                            *self.pick_possess_mode,
+                            TbTone::Normal,
+                            "Pick: click any vehicle, lamp, yacht or building to possess its camera \
+                             mount (also Ctrl + Left Click or double-click in the viewport)",
+                        )
+                        .clicked()
+                        {
+                            *self.pick_possess_mode = !*self.pick_possess_mode;
+                        }
+                        if tb_icon_button(
+                            ui,
+                            ic::CAR,
+                            false,
+                            TbTone::Normal,
+                            "Possess Car: jump into a driving vehicle or mounted landmark (cycles targets)",
+                        )
+                        .clicked()
+                        {
+                            self.bus.emit_ui(UiCommand::PossessNextVehicle);
+                        }
+                    });
+                }
+                tb_separator(ui);
+                let pin_tip = if prefs.pinned {
+                    "Pinned open: stays expanded after leaving possession (click to unpin)"
+                } else {
+                    "Pin open: keep this toolbar expanded after leaving possession"
+                };
+                if tb_icon_button(ui, ic::PUSH_PIN, prefs.pinned, TbTone::Normal, pin_tip).clicked() {
+                    prefs.pinned = !prefs.pinned;
+                }
+            });
+        if possess_resp.toggled {
+            possess_toolbar.prefs.on_user_toggle(possess_toolbar.bar.expanded);
+        }
+        let toolbar_rects = [toolbar_resp.rect, possess_resp.rect];
+
+        let toolbar_blocking = toolbar_resp.contains_pointer || possess_resp.contains_pointer;
         if *self.pick_possess_mode && resp.hovered() && !toolbar_blocking {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
@@ -1233,59 +1387,14 @@ impl UiContext<'_> {
             }
         }
 
-        // Top-left floating Possess Body HUD overlay with mount pills and Eject button
-        if let Some(pinfo) = self.possess_info {
-            let overlay_rect = egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(10.0, 10.0),
-                egui::vec2((rect.width() - 20.0).max(160.0), 56.0),
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
-                egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 210))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)))
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(8, 5))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            let tag = if pinfo.is_dynamic { "RIDING" } else { "POSSESS" };
-                            ui.label(
-                                RichText::new(format!("{} {tag}: {}", ic::CAR, pinfo.assembly_name))
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::from_rgb(174, 236, 194)),
-                            );
-                            for (idx, mount) in pinfo.mounts.iter().enumerate() {
-                                let selected = idx == pinfo.mount_idx;
-                                if ui
-                                    .add(egui::Button::selectable(selected, &mount.label).small())
-                                    .clicked()
-                                {
-                                    self.bus.emit_ui(UiCommand::SelectPossessMount { mount_idx: idx });
-                                }
-                            }
-                            ui.checkbox(self.possess_auto_level, "Level")
-                                .on_hover_text("Keep horizon level while riding vehicles.");
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("Eject (Esc)").color(Color32::WHITE),
-                                    )
-                                    .fill(Color32::from_rgb(168, 46, 54))
-                                    .small(),
-                                )
-                                .clicked()
-                            {
-                                self.bus.emit_ui(UiCommand::EjectPossess);
-                            }
-                        });
-                    });
-            });
-        }
-
         // Compact bottom-left status badge inside viewport (formatted into reusable scratch buffer).
-        let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
-        let aov_tag = aov_pass(self.settings.aov_mode).tag;
+        // Bottom overlays stack upwards from the bottom edge, above a bottom-docked toolbar.
+        let bottom_reserve = vt::bottom_reserve(self.viewport_toolbar.edge, rect, &toolbar_rects);
+        let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0 - bottom_reserve);
+        let aov_tag = match self.settings.display_mode {
+            DisplayMode::Csg => aov_pass(self.settings.aov_mode).tag,
+            DisplayMode::Wireframe => DisplayMode::Wireframe.tag(),
+        };
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let demo_running = self.demo_anim.is_running();

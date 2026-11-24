@@ -181,6 +181,8 @@ pub struct SavedScene {
 pub struct PersistedToolbar {
     pub edge: ToolbarEdge,
     pub expanded: bool,
+    /// The user's possession-toolbar choices (manual collapse, pin).
+    pub possess_bar: crate::viewport_toolbar::PossessBarPrefs,
 }
 
 impl Default for PersistedToolbar {
@@ -189,6 +191,7 @@ impl Default for PersistedToolbar {
         Self {
             edge: d.edge,
             expanded: d.expanded,
+            possess_bar: crate::viewport_toolbar::PossessBarPrefs::default(),
         }
     }
 }
@@ -624,6 +627,10 @@ mod tests {
         state.viewport_toolbar = PersistedToolbar {
             edge: ToolbarEdge::Left,
             expanded: false,
+            possess_bar: crate::viewport_toolbar::PossessBarPrefs {
+                user_collapsed: true,
+                pinned: true,
+            },
         };
         save_to(&path, &state).expect("save_to");
         let report = load_from(&path);

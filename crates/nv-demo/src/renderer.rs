@@ -789,6 +789,10 @@ pub struct DemoSettings {
     pub spp: u32,
     pub max_accum: u32,
     pub aov_mode: u32,
+    /// Viewport display mode (`DEMO:VIEWS`): shaded CSG render or hidden-line wireframe.
+    pub display_mode: crate::wireframe::DisplayMode,
+    /// Wireframe silhouette stroke width in screen pixels (creases are thinner).
+    pub wire_line_px: f32,
     pub render_scale: f32,
     pub denoiser_on: bool,
     pub temporal_denoise: bool,
@@ -928,6 +932,18 @@ pub struct DemoSettings {
     pub sdg_burst_frames: u32,
 }
 
+impl DemoSettings {
+    /// The `aov_mode` the raygen runs with: the selected AOV in `Csg` display mode, the
+    /// wireframe G-buffer pass in `Wireframe` mode. Every "is this the beauty pass" decision
+    /// (denoiser, bloom, DLSS, captures) reads this, never `aov_mode` directly.
+    pub const fn launch_aov_mode(&self) -> u32 {
+        match self.display_mode {
+            crate::wireframe::DisplayMode::Csg => self.aov_mode,
+            crate::wireframe::DisplayMode::Wireframe => crate::wireframe::AOV_WIREFRAME,
+        }
+    }
+}
+
 impl Default for DemoSettings {
     fn default() -> Self {
         Self {
@@ -989,6 +1005,8 @@ impl Default for DemoSettings {
             spp: 1,
             max_accum: 256,
             aov_mode: 0,
+            display_mode: crate::wireframe::DisplayMode::Csg,
+            wire_line_px: crate::wireframe::WIRE_LINE_PX_DEFAULT,
             render_scale: 1.0,
             denoiser_on: false,
             temporal_denoise: false,
@@ -1182,6 +1200,10 @@ struct TonemapKernel {
     module: cu::CUmodule,
     func: cu::CUfunction,
     scrgb_func: cu::CUfunction,
+    /// `wire_classify` / `wire_smooth` / `wire_draw`: contour lines for `DisplayMode::Wireframe`.
+    wire_classify: cu::CUfunction,
+    wire_smooth: cu::CUfunction,
+    wire_draw: cu::CUfunction,
     pack_rr_func: cu::CUfunction,
 }
 
@@ -1239,6 +1261,10 @@ struct OptixRig {
     motion_f32: Option<DeviceBuffer<[f32; 2]>>,
     depth_f32: Option<DeviceBuffer<f32>>,
     semantic_u32: Option<DeviceBuffer<u32>>,
+    /// Wireframe contour classes (2 bits per lattice edge) and the second vertex buffer of the
+    /// smoothing ping-pong (`albedo_f32` is the first); allocated only in Wireframe mode.
+    wire_cls_u32: Option<DeviceBuffer<u32>>,
+    wire_pos_f32: Option<DeviceBuffer<[f32; 4]>>,
     instance_u32: Option<DeviceBuffer<u32>>,
     params_buf: DeviceBuffer<u8>,
     /// Device copy of the classic motion table (`LaunchParams::classic_motion`).
@@ -2642,10 +2668,16 @@ fn init_optix(
         module: cu_mod,
         func: std::ptr::null_mut(),
         scrgb_func: std::ptr::null_mut(),
+        wire_classify: std::ptr::null_mut(),
+        wire_smooth: std::ptr::null_mut(),
+        wire_draw: std::ptr::null_mut(),
         pack_rr_func: std::ptr::null_mut(),
     };
     tonemap.func = cu_module_function(tonemap.module, c"tonemap_f32_to_rgba8")?;
     tonemap.scrgb_func = cu_module_function(tonemap.module, c"tonemap_f32_to_scrgb_f16")?;
+    tonemap.wire_classify = cu_module_function(tonemap.module, c"wire_classify")?;
+    tonemap.wire_smooth = cu_module_function(tonemap.module, c"wire_smooth")?;
+    tonemap.wire_draw = cu_module_function(tonemap.module, c"wire_draw")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
     let (pipeline, sbt, probe_sbt, sdg_sbt, _stack_needs) = initial_pipeline(&optix_ctx, &stream)
@@ -2860,6 +2892,8 @@ fn init_optix(
         motion_f32: None,
         depth_f32: None,
         semantic_u32: None,
+        wire_cls_u32: None,
+        wire_pos_f32: None,
         instance_u32: None,
         params_buf,
         classic_motion_buf,
@@ -2907,6 +2941,139 @@ fn ensure_cuda_crowd<'a>(
     }
 }
 
+/// Launches one CUDA kernel on `rig.stream` over `w x h` pixels in 16x16 blocks.
+///
+/// # Safety
+/// `args` must match the kernel's parameter list, and every device pointer among them must stay
+/// valid until the stream reaches the end-of-frame fence.
+unsafe fn launch_px_kernel(
+    rig: &OptixRig,
+    func: cu::CUfunction,
+    w: u32,
+    h: u32,
+    args: &mut [*mut c_void],
+    name: &str,
+) -> Result<(), String> {
+    // SAFETY: forwarded to the caller (argument list and pointer lifetimes).
+    let res = unsafe {
+        cu::cuLaunchKernel(
+            func,
+            w.div_ceil(16),
+            h.div_ceil(16),
+            1,
+            16,
+            16,
+            1,
+            0,
+            rig.stream.cu_stream(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if res == cu::cudaError_enum_CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(format!("{name} cuLaunchKernel failed ({res:?})"))
+    }
+}
+
+/// Wireframe contour pass (`wireframe.rs`, `tonemap.cu`): classify the lattice edges of the
+/// `normal_f32` G-buffer, smooth the contour vertices (Laplacian, `WIRE_SMOOTH_STEPS` passes
+/// ping-ponging `albedo_f32` <-> `wire_pos_f32`, ending in `albedo_f32`), then draw the strokes
+/// and faces into `color_f32`. Stream-ordered after the raygen launch; no allocation.
+fn launch_wireframe(
+    rig: &OptixRig,
+    w: u32,
+    h: u32,
+    accum_count: u32,
+    settings: &DemoSettings,
+) -> Result<(), String> {
+    use crate::wireframe as wf;
+    let (Some(cls), Some(pos_b)) = (rig.wire_cls_u32.as_ref(), rig.wire_pos_f32.as_ref()) else {
+        // `ensure_lazy_aovs` already reported the allocation failure; faces and lines stay off
+        // until the next resize retries it.
+        return Ok(());
+    };
+    let (mut w, mut h) = (w, h);
+    let mut gbuf = rig.normal_f32.cu_deviceptr();
+    let mut cls_ptr = cls.cu_deviceptr();
+    let mut pos_a = rig.albedo_f32.cu_deviceptr();
+    let pos_b = pos_b.cu_deviceptr();
+    let mut depth_thr = wf::WIRE_DEPTH_THRESHOLD;
+    let mut crease_cos = wf::WIRE_CREASE_COS;
+    // SAFETY: `wire_classify(const float4*, unsigned*, float4*, u32, u32, f32, f32)`; all
+    // buffers hold `w * h` elements and live until the end-of-frame fence.
+    unsafe {
+        launch_px_kernel(
+            rig,
+            rig.tonemap.wire_classify,
+            w,
+            h,
+            &mut [
+                (&raw mut gbuf).cast(),
+                (&raw mut cls_ptr).cast(),
+                (&raw mut pos_a).cast(),
+                (&raw mut w).cast(),
+                (&raw mut h).cast(),
+                (&raw mut depth_thr).cast(),
+                (&raw mut crease_cos).cast(),
+            ],
+            "wire_classify",
+        )?;
+    }
+    for step in 0..wf::WIRE_SMOOTH_STEPS {
+        let mut lambda = wf::WIRE_SMOOTH_LAMBDA;
+        let (mut src, mut dst) = if step % 2 == 0 { (pos_a, pos_b) } else { (pos_b, pos_a) };
+        // SAFETY: `wire_smooth(const unsigned*, const float4*, float4*, u32, u32, f32)`; `src`
+        // and `dst` are distinct `w * h` float4 buffers alive until the end-of-frame fence.
+        unsafe {
+            launch_px_kernel(
+                rig,
+                rig.tonemap.wire_smooth,
+                w,
+                h,
+                &mut [
+                    (&raw mut cls_ptr).cast(),
+                    (&raw mut src).cast(),
+                    (&raw mut dst).cast(),
+                    (&raw mut w).cast(),
+                    (&raw mut h).cast(),
+                    (&raw mut lambda).cast(),
+                ],
+                "wire_smooth",
+            )?;
+        }
+    }
+    let mut out = rig.color_f32.cu_deviceptr();
+    let mut accum = accum_count;
+    let mut sil_px = settings.wire_line_px.clamp(wf::WIRE_LINE_PX_MIN, wf::WIRE_LINE_PX_MAX);
+    let mut crease_px = sil_px * wf::WIRE_CREASE_WIDTH_RATIO;
+    // SAFETY: `wire_draw(const float4*, const unsigned*, const float4*, float4*, u32, u32, u32,
+    // f32, f32)` with 16x16 blocks (its shared tile assumes that block size); the smoothed
+    // vertices end in `albedo_f32` (`WIRE_SMOOTH_STEPS` is even); all buffers live until the
+    // end-of-frame fence.
+    unsafe {
+        launch_px_kernel(
+            rig,
+            rig.tonemap.wire_draw,
+            w,
+            h,
+            &mut [
+                (&raw mut gbuf).cast(),
+                (&raw mut cls_ptr).cast(),
+                (&raw mut pos_a).cast(),
+                (&raw mut out).cast(),
+                (&raw mut w).cast(),
+                (&raw mut h).cast(),
+                (&raw mut accum).cast(),
+                (&raw mut sil_px).cast(),
+                (&raw mut crease_px).cast(),
+            ],
+            "wire_draw",
+        )
+    }
+}
+
 /// Lazily allocated per-pixel buffers requested by this frame's features.
 #[derive(Clone, Copy, Debug, Default)]
 struct LazyAovNeeds {
@@ -2916,6 +3083,7 @@ struct LazyAovNeeds {
     denoised: bool,
     prev_denoised: bool,
     sdg_ids: bool,
+    wire: bool,
 }
 
 /// Allocates `slot` once with `n` zeroed elements, naming the buffer in the error.
@@ -2957,6 +3125,10 @@ fn ensure_lazy_aovs(rig: &mut OptixRig, needs: LazyAovNeeds, n_px: usize) -> Res
     if needs.sdg_ids {
         alloc_lazy(&mut rig.semantic_u32, &rig.stream, n_px, "semantic_u32")?;
         alloc_lazy(&mut rig.instance_u32, &rig.stream, n_px, "instance_u32")?;
+    }
+    if needs.wire {
+        alloc_lazy(&mut rig.wire_cls_u32, &rig.stream, n_px, "wire_cls_u32")?;
+        alloc_lazy(&mut rig.wire_pos_f32, &rig.stream, n_px, "wire_pos_f32")?;
     }
     Ok(())
 }
@@ -3822,6 +3994,8 @@ fn resize_rig(rig: &mut OptixRig, width: u32, height: u32, temporal: bool) -> Re
     rig.motion_f32 = None;
     rig.depth_f32 = None;
     rig.semantic_u32 = None;
+    rig.wire_cls_u32 = None;
+    rig.wire_pos_f32 = None;
     rig.instance_u32 = None;
     rig.denoiser = None;
     rig.denoiser_is_temporal = temporal;
@@ -5225,10 +5399,13 @@ pub fn spawn_render_thread(
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
                 }
 
-                let rr_export = settings.dlss_rr_on || rr_ptrs.is_some();
-                let dlss_any = settings.dlss_on || rr_export;
-                let will_run_denoiser = settings.denoiser_on && !dlss_any && settings.aov_mode == 0;
-                let will_run_bloom = settings.bloom_on && !rr_export && settings.aov_mode == 0;
+                let launch_aov = settings.launch_aov_mode();
+                // Wireframe renders at native resolution without DLSS (main.rs sizes it so).
+                let wireframe = launch_aov == crate::wireframe::AOV_WIREFRAME;
+                let rr_export = !wireframe && (settings.dlss_rr_on || rr_ptrs.is_some());
+                let dlss_any = !wireframe && (settings.dlss_on || rr_export);
+                let will_run_denoiser = settings.denoiser_on && !dlss_any && launch_aov == 0;
+                let will_run_bloom = settings.bloom_on && !rr_export && launch_aov == 0;
                 if will_run_bloom
                     && !prev_will_run_bloom
                     && let Err(e) = &rig.bloom
@@ -5291,6 +5468,7 @@ pub fn spawn_render_thread(
                     denoised: will_run_denoiser || will_run_bloom,
                     prev_denoised: will_run_denoiser && rig.denoiser_is_temporal,
                     sdg_ids: active_burst.is_some(),
+                    wire: wireframe,
                 };
                 if !rig.lazy_alloc_failed
                     && let Err(e) = ensure_lazy_aovs(&mut rig, needs, n_px)
@@ -5322,7 +5500,7 @@ pub fn spawn_render_thread(
                 let sun_y = el.sin();
                 let sun_z = el.cos() * az.cos();
 
-                let jitter = if dlss_jitter_active(dlss_any, settings.aov_mode, active_burst.is_some())
+                let jitter = if dlss_jitter_active(dlss_any, launch_aov, active_burst.is_some())
                 {
                     if !preserve_shutter_accum {
                         accum_count = 0;
@@ -5465,7 +5643,7 @@ pub fn spawn_render_thread(
                         settings.glass_roughness,
                         if settings.sat_on { 1.0 } else { 0.0 },
                     ],
-                    aov_mode: settings.aov_mode,
+                    aov_mode: launch_aov,
                     jitter_x: jitter[0],
                     jitter_y: jitter[1],
                     _pad1: 0,
@@ -5658,24 +5836,34 @@ pub fn spawn_render_thread(
                     let gx = cur_w.div_ceil(16);
                     let gy = cur_h.div_ceil(16);
 
+                    if wireframe {
+                        // Vector contour lines from the primary-hit G-buffer, drawn into
+                        // `color_f32`, which the tonemap below displays (`wireframe.rs`).
+                        if let Err(e) = launch_wireframe(&rig, cur_w, cur_h, accum_count, &settings) {
+                            bus.emit_render_event(RenderEvent::Fatal(e));
+                            break 'render;
+                        }
+                    }
+
                     // Skip redundant CUDA RGBA8/HDR tonemap when DLSS-RR owns the display output.
                     let skip_tonemap = should_skip_cuda_tonemap(
                         settings.dlss_rr_on,
                         rr_ptrs.is_some(),
-                        settings.aov_mode,
+                        launch_aov,
                         settings.split_on,
                         pending_jpeg.is_some(),
                     );
                     if !skip_tonemap {
-                        let mut src_ptr = match settings.aov_mode {
+                        let mut src_ptr = match launch_aov {
                             1 => rig.albedo_f32.cu_deviceptr(),
                             2 => rig.normal_f32.cu_deviceptr(),
                             _ => final_f32_ptr,
                         };
                         let mut dst_ptr = buf_ptrs[buf_idx];
                         let mut exposure = settings.exposure;
-                        let mut aov_mode = settings.aov_mode;
-                        let mut right_ptr: u64 = if settings.split_on {
+                        let mut aov_mode = launch_aov;
+                        // The wireframe G-buffer lives in albedo / normal: no A/B split over it.
+                        let mut right_ptr: u64 = if settings.split_on && !wireframe {
                             match settings.right_is_aov {
                                 1 => rig.albedo_f32.cu_deviceptr(),
                                 2 => rig.normal_f32.cu_deviceptr(),
@@ -5684,7 +5872,7 @@ pub fn spawn_render_thread(
                         } else {
                             0
                         };
-                        let mut split_x: f32 = if settings.split_on {
+                        let mut split_x: f32 = if settings.split_on && !wireframe {
                             settings.split_x.clamp(0.0, 1.0)
                         } else {
                             -1.0

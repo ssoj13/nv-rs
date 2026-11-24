@@ -1,6 +1,26 @@
 #include <optix.h>
 #include "csg_eval.cuh"
 
+// Hidden-line wireframe G-buffer pass (`wireframe.rs`): one pixel-centre primary ray per pixel.
+// out_normal_f32 = (octahedral normal, depth, instance key bits; WIRE_MISS_KEY on a miss),
+// out_color_f32.w = this frame's ambient occlusion. tonemap.cu `wire_*` kernels extract and draw
+// the contour lines and accumulate the display colour into out_color_f32.xyz.
+#define AOV_WIREFRAME 11u
+#define WIRE_MISS_KEY 0xFFFFFFFFu
+#define WIRE_AO_RAYS 4u
+
+// Octahedral unit-normal encoding (decoded by `wire_oct_decode` in tonemap.cu).
+static __forceinline__ __device__ float2 wire_oct_encode(float3 n) {
+    float inv = 1.0f / fmaxf(1e-8f, fabsf(n.x) + fabsf(n.y) + fabsf(n.z));
+    float2 e = make_float2(n.x * inv, n.y * inv);
+    if (n.z < 0.0f) {
+        float ex = (1.0f - fabsf(e.y)) * (e.x >= 0.0f ? 1.0f : -1.0f);
+        float ey = (1.0f - fabsf(e.x)) * (e.y >= 0.0f ? 1.0f : -1.0f);
+        e = make_float2(ex, ey);
+    }
+    return e;
+}
+
 struct Params {
     unsigned long long out_color_f32;
     unsigned long long out_albedo_f32;
@@ -40,7 +60,7 @@ struct Params {
     float prev_cam_up[4];
     float env_from_hi[4];  // env_params[4..8] of the crossfade source sky_mode_from (0 outside a fade)
     float glass_params[4]; // [ior, absorption, roughness, enable]
-    unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId
+    unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId, ..., 11=AOV_WIREFRAME
     float jitter_x;
     float jitter_y;
     unsigned int _pad1;
@@ -2038,8 +2058,12 @@ extern "C" __global__ void __raygen__render() {
     const bool aov_geom_only = aov_aa
         && (params.aov_mode != 1u && params.aov_mode != 2u && params.aov_mode != 9u);
     // AOV passes: 4 RGSS taps (s = 0..3) average into the displayed colour, plus one pixel-centre
-    // tap (s = 4) that feeds only the single-sample raw outputs (depth / motion / labels).
-    const unsigned int loop_spp = aov_aa ? 5u : spp;
+    // tap (s = 4) that feeds only the single-sample raw outputs (depth / motion / labels). The
+    // wireframe G-buffer needs only the pixel-centre tap (s = 0, one primary ray per pixel).
+    const bool aov_wire = (params.aov_mode == AOV_WIREFRAME);
+    float wire_occ = 0.0f;
+    const unsigned int ctr_tap = aov_wire ? 0u : 4u;
+    const unsigned int loop_spp = aov_wire ? 1u : (aov_aa ? 5u : spp);
     float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
     float aov_w_accum = 0.0f;
     float2 ctr_motion = make_float2(0.0f, 0.0f);
@@ -2073,8 +2097,8 @@ extern "C" __global__ void __raygen__render() {
             // jitter and clean 4x anti-aliased edges on every non-Beauty AOV pass.
             const float rgss_x[4] = {-0.375f,  0.125f, -0.125f, 0.375f};
             const float rgss_y[4] = {-0.125f, -0.375f,  0.375f, 0.125f};
-            jx = (s < 4u) ? rgss_x[s] : 0.0f;
-            jy = (s < 4u) ? rgss_y[s] : 0.0f;
+            jx = (s != ctr_tap && s < 4u) ? rgss_x[s] : 0.0f;
+            jy = (s != ctr_tap && s < 4u) ? rgss_y[s] : 0.0f;
         } else {
             bool use_dlss_jitter = (s == 0u) && (params.jitter_x != 0.0f || params.jitter_y != 0.0f);
             jx = use_dlss_jitter ? params.jitter_x : (rand01(seed) - 0.5f + params.jitter_x);
@@ -2144,7 +2168,7 @@ extern "C" __global__ void __raygen__render() {
         float3 origin = cam_pos;
         float aperture = params.cam_pos[3];
         float focus_dist = params.cam_right[3];
-        if (proj == 0u && aperture > 1e-5f && focus_dist > 0.05f) {
+        if (!aov_wire && proj == 0u && aperture > 1e-5f && focus_dist > 0.05f) {
             float r = sqrtf(rand01(seed)) * aperture;
             float phi = 6.28318530718f * rand01(seed);
             float3 lens_off = f3_add(
@@ -2598,6 +2622,18 @@ extern "C" __global__ void __raygen__render() {
                 first_roughness = fmaxf(0.0f, fminf(1.0f, rough));
                 first_mat_pbr = make_float3(first_roughness, fmaxf(0.0f, fminf(1.0f, metallic)), 0.0f);
             }
+            if (aov_wire && bounce == 0) {
+                // Slight ambient occlusion so faces read: a few short rays whose seed depends only
+                // on pixel and accumulation index (stable while moving, converging when still).
+                unsigned int ao_seed = pcg_hash(idx.x ^ pcg_hash(idx.y ^ pcg_hash(params.accum_count + 0x9E37u)));
+                float ao_r = fminf(3.0f, fmaxf(0.3f, 0.03f * hit_t));
+                float3 ao_org = f3_add(hit_pos, f3_mul(n, fmaxf(0.0005f, hit_t * 0.0003f)));
+                unsigned int occ = 0u;
+                for (unsigned int k = 0; k < WIRE_AO_RAYS; ++k) {
+                    if (trace_shadow(ao_org, sample_cosine_hemisphere(n, ao_seed), ao_r)) ++occ;
+                }
+                wire_occ = (float)occ / (float)WIRE_AO_RAYS;
+            }
             if (aov_aa) {
                 break;
             }
@@ -2647,7 +2683,7 @@ extern "C" __global__ void __raygen__render() {
         }
 
         if (aov_aa) {
-            if (s == 4u) {
+            if (s == ctr_tap) {
                 // Pixel-centre tap: raw outputs only, not part of the displayed RGSS average.
                 ctr_motion = first_motion;
                 ctr_depth = first_depth;
@@ -2726,6 +2762,15 @@ extern "C" __global__ void __raygen__render() {
     }
 
     unsigned int out_idx = idx.y * params.width + idx.x;
+    if (aov_wire) {
+        // This frame's G-buffer, overwritten every frame; `wire_draw` accumulates the display
+        // colour into out_color_f32.xyz and only reads this frame's AO from .w.
+        unsigned int key = first_has_hit ? first_inst_id : WIRE_MISS_KEY;
+        float2 o1 = wire_oct_encode(first_has_hit ? f3_norm(first_normal) : make_float3(0.0f, 0.0f, 1.0f));
+        ((float4*)params.out_normal_f32)[out_idx] =
+            make_float4(o1.x, o1.y, first_depth, __uint_as_float(key));
+        ((float*)params.out_color_f32)[4ull * out_idx + 3ull] = wire_occ;
+    }
     if (params.out_motion_f32 != 0ull) {
         ((float2*)params.out_motion_f32)[out_idx] = first_motion;
     }
@@ -2746,6 +2791,7 @@ extern "C" __global__ void __raygen__render() {
         ((float4*)params.out_spec_albedo_f32)[out_idx] =
             make_float4(first_specular.x, first_specular.y, first_specular.z, 1.0f);
     }
+    if (aov_wire) return;
     float4* color_buf  = (float4*)params.out_color_f32;
     float4* albedo_buf = (float4*)params.out_albedo_f32;
     float4* normal_buf = (float4*)params.out_normal_f32;

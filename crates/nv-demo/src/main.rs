@@ -4,6 +4,7 @@
 //! `cargo run -p nv-demo --release`
 
 mod app_events;
+mod bench;
 mod camera_rail;
 mod csg_scene_host;
 mod cuda_crowd;
@@ -2556,6 +2557,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         record_frames: u64,
         video_recorder: Option<ActiveRecorder>,
         shutter_in_flight: bool,
+        /// `--bench-rail` run (`None` = interactive app).
+        bench: Option<crate::bench::BenchRun>,
         ser_supported: bool,
         csg_stats: crate::csg_scene_host::CsgStats,
         crowd_step_ms: f32,
@@ -2703,11 +2706,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     impl DemoApp {
-        pub fn new(window: Arc<Window>, loaded: crate::persist::LoadReport) -> Self {
+        pub fn new(
+            window: Arc<Window>,
+            loaded: crate::persist::LoadReport,
+            bench_args: Option<crate::bench::BenchRailArgs>,
+        ) -> Self {
             let crate::persist::LoadReport {
                 state: mut persisted,
                 problem: persist_problem,
             } = loaded;
+            if let Some(b) = bench_args.as_ref() {
+                // Identical geometry and camera model in every benchmark run: frozen traffic and
+                // crowd, free Pinhole camera, no demo animation; the rail drives the camera.
+                if let Some(id) = b.scene.as_ref() {
+                    persisted.scene = Some(crate::persist::SavedScene {
+                        id: id.clone(),
+                        variant: String::new(),
+                    });
+                }
+                persisted.settings.csg_freeze_pose = true;
+                persisted.settings.camera_projection = crate::renderer::CameraProjection::Pinhole;
+                persisted.demo_anim.playing = false;
+            }
             let size = window.inner_size();
             // F26: keep the first failure of every startup stage so the UI can name the real
             // reason instead of a generic "unavailable".
@@ -2990,7 +3010,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // F17: the scene is persisted by descriptor id; the 1-based index is only a fallback
             // for files written before `scene` existed.
             let scene_descriptors = crate::csg_scene_host::default_scene_descriptors();
-            let protect_config = persist_problem.is_some();
+            // A benchmark run never writes the user's config (its overrides are not user intent).
+            let protect_config = persist_problem.is_some() || bench_args.is_some();
             if let Some(ref p) = persist_problem {
                 eprintln!("nv-demo config: {p}");
             }
@@ -3020,6 +3041,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
+            let bench = bench_args.map(|args| {
+                let mut run = crate::bench::BenchRun::new(args);
+                if persisted.settings.csg_mode == 0 {
+                    run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                        "no CSG scene to benchmark (saved scene {:?}; available: {})",
+                        persisted.scene.as_ref().map(|s| s.id.as_str()),
+                        scene_descriptors
+                            .iter()
+                            .map(|d| d.id)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                run
+            });
             let mut settings = persisted.settings;
             let mut startup_intent = StartupIntent::default();
             if settings.hdr_display && !hdr_surface_supported {
@@ -3178,6 +3214,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 record_frames: 0,
                 video_recorder: None,
                 shutter_in_flight: false,
+                bench,
                 ser_supported: false,
                 csg_stats: crate::csg_scene_host::CsgStats::default(),
                 crowd_step_ms: 0.0,
@@ -3244,6 +3281,65 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 last_saved_state: persisted,
                 last_persist_at: Instant::now(),
             }
+        }
+
+        /// `Some` once a `--bench-rail` run finished: the CSV path or why it failed.
+        pub fn bench_outcome(&self) -> Option<Result<std::path::PathBuf, String>> {
+            match self.bench.as_ref().map(|b| &b.phase) {
+                Some(crate::bench::BenchPhase::Done(r)) => Some(r.clone()),
+                _ => None,
+            }
+        }
+
+        /// Starts a waiting benchmark once the scene's rails are installed: selects the
+        /// requested cassette at rail time 0, starts the perf log and the 60 FPS lockstep.
+        fn start_bench_if_ready(&mut self) {
+            let Some(run) = self.bench.as_mut() else {
+                return;
+            };
+            if run.phase != crate::bench::BenchPhase::WaitingForRails {
+                return;
+            }
+            let rails = self.camera_rail.scene_rails();
+            let Some(idx) = rails.iter().position(|r| r.spec.id == run.args.rail) else {
+                let ids: Vec<&str> = rails.iter().map(|r| r.spec.id.as_str()).collect();
+                run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                    "rail {:?} not in this scene (available: {})",
+                    run.args.rail,
+                    ids.join(", ")
+                )));
+                return;
+            };
+            self.camera_rail.select_scene_rail(idx);
+            if !self.camera_rail.set_playing(true) {
+                run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                    "rail {:?} cannot play",
+                    run.args.rail
+                )));
+                return;
+            }
+            let frames = run.args.frames.unwrap_or_else(|| {
+                crate::bench::loop_frames(
+                    self.camera_rail.duration_s,
+                    RECORD_FPS,
+                    self.settings.clamped_time_scale(),
+                )
+            });
+            let start = RenderControl::StartPerfLog {
+                path: run.args.out.clone(),
+                frames,
+                warmup: run.args.warmup,
+            };
+            run.phase = crate::bench::BenchPhase::Running;
+            self.tod_transition = None;
+            self.rail_blend_remaining = 0.0;
+            self.send_render(start);
+            self.shutter_in_flight = false;
+            self.send_render(RenderControl::SetRecording {
+                active: true,
+                fixed_fps: RECORD_FPS,
+                shutter_subframes: 1,
+            });
         }
 
         fn notify_recording(&mut self, active: bool) {
@@ -3431,6 +3527,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
+            let mut scene_rails_updated = false;
+            let mut perf_log_written: Option<Result<std::path::PathBuf, String>> = None;
             let mut fatal_reason: Option<String> = None;
             self.bus.poll_render_events(&mut self.render_ev_scratch);
             for boxed in &self.render_ev_scratch {
@@ -3503,6 +3601,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         if self.camera_rail.is_active() {
                             self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
                         }
+                        scene_rails_updated = true;
                         if self.pending_scene_auto_frame == Some((meta.scene_idx, meta.variant_idx))
                         {
                             self.pending_scene_auto_frame = None;
@@ -3598,11 +3697,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
                     }
+                    RenderEvent::PerfLogWritten(result) => {
+                        perf_log_written = Some(result.clone());
+                    }
                     RenderEvent::Fatal(reason) => {
                         if fatal_reason.is_none() {
                             fatal_reason = Some(reason.clone());
                         }
                     }
+                }
+            }
+            if scene_rails_updated {
+                self.start_bench_if_ready();
+            }
+            if let Some(result) = perf_log_written {
+                self.last_saved_msg = Some(match &result {
+                    Ok(path) => format!("Perf log written: {}", path.display()),
+                    Err(e) => format!("Perf log failed: {e}"),
+                });
+                if let Some(run) = self.bench.as_mut()
+                    && run.is_running()
+                {
+                    run.phase = crate::bench::BenchPhase::Done(result);
                 }
             }
             if let Some(reason) = fatal_reason {
@@ -3620,12 +3736,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let reason = render_exit_reason(handle);
                 self.enter_render_fatal(reason);
             }
+            if let (Some(reason), Some(run)) = (self.render_fatal.as_ref(), self.bench.as_mut())
+                && !matches!(run.phase, crate::bench::BenchPhase::Done(_))
+            {
+                run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                    "render worker stopped: {reason}"
+                )));
+            }
 
             // 2. Docked egui pass (60+ FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let prev_theme = self.theme;
             let lighting_before = LightingKey::of(&self.settings);
-            let cam_fixed_dt = if self.is_recording && self.settings.record_fixed_fps {
+            let bench_lockstep = self.bench.as_ref().is_some_and(crate::bench::BenchRun::is_running);
+            let cam_fixed_dt = if bench_lockstep || (self.is_recording && self.settings.record_fixed_fps) {
                 // Lockstep recording steps camera strictly inside `RenderShutterSubframe` batches.
                 Some(0.0)
             } else {
@@ -3728,6 +3852,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut start_sdg_burst: Option<u32> = None;
             let mut cancel_sdg_burst_requested = false;
             self.bus.poll_ui_commands(&mut self.ui_cmd_scratch);
+            if self.bench.is_some() {
+                // A benchmark renders a fixed camera sequence: possess, scene, rail, record and
+                // other UI commands (a stray click or key on the window) are dropped.
+                self.ui_cmd_scratch.clear();
+            }
             for boxed in &self.ui_cmd_scratch {
                 let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
                     continue;
@@ -4655,7 +4784,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self.possess_auto_level,
             );
 
-            if self.is_recording && self.settings.record_fixed_fps {
+            if bench_lockstep || (self.is_recording && self.settings.record_fixed_fps) {
                 if !self.shutter_in_flight {
                     let frame_dt = time_scale / RECORD_FPS as f32;
                     let mut final_settings = self.last_sent_settings;
@@ -4677,6 +4806,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             {
                                 self.cam_pose = rp;
                                 self.cam_driver.controller_mut().set_pose(rp);
+                                if bench_lockstep {
+                                    // The benchmark renders the rail pose itself, not a glide
+                                    // from wherever the camera was when the scene loaded.
+                                    self.cam_damper.snap(rp);
+                                }
                             }
                         } else if self.possess_info.is_none() {
                             let raw = lockstep_subframe_raw_input(
@@ -5893,6 +6027,8 @@ fn compute_next_ui_tick(now: Instant, prev_deadline: Instant, interval: Duration
 struct Runner {
     app: Option<DemoApp>,
     next_redraw_at: Option<Instant>,
+    /// `--bench-rail` arguments, handed to the app when it is created.
+    bench: Option<bench::BenchRailArgs>,
 }
 
 impl ApplicationHandler for Runner {
@@ -5908,7 +6044,7 @@ impl ApplicationHandler for Runner {
                 attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
             }
             let win = Arc::new(event_loop.create_window(attrs).expect("window"));
-            self.app = Some(DemoApp::new(win, loaded));
+            self.app = Some(DemoApp::new(win, loaded, self.bench.take()));
             let now = Instant::now();
             self.next_redraw_at = Some(now);
             event_loop.set_control_flow(ControlFlow::WaitUntil(now));
@@ -5943,6 +6079,10 @@ impl ApplicationHandler for Runner {
         let Some(app) = self.app.as_ref() else {
             return;
         };
+        if app.bench_outcome().is_some() {
+            event_loop.exit();
+            return;
+        }
         let now = Instant::now();
         let deadline = self.next_redraw_at.unwrap_or(now);
         if now >= deadline {
@@ -5982,13 +6122,32 @@ fn teardown_report(drained: &cuda_core_ext::teardown::Drained) -> Vec<String> {
 
 fn main() -> std::process::ExitCode {
     nvtx::name_current_thread(c"nv-demo-main");
+    let bench = match bench::parse_args(std::env::args_os().skip(1)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("nv-demo: {e}\n{}", bench::USAGE);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let result = EventLoop::new()
         .map_err(|e| format!("event loop creation failed: {e}"))
         .and_then(|event_loop| {
-            let mut runner = Runner::default();
+            let mut runner = Runner {
+                bench,
+                ..Runner::default()
+            };
             event_loop
                 .run_app(&mut runner)
-                .map_err(|e| format!("event loop failed: {e}"))
+                .map_err(|e| format!("event loop failed: {e}"))?;
+            // A benchmark ends the event loop itself; its outcome is the process result.
+            match runner.app.as_ref().and_then(DemoApp::bench_outcome) {
+                Some(Ok(path)) => {
+                    println!("nv-demo bench: wrote {}", path.display());
+                    Ok(())
+                }
+                Some(Err(e)) => Err(format!("bench failed: {e}")),
+                None => Ok(()),
+            }
             // `runner` (and with it the app and every native handle) drops here, before the report.
         });
     for line in teardown_report(&cuda_core_ext::teardown::take(None)) {

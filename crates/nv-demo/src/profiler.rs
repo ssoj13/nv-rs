@@ -705,7 +705,19 @@ fn populate_nvml_telemetry(d: &NvmlDevice, out: &mut GpuTelemetry) {
 /// No callback `Subscriber` is registered: CUPTI allows one subscriber per process, so holding one
 /// would lock Nsight Systems / Compute out, and a driver-API callback costs CPU time on every driver
 /// call while nothing here consumes it.
+///
+/// Skipped entirely when an Nsight tool is injected: measured with Nsight Compute 2026.3 on CUDA
+/// 13.3, in-process kernel activity makes `ncu` fail with
+/// `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED` before the first kernel. `ncu` on Windows marks
+/// its target with `NV_NSIGHT_INJECTION_TRANSPORT_TYPE`; on Linux the injection goes through
+/// `CUDA_INJECTION64_PATH`.
 fn probe_cupti(cuda: &Arc<CudaContext>) -> (Option<ActivityProfiler>, String) {
+    if let Some(var) = ["NV_NSIGHT_INJECTION_TRANSPORT_TYPE", "CUDA_INJECTION64_PATH"]
+        .into_iter()
+        .find(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    {
+        return (None, format!("Disabled: Nsight profiler injected ({var})"));
+    }
     let ver = match cupti::version() {
         Ok(v) => v,
         Err(err) => return (None, format!("Unavailable: {err}")),

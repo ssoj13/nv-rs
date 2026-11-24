@@ -38,6 +38,20 @@ Async OptiX Render Worker (renderer.rs, rig.stream, live optix::LogFn)
 - **csg-rs `fa5e170` A/B (2026-11-24, same method, alternating main / adoption, 5 kept pairs)**: OptiX RT pass 44.11 -> 49.40 ms (+12 %), frame 45.31 -> 50.12 ms; cause not isolated (`audit/2026-11-23/csg_fa5e170_adoption.md`, `PERF:RT`).
 - **Measured frame profile (2026-11-23, RTX 3080 Ti, default persisted scene `csg_mode = 1` with traffic, 2207x996, 4 spp, 6 bounces, denoiser / bloom / DLSS off; `perf_log.rs`, 5 runs x 600 frames)**: frame work 46-57 ms, of which the OptiX RT pass is 98 % (45.5-55.9 ms); host prep before the launch 0.74 ms, CUDA compute (IAS / crowd) 0.68 ms, tonemap 0.09 ms, crowd step 0.18 ms. Speed work must target the raygen / CSG shader (Nsight Compute), not host code. Reproduce with `NV_DEMO_PERF_CSV=<path>` (optional `NV_DEMO_PERF_FRAMES`, `NV_DEMO_PERF_WARMUP`); the CSV is written once and a status message names it.
 
+## Benchmark (rail, deterministic)
+
+Every RT timing and A/B uses the rail benchmark, never a free-running session:
+
+```text
+nv-demo --bench-rail road_cruise --scene gundo --out rail.csv [--frames N] [--warmup 60]
+```
+
+- `bench.rs` parses the arguments (an unknown argument, a missing `--out`, or a rail id the scene does not have is an error and exit code 1; the error lists the scene's rail ids). `gundo` rails: `road_cruise` ("Street Navigation (24s)"), `landmark_slalom`, `urban_canyon`, `grand_tour`.
+- The run forces Freeze Pose (traffic and crowd static), a free Pinhole camera, no demo animation and no time-of-day transition; it drops UI commands (stray clicks cannot possess or change the rail) and never writes `~/.nv-rs/nv-demo.json`. Everything else (resolution = viewport size, spp, bounces, sky, LOD) comes from the saved config, so restore the same config before each arm.
+- The rail starts at time 0 and advances `time_scale / 60 s` per frame in lockstep with the renderer (the Smooth 60 FPS recording path, one rendered frame per step, damper snapped to the rail pose). Default `--frames` is one rail loop (`road_cruise`: 1440). Two runs of the same build render the identical eye sequence (checked on the CSV `eye_*` columns).
+- The CSV (`perf_log.rs`, written via temp file + `sync_all` + rename) has the engine times plus `possessed, projection, eye_x/y/z, width, height, spp, bounces` per frame; reject a run whose state columns differ from the other arm. The process exits 0 after the CSV is written.
+- `NV_DEMO_PERF_CSV` / `NV_DEMO_PERF_FRAMES` / `NV_DEMO_PERF_WARMUP` still log a free-running session; such numbers depend on camera state and traffic and are not A/B evidence.
+
 ## Traps & Future Improvements
 
 - **csg-rs contracts (`fa5e170`, adopted 2026-11-24 in `9b6e178`)**: `SceneModule::build` returns `Result<SceneBuilt, SceneBuildError>`; the only production call (`CsgGpuHost::rebuild_scene`) maps it to the sync error that `renderer.rs` shows as `RenderEvent::StatusMessage` (never `expect`). The WGS84 HUD reads `SceneDescriptor::geo_origin` (`ui::active_geo_origin`); `None` (classic, `gundo`, `inspector`) shows no coordinates, never a fallback; world `y` is already absolute altitude. Only `compound_flags::PURE_UNION` compounds go on the multi-AABB GAS; `FIRST_HIT_UNION` (overlapping / touching parts) stays on general RPN, because per-primitive closest hit reports internal faces for rays starting inside a part. `SceneBuildConfig::smart_fill` stays at its default (off). The PTX cache key hashes `csg_device::CSG_EVAL_CUH`. The pipeline stack is sized from the linked programs (`renderer::size_pipeline_stack`, continuation 320 B, `css_is = 0`): the CSG span stack is per-thread local memory (`__local_depot`, 4240 B for the large RPN frame), not OptiX stack. Registry tests check scene-id containment and never hard-code scene, viewpoint or rail counts (csg-rs adds data-only scenes).

@@ -4388,6 +4388,17 @@ pub fn spawn_render_thread(
                                 }
                             }
                         }
+                        RenderControl::StartPerfLog {
+                            path,
+                            frames,
+                            warmup,
+                        } => {
+                            perf_log = Some(crate::perf_log::PerfLog::new(
+                                path.clone(),
+                                *frames,
+                                *warmup,
+                            ));
+                        }
                         RenderControl::ReloadShader => {
                             let disk_path = PathBuf::from(RAYTRACER_CU_PATH);
                             let res = std::fs::read_to_string(&disk_path)
@@ -5840,12 +5851,18 @@ pub fn spawn_render_thread(
                         tonemap_ms,
                         cuda_compute_ms,
                         crowd_step_ms: last_crowd_step_ms,
+                        state: crate::perf_log::PerfState {
+                            possessed: rig.csg_host.is_possessing(),
+                            projection: lp.camera_projection,
+                            eye: [lp.cam_pos[0], lp.cam_pos[1], lp.cam_pos[2]],
+                            width: lp.width,
+                            height: lp.height,
+                            spp: lp.spp,
+                            bounces: lp.bounces,
+                        },
                     });
                     if let Some(result) = written {
-                        bus.emit_render_event(RenderEvent::StatusMessage(match result {
-                            Ok(path) => format!("Perf log written: {}", path.display()),
-                            Err(e) => format!("Perf log failed: {e}"),
-                        }));
+                        bus.emit_render_event(RenderEvent::PerfLogWritten(result));
                     }
                 }
 

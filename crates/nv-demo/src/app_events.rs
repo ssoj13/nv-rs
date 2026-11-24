@@ -223,6 +223,14 @@ pub enum RenderControl {
     RunSmartRail { seed: u64, backend: ProbeBackendKind },
     /// Hot-reload `raytracer.cu` from disk via NVRTC.
     ReloadShader,
+    /// Start (or restart) the per-frame performance log: skip `warmup` frames, keep `frames`,
+    /// then write the CSV to `path` and emit [`RenderEvent::PerfLogWritten`]. Sent by the rail
+    /// benchmark (`crate::bench`); `NV_DEMO_PERF_CSV` starts the same log from the environment.
+    StartPerfLog {
+        path: std::path::PathBuf,
+        frames: u32,
+        warmup: u32,
+    },
     /// Gracefully terminate the render worker thread.
     Shutdown,
 }
@@ -244,6 +252,8 @@ pub enum RenderEvent {
     PhaseChanged(EnginePhase),
     /// Human-readable status or diagnostic message for the UI status bar.
     StatusMessage(String),
+    /// The performance log finished: the CSV path, or why it could not be written.
+    PerfLogWritten(Result<std::path::PathBuf, String>),
     /// Unrecoverable render worker error, emitted once right before the worker leaves its loop.
     ///
     /// The UI shows it persistently, finishes any recording, leaves lockstep and stops sending

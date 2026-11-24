@@ -8,7 +8,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## [Unreleased]
 
 ### Fixed
-- **Workspace-wide audit repairs, Waves 1-2 (`plan2.md`; gated on RTX 3080 Ti at `05efa7e`: clippy `-D warnings` clean, 375 tests pass, ignored GPU tests of every touched crate pass)**. Every finding was re-verified against source and SDK headers before the change; refuted findings are listed in `plan2.md`.
+- **Workspace-wide audit repairs, Waves 1-2 (`audit/2026-11-23/plan2_full.md`; gated on RTX 3080 Ti at `05efa7e`: clippy `-D warnings` clean, 375 tests pass, ignored GPU tests of every touched crate pass)**. Every finding was re-verified against source and SDK headers before the change; refuted findings are listed in `PLAN.md` section 5.
   - **Buffer lifetime**: a stream-ordered `DeviceBuffer` freed while another stream still wrote it was reused and corrupted (measured 20/20); `curand` device generation now holds a `cuda-core` access lease through the new `cuda_core_ext::lease::enqueue_leased`.
   - **`cublas`**: the handle owns its workspace buffer while set and refuses a stream switch (`cublasSetStream` silently reset the workspace); context is bound on every `set_stream`; overlapping output batches, undersized `ld`, non-F32 grouped GEMM are rejected; `MatmulDesc` retains its `EmulationDesc`.
   - **`cufft`**: `Plan` is `!Sync`; the scratch lock is held until exec is queued; mixed NULL embeds and overlapping output batches are rejected.
@@ -55,7 +55,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - `cudnn::HeurMode` from the public API (no public function accepted it).
 
 ### Added
-- **Audit and execution records**: `plan2.md` (findings, verification status, decisions with rejected alternatives, gate results), `audit/2026-11-23/` (12 per-slice ledgers), `TODO.md`, `HANDOFF.md`.
+- **Audit and execution records**: `PLAN.md` (single authoritative plan) and `audit/2026-11-23/plan2_full.md` (findings, verification status, decisions with rejected alternatives, gate results), `audit/2026-11-23/` (12 per-slice ledgers), `HANDOFF.md`.
 - `cuda_core_ext::lease::enqueue_leased`, `optix::InstanceBuffer::staging_error`, `ngx::NgxVulkan::dlss_rr_availability`, `ngx::take_teardown_error`, `nccl::Comm::all_reduce_in_place`, `cuda_core_ext::ArrayDesc::color_attachment`, `nv_wgpu::Error::{Timeout, Poisoned, Poll}`.
 - **`nv-demo` Articulated `csg-actors` Crowds, True Object Optical Flow (`Motion` AOV), SDG JSON Export & `Freeze Pose` (`5b4fcf8`, synced to `csg-rs` `7b8a085`)** (`Cargo.toml`, `Cargo.lock`, `crates/nv-demo/Cargo.toml`, `crates/nv-demo/shaders/raytracer.cu`, `crates/nv-demo/src/{app_events,csg_scene_host,main,renderer,ui}.rs`):
   - **Articulated Crowds & 110-Variant `Inspector`**: integrated `csg-actors` (`csg-rs` 23-crate workspace at `7b8a085`, 84-slot `MaterialPalette`, 15-class `GasLedger` `246/256`, 11-GAS `SINGLE_PRIM | IDENTITY` SBT 5 actor bank); `CsgGpuHost` now owns `Option<SceneBuilt>` directly and steps both `TrafficStateSoA`/legacy vehicles (`!traffic.is_empty()`) and `SceneBuilt::crowd` (`step_dynamic`) across city walkways and `Inspector` variant `109` (`Actors: 4-Archetype Crowd Showcase` — Urban Human, comedic `RoadSignStickman`, `QuadrupedDog`, 5-finger `SdgMannequin`).

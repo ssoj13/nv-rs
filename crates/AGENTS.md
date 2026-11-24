@@ -35,7 +35,7 @@ OptiX objects retain dependencies through owned handles and `Arc` references. Pr
 
 ## Review checklist
 
-- A finding from review or audit is a claim until re-read against the source and the native header, and, where reading cannot decide it, measured on hardware. In the 2026-11-23 audit a substantial number of re-verified findings were refuted or much narrower than reported; they are listed one by one in `plan2.md`, "Execution record".
+- A finding from review or audit is a claim until re-read against the source and the native header, and, where reading cannot decide it, measured on hardware. In the 2026-11-23 audit a substantial number of re-verified findings were refuted or much narrower than reported; they are listed one by one in `audit/2026-11-23/plan2_full.md`, "Execution record".
 - Buffer lifetime: `cuda-core` frees a dropped buffer without waiting for GPU work. Synchronous buffers (`zeroed`, `from_host`) did not corrupt in measurement; a stream-ordered buffer (`uninitialized_async`) freed on its own stream while another stream still uses it did, 20/20. Keep internal scratch on one checked stream; lease caller buffers with `cuda_core_ext::lease::enqueue_leased` where they can cross streams.
 - Scratch memory is one type, `cuda_core_ext::scratch::Scratch` (`cufft` wraps it; `optix::Scratch` keeps its own temp/output accounting). Its budgets bound the whole allocation, and the old buffer is released before the new one is allocated.
 - Compare contexts with `cuda_core_ext::same_context` and streams with `same_stream` (by value / native handle), never `Arc::ptr_eq`: two `Context::new(0)` handles are one primary context and DLPack imports carry their own.

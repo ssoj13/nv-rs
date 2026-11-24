@@ -6,7 +6,7 @@ Item IDs are stable. `<PREFIX>:<id>` points into the per-slice ledgers `audit/20
 
 ## 1. Status
 
-State as of `git log -1` = `ee08ade` (`fix(nv-demo): follow-up wave - classic motion (ABI 648 B), ...`), 2026-11-23. Hardware: RTX 3080 Ti (sm_86), CUDA 13.3, OptiX 9.1, Windows 11.
+State as of `a33d21f` (`docs: final wave report and changelog`), 2026-11-23; the docs commit that applies the final wave to this file follows it. Hardware: RTX 3080 Ti (sm_86), CUDA 13.3, OptiX 9.1, Windows 11.
 
 ### Done (by wave; details in section 4)
 
@@ -23,12 +23,16 @@ State as of `git log -1` = `ee08ade` (`fix(nv-demo): follow-up wave - classic mo
 | W7 (partial) | docs sync | `d8dce5f`, `c441ac3`, `3bdc5a6` |
 | csg-rs adoption | `csg-rs` `24b22f5` merged | `ea2161d`, `a807624`, `csg_rs_125b870_adoption.md`; gate: clippy clean, 467 / 0 / 205, nv-demo ignored GPU tests 5/5, release app renders Marina with CUDA crowd 180 and DLSS RR |
 | nv-demo follow-ups | GPU:D03 (ABI 648 B), GPU:D21, RND:R10, `anim_range` sliders, async launch upload, APP:F19, RND:H13, `nv-wgpu` submit timeout | `ee08ade`, `wave_nvdemo_followups.md` |
+| Final wave | `W5.2` catalog-driven `xtask` + bindings manifest + loader leftovers + Linux loader search + cross-build fixes (`208e628`); `W4.3` wrapper duplicates + bounded `nv-wgpu` waits (`0508d75`); `nv-demo` OptiX SDK discovery, PTX cache key, `perf_log`, single-source tables, `main()` `ExitCode` (`0714f65`); `DPY:C20` `close()` / context managers (`473e1fe`); device CI job, `deny.toml`, `url` 2.5.9 / RUSTSEC-2026-0592 (`a7b7b49`); report and changelog (`a33d21f`) | `wave_final.md`; gate: clippy clean, **500 passed / 0 failed / 207 ignored** |
+
+Final wave GPU tests (`-- --ignored --test-threads=1`, passed / failed): cuda-core-ext 12/0, nv-wgpu 13/0, optix 68/0, cublas 9/0, cudnn 5/0, cusolver 9/0, cusparse 11/0, nvenc 4/0, nvdec 2/0, nvofa 4/0, nvjpeg 7/0, nvenc-sys 1/0, nvapi-sys 1/0, nv-demo 5/0. `python/nv-py`: clippy clean, `cargo test --lib` 19 / 0 / 5 ignored (+ 5 ignored passed), **pytest 118 passed / 2 skipped**. `device/`: **15/15** cases. Linux cross: `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings` clean except `nvcomp-sys` / `nvcomp` (compile only, nothing ran on Linux). `cargo deny check`: advisories, bans, sources ok; licenses FAILED (`DENY:LIC`).
+
+Final wave performance (release, persisted default scene, 4 spp, 6 bounces, 150 warm-up + 600 measured frames, 5 runs; median of run medians): frame work 51.17 ms (p95 59.70), OptiX RT pass 50.12 ms (98 %), host prep 0.74 ms, CUDA compute 0.68 ms, tonemap 0.089 ms, crowd step 0.175 ms. Runs 1-3 shared the GPU with other processes (20-34 %); the clean figure is about 45.6 ms. No speed-up was made, so there is no before/after pair (`PERF:RT`).
 
 ### In flight
 
-- **Final wave** (lead-launched agent): will write `audit/2026-11-23/wave_final.md`. At the time of this consolidation that file did not exist and its scope was not read; treat its report, when present, as the source for what it closed.
+- Final wave: done (`wave_final.md`, applied here).
 - **csg-rs session** (chat name `Mullis-16-3934`): `R00` GPU crowd steering moved into a csg-rs-owned kernel; `R00b` GPU traffic. Branches from `origin/main`; they ping in chat for review, the lead reviews and merges.
-- Another agent edits `CHANGELOG.md` and `crates/*/AGENTS.md` concurrently.
 
 ### Open
 
@@ -36,56 +40,56 @@ See section 2 (every unticked item, deduplicated).
 
 ## 2. Open items
 
-Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer = ledger or report holding the detail.
+Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer = ledger or report holding the detail. Updated after the final wave (`wave_final.md`, `ee08ade..a33d21f`).
 
 ### Verification and review
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `REV:W1` | Read the diffs of every P0 fix of Wave 1 and check each new test analytically (does its assertion depend on the fixed line?). No revert-and-rerun mutation runs (operator decision 2026-11-23). | lead | `plan2_full.md` Wave 1; `TODO_final.md` Open |
+| `REV:W1` | Read the diffs of every P0 fix of Wave 1 and check each new test analytically (does its assertion depend on the fixed line?). No revert-and-rerun mutation runs (operator decision 2026-11-23). The final wave did not repeat it. | lead | `plan2_full.md` Wave 1; `wave_final.md` "Not done" |
 | `REV:W2` | Review the `nv-wgpu` encoder-based submit diff. | lead | `plan2_full.md` W2.2; `06_coreext_wgpu.md` |
-| `GATE:FINAL` | Final full gate of both workspaces (root + `python/`; `device/` rebuild) after the final wave and the csg-rs R00/R00b work land. | lead | section 6 |
-| `VIS:DEMO` | Interactive checks of `nv-demo` that no gate performed: AOVs (Depth, Motion, Albedo, Normal, WorldPos, Semantic, Instance), the four sensor projections, MP4 recording, SDG burst and cancel, Traffic toggle, day/night crossfade, cursor modes (upstream requests `Hidden` during RMB hold-to-fly), DLSS SR picture, camera feel after the `camera-rs` switch, plus classic object motion under DLSS / temporal denoiser with auto-rotate or sat orbit, parameterised-to-parameterised sky crossfade, SDG occlusion against the fractal. | lead (needs a person at the machine) | `plan2_full.md` Status; `wave_nvdemo_followups.md` Risks |
-| `GPU:RERUN` | Ignored GPU tests of crates not touched by Wave 1b (green at `05efa7e`, not rerun since). | lead | `TODO_final.md` Not run yet |
-| `LNX:ALL` | Linux-only code never compiled or run: `cufile` GDS, `nccl` (also needs 2+ GPUs), Linux loader search paths (needs globbing, `lib/Linux_x86_64/rel`, `extras/CUPTI/lib64`), Linux branches of `cudnn-sys` `loaded_copy` and `python/nv-py` `platform_ext.rs` (read-checked only), Linux CI. | lead (needs a Linux host) | `plan2_full.md` Status; `TODO_final.md` Not run yet |
+| `GATE:FINAL` | Narrowed: the final wave gated root (clippy clean, 500 / 0 / 207), `python/` (pytest 118 passed / 2 skipped) and `device/` (15/15). Remaining: one more full gate after the csg-rs `R00` / `R00b` work lands. | lead | section 6; `wave_final.md` Gate results |
+| `VIS:DEMO` | Interactive checks of `nv-demo` that no gate performed: AOVs (Depth, Motion, Albedo, Normal, WorldPos, Semantic, Instance), the four sensor projections, MP4 recording, SDG burst and cancel, DLSS picture, classic object motion under DLSS / temporal denoiser, sky crossfade, camera feel after the `camera-rs` switch, cursor modes. The final wave did none of them. | lead (needs a person at the machine) | `plan2_full.md` Status; `wave_final.md` "Not done" |
+| `GPU:RERUN` | Narrowed: ignored GPU tests were rerun in the final wave for cuda-core-ext 12, nv-wgpu 13, optix 68, cublas 9, cudnn 5, cusolver 9, cusparse 11, nvenc 4, nvdec 2, nvofa 4, nvjpeg 7, nvenc-sys 1, nvapi-sys 1, nv-demo 5 (all 0 failed). Crates not in that list (for example cufft, curand, cupti, nvcomp) were not rerun. | lead | `wave_final.md` Gate results |
+| `LNX:ALL` | Narrowed: Linux code now compiles and `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings` is clean except `nvcomp-sys` / `nvcomp` (no Linux nvCOMP headers); Linux loader search (globbing, versioned sonames, `extras/CUPTI/lib64`) done in `208e628`. Still open: nothing ever ran on Linux (NCCL needs 2+ GPUs, cuFile needs GDS), `python/` not cross-compiled (PyO3 needs a Linux interpreter config), `nvcomp` on Linux needs Linux headers. | lead (needs a Linux host) | `wave_final.md` Linux-only code, Not done |
 | `SYS:NGX-HARNESS` | Vulkan test harness for `ngx` (`ash` as dev-dependency); `SYS:NGX-2`, `SYS:NGX-7`, `SYS:NGX-11` have documentation only. | lead | `07_system_xtask.md` |
-| `HOF:PY-FOLLOW` | Follow-ups the `python/nv-py` platform worker asked for elsewhere (recorded in the old `HANDOFF.md`, not re-verified in this consolidation): `cuda-core-ext` `ManagedBuffer::as_slice` / `as_mut_slice` unsafe or synchronising, `zeroed` via `cuMemsetD8`, `HostRegistration::unregister(self) -> Result`; `cupti` `Subscriber::close` / `ActivityProfiler::close` returning `Result`; `python/nv-py` `errors.rs` allowing `General` on Windows so NVAPI errors stop mapping to `NvCudaError`. (The `nccl` `Arc::ptr_eq` part is closed: no `Arc::ptr_eq` remains in `crates/nccl/src`.) | lead | old `HANDOFF.md` (`git show ee08ade:HANDOFF.md`, python platform worker row) |
+| `HOF:PY-FOLLOW` | Follow-ups the `python/nv-py` platform worker asked for elsewhere (not re-verified): `cuda-core-ext` `ManagedBuffer::as_slice` / `as_mut_slice` unsafe or synchronising, `zeroed` via `cuMemsetD8`, `HostRegistration::unregister(self) -> Result`; `cupti` `Subscriber::close` / `ActivityProfiler::close` returning `Result`; `python/nv-py` `errors.rs` allowing `General` on Windows so NVAPI errors stop mapping to `NvCudaError`. | lead | old `HANDOFF.md` (`git show ee08ade:HANDOFF.md`) |
 
 ### Build, release, CI
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `W5.2` | `xtask` consumes `nv_loader::catalog` and ships `nvngx_dlssd.dll` and companion DLLs (`SYS:X-1..X-3`); `nv-bindgen` writes an expected-files manifest and a prebuilt-fallback marker (today `xtask` infers both); `release.yml` Windows step checks `$LASTEXITCODE`. | lead | `07_system_xtask.md`, `04_loader_bindgen_sys.md` |
-| `W5.4` | CI workflows (`a246a6a`) never executed and `cargo deny` never run: needs a green CI run. | lead | `07_system_xtask.md` `SYS:B-3..B-6` |
-| `DEV:CI` | CI job that builds `device/`. | lead | `wave_6_device.md` |
-| `DEV:FORK` | Refresh the `cuda-rust_b` fork when the root workspace needs an NVIDIA-only `cuda-core` API. | lead | ADR-12 |
+| `CI:EXEC` | Replaces `W5.4`. Workflows (`a246a6a`, fixed in `a7b7b49`) are written and `actionlint` v1.7.12 is clean (only its unknown `ubuntu-26.04` label), but CI was never executed. The new `device` job needs the secret `CUDA_RUST_B_TOKEN` (the `cuda-rust_b` fork is private); its 15 GPU cases stay a hardware run. | lead | `wave_final.md` CI / W5.4 |
+| `DENY:LIC` | `cargo deny check`: advisories ok, bans ok, sources ok, licenses FAILED for `flex-geom`, `nodes-core`, `ui-theme` 0.1.0 (git crates of the operator's own repositories without a `license` field). Fix: add `license` upstream or a `[[licenses.clarify]]` entry. Operator decision; no license is invented here. | operator | `wave_final.md` Addendum |
+| `PREBUILT:REGEN` | Committed prebuilt sets (NVAPI, cuDNN, NGX, OptiX) come from newer SDKs than this machine has (NVAPI 62115 vs local 61683), so regenerating here would downgrade them; only `nvenc_types.rs` was regenerated. The committed NVAPI prebuilt shims still resolve the id on every call (L-30). Run `cargo xtask prebuilt` on a machine with the matching SDKs. | lead (needs newer SDKs) | `wave_final.md` Not done |
+| `LDR:L-31a` | cuDNN still preloads every `cudnn_*` sibling eagerly. The alternatives (`AddDllDirectory` / `SetDllDirectory`) change the process-wide DLL search and no test covers the effect on other DLLs. | lead | `wave_final.md` L-31 |
+| `DEV:FORK` | Refresh the `cuda-rust_b` fork when the root workspace needs an NVIDIA-only `cuda-core` API. | lead | ADR-3 |
 
 ### Single source of truth
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `W4.3` | Remaining duplication: `OPX:S1..S4` (five `optixAccelBuild` copies, three primitive-type mappings), `SOL:S5`, `SOL:N5`, `BLA:LT-09`, `MED:X-2` (NV12/P016 plane math, `detail_suffix`, PSNR, 2D copies), `IOP:NW-20`, `IOP:CE-09`; `nv-demo` duplicates (FOV / AOV labels / DLSS quality table / scene rules `APP:F24`; the animation-range part was closed by `anim_range` sliders in `ee08ade`; SDK discovery is `GPU:D07`). | lead | `plan2_full.md` "Single source of truth" |
+| `APP:F24` | Narrowed: AOV / DLSS quality / time scale / shutter / sky tables are single-source now (`0714f65`). The scene geo-origin table stays: it needs a `SceneDescriptor` field in csg-rs. | csg-rs | `wave_final.md` W4.3 |
 | `APP:F21` | `persist.rs:313-374` and `ui.rs:145-164` keep hand-written string tables although `serde` derives are available; left to keep the on-disk config format unchanged. | lead | `11_demo_main_ui.md` |
 
 ### `nv-demo`
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `GPU:D07` / `GPU:D08` | Hash `optix.h` in the PTX cache key; share `build.rs` OptiX SDK discovery with the renderer (picks the first folder today). Not part of the `ee08ade` wave. | lead | `10_demo_gpu.md`; `wave_nvdemo_followups.md` |
-| `APP:F27` | Unbounded waits: `device.poll(wait_indefinitely)` in `main.rs` and `platform::wait_for_submission` in `nv-wgpu` Drop paths (`VULKAN_SUBMIT_TIMEOUT` = 5 s covers only the submit). | lead | `11_demo_main_ui.md`; `wave_nvdemo_followups.md` |
-| `RND:H12` | README and docs site still describe CSG host staging as 256 KiB (it is 2 MiB growing to 16 MiB). | lead | `09_demo_renderer_host.md`; `wave_nvdemo_followups.md` |
-| `GPU:D04` | Cryptomatte id per pixel on road tiles needs the `csg-rs` `part_id` road-UV packing decision (recorded for that repository). | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
-| `CSG:RPN-FLAG` | `csg-rs` RPN stack overflow flag (recorded for that repository with the road-tile UV note). | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
-| `CSG:R00` | GPU crowd steering moves out of `nv-demo` `cuda_crowd.rs` into a csg-rs-owned CUDA kernel. | csg-rs | chat `Mullis-16-3934` |
-| `CSG:R00b` | GPU traffic. | csg-rs | chat `Mullis-16-3934` |
+| `PERF:RT` | RT shader speed-up. Measured (release, 5 runs x 600 frames, 4 spp, 6 bounces): frame 51.17 ms median, OptiX RT pass 50.12 ms = 98 % of the frame; host prep 0.74 ms + CUDA compute 0.68 ms are under 3 %. No before/after pair exists: no speed-up was made. Needs Nsight Compute on `__raygen__` / `hit_csg*`; a shader change can alter the image. | lead | `wave_final.md` Performance |
+| `RND:H12` | README and docs site still describe CSG host staging as 256 KiB (it is 2 MiB growing to 16 MiB). The final wave updated other counts in these files but not this one. | lead | `09_demo_renderer_host.md` |
+| `GPU:D04` | Cryptomatte id per pixel on road tiles needs the `csg-rs` `part_id` road-UV packing decision. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
+| `CSG:RPN-FLAG` | `csg-rs` RPN stack overflow flag. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
+| `CSG:R00` | GPU crowd steering moves out of `nv-demo` `cuda_crowd.rs` into a csg-rs-owned CUDA kernel; branch review by the lead pending. | csg-rs | chat `Mullis-16-3934` |
+| `CSG:R00b` | GPU traffic; branch review by the lead pending. | csg-rs | chat `Mullis-16-3934` |
 
 ### Python and docs
 
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
-| `DPY:C20` | `close()` / `__exit__` for the eight classes. | lead | `12_device_python.md` |
-| `DPY:DLPACK-WAIT` | Precise `__dlpack__` wait needs a `cuda-core` API exposing pending write events (today a context-wide synchronize). | lead (blocked on external `cuda-core`) | `gate_python_w6.md` |
-| `W7.1` | Documentation: `crates/nv-demo/AGENTS.md` (owned by the other agent right now), `optix` module docs (`optix.rs:19-20`, `accel.rs:25-26`, `OPX:DOC1`, `OPX:A7`), add the systemic defects to `## Traps`; every cited constant re-read in source. Links to the moved plan files in `CHANGELOG.md` and `crates/*/AGENTS.md` (section 7 of the consolidation report). | lead | `plan2_full.md` Documentation drift |
+| `DPY:DLPACK-WAIT` | Exact `__dlpack__` wait: `cuda-core` keeps pending write events private (`allocation.rs:33` at `348895e`); today a context-wide synchronize. | lead (blocked on external `cuda-core`) | `wave_final.md` DPY |
+| `DPY:P17` | Stubs model submodules as classes; needs an `xtask py-stubs` generator change. | lead | `wave_final.md` DPY |
+| `W7.1` | Narrowed: `crates/nv-demo/AGENTS.md`, README and the docs-site pages are done (`0714f65`, `a33d21f`); stale plan links fixed in the commit that applies this report. Not covered by any report: `optix` module docs (`optix.rs:19-20`, `accel.rs:25-26`, `OPX:DOC1`, `OPX:A7`), systemic defects in `## Traps`, re-reading every cited constant. | lead | `plan2_full.md` Documentation drift |
 
 ### Old backlog (from the former `PLAN.md`, not re-verified)
 
@@ -94,9 +98,11 @@ Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer
 | `BK:SANITIZER` | P2: `cargo test --workspace -- --ignored` plus `compute-sanitizer` on live GPU paths (`cufft` `ManyDesc` / `Scratch` growth, `cudnn`, `cufile`, `optix`). The probabilistic scratch-race tests in `cufft` and `cusparse` have not run under the sanitizer. | lead | `audit/history/PLAN_milestones_M1-M6.md` |
 | `BK:SPAN-TRAIT` | P3: consolidate the sealed `DeviceSpan` / `DeviceSpanMut` contracts of `cudnn`, `nccl`, `cufile` into `cuda-core-ext`. | lead | same |
 | `BK:PY-DTYPE` | P3: reuse `dlpack::find_dtype_entry` in `python/nv-py/src/core.rs` dtype inference. | lead | same |
-| `BK:PROFILE` | P3: profile `nv-demo` frame time and wrapper hot paths (`samply` / `tracing-chrome` / `criterion`, A/B release). | lead | same |
+| `BK:PROFILE` | Narrowed: `nv-demo` frame time is profiled (`perf_log.rs`, `NV_DEMO_PERF_CSV`, see `PERF:RT`). Wrapper hot paths (`criterion`, A/B release) are not. | lead | same; `wave_final.md` Performance |
 
-Item count: 29 rows: 8 verification/review, 5 build/release/CI, 2 SSOT, 7 `nv-demo` (3 lead, 4 csg-rs), 3 python/docs, 4 old backlog. Closed since the old trackers and therefore absent here: `W4.1`, `W1.1..W1.6`, `W2.1..W2.3`, `W3.1..W3.6`, `W4.2`, `W5.1`, `W5.3`, `W6.1`, `W6.2`, GPU:D03, GPU:D21, RND:R10, RND:H13, APP:F19, `anim_range` sliders, async params upload, `nv-wgpu` submit timeout.
+Item count: 28 open rows: 8 verification/review, 5 build/release/CI, 2 SSOT, 6 `nv-demo` (2 lead, 4 csg-rs), 3 python/docs, 4 old backlog (`APP:F24` residual is also csg-rs-owned).
+
+Closed by the final wave (`ee08ade..a33d21f`, 7 items, plus `W5.4` split into `CI:EXEC` and `DENY:LIC`): `W5.2` (`208e628`; catalog-driven `xtask`, `dlssd`, companions, manifest and prebuilt marker, `release.yml` exit codes), `W4.3` (`0508d75`, `0714f65`; geo-origin part stays as `APP:F24`), `DEV:CI` (`a7b7b49`, written, not executed), `DPY:C20` (`473e1fe`, nine classes), `GPU:D07` and `GPU:D08` (`0714f65`), `APP:F27` (`0508d75`, `0714f65`). Closed earlier and absent here: `W4.1`, `W1.1..W1.6`, `W2.1..W2.3`, `W3.1..W3.6`, `W4.2`, `W5.1`, `W5.3`, `W6.1`, `W6.2`, GPU:D03, GPU:D21, RND:R10, RND:H13, APP:F19, `anim_range` sliders, async params upload, `nv-wgpu` submit timeout.
 
 ## 3. Decisions (ADR)
 
@@ -123,6 +129,13 @@ Newest decisions last. Operator delegated design decisions to the lead on 2026-1
 | 17 | Classic geometry had camera-only motion vectors (`GPU:D03`); SDG fractal params missing in probe launches (`GPU:D21`). | New launch fields (`classic_motion_count` at 636 and the previous-transform pointer): `LaunchParams` / `Params` ABI grows 640 B to 648 B, checked by compile-time Rust `assert!` and CUDA `static_assert`. | Not recorded in `wave_nvdemo_followups.md` beyond the layout; none stated. |
 | 18 | Alpha code of this repository. | No backward-compatibility shims, adapters or old codepaths for our own alpha code (global rule); removed variants and APIs are replaced, callers adapted. | Transitional shims kept "for now". |
 | 19 | Operator process rules. | Lead model does not run clippy / tests / log triage (cheap subagent does); new tests are verified by reading them, no revert-and-rerun mutation runs; one gate per wave, workers edit disjoint files and never run cargo; push after each green gate. | Mutation reruns and per-worker builds: cost and `.cargo-lock` contention. |
+| 20 | Prebuilt staging inferred completeness from file times and the inventory; that rejected every `cupti-sys` build (its `build.rs` appends a type after `generate`). | `nv-bindgen` writes `<lib>_manifest.json` last (`Origin::{Generated, Prebuilt}`, promised files must exist); `xtask prebuilt` stages exactly the files of a `generated` manifest and rejects out dirs without one; `xtask stage-dlls` uses `nv_loader::catalog::ALL` with typed `StageError` and companion DLLs. | Keep mtime comparison and the hand-kept `SPECS` table: false rejections and a second DLL list that drifted (`dlssd` was not shipped). |
+| 21 | Missing optional SDKs on Linux targets (`L-32`). | One policy: NCCL and cuFile are required on Linux targets; NGX stays a warning (gated `cfg(has_ngx_sdk)`, the wrapper has a stub path). | Warn everywhere: hides a missing library until runtime. |
+| 22 | C enum constants are `i32` under MSVC and `u32` under GCC (`unnecessary_cast` on the Linux target). | Bit-preserving `u32::from_ne_bytes(x.to_ne_bytes())`; one `optix::INSTANCE_FLAG_DISABLE_ANYHIT` for `nv-demo`. | `as u32` with `#[allow]`: breaks the clippy gate on one of the targets. |
+| 23 | `nv-wgpu` waits polled with `timeout: None`; failures were printed. | `wait_submission_bounded` (`VULKAN_SUBMIT_TIMEOUT`), typed errors, drop failures recorded in `cuda_core_ext::teardown` under `Library::NvWgpu`; `nv-demo` prints the teardown sink once at exit. `ExternalSemaphore` drop stays a driver-side context sync (cannot be bounded from Rust). | Keep indefinite waits in Drop paths: a stalled driver hangs process exit. |
+| 24 | Python handles had no deterministic release. | `close()`, `is_closed`, `__enter__` / `__exit__` on nine classes; state in `Arc<Mutex<Option<State>>>`; close waits for in-flight calls, drains the stream, still releases on sync failure and returns the error; idempotent; use after close raises `NvInvalidArgumentError`. | Rely on `Drop` only: not deterministic from Python. |
+| 25 | RT pass is 98 % of the frame; the only available lever is the shader, which needs Nsight Compute and can change the image. | No speculative shader change; recorded as `PERF:RT`. | Host-side micro-optimisation: under 3 % of the frame, no measurable gain. |
+| 26 | `cargo deny` licenses: crates without a `license` field. | Do not invent a license; per-crate exceptions only for real third-party licenses (`clipboard-win`, `error-code`, `tiny-keccak`, `smartstring`, `epaint_default_fonts`); the three operator crates are `DENY:LIC`. | A blanket `clarify` for the operator's crates: asserts a license nobody chose. |
 
 ## 4. Done history
 
@@ -146,6 +159,7 @@ One line per wave or milestone; the full text of each is in the archive.
 - Wave 1-2 follow-up: `MED:CMP-4` bitcomp header validation (magic `NVZ\0`, 32-byte header, shortest stream 56 bytes), `nvjpeg` single retrieve, hardware-decided tests turned into regression tests, `cublas` emulation-desc retention, `optix` one-stream check.
 - csg-rs adoption (`csg-rs` `24b22f5`): `ff1b178`, `0a96f69`, `76c02d9`, `dee0d00`, `a637df6`, merge `ea2161d`.
 - nv-demo follow-up wave (`ee08ade`): see Status table.
+- Final wave (`208e628`, `0508d75`, `0714f65`, `473e1fe`, `a7b7b49`, `a33d21f`; `wave_final.md`): see Status table and ADR 20-26.
 
 ### Old `PLAN.md` milestones (full text `audit/history/PLAN_milestones_M1-M6.md`)
 
@@ -179,6 +193,8 @@ No code change for the refuted part. Per-item loader verdicts (`LDR:L-01..L-37`)
 - A worker fix reverted by the gate: `MED:JPG-6` (`reserve` + `unsafe set_len` returned uninitialised heap because a second retrieve succeeds without writing); `resize` + `truncate` restored.
 - Narrowed: `SYS:CUPTI-3` (field offsets identical across record versions; the reference to a larger struct was formal UB, fixed). `BLA:SEAM-01` / `SOL:X1` / `MED:X-1` P0 ratings do not hold for callers using only safe constructors.
 - Wave 3 / 5 / 6 / 1b: `DPY:D3` fix direction impossible (ADR-3); `DPY:D7` doc-only (stack-local `Footprint2d` works under 64-bit pointers); `DPY:D9` not a wrapper bug (driver 621.24 returns key 0 for current-hit vertices, test accepts both); "`spin_speed` unreachable in `ui.rs`" refuted (reachable at `ui.rs:805`); "`cudnn` is the only crate using `Arc::ptr_eq`" refuted (`same_stream` and the `cublas` handle did too); `probe_libraries` key changes and `NV_RS_DEBUG` meaning: nothing in `python/` depends on them; the loader was not established as the cause of the `import torch` `WinError 127` (ADR-14).
+
+- Final wave (`wave_final.md`), refuted as open: `L-31(b)` (zlib failure already in `diag::record_event`), `L-33`, `L-24`, `L-25`, `L-28`, `L-29`, `L-34`, `L-35`, `L-37` (already fixed in Wave 5), `APP:F27` for `nv-demo` (every `device.poll` already waits one submission with `GPU_COPY_WAIT_TIMEOUT`), `CAM:D09`, `CAM:D12`, `RND:H5`, `RND:H6` (already fixed), `IOP:NW-20` part (a) (no runner left), `MED:X-2` entry-macro and nvdec "UNKNOWN" parts, `SE-05` (already fixed in `sys_ext.rs`); `P14` accepted as valid (legacy capsule allowed); `device/.optix_device_tests.oxide-pipeline.lock` already untracked and ignored. Partly confirmed: `GPU:D07`, `GPU:D08`, `APP:F24`. Confirmed by measurement: Linux-target builds got MSVC `vadefs.h` / `vcruntime.h` (fixed: `system_include_dirs` only for windows-msvc, `cross_include_dir`).
 
 ## 6. Verification rules and gates
 

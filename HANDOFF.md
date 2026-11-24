@@ -4,9 +4,9 @@ Read [`PLAN.md`](PLAN.md) first: it holds status, open items, decisions (ADR), d
 
 ## In-flight work
 
-- Final wave agent (launched by the lead): will write `audit/2026-11-23/wave_final.md`. If the file exists, read it and tick the matching items in `PLAN.md` section 2 after review; if it does not exist and no agent is alive, check `git status` for its uncommitted edits and do not revert them.
-- csg-rs session: `R00` (GPU crowd steering into a csg-rs-owned kernel) and `R00b` (GPU traffic) on branches from `origin/main`.
-- Another agent edits `CHANGELOG.md` and `crates/*/AGENTS.md` concurrently; links in them to the moved plan files are stale until it finishes (`PLAN.md` item `W7.1`).
+- Final wave: done and applied to `PLAN.md` (report `audit/2026-11-23/wave_final.md`; gate 500 passed / 0 failed / 207 ignored, pytest 118 passed / 2 skipped, device 15/15). Nothing of it is in flight.
+- Next: review the csg-rs `R00` (GPU crowd steering into a csg-rs-owned kernel) and `R00b` (GPU traffic) branches when `Mullis-16-3934` pings, merge, then run one more full gate (`GATE:FINAL`).
+- Still open (`PLAN.md` section 2): `PERF:RT` (RT shader speed-up, needs Nsight Compute; 98 % of the frame is the OptiX RT pass), `LDR:L-31a`, `PREBUILT:REGEN` (NVAPI and other prebuilt sets need newer SDKs than this machine has), `LNX:ALL` (Linux runtime never executed; NCCL needs 2+ GPUs, cuFile needs GDS; `python/` not cross-compiled), `CI:EXEC` (CI never executed; `device` job needs secret `CUDA_RUST_B_TOKEN`), `DENY:LIC` (`flex-geom`, `nodes-core`, `ui-theme` have no `license` field; operator decision), `DPY:DLPACK-WAIT`, `DPY:P17`, `APP:F24` geo-origin (needs a csg-rs `SceneDescriptor` field), `VIS:DEMO` (manual visual check), `REV:W1` / `REV:W2` (lead review of the W1 / W2 diffs), `CSG:R00` / `CSG:R00b`.
 
 ## Chat coordination
 

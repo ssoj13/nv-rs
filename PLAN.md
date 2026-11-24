@@ -58,7 +58,6 @@ Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer
 | `W5.2` | `xtask` consumes `nv_loader::catalog` and ships `nvngx_dlssd.dll` and companion DLLs (`SYS:X-1..X-3`); `nv-bindgen` writes an expected-files manifest and a prebuilt-fallback marker (today `xtask` infers both); `release.yml` Windows step checks `$LASTEXITCODE`. | lead | `07_system_xtask.md`, `04_loader_bindgen_sys.md` |
 | `W5.4` | CI workflows (`a246a6a`) never executed and `cargo deny` never run: needs a green CI run. | lead | `07_system_xtask.md` `SYS:B-3..B-6` |
 | `DEV:CI` | CI job that builds `device/`. | lead | `wave_6_device.md` |
-| `DEV:LOCK` | `git rm --cached` of `device/.optix_device_tests.oxide-pipeline.lock`: `git ls-files device` at `ee08ade` lists no such file (`.gitignore` entry added in `c04d692`), so this looks closed; confirm once and drop. | lead | `wave_6_device.md` D8 |
 | `DEV:FORK` | Refresh the `cuda-rust_b` fork when the root workspace needs an NVIDIA-only `cuda-core` API. | lead | ADR-12 |
 
 ### Single source of truth

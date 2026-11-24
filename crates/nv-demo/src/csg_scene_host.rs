@@ -793,7 +793,8 @@ fn pack_dynamic_prefix_only(
     {
         // The world's kind tag is the authority: `user_id` is an application id (some generators
         // derive it from OSM ids) and its numeric range does not identify crowd bones.
-        let is_crowd_bone = world.crowd_actor_of_dynamic(dyn_idx).is_some();
+        let crowd_actor = world.crowd_actor_of_dynamic(dyn_idx);
+        let is_crowd_bone = crowd_actor.is_some();
         if skip_crowd_bones && is_crowd_bone {
             continue;
         }
@@ -803,6 +804,11 @@ fn pack_dynamic_prefix_only(
         let Some(assembly) = world.assembly(inst.assembly_id) else {
             continue;
         };
+        // csg-scene owns the per-actor visibility rule (frustum + draw radius on the actor's
+        // bounds, honouring `set_crowd_culling`); a private copy here drifted once already.
+        if crowd_actor.is_some_and(|actor| !world.crowd_actor_visible(actor, view)) {
+            continue;
+        }
         let world_aabb = inst.xform.xform_aabb(assembly.local_aabb);
         let dist_sq = csg_aabb_distance_sq(world_aabb, view.position);
         if !is_crowd_bone && max_radius_sq.is_finite() && dist_sq > max_radius_sq {

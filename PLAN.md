@@ -77,7 +77,6 @@ Owner `lead` = this repository's session; `csg-rs` = the csg-rs session. Pointer
 | ID | Description | Owner | Pointer |
 | --- | --- | --- | --- |
 | `PERF:RT` | RT shader speed-up. Measured (release, 5 runs x 600 frames, 4 spp, 6 bounces): frame 51.17 ms median, OptiX RT pass 50.12 ms = 98 % of the frame; host prep 0.74 ms + CUDA compute 0.68 ms are under 3 %. No before/after pair exists: no speed-up was made. Needs Nsight Compute on `__raygen__` / `hit_csg*`; a shader change can alter the image. | lead | `wave_final.md` Performance |
-| `RND:H12` | README and docs site still describe CSG host staging as 256 KiB (it is 2 MiB growing to 16 MiB). The final wave updated other counts in these files but not this one. | lead | `09_demo_renderer_host.md` |
 | `GPU:D04` | Cryptomatte id per pixel on road tiles needs the `csg-rs` `part_id` road-UV packing decision. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
 | `CSG:RPN-FLAG` | `csg-rs` RPN stack overflow flag. | csg-rs | `10_demo_gpu.md` `E01`, `E02` |
 | `CSG:R00` | GPU crowd steering moves out of `nv-demo` `cuda_crowd.rs` into a csg-rs-owned CUDA kernel; branch review by the lead pending. | csg-rs | chat `Mullis-16-3934` |

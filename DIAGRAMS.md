@@ -112,7 +112,7 @@ flowchart TD
 
 ## Systemic defects found by the workspace audit (`plan2_full.md`, 2026-11-23)
 
-Status (HEAD `1467778`): all three diagrams below are closed. They show the state at audit time; the fixed flows are given after each one. Gates: root workspace clippy clean, 467 passed / 0 failed / 205 ignored (`wave_1b.md`); `python/` clippy clean, pytest 80 passed / 1 failed (NVAPI sees 0 displays, environment) / 1 skipped. Not verified: Linux-only code, CI workflows, interactive `nv-demo` features (see `TODO.md`).
+Status (HEAD `a33d21f`): all three diagrams below are closed. They show the state at audit time; the fixed flows are given after each one. Gates: root workspace clippy clean, 500 passed / 0 failed / 207 ignored (`wave_final.md`); `python/` clippy clean, pytest 118 passed / 2 skipped; `device/` 15/15. Not verified: Linux runtime (compile only), CI execution, interactive `nv-demo` features (see `PLAN.md`).
 
 Async work outlives a stream-ordered buffer used on another stream (audit-time hazard; real only for `DeviceBuffer::uninitialized_async` used across streams, measured 20/20 in Rust and 10/10 from Python):
 

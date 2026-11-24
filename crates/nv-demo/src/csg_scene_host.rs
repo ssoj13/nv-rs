@@ -32,7 +32,7 @@ use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
 use csg_scene::{
-    CROWD_USER_ID_BASE, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
+    CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
     GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec,
     SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
     SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
@@ -788,8 +788,13 @@ fn pack_dynamic_prefix_only(
     };
     let shadow_radius_sq = shadow_radius * shadow_radius;
 
-    for (inst, prev_lod_slot) in dyn_slice.iter().zip(dyn_prev_lods.iter_mut()) {
-        let is_crowd_bone = inst.user_id >= CROWD_USER_ID_BASE;
+    for (dyn_idx, (inst, prev_lod_slot)) in
+        dyn_slice.iter().zip(dyn_prev_lods.iter_mut()).enumerate()
+    {
+        // The world's kind tag is the authority: `user_id` is an application id (some generators
+        // derive it from OSM ids) and its numeric range does not identify crowd bones.
+        let crowd_actor = world.crowd_actor_of_dynamic(dyn_idx);
+        let is_crowd_bone = crowd_actor.is_some();
         if skip_crowd_bones && is_crowd_bone {
             continue;
         }
@@ -799,6 +804,11 @@ fn pack_dynamic_prefix_only(
         let Some(assembly) = world.assembly(inst.assembly_id) else {
             continue;
         };
+        // csg-scene owns the per-actor visibility rule (frustum + draw radius on the actor's
+        // bounds, honouring `set_crowd_culling`); a private copy here drifted once already.
+        if crowd_actor.is_some_and(|actor| !world.crowd_actor_visible(actor, view)) {
+            continue;
+        }
         let world_aabb = inst.xform.xform_aabb(assembly.local_aabb);
         let dist_sq = csg_aabb_distance_sq(world_aabb, view.position);
         if !is_crowd_bone && max_radius_sq.is_finite() && dist_sq > max_radius_sq {
@@ -832,6 +842,8 @@ fn pack_dynamic_prefix_only(
         if part_end == 0 {
             continue;
         }
+        // Same projection of the kind tag as `WorldScene::pack_visible` (`inst_flags::CROWD_BONE`).
+        let packed_flags = inst_flags::with_crowd_bone(inst.flags, is_crowd_bone);
 
         let scale_max = xform_max_scale(inst.xform);
         let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
@@ -891,7 +903,7 @@ fn pack_dynamic_prefix_only(
                         compound_id: proxy.compound_id.0,
                         user_id: inst.user_id,
                         mat_override: mat_ov,
-                        flags: inst.flags,
+                        flags: packed_flags,
                     });
                     out_prev.push(part_prev.0);
                 }
@@ -914,7 +926,7 @@ fn pack_dynamic_prefix_only(
                     compound_id: cid.0,
                     user_id: inst.user_id,
                     mat_override: mat_ov,
-                    flags: inst.flags,
+                    flags: packed_flags,
                 });
                 out_prev.push(part_prev.0);
             }
@@ -1311,7 +1323,9 @@ impl CsgGpuHost {
 
         let mut gidx = 0usize;
         for (slot, gpu_inst) in slice[..dyn_count].iter().enumerate() {
-            if gpu_inst.user_id < CROWD_USER_ID_BASE {
+            // The packer derives this bit from the world's kind tag; `user_id` ranges are not
+            // guaranteed unique across generators.
+            if (gpu_inst.flags & inst_flags::CROWD_BONE) == 0 {
                 continue;
             }
             let target_bits = xform_to_bits(gpu_inst.xform);
@@ -2103,6 +2117,10 @@ impl CsgGpuHost {
                 if gpu_crowd_active {
                     mark_crowd_bones_visible(scene);
                 }
+                // GPU-direct scatter needs a packed slot for every bone wherever the camera
+                // looks, and the CPU-side actor bounds that per-actor culling tests are not
+                // advanced while the GPU steps the crowd. The CPU crowd path keeps culling.
+                scene.world.set_crowd_culling(!gpu_crowd_active);
                 scene.world.pack_visible(&cam_view, &mut self.packed);
                 let slice = self.packed.instances_slice();
                 let prev_slice = self.packed.motion_prev_xforms_slice();
@@ -2120,7 +2138,7 @@ impl CsgGpuHost {
                 let mut crowd_tail_contiguous = true;
                 for (i, inst) in slice[..dyn_count].iter().enumerate() {
                     self.prev_dyn_sig.push((inst.compound_id, inst.user_id));
-                    if inst.user_id >= CROWD_USER_ID_BASE {
+                    if (inst.flags & inst_flags::CROWD_BONE) != 0 {
                         if !saw_crowd {
                             first_crowd = i;
                             saw_crowd = true;
@@ -2414,6 +2432,14 @@ impl CsgGpuHost {
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
         let lib = &built.world.library;
+        // A compound the compiler refused is absent from the library, so its object would
+        // otherwise vanish from the render without a trace.
+        for issue in &lib.issues {
+            eprintln!(
+                "nv-demo: CSG compiler rejected geometry: {:?} (required {}, limit {})",
+                issue.kind, issue.required, issue.limit
+            );
+        }
         self.compounds_buf.upload(stream, &lib.compounds)?;
         self.ops_buf.upload(stream, &lib.ops)?;
         self.prims_buf.upload(stream, &lib.prims)?;
@@ -2567,8 +2593,9 @@ mod tests {
                 "{scene_id}: expected rich instance count"
             );
             assert!(
-                built.world.library.compounds.len() <= 256,
-                "{scene_id}: exceeded 256 GPU GAS budget ({})",
+                built.world.library.compounds.len() <= csg_scene::gas_ledger::MAX_GPU_COMPOUNDS,
+                "{scene_id}: exceeded the {} GPU compound limit ({})",
+                csg_scene::gas_ledger::MAX_GPU_COMPOUNDS,
                 built.world.library.compounds.len()
             );
             assert!(!built.viewpoints.is_empty(), "{scene_id}: missing viewpoints");
@@ -3276,7 +3303,7 @@ mod tests {
         // Verify `skip_crowd_bones = true` emits strictly the non-crowd traffic prefix.
         let expected_non_crowd = full_packed.instances_slice()[..full_dyn_count]
             .iter()
-            .filter(|inst| inst.user_id < CROWD_USER_ID_BASE)
+            .filter(|inst| (inst.flags & inst_flags::CROWD_BONE) == 0)
             .count();
         let mut traffic_lods = Vec::new();
         let mut traffic_insts = Vec::new();
@@ -3293,7 +3320,7 @@ mod tests {
         assert!(
             traffic_insts
                 .iter()
-                .all(|inst| inst.user_id < CROWD_USER_ID_BASE),
+                .all(|inst| (inst.flags & inst_flags::CROWD_BONE) == 0),
             "skip_crowd_bones must omit all GPU-scattered crowd bones"
         );
 

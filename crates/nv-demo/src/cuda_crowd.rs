@@ -1,6 +1,6 @@
 //! CUDA/NVRTC GPU-direct articulated crowd simulation backend for `csg-actors`.
 //!
-//! What: compiles `csg_actors::ACTOR_SIM_CUH` (`step_and_emit_actors_cuda`) alongside a compact
+//! What: compiles `csg_actors::pod::actor_sim_cuh_source()` (`step_and_emit_actors_cuda`) alongside a compact
 //! bounds-checked scatter kernel (`scatter_crowd_to_csg_and_optix`) via NVRTC, steps `ActorStatePod`
 //! LIPM/PD balance + rigid FK + analytical 2-bone limb IK on the GPU, and writes resolved transforms
 //! directly into device `CsgGpuInstance`, `prev_xforms`, and OptiX `OptixInstance` VRAM buffers.
@@ -19,8 +19,8 @@ use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 
 use csg_actors::{
-    ACTOR_SIM_CUH, ActorDescPod, ActorStatePod, ArchetypeKind, ArchetypeMetaPod, BoneDescPod,
-    BoneOutPod, GroundSamplePod, IntentPod, SimUniformsPod, intent_flags,
+    ActorDescPod, ActorStatePod, ArchetypeKind, ArchetypeMetaPod, BoneDescPod, BoneOutPod,
+    GroundSamplePod, IntentPod, SimUniformsPod, intent_flags, pod::actor_sim_cuh_source,
 };
 use csg_scene::{CROWD_SIDEWALK_CLEARANCE_M, SceneBuilt, inst_flags};
 #[cfg(test)]
@@ -28,10 +28,13 @@ use csg_scene::encode_walkway_target;
 
 use crate::csg_scene_host::CSG_SBT_PRIM_OFFSET;
 
-/// Extra `CsgGpuInstance::flags` bits OR'd onto visible scattered crowd bone instances so shadows
-/// and `Motion` AOV optical flow match CPU-packed dynamic actors identically.
-const SCATTER_VISIBLE_EXTRA_FLAGS: u32 =
-    inst_flags::DYNAMIC | inst_flags::CAST_SHADOW | inst_flags::MOTION_BLUR;
+/// Extra `CsgGpuInstance::flags` bits OR'd onto visible scattered crowd bone instances so the
+/// GPU-written slot carries the same flags `WorldScene::pack_visible` gives a crowd bone: shadows,
+/// `Motion` AOV optical flow and the `CROWD_BONE` marker that slot mapping and repacks test.
+const SCATTER_VISIBLE_EXTRA_FLAGS: u32 = inst_flags::DYNAMIC
+    | inst_flags::CAST_SHADOW
+    | inst_flags::MOTION_BLUR
+    | inst_flags::CROWD_BONE;
 
 /// OptiX instance flag disabling any-hit programs on opaque crowd bone instances.
 const OPTIX_INST_DISABLE_ANYHIT: u32 =
@@ -249,7 +252,8 @@ impl Drop for PinnedU32 {
 }
 
 /// GPU steering, DEM ground sampling, bounds-checked CSG/OptiX scatter, and amortized IAS
-/// displacement-flag kernels appended to `csg_actors::ACTOR_SIM_CUH` in the same NVRTC unit.
+/// displacement-flag kernels appended to `csg_actors::pod::actor_sim_cuh_source()` in the same
+/// NVRTC unit.
 const SCATTER_KERNEL_CU: &str = r#"
 #if defined(__CUDACC__) || defined(__CUDACC_RTC__)
 struct alignas(16) ActorDemUniformsPod {
@@ -366,10 +370,16 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
     // 1. Update walkway patrol steering intent in-place on GPU (matches `SceneBuilt::step_crowd`).
     if (num_walkways > 0u && walkway_pts != nullptr && walkway_spans != nullptr) {
         ActorIntentPod intent = intents[i];
-        if ((intent.flags & ACTOR_INTENT_FREEZE_POSE) == 0u && intent.target_id != 0xFFFFFFFFu) {
-            const uint32_t w_idx = (intent.target_id >> 16u) & 0x7FFFu;
-            uint32_t wp_idx = (intent.target_id >> 1u) & 0x7FFFu;
-            bool reverse = (intent.target_id & 1u) != 0u;
+        const uint32_t tid = intent.target_id;
+        // Same handle layout as `csg_scene::scene_module::encode_walkway_target`; the bit widths
+        // and sentinels come from the generated `ACTOR_WALKWAY_*` block (see
+        // `walkway_target_defines`). `0` is the zeroed `IntentPod` default and means "free".
+        if ((intent.flags & ACTOR_INTENT_FREEZE_POSE) == 0u && tid != 0u
+            && tid != ACTOR_WALKWAY_TARGET_NONE && tid != ACTOR_WALKWAY_TARGET_INVALID) {
+            const uint32_t packed = tid - 1u;
+            const uint32_t w_idx = packed >> (ACTOR_WALKWAY_WP_BITS + 1u);
+            uint32_t wp_idx = (packed >> 1u) & ACTOR_WALKWAY_WP_MASK;
+            bool reverse = (packed & 1u) != 0u;
             if (w_idx < num_walkways) {
                 const uint2 span = walkway_spans[w_idx];
                 const uint32_t start = span.x;
@@ -410,10 +420,11 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
                         intent.move_cmd[3] = speed;
                         intent.flags |= ACTOR_INTENT_MASK_VEL | ACTOR_INTENT_MASK_HEADING;
                     }
-                    if (w_idx < 32767u && wp_idx < 32767u) {
-                        intent.target_id = (w_idx << 16u) | (wp_idx << 1u) | (reverse ? 1u : 0u);
+                    if (w_idx <= ACTOR_WALKWAY_MAX_IDX && wp_idx <= ACTOR_WALKWAY_WP_MASK) {
+                        intent.target_id = ((w_idx << (ACTOR_WALKWAY_WP_BITS + 1u))
+                            | (wp_idx << 1u) | (reverse ? 1u : 0u)) + 1u;
                     } else {
-                        intent.target_id = 0xFFFFFFFFu;
+                        intent.target_id = ACTOR_WALKWAY_TARGET_INVALID;
                     }
                     intents[i] = intent;
                 }
@@ -755,16 +766,55 @@ fn check_scatter_topology(
     Ok(())
 }
 
+/// `#define` block giving the GPU steering kernel the walkway patrol-handle layout of
+/// `csg_scene::scene_module::encode_walkway_target`, generated from csg-scene's public constants so
+/// the CUDA copy cannot drift from the encoder (it did once: the layout changed and the kernel kept
+/// decoding the old one).
+fn walkway_target_defines() -> String {
+    use csg_scene::scene_module::{
+        MAX_WALKWAY_INDEX, MAX_WAYPOINT_INDEX, WALKWAY_TARGET_INVALID, WALKWAY_TARGET_NONE,
+    };
+    // `MAX_WAYPOINT_INDEX` is `2^bits - 1`, so its popcount is the field width.
+    const _: () = assert!((MAX_WAYPOINT_INDEX + 1).is_power_of_two());
+    format!(
+        "#define ACTOR_WALKWAY_WP_BITS {}u\n#define ACTOR_WALKWAY_WP_MASK {}u\n\
+         #define ACTOR_WALKWAY_MAX_IDX {}u\n#define ACTOR_WALKWAY_TARGET_NONE {}u\n\
+         #define ACTOR_WALKWAY_TARGET_INVALID {}u\n",
+        MAX_WAYPOINT_INDEX.count_ones(),
+        MAX_WAYPOINT_INDEX,
+        MAX_WALKWAY_INDEX,
+        WALKWAY_TARGET_NONE,
+        WALKWAY_TARGET_INVALID,
+    )
+}
+
+/// Parameter count of `step_and_emit_actors_cuda` (`csg-actors/shaders/actor_sim.cuh`).
+const STEP_KERNEL_ARG_COUNT: usize = 19;
+
+/// Kernel sentinel for "keep the root bone's own compound on a LOD2 pawn" (see the comment above
+/// `step_and_emit_actors_cuda`).
+const LOD2_PAWN_KEEP_ROOT: u32 = u32::MAX;
+
+/// Trailing `lod2_pawn_compound` kernel argument for `crowd`.
+#[inline]
+fn lod2_pawn_compound_arg(crowd: &csg_actors::CrowdSim) -> u32 {
+    crowd.lod2_pawn_compound.unwrap_or(LOD2_PAWN_KEEP_ROOT)
+}
+
 impl CudaCrowdBackend {
-    /// Compile `csg_actors::ACTOR_SIM_CUH` + GPU steering/DEM/scatter/displacement kernels via
+    /// Compile `csg_actors::pod::actor_sim_cuh_source()` + GPU steering/DEM/scatter/displacement kernels via
     /// NVRTC (backed by the content-addressed disk PTX cache) and load the CUDA module.
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed for CudaCrowdBackend: {e}"))?;
 
-        let mut full_src = String::with_capacity(ACTOR_SIM_CUH.len() + SCATTER_KERNEL_CU.len() + 2);
-        full_src.push_str(ACTOR_SIM_CUH);
+        // The header refuses to compile without the generated `#define` block that carries the
+        // Rust-side layout and gait constants, so the kernel can never drift from `csg_actors::pod`.
+        let mut full_src = actor_sim_cuh_source();
+        let walkway_defines = walkway_target_defines();
+        full_src.reserve(walkway_defines.len() + SCATTER_KERNEL_CU.len() + 2);
         full_src.push('\n');
+        full_src.push_str(&walkway_defines);
         full_src.push_str(SCATTER_KERNEL_CU);
 
         let module = crate::gpu_export::load_ptx_cached(
@@ -945,7 +995,9 @@ impl CudaCrowdBackend {
                 .synchronize()
                 .map_err(|e| format!("CUDA crowd CPU snapshot sync failed: {e}"))?;
             if sync_to_world {
-                scene.sync_crowd_to_world();
+                scene
+                    .sync_crowd_to_world()
+                    .map_err(|e| format!("CUDA crowd snapshot to world sync failed: {e:?}"))?;
             }
         }
         self.cpu_bones_stale = false;
@@ -1178,8 +1230,11 @@ impl CudaCrowdBackend {
         let mut p_sbt_null: u64 = 0;
         let mut optix_off_zero: u32 = 0;
         let (mut lod1, mut lod2, mut cull) = lod.resolve_dists();
+        // Same source as the CPU step (`CrowdSim::lod2_pawn_compound`, set by csg-scene from the
+        // actor GAS bank) so CPU and GPU agree on which compound a LOD2 pawn draws.
+        let mut lod2_pawn = lod2_pawn_compound_arg(&scene.crowd);
 
-        let mut step_args: [*mut c_void; 18] = [
+        let mut step_args: [*mut c_void; STEP_KERNEL_ARG_COUNT] = [
             (&raw mut p_u_sim).cast(),
             (&raw mut p_arch).cast(),
             (&raw mut p_descs).cast(),
@@ -1198,9 +1253,10 @@ impl CudaCrowdBackend {
             (&raw mut lod1).cast(),
             (&raw mut lod2).cast(),
             (&raw mut cull).cast(),
+            (&raw mut lod2_pawn).cast(),
         ];
 
-        // SAFETY: `self.step_fn` matches the 18-parameter ABI of `step_and_emit_actors_cuda`;
+        // SAFETY: `step_args` lists the 19 parameters of `step_and_emit_actors_cuda` in order;
         // every non-null device pointer has capacity for at least `n_actors`/`n_bones` elements
         // and outlives `stream` synchronization.
         let step_res = unsafe {
@@ -1438,7 +1494,8 @@ impl CudaCrowdBackend {
         let mut p_null: u64 = 0;
         let mut off_zero: u32 = 0;
         let (mut lod1, mut lod2, mut cull) = lod.resolve_dists();
-        let mut step_args: [*mut c_void; 18] = [
+        let mut lod2_pawn = lod2_pawn_compound_arg(crowd);
+        let mut step_args: [*mut c_void; STEP_KERNEL_ARG_COUNT] = [
             (&raw mut p_u_sim).cast(),
             (&raw mut p_arch).cast(),
             (&raw mut p_descs).cast(),
@@ -1457,10 +1514,11 @@ impl CudaCrowdBackend {
             (&raw mut lod1).cast(),
             (&raw mut lod2).cast(),
             (&raw mut cull).cast(),
+            (&raw mut lod2_pawn).cast(),
         ];
         let block_x = 128u32;
         let grid_x = (n_actors as u32).div_ceil(block_x).max(1);
-        // SAFETY: `self.step_fn` matches the 18-parameter ABI of `step_and_emit_actors_cuda`
+        // SAFETY: `step_args` lists the 19 parameters of `step_and_emit_actors_cuda` in order
         // and all non-null device buffers are allocated on `stream`.
         let res = unsafe {
             cu::cuLaunchKernel(
@@ -1495,17 +1553,16 @@ impl CudaCrowdBackend {
     }
 }
 
-/// Unpack a walkway patrol handle matching `csg_scene::encode_walkway_target`.
+/// Unpack a walkway patrol handle with csg-scene's own decoder (single source of the layout).
 #[cfg(test)]
 #[inline]
 const fn decode_walkway_target(target_id: u32) -> Option<(usize, usize, bool)> {
-    if target_id == u32::MAX {
-        None
-    } else {
-        let walkway_idx = ((target_id >> 16) & 0x7FFF) as usize;
-        let wp_idx = ((target_id >> 1) & 0x7FFF) as usize;
-        let reverse = (target_id & 1) != 0;
-        Some((walkway_idx, wp_idx, reverse))
+    match csg_scene::scene_module::decode_walkway_target(target_id) {
+        csg_scene::scene_module::WalkwayTarget::Patrol { walkway, wp, reverse } => {
+            Some((walkway, wp, reverse))
+        }
+        csg_scene::scene_module::WalkwayTarget::Free
+        | csg_scene::scene_module::WalkwayTarget::Invalid => None,
     }
 }
 

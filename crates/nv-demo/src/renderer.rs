@@ -1619,8 +1619,8 @@ fn build_optix_pipeline(
     let miss_shadow =
         ProgramGroup::miss(&module, "__miss__shadow").map_err(|e| format!("miss_shadow: {e}"))?;
 
-    // Paired `[primary, shadow]` hit groups (`SBT_STRIDE = 2`, 12 records total):
-    // 0,1: Floor/Mesh/Neon | 2,3: Fractal | 4,5: Sphere | 6,7: OMM | 8,9: CSG RPN | 10,11: CSG Prim/Multi-AABB
+    // Paired `[primary, shadow]` hit groups (`SBT_STRIDE = 2`, 14 records total):
+    // 0,1: Floor/Mesh/Neon | 2,3: Fractal | 4,5: Sphere | 6,7: OMM | 8,9: CSG RPN | 10,11: CSG Prim/pure-union Multi-AABB | 12,13: CSG first-hit-union Multi-AABB
     let hit_floor = ProgramGroup::hit_group(
         optix_ctx,
         HitGroup {
@@ -1727,6 +1727,26 @@ fn build_optix_pipeline(
         },
     )
     .map_err(|e| format!("hit_csg_prim_shadow: {e}"))?;
+    // FIRST_HIT_UNION multi-AABB GASes: own programs, so the heavier exact per-part rule
+    // (csg-rs `csg_union_part_hit`, ~193 registers) does not tax the single-primitive group.
+    let hit_csg_union = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__csg")),
+            intersection: Some((&module, "__intersection__csg_union_part")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_csg_union: {e}"))?;
+    let hit_csg_union_shadow = ProgramGroup::hit_group(
+        optix_ctx,
+        HitGroup {
+            closest_hit: Some((&module, "__closesthit__shadow")),
+            intersection: Some((&module, "__intersection__csg_union_part_shadow")),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("hit_csg_union_shadow: {e}"))?;
 
     let groups = [
         raygen.clone(),
@@ -1746,6 +1766,8 @@ fn build_optix_pipeline(
         hit_csg_shadow.clone(),
         hit_csg_prim.clone(),
         hit_csg_prim_shadow.clone(),
+        hit_csg_union.clone(),
+        hit_csg_union_shadow.clone(),
     ];
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
@@ -1777,6 +1799,8 @@ fn build_optix_pipeline(
         SbtRecord::new(&hit_csg_shadow, 0u32).map_err(|e| format!("sbt hit9: {e}"))?,
         SbtRecord::new(&hit_csg_prim, 0u32).map_err(|e| format!("sbt hit10: {e}"))?,
         SbtRecord::new(&hit_csg_prim_shadow, 0u32).map_err(|e| format!("sbt hit11: {e}"))?,
+        SbtRecord::new(&hit_csg_union, 0u32).map_err(|e| format!("sbt hit12: {e}"))?,
+        SbtRecord::new(&hit_csg_union_shadow, 0u32).map_err(|e| format!("sbt hit13: {e}"))?,
     ];
     let sbt = ShaderBindingTable::new(
         stream,

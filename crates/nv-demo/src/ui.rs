@@ -94,7 +94,7 @@ fn active_geo_origin(descs: &[SceneDescriptor], csg_mode: u32) -> Option<csg_sce
 }
 
 /// `Inspector` variant index of the 4-archetype crowd showcase.
-const INSPECTOR_CROWD_SHOWCASE_VARIANT: u32 = 109;
+const INSPECTOR_CROWD_SHOWCASE_VARIANT: u32 = csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32;
 
 /// `true` for the `Inspector` crowd showcase variant, where a poke hits every actor instead of the
 /// nearest one.
@@ -2217,7 +2217,7 @@ impl UiContext<'_> {
                             if ui
                                 .add_sized([w, ROW_H + 2.0], egui::Button::new(lbl).truncate())
                                 .on_hover_text(
-                                    "Apply a stumble/flinch impulse to the nearest actor along view (or all actors in Inspector 109). Hotkey: P.",
+                                    "Apply a stumble/flinch impulse to the nearest actor along view (or all actors in the Inspector crowd showcase). Hotkey: P.",
                                 )
                                 .clicked()
                             {

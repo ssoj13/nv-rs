@@ -54,6 +54,11 @@ pub const CSG_SBT_OFFSET: u32 = 8;
 /// `CSG_SBT_PRIM_OFFSET + 1` under `SBT_STRIDE = 2`).
 pub const CSG_SBT_PRIM_OFFSET: u32 = 10;
 
+/// SBT hit-group offset for Multi-AABB `FIRST_HIT_UNION` CSG (overlapping / touching parts):
+/// `__intersection__csg_union_part` + `__closesthit__csg`, shadow group at `+ 1`. A separate group
+/// because the exact per-part rule needs far more registers than `__intersection__csg_prim`.
+pub const CSG_SBT_UNION_OFFSET: u32 = 12;
+
 /// OptiX instance flag disabling any-hit programs on opaque CSG instances.
 const OPTIX_INST_DISABLE_ANYHIT: u32 = optix::INSTANCE_FLAG_DISABLE_ANYHIT;
 
@@ -112,6 +117,9 @@ enum CompoundGasPlan {
     /// Pure union of `count >= 2` contiguous finite primitives (no `FINITE_REPEAT`) -> `count`-AABB
     /// hardware BVH GAS with `primitive_offset = first_prim`, SBT 10.
     MultiAabbUnion { first_prim: u32, count: usize },
+    /// Same GAS for a `FIRST_HIT_UNION` (overlapping / touching parts), SBT 12: the per-part
+    /// program hides internal faces (`csg_union_part_hit`).
+    FirstHitUnion { first_prim: u32, count: usize },
     /// General RPN / `SUBTRACT` / `INTERSECT` / `FINITE_REPEAT` -> 1-AABB GAS with `primitive_offset = 0`, SBT 8.
     GeneralRpn,
 }
@@ -121,6 +129,7 @@ impl CompoundGasPlan {
     const fn sbt_offset(self) -> u32 {
         match self {
             Self::SinglePrim { .. } | Self::MultiAabbUnion { .. } => CSG_SBT_PRIM_OFFSET,
+            Self::FirstHitUnion { .. } => CSG_SBT_UNION_OFFSET,
             Self::GeneralRpn => CSG_SBT_OFFSET,
         }
     }
@@ -128,14 +137,15 @@ impl CompoundGasPlan {
 
 /// Inspects a compiled compound in `lib` and selects the fastest valid OptiX GAS strategy.
 ///
-/// Eligible `PURE_UNION` compounds with `M >= 2` contiguous `PUSH_PRIM`s (no `FINITE_REPEAT`,
-/// bounded finite primitive AABBs) build an `M`-AABB custom-primitive GAS with
-/// `primitive_offset = first_prim` so hardware RT Cores traverse the compound's internal BVH
-/// and invoke `__intersection__csg_prim[_shadow]` with `optixGetPrimitiveIndex() == prim_idx`.
-/// Only `PURE_UNION` (pairwise separated parts) qualifies: a union whose parts overlap or touch
-/// carries `FIRST_HIT_UNION` instead, and the per-primitive closest hit would report internal
-/// faces for rays starting inside a part, so it stays on general RPN where `csg_eval.cuh` picks
-/// the first-hit or exact span path per ray.
+/// Eligible union compounds (`PURE_UNION` = separated parts, or `FIRST_HIT_UNION` = overlapping /
+/// touching parts) with `M >= 2` contiguous `PUSH_PRIM`s (no `FINITE_REPEAT`, bounded finite
+/// primitive AABBs) build an `M`-AABB custom-primitive GAS with `primitive_offset = first_prim`
+/// so hardware RT Cores traverse the compound's internal BVH with
+/// `optixGetPrimitiveIndex() == prim_idx`. `PURE_UNION` parts are disjoint, so the per-part hit is
+/// the union's (`__intersection__csg_prim`, SBT 10); `FIRST_HIT_UNION` parts go to SBT 12
+/// (`__intersection__csg_union_part`), whose `csg_union_part_hit` / `_shadow` (csg-rs `6e84ff6`)
+/// report a part's hit only where no other part covers it, so internal faces of overlapping parts
+/// never surface, also for rays starting inside a part.
 fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPlan {
     let op_start = comp.op_offset as usize;
     let op_end = op_start.saturating_add(comp.op_count as usize);
@@ -153,7 +163,7 @@ fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPl
         };
     }
 
-    if (comp.flags & compound_flags::PURE_UNION) != 0
+    if (comp.flags & (compound_flags::PURE_UNION | compound_flags::FIRST_HIT_UNION)) != 0
         && (comp.flags & compound_flags::UNBOUNDED) == 0
     {
         let mut first_prim: Option<u32> = None;
@@ -198,9 +208,16 @@ fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPl
             }
         }
         if eligible && let Some(base) = first_prim && count >= 2 {
-            return CompoundGasPlan::MultiAabbUnion {
-                first_prim: base,
-                count,
+            return if (comp.flags & compound_flags::PURE_UNION) != 0 {
+                CompoundGasPlan::MultiAabbUnion {
+                    first_prim: base,
+                    count,
+                }
+            } else {
+                CompoundGasPlan::FirstHitUnion {
+                    first_prim: base,
+                    count,
+                }
             };
         }
     }
@@ -706,7 +723,7 @@ pub struct SdgExportFrame {
     pub scene_id: String,
     /// Active 1-based scene index (`csg_mode`).
     pub scene_idx: u32,
-    /// Active variant index (e.g. `109` for the 4-archetype actor showcase).
+    /// Active variant index (e.g. `csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX` for the 4-archetype actor showcase).
     pub variant_idx: u32,
     /// Render frame index at export time.
     pub frame_index: u32,
@@ -945,7 +962,7 @@ fn pack_dynamic_prefix_only(
 }
 
 /// Builds a single cached OptiX custom-primitive GAS for `comp`, selecting Multi-AABB hardware BVH
-/// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible `PURE_UNION`
+/// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible union
 /// compounds, `primitive_offset = prim_idx` for `SINGLE_PRIM` compounds, and a 1-AABB GAS for
 /// general RPN compounds, with `compact: false` and `GeometryFlags::DISABLE_ANYHIT`.
 ///
@@ -965,7 +982,8 @@ fn build_compound_gas(
     let plan = compound_gas_plan(lib, comp);
     let sbt_off = plan.sbt_offset();
     let gas = match plan {
-        CompoundGasPlan::MultiAabbUnion { first_prim, count } => {
+        CompoundGasPlan::MultiAabbUnion { first_prim, count }
+        | CompoundGasPlan::FirstHitUnion { first_prim, count } => {
             let MultiAabbStaging {
                 host: multi_aabb_host,
                 device: multi_aabb_staging,
@@ -2236,7 +2254,8 @@ impl CsgGpuHost {
     ///
     /// Each OptiX instance receives `id = csg_instance_index` (matching `params.csg_instances[id]`),
     /// `OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT` for opaque RT traversal, and routes single-primitive &
-    /// Multi-AABB `PURE_UNION` compounds to `CSG_SBT_PRIM_OFFSET` (`10`) and general RPN compounds
+    /// Multi-AABB `PURE_UNION` compounds to `CSG_SBT_PRIM_OFFSET` (`10`), Multi-AABB `FIRST_HIT_UNION`
+    /// compounds to `CSG_SBT_UNION_OFFSET` (`12`), and general RPN compounds
     /// to `CSG_SBT_OFFSET` (`8`). Only instances present in `instances_buf` are appended, so a
     /// failed upload never leaves IAS instances indexing missing `csg_instances` entries.
     pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>) {
@@ -2539,6 +2558,9 @@ fn crowd_actor_display_name(crowd: &CrowdSim, actor_idx: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The Inspector's 4-archetype crowd showcase variant (its index moves when csg-rs adds kits).
+    const SHOWCASE_VARIANT: u32 = csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32;
+
     #[test]
     fn scene_registry_exposes_all_scenes_and_variants() {
         let descs = default_scene_descriptors();
@@ -2794,7 +2816,7 @@ mod tests {
             .get_by_index(inspector_idx)
             .expect("inspector module");
         let cfg = SceneBuildConfig {
-            variant_idx: 109, // 4-archetype actor crowd showcase
+            variant_idx: SHOWCASE_VARIANT, // 4-archetype actor crowd showcase
             ..SceneBuildConfig::default()
         };
         let mut built = module.build(&cfg).expect("scene builds");
@@ -2805,7 +2827,7 @@ mod tests {
 
         host.scene_key = CsgSceneKey {
             scene_idx: (inspector_idx + 1) as u32,
-            variant_idx: 109,
+            variant_idx: SHOWCASE_VARIANT,
             seed: 1,
             road_mode: 2,
         };
@@ -3109,7 +3131,7 @@ mod tests {
             .expect("inspector registered");
         let module = host.registry.get_by_index(insp_idx).expect("inspector module");
         let built = module.build(&SceneBuildConfig {
-            variant_idx: 109,
+            variant_idx: SHOWCASE_VARIANT,
             ..SceneBuildConfig::default()
         })
         .expect("scene builds");
@@ -3118,7 +3140,7 @@ mod tests {
 
         host.scene_key = CsgSceneKey {
             scene_idx: (insp_idx + 1) as u32,
-            variant_idx: 109,
+            variant_idx: SHOWCASE_VARIANT,
             seed: 2026,
             road_mode: 2,
         };
@@ -3145,7 +3167,7 @@ mod tests {
         let mapped_visible = slot_map.iter().filter(|&&s| s != u32::MAX).count();
         assert!(
             mapped_visible >= 40,
-            "expected >=40 visible bones mapped in Inspector 109, got {mapped_visible}"
+            "expected >=40 visible bones mapped in the Inspector crowd showcase, got {mapped_visible}"
         );
 
         // Possess cycling finds all 4 crowd actors with eye_pov + over_shoulder mounts.
@@ -3192,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn csg_gas_build_opts_disables_compaction_and_multi_aabb_plans_pure_union() {
+    fn csg_gas_build_opts_disables_compaction_and_multi_aabb_plans_unions() {
         let opts = csg_gas_build_opts();
         assert!(!opts.compact, "CSG compound GAS builds must disable synchronous compaction");
         assert!(opts.prefer_fast_trace);
@@ -3249,8 +3271,8 @@ mod tests {
         );
         assert_eq!(plan.sbt_offset(), CSG_SBT_PRIM_OFFSET);
 
-        // Overlapping parts: first hit over parts is wrong for rays starting inside a part, so
-        // the compound must stay on the exact RPN path, never on the multi-AABB GAS.
+        // Overlapping parts (`FIRST_HIT_UNION`) also go on the multi-AABB GAS, on their own hit
+        // group whose per-part entry `csg_union_part_hit` hides internal faces (csg-rs `6e84ff6`).
         let overlap_id = lib
             .compile_single(&three_parts(0.5), csg_core::OptimizeConfig::default(), 0)
             .expect("overlapping union");
@@ -3262,8 +3284,11 @@ mod tests {
         );
         assert_eq!(overlap_flags & compound_flags::PURE_UNION, 0, "flags {overlap_flags:#x}");
         let overlap_plan = compound_gas_plan(&lib, &lib.compounds[overlap_id.0 as usize]);
-        assert_eq!(overlap_plan, CompoundGasPlan::GeneralRpn);
-        assert_eq!(overlap_plan.sbt_offset(), CSG_SBT_OFFSET);
+        assert!(
+            matches!(overlap_plan, CompoundGasPlan::FirstHitUnion { count: 3, .. }),
+            "expected FirstHitUnion with 3 prims, got {overlap_plan:?}"
+        );
+        assert_eq!(overlap_plan.sbt_offset(), CSG_SBT_UNION_OFFSET);
 
         let sub_node = single_node.subtract(
             csg_core::CsgNode::sphere(0.5, csg_core::MaterialId(2), csg_core::semantic::WINDOW)
@@ -3502,13 +3527,13 @@ mod tests {
             .get_by_index(insp_idx)
             .expect("inspector module");
         let built = module.build(&SceneBuildConfig {
-            variant_idx: 109,
+            variant_idx: SHOWCASE_VARIANT,
             ..SceneBuildConfig::default()
         })
         .expect("scene builds");
         host.scene_key = CsgSceneKey {
             scene_idx: (insp_idx + 1) as u32,
-            variant_idx: 109,
+            variant_idx: SHOWCASE_VARIANT,
             seed: 1,
             road_mode: 2,
         };

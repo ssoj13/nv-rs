@@ -133,7 +133,7 @@ pub enum UiCommand {
     RunSmartView { seed: u64, backend: ProbeBackendKind },
     /// Generate multiple candidate rails, score their key vistas on `backend`, and activate the best rail.
     RunSmartRail { seed: u64, backend: ProbeBackendKind },
-    /// Trigger an interactive poke impulse on the nearest actor (or all actors in `Inspector 109`).
+    /// Trigger an interactive poke impulse on the nearest actor (or all actors in the `Inspector` crowd showcase).
     PokeCrowd { impulse: f32, all: bool },
     /// Spawn (or toggle) the 2,000-actor GPU/CPU crowd stress grid around the camera.
     SpawnCrowdStress { target_count: usize },

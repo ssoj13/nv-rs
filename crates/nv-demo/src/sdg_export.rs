@@ -186,7 +186,7 @@ pub struct SdgBurstManifest {
     pub scene_id: String,
     /// Active 1-based scene index (`csg_mode`).
     pub scene_idx: u32,
-    /// Active scene variant index (e.g. `109` for the 4-archetype crowd showcase).
+    /// Active scene variant index (e.g. `csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX` for the 4-archetype crowd showcase).
     pub variant_idx: u32,
     /// Rendered image width in pixels.
     pub width: u32,

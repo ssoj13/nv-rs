@@ -3300,6 +3300,75 @@ extern "C" __global__ void __intersection__csg_prim_shadow() {
     }
 }
 
+// FIRST_HIT_UNION multi-AABB GAS (SBT offset 12, `CSG_SBT_UNION_OFFSET`): one AABB per union part
+// (`primitive_offset = first_prim`, so optixGetPrimitiveIndex() is the global prim_idx). Unlike
+// `__intersection__csg_prim`, overlapping / touching parts must hide their internal faces:
+// `csg_union_part_hit` reports a part's first boundary that no other part covers (csg-rs
+// `6e84ff6`). Kept out of `__intersection__csg_prim` because its register footprint would tax
+// every single-primitive instance.
+extern "C" __global__ void __intersection__csg_union_part() {
+    if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int compound_id  = meta.x;
+    unsigned int mat_override = meta.z;
+    unsigned int flags        = meta.w;
+    if ((flags & CSG_INST_FLAG_VISIBLE) == 0u) return;
+    if (compound_id >= params.csg_compound_count) return;
+
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    CsgHit hit = csg_union_part_hit(
+        make_csg_view(), compound_id, optixGetPrimitiveIndex(), orig, dir, tmin, tmax
+    );
+    if (hit.t >= 0.0f) {
+        unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
+            ? (mat_override & 0xFFFFu)
+            : (hit.mat_id & 0xFFFFu);
+        unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
+        optixReportIntersection(
+            hit.t,
+            1u,
+            __float_as_uint(hit.normal.x),
+            __float_as_uint(hit.normal.y),
+            __float_as_uint(hit.normal.z),
+            mat_sem,
+            hit.part_id
+        );
+    }
+}
+
+extern "C" __global__ void __intersection__csg_union_part_shadow() {
+    if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
+    unsigned int inst_idx = optixGetInstanceId();
+    if (inst_idx >= params.csg_instance_count) return;
+
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int compound_id = meta.x;
+    unsigned int flags       = meta.w;
+    if ((flags & (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW))
+        != (CSG_INST_FLAG_VISIBLE | CSG_INST_FLAG_CAST_SHADOW)) {
+        return;
+    }
+    if (compound_id >= params.csg_compound_count) return;
+
+    float3 orig = optixGetObjectRayOrigin();
+    float3 dir  = optixGetObjectRayDirection();
+    float tmin  = optixGetRayTmin();
+    float tmax  = optixGetRayTmax();
+
+    if (csg_union_part_shadow(
+            make_csg_view(), compound_id, optixGetPrimitiveIndex(), orig, dir, tmin, tmax)) {
+        optixReportIntersection(tmin, 0u);
+    }
+}
+
 extern "C" __global__ void __closesthit__csg() {
     float3 obj_n = make_float3(
         __uint_as_float(optixGetAttribute_0()),

@@ -179,11 +179,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ProgramData");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
+    // `csg_eval.cuh` is an umbrella over its parts; an edit inside a part must rebuild the PTX.
     let csg_inc = PathBuf::from(csg_device::csg_eval_cuh_dir());
-    println!(
-        "cargo:rerun-if-changed={}",
-        csg_inc.join("csg_eval.cuh").display()
-    );
+    for file in csg_device::CUDA_SOURCE_FILES {
+        println!("cargo:rerun-if-changed={}", csg_inc.join(file).display());
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     stage_dlss_runtime(&out_dir);

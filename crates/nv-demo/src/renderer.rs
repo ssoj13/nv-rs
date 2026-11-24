@@ -1221,6 +1221,8 @@ struct TonemapKernel {
     wire_emit: cu::CUfunction,
     /// Overlay raster (`overlay.rs`): segments -> per-pixel coverage.
     ovl_splat: cu::CUfunction,
+    /// Object axes provider: device CSG instances -> axis (and selection bounds) segments.
+    ovl_axes: cu::CUfunction,
     /// Overlay composite: coverage -> tonemapped RGBA8 / scRGB outputs.
     ovl_composite: cu::CUfunction,
     pack_rr_func: cu::CUfunction,
@@ -2694,6 +2696,7 @@ fn init_optix(
         wire_faces: std::ptr::null_mut(),
         wire_emit: std::ptr::null_mut(),
         ovl_splat: std::ptr::null_mut(),
+        ovl_axes: std::ptr::null_mut(),
         ovl_composite: std::ptr::null_mut(),
         pack_rr_func: std::ptr::null_mut(),
     };
@@ -2704,6 +2707,7 @@ fn init_optix(
     tonemap.wire_faces = cu_module_function(tonemap.module, c"wire_faces")?;
     tonemap.wire_emit = cu_module_function(tonemap.module, c"wire_emit")?;
     tonemap.ovl_splat = cu_module_function(tonemap.module, c"ovl_splat")?;
+    tonemap.ovl_axes = cu_module_function(tonemap.module, c"ovl_axes")?;
     tonemap.ovl_composite = cu_module_function(tonemap.module, c"ovl_composite")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
@@ -3147,6 +3151,9 @@ struct OverlayRig {
     styles: DeviceBuffer<[u32; 8]>,
     /// One `GpuOverlayCamera`.
     camera: DeviceBuffer<[u32; 20]>,
+    /// Selection keys (`[u32; MAX_SELECTED]`): Selected-scope filter of `ovl_splat` and the
+    /// highlight test of the GPU providers.
+    sel: DeviceBuffer<u32>,
     /// Page-locked staging (`OverlayStaging` layout): rewritten only after the previous frame's
     /// end-of-frame fence, so a DMA never reads a half-written block; the counter readback of
     /// frame N is read at frame N + 1, after that fence, so reporting never stalls.
@@ -3165,7 +3172,8 @@ struct OverlayStaging;
 impl OverlayStaging {
     const STYLES: usize = 0;
     const CAMERA: usize = crate::overlay::MAX_STYLES * 32;
-    const SEGS: usize = Self::CAMERA + 128;
+    const SEL: usize = Self::CAMERA + 128;
+    const SEGS: usize = Self::SEL + crate::overlay::MAX_SELECTED * 4;
     const COUNTER: usize = Self::SEGS + OVERLAY_CPU_SEG_MAX * 64;
     const BYTES: usize = Self::COUNTER + 16;
 }
@@ -3189,6 +3197,7 @@ impl OverlayRig {
             hist_valid: false,
             styles: DeviceBuffer::zeroed(s, ov::MAX_STYLES).map_err(|e| err("style", &e))?,
             camera: DeviceBuffer::zeroed(s, 1).map_err(|e| err("camera", &e))?,
+            sel: DeviceBuffer::zeroed(s, ov::MAX_SELECTED).map_err(|e| err("selection", &e))?,
             staging: crate::csg_scene_host::PinnedStagingBuffer::try_new(
                 &rig.tonemap.cuda,
                 OverlayStaging::BYTES,
@@ -3200,13 +3209,16 @@ impl OverlayRig {
 }
 
 /// Per-frame inputs of [`run_overlay`] that come from the render loop.
-struct OverlayFrame {
+struct OverlayFrame<'a> {
     w: u32,
     h: u32,
     camera: CameraFrame,
     projection: CameraProjection,
     filter: crate::overlay::OverlayFilter,
-    selected: Option<u32>,
+    /// Selection keys (primary-hit instance key space).
+    selected: &'a [u32],
+    /// Device CSG scene of this frame (instance and compound records for the axes provider).
+    csg: crate::csg_scene_host::CsgDevicePointers,
     /// RGBA8 display target of this frame.
     dst8: u64,
     /// scRGB display target of this frame (0 when HDR is off).
@@ -3231,7 +3243,8 @@ fn run_overlay(
     rig: &mut OptixRig,
     list: &mut crate::overlay::OverlayList,
     contours: &mut crate::overlay::ContourProvider,
-    f: &OverlayFrame,
+    axes: &mut crate::overlay::AxesProvider,
+    f: &OverlayFrame<'_>,
 ) -> Result<Option<String>, String> {
     use crate::overlay::{self as ov, OverlayProvider};
     let ctx = ov::OverlayCtx {
@@ -3250,6 +3263,7 @@ fn run_overlay(
     contours.wireframe = f.wire;
     contours.line_px = f.wire_line_px;
     contours.emit(&ctx, list);
+    axes.emit(&ctx, list);
     let n_cpu = list.flatten(&ctx).len().min(OVERLAY_CPU_SEG_MAX);
     if n_cpu == 0 && list.gpu_sources().is_empty() {
         if let Some(o) = rig.overlay.as_mut() {
@@ -3283,12 +3297,13 @@ fn run_overlay(
             None
         };
     }
-    let (segs_ptr, counter_ptr, cov_ptr, styles_ptr, cam_ptr, seg_cap) = (
+    let (segs_ptr, counter_ptr, cov_ptr, styles_ptr, cam_ptr, sel_ptr, seg_cap) = (
         o.segs.cu_deviceptr(),
         o.counter.cu_deviceptr(),
         o.cov.cu_deviceptr(),
         o.styles.cu_deviceptr(),
         o.camera.cu_deviceptr(),
+        o.sel.cu_deviceptr(),
         o.seg_cap,
     );
     let temporal = f.filter.temporal && f.motion != 0;
@@ -3305,6 +3320,7 @@ fn run_overlay(
         o.hist_valid = false;
     }
     let n_styles = list.styles().len();
+    let n_sel = f.selected.len().min(ov::MAX_SELECTED);
     let cam = f.camera;
     let gcam = ov::GpuOverlayCamera {
         eye: cam.eye,
@@ -3314,13 +3330,11 @@ fn run_overlay(
         right: cam.right,
         pinhole: u32::from(f.projection == CameraProjection::Pinhole),
         up: cam.up,
-        selected: match (f.filter.scope, f.selected) {
-            (ov::OverlayScope::Selected, Some(id)) => id,
-            _ => u32::MAX,
-        },
+        sel_count: n_sel as u32,
         radius: if f.filter.scope == ov::OverlayScope::WithinRadius { f.filter.radius_m } else { 0.0 },
         min_px: f.filter.min_screen_px,
-        pad: [0.0; 2],
+        scope_selected: u32::from(f.filter.scope == ov::OverlayScope::Selected),
+        pad: 0.0,
     };
     // SAFETY: the staging block holds `OverlayStaging::BYTES` (styles, camera, CPU segments,
     // counter); `n_styles <= MAX_STYLES`, `n_cpu <= OVERLAY_CPU_SEG_MAX`; the previous frame's
@@ -3335,6 +3349,11 @@ fn run_overlay(
             std::ptr::from_ref(&gcam).cast::<u8>(),
             stage.add(OverlayStaging::CAMERA),
             std::mem::size_of::<ov::GpuOverlayCamera>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            f.selected.as_ptr().cast::<u8>(),
+            stage.add(OverlayStaging::SEL),
+            n_sel * 4,
         );
         std::ptr::copy_nonoverlapping(
             list.flatten(&ctx).as_ptr().cast::<u8>(),
@@ -3353,6 +3372,11 @@ fn run_overlay(
         [
             cu::cuMemcpyHtoDAsync_v2(styles_ptr, host(OverlayStaging::STYLES), n_styles * 32, cs),
             cu::cuMemcpyHtoDAsync_v2(cam_ptr, host(OverlayStaging::CAMERA), 80, cs),
+            if n_sel > 0 {
+                cu::cuMemcpyHtoDAsync_v2(sel_ptr, host(OverlayStaging::SEL), n_sel * 4, cs)
+            } else {
+                cu::cudaError_enum_CUDA_SUCCESS
+            },
             if n_cpu > 0 {
                 cu::cuMemcpyHtoDAsync_v2(segs_ptr, host(OverlayStaging::SEGS), n_cpu * 64, cs)
             } else {
@@ -3408,20 +3432,77 @@ fn run_overlay(
                     )?;
                 }
             }
+            ov::GpuSource::Axes { x, y, z, bounds, axis_px } => {
+                let mut inst_count = f.csg.instance_count;
+                if inst_count == 0 || f.csg.instances == 0 || f.csg.compounds == 0 {
+                    continue;
+                }
+                let mut insts = f.csg.instances;
+                let mut comps = f.csg.compounds;
+                let mut comp_count = f.csg.compound_count;
+                let mut gas_count = f.csg.gas_count;
+                let mut cam_dev = cam_ptr;
+                let mut sel_dev = sel_ptr;
+                let (mut sx, mut sy, mut sz, mut sb) = (x.0, y.0, z.0, bounds.0);
+                let mut len_px = axis_px;
+                let mut args: [*mut c_void; 16] = [
+                    (&raw mut insts).cast(),
+                    (&raw mut inst_count).cast(),
+                    (&raw mut comps).cast(),
+                    (&raw mut comp_count).cast(),
+                    (&raw mut gas_count).cast(),
+                    (&raw mut cam_dev).cast(),
+                    (&raw mut sel_dev).cast(),
+                    (&raw mut segs).cast(),
+                    (&raw mut counter).cast(),
+                    (&raw mut cap).cast(),
+                    (&raw mut h).cast(),
+                    (&raw mut sx).cast(),
+                    (&raw mut sy).cast(),
+                    (&raw mut sz).cast(),
+                    (&raw mut sb).cast(),
+                    (&raw mut len_px).cast(),
+                ];
+                // SAFETY: `ovl_axes(const float4*, u32, const float4*, u32, u32, const OvlCamera*,
+                // const unsigned*, NvOverlaySegment*, unsigned*, u32, u32, u32, u32, u32, u32,
+                // f32)`; the instance / compound buffers hold `inst_count` / `comp_count` 64-byte
+                // records (csg-device layouts) and live in `CsgGpuHost` until the end-of-frame
+                // fence; writes are bounded by `cap`.
+                let rc = unsafe {
+                    cu::cuLaunchKernel(
+                        rig.tonemap.ovl_axes,
+                        inst_count.div_ceil(128),
+                        1,
+                        1,
+                        128,
+                        1,
+                        1,
+                        0,
+                        cs,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                    return Err(format!("ovl_axes cuLaunchKernel failed ({rc:?})"));
+                }
+            }
         }
     }
     let mut styles = styles_ptr;
     let mut style_count = n_styles as u32;
     let mut cam_dev = cam_ptr;
+    let mut sel_dev = sel_ptr;
     let mut depth = f.depth;
     let mut cov = cov_ptr;
-    let mut splat_args: [*mut c_void; 10] = [
+    let mut splat_args: [*mut c_void; 11] = [
         (&raw mut segs).cast(),
         (&raw mut counter).cast(),
         (&raw mut cap).cast(),
         (&raw mut styles).cast(),
         (&raw mut style_count).cast(),
         (&raw mut cam_dev).cast(),
+        (&raw mut sel_dev).cast(),
         (&raw mut depth).cast(),
         (&raw mut cov).cast(),
         (&raw mut w).cast(),
@@ -3431,8 +3512,8 @@ fn run_overlay(
     // each block one segment at a time.
     let blocks = seg_cap.clamp(1, 8192);
     // SAFETY: `ovl_splat(const NvOverlaySegment*, unsigned*, u32, const OvlStyle*, u32, const
-    // OvlCamera*, const float*, unsigned*, u32, u32)`; `depth` is 0 or a `w * h` float buffer;
-    // all live until the fence.
+    // OvlCamera*, const unsigned*, const float*, unsigned*, u32, u32)`; `sel` holds
+    // `MAX_SELECTED` words; `depth` is 0 or a `w * h` float buffer; all live until the fence.
     let rc = unsafe {
         cu::cuLaunchKernel(
             rig.tonemap.ovl_splat,
@@ -4554,6 +4635,7 @@ pub fn spawn_render_thread(
             // reused every frame (`overlay.rs`).
             let mut overlay_list = crate::overlay::OverlayList::default();
             let mut contour_provider = crate::overlay::ContourProvider::default();
+            let mut axes_provider = crate::overlay::AxesProvider;
             let mut overlay_status: Option<String> = None;
             // A camera / scene cut since the last overlay frame: its coverage history is stale.
             let mut overlay_history_cut = false;
@@ -6420,7 +6502,8 @@ pub fn spawn_render_thread(
                             camera: active_camera,
                             projection: settings.camera_projection,
                             filter: settings.overlay,
-                            selected: None,
+                            selected: &[],
+                            csg: rig.csg_host.device_pointers(),
                             dst8: buf_ptrs[buf_idx],
                             dst16: hdr_ptrs.map_or(0, |p| p[buf_idx]),
                             depth: rig.depth_f32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
@@ -6430,7 +6513,13 @@ pub fn spawn_render_thread(
                             wire_line_px: settings.wire_line_px,
                         };
                         overlay_history_cut = false;
-                        match run_overlay(&mut rig, &mut overlay_list, &mut contour_provider, &frame) {
+                        match run_overlay(
+                            &mut rig,
+                            &mut overlay_list,
+                            &mut contour_provider,
+                            &mut axes_provider,
+                            &frame,
+                        ) {
                             Ok(st) => report_overlay_status(&bus, &mut overlay_status, st),
                             Err(e) => {
                                 bus.emit_render_event(RenderEvent::Fatal(e));

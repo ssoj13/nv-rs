@@ -456,6 +456,9 @@ pub struct CsgDevicePointers {
     pub instance_count: u32,
     pub material_count: u32,
     pub compound_count: u32,
+    /// Compounds `0..gas_count` own an OptiX GAS; an instance of any other compound is in the
+    /// IAS with visibilityMask 0 (`optix_slot_gas`), so device-side overlays skip it too.
+    pub gas_count: u32,
 }
 
 /// Structural configuration key that triggers a full `WorldScene` + GAS rebuild.
@@ -1823,6 +1826,7 @@ impl CsgGpuHost {
             instance_count: self.packed.len().min(self.instances_buf.len_elems) as u32,
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
+            gas_count: self.compound_gases.len() as u32,
         }
     }
 

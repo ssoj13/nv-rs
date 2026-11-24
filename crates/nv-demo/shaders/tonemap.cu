@@ -298,16 +298,27 @@ struct OvlCamera {
     float right[3];
     unsigned int pinhole;
     float up[3];
-    unsigned int selected;  // instance key of the Selected scope, 0xFFFFFFFF = all
-    float radius;           // WithinRadius scope (view depth / distance), <= 0 = off
-    float min_px;           // line LOD: records whose proj_size_px is below this are not drawn
-    float pad[2];
+    unsigned int sel_count;      // valid keys in the selection table (`sel`, OVL_MAX_SELECTED)
+    float radius;                // WithinRadius scope (view depth / distance), <= 0 = off
+    float min_px;                // line LOD: records whose proj_size_px is below this are not drawn
+    unsigned int scope_selected; // 1 = draw only records whose inst_id is in the selection table
+    float pad;
 };
 
 #define OVL_DEPTH_ALWAYS 0u
 #define OVL_DEPTH_SKIP_HIDDEN 1u
 #define OVL_DEPTH_FADE_HIDDEN 2u
-#define OVL_NO_SELECTION 0xFFFFFFFFu
+#define OVL_MAX_SELECTED 64u
+
+// True when `key` is one of the first `n` selection keys (the selection is small: a linear scan
+// of at most OVL_MAX_SELECTED words, read through the read-only cache).
+static __forceinline__ __device__ bool ovl_is_selected(const unsigned int* sel, unsigned int n, unsigned int key) {
+    n = min(n, OVL_MAX_SELECTED);
+    for (unsigned int i = 0; i < n; ++i) {
+        if (__ldg(sel + i) == key) return true;
+    }
+    return false;
+}
 
 // Coverage of a stroke `width` px wide whose centre line is `dist` px from the pixel centre:
 // smoothstep over one pixel of falloff; strokes thinner than a pixel fade in opacity instead.
@@ -336,6 +347,7 @@ extern "C" __global__ void ovl_splat(
     const OvlStyle* styles,
     unsigned int style_count,
     const OvlCamera* cam,
+    const unsigned int* sel,
     const float* depth,
     unsigned int* cov,
     unsigned int width,
@@ -352,7 +364,7 @@ extern "C" __global__ void ovl_splat(
             if (threadIdx.x == 0) atomicAdd(&counter[3], 1u);
             continue;
         }
-        if (c.selected != OVL_NO_SELECTION && s.inst_id != c.selected) continue;
+        if (c.scope_selected != 0u && !ovl_is_selected(sel, c.sel_count, s.inst_id)) continue;
         const OvlStyle st = styles[s.style];
         float3 pa, pb;
         if ((s.flags & NV_OVERLAY_FLAG_WORLD) != 0u) {
@@ -523,6 +535,163 @@ extern "C" __global__ void ovl_composite(
             return c + (l * pw - c) * a;
         };
         dst16[i] = pack_f16_4(mix16(d.x, st.r), mix16(d.y, st.g), mix16(d.z, st.b), ovl_f16_to_f32(d.w));
+    }
+}
+
+// Object axes provider (`overlay::AxesProvider`, CPU mirror `overlay::axes_emit`, unit-tested).
+// Why on the device: the instance transforms live here (`csg_instances`, also written in place by
+// the GPU crowd), so the axes cost one thread per instance and no host copy.
+// Inputs: the frame's CSG instance records (csg-device `CsgGpuInstance`, 64 B: row-major 3x4
+// xform, compound_id @48, user_id @52, flags @60) and compound records (`CsgGpuCompound`, 64 B:
+// flags @12, local aabb_min @16, aabb_max @32); `gas_count` = compounds that own an OptiX GAS
+// (an instance of any other compound has visibilityMask 0 in the IAS and is skipped).
+// One thread per instance:
+//   skip    not VISIBLE, crowd bones (they get skeletons), mask-0 instances, unbounded compounds
+//           (ground / water planes have no meaningful frame), the Selected scope's non-members,
+//           the WithinRadius scope's far origins, and non-pinhole lenses (UNPROJECTABLE fault);
+//   cull    origin within OVL_AXES_NEAR of the eye plane, bounding sphere outside the frustum,
+//           or smaller than `min_px` on screen (the selection is never size-culled);
+//   emit    X / Y / Z from the origin along the normalised transform columns, length
+//           `axis_px * 2 tan(fov/2) z / height` (constant on screen), SCREEN_CONSTANT_WIDTH, the
+//           SELECTED flag for selection members, plus the 12 oriented-box edges of a selected
+//           instance's bounds. Instance key = `hit_instance_id` of raytracer.cu (user_id, else
+//           0xFF000000 | instance index): the key space of the pick record and the contours.
+#define OVL_CSG_INST_VISIBLE 1u       // CSG_INST_FLAG_VISIBLE
+#define OVL_CSG_INST_CROWD_BONE 16u   // CSG_INST_FLAG_CROWD_BONE
+#define OVL_CSG_COMPOUND_UNBOUNDED 1u // CSG_COMPOUND_FLAG_UNBOUNDED
+#define OVL_AXES_NEAR 0.05f           // overlay::AXES_NEAR_M
+#define OVL_AXES_DEPTH_BIAS 0.05f     // metres: an origin on a surface must not z-fight it
+
+static __forceinline__ __device__ void ovl_push_world(
+    NvOverlaySegment* segs, unsigned int* counter, unsigned int cap,
+    float3 a, float3 b, unsigned int flags, unsigned int cls, unsigned int key,
+    unsigned int style, float proj_px
+) {
+    NvOverlaySegment s;
+    s.a[0] = a.x; s.a[1] = a.y; s.a[2] = a.z;
+    s.flags = flags;
+    s.b[0] = b.x; s.b[1] = b.y; s.b[2] = b.z;
+    s.kind = NV_OVERLAY_KIND_SEGMENT;
+    s.cls = cls;
+    s.inst_id = key;
+    s.part_id = 0xFFFFFFFFu;
+    s.style = style;
+    s.s0 = 0.0f;
+    s.depth_bias = OVL_AXES_DEPTH_BIAS;
+    s.proj_size_px = isinf(proj_px) ? 0.0f : proj_px;
+    s.reserved = 0u;
+    nv_overlay_push(segs, counter, cap, s);
+}
+
+extern "C" __global__ void ovl_axes(
+    const float4* insts,
+    unsigned int inst_count,
+    const float4* compounds,
+    unsigned int compound_count,
+    unsigned int gas_count,
+    const OvlCamera* cam,
+    const unsigned int* sel,
+    NvOverlaySegment* segs,
+    unsigned int* counter,
+    unsigned int cap,
+    unsigned int height,
+    unsigned int style_x,
+    unsigned int style_y,
+    unsigned int style_z,
+    unsigned int style_box,
+    float axis_px
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= inst_count) return;
+    const OvlCamera c = *cam;
+    if (c.pinhole == 0u) {
+        if (i == 0u) atomicAdd(&counter[2], 1u);
+        return;
+    }
+    const float4 r0 = __ldg(insts + 4u * i + 0u);
+    const float4 r1 = __ldg(insts + 4u * i + 1u);
+    const float4 r2 = __ldg(insts + 4u * i + 2u);
+    const float4 meta = __ldg(insts + 4u * i + 3u);
+    const unsigned int compound_id = __float_as_uint(meta.x);
+    const unsigned int user_id = __float_as_uint(meta.y);
+    const unsigned int flags = __float_as_uint(meta.w);
+    if ((flags & OVL_CSG_INST_VISIBLE) == 0u || (flags & OVL_CSG_INST_CROWD_BONE) != 0u) return;
+    if (compound_id >= gas_count || compound_id >= compound_count) return;
+    const float4 c0 = __ldg(compounds + 4u * compound_id + 0u);
+    const float4 c1 = __ldg(compounds + 4u * compound_id + 1u);
+    const float4 c2 = __ldg(compounds + 4u * compound_id + 2u);
+    if ((__float_as_uint(c0.w) & OVL_CSG_COMPOUND_UNBOUNDED) != 0u) return;
+    const unsigned int key = (user_id != 0u) ? user_id : (0xFF000000u | (i & 0x00FFFFFFu));
+    const bool selected = ovl_is_selected(sel, c.sel_count, key);
+    if (c.scope_selected != 0u && !selected) return;
+
+    const float m[12] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w, r2.x, r2.y, r2.z, r2.w};
+    const float3 eye = make_float3(c.eye[0], c.eye[1], c.eye[2]);
+    const float3 fwd = make_float3(c.fwd[0], c.fwd[1], c.fwd[2]);
+    const float3 rgt = make_float3(c.right[0], c.right[1], c.right[2]);
+    const float3 up = make_float3(c.up[0], c.up[1], c.up[2]);
+    const float3 o = make_float3(m[3], m[7], m[11]);
+    const float3 vo = make_float3(o.x - eye.x, o.y - eye.y, o.z - eye.z);
+    const float zo = vo.x * fwd.x + vo.y * fwd.y + vo.z * fwd.z;
+    if (zo <= OVL_AXES_NEAR) return;
+    if (c.radius > 0.0f && sqrtf(vo.x * vo.x + vo.y * vo.y + vo.z * vo.z) > c.radius) return;
+
+    // Bounding sphere of the transformed local AABB (centre M*c, half extents |M| h).
+    const float lo[3] = {c1.x, c1.y, c1.z};
+    const float hi[3] = {c2.x, c2.y, c2.z};
+    const float cc[3] = {0.5f * (lo[0] + hi[0]), 0.5f * (lo[1] + hi[1]), 0.5f * (lo[2] + hi[2])};
+    const float hh[3] = {0.5f * (hi[0] - lo[0]), 0.5f * (hi[1] - lo[1]), 0.5f * (hi[2] - lo[2])};
+    float wc[3], ex[3];
+    for (int r = 0; r < 3; ++r) {
+        wc[r] = m[4 * r] * cc[0] + m[4 * r + 1] * cc[1] + m[4 * r + 2] * cc[2] + m[4 * r + 3];
+        ex[r] = fabsf(m[4 * r]) * hh[0] + fabsf(m[4 * r + 1]) * hh[1] + fabsf(m[4 * r + 2]) * hh[2];
+    }
+    const float rad = sqrtf(ex[0] * ex[0] + ex[1] * ex[1] + ex[2] * ex[2]);
+    const float3 p = make_float3(wc[0] - eye.x, wc[1] - eye.y, wc[2] - eye.z);
+    const float px = p.x * rgt.x + p.y * rgt.y + p.z * rgt.z;
+    const float py = p.x * up.x + p.y * up.y + p.z * up.z;
+    const float pz = p.x * fwd.x + p.y * fwd.y + p.z * fwd.z;
+    const float tx = c.tan_half_fov * c.aspect, ty = c.tan_half_fov;
+    const float nx = sqrtf(1.0f + tx * tx), ny = sqrtf(1.0f + ty * ty);
+    if (pz + rad <= 0.0f || (px - pz * tx) / nx > rad || (-px - pz * tx) / nx > rad
+        || (py - pz * ty) / ny > rad || (-py - pz * ty) / ny > rad) {
+        return;
+    }
+    const float dist = sqrtf(p.x * p.x + p.y * p.y + p.z * p.z);
+    const float proj_px = (dist <= rad)
+        ? INFINITY
+        : 2.0f * rad * (float)height / (2.0f * fmaxf(c.tan_half_fov, 1e-4f) * fmaxf(pz, 1e-3f));
+    if (!selected && proj_px < c.min_px) return;
+
+    const unsigned int sflags = NV_OVERLAY_FLAG_WORLD | NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH
+        | (selected ? NV_OVERLAY_FLAG_SELECTED : 0u);
+    const float len = axis_px * 2.0f * c.tan_half_fov * zo / (float)max(height, 1u);
+    const unsigned int styles[3] = {style_x, style_y, style_z};
+    for (int k = 0; k < 3; ++k) {
+        const float3 col = make_float3(m[k], m[4 + k], m[8 + k]);
+        const float n = sqrtf(col.x * col.x + col.y * col.y + col.z * col.z);
+        if (n <= 1e-8f) continue;
+        const float s = len / n;
+        ovl_push_world(segs, counter, cap, o, make_float3(o.x + col.x * s, o.y + col.y * s, o.z + col.z * s),
+                       sflags, NV_OVERLAY_CLASS_AXIS, key, styles[k], proj_px);
+    }
+    if (!selected) return;
+    // Selection highlight: the 12 edges of the instance's oriented local bounds.
+    float3 corner[8];
+    for (int k = 0; k < 8; ++k) {
+        const float q[3] = {(k & 1) ? hi[0] : lo[0], (k & 2) ? hi[1] : lo[1], (k & 4) ? hi[2] : lo[2]};
+        corner[k] = make_float3(
+            m[0] * q[0] + m[1] * q[1] + m[2] * q[2] + m[3],
+            m[4] * q[0] + m[5] * q[1] + m[6] * q[2] + m[7],
+            m[8] * q[0] + m[9] * q[1] + m[10] * q[2] + m[11]);
+    }
+    for (int k = 0; k < 8; ++k) {
+        for (int bit = 1; bit < 8; bit <<= 1) {
+            if ((k & bit) == 0) {
+                ovl_push_world(segs, counter, cap, corner[k], corner[k | bit], sflags,
+                               NV_OVERLAY_CLASS_BOUNDS, key, style_box, proj_px);
+            }
+        }
     }
 }
 

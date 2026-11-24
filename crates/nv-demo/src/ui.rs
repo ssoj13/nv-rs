@@ -1023,6 +1023,7 @@ impl UiContext<'_> {
                     for kind in OverlayKind::ALL {
                         let icon = match kind {
                             OverlayKind::Contours => ic::POLYGON,
+                            OverlayKind::Axes => ic::ARROWS_OUT_CARDINAL,
                         };
                         if tb_icon_button(ui, icon, ov.kinds & kind.bit() != 0, TbTone::Normal, kind.label())
                             .clicked()
@@ -1039,6 +1040,15 @@ impl UiContext<'_> {
                         if tb_icon_button(ui, icon, ov.scope == scope, TbTone::Normal, scope.label()).clicked() {
                             ov.scope = scope;
                         }
+                    }
+                    if ov.kinds & OverlayKind::Axes.bit() != 0 {
+                        ui.add(
+                            egui::DragValue::new(&mut ov.axis_px)
+                                .range(crate::overlay::AXIS_PX_RANGE)
+                                .speed(0.5)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text("Object axis length on screen (constant at any distance)");
                     }
                     if ov.scope == OverlayScope::WithinRadius {
                         ui.add(egui::DragValue::new(&mut ov.radius_m).range(1.0..=5000.0).speed(1.0).suffix(" m"))

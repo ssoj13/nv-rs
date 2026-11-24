@@ -29,6 +29,7 @@
 #define NV_OVERLAY_CLASS_AXIS 5u
 #define NV_OVERLAY_CLASS_BONE 6u
 #define NV_OVERLAY_CLASS_PATH 7u
+#define NV_OVERLAY_CLASS_BOUNDS 8u  // oriented bounding-box edge (selection highlight)
 
 // Flag bits (`overlay::seg_flags`).
 #define NV_OVERLAY_FLAG_WORLD 1u                  // a / b in world metres (projected by nv-demo), else screen

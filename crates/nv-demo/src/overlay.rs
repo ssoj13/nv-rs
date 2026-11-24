@@ -1,8 +1,8 @@
 //! Generic overlay line renderer for nv-demo: one device-resident primitive list, one GPU
 //! antialiased raster pass, one shared filter, many providers.
 //!
-//! - **What**: overlays (wireframe contours today; object axes, actor skeletons, rail path,
-//!   bounds and camera frustum in later waves) are line segments and point markers with a
+//! - **What**: overlays (wireframe contours and object axes with the selection's bounds today;
+//!   actor skeletons, rail path and camera frustum in later waves) are line segments and point markers with a
 //!   constant screen-space width, colour, dash pattern and depth mode, drawn over the finished
 //!   frame. Every frame the segment list is rebuilt on the device; nothing is read back.
 //! - **Why**: one renderer and one filter instead of one-off drawing code per feature, and no
@@ -65,6 +65,8 @@ pub enum SegmentClass {
     Bone = 6,
     /// Path (camera rail, trajectories).
     Path = 7,
+    /// Oriented bounding box edge (selection highlight).
+    Bounds = 8,
 }
 
 /// How the draw pass interprets a record (`NV_OVERLAY_KIND_*`). Straight kinds today; analytic
@@ -178,14 +180,17 @@ pub struct GpuOverlayCamera {
     pub pinhole: u32,
     /// Up axis.
     pub up: [f32; 3],
-    /// Instance key of the Selected scope, `u32::MAX` = no filter.
-    pub selected: u32,
+    /// Number of valid keys in the device selection table (`[u32; MAX_SELECTED]`).
+    pub sel_count: u32,
     /// WithinRadius scope distance in metres (`<= 0` = off).
     pub radius: f32,
     /// Line LOD threshold ([`OverlayFilter::min_screen_px`]).
     pub min_px: f32,
+    /// 1 = Selected scope: only records whose `inst_id` is in the selection table are drawn
+    /// (an empty selection draws nothing), 0 = no selection filter.
+    pub scope_selected: u32,
     /// Keeps the record at 80 bytes (16-byte multiple).
-    pub pad: [f32; 2],
+    pub pad: f32,
 }
 const _: () = assert!(std::mem::size_of::<GpuOverlayCamera>() == 80);
 
@@ -209,6 +214,9 @@ const _: () = assert!(std::mem::size_of::<GpuStyle>() == 32);
 
 /// Largest style table (device buffer size, fixed).
 pub const MAX_STYLES: usize = 64;
+/// Largest selection the device filter and highlight see (`OVL_MAX_SELECTED` in tonemap.cu); a
+/// bigger selection keeps its first keys on the device and says so in the status line.
+pub const MAX_SELECTED: usize = 64;
 /// Device segment capacity per pixel of the frame (grown with the frame size; the counter
 /// reports dropped segments beyond it).
 pub const SEGS_PER_PIXEL: f32 = 0.5;
@@ -218,17 +226,20 @@ pub const SEGS_PER_PIXEL: f32 = 0.5;
 pub enum OverlayKind {
     /// Wireframe contour lines (silhouettes, creases, instance borders).
     Contours,
+    /// Object axis triads (X red, Y green, Z blue) at every device CSG instance origin.
+    Axes,
 }
 
 impl OverlayKind {
     /// Every kind, in toolbar order (one toggle each).
-    pub const ALL: [Self; 1] = [Self::Contours];
+    pub const ALL: [Self; 2] = [Self::Contours, Self::Axes];
 
     /// Bit of this kind in [`OverlayFilter::kinds`] (a mask persists compactly and new kinds
     /// default to off in old configs).
     pub const fn bit(self) -> u32 {
         match self {
             Self::Contours => 1,
+            Self::Axes => 2,
         }
     }
 
@@ -236,6 +247,7 @@ impl OverlayKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Contours => "Contours",
+            Self::Axes => "Object axes (X red, Y green, Z blue; the selection also shows its bounds)",
         }
     }
 }
@@ -246,7 +258,7 @@ pub enum OverlayScope {
     /// Everything in view.
     #[default]
     All,
-    /// Only the selected (today: possessed) object.
+    /// Only the selected objects (viewport click selection).
     Selected,
     /// Only primitives within [`OverlayFilter::radius_m`] of the camera.
     WithinRadius,
@@ -287,6 +299,8 @@ pub struct OverlayFilter {
     /// Temporal stabilisation of the line coverage (motion-reprojected history, clamped and
     /// blended), so lines do not flicker while the camera moves.
     pub temporal: bool,
+    /// Object axis length in screen pixels, constant at any distance (a gizmo, not geometry).
+    pub axis_px: f32,
 }
 
 impl Default for OverlayFilter {
@@ -299,6 +313,7 @@ impl Default for OverlayFilter {
             radius_m: 150.0,
             min_screen_px: 2.0,
             temporal: true,
+            axis_px: AXIS_PX_DEFAULT,
         }
     }
 }
@@ -349,19 +364,27 @@ struct Polyline {
     object: Option<u32>,
 }
 
+/// Default [`OverlayFilter::axis_px`].
+pub const AXIS_PX_DEFAULT: f32 = 40.0;
+/// Range of [`OverlayFilter::axis_px`] (toolbar drag value and the provider clamp).
+pub const AXIS_PX_RANGE: std::ops::RangeInclusive<f32> = 8.0..=200.0;
+
 /// GPU-side overlay sources requested by providers (the renderer runs their kernels).
 ///
 /// Why: large overlays (contours, later instance axes and skeletons) are generated where their
 /// data lives, on the device, with no host copy of scene data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GpuSource {
     /// Wireframe contours from the wireframe G-buffer (`wire_emit`).
     Contours { silhouette: StyleId, crease: StyleId },
+    /// Object axes from the device CSG instance records (`ovl_axes`): one style per axis plus
+    /// the selection's bounding-box style, and the axis length in pixels.
+    Axes { x: StyleId, y: StyleId, z: StyleId, bounds: StyleId, axis_px: f32 },
 }
 
 /// Per-frame camera, viewport and filter handed to providers.
 #[derive(Clone, Copy, Debug)]
-pub struct OverlayCtx {
+pub struct OverlayCtx<'a> {
     /// The camera that rendered this frame (world-space primitives project with it).
     pub camera: CameraFrame,
     /// Active lens; world-space projection supports [`CameraProjection::Pinhole`] only.
@@ -372,14 +395,15 @@ pub struct OverlayCtx {
     pub height: u32,
     /// The shared visibility state every provider honours.
     pub filter: OverlayFilter,
-    /// The selected object (today: the possessed instance), for [`OverlayScope::Selected`].
-    pub selected: Option<u32>,
+    /// Keys of the selected objects (primary-hit instance key space), for
+    /// [`OverlayScope::Selected`] and the selection highlight.
+    pub selected: &'a [u32],
     /// A primary-hit depth buffer is available for [`DepthMode`] tests this frame.
     #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
     pub depth_available: bool,
 }
 
-impl OverlayCtx {
+impl OverlayCtx<'_> {
     /// Projects a world point to image pixels and planar view depth (pinhole only).
     pub fn project(&self, p: [f32; 3]) -> Option<[f32; 3]> {
         if self.projection != CameraProjection::Pinhole || self.width == 0 || self.height == 0 {
@@ -415,7 +439,7 @@ impl OverlayCtx {
 pub trait OverlayProvider {
     /// Appends this frame's primitives to `out`; must honour `ctx.filter` and allocate nothing
     /// in steady state (reuse `out`'s buffers).
-    fn emit(&mut self, ctx: &OverlayCtx, out: &mut OverlayList);
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList);
 }
 
 /// The per-frame primitive list. Every buffer is cleared, never freed, so steady state does
@@ -517,12 +541,12 @@ impl OverlayList {
     }
 
     /// Projects and filters the CPU primitives into device segments (`ovl_segs[0..n]`).
-    pub fn flatten(&mut self, ctx: &OverlayCtx) -> &[OverlaySegmentPod] {
+    pub fn flatten(&mut self, ctx: &OverlayCtx<'_>) -> &[OverlaySegmentPod] {
         self.segs.clear();
         let f = ctx.filter;
         for li in 0..self.lines.len() {
             let l = self.lines[li];
-            if f.scope == OverlayScope::Selected && (l.object.is_none() || l.object != ctx.selected) {
+            if f.scope == OverlayScope::Selected && !l.object.is_some_and(|o| ctx.selected.contains(&o)) {
                 continue;
             }
             let start = self.segs.len();
@@ -603,12 +627,9 @@ pub struct ContourProvider {
 }
 
 impl OverlayProvider for ContourProvider {
-    fn emit(&mut self, ctx: &OverlayCtx, out: &mut OverlayList) {
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList) {
         if !self.wireframe || !ctx.filter.shows(OverlayKind::Contours) {
             return;
-        }
-        if ctx.filter.scope == OverlayScope::Selected {
-            out.status = Some("contours have no per-object selection yet (picking wave); showing all");
         }
         let w = self
             .line_px
@@ -623,11 +644,129 @@ impl OverlayProvider for ContourProvider {
     }
 }
 
+/// The object axes provider: requests the GPU axes source (`ovl_axes` reads every device CSG
+/// instance record and appends three world-space axis segments per qualifying instance) with
+/// one style per axis and a bounds style for the selection.
+///
+/// Why GPU: the transforms already live on the device (`csg_instances`, also written in place by
+/// the GPU crowd); a host copy of tens of thousands of instances per frame is exactly what the
+/// overlay layer exists to avoid.
+#[derive(Debug, Default)]
+pub struct AxesProvider;
+
+impl OverlayProvider for AxesProvider {
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList) {
+        if !ctx.filter.shows(OverlayKind::Axes) {
+            return;
+        }
+        // Occluded parts are drawn faded and dashed: an axis triad sits at the instance origin,
+        // usually inside the object, so skipping hidden parts would hide most of it.
+        let depth = DepthMode::FadeHidden;
+        let x = out.style([0.90, 0.06, 0.05, 1.0], 1.5, [0.0, 0.0], depth);
+        let y = out.style([0.10, 0.80, 0.08, 1.0], 1.5, [0.0, 0.0], depth);
+        let z = out.style([0.08, 0.22, 1.00, 1.0], 1.5, [0.0, 0.0], depth);
+        let bounds = out.style([1.00, 0.80, 0.05, 1.0], 1.5, [0.0, 0.0], depth);
+        if let (Some(x), Some(y), Some(z), Some(bounds)) = (x, y, z, bounds) {
+            let axis_px = ctx.filter.axis_px.clamp(*AXIS_PX_RANGE.start(), *AXIS_PX_RANGE.end());
+            out.gpu_source(GpuSource::Axes { x, y, z, bounds, axis_px });
+        }
+    }
+}
+
+/// Near limit (metres along the view axis) below which `ovl_axes` draws no axes: the triad
+/// length scales with the origin depth and would collapse to nothing.
+pub const AXES_NEAR_M: f32 = 0.05;
+
+/// What `ovl_axes` emits for one instance: the three axis end points from `origin` and the
+/// projected size of the instance bounds that drives the screen-size cull and the line LOD.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxesEmit {
+    /// Instance origin (translation column of the 3x4 transform), world metres.
+    pub origin: [f32; 3],
+    /// End point of the X / Y / Z axis; `None` for a degenerate (zero-scale) axis.
+    pub ends: [Option<[f32; 3]>; 3],
+    /// Projected diameter of the instance bounding sphere in pixels (`f32::INFINITY` when the
+    /// camera is inside it).
+    pub proj_px: f32,
+}
+
+/// CPU mirror of the per-instance math of `ovl_axes` (`shaders/tonemap.cu`); the unit tests pin
+/// the formulas, so a change on one side without the other fails them.
+///
+/// `xform` is the row-major 3x4 object-to-world transform of the device instance record,
+/// `aabb` the compound's local bounds. Returns `None` when the instance is culled: origin behind
+/// the near limit, bounds outside the frustum, or bounds smaller than `min_px` on screen (unless
+/// `selected`). The axis length is `axis_px` pixels at the origin depth, so it reads the same at
+/// any distance: `L = axis_px * 2 tan(fov/2) z / height`.
+pub fn axes_emit(
+    cam: &GpuOverlayCamera,
+    height: u32,
+    xform: &[f32; 12],
+    aabb: ([f32; 3], [f32; 3]),
+    axis_px: f32,
+    min_px: f32,
+    selected: bool,
+) -> Option<AxesEmit> {
+    let m = xform;
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let origin = [m[3], m[7], m[11]];
+    let zo = dot(sub(origin, cam.eye), cam.fwd);
+    if zo <= AXES_NEAR_M {
+        return None;
+    }
+    let (lo, hi) = aabb;
+    let c = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])];
+    let h = [0.5 * (hi[0] - lo[0]), 0.5 * (hi[1] - lo[1]), 0.5 * (hi[2] - lo[2])];
+    let mut wc = [0.0f32; 3];
+    let mut e = [0.0f32; 3];
+    for r in 0..3 {
+        wc[r] = m[4 * r] * c[0] + m[4 * r + 1] * c[1] + m[4 * r + 2] * c[2] + m[4 * r + 3];
+        e[r] = m[4 * r].abs() * h[0] + m[4 * r + 1].abs() * h[1] + m[4 * r + 2].abs() * h[2];
+    }
+    let rad = dot(e, e).sqrt();
+    let p = sub(wc, cam.eye);
+    let (x, y, z) = (dot(p, cam.right), dot(p, cam.up), dot(p, cam.fwd));
+    // Sphere against the four side planes and the eye plane of the pinhole frustum.
+    let tx = cam.tan_half_fov * cam.aspect;
+    let ty = cam.tan_half_fov;
+    let nx = (1.0 + tx * tx).sqrt();
+    let ny = (1.0 + ty * ty).sqrt();
+    if z + rad <= 0.0
+        || (x - z * tx) / nx > rad
+        || (-x - z * tx) / nx > rad
+        || (y - z * ty) / ny > rad
+        || (-y - z * ty) / ny > rad
+    {
+        return None;
+    }
+    let dist = dot(p, p).sqrt();
+    let proj_px = if dist <= rad {
+        f32::INFINITY
+    } else {
+        2.0 * rad * height as f32 / (2.0 * cam.tan_half_fov.max(1e-4) * z.max(1e-3))
+    };
+    if !selected && proj_px < min_px {
+        return None;
+    }
+    let len = axis_px * 2.0 * cam.tan_half_fov * zo / height.max(1) as f32;
+    let mut ends = [None; 3];
+    for (k, end) in ends.iter_mut().enumerate() {
+        let col = [m[k], m[4 + k], m[8 + k]];
+        let n = dot(col, col).sqrt();
+        if n > 1e-8 {
+            let s = len / n;
+            *end = Some([origin[0] + col[0] * s, origin[1] + col[1] * s, origin[2] + col[2] * s]);
+        }
+    }
+    Some(AxesEmit { origin, ends, proj_px })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ctx(projection: CameraProjection) -> OverlayCtx {
+    fn ctx(projection: CameraProjection) -> OverlayCtx<'static> {
         OverlayCtx {
             camera: CameraFrame {
                 eye: [0.0, 0.0, 0.0],
@@ -640,7 +779,7 @@ mod tests {
             width: 200,
             height: 100,
             filter: OverlayFilter::default(),
-            selected: None,
+            selected: &[],
             depth_available: true,
         }
     }
@@ -689,7 +828,7 @@ mod tests {
         c.filter.radius_m = 50.0;
         assert_eq!(l.flatten(&c).len(), 1);
         c.filter.scope = OverlayScope::Selected;
-        c.selected = Some(8);
+        c.selected = &[8];
         let segs = l.flatten(&c).to_vec();
         assert_eq!(segs.len(), 1);
         assert!(segs[0].a[2] > 400.0);
@@ -729,6 +868,7 @@ mod tests {
             ("NV_OVERLAY_CLASS_AXIS", SegmentClass::Axis as u32),
             ("NV_OVERLAY_CLASS_BONE", SegmentClass::Bone as u32),
             ("NV_OVERLAY_CLASS_PATH", SegmentClass::Path as u32),
+            ("NV_OVERLAY_CLASS_BOUNDS", SegmentClass::Bounds as u32),
             ("NV_OVERLAY_FLAG_WORLD", seg_flags::WORLD),
             ("NV_OVERLAY_FLAG_HIDDEN", seg_flags::HIDDEN),
             ("NV_OVERLAY_FLAG_DASHED", seg_flags::DASHED),
@@ -765,5 +905,108 @@ mod tests {
         assert_eq!(l.gpu_sources().len(), 1);
         assert_eq!(l.styles().len(), 2);
         assert!(l.styles()[0].width_px > l.styles()[1].width_px, "silhouettes are wider");
+    }
+
+    fn axes_cam() -> GpuOverlayCamera {
+        GpuOverlayCamera {
+            eye: [0.0, 0.0, 0.0],
+            tan_half_fov: 0.5,
+            fwd: [0.0, 0.0, 1.0],
+            aspect: 2.0,
+            right: [1.0, 0.0, 0.0],
+            pinhole: 1,
+            up: [0.0, 1.0, 0.0],
+            sel_count: 0,
+            radius: 0.0,
+            min_px: 2.0,
+            scope_selected: 0,
+            pad: 0.0,
+        }
+    }
+
+    /// Row-major 3x4 with uniform `scale` and translation `t`.
+    fn xf(scale: f32, t: [f32; 3]) -> [f32; 12] {
+        [scale, 0.0, 0.0, t[0], 0.0, scale, 0.0, t[1], 0.0, 0.0, scale, t[2]]
+    }
+
+    #[test]
+    fn axes_have_a_constant_screen_length_at_any_distance_and_scale() {
+        let cam = axes_cam();
+        let c = OverlayCtx {
+            camera: CameraFrame { eye: cam.eye, fwd: cam.fwd, right: cam.right, up: cam.up, tan_half_fov: cam.tan_half_fov },
+            ..ctx(CameraProjection::Pinhole)
+        };
+        let (w, h) = (c.width, c.height);
+        assert_eq!(cam.aspect, w as f32 / h as f32);
+        let unit = ([-1.0; 3], [1.0; 3]);
+        for (z, scale) in [(5.0, 1.0), (50.0, 1.0), (500.0, 3.0), (20.0, 0.1)] {
+            // `min_px = 0`: this test pins the length, not the size cull.
+            let e = axes_emit(&cam, h, &xf(scale, [0.3, -0.2, z]), unit, 40.0, 0.0, false).expect("in view");
+            let o = c.project(e.origin).expect("origin projects");
+            for (k, end) in e.ends.iter().enumerate() {
+                let p = c.project(end.expect("non-degenerate axis")).expect("end projects");
+                let px = (p[0] - o[0]).hypot(p[1] - o[1]);
+                // X and Y lie in a plane parallel to the image (exactly 40 px); Z points along
+                // the view axis and foreshortens, by design.
+                if k < 2 {
+                    assert!((px - 40.0).abs() < 1e-2, "z={z} scale={scale} axis {k}: {px} px");
+                } else {
+                    assert!(px < 40.0, "the view-axis Z arm is foreshortened: {px}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axes_cull_behind_outside_tiny_and_keep_the_selection() {
+        let cam = axes_cam();
+        let unit = ([-1.0; 3], [1.0; 3]);
+        let tiny = ([-0.001; 3], [0.001; 3]);
+        assert!(axes_emit(&cam, 100, &xf(1.0, [0.0, 0.0, -5.0]), unit, 40.0, 2.0, false).is_none(), "behind");
+        assert!(axes_emit(&cam, 100, &xf(1.0, [500.0, 0.0, 10.0]), unit, 40.0, 2.0, false).is_none(), "outside");
+        assert!(axes_emit(&cam, 100, &xf(1.0, [0.0, 0.0, 400.0]), tiny, 40.0, 2.0, false).is_none(), "sub-pixel");
+        let sel = axes_emit(&cam, 100, &xf(1.0, [0.0, 0.0, 400.0]), tiny, 40.0, 2.0, true).expect("selected stays");
+        assert!(sel.proj_px < 2.0);
+        // Bounds partly on screen (centre just outside the right plane) are kept.
+        let edge = axes_emit(&cam, 100, &xf(1.0, [10.6, 0.0, 10.0]), unit, 40.0, 2.0, false);
+        assert!(edge.is_some(), "a sphere overlapping the frustum is not culled");
+        // Inside the bounds: infinite projected size, never culled by size.
+        let inside = axes_emit(&cam, 100, &xf(10.0, [0.0, 0.0, 1.0]), unit, 40.0, 2.0, false).expect("inside");
+        assert!(inside.proj_px.is_infinite());
+        // A zero-scale axis is dropped, the others stay.
+        let mut m = xf(1.0, [0.0, 0.0, 10.0]);
+        m[0] = 0.0;
+        let e = axes_emit(&cam, 100, &m, unit, 40.0, 2.0, false).expect("in view");
+        assert!(e.ends[0].is_none() && e.ends[1].is_some());
+    }
+
+    #[test]
+    fn axes_provider_requests_the_gpu_source_only_when_enabled() {
+        let mut c = ctx(CameraProjection::Pinhole);
+        let mut l = OverlayList::default();
+        AxesProvider.emit(&c, &mut l);
+        assert!(l.gpu_sources().is_empty(), "axes are off by default");
+        c.filter.kinds |= OverlayKind::Axes.bit();
+        c.filter.axis_px = 1.0e4;
+        AxesProvider.emit(&c, &mut l);
+        match l.gpu_sources() {
+            [GpuSource::Axes { axis_px, .. }] => assert_eq!(*axis_px, *AXIS_PX_RANGE.end()),
+            other => panic!("expected one axes source, got {other:?}"),
+        }
+        assert_eq!(l.styles().len(), 4);
+    }
+
+    #[test]
+    fn axes_kernel_constants_match_csg_and_the_cpu_mirror() {
+        let tm = include_str!("../shaders/tonemap.cu");
+        for (name, v) in [
+            ("OVL_CSG_INST_VISIBLE", csg_scene::inst_flags::VISIBLE),
+            ("OVL_CSG_INST_CROWD_BONE", csg_scene::inst_flags::CROWD_BONE),
+            ("OVL_CSG_COMPOUND_UNBOUNDED", csg_core::abi::compound_flags::UNBOUNDED),
+            ("OVL_MAX_SELECTED", MAX_SELECTED as u32),
+        ] {
+            assert!(tm.contains(&format!("#define {name} {v}u")), "{name} != {v}");
+        }
+        assert!(tm.contains(&format!("#define OVL_AXES_NEAR {AXES_NEAR_M:.2}f")));
     }
 }

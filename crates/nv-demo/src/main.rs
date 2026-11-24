@@ -6436,6 +6436,7 @@ mod ui_pacing_tests {
             default_wetness: 0.0,
             supports_traffic: false,
             variant_labels: variants,
+            geo_origin: None,
         };
         let old = [d("gundo", &[]), d("inspector", &["Robotaxi", "Bridge"])];
         let saved = demo_app::saved_scene_of(&old, 2, 1).expect("scene ref");

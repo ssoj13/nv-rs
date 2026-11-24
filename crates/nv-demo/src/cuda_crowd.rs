@@ -1894,7 +1894,9 @@ mod tests {
 
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("gundo_osm").expect("gundo_osm registered");
-        let mut gpu_scene = module.build(&csg_scene::SceneBuildConfig::default());
+        let mut gpu_scene = module
+            .build(&csg_scene::SceneBuildConfig::default())
+            .expect("scene builds");
         assert!(
             gpu_scene.crowd.actor_count() > 0,
             "gundo_osm must spawn a crowd for this test to compare anything"

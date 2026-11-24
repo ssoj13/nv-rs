@@ -16,8 +16,8 @@ use optix::{
     DeviceContext, GeometryFlags, Guides, HitGroup, Image, Instance, InstanceBuffer, Layer,
     LinkOptions, MicromapCount, MicromapDesc, MicromapFormat, MicromapIndices, MicromapOptions,
     MicromapUse, Module, ModuleOptions, OpacityMicromapArray, Params as DenoiserParams, Pipeline,
-    PipelineOptions, ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, TriangleMesh,
-    micro_to_base_bary,
+    PipelineOptions, ProgramGroup, SbtRecord, Scratch, ShaderBindingTable, StackSizes,
+    TriangleMesh, micro_to_base_bary,
 };
 
 use crate::app_events::{
@@ -1426,7 +1426,8 @@ fn cu_module_function(module: cu::CUmodule, name: &CStr) -> Result<cu::CUfunctio
     Ok(func)
 }
 
-/// Include directories and extra PTX cache-key blobs (OptiX header-set digest, `csg_eval.cuh` bytes)
+/// Include directories and extra PTX cache-key blobs (OptiX header-set digest, the CSG evaluator
+/// text `csg_device::CSG_EVAL_CUH`, which csg-rs names as the cache key of its device source)
 /// for compiling `raytracer.cu`.
 fn raytracer_ptx_inputs() -> Result<(Vec<String>, Vec<Vec<u8>>), String> {
     let optix = optix_headers()?;
@@ -1435,11 +1436,14 @@ fn raytracer_ptx_inputs() -> Result<(Vec<String>, Vec<Vec<u8>>), String> {
     if let Some(p) = find_cuda_include() {
         include_dirs.push(p);
     }
-    let csg_dir = csg_device::csg_eval_cuh_dir();
-    let csg_eval = std::fs::read(std::path::Path::new(csg_dir).join("csg_eval.cuh"))
-        .map_err(|e| format!("read csg_eval.cuh in {csg_dir}: {e}"))?;
-    include_dirs.push(csg_dir.to_string());
-    Ok((include_dirs, vec![optix.digest.to_vec(), csg_eval]))
+    include_dirs.push(csg_device::csg_eval_cuh_dir().to_string());
+    Ok((
+        include_dirs,
+        vec![
+            optix.digest.to_vec(),
+            csg_device::CSG_EVAL_CUH.as_bytes().to_vec(),
+        ],
+    ))
 }
 
 /// Compiles `raytracer.cu` source `src` through the PTX cache and builds the OptiX pipeline from
@@ -1549,13 +1553,46 @@ fn compile_optix_module_parallel(
 }
 
 /// Render, probe and SDG pipelines of one compiled `raytracer.cu`: `(pipeline, render SBT,
-/// probe SBT, SDG SBT)`.
+/// probe SBT, SDG SBT, per-kind stack needs the pipeline stack was sized from)`.
 type OptixPipelineSet = (
     Pipeline,
     ShaderBindingTable,
     ShaderBindingTable,
     ShaderBindingTable,
+    StackSizes,
 );
+
+/// `optixTrace` recursion of `raytracer.cu`: only raygen programs trace (bounces and shadow rays
+/// are loops in raygen), so hit programs never nest a trace.
+const PIPELINE_MAX_TRACE_DEPTH: u32 = 1;
+
+/// Traversable graph depth: one IAS over GASes (`single_level_instancing`).
+const PIPELINE_MAX_GRAPH_DEPTH: u32 = 2;
+
+/// Sizes the pipeline stack from the linked programs' own needs (`optixUtilComputeStackSizes`
+/// with [`PIPELINE_MAX_TRACE_DEPTH`], no callables): continuation stack
+/// `css_rg + max(css_ch, css_ms, css_is + css_ah)` of the programs actually linked. The CSG
+/// evaluator's span stack (`csg_eval.cuh` caps `CSG_MAX_SPANS` / `CSG_MAX_STACK`) is not part
+/// of it: it is per-thread local memory of the evaluator functions (`__local_depot`), which the
+/// driver sizes from the module, so a cap change needs no stack constant here.
+fn size_pipeline_stack(
+    pipeline: &Pipeline,
+    groups: &[Arc<ProgramGroup>],
+) -> Result<StackSizes, String> {
+    let mut needs = StackSizes::default();
+    for group in groups {
+        needs
+            .accumulate(group, Some(pipeline))
+            .map_err(|e| format!("optixProgramGroupGetStackSize: {e}"))?;
+    }
+    let stack = needs
+        .compute(PIPELINE_MAX_TRACE_DEPTH, 0, 0)
+        .map_err(|e| format!("pipeline stack size: {e}"))?;
+    pipeline
+        .set_stack(stack, PIPELINE_MAX_GRAPH_DEPTH)
+        .map_err(|e| format!("optixPipelineSetStackSize: {e}"))?;
+    Ok(needs)
+}
 
 fn build_optix_pipeline(
     optix_ctx: &Arc<DeviceContext>,
@@ -1691,31 +1728,37 @@ fn build_optix_pipeline(
     )
     .map_err(|e| format!("hit_csg_prim_shadow: {e}"))?;
 
+    let groups = [
+        raygen.clone(),
+        raygen_probe.clone(),
+        raygen_sdg.clone(),
+        miss.clone(),
+        miss_shadow.clone(),
+        hit_floor.clone(),
+        hit_floor_shadow.clone(),
+        hit_fractal.clone(),
+        hit_fractal_shadow.clone(),
+        hit_sphere.clone(),
+        hit_sphere_shadow.clone(),
+        hit_omm.clone(),
+        hit_omm_shadow.clone(),
+        hit_csg.clone(),
+        hit_csg_shadow.clone(),
+        hit_csg_prim.clone(),
+        hit_csg_prim_shadow.clone(),
+    ];
     let (pipeline, _) = Pipeline::new(
         optix_ctx,
         &opts,
-        LinkOptions::default(),
-        &[
-            raygen.clone(),
-            raygen_probe.clone(),
-            raygen_sdg.clone(),
-            miss.clone(),
-            miss_shadow.clone(),
-            hit_floor.clone(),
-            hit_floor_shadow.clone(),
-            hit_fractal.clone(),
-            hit_fractal_shadow.clone(),
-            hit_sphere.clone(),
-            hit_sphere_shadow.clone(),
-            hit_omm.clone(),
-            hit_omm_shadow.clone(),
-            hit_csg.clone(),
-            hit_csg_shadow.clone(),
-            hit_csg_prim.clone(),
-            hit_csg_prim_shadow.clone(),
-        ],
+        LinkOptions {
+            max_trace_depth: PIPELINE_MAX_TRACE_DEPTH,
+            max_graph_depth: PIPELINE_MAX_GRAPH_DEPTH,
+            ..LinkOptions::default()
+        },
+        &groups,
     )
     .map_err(|e| format!("Pipeline::new: {e}"))?;
+    let stack_needs = size_pipeline_stack(&pipeline, &groups)?;
 
     let miss_recs = [
         SbtRecord::new(&miss, 0u32).map_err(|e| format!("sbt miss0: {e}"))?,
@@ -1757,7 +1800,7 @@ fn build_optix_pipeline(
     )
     .map_err(|e| format!("sdg SBT::new: {e}"))?;
 
-    Ok((pipeline, sbt, probe_sbt, sdg_sbt))
+    Ok((pipeline, sbt, probe_sbt, sdg_sbt, stack_needs))
 }
 
 /// Creates the OptiX AI denoiser and returns `(denoiser, is_temporal, downgrade_reason)`.
@@ -2579,7 +2622,7 @@ fn init_optix(
     tonemap.scrgb_func = cu_module_function(tonemap.module, c"tonemap_f32_to_scrgb_f16")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
-    let (pipeline, sbt, probe_sbt, sdg_sbt) = initial_pipeline(&optix_ctx, &stream)
+    let (pipeline, sbt, probe_sbt, sdg_sbt, _stack_needs) = initial_pipeline(&optix_ctx, &stream)
         .map_err(|e| format!("OptiX pipeline: {e}"))?;
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
@@ -4357,7 +4400,7 @@ pub fn spawn_render_thread(
                                     )
                                 });
                             match res {
-                                Ok((pipeline, sbt, probe_sbt, sdg_sbt)) => {
+                                Ok((pipeline, sbt, probe_sbt, sdg_sbt, _stack_needs)) => {
                                     if let Err(sync_err) = rig.stream.synchronize() {
                                         bus.emit_render_event(RenderEvent::StatusMessage(format!(
                                             "Hot-reload stream sync failed: {sync_err}"
@@ -6007,6 +6050,36 @@ mod tests {
         assert!(opts.allow_update, "persistent IAS requires allow_update = true");
         assert!(!opts.compact, "Accel::instances_into requires compact = false");
         assert!(opts.prefer_fast_trace);
+    }
+
+    /// The pipeline stack is sized from the linked programs' reported needs by the
+    /// `optixUtilComputeStackSizes` formula, with no direct-callable stack.
+    #[test]
+    #[ignore = "GPU"]
+    fn pipeline_stack_follows_the_linked_programs() {
+        let cuda = CudaContext::new(0).expect("CUDA context on device 0");
+        cuda.bind_to_thread().expect("bind CUDA context");
+        let stream = cuda.default_stream();
+        let optix_ctx = DeviceContext::new(&cuda, None, 0, false).expect("OptiX context");
+        let (_pipeline, _sbt, _probe_sbt, _sdg_sbt, needs) =
+            initial_pipeline(&optix_ctx, &stream).expect("raytracer pipeline");
+        let stack = needs
+            .compute(PIPELINE_MAX_TRACE_DEPTH, 0, 0)
+            .expect("stack sizes");
+        eprintln!(
+            "raytracer.cu stack needs: {needs:?}; continuation {} B, direct {} / {} B",
+            stack.continuation, stack.direct_from_traversal, stack.direct_from_state
+        );
+        assert!(needs.css_rg > 0, "raygen keeps state across optixTrace: {needs:?}");
+        assert_eq!(
+            stack.continuation,
+            needs.css_rg
+                + needs
+                    .css_ch
+                    .max(needs.css_ms)
+                    .max(needs.css_is + needs.css_ah)
+        );
+        assert_eq!((stack.direct_from_traversal, stack.direct_from_state), (0, 0));
     }
 
     #[test]

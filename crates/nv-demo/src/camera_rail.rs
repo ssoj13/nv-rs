@@ -944,7 +944,7 @@ mod tests {
 
         for scene_id in ["gundo", "marina", "sf_house_of_ai", "inspector"] {
             let module = reg.get(scene_id).expect("scene registered");
-            let built = module.build(&SceneBuildConfig::default());
+            let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
             rail.selected_rail_id.clear();
             rail.set_scene_rails(built.rails);
             assert!(
@@ -1028,7 +1028,12 @@ mod tests {
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("gundo").expect("scene registered");
         let mut rail = CameraRail::default();
-        rail.set_scene_rails(module.build(&SceneBuildConfig::default()).rails);
+        rail.set_scene_rails(
+            module
+                .build(&SceneBuildConfig::default())
+                .expect("scene builds")
+                .rails,
+        );
         assert!(!rail.scene_rails().is_empty());
 
         let saved = rail.clone();

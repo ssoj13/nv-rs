@@ -132,6 +132,10 @@ impl CompoundGasPlan {
 /// bounded finite primitive AABBs) build an `M`-AABB custom-primitive GAS with
 /// `primitive_offset = first_prim` so hardware RT Cores traverse the compound's internal BVH
 /// and invoke `__intersection__csg_prim[_shadow]` with `optixGetPrimitiveIndex() == prim_idx`.
+/// Only `PURE_UNION` (pairwise separated parts) qualifies: a union whose parts overlap or touch
+/// carries `FIRST_HIT_UNION` instead, and the per-primitive closest hit would report internal
+/// faces for rays starting inside a part, so it stays on general RPN where `csg_eval.cuh` picks
+/// the first-hit or exact span path per ray.
 fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPlan {
     let op_start = comp.op_offset as usize;
     let op_end = op_start.saturating_add(comp.op_count as usize);
@@ -2394,7 +2398,9 @@ impl CsgGpuHost {
                 cached.set_crowd_frozen(false);
                 cached
             }
-            None => module.build(&build_cfg),
+            None => module.build(&build_cfg).map_err(|e| {
+                format!("CSG scene '{}' failed to build: {e}", module.descriptor().name)
+            })?,
         };
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
@@ -2537,10 +2543,10 @@ mod tests {
     fn scene_registry_exposes_all_scenes_and_variants() {
         let descs = default_scene_descriptors();
         let ids: Vec<&str> = descs.iter().map(|d| d.id).collect();
-        assert_eq!(
-            ids,
-            vec!["gundo", "gundo_osm", "marina", "sf_house_of_ai", "inspector"]
-        );
+        // The scenes nv-demo relies on must be present; csg-rs may register more.
+        for id in ["gundo", "gundo_osm", "marina", "sf_house_of_ai", "inspector"] {
+            assert!(ids.contains(&id), "{id} missing from {ids:?}");
+        }
         let inspector = descs.iter().find(|d| d.id == "inspector").expect("inspector");
         assert!(inspector.variant_labels.len() >= 45);
     }
@@ -2586,7 +2592,7 @@ mod tests {
         let reg = csg_scenes::default_scene_registry();
         for scene_id in ["gundo", "gundo_osm", "marina", "sf_house_of_ai"] {
             let module = reg.get(scene_id).expect("scene registered");
-            let mut built = module.build(&SceneBuildConfig::default());
+            let mut built = module.build(&SceneBuildConfig::default()).expect("scene builds");
             assert!(
                 built.world.total_instance_count() >= 100,
                 "{scene_id}: expected rich instance count"
@@ -2662,7 +2668,7 @@ mod tests {
     fn dynamic_prefix_packer_drops_lod_history_when_lod_is_disabled() {
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("gundo_osm").expect("gundo_osm registered");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = built.viewpoints[0].clone();
         let fwd = (vp.target - vp.eye).norm();
         let view = CameraView::perspective(
@@ -2702,7 +2708,7 @@ mod tests {
             .registry
             .get_by_index(gundo_idx)
             .expect("gundo module");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = built.viewpoints[0].clone();
         let fwd = (vp.target - vp.eye).norm();
         let key = CsgSceneKey {
@@ -2746,7 +2752,7 @@ mod tests {
     fn perspective_frustum_culling_prunes_offscreen_city_micro_instances() {
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("sf_house_of_ai").expect("sf_house_of_ai");
-        let mut built = module.build(&SceneBuildConfig::default());
+        let mut built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = &built.viewpoints[0];
         let fwd = (vp.target - vp.eye).norm();
         let cam_persp = CameraView::perspective(
@@ -2791,7 +2797,7 @@ mod tests {
             variant_idx: 109, // 4-archetype actor crowd showcase
             ..SceneBuildConfig::default()
         };
-        let mut built = module.build(&cfg);
+        let mut built = module.build(&cfg).expect("scene builds");
         assert_eq!(built.crowd.actor_count(), 4, "4-archetype showcase has 4 actors");
         built.reset_crowd_motion_history();
         let vp = built.viewpoints[0].clone();
@@ -2936,10 +2942,10 @@ mod tests {
             .registry
             .get_by_index(osm_idx)
             .expect("gundo_osm module");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         assert!(
-            built.traffic.actors.is_empty() && built.traffic.soa_vehicle_count() > 0,
-            "gundo_osm must exercise TrafficStateSoA (actors empty, soa_vehicle_count > 0)"
+            built.traffic.vehicle_count() > 0,
+            "gundo_osm must exercise the SoA city traffic (vehicle_count > 0)"
         );
         let vp = built.viewpoints[0].clone();
         let cam_eye = [vp.eye.x, vp.eye.y, vp.eye.z];
@@ -2998,7 +3004,8 @@ mod tests {
         let built = module.build(&SceneBuildConfig {
             road_mode: csg_scene::RoadMode::FRepTile,
             ..SceneBuildConfig::default()
-        });
+        })
+        .expect("scene builds");
         let vp = built.viewpoints[0].clone();
         host.scene_key = CsgSceneKey {
             scene_idx: (osm_idx + 1) as u32,
@@ -3104,7 +3111,8 @@ mod tests {
         let built = module.build(&SceneBuildConfig {
             variant_idx: 109,
             ..SceneBuildConfig::default()
-        });
+        })
+        .expect("scene builds");
         assert_eq!(built.crowd.actor_count(), 4);
         let initial_compounds = built.world.library.compounds.len();
 
@@ -3203,37 +3211,59 @@ mod tests {
             CompoundGasPlan::SinglePrim { .. }
         ));
 
-        let union_node = csg_core::CsgNode::box3(
-            [1.0, 1.0, 1.0],
-            csg_core::MaterialId(1),
-            csg_core::semantic::BUILDING,
-        )
-        .union(
-            csg_core::CsgNode::sphere(
-                0.75,
-                csg_core::MaterialId(2),
+        // Box + sphere + cylinder at lateral offset `dx`: separated parts for `dx = 5`
+        // (`PURE_UNION`), overlapping parts for `dx = 0.5` (`FIRST_HIT_UNION`).
+        let three_parts = |dx: f32| {
+            csg_core::CsgNode::box3(
+                [1.0, 1.0, 1.0],
+                csg_core::MaterialId(1),
                 csg_core::semantic::BUILDING,
             )
-            .translated(0.5, 0.0, 0.0),
-        )
-        .union(
-            csg_core::CsgNode::cylinder(
-                0.4,
-                1.2,
-                csg_core::MaterialId(3),
-                csg_core::semantic::BUILDING,
+            .union(
+                csg_core::CsgNode::sphere(
+                    0.75,
+                    csg_core::MaterialId(2),
+                    csg_core::semantic::BUILDING,
+                )
+                .translated(dx, 0.0, 0.0),
             )
-            .translated(-0.5, 0.2, 0.0),
-        );
+            .union(
+                csg_core::CsgNode::cylinder(
+                    0.4,
+                    1.2,
+                    csg_core::MaterialId(3),
+                    csg_core::semantic::BUILDING,
+                )
+                .translated(-dx, 0.2, 0.0),
+            )
+        };
         let union_id = lib
-            .compile_single(&union_node, csg_core::OptimizeConfig::default(), 0)
+            .compile_single(&three_parts(5.0), csg_core::OptimizeConfig::default(), 0)
             .expect("pure union");
+        let union_flags = lib.compounds[union_id.0 as usize].flags;
+        assert_ne!(union_flags & compound_flags::PURE_UNION, 0, "flags {union_flags:#x}");
         let plan = compound_gas_plan(&lib, &lib.compounds[union_id.0 as usize]);
         assert!(
             matches!(plan, CompoundGasPlan::MultiAabbUnion { count: 3, .. }),
             "expected MultiAabbUnion with 3 prims, got {plan:?}"
         );
         assert_eq!(plan.sbt_offset(), CSG_SBT_PRIM_OFFSET);
+
+        // Overlapping parts: first hit over parts is wrong for rays starting inside a part, so
+        // the compound must stay on the exact RPN path, never on the multi-AABB GAS.
+        let overlap_id = lib
+            .compile_single(&three_parts(0.5), csg_core::OptimizeConfig::default(), 0)
+            .expect("overlapping union");
+        let overlap_flags = lib.compounds[overlap_id.0 as usize].flags;
+        assert_ne!(
+            overlap_flags & compound_flags::FIRST_HIT_UNION,
+            0,
+            "flags {overlap_flags:#x}"
+        );
+        assert_eq!(overlap_flags & compound_flags::PURE_UNION, 0, "flags {overlap_flags:#x}");
+        let overlap_plan = compound_gas_plan(&lib, &lib.compounds[overlap_id.0 as usize]);
+        assert_eq!(overlap_plan, CompoundGasPlan::GeneralRpn);
+        assert_eq!(overlap_plan.sbt_offset(), CSG_SBT_OFFSET);
 
         let sub_node = single_node.subtract(
             csg_core::CsgNode::sphere(0.5, csg_core::MaterialId(2), csg_core::semantic::WINDOW)
@@ -3260,7 +3290,7 @@ mod tests {
             .registry
             .get_by_index(osm_idx)
             .expect("gundo_osm module");
-        let mut built = module.build(&SceneBuildConfig::default());
+        let mut built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = built.viewpoints[0].clone();
         let fwd = (vp.target - vp.eye).norm();
         let view = CameraView::perspective(
@@ -3350,7 +3380,7 @@ mod tests {
             .registry
             .get_by_index(gundo_idx)
             .expect("gundo module");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = built.viewpoints[0].clone();
         let fwd = (vp.target - vp.eye).norm();
 
@@ -3474,7 +3504,8 @@ mod tests {
         let built = module.build(&SceneBuildConfig {
             variant_idx: 109,
             ..SceneBuildConfig::default()
-        });
+        })
+        .expect("scene builds");
         host.scene_key = CsgSceneKey {
             scene_idx: (insp_idx + 1) as u32,
             variant_idx: 109,
@@ -3524,7 +3555,7 @@ mod tests {
             .registry
             .get_by_index(gundo_idx)
             .expect("gundo module");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         host.scene_key = CsgSceneKey {
             scene_idx: (gundo_idx + 1) as u32,
             variant_idx: 0,
@@ -3564,7 +3595,7 @@ mod tests {
             .registry
             .get_by_index(gundo_idx)
             .expect("gundo module");
-        let built = module.build(&SceneBuildConfig::default());
+        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
         let vp = built.viewpoints[0].clone();
         let fwd = (vp.target - vp.eye).norm();
 

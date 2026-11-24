@@ -83,18 +83,14 @@ const WGS84_F: f64 = 1.0 / 298.257_223_563;
 /// WGS84 first eccentricity squared (`f * (2 - f)`).
 const WGS84_E2: f64 = WGS84_F * (2.0 - WGS84_F);
 
-/// Returns the WGS84 geodetic origin `(lat_deg, lon_deg)` for real-world OSM scenes.
-///
-/// Matches the verified `osm_rs` origins (`GUNDO_EL_SEGUNDO_ORIGIN`, `MARINA_CITY_DR_ORIGIN`,
-/// `SF_HOUSE_OF_AI_ORIGIN`). Returns `None` for non-georeferenced scenes (`classic`, procedural
-/// `gundo`, `inspector`).
-pub fn scene_wgs84_origin(scene_id: &str) -> Option<(f64, f64)> {
-    match scene_id {
-        "gundo_osm" => Some((33.9138, -118.4190)),
-        "marina" => Some((33.9846, -118.4534)),
-        "sf_house_of_ai" => Some((37.7750, -122.4032)),
-        _ => None,
-    }
+/// WGS84 anchor of the scene selected by `csg_mode` (`0` = classic, `n` = `descs[n - 1]`), read
+/// from the scene's own [`SceneDescriptor::geo_origin`]. `None` for the classic stage and for
+/// synthetic scenes, which then show no coordinates.
+fn active_geo_origin(descs: &[SceneDescriptor], csg_mode: u32) -> Option<csg_scene::GeoAnchor> {
+    csg_mode
+        .checked_sub(1)
+        .and_then(|i| descs.get(i as usize))
+        .and_then(|d| d.geo_origin)
 }
 
 /// `Inspector` variant index of the 4-archetype crowd showcase.
@@ -1400,15 +1396,9 @@ impl UiContext<'_> {
         ui.painter().galley(hud_pos, galley, Color32::WHITE);
 
         // Clickable Apple Maps / WGS84 coordinate readout in bottom Viewport status bar
-        let active_scene_id = self
-            .settings
-            .csg_mode
-            .checked_sub(1)
-            .and_then(|idx| self.scene_descriptors.get(idx as usize))
-            .map(|d| d.id);
-        if let Some((origin_lat, origin_lon)) = active_scene_id.and_then(scene_wgs84_origin) {
+        if let Some(origin) = active_geo_origin(self.scene_descriptors, self.settings.csg_mode) {
             let (lat, lon, alt_m) =
-                world_to_wgs84(origin_lat, origin_lon, self.cam_pose.eye.to_array());
+                world_to_wgs84(origin.lat_deg, origin.lon_deg, self.cam_pose.eye.to_array());
             let copy_id = ui.id().with("wgs84-hud-copied-at");
             let now_s = ui.input(|i| i.time);
             let copied_recently = ui
@@ -4713,15 +4703,30 @@ mod tests {
     }
 
     #[test]
-    fn scene_wgs84_origin_maps_osm_scenes_and_skips_non_geo() {
-        assert_eq!(scene_wgs84_origin("gundo_osm"), Some((33.9138, -118.4190)));
-        assert_eq!(scene_wgs84_origin("marina"), Some((33.9846, -118.4534)));
+    fn geo_origin_comes_from_the_selected_scene_descriptor_only() {
+        let reg = csg_scenes::default_scene_registry();
+        let descs: Vec<SceneDescriptor> = (0..reg.len())
+            .map(|i| reg.get_by_index(i).expect("registered scene").descriptor())
+            .collect();
+        assert_eq!(active_geo_origin(&descs, 0), None, "classic stage");
         assert_eq!(
-            scene_wgs84_origin("sf_house_of_ai"),
-            Some((37.7750, -122.4032))
+            active_geo_origin(&descs, descs.len() as u32 + 1),
+            None,
+            "out of range"
         );
-        assert_eq!(scene_wgs84_origin("gundo"), None);
-        assert_eq!(scene_wgs84_origin("inspector"), None);
+        for (i, d) in descs.iter().enumerate() {
+            assert_eq!(active_geo_origin(&descs, i as u32 + 1), d.geo_origin, "{}", d.id);
+        }
+        let by_id = |id: &str| {
+            let i = descs.iter().position(|d| d.id == id).expect("scene id");
+            active_geo_origin(&descs, i as u32 + 1)
+        };
+        for id in ["gundo_osm", "marina", "sf_house_of_ai"] {
+            assert!(by_id(id).is_some(), "{id} is a real-world scene");
+        }
+        for id in ["gundo", "inspector"] {
+            assert_eq!(by_id(id), None, "{id} is synthetic: no invented coordinates");
+        }
     }
 
     #[test]

@@ -2,10 +2,14 @@
 //!
 //! Compiles both `.cu` sources to `$OUT_DIR/*.ptx` via `nvcc` when CUDA + OptiX headers are
 //! available so `nv-demo` binaries start without runtime NVRTC or `<optix.h>` on target machines.
+//! The OptiX SDK is chosen by `src/optix_sdk.rs`, the same module the runtime NVRTC path uses.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "src/optix_sdk.rs"]
+mod optix_sdk;
 
 /// `nvcc` from `CUDA_PATH` / `CUDA_HOME` / `CUDA_ROOT`, else from `PATH`; `None` when absent.
 fn find_nvcc() -> Option<PathBuf> {
@@ -22,46 +26,6 @@ fn find_nvcc() -> Option<PathBuf> {
     env::split_paths(&path)
         .map(|dir| dir.join(exe))
         .find(|p| p.is_file())
-}
-
-/// `OPTIX_VERSION` (e.g. `90000`) declared by `<include>/optix.h`, if readable.
-fn optix_header_version(include: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string(include.join("optix.h")).ok()?;
-    text.lines().find_map(|line| {
-        let rest = line.trim().strip_prefix("#define")?.trim_start();
-        let value = rest.strip_prefix("OPTIX_VERSION")?;
-        // Reject longer macro names that merely start with `OPTIX_VERSION`.
-        if !value.starts_with(char::is_whitespace) {
-            return None;
-        }
-        value.trim().parse().ok()
-    })
-}
-
-/// OptiX include directory: `OPTIX_ROOT` when it holds `optix.h` (explicit choice wins), else the
-/// `ProgramData/NVIDIA Corporation/OptiX SDK*` install with the highest `OPTIX_VERSION`.
-/// `raytracer.cu` needs the OptiX 8+/9 device API (`optixTraverse`, `optixReorder`), so directory
-/// order (oldest SDK first on NTFS) must not decide.
-fn find_optix_include() -> Option<PathBuf> {
-    if let Ok(root) = env::var("OPTIX_ROOT") {
-        let inc = PathBuf::from(root).join("include");
-        if inc.join("optix.h").is_file() {
-            return Some(inc);
-        }
-        println!(
-            "cargo:warning=OPTIX_ROOT is set but {} has no optix.h; searching installed SDKs",
-            inc.display()
-        );
-    }
-    let base = PathBuf::from(env::var_os("ProgramData")?).join("NVIDIA Corporation");
-    std::fs::read_dir(&base)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("OptiX SDK"))
-        .map(|entry| entry.path().join("include"))
-        .filter_map(|inc| optix_header_version(&inc).map(|ver| (ver, inc)))
-        .max_by_key(|(ver, _)| *ver)
-        .map(|(_, inc)| inc)
 }
 
 fn compile_ptx(
@@ -210,7 +174,9 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(has_embedded_ptx)");
     println!("cargo:rerun-if-changed=shaders/raytracer.cu");
     println!("cargo:rerun-if-changed=shaders/tonemap.cu");
+    println!("cargo:rerun-if-changed=src/optix_sdk.rs");
     println!("cargo:rerun-if-env-changed=OPTIX_ROOT");
+    println!("cargo:rerun-if-env-changed=ProgramData");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     let csg_inc = PathBuf::from(csg_device::csg_eval_cuh_dir());
@@ -226,12 +192,21 @@ fn main() {
         println!("cargo:warning=nvcc not found; nv-demo shaders will be compiled at runtime by NVRTC");
         return;
     };
-    let Some(optix_inc) = find_optix_include() else {
-        println!(
-            "cargo:warning=OptiX SDK headers not found (set OPTIX_ROOT); nv-demo shaders will be compiled at runtime by NVRTC"
-        );
-        return;
+    let optix_inc = match optix_sdk::include_dir() {
+        Ok(inc) => inc,
+        Err(err) => {
+            println!(
+                "cargo:warning={err}; nv-demo shaders will be compiled at runtime by NVRTC"
+            );
+            return;
+        }
     };
+
+    // An in-place SDK update (same folder, new headers) must rebuild the embedded PTX.
+    println!(
+        "cargo:rerun-if-changed={}",
+        optix_inc.join("optix.h").display()
+    );
 
     let rt_out = out_dir.join("raytracer.ptx");
     let tm_out = out_dir.join("tonemap.ptx");

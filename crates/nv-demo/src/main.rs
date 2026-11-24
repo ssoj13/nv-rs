@@ -12,6 +12,8 @@ mod fft_bloom;
 mod gpu_export;
 mod mp4_muxer;
 mod nvtx;
+mod optix_sdk;
+mod perf_log;
 mod persist;
 mod profiler;
 mod renderer;
@@ -41,8 +43,9 @@ mod demo_app {
     };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
-        CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DemoSettings, DlssRrBufferPtrs,
-        align_render_size, camera_projection_ray, spawn_render_thread,
+        CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DLSS_QUALITY_MODES, DemoSettings,
+        DlssRrBufferPtrs, align_render_size, camera_projection_ray, dlss_quality_index,
+        spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiScratch, UiTheme, default_dock_state, install_fonts};
     use appbus::downcast_event;
@@ -57,18 +60,6 @@ mod demo_app {
         InteropContext, SharedBuffer, SharedBufferDescriptor, SharedTexture,
         SharedTextureDescriptor, VkImageTransition, vk_image_view_raw,
     };
-
-    fn dlss_quality_from_ui(q: u32) -> ngx::DlssPerfQuality {
-        match q {
-            0 => ngx::DlssPerfQuality::UltraPerformance,
-            1 => ngx::DlssPerfQuality::MaxPerf,
-            2 => ngx::DlssPerfQuality::Balanced,
-            3 => ngx::DlssPerfQuality::MaxQuality,
-            5 => ngx::DlssPerfQuality::Dlaa,
-            // `UltraQuality` (4) is deprecated/unsupported in DLSS 3.x+ runtime.
-            _ => ngx::DlssPerfQuality::MaxQuality,
-        }
-    }
 
     struct DlssPass {
         feature: ngx::FeatureHandle,
@@ -150,7 +141,7 @@ mod demo_app {
                 .wgpu_texture()
                 .create_view(&wgpu::TextureViewDescriptor::default());
 
-            let ngx_q = dlss_quality_from_ui(quality);
+            let ngx_q = DLSS_QUALITY_MODES[dlss_quality_index(quality)].ngx;
             let flags = ngx::DlssFeatureFlags::MV_LOW_RES | ngx::DlssFeatureFlags::DO_SHARPENING;
             let mut create_res: Option<Result<ngx::FeatureHandle, ngx::Error>> = None;
             interop
@@ -803,7 +794,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 render_height: render_h,
                 out_width: out_w,
                 out_height: out_h,
-                quality: dlss_quality_from_ui(quality),
+                quality: DLSS_QUALITY_MODES[dlss_quality_index(quality)].ngx,
                 flags: ngx::DlssFeatureFlags::IS_HDR | ngx::DlssFeatureFlags::MV_LOW_RES,
                 roughness_mode: ngx::DlssRoughnessMode::Packed,
                 depth_type: ngx::DlssDepthType::Linear,
@@ -1118,8 +1109,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             })
     }
 
-    /// Returns `true` when the Full-Window offscreen capture + `device.poll(WaitIndefinitely)`
-    /// should execute on the current UI frame (skips idle video frames when `frames_received == 0`).
+    /// Returns `true` when the Full-Window offscreen capture + its bounded `device.poll`
+    /// ([`GPU_COPY_WAIT_TIMEOUT`]) should execute on the current UI frame (skips idle video frames when `frames_received == 0`).
     pub(crate) fn should_capture_full_window(
         recording_full_win: bool,
         frames_received: u32,
@@ -3263,7 +3254,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 0
             };
             let shutter_subframes = if fixed_fps > 0 {
-                self.settings.record_shutter_subframes.clamp(1, 4)
+                self.settings.shutter_subframes()
             } else {
                 1
             };
@@ -3855,7 +3846,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let opt_res = match self.cached_dlss_opt {
                         Some((k, opt)) if k == key => Ok(opt),
                         _ => {
-                            let q = dlss_quality_from_ui(self.settings.dlss_quality);
+                            let q = DLSS_QUALITY_MODES[dlss_quality_index(self.settings.dlss_quality)].ngx;
                             let res = if is_rr {
                                 ngx.query_dlss_rr_optimal_settings(out_w, out_h, q)
                             } else {
@@ -4637,9 +4628,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.
             // In Smooth 60 FPS recording mode, step everything by exact `(1/60s) * time_scale` per
             // encoded frame (and across N 180-degree shutter subframes when enabled).
-            let time_scale = self.settings.time_scale.clamp(0.05, 2.0);
+            let time_scale = self.settings.clamped_time_scale();
             let shutter_n = if self.is_recording && self.settings.record_fixed_fps {
-                self.settings.record_shutter_subframes.clamp(1, 4)
+                self.settings.shutter_subframes()
             } else {
                 1
             };
@@ -5976,16 +5967,63 @@ impl ApplicationHandler for Runner {
     }
 }
 
-fn main() {
+/// One stderr line per native teardown failure recorded by `Drop` impls (`cuda_core_ext::teardown`)
+/// plus one line for failures that overflowed the sink.
+fn teardown_report(drained: &cuda_core_ext::teardown::Drained) -> Vec<String> {
+    let mut lines: Vec<String> = drained.errors.iter().map(|e| format!("nv-demo: {e}")).collect();
+    if drained.lost > 0 {
+        lines.push(format!(
+            "nv-demo: {} further teardown failure(s) were dropped (sink full)",
+            drained.lost
+        ));
+    }
+    lines
+}
+
+fn main() -> std::process::ExitCode {
     nvtx::name_current_thread(c"nv-demo-main");
-    let event_loop = EventLoop::new().expect("event loop");
-    let mut runner = Runner::default();
-    event_loop.run_app(&mut runner).expect("run app");
+    let result = EventLoop::new()
+        .map_err(|e| format!("event loop creation failed: {e}"))
+        .and_then(|event_loop| {
+            let mut runner = Runner::default();
+            event_loop
+                .run_app(&mut runner)
+                .map_err(|e| format!("event loop failed: {e}"))
+            // `runner` (and with it the app and every native handle) drops here, before the report.
+        });
+    for line in teardown_report(&cuda_core_ext::teardown::take(None)) {
+        eprintln!("{line}");
+    }
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("nv-demo: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
 mod ui_pacing_tests {
     use super::*;
+
+    #[test]
+    fn teardown_report_lists_each_failure_and_the_overflow_count() {
+        use cuda_core_ext::teardown::{Drained, Library, TeardownError};
+        let drained = Drained {
+            errors: vec![TeardownError {
+                library: Library::Cublas,
+                op: "cublasDestroy_v2",
+                status: 14,
+            }],
+            lost: 3,
+        };
+        let lines = teardown_report(&drained);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("cublasDestroy_v2") && lines[0].contains("14"));
+        assert!(lines[1].contains('3'));
+        assert!(teardown_report(&Drained::default()).is_empty());
+    }
 
     #[test]
     fn compute_next_ui_tick_locks_60hz_and_avoids_catchup_bursts() {

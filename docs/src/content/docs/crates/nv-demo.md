@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-`nv-demo` (`crates/nv-demo/`, **284 unit tests**) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, `nv-wgpu`, `appbus-rs`, and `csg-rs` (`csg-core`, `csg-actors`, `csg-scene`, `csg-device`, `csg-scenes` at `7b8a085`) into a decoupled **60 Hz paced** `egui-wgpu` docked desktop studio with zero-copy CUDA ↔ `wgpu` presentation.
+`nv-demo` (`crates/nv-demo/`, **146 unit tests** (plus 5 ignored GPU/NVRTC tests)) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, `nv-wgpu`, `appbus-rs`, and `csg-rs` (`csg-core`, `csg-actors`, `csg-scene`, `csg-device`, `csg-scenes` at `24b22f5`) into a decoupled **60 Hz paced** `egui-wgpu` docked desktop studio with zero-copy CUDA ↔ `wgpu` presentation.
 
 ## Building & Running
 
@@ -23,7 +23,7 @@ On Windows, `ngx` (`ngx-sys`) is enabled by default (`default = ["ngx"]`) and au
 
 ### Scene-Agnostic `csg-rs` World Host (`CsgGpuHost`)
 
-`CsgGpuHost` (`src/csg_scene_host.rs`) owns `Option<SceneBuilt>` directly from `csg_scenes::default_scene_registry()` (backed by the **23-crate** `csg-rs` workspace at `7b8a085` with **13** analytical primitives `0..12`, an **84-slot** `MaterialPalette`, and a **15-class** `GasLedger` capped at **`246 / 256`** GASes):
+`CsgGpuHost` (`src/csg_scene_host.rs`) owns `Option<SceneBuilt>` directly from `csg_scenes::default_scene_registry()` (backed by the **23-crate** `csg-rs` workspace at `24b22f5` with **13** analytical primitives `0..12`, an **84-slot** `MaterialPalette`, and a **15-class** `GasLedger` capped at **`246 / 256`** GASes):
 
 - **Gundo & GundoOSM**: coastal El Segundo refinery, 3-tier `RivetedPipeBridge`, catenary power lines, Road Work zones, `TrafficStateSoA` arterial traffic, Seawall Promenade & sidewalk biome crowds, and Vista Del Mar beach.
 - **Marina del Rey**: procedurally instanced 16-story Marina City Club crescent towers, furnished `4316 Marina City Dr — 3F Balcony` (`csg-kit-marina-furniture`), yacht harbor, and promenade crowds.

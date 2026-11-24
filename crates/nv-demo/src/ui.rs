@@ -17,37 +17,57 @@ use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
-use crate::renderer::{CameraProjection, CaptureSource, DemoSettings};
+use crate::renderer::{
+    CameraProjection, CaptureSource, DLSS_QUALITY_MODES, DemoSettings, TIME_SCALE_MAX,
+    TIME_SCALE_MIN, dlss_quality_index,
+};
 use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
 use csg_scene::{ProbeBackendKind, SceneDescriptor, SceneViewpoint, TimeOfDay};
 
-const AOV_LABELS: [&str; 11] = [
-    "Beauty",
-    "Albedo",
-    "Normal",
-    "Depth",
-    "Motion",
-    "Semantic",
-    "Instance",
-    "WorldPos",
-    "Range (LiDAR)",
-    "Material",
-    "Cryptomatte",
+/// One selectable output pass: `label` for combo boxes, `tag` for the viewport HUD and its toolbar.
+struct AovPass {
+    label: &'static str,
+    tag: &'static str,
+}
+
+/// The 11 SDG/VFX output passes, indexed by `DemoSettings::aov_mode` (the shader's `aov_mode`).
+const AOV_PASSES: [AovPass; 11] = [
+    AovPass { label: "Beauty", tag: "BEAUTY" },
+    AovPass { label: "Albedo", tag: "ALBEDO" },
+    AovPass { label: "Normal", tag: "NORMAL" },
+    AovPass { label: "Depth", tag: "DEPTH" },
+    AovPass { label: "Motion", tag: "MOTION" },
+    AovPass { label: "Semantic", tag: "SEMANTIC" },
+    AovPass { label: "Instance", tag: "INSTANCE" },
+    AovPass { label: "WorldPos", tag: "WORLDPOS" },
+    AovPass { label: "Range (LiDAR)", tag: "RANGE" },
+    AovPass { label: "Material", tag: "MATERIAL" },
+    AovPass { label: "Cryptomatte", tag: "CRYPTO" },
 ];
 
-const AOV_HUD_TAGS: [&str; 11] = [
-    "BEAUTY",
-    "ALBEDO",
-    "NORMAL",
-    "DEPTH",
-    "MOTION",
-    "SEMANTIC",
-    "INSTANCE",
-    "WORLDPOS",
-    "RANGE",
-    "MATERIAL",
-    "CRYPTO",
+/// The pass for `aov_mode`; an out-of-range mode reads as `Beauty`.
+fn aov_pass(aov_mode: u32) -> &'static AovPass {
+    AOV_PASSES.get(aov_mode as usize).unwrap_or(&AOV_PASSES[0])
+}
+
+/// Background sky labels, indexed by `DemoSettings::sky_mode` (the shader's `sky_mode`).
+const SKY_MODES: [&str; 9] = [
+    "Daylight",
+    "Sunset",
+    "Studio",
+    "Nebula",
+    "Cyber Grid",
+    "Elevated (4k)",
+    "Unprogress (4k)",
+    "Offscreen Colonies",
+    "Coastal Night",
 ];
+/// `sky_mode` of the "Daylight" entry of [`SKY_MODES`] (time-of-day preset 0).
+const SKY_DAYLIGHT: u32 = 0;
+/// `sky_mode` of the "Sunset" entry of [`SKY_MODES`] (time-of-day preset 1).
+const SKY_SUNSET: u32 = 1;
+/// `sky_mode` of the "Coastal Night" entry of [`SKY_MODES`] (time-of-day preset 2).
+const SKY_COASTAL_NIGHT: u32 = 8;
 
 const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
 
@@ -77,13 +97,21 @@ pub fn scene_wgs84_origin(scene_id: &str) -> Option<(f64, f64)> {
     }
 }
 
-/// `true` for the `Inspector` variant `109` (4-archetype crowd showcase), where a poke hits every
-/// actor instead of the nearest one.
+/// `Inspector` variant index of the 4-archetype crowd showcase.
+const INSPECTOR_CROWD_SHOWCASE_VARIANT: u32 = 109;
+
+/// `true` for the `Inspector` crowd showcase variant, where a poke hits every actor instead of the
+/// nearest one.
+fn is_crowd_showcase(desc: &SceneDescriptor, asset_idx: u32) -> bool {
+    desc.id == "inspector" && asset_idx == INSPECTOR_CROWD_SHOWCASE_VARIANT
+}
+
+/// [`is_crowd_showcase`] for the scene selected by `csg_mode` (`0` = classic, `n` = `descs[n - 1]`).
 fn is_inspector_crowd_showcase(descs: &[SceneDescriptor], csg_mode: u32, asset_idx: u32) -> bool {
     csg_mode
         .checked_sub(1)
         .and_then(|i| descs.get(i as usize))
-        .is_some_and(|d| d.id == "inspector" && asset_idx == 109)
+        .is_some_and(|d| is_crowd_showcase(d, asset_idx))
 }
 
 /// Resolves the `Home` camera pose and optional orbit pivot distance for the active mode.
@@ -707,13 +735,12 @@ impl UiContext<'_> {
             ui.separator();
 
             ui.label(RichText::new("AOV").small().weak());
-            let cur_aov = (self.settings.aov_mode as usize).min(AOV_LABELS.len() - 1);
             egui::ComboBox::from_id_salt("toolbar_aov_mode")
                 .width(102.0)
-                .selected_text(AOV_LABELS[cur_aov])
+                .selected_text(aov_pass(self.settings.aov_mode).label)
                 .show_ui(ui, |ui| {
-                    for (idx, lbl) in AOV_LABELS.iter().enumerate() {
-                        ui.selectable_value(&mut self.settings.aov_mode, idx as u32, *lbl);
+                    for (idx, pass) in AOV_PASSES.iter().enumerate() {
+                        ui.selectable_value(&mut self.settings.aov_mode, idx as u32, pass.label);
                     }
                 });
 
@@ -907,19 +934,16 @@ impl UiContext<'_> {
         let toolbar_resp = crate::viewport_toolbar::ViewportToolbar::new("nv_demo_viewport_toolbar")
             .show(ui.ctx(), rect, self.viewport_toolbar, |ui| {
                 // 1. AOV quick selector
-                let aov_cur = AOV_HUD_TAGS
-                    .get(self.settings.aov_mode as usize)
-                    .copied()
-                    .unwrap_or("BEAUTY");
+                let aov_cur = aov_pass(self.settings.aov_mode).tag;
                 egui::ComboBox::from_id_salt("vt_aov")
                     .selected_text(format!("{} {aov_cur}", ic::STACK))
                     .width(96.0)
                     .show_ui(ui, |ui| {
-                        for (idx, tag) in AOV_HUD_TAGS.iter().enumerate() {
+                        for (idx, pass) in AOV_PASSES.iter().enumerate() {
                             ui.selectable_value(
                                 &mut self.settings.aov_mode,
                                 idx as u32,
-                                *tag,
+                                pass.tag,
                             );
                         }
                     });
@@ -1263,10 +1287,7 @@ impl UiContext<'_> {
 
         // Compact bottom-left status badge inside viewport (formatted into reusable scratch buffer).
         let hud_pos = rect.left_bottom() + egui::vec2(10.0, -26.0);
-        let aov_tag = AOV_HUD_TAGS
-            .get(self.settings.aov_mode as usize)
-            .copied()
-            .unwrap_or("BEAUTY");
+        let aov_tag = aov_pass(self.settings.aov_mode).tag;
         let sat_orbiting =
             self.settings.sat_on && self.settings.sat_orbit && self.settings.sat_count > 0;
         let demo_running = self.demo_anim.is_running();
@@ -2195,7 +2216,7 @@ impl UiContext<'_> {
                             s.sdg_occluder_backend = b;
                         }
                     });
-                    let is_inspector_109 = desc.id == "inspector" && s.csg_asset_idx == 109;
+                    let is_inspector_109 = is_crowd_showcase(desc, s.csg_asset_idx);
                     equal_grid(ui, 2, 2, |ui, idx, w| match idx {
                         0 => {
                             let lbl = if is_inspector_109 {
@@ -2355,24 +2376,13 @@ impl UiContext<'_> {
                 let gap = 4.0;
                 let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
                 ui.spacing_mut().item_spacing.x = gap;
-                let modes = [
-                    "Daylight",
-                    "Sunset",
-                    "Studio",
-                    "Nebula",
-                    "Cyber Grid",
-                    "Elevated (4k)",
-                    "Unprogress (4k)",
-                    "Offscreen Colonies",
-                    "Coastal Night",
-                ];
-                let idx = (s.sky_mode as usize).min(modes.len() - 1);
+                let idx = (s.sky_mode as usize).min(SKY_MODES.len() - 1);
                 egui::ComboBox::from_id_salt("sky_mode_combo")
                     .width(combo_w)
                     .truncate()
-                    .selected_text(modes[idx])
+                    .selected_text(SKY_MODES[idx])
                     .show_ui(ui, |ui| {
-                        for (i, label) in modes.iter().enumerate() {
+                        for (i, label) in SKY_MODES.iter().enumerate() {
                             ui.selectable_value(&mut s.sky_mode, i as u32, *label);
                         }
                     });
@@ -2821,20 +2831,20 @@ impl UiContext<'_> {
                     }
                 }
                 1 => {
-                    let cur = (s.aov_mode as usize).min(AOV_LABELS.len() - 1);
+                    let cur = (s.aov_mode as usize).min(AOV_PASSES.len() - 1);
                     let tint = (cur != 0).then(|| active_accent_tint(ui));
                     let step = cycle_toggle_btn(
                         ui,
                         w,
                         "AOV",
-                        AOV_LABELS[cur],
+                        AOV_PASSES[cur].label,
                         "Inspect all 11 SDG/VFX passes: Beauty, Albedo, Normal, Depth, Motion, SemanticId, InstanceId, WorldPos, Range (LiDAR), Material (PBR), and Cryptomatte.",
                         true,
                         tint,
                     );
                     if step != 0 {
                         s.aov_mode =
-                            ((cur as i32 + step).rem_euclid(AOV_LABELS.len() as i32)) as u32;
+                            ((cur as i32 + step).rem_euclid(AOV_PASSES.len() as i32)) as u32;
                     }
                 }
                 _ => {
@@ -2893,29 +2903,20 @@ impl UiContext<'_> {
                     let gap = 4.0;
                     let inner_w = (ui.available_width() - ANIM_BTN_W - gap).max(60.0);
                     ui.spacing_mut().item_spacing.x = gap;
-                    const QUALS: [(u32, &str); 5] = [
-                        (0, "Ultra Perf"),
-                        (1, "Performance"),
-                        (2, "Balanced"),
-                        (3, "Quality"),
-                        (5, "DLAA"),
-                    ];
-                    let cur = QUALS
-                        .iter()
-                        .position(|&(q, _)| q == s.dlss_quality)
-                        .unwrap_or(3);
+                    let cur = dlss_quality_index(s.dlss_quality);
                     let step = cycle_toggle_btn(
                         ui,
                         inner_w,
                         "Quality",
-                        QUALS[cur].1,
+                        DLSS_QUALITY_MODES[cur].label,
                         "Balance between frame rate and sharpness: Ultra Perf is fastest, Quality and DLAA give the sharpest image.",
                         true,
                         None,
                     );
                     if step != 0 {
-                        let next = (cur as i32 + step).rem_euclid(QUALS.len() as i32) as usize;
-                        s.dlss_quality = QUALS[next].0;
+                        let next = (cur as i32 + step)
+                            .rem_euclid(DLSS_QUALITY_MODES.len() as i32) as usize;
+                        s.dlss_quality = DLSS_QUALITY_MODES[next].id;
                     }
                     anim_toggle_btn_disabled(ui);
                 });
@@ -3562,7 +3563,7 @@ impl UiContext<'_> {
                         ui,
                         "Time Scale",
                         &mut s.time_scale,
-                        0.05..=2.0,
+                        TIME_SCALE_MIN..=TIME_SCALE_MAX,
                         2,
                         "x",
                     );
@@ -3897,7 +3898,7 @@ pub fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
     s.csg_time_of_day = tod.min(2);
     match s.csg_time_of_day {
         0 => {
-            s.sky_mode = 0; // Daylight
+            s.sky_mode = SKY_DAYLIGHT;
             s.sun_azimuth = -52.0;
             s.sun_elevation = 46.0;
             s.sun_intensity = 2.20;
@@ -3905,7 +3906,7 @@ pub fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
             s.exposure = 0.90;
         }
         2 => {
-            s.sky_mode = 8; // Coastal Night
+            s.sky_mode = SKY_COASTAL_NIGHT;
             s.sun_azimuth = -110.0;
             s.sun_elevation = 24.0;
             s.sun_intensity = 0.16;
@@ -3913,7 +3914,7 @@ pub fn apply_csg_time_of_day_preset(s: &mut DemoSettings, tod: u32) {
             s.exposure = 1.05;
         }
         _ => {
-            s.sky_mode = 1; // Golden Sunset
+            s.sky_mode = SKY_SUNSET;
             s.sun_azimuth = -98.0;
             s.sun_elevation = 11.0;
             s.sun_intensity = 1.75;
@@ -4697,6 +4698,18 @@ mod tests {
             }
         }
         assert!(calls > 80, "found only {calls} call sites");
+    }
+
+    #[test]
+    fn time_of_day_presets_select_the_named_sky_entries() {
+        assert_eq!(SKY_MODES[SKY_DAYLIGHT as usize], "Daylight");
+        assert_eq!(SKY_MODES[SKY_SUNSET as usize], "Sunset");
+        assert_eq!(SKY_MODES[SKY_COASTAL_NIGHT as usize], "Coastal Night");
+        let mut s = DemoSettings::default();
+        for (tod, sky) in [(0, SKY_DAYLIGHT), (1, SKY_SUNSET), (2, SKY_COASTAL_NIGHT)] {
+            apply_csg_time_of_day_preset(&mut s, tod);
+            assert_eq!(s.sky_mode, sky);
+        }
     }
 
     #[test]

@@ -55,8 +55,7 @@ pub const CSG_SBT_OFFSET: u32 = 8;
 pub const CSG_SBT_PRIM_OFFSET: u32 = 10;
 
 /// OptiX instance flag disabling any-hit programs on opaque CSG instances.
-const OPTIX_INST_DISABLE_ANYHIT: u32 =
-    optix::sys::OptixInstanceFlags_OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT as u32;
+const OPTIX_INST_DISABLE_ANYHIT: u32 = optix::INSTANCE_FLAG_DISABLE_ANYHIT;
 
 /// Maximum cached `SceneBuilt` entries retained across scene/road-mode switches.
 const SCENE_LRU_MAX_ENTRIES: usize = 4;

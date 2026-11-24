@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,35 @@ const TONEMAP_CU: &str = include_str!("../shaders/tonemap.cu");
 /// Absolute path of the ray-tracing shader read by `ReloadShader`, independent of the working
 /// directory the binary was launched from.
 const RAYTRACER_CU_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/raytracer.cu");
+
+/// One DLSS quality preset: the persisted/UI `id` (`DemoSettings::dlss_quality`), its label, and the
+/// NGX mode it selects.
+pub struct DlssQualityMode {
+    pub id: u32,
+    pub label: &'static str,
+    pub ngx: ngx::DlssPerfQuality,
+}
+
+/// The selectable DLSS presets in UI cycle order (id `4`, `UltraQuality`, is unsupported by the DLSS
+/// 3.x+ runtime and absent).
+pub const DLSS_QUALITY_MODES: [DlssQualityMode; 5] = [
+    DlssQualityMode { id: 0, label: "Ultra Perf", ngx: ngx::DlssPerfQuality::UltraPerformance },
+    DlssQualityMode { id: 1, label: "Performance", ngx: ngx::DlssPerfQuality::MaxPerf },
+    DlssQualityMode { id: 2, label: "Balanced", ngx: ngx::DlssPerfQuality::Balanced },
+    DlssQualityMode { id: 3, label: "Quality", ngx: ngx::DlssPerfQuality::MaxQuality },
+    DlssQualityMode { id: 5, label: "DLAA", ngx: ngx::DlssPerfQuality::Dlaa },
+];
+
+/// Index of `Quality` in [`DLSS_QUALITY_MODES`], used for an unknown persisted id.
+pub const DLSS_QUALITY_DEFAULT_IDX: usize = 3;
+
+/// Index into [`DLSS_QUALITY_MODES`] of preset `id`; an unknown id selects `Quality`.
+pub fn dlss_quality_index(id: u32) -> usize {
+    DLSS_QUALITY_MODES
+        .iter()
+        .position(|m| m.id == id)
+        .unwrap_or(DLSS_QUALITY_DEFAULT_IDX)
+}
 
 pub const DEFAULT_W: u32 = 896;
 pub const DEFAULT_H: u32 = 512;
@@ -816,7 +845,7 @@ pub struct DemoSettings {
     pub capture_source: CaptureSource,
     /// Cinematic gimbal camera smoothing time constant in seconds (`0.0` = instant/off).
     pub cam_smooth_tau: f32,
-    /// Global simulation & animation time scale (`0.05..=2.0`, `1.0` = real-time).
+    /// Global simulation & animation time scale (`TIME_SCALE_MIN..=TIME_SCALE_MAX`, `1.0` = real-time).
     pub time_scale: f32,
     /// 180-degree shutter motion-blur subframe count in Smooth 60 recording (`1` = Off, `2`, `4`).
     pub record_shutter_subframes: u32,
@@ -1045,7 +1074,27 @@ impl Default for DemoSettings {
     }
 }
 
+/// Slowest `DemoSettings::time_scale` the UI offers and every consumer honours.
+pub const TIME_SCALE_MIN: f32 = 0.05;
+/// Fastest `DemoSettings::time_scale`.
+pub const TIME_SCALE_MAX: f32 = 2.0;
+/// Most 180-degree shutter subframes per recorded frame.
+pub const SHUTTER_SUBFRAMES_MAX: u32 = 4;
+
 impl DemoSettings {
+    /// `time_scale` clamped to `TIME_SCALE_MIN..=TIME_SCALE_MAX` (a hand-edited config cannot stall
+    /// or race the simulation).
+    #[inline]
+    pub fn clamped_time_scale(&self) -> f32 {
+        self.time_scale.clamp(TIME_SCALE_MIN, TIME_SCALE_MAX)
+    }
+
+    /// `record_shutter_subframes` clamped to `1..=SHUTTER_SUBFRAMES_MAX`.
+    #[inline]
+    pub fn shutter_subframes(&self) -> u32 {
+        self.record_shutter_subframes.clamp(1, SHUTTER_SUBFRAMES_MAX)
+    }
+
     /// Builds the unified [`csg_scene::LodConfig`] driving static/dynamic CSG LODs and culling.
     #[inline]
     pub fn csg_lod_config(&self) -> csg_scene::LodConfig {
@@ -1220,26 +1269,27 @@ struct OptixRig {
     crowd_gas_handles_host: Vec<u64>,
 }
 
-fn find_optix_include() -> Option<String> {
-    let mut candidates = Vec::new();
-    if let Ok(root) = std::env::var("OPTIX_ROOT") {
-        candidates.push(std::path::PathBuf::from(root).join("include"));
+/// OptiX include directory ([`crate::optix_sdk::include_dir`], the discovery `build.rs` uses too)
+/// and the digest of its whole header set.
+struct OptixHeaders {
+    include: String,
+    digest: [u8; 16],
+}
+
+/// Resolves the OptiX SDK once per process. The digest keys the PTX cache on the header bytes, so an
+/// in-place SDK update recompiles. Failures are not cached: fixing `OPTIX_ROOT` and hot-reloading
+/// works without a restart.
+fn optix_headers() -> Result<&'static OptixHeaders, String> {
+    static HEADERS: OnceLock<OptixHeaders> = OnceLock::new();
+    if let Some(headers) = HEADERS.get() {
+        return Ok(headers);
     }
-    if let Ok(pd) = std::env::var("ProgramData") {
-        let base = std::path::PathBuf::from(pd).join("NVIDIA Corporation");
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("OptiX SDK") {
-                    candidates.push(entry.path().join("include"));
-                }
-            }
-        }
-    }
-    candidates
-        .into_iter()
-        .find(|p| p.join("optix.h").is_file())
-        .map(|p| p.to_string_lossy().into_owned())
+    let include = crate::optix_sdk::include_dir()?;
+    let digest = crate::gpu_export::dir_content_digest(&include)?;
+    Ok(HEADERS.get_or_init(|| OptixHeaders {
+        include: include.to_string_lossy().into_owned(),
+        digest,
+    }))
 }
 
 fn find_cuda_include() -> Option<String> {
@@ -1259,8 +1309,7 @@ fn find_cuda_include() -> Option<String> {
 }
 
 /// OptiX instance flag disabling any-hit programs on opaque classic instances.
-const OPTIX_INST_DISABLE_ANYHIT: u32 =
-    optix::sys::OptixInstanceFlags_OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT as u32;
+const OPTIX_INST_DISABLE_ANYHIT: u32 = optix::INSTANCE_FLAG_DISABLE_ANYHIT;
 
 /// Pure helper clamping `accum_count` before a `SaveJpeg` capture without discarding converged
 /// samples when `max_accum == 0` (infinite accumulation).
@@ -1377,34 +1426,41 @@ fn cu_module_function(module: cu::CUmodule, name: &CStr) -> Result<cu::CUfunctio
     Ok(func)
 }
 
-fn try_compile_ptx(src: &str, name: &str, include_optix: bool) -> Result<Vec<u8>, String> {
+/// Include directories and extra PTX cache-key blobs (OptiX header-set digest, `csg_eval.cuh` bytes)
+/// for compiling `raytracer.cu`.
+fn raytracer_ptx_inputs() -> Result<(Vec<String>, Vec<Vec<u8>>), String> {
+    let optix = optix_headers()?;
     let mut include_dirs = Vec::with_capacity(3);
-    let mut csg_eval_bytes: Vec<u8> = Vec::new();
-    let mut optix_tag: Vec<u8> = Vec::new();
+    include_dirs.push(optix.include.clone());
+    if let Some(p) = find_cuda_include() {
+        include_dirs.push(p);
+    }
+    let csg_dir = csg_device::csg_eval_cuh_dir();
+    let csg_eval = std::fs::read(std::path::Path::new(csg_dir).join("csg_eval.cuh"))
+        .map_err(|e| format!("read csg_eval.cuh in {csg_dir}: {e}"))?;
+    include_dirs.push(csg_dir.to_string());
+    Ok((include_dirs, vec![optix.digest.to_vec(), csg_eval]))
+}
 
-    if include_optix {
-        if let Some(p) = find_optix_include() {
-            optix_tag.extend_from_slice(p.as_bytes());
-            include_dirs.push(p);
-        }
-        if let Some(p) = find_cuda_include() {
-            include_dirs.push(p);
-        }
-        let csg_dir = csg_device::csg_eval_cuh_dir();
-        if let Ok(bytes) = std::fs::read(std::path::Path::new(csg_dir).join("csg_eval.cuh")) {
-            csg_eval_bytes = bytes;
-        }
-        include_dirs.push(csg_dir.to_string());
-    }
-
-    let mut extra_blobs: Vec<&[u8]> = Vec::with_capacity(2);
-    if !optix_tag.is_empty() {
-        extra_blobs.push(optix_tag.as_slice());
-    }
-    if !csg_eval_bytes.is_empty() {
-        extra_blobs.push(csg_eval_bytes.as_slice());
-    }
-    crate::gpu_export::compile_ptx_cached(src, name, "compute_75", &include_dirs, &extra_blobs)
+/// Compiles `raytracer.cu` source `src` through the PTX cache and builds the OptiX pipeline from
+/// it. A cached image that OptiX rejects is evicted and recompiled once ([`load_ptx_cached`]).
+///
+/// [`load_ptx_cached`]: crate::gpu_export::load_ptx_cached
+fn raytracer_pipeline_from_source(
+    src: &str,
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Stream,
+) -> Result<OptixPipelineSet, String> {
+    let (include_dirs, blobs) = raytracer_ptx_inputs()?;
+    let blob_refs: Vec<&[u8]> = blobs.iter().map(Vec::as_slice).collect();
+    crate::gpu_export::load_ptx_cached(
+        src,
+        "raytracer.cu",
+        "compute_75",
+        &include_dirs,
+        &blob_refs,
+        |ptx| build_optix_pipeline(optix_ctx, stream, ptx),
+    )
 }
 
 /// Compiles an OptiX `Module` in parallel via `Module::with_tasks` across a scoped worker pool,
@@ -1492,19 +1548,20 @@ fn compile_optix_module_parallel(
     Ok(module)
 }
 
+/// Render, probe and SDG pipelines of one compiled `raytracer.cu`: `(pipeline, render SBT,
+/// probe SBT, SDG SBT)`.
+type OptixPipelineSet = (
+    Pipeline,
+    ShaderBindingTable,
+    ShaderBindingTable,
+    ShaderBindingTable,
+);
+
 fn build_optix_pipeline(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Stream,
     rt_ptx: &[u8],
-) -> Result<
-    (
-        Pipeline,
-        ShaderBindingTable,
-        ShaderBindingTable,
-        ShaderBindingTable,
-    ),
-    String,
-> {
+) -> Result<OptixPipelineSet, String> {
     let mut opts = PipelineOptions::new("params", std::mem::size_of::<LaunchParams>(), 8)
         .map_err(|e| format!("PipelineOptions: {e}"))?;
     opts.attribute_values = 5;
@@ -2139,25 +2196,6 @@ impl FractalLaunch {
     }
 }
 
-struct SceneState {
-    sat_angle: f32,
-    sat_count: u32,
-    sat_seed: u32,
-    sat_size_range: [f32; 2],
-    sat_orbit_range: [f32; 2],
-    sat_height_range: [f32; 2],
-    sat_speed_range: [f32; 2],
-    sat_bob_amp_range: [f32; 2],
-    sat_bob_freq_range: [f32; 2],
-    sat_hue_spread: f32,
-    sat_on: bool,
-    glass_analytic: bool,
-    neon_on: bool,
-    omm_mode: u32,
-    show_classic: bool,
-    fractal_transform: [f32; 12],
-}
-
 fn splitmix32(mut x: u32) -> f32 {
     x = x.wrapping_add(0x9E37_79B9);
     x = (x ^ (x >> 16)).wrapping_mul(0x85EB_CA6B);
@@ -2178,35 +2216,47 @@ fn ias_build_opts() -> BuildOptions {
     }
 }
 
-/// Comparable classic-stage IAS state that ignores satellite/fractal transforms completely when
-/// `!show_classic` so CSG scenes incur zero spurious 50k-instance IAS rebuilds.
+/// Classic-stage IAS inputs and comparison key in one value: the IAS is rebuilt exactly when this
+/// changes, and [`build_ias_into`] reads everything it needs from it, so the key and the build
+/// cannot drift apart. `Hidden` ignores satellite and fractal parameters completely when
+/// `!show_classic`, so CSG scenes incur zero spurious 50k-instance IAS rebuilds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum IasClassicState {
     Hidden,
     Visible {
         sat_on: bool,
         glass_analytic: bool,
+        /// Glass mesh segment counts; `0` while the mesh GAS is not referenced (sats off or analytic).
         sat_u_segs: u32,
         sat_v_segs: u32,
         sat_count: u32,
         sat_seed: u32,
         neon_on: bool,
         omm_mode: u32,
-        sat_params: [f32; 14],
+        sat_size: [f32; 2],
+        sat_orbit: [f32; 2],
+        sat_height: [f32; 2],
+        sat_speed: [f32; 2],
+        sat_bob_amp: [f32; 2],
+        sat_bob_freq: [f32; 2],
+        sat_hue_spread: f32,
+        /// Satellite orbit phase; `0` while no satellite is visible so a running orbit clock does
+        /// not rebuild the IAS.
+        sat_angle: f32,
         fractal_transform: [f32; 12],
     },
 }
 
-/// Computes the classic-stage IAS comparison key and fractal transform, guarding `sat_angle` and
-/// `fractal_transform` strictly behind `show_classic` (`csg_mode == 0 || csg_show_fractal`).
+/// Computes the classic-stage IAS state, guarding `sat_angle` and `fractal_transform` strictly
+/// behind `show_classic` (`csg_mode == 0 || csg_show_fractal`).
 fn compute_ias_classic_state(
     settings: &DemoSettings,
     spin_angle: f32,
     sat_angle: f32,
-) -> (IasClassicState, [f32; 12]) {
+) -> IasClassicState {
     let show_classic = settings.csg_mode == 0 || settings.csg_show_fractal;
     if !show_classic {
-        return (IasClassicState::Hidden, Instance::IDENTITY);
+        return IasClassicState::Hidden;
     }
     let fractal_transform = fractal_instance_transform(
         settings.fractal_translate,
@@ -2217,7 +2267,7 @@ fn compute_ias_classic_state(
         ],
         settings.obj_scale,
     );
-    let sat_angle_key = if settings.sat_on && settings.sat_count > 0 {
+    let sat_angle = if settings.sat_on && settings.sat_count > 0 {
         sat_angle
     } else {
         0.0
@@ -2229,7 +2279,7 @@ fn compute_ias_classic_state(
     } else {
         (0, 0)
     };
-    let state = IasClassicState::Visible {
+    IasClassicState::Visible {
         sat_on: settings.sat_on,
         glass_analytic: settings.glass_analytic,
         sat_u_segs,
@@ -2238,50 +2288,14 @@ fn compute_ias_classic_state(
         sat_seed: settings.sat_seed,
         neon_on: settings.neon_on,
         omm_mode: settings.omm_mode,
-        sat_params: [
-            settings.sat_size_min,
-            settings.sat_size_max,
-            settings.sat_orbit_min,
-            settings.sat_orbit_max,
-            settings.sat_height_min,
-            settings.sat_height_max,
-            settings.sat_speed_min,
-            settings.sat_speed_max,
-            settings.sat_bob_amp_min,
-            settings.sat_bob_amp_max,
-            settings.sat_bob_freq_min,
-            settings.sat_bob_freq_max,
-            settings.sat_hue_spread,
-            sat_angle_key,
-        ],
-        fractal_transform,
-    };
-    (state, fractal_transform)
-}
-
-/// Builds the classic-stage IAS inputs from `settings`; the single source for both the initial
-/// build and the frame loop.
-fn scene_state(
-    settings: &DemoSettings,
-    sat_angle: f32,
-    fractal_transform: [f32; 12],
-) -> SceneState {
-    SceneState {
-        sat_angle,
-        sat_count: settings.sat_count,
-        sat_seed: settings.sat_seed,
-        sat_size_range: [settings.sat_size_min, settings.sat_size_max],
-        sat_orbit_range: [settings.sat_orbit_min, settings.sat_orbit_max],
-        sat_height_range: [settings.sat_height_min, settings.sat_height_max],
-        sat_speed_range: [settings.sat_speed_min, settings.sat_speed_max],
-        sat_bob_amp_range: [settings.sat_bob_amp_min, settings.sat_bob_amp_max],
-        sat_bob_freq_range: [settings.sat_bob_freq_min, settings.sat_bob_freq_max],
+        sat_size: [settings.sat_size_min, settings.sat_size_max],
+        sat_orbit: [settings.sat_orbit_min, settings.sat_orbit_max],
+        sat_height: [settings.sat_height_min, settings.sat_height_max],
+        sat_speed: [settings.sat_speed_min, settings.sat_speed_max],
+        sat_bob_amp: [settings.sat_bob_amp_min, settings.sat_bob_amp_max],
+        sat_bob_freq: [settings.sat_bob_freq_min, settings.sat_bob_freq_max],
         sat_hue_spread: settings.sat_hue_spread,
-        sat_on: settings.sat_on,
-        glass_analytic: settings.glass_analytic,
-        neon_on: settings.neon_on,
-        omm_mode: settings.omm_mode,
-        show_classic: settings.csg_mode == 0 || settings.csg_show_fractal,
+        sat_angle,
         fractal_transform,
     }
 }
@@ -2299,11 +2313,29 @@ fn build_ias_into(
     gas: SceneGas<'_>,
     csg_host: &CsgGpuHost,
     instances: &mut Vec<Instance>,
-    state: SceneState,
+    state: &IasClassicState,
 ) -> Result<ClassicXforms, String> {
     instances.clear();
-    if state.show_classic {
-        let count = (state.sat_count as usize).min(MAX_SATELLITES);
+    if let IasClassicState::Visible {
+        sat_on,
+        glass_analytic,
+        sat_count,
+        sat_seed,
+        neon_on,
+        omm_mode,
+        sat_size,
+        sat_orbit,
+        sat_height,
+        sat_speed,
+        sat_bob_amp,
+        sat_bob_freq,
+        sat_hue_spread,
+        sat_angle,
+        fractal_transform,
+        ..
+    } = *state
+    {
+        let count = (sat_count as usize).min(MAX_SATELLITES);
         let mut i0 = Instance::new(gas.floor);
         i0.id = 0;
         i0.sbt_offset = 0;
@@ -2314,36 +2346,35 @@ fn build_ias_into(
         i1.id = 1;
         i1.sbt_offset = 2;
         i1.flags = OPTIX_INST_DISABLE_ANYHIT;
-        i1.transform = state.fractal_transform;
+        i1.transform = fractal_transform;
         instances.push(i1);
 
-        if state.sat_on && count > 0 {
-            let (glass_gas, sbt_off) = if state.glass_analytic {
+        if sat_on && count > 0 {
+            let (glass_gas, sbt_off) = if glass_analytic {
                 (gas.glass_analytic, 4)
             } else {
                 (gas.glass_mesh, 0)
             };
-            let s_min = state.sat_size_range[0]
-                .min(state.sat_size_range[1])
+            let s_min = sat_size[0]
+                .min(sat_size[1])
                 .max(0.001);
-            let s_max = state.sat_size_range[0]
-                .max(state.sat_size_range[1])
+            let s_max = sat_size[0]
+                .max(sat_size[1])
                 .max(0.001);
-            let o_min = state.sat_orbit_range[0].min(state.sat_orbit_range[1]);
-            let o_max = state.sat_orbit_range[0].max(state.sat_orbit_range[1]);
-            let h_min = state.sat_height_range[0].min(state.sat_height_range[1]);
-            let h_max = state.sat_height_range[0].max(state.sat_height_range[1]);
-            let v_min = state.sat_speed_range[0].min(state.sat_speed_range[1]);
-            let v_max = state.sat_speed_range[0].max(state.sat_speed_range[1]);
-            let a_min = state.sat_bob_amp_range[0].min(state.sat_bob_amp_range[1]);
-            let a_max = state.sat_bob_amp_range[0].max(state.sat_bob_amp_range[1]);
-            let f_min = state.sat_bob_freq_range[0].min(state.sat_bob_freq_range[1]);
-            let f_max = state.sat_bob_freq_range[0].max(state.sat_bob_freq_range[1]);
-            let hue_spread = state.sat_hue_spread.clamp(0.0, 1.0);
+            let o_min = sat_orbit[0].min(sat_orbit[1]);
+            let o_max = sat_orbit[0].max(sat_orbit[1]);
+            let h_min = sat_height[0].min(sat_height[1]);
+            let h_max = sat_height[0].max(sat_height[1]);
+            let v_min = sat_speed[0].min(sat_speed[1]);
+            let v_max = sat_speed[0].max(sat_speed[1]);
+            let a_min = sat_bob_amp[0].min(sat_bob_amp[1]);
+            let a_max = sat_bob_amp[0].max(sat_bob_amp[1]);
+            let f_min = sat_bob_freq[0].min(sat_bob_freq[1]);
+            let f_max = sat_bob_freq[0].max(sat_bob_freq[1]);
+            let hue_spread = sat_hue_spread.clamp(0.0, 1.0);
 
             for idx in 0..count {
-                let base = state
-                    .sat_seed
+                let base = sat_seed
                     .wrapping_mul(747_796_405)
                     .wrapping_add((idx as u32).wrapping_mul(2_891_336_453));
                 let u0 = splitmix32(base ^ 0x1111_1111);
@@ -2363,12 +2394,12 @@ fn build_ias_into(
                 let height = h_min + (h_max - h_min) * u2;
                 let phase0 = u3 * std::f32::consts::TAU;
                 let speed = v_min + (v_max - v_min) * u4;
-                let angle = phase0 + state.sat_angle * speed;
+                let angle = phase0 + sat_angle * speed;
                 let bob_amp = a_min + (a_max - a_min) * u5;
                 let bob_freq = f_min + (f_max - f_min) * u6;
                 let bob_phase = u7 * std::f32::consts::TAU;
-                let bob = (state.sat_angle * bob_freq + bob_phase).sin() * 0.7
-                    + (state.sat_angle * bob_freq * 0.63 + bob_phase * 1.7).cos() * 0.3;
+                let bob = (sat_angle * bob_freq + bob_phase).sin() * 0.7
+                    + (sat_angle * bob_freq * 0.63 + bob_phase * 1.7).cos() * 0.3;
                 let px = orbit_r * angle.cos();
                 let py = height + bob_amp * bob;
                 let pz = orbit_r * angle.sin();
@@ -2384,7 +2415,7 @@ fn build_ias_into(
             }
         }
 
-        if state.neon_on {
+        if neon_on {
             let mut i3 = Instance::new(gas.neon);
             i3.id = 3;
             i3.sbt_offset = 0;
@@ -2393,8 +2424,8 @@ fn build_ias_into(
             instances.push(i3);
         }
 
-        if state.omm_mode == 1 || state.omm_mode == 2 {
-            let omm_accel = if state.omm_mode == 1 {
+        if omm_mode == 1 || omm_mode == 2 {
+            let omm_accel = if omm_mode == 1 {
                 gas.omm
             } else {
                 gas.omm_anyhit
@@ -2443,21 +2474,30 @@ fn build_ias_into(
 }
 
 #[cfg(has_embedded_ptx)]
-fn initial_ptx() -> Result<(Vec<u8>, Vec<u8>), String> {
-    Ok((
-        EMBEDDED_RAYTRACER_PTX.as_bytes().to_vec(),
-        EMBEDDED_TONEMAP_PTX.as_bytes().to_vec(),
-    ))
+fn tonemap_ptx() -> Result<Vec<u8>, String> {
+    Ok(EMBEDDED_TONEMAP_PTX.as_bytes().to_vec())
 }
 
 #[cfg(not(has_embedded_ptx))]
-fn initial_ptx() -> Result<(Vec<u8>, Vec<u8>), String> {
-    Ok((
-        try_compile_ptx(RAYTRACER_CU, "raytracer.cu", true)
-            .map_err(|e| format!("raytracer.cu PTX: {e}"))?,
-        try_compile_ptx(TONEMAP_CU, "tonemap.cu", false)
-            .map_err(|e| format!("tonemap.cu PTX: {e}"))?,
-    ))
+fn tonemap_ptx() -> Result<Vec<u8>, String> {
+    crate::gpu_export::compile_ptx_cached(TONEMAP_CU, "tonemap.cu", "compute_75", &[], &[])
+        .map_err(|e| format!("tonemap.cu PTX: {e}"))
+}
+
+#[cfg(has_embedded_ptx)]
+fn initial_pipeline(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Stream,
+) -> Result<OptixPipelineSet, String> {
+    build_optix_pipeline(optix_ctx, stream, EMBEDDED_RAYTRACER_PTX.as_bytes())
+}
+
+#[cfg(not(has_embedded_ptx))]
+fn initial_pipeline(
+    optix_ctx: &Arc<DeviceContext>,
+    stream: &Stream,
+) -> Result<OptixPipelineSet, String> {
+    raytracer_pipeline_from_source(RAYTRACER_CU, optix_ctx, stream)
 }
 
 fn init_optix(
@@ -2520,7 +2560,7 @@ fn init_optix(
     let ser_supported = optix_ctx.shader_reordering().unwrap_or(false);
     let mut scratch = Scratch::new(&stream);
 
-    let (rt_ptx, tm_ptx) = initial_ptx()?;
+    let tm_ptx = tonemap_ptx()?;
     let mut cu_mod: cu::CUmodule = std::ptr::null_mut();
     // SAFETY: `tm_ptx` is NUL-terminated PTX compiled by NVRTC on the current context.
     let res = unsafe { cu::cuModuleLoadData(&mut cu_mod, tm_ptx.as_ptr().cast()) };
@@ -2539,7 +2579,7 @@ fn init_optix(
     tonemap.scrgb_func = cu_module_function(tonemap.module, c"tonemap_f32_to_scrgb_f16")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
-    let (pipeline, sbt, probe_sbt, sdg_sbt) = build_optix_pipeline(&optix_ctx, &stream, &rt_ptx)
+    let (pipeline, sbt, probe_sbt, sdg_sbt) = initial_pipeline(&optix_ctx, &stream)
         .map_err(|e| format!("OptiX pipeline: {e}"))?;
 
     // Raytraced metal stage floor (~10x the [-1.5, 1.5] fractal, y = -1.35)
@@ -2667,7 +2707,7 @@ fn init_optix(
     let ias_dyn_scratch = Vec::with_capacity(1024);
     let mut d_optix_instances = InstanceBuffer::new(&optix_ctx, &stream);
     let mut ias: Option<Arc<Accel>> = None;
-    let (_, initial_fractal_transform) = compute_ias_classic_state(initial_settings, 0.0, 0.0);
+    let initial_classic = compute_ias_classic_state(initial_settings, 0.0, 0.0);
 
     let classic_xforms = build_ias_into(
         &optix_ctx,
@@ -2686,7 +2726,7 @@ fn init_optix(
         },
         &csg_host,
         &mut ias_instances_scratch,
-        scene_state(initial_settings, 0.0, initial_fractal_transform),
+        &initial_classic,
     )?;
 
     let n = (DEFAULT_W * DEFAULT_H) as usize;
@@ -3816,8 +3856,7 @@ pub fn spawn_render_thread(
             let mut sat_angle: f32 = 0.0;
             let mut traffic_time: f32 = 0.0;
             let mut fast_preview_reduced = false;
-            let (mut last_ias_state, _) =
-                compute_ias_classic_state(&settings, spin_angle, sat_angle);
+            let mut last_ias_state = compute_ias_classic_state(&settings, spin_angle, sat_angle);
             let mut last_tick = Instant::now();
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
             let mut active_burst: Option<SdgBurstState> = None;
@@ -3836,6 +3875,16 @@ pub fn spawn_render_thread(
             let mut temporal_history_cut = false;
             let mut prev_will_run_bloom = false;
             let mut last_csg_sync_err: Option<String> = None;
+
+            let mut perf_log = match crate::perf_log::PerfLog::from_env() {
+                Ok(log) => log,
+                Err(e) => {
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "Perf log disabled: {e}"
+                    )));
+                    None
+                }
+            };
 
             // Unrecoverable errors emit `RenderEvent::Fatal` once and `break 'render`, so the
             // thread ends and drops `rig` in its normal order.
@@ -4300,9 +4349,12 @@ pub fn spawn_render_thread(
                             let disk_path = PathBuf::from(RAYTRACER_CU_PATH);
                             let res = std::fs::read_to_string(&disk_path)
                                 .map_err(|e| format!("Read {}: {e}", disk_path.display()))
-                                .and_then(|src| try_compile_ptx(&src, "raytracer.cu", true))
-                                .and_then(|ptx| {
-                                    build_optix_pipeline(&rig._optix_ctx, &rig.stream, &ptx)
+                                .and_then(|src| {
+                                    raytracer_pipeline_from_source(
+                                        &src,
+                                        &rig._optix_ctx,
+                                        &rig.stream,
+                                    )
                                 });
                             match res {
                                 Ok((pipeline, sbt, probe_sbt, sdg_sbt)) => {
@@ -4451,6 +4503,7 @@ pub fn spawn_render_thread(
                     }
                     continue;
                 }
+                let frame_start = Instant::now();
 
                 let (shutter_sub_idx, publish_frame, dt) = if in_shutter_mode {
                     let Some(q) = shutter_queue.pop_front() else {
@@ -4481,7 +4534,7 @@ pub fn spawn_render_thread(
                         now.duration_since(last_tick).as_secs_f32().min(0.1)
                     };
                     last_tick = now;
-                    let scale = settings.time_scale.clamp(0.05, 2.0);
+                    let scale = settings.clamped_time_scale();
                     (None, true, base_dt * scale)
                 };
 
@@ -4842,8 +4895,7 @@ pub fn spawn_render_thread(
                     // Recorded on failure too, so a failing size is not rebuilt every frame.
                     rig.glass_mesh_segs = (settings.sat_u_segs, settings.sat_v_segs);
                 }
-                let (ias_state, fractal_transform) =
-                    compute_ias_classic_state(&settings, spin_angle, sat_angle);
+                let ias_state = compute_ias_classic_state(&settings, spin_angle, sat_angle);
                 let classic_changed = ias_state != last_ias_state;
                 // The traffic prefix is in `d_optix_instances` but the refit was left to the
                 // CUDA crowd step; refit below if that step does not.
@@ -4921,7 +4973,7 @@ pub fn spawn_render_thread(
                             },
                             &rig.csg_host,
                             &mut rig.ias_instances_scratch,
-                            scene_state(&settings, sat_angle, fractal_transform),
+                            &ias_state,
                         );
                         match built {
                             Ok(classic) => {
@@ -5390,6 +5442,7 @@ pub fn spawn_render_thread(
                     prof.mark_accel_end(slot, &rig.stream);
                 }
 
+                let launch_start = Instant::now();
                 // Single uninterrupted GPU stream burst: [IAS/Traffic] -> [RT Cores] ->
                 // [Tensor Denoiser] -> [cuFFT Bloom] -> [Tonemap/Pack], with ONE end-of-frame fence.
                 {
@@ -5730,6 +5783,28 @@ pub fn spawn_render_thread(
                     } else {
                         (0.0, 0.0, 0.0, 0.0, 0.0)
                     };
+
+                if let Some(log) = perf_log.as_mut() {
+                    let fence_done = Instant::now();
+                    let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+                    let written = log.record(crate::perf_log::PerfSample {
+                        host_prep_ms: ms(launch_start.duration_since(frame_start)),
+                        launch_to_fence_ms: ms(fence_done.duration_since(launch_start)),
+                        frame_work_ms: ms(fence_done.duration_since(frame_start)),
+                        rt_ms,
+                        denoise_ms,
+                        bloom_ms,
+                        tonemap_ms,
+                        cuda_compute_ms,
+                        crowd_step_ms: last_crowd_step_ms,
+                    });
+                    if let Some(result) = written {
+                        bus.emit_render_event(RenderEvent::StatusMessage(match result {
+                            Ok(path) => format!("Perf log written: {}", path.display()),
+                            Err(e) => format!("Perf log failed: {e}"),
+                        }));
+                    }
+                }
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
                     let msg = match save_jpeg_from_rgba8(
@@ -6220,10 +6295,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (st_a, _) = compute_ias_classic_state(&s, 0.0, 0.0);
+        let st_a = compute_ias_classic_state(&s, 0.0, 0.0);
         s.fractal_translate = [10.0, 5.0, -3.0];
         s.rot_y = 90.0;
-        let (st_b, _) = compute_ias_classic_state(&s, 2.5, 7.25);
+        let st_b = compute_ias_classic_state(&s, 2.5, 7.25);
         assert_eq!(st_a, IasClassicState::Hidden);
         assert_eq!(
             st_a, st_b,
@@ -6231,10 +6306,75 @@ mod tests {
         );
 
         s.csg_show_fractal = true;
-        let (st_c, _) = compute_ias_classic_state(&s, 0.0, 0.0);
-        let (st_d, _) = compute_ias_classic_state(&s, 0.0, 1.5);
+        let st_c = compute_ias_classic_state(&s, 0.0, 0.0);
+        let st_d = compute_ias_classic_state(&s, 0.0, 1.5);
         assert_ne!(st_c, IasClassicState::Hidden);
         assert_ne!(st_c, st_d);
+    }
+
+    #[test]
+    fn ias_classic_state_carries_every_build_input_and_zeroes_idle_orbit_phase() {
+        let s = DemoSettings {
+            csg_mode: 0,
+            sat_on: false,
+            sat_count: 8,
+            sat_seed: 7,
+            neon_on: true,
+            omm_mode: 2,
+            ..Default::default()
+        };
+        let IasClassicState::Visible {
+            sat_seed,
+            neon_on,
+            omm_mode,
+            sat_angle,
+            sat_size,
+            fractal_transform,
+            ..
+        } = compute_ias_classic_state(&s, 0.0, 3.0)
+        else {
+            panic!("classic stage must be visible in csg_mode 0");
+        };
+        assert_eq!((sat_seed, neon_on, omm_mode), (7, true, 2));
+        assert_eq!(sat_size, [s.sat_size_min, s.sat_size_max]);
+        assert_eq!(sat_angle, 0.0, "no visible satellite, so the orbit clock must not key the IAS");
+        assert_eq!(
+            fractal_transform,
+            fractal_instance_transform(s.fractal_translate, [s.rot_x, s.rot_y, s.rot_z], s.obj_scale)
+        );
+    }
+
+    #[test]
+    fn dlss_quality_table_ids_are_unique_and_unknown_ids_select_quality() {
+        let mut ids: Vec<u32> = DLSS_QUALITY_MODES.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), DLSS_QUALITY_MODES.len());
+        assert_eq!(DLSS_QUALITY_MODES[DLSS_QUALITY_DEFAULT_IDX].label, "Quality");
+        for (idx, m) in DLSS_QUALITY_MODES.iter().enumerate() {
+            assert_eq!(dlss_quality_index(m.id), idx);
+        }
+        // Id 4 (`UltraQuality`) is unsupported by the DLSS 3.x+ runtime.
+        assert_eq!(dlss_quality_index(4), DLSS_QUALITY_DEFAULT_IDX);
+        assert_eq!(dlss_quality_index(u32::MAX), DLSS_QUALITY_DEFAULT_IDX);
+    }
+
+    #[test]
+    fn time_scale_and_shutter_clamps_follow_the_shared_limits() {
+        let fast = DemoSettings {
+            time_scale: 100.0,
+            record_shutter_subframes: 99,
+            ..Default::default()
+        };
+        assert_eq!(fast.clamped_time_scale(), TIME_SCALE_MAX);
+        assert_eq!(fast.shutter_subframes(), SHUTTER_SUBFRAMES_MAX);
+        let slow = DemoSettings {
+            time_scale: 0.0,
+            record_shutter_subframes: 0,
+            ..Default::default()
+        };
+        assert_eq!(slow.clamped_time_scale(), TIME_SCALE_MIN);
+        assert_eq!(slow.shutter_subframes(), 1);
     }
 
     #[test]
@@ -6314,8 +6454,8 @@ mod tests {
             ..analytic
         };
         assert_eq!(
-            compute_ias_classic_state(&analytic, 0.0, 0.0).0,
-            compute_ias_classic_state(&dragged, 0.0, 0.0).0,
+            compute_ias_classic_state(&analytic, 0.0, 0.0),
+            compute_ias_classic_state(&dragged, 0.0, 0.0),
             "segment sliders must not rebuild the IAS while the glass is analytic"
         );
         let mesh = DemoSettings {
@@ -6327,8 +6467,8 @@ mod tests {
             ..dragged
         };
         assert_ne!(
-            compute_ias_classic_state(&mesh, 0.0, 0.0).0,
-            compute_ias_classic_state(&mesh_dragged, 0.0, 0.0).0,
+            compute_ias_classic_state(&mesh, 0.0, 0.0),
+            compute_ias_classic_state(&mesh_dragged, 0.0, 0.0),
             "mesh glass must rebuild the IAS when its GAS changes"
         );
     }

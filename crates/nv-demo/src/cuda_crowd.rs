@@ -37,8 +37,7 @@ const SCATTER_VISIBLE_EXTRA_FLAGS: u32 = inst_flags::DYNAMIC
     | inst_flags::CROWD_BONE;
 
 /// OptiX instance flag disabling any-hit programs on opaque crowd bone instances.
-const OPTIX_INST_DISABLE_ANYHIT: u32 =
-    optix::sys::OptixInstanceFlags_OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT as u32;
+const OPTIX_INST_DISABLE_ANYHIT: u32 = optix::INSTANCE_FLAG_DISABLE_ANYHIT;
 
 const _: () = assert!(OPTIX_INST_DISABLE_ANYHIT == 4);
 const _: () = assert!(CSG_SBT_PRIM_OFFSET == 10);

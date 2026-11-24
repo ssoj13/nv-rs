@@ -540,6 +540,47 @@ pub(crate) fn ptx_cache_key_128(
     (h0, h1)
 }
 
+/// 128-bit content digest of every regular file under `dir` (relative path and bytes, in sorted
+/// path order), used to key the PTX cache on the header set that is actually included (an
+/// in-place SDK update changes it, a changed path string alone would not).
+pub(crate) fn dir_content_digest(dir: &Path) -> Result<[u8; 16], String> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let entries =
+            std::fs::read_dir(&d).map_err(|e| format!("read_dir {}: {e}", d.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read_dir {}: {e}", d.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("file_type {}: {e}", path.display()))?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut acc = (0u64, 0u64);
+    for path in &files {
+        let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let rel = path.strip_prefix(dir).unwrap_or(path).to_string_lossy();
+        acc = ptx_cache_key_128(
+            &rel,
+            "dir_content_digest",
+            0,
+            "",
+            &[&acc.0.to_le_bytes()[..], &acc.1.to_le_bytes()[..], &bytes[..]],
+        );
+    }
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&acc.0.to_le_bytes());
+    out[8..].copy_from_slice(&acc.1.to_le_bytes());
+    Ok(out)
+}
+
 /// Queries the installed CUDA driver version once for PTX cache key invalidation across driver upgrades.
 fn cached_cuda_driver_version() -> i32 {
     static DRIVER_VER: OnceLock<i32> = OnceLock::new();
@@ -662,7 +703,8 @@ fn compile_and_store_ptx(
 /// `cuModuleLoadData` or `optix::Module`.
 ///
 /// Prefer [`load_ptx_cached`] when the caller loads the PTX itself: it evicts a cached image the
-/// driver rejects instead of failing on every start.
+/// driver rejects instead of failing on every start. Only the NVRTC build (no embedded PTX) uses it.
+#[cfg(not(has_embedded_ptx))]
 pub(crate) fn compile_ptx_cached(
     src: &str,
     unit_name: &str,
@@ -677,7 +719,7 @@ pub(crate) fn compile_ptx_cached(
     compile_and_store_ptx(src, unit_name, &entry)
 }
 
-/// Like [`compile_ptx_cached`], then hands the PTX to `load`. When a *cached* image fails to load
+/// Like `compile_ptx_cached`, then hands the PTX to `load`. When a *cached* image fails to load
 /// (truncated or corrupt file, or PTX the current driver rejects), the entry is deleted, the source
 /// is recompiled and loaded once more; a freshly compiled image that fails returns `load`'s error.
 pub(crate) fn load_ptx_cached<T>(
@@ -1466,5 +1508,26 @@ mod tests {
         assert!(len > 0);
         let stored = std::fs::read(&entry.path).expect("recompiled entry stored");
         assert!(has_ptx_header(&stored));
+    }
+
+    #[test]
+    fn dir_content_digest_tracks_header_bytes_not_just_paths() {
+        let root = std::env::temp_dir().join(format!("nv_demo_digest_{}", std::process::id()));
+        let inner = root.join("internal");
+        std::fs::create_dir_all(&inner).expect("create digest test tree");
+        std::fs::write(root.join("optix.h"), b"#define OPTIX_VERSION 90000
+").expect("write");
+        std::fs::write(inner.join("types.h"), b"typedef int T;
+").expect("write");
+        let before = dir_content_digest(&root).expect("digest");
+        assert_eq!(before, dir_content_digest(&root).expect("digest again"));
+
+        std::fs::write(root.join("optix.h"), b"#define OPTIX_VERSION 90100
+").expect("write");
+        let after = dir_content_digest(&root).expect("digest after in-place update");
+        assert_ne!(before, after, "an in-place header update must change the digest");
+
+        assert!(dir_content_digest(&root.join("missing")).is_err());
+        std::fs::remove_dir_all(&root).expect("remove digest test tree");
     }
 }

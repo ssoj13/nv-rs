@@ -14,7 +14,7 @@ Direct static inspection of the compiled `raytracer.ptx` (`2.74 MB`, `63,759` li
 - **Massive `.local` stack spills**:
   - `csg_trace_rpn_slow` (`csg_eval.cuh:4795`): `.local .align 16 .b8 __local_depot15[4224]` — **4.2 KiB per thread** allocated unconditionally even for small RPNs or shadow hits.
   - `__intersection__csg` (`raytracer.cu:2837`): `__local_depot28[112]` (`112 B` per thread — `CsgSceneView` 80 B + `CsgHit` 32 B spilled to local memory).
-  - `__intersection__csg_prim` (`raytracer.cu:2879`): `__local_depot29[32]` (`32 B` per thread — even for single-primitive SBT-5 `BOX`!).
+  - `__intersection__csg_prim` (`raytracer.cu:2879`): `__local_depot29[32]` (`32 B` per thread — even for a single-primitive `BOX` on the `hit_csg_prim` group (SBT offset `10`, `CSG_SBT_PRIM_OFFSET`)!).
   - `__raygen__render` (`raytracer.cu:1757`): `36,361` PTX lines, **`25,534` `.f32` virtual registers**, `80 B` `.local` spill.
   - `csg_intersect_road_terrain_direct` (`csg_eval.cuh:2732`): **`4,206` `.f32` virtual registers** due to `__forceinline__` of `csg_eval_road_cell_height` (`2294`) 6+1 times.
 - **Read-only cache underutilization**: `282` non-nc `ld.global` vs only `30` `ld.global.nc` (`__ldg`) across CSG traversal; `csg_materials` (`5.4 KiB`) fetched via global memory instead of `__constant__`.
@@ -30,7 +30,7 @@ Direct static inspection of the compiled `raytracer.ptx` (`2.74 MB`, `63,759` li
 | --- | --- | --- |
 | Multi-AABB Custom Primitive GAS for `PURE_UNION` | SM linear scan of 10–120 prim compounds | **2x–6x RT speedup** on dense buildings/marina/vehicles (`0` extra GAS count) |
 | Eliminate `.local` spills + `__ldg` + `__constant__` palette + AABB pre-check | Local memory thrash & low SM occupancy | **1.3x–2.0x RT speedup** |
-| Dedicated Shadow SBT + Typed Payloads + `DISABLE_ANYHIT` + SER `mat_id` fix | Shadow ray overhead & warp divergence | **1.25x–1.55x RT speedup** |
+| Dedicated Shadow SBT (plain 8-word payloads, no typed payloads) + `DISABLE_ANYHIT` + SER `mat_id` fix | Shadow ray overhead & warp divergence | **1.25x–1.55x RT speedup** |
 | AOV Mode Early-Out (skip shading/shadows/16-bounce loop) | `aov_mode != 0` wasted shading | **2x–4x AOV FPS** |
 | Half-Res 7-Smooth `FftBloomPass` + Pre-Normalized PSF | Full-res `2048²`/`4096²` cuFFT (`~302 MiB` @ 4K) | **4x–7x bloom speedup** (`1.15x–1.35x` total FPS @ 4K) |
 | Fix `!show_classic` IAS bug + Static-Tail Split + Async GPU Crowd | Full 50k IAS rebuild & mid-frame GPU sync | **Eliminates 10–30 ms/frame CPU+sync stalls** |

@@ -1,6 +1,6 @@
 # Architecture and runtime flows
 
-Doc sync 2026-11-23 against `072dd51` (`csg-rs` `f7c8474a`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
+Doc sync 2026-11-23 against `1467778` (`csg-rs` `f7c8474a`). See [repository guidance](AGENTS.md), [crate codepaths](crates/AGENTS.md), the closed [`nv-demo` acceleration plan](plan1.md) and the open [workspace remediation plan](plan2.md).
 
 ## Build architecture
 
@@ -22,7 +22,7 @@ flowchart TD
   PTX --> App
 ```
 
-Prebuilt fallback depends on matching artifacts. Static-link shapes still require native link inputs; normal export shapes load libraries at runtime.
+Prebuilt bindings replace generation only when requested (`NV_RS_USE_PREBUILT=1`), the SDK is absent, or libclang cannot be loaded; any other generator failure is a build error. Static-link shapes still require native link inputs; normal export shapes load libraries at runtime.
 
 ## First call and cached failures
 
@@ -112,9 +112,9 @@ flowchart TD
 
 ## Systemic defects found by the workspace audit (`plan2.md`, 2026-11-23)
 
-Status: the first diagram was measured on GPU and is real only for stream-ordered buffers (`DeviceBuffer::uninitialized_async`) used across streams; it is closed for `curand` and for `python/nv-py` bindings that go through `buf_util::enqueue_leased`. The second and third are being repaired in Waves 5 and 3.
+Status (HEAD `1467778`): all three diagrams below are closed. They show the state at audit time; the fixed flows are given after each one. Gates: root workspace clippy clean, 467 passed / 0 failed / 205 ignored (`wave_1b.md`); `python/` clippy clean, pytest 80 passed / 1 failed (NVAPI sees 0 displays, environment) / 1 skipped. Not verified: Linux-only code, CI workflows, interactive `nv-demo` features (see `TODO.md`).
 
-Async work outlives a stream-ordered buffer used on another stream:
+Async work outlives a stream-ordered buffer used on another stream (audit-time hazard; real only for `DeviceBuffer::uninitialized_async` used across streams, measured 20/20 in Rust and 10/10 from Python):
 
 ```mermaid
 sequenceDiagram
@@ -130,27 +130,32 @@ sequenceDiagram
     S1--xS1: kernel reads/writes freed device memory
 ```
 
-Binding generation silently falls back to prebuilt output (`nv-bindgen`):
+Fixed: `curand` and every `python/nv-py` binding take a `cuda-core` access lease (`cuda_core_ext::lease::enqueue_leased`); wrapper-internal scratch stays on one checked stream; `cusparse` SpSV/SpSM/SpGEMM own their buffers. Other wrappers deliberately take no lease (decision in `plan2.md`).
+
+Binding generation (`nv-bindgen::generate`), current flow. Before the repair any generator failure silently used prebuilt output and the fallback was sticky:
 
 ```mermaid
 flowchart TD
-    A[sys build.rs: nv_bindgen::generate] --> B{SDK headers found?}
-    B -- no --> P[use prebuilt/ bindings]
-    B -- yes --> C[bindgen + shims]
-    C -- ok --> O[OUT_DIR output + rerun-if-changed on headers]
-    C -- Bindgen / HeaderNotFound error --> P
-    C -- any panic, caught by catch_unwind --> P
-    P --> W[one cargo warning: libclang is unavailable]
-    P --> X[header sha256 not compared with installed SDK]
-    P --> Y[no rerun-if-env-changed for LIBCLANG_PATH: fallback is sticky until cargo clean]
+    A[sys build.rs: nv_bindgen::generate] --> R{NV_RS_USE_PREBUILT=1?}
+    R -- yes --> P[prebuilt/ bindings, named in a cargo warning]
+    R -- no --> B{SDK headers found?}
+    B -- no --> P
+    B -- yes --> L{libclang loads?}
+    L -- no --> P
+    L -- yes --> C[bindgen + shims]
+    C -- ok --> O[OUT_DIR output + rerun triggers: SDK roots, libclang vars, found headers]
+    C -- bindgen error / missing header / panic --> E[build error with its own cause]
+    P --> H[prebuilt header sha256 compared with the installed SDK; differences warned]
+    P --> Z[SDK installed later or libclang fixed: rerun triggers refresh the build, fallback is not sticky]
 ```
 
-`nv-demo` render-worker failure path:
+Static-link specs (NGX) never fall back to prebuilt when the SDK is absent.
+
+`nv-demo` render-worker failure path, current flow. Before the repair the worker panicked on `expect` / `assert` and the UI froze:
 
 ```mermaid
 flowchart LR
-    R[renderer.rs worker: expect / assert on driver error] --> D[thread panics]
-    D --> U[UI never polls is_finished]
-    U --> F[viewport frozen, recording left open, lockstep waits forever]
-    D -. only at exit .-> J[join reports the panic]
+    R[renderer.rs worker: driver error] --> F[RenderEvent::Fatal]
+    F --> U[UI status line, no further render work is sent]
+    R -. panic without Fatal .-> J[UI polls JoinHandle::is_finished and reports the panic payload]
 ```

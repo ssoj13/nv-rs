@@ -3,7 +3,19 @@
 **Audit date**: 2026-11-23
 **Baseline**: `nv-rs` `b235d78` (`main`), `csg-rs` `f7c8474a` (from `Cargo.lock`)
 **Scope**: the whole repository: all `crates/*`, `xtask`, `bootstrap.py`, CI, and the excluded `device/` and `python/` workspaces. `plan1.md` (fully closed) covered `crates/nv-demo` only.
-**Status**: findings only. Nothing in the source tree was changed. Remediation waits for operator approval.
+**Status** (updated 2026-11-23 at HEAD `1467778`): Waves 1, 1b, 2, 3, 5 and 6 are implemented and gated; Wave 7 (documentation) is in progress. The audit sections below describe the state at audit time; the remediation checklist and "Execution record" give the current truth.
+
+- **Done and gated** (RTX 3080 Ti, CUDA 13.3):
+  - Waves 1-2 and follow-up: `05efa7e` (clippy clean, 375 passed / 0 failed).
+  - Wave 3 `nv-demo` and Wave 5 loader / bindgen / sys / `xtask` / `bootstrap.py` / CI: root gate `4f457d0`, `audit/2026-11-23/gate_root_w3_w5.md` (clippy clean, 467 passed / 0 failed / 204 ignored, `nv-demo` starts and renders Old Gundo with DLSS RR and the CUDA crowd).
+  - Wave 6 `python/nv-py`: gate `8f7af2f`, `gate_python_w6.md`. Wave 6 `device/`: `c04d692`, `wave_6_device.md` (15 of 15 GPU cases pass).
+  - Wave 1b cross-crate items: `1467778`, `wave_1b.md` (root: clippy clean, 467 passed / 0 failed / 205 ignored; python: pytest 80 passed / 1 failed (NVAPI sees 0 displays, environment) / 1 skipped).
+- **Remains** (details and owners in `TODO.md`):
+  - `nv-demo` follow-ups: `ui.rs` animation sliders from `demo_anim::anim_range`, previous classic transforms for object motion (`GPU:D03`), fractal shape parameters in probe / SDG launches (`GPU:D21`), `prev_camera` during SDG bursts, dock layout persistence (`APP:F19`), pinned staging growth (`RND:H13`), `nv-wgpu` `submit_vulkan_commands` timeout.
+  - csg-rs `125b870` adoption: branch `csg-rs-adoption` is being finished by a separate agent; change list in `audit/2026-11-23/csg_rs_125b870_adoption.md`.
+  - Interactive checks of `nv-demo` that no gate performed: other AOVs, the four sensor projections, MP4 recording, SDG burst and cancel, Traffic toggle, day/night crossfade, cursor modes, camera feel after the `camera-rs` switch.
+  - Never executed or compiled: Linux-only code (`cufile` GDS, `nccl`, Linux loader search, the Linux branches of `python/nv-py` `platform_ext.rs` and of `cudnn-sys`), and the CI workflows and `cargo deny` (written in `a246a6a`, never run).
+  - Smaller open items: remaining wrapper duplication (`OPX:S1..S4`, `SOL:S5`, `SOL:N5`, `BLA:LT-09`, `MED:X-2`, `IOP:NW-20`, `IOP:CE-09`), `xtask` consuming `nv_loader::catalog` and shipping `dlssd`, `DPY:C20` (`close()` / `__exit__`), a CI job that builds `device/`, `git rm --cached` of the device pipeline lock file, `nv-demo/AGENTS.md` and the `optix` module-doc drift.
 
 ## How this audit was done
 
@@ -152,25 +164,25 @@
 Every fix starts with a test that reproduces the defect. Items rated PLAUSIBLE are confirmed (ignored GPU test or `compute-sanitizer --tool memcheck`) before code changes.
 
 ### Wave 1 - Systemic memory safety in wrapper crates
-- [ ] **W1.1** Buffer leases. Reproduction and helper prototype done (see systemic 1); scope of the rollout is an open operator decision because the measured exposure is narrower than reported: (a) lease every wrapper entry point (uniform, about +2 us per call, new `NOT_READY` errors), (b) lease only where stream-ordered buffers can cross streams (`python/nv-py`, plus any wrapper-internal scratch found to be used off its own stream), or (c) no leases in wrappers, document the contract and fix `nv-py` only | verify: `crates/curand/tests/lease.rs`-style test per leased entry point; `cargo test -p <crate> --quiet`
-- [ ] **W1.2** Context rule: every FFI entry and every `Drop` binds its context; fix `cublas::Handle::set_stream` cache hit, `cusolver` Dn/Sp, `cusparse` handle, listed `Drop` impls | verify: cross-thread unit test per handle type
-- [ ] **W1.3** `Send`/`Sync` soundness: `cufft::Plan`, `ngx::VulkanSession`, `nccl::GroupGuard`, `nvdec::VideoDecoder`, `nvofa`, `nvjpeg` states | verify: `static_assertions`-style compile tests (`assert_not_impl_any!`)
-- [ ] **W1.4** Workspace ownership: `cublas::set_workspace`, `cufft` scratch lock across exec, `cusparse` SpSV/SpSM/SpGEMM buffers, `nvcomp` receipt generation | verify: targeted tests that grow or drop the scratch between phases
-- [ ] **W1.5** Validation gaps: `nvjpeg` decode/encode sizes, `cusparse` scalar type and CSR `nnz`, cuBLASLt raw attribute setters, `cufft` embed/stride overlap, GEMM batch stride, `nvcomp` header trust | verify: negative unit tests, no GPU needed where the check is host-side
-- [ ] **W1.6** Typed teardown error sink replacing the `CUDA_ERROR_UNKNOWN` mapping; unify the four `Scratch` implementations under one owner | verify: `cargo clippy --workspace --all-targets` + `cargo test --workspace`
+- [x] **W1.1** Done (`8e84de4`, `05efa7e`; decision: targeted, see "Decisions taken by the lead"). Buffer leases. Reproduction and helper prototype done (see systemic 1); the rollout scope was an operator decision because the measured exposure is narrower than reported: (a) lease every wrapper entry point (uniform, about +2 us per call, new `NOT_READY` errors), (b) lease only where stream-ordered buffers can cross streams (`python/nv-py`, plus any wrapper-internal scratch found to be used off its own stream), or (c) no leases in wrappers, document the contract and fix `nv-py` only | verify: `crates/curand/tests/lease.rs`-style test per leased entry point; `cargo test -p <crate> --quiet`
+- [x] **W1.2** Done (`05efa7e` gate; context identity by value in Wave 1b `1467778`). Context rule: every FFI entry and every `Drop` binds its context; fix `cublas::Handle::set_stream` cache hit, `cusolver` Dn/Sp, `cusparse` handle, listed `Drop` impls | verify: cross-thread unit test per handle type
+- [x] **W1.3** Done (`05efa7e`). `Send`/`Sync` soundness: `cufft::Plan`, `ngx::VulkanSession`, `nccl::GroupGuard`, `nvdec::VideoDecoder`, `nvofa`, `nvjpeg` states | verify: `static_assertions`-style compile tests (`assert_not_impl_any!`)
+- [x] **W1.4** Done (`05efa7e`). Workspace ownership: `cublas::set_workspace`, `cufft` scratch lock across exec, `cusparse` SpSV/SpSM/SpGEMM buffers, `nvcomp` receipt generation | verify: targeted tests that grow or drop the scratch between phases
+- [x] **W1.5** Done (`05efa7e`). Validation gaps: `nvjpeg` decode/encode sizes, `cusparse` scalar type and CSR `nnz`, cuBLASLt raw attribute setters, `cufft` embed/stride overlap, GEMM batch stride, `nvcomp` header trust | verify: negative unit tests, no GPU needed where the check is host-side
+- [x] **W1.6** Done in Wave 1b (`1467778`, `wave_1b.md`: `cuda_core_ext::teardown`, `cuda_core_ext::scratch`; `optix::Scratch` kept separate for its temp/output accounting). Typed teardown error sink replacing the `CUDA_ERROR_UNKNOWN` mapping; unify the four `Scratch` implementations under one owner | verify: `cargo clippy --workspace --all-targets` + `cargo test --workspace`
 
 ### Wave 2 - OptiX and graphics interop
-- [ ] **W2.1** `optix`: `InstanceBuffer` staging fence or slot ring (`OPX:A1`), reject in-place tiled denoise (`OPX:D1`), grow-failure state (`OPX:A2`), budget and context checks in `instances_into` (`OPX:A3..A5`), async compaction alloc (`OPX:A7`), report pinned fallback (`OPX:A9`) | verify: new `InstanceBuffer` / tiled-denoise tests in `crates/optix/tests`
-- [ ] **W2.2** `nv-wgpu`: semaphore drop order and pending-work wait (`IOP:NW-01`), make `with_vulkan_barrier_queue` unsafe or validated (`IOP:NW-02`), retain `wgpu::Device` (`IOP:NW-04`, `IOP:NW-05`), array descriptors and colour-attachment flag (`IOP:NW-06`, `IOP:NW-07`, needs `IOP:CE-05`), full-subresource barrier (`IOP:NW-09`), queue synchronisation (`IOP:NW-03`, `IOP:NW-11`) | verify: kernel-level GPU tests (`tex2D` / `surf2Dwrite`, mips, cubemap, 1D)
-- [ ] **W2.3** `cuda-core-ext`: cubemap mip levels (`IOP:CE-01`), mip count clamp (`IOP:CE-02`), semaphore drop contract (`IOP:CE-03`) | verify: `cargo test -p cuda-core-ext --quiet` + ignored GPU tests
+- [x] **W2.1** Done (`05efa7e`). `optix`: `InstanceBuffer` staging fence or slot ring (`OPX:A1`), reject in-place tiled denoise (`OPX:D1`), grow-failure state (`OPX:A2`), budget and context checks in `instances_into` (`OPX:A3..A5`), async compaction alloc (`OPX:A7`), report pinned fallback (`OPX:A9`) | verify: new `InstanceBuffer` / tiled-denoise tests in `crates/optix/tests`
+- [x] **W2.2** Done (`05efa7e`; encoder-based submit, `with_vulkan_barrier_queue` removed). `nv-wgpu`: semaphore drop order and pending-work wait (`IOP:NW-01`), make `with_vulkan_barrier_queue` unsafe or validated (`IOP:NW-02`), retain `wgpu::Device` (`IOP:NW-04`, `IOP:NW-05`), array descriptors and colour-attachment flag (`IOP:NW-06`, `IOP:NW-07`, needs `IOP:CE-05`), full-subresource barrier (`IOP:NW-09`), queue synchronisation (`IOP:NW-03`, `IOP:NW-11`) | verify: kernel-level GPU tests (`tex2D` / `surf2Dwrite`, mips, cubemap, 1D)
+- [x] **W2.3** Done (`05efa7e`). `cuda-core-ext`: cubemap mip levels (`IOP:CE-01`), mip count clamp (`IOP:CE-02`), semaphore drop contract (`IOP:CE-03`) | verify: `cargo test -p cuda-core-ext --quiet` + ignored GPU tests
 
 ### Wave 3 - `nv-demo` correctness
-- [ ] **W3.1** Render-thread failures become `RenderEvent::Fatal` and the UI polls `is_finished()` (`RND:R5`, `APP:F12`); remove `.ok()` on AOV buffers and bloom (`RND:R6`, `RND:R7`) | verify: unit test for the event path
-- [ ] **W3.2** `GrowDeviceBuffer::upload` ordering (`RND:H1`), stale IAS after crowd-step failure (`RND:R3`), topology check in `step_gpu_direct` (`GPU:D05`), `rebuild_scene` key commit (`RND:H2`) | verify: `cargo test -p nv-demo --quiet` with injected failures
-- [ ] **W3.3** Behaviour bugs: Traffic toggle (`RND:R4`), SDG Burst completion and cancel command (`RND:R2`), denoiser fallback loop (`RND:R1`), sky crossfade parameters (`RND:R10`) | verify: targeted unit tests
-- [ ] **W3.4** SDG data: range/depth for non-pinhole sensors (`GPU:D01`), motion vectors for all projections and classic geometry (`GPU:D02`, `GPU:D03`), Cryptomatte ids (`GPU:D04`, needs a `csg-rs` decision on `part_id`) | verify: PTX compile + golden EXR check per sensor projection
-- [ ] **W3.5** Capture and persistence: PNG under DLSS-RR (`APP:F01`, `APP:F10`), unique output names (`APP:F03`), atomic MP4 with finalisation on drop (`CAM:D01`, `CAM:D02`), config parse failure keeps the user file (`APP:F07`), scene persisted by descriptor id (`APP:F17`) | verify: unit tests for naming, persistence and muxer finalisation
-- [ ] **W3.6** Frame loop and UI: surface-lost path (`APP:F02`), Live RT timing (`APP:F04`), time-of-day override (`APP:F05`), EV range (`APP:F06`), DLSS aspect (`APP:F09`), export pool eviction (`APP:F11`), `dt` clamp (`CAM:D03`) | verify: `cargo test -p nv-demo --quiet`
+- [x] **W3.1** Done (`4f457d0`, `gate_root_w3_w5.md`); interactive behaviour not checked, see Status. Render-thread failures become `RenderEvent::Fatal` and the UI polls `is_finished()` (`RND:R5`, `APP:F12`); remove `.ok()` on AOV buffers and bloom (`RND:R6`, `RND:R7`) | verify: unit test for the event path
+- [x] **W3.2** Done (`4f457d0`, `gate_root_w3_w5.md`); interactive behaviour not checked, see Status. `GrowDeviceBuffer::upload` ordering (`RND:H1`), stale IAS after crowd-step failure (`RND:R3`), topology check in `step_gpu_direct` (`GPU:D05`), `rebuild_scene` key commit (`RND:H2`) | verify: `cargo test -p nv-demo --quiet` with injected failures
+- [x] **W3.3** Done (`4f457d0`, `gate_root_w3_w5.md`); interactive behaviour not checked, see Status. Behaviour bugs: Traffic toggle (`RND:R4`), SDG Burst completion and cancel command (`RND:R2`), denoiser fallback loop (`RND:R1`), sky crossfade parameters (`RND:R10`) | verify: targeted unit tests
+- [x] **W3.4** Done (`4f457d0`) except that `GPU:D04` depends on the `csg-rs` `part_id` road-UV packing, which is recorded for that repository (out of scope); interactive check of the four projections not done. SDG data: range/depth for non-pinhole sensors (`GPU:D01`), motion vectors for all projections and classic geometry (`GPU:D02`, `GPU:D03`), Cryptomatte ids (`GPU:D04`, needs a `csg-rs` decision on `part_id`) | verify: PTX compile + golden EXR check per sensor projection
+- [x] **W3.5** Done (`4f457d0`, `gate_root_w3_w5.md`); interactive behaviour not checked, see Status. Capture and persistence: PNG under DLSS-RR (`APP:F01`, `APP:F10`), unique output names (`APP:F03`), atomic MP4 with finalisation on drop (`CAM:D01`, `CAM:D02`), config parse failure keeps the user file (`APP:F07`), scene persisted by descriptor id (`APP:F17`) | verify: unit tests for naming, persistence and muxer finalisation
+- [x] **W3.6** Done (`4f457d0`, `gate_root_w3_w5.md`); interactive behaviour not checked, see Status. Frame loop and UI: surface-lost path (`APP:F02`), Live RT timing (`APP:F04`), time-of-day override (`APP:F05`), EV range (`APP:F06`), DLSS aspect (`APP:F09`), export pool eviction (`APP:F11`), `dt` clamp (`CAM:D03`) | verify: `cargo test -p nv-demo --quiet`
 
 ### Wave 4 - Single source of truth
 - [x] **W4.1** `camera-rs` per decision 2; remove the blanket allow at `main.rs:7,9` | verify: `cargo clippy -p nv-demo --all-targets` with no module-level allow
@@ -179,21 +191,21 @@ Every fix starts with a test that reproduces the defect. Items rated PLAUSIBLE a
   - Inherited from upstream, closes `CAM:D03`, `CAM:D04`, `CAM:D20`: `MAX_DT = 0.1` clamp, coast speed clamp, no look-inertia coast after hold-fly. `CAM:D05`, `CAM:D06`, `CAM:D07` are closed by the removal.
   - Not verified (needs a run on the GPU machine): interactive feel. Upstream requests a `Hidden` cursor (not `Locked`) during RMB hold-to-fly, which touches the `CursorGrabController` path in `main.rs`; `NavScheme::Studio` is new and was added to the three scheme name tables (`persist.rs`, `ui.rs`).
   - Still open from `APP:F21`: `persist.rs:313-374` and `ui.rs:145-164` keep hand-written string tables although `serde` derives are now available; left as is to keep the on-disk config format unchanged.
-- [ ] **W4.2** One DLL spec catalog consumed by sys crates, `nv-loader::diag` and `xtask stage-dlls` | verify: xtask test comparing the catalogs is deleted because only one remains
-- [ ] **W4.3** Remaining duplicates listed above (function-table loader macro, media plane math, `optix` build-input packing, `nv-demo` FOV / animation ranges / AOV tables / SDK discovery) | verify: `cargo test --workspace`
+- [x] **W4.2** Done in Wave 5 (`7a62138`, gated `4f457d0`): `nv_loader::catalog` is the single owner; `xtask` still has its own table until it consumes the catalog (open, `TODO.md`). One DLL spec catalog consumed by sys crates, `nv-loader::diag` and `xtask stage-dlls` | verify: xtask test comparing the catalogs is deleted because only one remains
+- [ ] **W4.3** Open. Function-table loader macro done in Wave 5 (`cached_loader!` replaced three hand-written loaders); media plane math, `optix` build-input packing and the `nv-demo` FOV / animation / AOV / SDK-discovery duplicates remain. Remaining duplicates listed above (function-table loader macro, media plane math, `optix` build-input packing, `nv-demo` FOV / animation ranges / AOV tables / SDK discovery) | verify: `cargo test --workspace`
 
 ### Wave 5 - Build, release and CI
-- [ ] **W5.1** `nv-bindgen`: no prebuilt fallback after a generator panic or when the SDK is present; verify prebuilt header hashes; complete `rerun-if-*` (`LDR:L-01..L-03`, `LDR:L-16`); typed NCCL device-header detection (`LDR:L-04`); runtime version check (`LDR:L-06`, wires the unused `check_version`) | verify: `nv-bindgen-fixture` tests
-- [ ] **W5.2** `xtask`: `stage-dlls` fails on missing requested libs and ships `nvngx_dlssd.dll` (`SYS:X-1`, `SYS:X-2`); prebuilt completeness instead of mtime (`SYS:X-5`); atomic writes (`SYS:X-6`) | verify: `cargo test -p xtask --quiet`
-- [ ] **W5.3** `bootstrap.py`: atomic unpack, pinned revisions with checksums (`SYS:B-1`, `SYS:B-2`) | verify: interrupted-unpack test
-- [ ] **W5.4** CI: clippy and tests for the whole workspace on Windows and Linux, `cargo deny`, one toolchain pin (`SYS:B-3..B-6`); mark GPU tests in `cuda_crowd.rs` `#[ignore]` (`GPU:D26`) | verify: green CI run
+- [x] **W5.1** Done (`7a62138`, gated `4f457d0`; no prebuilt fallback on generator failure, header-hash warning, runtime version gate). `nv-bindgen`: no prebuilt fallback after a generator panic or when the SDK is present; verify prebuilt header hashes; complete `rerun-if-*` (`LDR:L-01..L-03`, `LDR:L-16`); typed NCCL device-header detection (`LDR:L-04`); runtime version check (`LDR:L-06`, wires the unused `check_version`) | verify: `nv-bindgen-fixture` tests
+- [ ] **W5.2** Mostly done (`stage-dlls` fails on missing libs, completeness instead of mtime, atomic writes; gated `4f457d0`); open: `xtask` consuming `nv_loader::catalog` and shipping `nvngx_dlssd.dll` from it, `release.yml` `$LASTEXITCODE` check. `xtask`: `stage-dlls` fails on missing requested libs and ships `nvngx_dlssd.dll` (`SYS:X-1`, `SYS:X-2`); prebuilt completeness instead of mtime (`SYS:X-5`); atomic writes (`SYS:X-6`) | verify: `cargo test -p xtask --quiet`
+- [x] **W5.3** Done (`a246a6a`; not executed end to end). `bootstrap.py`: atomic unpack, pinned revisions with checksums (`SYS:B-1`, `SYS:B-2`) | verify: interrupted-unpack test
+- [ ] **W5.4** Written (`a246a6a`) but the workflows were never executed and `cargo deny` never run, so not verified; `GPU:D26` done. CI: clippy and tests for the whole workspace on Windows and Linux, `cargo deny`, one toolchain pin (`SYS:B-3..B-6`); mark GPU tests in `cuda_crowd.rs` `#[ignore]` (`GPU:D26`) | verify: green CI run
 
 ### Wave 6 - `device/` and `python/`
-- [ ] **W6.1** `device/`: single `cuda-core` source (decision 3) so the 15 GPU cases build; `u16` PTX params (`DPY:D2`) | verify: `device` workspace build + test run on hardware
-- [ ] **W6.2** `python/nv-py`: DLPack strides/dtype/contiguity/device checks (`DPY:P1`, `DPY:X3`, `DPY:P5`), stream handling (`DPY:P2..P4`, `DPY:X2`), NVENC stream ownership (`DPY:V1`), NCCL temp-buffer ordering (`DPY:PE-01`), swallowed errors (`DPY:P8`, `DPY:NV-01`) | verify: pytest negative cases
+- [x] **W6.1** Done (`c04d692`, `wave_6_device.md`; open: CI job for `device/`, `git rm --cached` of the tracked pipeline lock). `device/`: single `cuda-core` source (decision 3) so the 15 GPU cases build; `u16` PTX params (`DPY:D2`) | verify: `device` workspace build + test run on hardware
+- [x] **W6.2** Done (`8f7af2f` gate, `1467778`; open: `DPY:C20` `close()` / `__exit__`, precise `__dlpack__` wait needs a `cuda-core` API). `python/nv-py`: DLPack strides/dtype/contiguity/device checks (`DPY:P1`, `DPY:X3`, `DPY:P5`), stream handling (`DPY:P2..P4`, `DPY:X2`), NVENC stream ownership (`DPY:V1`), NCCL temp-buffer ordering (`DPY:PE-01`), swallowed errors (`DPY:P8`, `DPY:NV-01`) | verify: pytest negative cases
 
 ### Wave 7 - Documentation
-- [ ] **W7.1** Correct `crates/nv-demo/AGENTS.md`, root `AGENTS.md`, `plan1.md:33`, `optix` module docs as listed under Documentation drift; add the systemic defects to `## Traps` | verify: every cited constant re-read in source
+- [ ] **W7.1** In progress: root `AGENTS.md`, `crates/AGENTS.md`, `plan1.md`, `DIAGRAMS.md`, `plan2.md`, `TODO.md` updated; open: `crates/nv-demo/AGENTS.md` (another agent is merging a branch there). Correct `crates/nv-demo/AGENTS.md`, root `AGENTS.md`, `plan1.md:33`, `optix` module docs as listed under Documentation drift; add the systemic defects to `## Traps` | verify: every cited constant re-read in source
 
 ## Execution record - Waves 1 and 2 (2026-11-23)
 
@@ -239,6 +251,17 @@ Eleven edit-only workers re-verified every finding in their crates before changi
 - Systemic 1 inside the wrappers: scratch buffers in `cublas`, `cudnn`, `cusolver`, `nvcomp`, `optix` are allocated and used on one checked stream. The only real cross-stream cases were `cusparse` SpSV/SpSM/SpGEMM (fixed by ownership, no lease) and caller-supplied buffers (`curand`, leased).
 - Narrower than reported: `SYS:CUPTI-3` (field offsets are identical across record versions, so values were read correctly; the reference to a larger struct was formal UB and is fixed).
 
+### Findings refuted or narrowed in Waves 3, 5, 6 and 1b (no code change for the refuted part)
+- `device/` `DPY:D3` fix direction (re-export `cuda_device` from `optix_device`): not possible. `ptx_asm!` itself expands to `cuda_device::ptx::...` (fork `cuda-macros/src/ptx_asm.rs:288,332,369,380`), so the dependency stays; the requirement is documented (`wave_6_device.md`).
+- `DPY:D7` (`PLAUSIBLE` stale doc): confirmed by test, not a defect in the code. A stack-local `Footprint2d` works under the 64-bit pointer build (`__local_depot` plus `cvta.local`); only the doc changed.
+- `DPY:D9`: not a wrapper bug (the wrapper matches `optix_device_impl.h`); driver 621.24 still returns key 0 for the current-hit vertices, so the test accepts both documented and observed behaviour.
+- `DPY:D2` was `PLAUSIBLE`; hardware confirmed it (`got 3060 want 65517`), so it was fixed, not refuted.
+- Wave 3 follow-up "`spin_speed` is unreachable in `ui.rs`": refuted; it is reachable at `ui.rs:805` with the same range as `demo_anim` (only the UI-wide switch to `anim_range` stays open).
+- Wave 3 follow-up "`cudnn` is the only crate comparing contexts with `Arc::ptr_eq`": refuted; `same_stream` and the `cublas` handle did too, so the fix became the workspace-wide `same_context` / `same_stream` by value in Wave 1b.
+- Wave 5 / python gate: `python/nv-py` `probe_libraries` keys changing (`nvoptix` -> `optix`, `nvofapi` -> `nvofa`) and `NV_RS_DEBUG` meaning: nothing in `python/` depends on them (`gate_python_w6.md` section 4).
+- Wave 5 loader attributed for the `import torch` `WinError 127`: not established. Two cuDNN 9 builds cannot share a Windows process, and the root gate judged the old code equally affected (not verified); the pytest failure was test order (a file that loads cuDNN through nv-rs ran before torch was imported), fixed in `tests/conftest.py` by importing torch first (`wave_1b.md` item 7). The rejection `reject_foreign_copy` from the root gate was superseded by adopting the loaded copy.
+- Per-item verdicts for the 37 loader findings (`LDR:L-01..L-37`) and the `nv-demo` / `xtask` ledgers exist only in the worker handoff notes (`HANDOFF.md` M1, commit message `7a62138`), not as per-finding refuted lines here; no separate refuted list for them was recorded.
+
 ### Decisions taken by the lead (operator delegated design decisions on 2026-11-23)
 | Topic | Decision | Rejected alternative and why |
 | --- | --- | --- |
@@ -268,7 +291,7 @@ Eleven edit-only workers re-verified every finding in their crates before changi
 - `optix`: in-place tiled denoise, streams/SBTs of another CUDA context are rejected; compacting builds need about twice the output size in budget.
 - `nv-wgpu` / `cuda-core-ext`: `with_vulkan_barrier_queue` removed; drops of semaphores and shared resources wait for pending work; 2D textures import as 2D CUDA arrays; mip counts and timeline values are validated.
 
-### Open after Waves 1-2
+### Open after Waves 1-2 (state at that gate; superseded by the Status block for items later closed)
 - Needs a run of `nv-demo` on hardware: DLSS SR/RR after NGX commands moved into the wgpu encoder; camera feel after the `camera-rs` switch.
 - Needs Linux / multi-GPU: `nccl` drop behaviour, `cufile` GDS session lifetime, every Linux cfg branch touched.
 - Needs a Vulkan test harness for `ngx` (`ash` as a dev-dependency): `SYS:NGX-2`, `SYS:NGX-7`, `SYS:NGX-11` have documentation only.

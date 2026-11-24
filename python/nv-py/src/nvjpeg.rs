@@ -28,7 +28,10 @@ use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased, typed_view};
+use crate::buf_util::{
+    Access, check_buf, close_slot, closed as closed_err, drain_stream, enqueue_leased, is_closed,
+    open, poisoned, typed_view,
+};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -174,18 +177,21 @@ fn resolve_image_dims(
 }
 
 /// Decode state plus the stream its last decode was queued on.
+///
+/// The library handle lives here (declared last, so it drops after `state`) so that `close()`
+/// releases it together with the decode state.
 struct DecoderState {
     state: JpegState,
     /// nvJPEG keeps per-decode buffers in `state`; a decode on another stream waits for this one
     /// to drain first so it cannot overwrite them under queued work.
     last_stream: Arc<Stream>,
+    handle: Arc<Handle>,
 }
 
 /// GPU-accelerated JPEG decoder bound to a CUDA context and default stream.
 #[pyclass(name = "NvjpegDecoder", module = "nv_rs.nvjpeg")]
 pub struct PyNvjpegDecoder {
-    handle: Arc<Handle>,
-    state: Arc<Mutex<DecoderState>>,
+    state: Arc<Mutex<Option<DecoderState>>>,
     stream: PyStream,
 }
 
@@ -211,11 +217,11 @@ impl PyNvjpegDecoder {
             .map_err(|e| map_nvjpeg_err("NvjpegDecoder::new", e))?;
 
         Ok(Self {
-            handle,
-            state: Arc::new(Mutex::new(DecoderState {
+            state: Arc::new(Mutex::new(Some(DecoderState {
                 state,
                 last_stream: stream.inner.clone(),
-            })),
+                handle,
+            }))),
             stream: stream.clone(),
         })
     }
@@ -227,11 +233,19 @@ impl PyNvjpegDecoder {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<(u32, u32, usize, &'static str)> {
         let host = copy_py_bytes(py, data, "decode_info")?;
-        let handle = self.handle.clone();
+        let state_arc = self.state.clone();
         let t0 = Instant::now();
-        let info = py
-            .detach(move || handle.image_info(&host))
-            .map_err(|e| map_nvjpeg_err("decode_info", e))?;
+        let info = py.detach(move || -> PyResult<_> {
+            let handle = {
+                let mut slot = state_arc
+                    .lock()
+                    .map_err(|_| poisoned("nvjpeg", "decode_info"))?;
+                open(&mut slot, "nvjpeg", "decode_info")?.handle.clone()
+            };
+            handle
+                .image_info(&host)
+                .map_err(|e| map_nvjpeg_err("decode_info", e))
+        })?;
 
         let w = info.widths[0];
         let h = info.heights[0];
@@ -261,7 +275,6 @@ impl PyNvjpegDecoder {
         let (fmt, bpp) = parse_output_format(output_format)?;
         let host = copy_py_bytes(py, data, "decode")?;
         let s = stream.unwrap_or(&self.stream).inner.clone();
-        let handle = self.handle.clone();
         let state_arc = self.state.clone();
         let t0 = Instant::now();
 
@@ -269,7 +282,11 @@ impl PyNvjpegDecoder {
             let map = |e| map_nvjpeg_err("decode", e);
             let invalid =
                 |msg: &str| record_and_err("nvjpeg", "decode", msg, ErrorKind::InvalidArgument);
-            let info = handle.image_info(&host).map_err(map)?;
+            let mut slot = state_arc
+                .lock()
+                .map_err(|_| invalid("decoder state mutex poisoned"))?;
+            let guard = open(&mut slot, "nvjpeg", "decode")?;
+            let info = guard.handle.image_info(&host).map_err(map)?;
             let w = info.widths[0];
             let h = info.heights[0];
             let pitch = (w as usize)
@@ -297,9 +314,6 @@ impl PyNvjpegDecoder {
             }
             .map_err(map)?;
 
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| invalid("decoder state mutex poisoned"))?;
             if guard.last_stream.cu_stream() != s.cu_stream() {
                 guard
                     .last_stream
@@ -323,6 +337,41 @@ impl PyNvjpegDecoder {
         );
         Ok(out)
     }
+
+    /// Releases the nvJPEG handle and decode state now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for the last decode's stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("nvjpeg", &st.last_stream))
+    }
+
+    /// `True` once `close()` has released the native decoder.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("nvjpeg", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the decoder; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
+    }
 }
 
 struct EncoderInner {
@@ -339,7 +388,7 @@ struct EncoderInner {
 /// GPU-accelerated JPEG encoder bound to a CUDA context and default stream.
 #[pyclass(name = "NvjpegEncoder", module = "nv_rs.nvjpeg")]
 pub struct PyNvjpegEncoder {
-    inner: Arc<Mutex<EncoderInner>>,
+    inner: Arc<Mutex<Option<EncoderInner>>>,
     stream: PyStream,
 }
 
@@ -373,14 +422,14 @@ impl PyNvjpegEncoder {
             .map_err(|e| map_nvjpeg_err("NvjpegEncoder::new", e))?;
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(EncoderInner {
+            inner: Arc::new(Mutex::new(Some(EncoderInner {
                 params,
                 state,
                 default_quality: quality,
                 default_css: css,
                 quality,
                 css,
-            })),
+            }))),
             stream: stream.clone(),
         })
     }
@@ -456,10 +505,10 @@ impl PyNvjpegEncoder {
             };
             let planes = ImagePlanes::interleaved(src, w, h, bpp as u32, pitch).map_err(map)?;
 
-            let mut guard = inner_arc
+            let mut slot = inner_arc
                 .lock()
                 .map_err(|_| invalid("encoder state mutex poisoned"))?;
-            let inner = &mut *guard;
+            let inner = open(&mut slot, "nvjpeg", "encode")?;
             let q = quality.unwrap_or(inner.default_quality);
             if q != inner.quality {
                 inner.params.set_quality(q, &s).map_err(map)?;
@@ -493,6 +542,43 @@ impl PyNvjpegEncoder {
         );
 
         Ok(PyBytes::new(py, &jpeg))
+    }
+
+    /// Releases the nvJPEG encoder state now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the encoder's stream, then frees the
+    /// native objects. Idempotent; every later call on this object raises
+    /// `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let stream = self.stream.inner.clone();
+        close_slot(py, &self.inner, move |_| drain_stream("nvjpeg", &stream))
+    }
+
+    /// `True` once `close()` has released the native encoder.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.inner)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.inner) {
+            return Err(closed_err("nvjpeg", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the encoder; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
     }
 }
 

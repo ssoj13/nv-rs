@@ -20,7 +20,10 @@ use curand::{Generator as CurandInnerGenerator, RngType};
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased, poisoned, typed_view};
+use crate::buf_util::{
+    Access, check_buf, close_slot, closed as closed_err, drain_stream, enqueue_leased, is_closed,
+    open, poisoned, typed_view,
+};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -42,7 +45,7 @@ struct CublasState {
 /// Owning cuBLAS handle bound to a CUDA stream.
 #[pyclass(name = "CublasHandle", module = "nv_rs.cublas")]
 pub struct PyCublasHandle {
-    state: Arc<Mutex<CublasState>>,
+    state: Arc<Mutex<Option<CublasState>>>,
     /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
     ctx: Arc<Context>,
     device_id: i32,
@@ -73,7 +76,7 @@ impl PyCublasHandle {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
         })
@@ -84,15 +87,18 @@ impl PyCublasHandle {
         let t0 = Instant::now();
         let state_arc = self.state.clone();
         let s = stream.clone();
-        py.detach(move || -> cublas::Result<()> {
-            let mut guard = state_arc
+        py.detach(move || -> PyResult<()> {
+            let mut slot = state_arc
                 .lock()
-                .map_err(|_| cublas::Error::Invalid("cublas handle mutex poisoned"))?;
-            guard.handle.set_stream(&s.inner)?;
+                .map_err(|_| poisoned("cublas", "set_stream"))?;
+            let guard = open(&mut slot, "cublas", "set_stream")?;
+            guard
+                .handle
+                .set_stream(&s.inner)
+                .map_err(|e| map_cublas_err("set_stream", e))?;
             guard.stream = s;
             Ok(())
-        })
-        .map_err(|e| map_cublas_err("set_stream", e))?;
+        })?;
 
         diag::record_event(
             Level::Trace,
@@ -179,9 +185,10 @@ impl PyCublasHandle {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc
+            let mut slot = state_arc
                 .lock()
                 .map_err(|_| poisoned("cublas", "gemm_f32"))?;
+            let guard = open(&mut slot, "cublas", "gemm_f32")?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 "cublas",
@@ -223,6 +230,41 @@ impl PyCublasHandle {
         Ok(())
     }
 
+    /// Releases the native cuBLAS handle now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("cublas", &st.stream.inner))
+    }
+
+    /// `True` once [`close`](Self::close) has released the native cuBLAS handle.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("cublas", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
+    }
+
     fn __repr__(&self) -> String {
         format!("CublasHandle(device_id={})", self.device_id)
     }
@@ -262,7 +304,7 @@ struct CufftState {
 /// Complex data is interleaved `f32` pairs (`dtype="f32"`, two elements per complex value).
 #[pyclass(name = "CufftPlan1d", module = "nv_rs.cufft")]
 pub struct PyCufftPlan1d {
-    state: Arc<Mutex<CufftState>>,
+    state: Arc<Mutex<Option<CufftState>>>,
     ctx: Arc<Context>,
     device_id: i32,
     nx: i32,
@@ -354,7 +396,7 @@ impl PyCufftPlan1d {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
             nx,
@@ -447,7 +489,8 @@ impl PyCufftPlan1d {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc.lock().map_err(|_| poisoned("cufft", "execute"))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned("cufft", "execute"))?;
+            let guard = open(&mut slot, "cufft", "execute")?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 "cufft",
@@ -476,6 +519,41 @@ impl PyCufftPlan1d {
         Ok(())
     }
 
+    /// Releases the native cuFFT plan now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("cufft", &st.stream.inner))
+    }
+
+    /// `True` once [`close`](Self::close) has released the native cuFFT plan.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("cufft", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "CufftPlan1d(nx={}, batch={}, kind={:?}, device_id={})",
@@ -502,7 +580,7 @@ struct CurandState {
 /// Device-side cuRAND Philox4_32_10 generator bound to a CUDA stream.
 #[pyclass(name = "CurandGenerator", module = "nv_rs.curand")]
 pub struct PyCurandGenerator {
-    state: Arc<Mutex<CurandState>>,
+    state: Arc<Mutex<Option<CurandState>>>,
     ctx: Arc<Context>,
     device_id: i32,
 }
@@ -540,7 +618,7 @@ impl PyCurandGenerator {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
         })
@@ -563,9 +641,10 @@ impl PyCurandGenerator {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc
+            let mut slot = state_arc
                 .lock()
                 .map_err(|_| poisoned("curand", "fill_uniform_f32"))?;
+            let guard = open(&mut slot, "curand", "fill_uniform_f32")?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 "curand",
@@ -633,9 +712,10 @@ impl PyCurandGenerator {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc
+            let mut slot = state_arc
                 .lock()
                 .map_err(|_| poisoned("curand", "fill_normal_f32"))?;
+            let guard = open(&mut slot, "curand", "fill_normal_f32")?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 "curand",
@@ -660,6 +740,41 @@ impl PyCurandGenerator {
             true,
         );
         Ok(())
+    }
+
+    /// Releases the native cuRAND generator now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("curand", &st.stream.inner))
+    }
+
+    /// `True` once [`close`](Self::close) has released the native cuRAND generator.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("curand", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
     }
 
     fn __repr__(&self) -> String {

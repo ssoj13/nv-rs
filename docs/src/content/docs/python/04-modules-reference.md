@@ -177,6 +177,10 @@ Reusable GPU compression/decompression manager bound to a CUDA stream.
 - `__init__(self, stream: core.Stream, format: str = "lz4", chunk_size: int = 65536, budget: int | None = None) -> None`
 - `compress(self, input: core.DeviceBuffer) -> nvcomp.CompressedBuffer`
 - `decompress(self, compressed: nvcomp.CompressedBuffer) -> core.DeviceBuffer`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> nvcomp.CompressionManager`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.nvjpeg`
 
@@ -189,6 +193,10 @@ GPU-accelerated JPEG decoder bound to a CUDA context and default stream.
 - `__init__(self, stream: core.Stream, backend: str = "default") -> None`
 - `decode_info(self, data: Any) -> tuple[int, int, int, str]`
 - `decode(self, data: Any, stream: core.Stream | None = None, output_format: str = "rgbi") -> core.DeviceBuffer`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> nvjpeg.NvjpegDecoder`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 #### `nvjpeg.NvjpegEncoder`
 
@@ -196,6 +204,10 @@ GPU-accelerated JPEG encoder bound to a CUDA context and default stream.
 
 - `__init__(self, stream: core.Stream, quality: int = 90, subsampling: str | None = None) -> None`
 - `encode(self, image: Any, width: int | None = None, height: int | None = None, quality: int | None = None, subsampling: str | None = None, input_format: str = "rgbi", stream: core.Stream | None = None) -> bytes`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> nvjpeg.NvjpegEncoder`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ---
 
@@ -296,6 +308,10 @@ Owning cuBLAS handle bound to a CUDA stream.
 - `__init__(self, stream: core.Stream) -> None`
 - `set_stream(self, stream: core.Stream) -> None`
 - `gemm_f32(self, a: core.DeviceBuffer, b: core.DeviceBuffer, c: core.DeviceBuffer, m: int, n: int, k: int, alpha: float = 1.0, beta: float = 0.0, trans_a: bool = False, trans_b: bool = False) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> cublas.CublasHandle`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.cufft`
 
@@ -307,6 +323,10 @@ Fast Fourier Transforms via cuFFT.
 
 - `__init__(self, stream: core.Stream, nx: int, kind: str = "c2c", batch: int = 1) -> None`
 - `execute(self, in_buf: core.DeviceBuffer, out_buf: core.DeviceBuffer, direction: str | None = None) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> cufft.CufftPlan1d`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.curand`
 
@@ -319,6 +339,10 @@ Device-side cuRAND Philox4_32_10 generator bound to a CUDA stream.
 - `__init__(self, stream: core.Stream, seed: int | None = None) -> None`
 - `fill_uniform_f32(self, buf: core.DeviceBuffer) -> None`
 - `fill_normal_f32(self, buf: core.DeviceBuffer, mean: float = 0.0, stddev: float = 1.0) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> curand.CurandGenerator`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.cusparse`
 
@@ -336,6 +360,10 @@ Owning cuSPARSE handle bound to a CUDA stream.
 - `set_stream(self, stream: core.Stream) -> None`
 - `version(self) -> int`
 - `spmv_f32(self, row_offsets: core.DeviceBuffer, col_ind: core.DeviceBuffer, values: core.DeviceBuffer, x: core.DeviceBuffer, y: core.DeviceBuffer, rows: int, cols: int, nnz: int, alpha: float = 1.0, beta: float = 0.0, transpose: bool = False) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> cusparse.CusparseHandle`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.cusolver`
 
@@ -351,6 +379,10 @@ Owning dense cuSOLVER handle bound to a CUDA stream.
 - `getrs_f32(self, a: core.DeviceBuffer, ipiv: core.DeviceBuffer, b: core.DeviceBuffer, dev_info: core.DeviceBuffer, n: int, nrhs: int = 1, lda: int | None = None, ldb: int | None = None, trans: bool = False) -> None`
 - `potrf_f32(self, a: core.DeviceBuffer, dev_info: core.DeviceBuffer, n: int, lda: int | None = None, upper: bool = False) -> None`
 - `potrs_f32(self, a: core.DeviceBuffer, b: core.DeviceBuffer, dev_info: core.DeviceBuffer, n: int, nrhs: int = 1, lda: int | None = None, ldb: int | None = None, upper: bool = False) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> cusolver.CusolverDnHandle`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ### `nv_rs.cudnn`
 
@@ -368,6 +400,10 @@ Owning cuDNN handle bound to a CUDA stream.
 - `set_stream(self, stream: core.Stream) -> None`
 - `activation_forward_f32(self, x: core.DeviceBuffer, y: core.DeviceBuffer, shape: Sequence[int], mode: str = "relu", alpha: float = 1.0, beta: float = 0.0, coef: float | None = None) -> None`
 - `softmax_forward_f32(self, x: core.DeviceBuffer, y: core.DeviceBuffer, shape: Sequence[int], algo: str = "accurate", mode: str = "channel", alpha: float = 1.0, beta: float = 0.0) -> None`
+- `close(self) -> None`
+- `@property is_closed(self) -> bool`
+- `__enter__(self) -> cudnn.CudnnHandle`
+- `__exit__(self, exc_type: Any = None, exc_val: Any = None, exc_tb: Any = None) -> bool`
 
 ---
 

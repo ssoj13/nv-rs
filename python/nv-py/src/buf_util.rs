@@ -8,6 +8,10 @@
 //!   `cuda_core::DeviceBuffer<T>` over the same allocation (no copy; `T: AnyBits`);
 //! - [`enqueue_leased`] runs the FFI enqueue with completion leases on the Python-owned buffers;
 //! - [`poisoned`] is the error for a handle mutex poisoned by an earlier panic.
+//! - [`open`], [`close_slot`], [`is_closed`], [`drain_stream`] and [`closed`] implement the
+//!   `close()` / context-manager lifecycle of the handle classes (state kept in an
+//!   `Arc<Mutex<Option<State>>>` slot that `close()` empties, so later use raises instead of
+//!   touching released native objects).
 //!
 //! **Why.** A native library receives raw pointers, so nothing in `cuda-core` keeps the memory
 //! alive or checks it: `del buf` right after an asynchronous call frees the allocation while
@@ -38,6 +42,8 @@
 //! for owned buffers and DLPack imports alike, and errors are mapped to Python exceptions.
 //! **Used by** `core.rs` (`DeviceBuffer.to_bytes`) and the native bindings (`compute`,
 //! `sparse_ai`, `gfx_img`, `video`, `nvjpeg`, `nvcomp`, `platform_ext`).
+
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use cuda_core::{Context, DeviceBuffer as CudaDeviceBuffer, DriverError, Stream};
 pub(crate) use cuda_core_ext::Access;
@@ -103,6 +109,70 @@ pub(crate) fn poisoned(category: &str, op: &str) -> PyErr {
         format!("{category} handle mutex poisoned"),
         ErrorKind::InvalidArgument,
     )
+}
+
+/// Error for a call on a handle, plan or manager after `close()`.
+pub(crate) fn closed(category: &str, op: &str) -> PyErr {
+    record_and_err(
+        category,
+        op,
+        format!("{category} object is closed"),
+        ErrorKind::InvalidArgument,
+    )
+}
+
+/// Borrows the native state of a handle locked from an `Arc<Mutex<Option<State>>>` slot; fails
+/// with the "closed" error once `close()` has taken it.
+pub(crate) fn open<'a, T>(
+    slot: &'a mut Option<T>,
+    category: &str,
+    op: &str,
+) -> PyResult<&'a mut T> {
+    slot.as_mut().ok_or_else(|| closed(category, op))
+}
+
+/// `true` when `slot` was emptied by [`close_slot`].
+///
+/// Never blocks: a slot locked by an in-flight call is not closed yet (closing waits for that
+/// call), and a poisoned slot still reports its content.
+pub(crate) fn is_closed<T>(slot: &Mutex<Option<T>>) -> bool {
+    match slot.try_lock() {
+        Ok(guard) => guard.is_none(),
+        Err(TryLockError::Poisoned(poison)) => poison.into_inner().is_none(),
+        Err(TryLockError::WouldBlock) => false,
+    }
+}
+
+/// Waits until every operation queued on `stream` has finished.
+pub(crate) fn drain_stream(category: &str, stream: &Stream) -> PyResult<()> {
+    stream
+        .synchronize()
+        .map_err(|e| record_and_err(category, "close", e, ErrorKind::Cuda))
+}
+
+/// Releases the native state of a handle: waits for an in-flight call (it holds the lock), runs
+/// `drain` while the state is still alive, then drops the state, all without the GIL.
+///
+/// Idempotent: a second call finds the slot empty and returns `Ok`. The state is dropped even
+/// when `drain` fails (the error is returned afterwards), and a slot poisoned by a panic in an
+/// earlier call is still released, so `close()` never strands native resources.
+pub(crate) fn close_slot<T: Send>(
+    py: Python<'_>,
+    slot: &Arc<Mutex<Option<T>>>,
+    drain: impl FnOnce(&T) -> PyResult<()> + Send,
+) -> PyResult<()> {
+    let slot = Arc::clone(slot);
+    py.detach(move || {
+        let taken = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        match taken {
+            Some(state) => {
+                let drained = drain(&state);
+                drop(state);
+                drained
+            },
+            None => Ok(()),
+        }
+    })
 }
 
 /// Validates buffer argument `name` of native call `category`/`op` and returns its dense

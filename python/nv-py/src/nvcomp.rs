@@ -13,7 +13,10 @@ use nv_loader::diag::{self, Level};
 use nvcomp::{CompressedBuffer, CompressionManager, Format, FormatKind};
 use pyo3::prelude::*;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased, typed_view};
+use crate::buf_util::{
+    Access, check_buf, close_slot, closed as closed_err, drain_stream, enqueue_leased, is_closed,
+    open, poisoned, typed_view,
+};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -121,7 +124,7 @@ impl PyCompressedBuffer {
 /// Reusable GPU compression/decompression manager bound to a CUDA stream.
 #[pyclass(name = "CompressionManager", module = "nv_rs.nvcomp")]
 pub struct PyCompressionManager {
-    inner: Arc<Mutex<CompressionManager>>,
+    inner: Arc<Mutex<Option<CompressionManager>>>,
     stream: PyStream,
     format_name: &'static str,
 }
@@ -145,7 +148,7 @@ impl PyCompressionManager {
             .detach(move || CompressionManager::new(&s, fmt, chunk_size, budget))
             .map_err(|e| map_nvcomp_err("CompressionManager::new", e))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(mgr)),
+            inner: Arc::new(Mutex::new(Some(mgr))),
             stream: stream.clone(),
             format_name: format_kind_name(kind),
         })
@@ -167,14 +170,8 @@ impl PyCompressionManager {
         let mgr_arc = self.inner.clone();
         let t0 = Instant::now();
         let compressed = py.detach(move || -> PyResult<CompressedBuffer> {
-            let mut mgr = mgr_arc.lock().map_err(|_| {
-                record_and_err(
-                    "nvcomp",
-                    "compress",
-                    "manager mutex poisoned",
-                    ErrorKind::InvalidArgument,
-                )
-            })?;
+            let mut slot = mgr_arc.lock().map_err(|_| poisoned("nvcomp", "compress"))?;
+            let mgr = open(&mut slot, "nvcomp", "compress")?;
             let mut out = None;
             enqueue_leased("nvcomp", "compress", &s, [(input, Access::Read)], || {
                 out = Some(
@@ -227,14 +224,14 @@ impl PyCompressionManager {
         // `py.detach` needs only `Send` captures: `&CompressedBuffer` is one, and the GIL-held
         // borrow of `compressed` outlives the call.
         let comp_ref = &compressed.inner;
-        let dev_out = py
-            .detach(|| {
-                let mut mgr = mgr_arc
-                    .lock()
-                    .map_err(|_| nvcomp::Error::Invalid("manager mutex poisoned"))?;
-                mgr.decompress_to_buffer_async(&s, comp_ref)
-            })
-            .map_err(|e| map_nvcomp_err("decompress", e))?;
+        let dev_out = py.detach(|| -> PyResult<_> {
+            let mut slot = mgr_arc
+                .lock()
+                .map_err(|_| poisoned("nvcomp", "decompress"))?;
+            let mgr = open(&mut slot, "nvcomp", "decompress")?;
+            mgr.decompress_to_buffer_async(&s, comp_ref)
+                .map_err(|e| map_nvcomp_err("decompress", e))
+        })?;
 
         let nbytes = dev_out.len();
         diag::record_event(
@@ -255,6 +252,43 @@ impl PyCompressionManager {
             )
         })?;
         PyDeviceBuffer::from_owned_cuda(dev_out, "u8", vec![len], &s)
+    }
+
+    /// Releases the native manager now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the manager's stream, then frees the
+    /// native objects. Idempotent; every later call on this object raises
+    /// `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let stream = self.stream.inner.clone();
+        close_slot(py, &self.inner, move |_| drain_stream("nvcomp", &stream))
+    }
+
+    /// `True` once `close()` has released the native manager.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.inner)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.inner) {
+            return Err(closed_err("nvcomp", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the manager; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
     }
 }
 

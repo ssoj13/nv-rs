@@ -28,7 +28,10 @@ use cusparse::{
 use nv_loader::diag::{self, Level};
 use pyo3::prelude::*;
 
-use crate::buf_util::{Access, check_buf, enqueue_leased, poisoned, typed_view};
+use crate::buf_util::{
+    Access, check_buf, close_slot, closed as closed_err, drain_stream, enqueue_leased, is_closed,
+    open, poisoned, typed_view,
+};
 use crate::core::{PyDeviceBuffer, PyStream};
 use crate::errors::{ErrorKind, record_and_err};
 
@@ -99,7 +102,7 @@ struct CusparseState {
 /// Owning cuSPARSE handle bound to a CUDA stream.
 #[pyclass(name = "CusparseHandle", module = "nv_rs.cusparse")]
 pub struct PyCusparseHandle {
-    state: Arc<Mutex<CusparseState>>,
+    state: Arc<Mutex<Option<CusparseState>>>,
     /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
     ctx: Arc<Context>,
     device_id: i32,
@@ -135,7 +138,7 @@ impl PyCusparseHandle {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
         })
@@ -146,18 +149,21 @@ impl PyCusparseHandle {
         let t0 = Instant::now();
         let state_arc = self.state.clone();
         let s = stream.clone();
-        py.detach(move || -> cusparse::Result<()> {
-            let mut guard = state_arc
+        py.detach(move || -> PyResult<()> {
+            let mut slot = state_arc
                 .lock()
-                .map_err(|_| cusparse::Error::InvalidInput("cusparse handle mutex poisoned"))?;
-            guard.handle.set_stream(&s.inner)?;
+                .map_err(|_| poisoned("cusparse", "set_stream"))?;
+            let guard = open(&mut slot, "cusparse", "set_stream")?;
+            guard
+                .handle
+                .set_stream(&s.inner)
+                .map_err(|e| map_cusparse_err("set_stream", e))?;
             if guard.stream.inner.cu_stream() != s.inner.cu_stream() {
                 guard.scratch = CusparseScratch::new(&s.inner);
             }
             guard.stream = s;
             Ok(())
-        })
-        .map_err(|e| map_cusparse_err("set_stream", e))?;
+        })?;
 
         diag::record_event(
             Level::Trace,
@@ -173,13 +179,16 @@ impl PyCusparseHandle {
     /// Returns the cuSPARSE library version (`major * 1000 + minor * 100 + patch`).
     fn version(&self, py: Python<'_>) -> PyResult<i32> {
         let state_arc = self.state.clone();
-        py.detach(move || -> cusparse::Result<i32> {
-            let guard = state_arc
+        py.detach(move || -> PyResult<i32> {
+            let mut slot = state_arc
                 .lock()
-                .map_err(|_| cusparse::Error::InvalidInput("cusparse handle mutex poisoned"))?;
-            guard.handle.version()
+                .map_err(|_| poisoned("cusparse", "version"))?;
+            let guard = open(&mut slot, "cusparse", "version")?;
+            guard
+                .handle
+                .version()
+                .map_err(|e| map_cusparse_err("version", e))
         })
-        .map_err(|e| map_cusparse_err("version", e))
     }
 
     /// Executes CSR single-precision SpMV: `y = alpha * op(A) * x + beta * y`, GIL-free.
@@ -250,9 +259,8 @@ impl PyCusparseHandle {
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
             let map = |e| map_cusparse_err("spmv_f32", e);
-            let mut guard = state_arc
-                .lock()
-                .map_err(|_| poisoned("cusparse", "spmv_f32"))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned("cusparse", "spmv_f32"))?;
+            let guard = open(&mut slot, "cusparse", "spmv_f32")?;
             let CusparseState {
                 handle,
                 scratch,
@@ -322,6 +330,41 @@ impl PyCusparseHandle {
         Ok(())
     }
 
+    /// Releases the native cuSPARSE handle now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("cusparse", &st.stream.inner))
+    }
+
+    /// `True` once `close()` has released the native cuSPARSE handle.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("cusparse", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
+    }
+
     fn __repr__(&self) -> String {
         format!("CusparseHandle(device_id={})", self.device_id)
     }
@@ -348,7 +391,7 @@ struct CusolverDnState {
 /// Owning dense cuSOLVER handle bound to a CUDA stream.
 #[pyclass(name = "CusolverDnHandle", module = "nv_rs.cusolver")]
 pub struct PyCusolverDnHandle {
-    state: Arc<Mutex<CusolverDnState>>,
+    state: Arc<Mutex<Option<CusolverDnState>>>,
     /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
     ctx: Arc<Context>,
     device_id: i32,
@@ -384,7 +427,7 @@ impl PyCusolverDnHandle {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
         })
@@ -395,18 +438,21 @@ impl PyCusolverDnHandle {
         let t0 = Instant::now();
         let state_arc = self.state.clone();
         let s = stream.clone();
-        py.detach(move || -> cusolver::Result<()> {
-            let mut guard = state_arc
+        py.detach(move || -> PyResult<()> {
+            let mut slot = state_arc
                 .lock()
-                .map_err(|_| cusolver::Error::InvalidInput("cusolver handle mutex poisoned"))?;
-            guard.handle.set_stream(&s.inner)?;
+                .map_err(|_| poisoned("cusolver", "set_stream"))?;
+            let guard = open(&mut slot, "cusolver", "set_stream")?;
+            guard
+                .handle
+                .set_stream(&s.inner)
+                .map_err(|e| map_cusolver_err("set_stream", e))?;
             if guard.stream.inner.cu_stream() != s.inner.cu_stream() {
                 guard.scratch = CusolverScratch::new(&s.inner);
             }
             guard.stream = s;
             Ok(())
-        })
-        .map_err(|e| map_cusolver_err("set_stream", e))?;
+        })?;
 
         diag::record_event(
             Level::Trace,
@@ -451,7 +497,8 @@ impl PyCusolverDnHandle {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let mut guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let guard = open(&mut slot, cat, op)?;
             let CusolverDnState {
                 handle,
                 scratch,
@@ -546,7 +593,8 @@ impl PyCusolverDnHandle {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let guard = open(&mut slot, cat, op)?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 cat,
@@ -616,7 +664,8 @@ impl PyCusolverDnHandle {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let mut guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let guard = open(&mut slot, cat, op)?;
             let CusolverDnState {
                 handle,
                 scratch,
@@ -694,7 +743,8 @@ impl PyCusolverDnHandle {
         let state_arc = self.state.clone();
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
-            let guard = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned(cat, op))?;
+            let guard = open(&mut slot, cat, op)?;
             let stream = &guard.stream.inner;
             enqueue_leased(
                 cat,
@@ -723,6 +773,41 @@ impl PyCusolverDnHandle {
             true,
         );
         Ok(())
+    }
+
+    /// Releases the native cuSOLVER handle now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("cusolver", &st.stream.inner))
+    }
+
+    /// `True` once `close()` has released the native cuSOLVER handle.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("cusolver", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
     }
 
     fn __repr__(&self) -> String {
@@ -835,7 +920,7 @@ struct CudnnState {
 /// Owning cuDNN handle bound to a CUDA stream.
 #[pyclass(name = "CudnnHandle", module = "nv_rs.cudnn")]
 pub struct PyCudnnHandle {
-    state: Arc<Mutex<CudnnState>>,
+    state: Arc<Mutex<Option<CudnnState>>>,
     /// The handle's context; `set_stream` only accepts streams of it, so it never changes.
     ctx: Arc<Context>,
     device_id: i32,
@@ -866,7 +951,7 @@ impl PyCudnnHandle {
         );
 
         Ok(Self {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::new(Mutex::new(Some(state))),
             ctx: stream.inner.context().clone(),
             device_id: stream.device_id,
         })
@@ -877,15 +962,18 @@ impl PyCudnnHandle {
         let t0 = Instant::now();
         let state_arc = self.state.clone();
         let s = stream.clone();
-        py.detach(move || -> cudnn::Result<()> {
-            let mut guard = state_arc
+        py.detach(move || -> PyResult<()> {
+            let mut slot = state_arc
                 .lock()
-                .map_err(|_| cudnn::Error::Invalid("cudnn handle mutex poisoned"))?;
-            guard.handle.set_stream(&s.inner)?;
+                .map_err(|_| poisoned("cudnn", "set_stream"))?;
+            let guard = open(&mut slot, "cudnn", "set_stream")?;
+            guard
+                .handle
+                .set_stream(&s.inner)
+                .map_err(|e| map_cudnn_err("set_stream", e))?;
             guard.stream = s;
             Ok(())
-        })
-        .map_err(|e| map_cudnn_err("set_stream", e))?;
+        })?;
 
         diag::record_event(
             Level::Trace,
@@ -940,7 +1028,8 @@ impl PyCudnnHandle {
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
             let map = |e| map_cudnn_err(op, e);
-            let mut guard = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
+            let guard = open(&mut slot, "cudnn", op)?;
             let ctx = guard.handle.context().clone();
             let stream = guard.stream.inner.clone();
             guard.handle.set_stream(&stream).map_err(map)?;
@@ -1023,7 +1112,8 @@ impl PyCudnnHandle {
         let t0 = Instant::now();
         py.detach(move || -> PyResult<()> {
             let map = |e| map_cudnn_err(op, e);
-            let mut guard = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
+            let mut slot = state_arc.lock().map_err(|_| poisoned("cudnn", op))?;
+            let guard = open(&mut slot, "cudnn", op)?;
             let ctx = guard.handle.context().clone();
             let stream = guard.stream.inner.clone();
             guard.handle.set_stream(&stream).map_err(map)?;
@@ -1064,6 +1154,41 @@ impl PyCudnnHandle {
             true,
         );
         Ok(())
+    }
+
+    /// Releases the native cuDNN handle now instead of at garbage collection.
+    ///
+    /// Waits for in-flight calls and for work queued on the bound stream, then frees the native
+    /// objects. Idempotent; every later call on this object raises `NvInvalidArgumentError`.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_slot(py, &self.state, |st| drain_stream("cudnn", &st.stream.inner))
+    }
+
+    /// `True` once `close()` has released the native cuDNN handle.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        is_closed(&self.state)
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if is_closed(&slf.state) {
+            return Err(closed_err("cudnn", "__enter__"));
+        }
+        Ok(slf)
+    }
+
+    /// Closes the object; exceptions raised in the `with` body are not suppressed.
+    #[pyo3(signature = (exc_type=None, exc_val=None, exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_val: Option<&Bound<'_, PyAny>>,
+        exc_tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_val, exc_tb);
+        self.close(py)?;
+        Ok(false)
     }
 
     fn __repr__(&self) -> String {

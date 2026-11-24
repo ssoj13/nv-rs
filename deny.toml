@@ -28,6 +28,8 @@ exceptions = [
     { crate = "smartstring", allow = ["MPL-2.0"] },
     # egui default fonts: the code is MIT OR Apache-2.0, the bundled fonts OFL-1.1 and Ubuntu-font-1.0.
     { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+    # Mozilla CA root certificate data (pulled by osm-rs -> ureq -> rustls); permissive data licence.
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
     # Private, unpublished ssoj13 crates (git dependencies, no `license` field): proprietary.
     { crate = "flex-geom", allow = ["LicenseRef-Proprietary"] },
     { crate = "nodes-core", allow = ["LicenseRef-Proprietary"] },
@@ -70,6 +72,7 @@ allow-git = [
     "https://github.com/ssoj13/gpu-info-rs.git",
     "ssh://git@github.com/ssoj13/appbus-rs.git",
     "ssh://git@github.com/ssoj13/box-rs.git",
+    "ssh://git@github.com/ssoj13/byte-cache-rs.git",
     "ssh://git@github.com/ssoj13/camera-rs.git",
     "ssh://git@github.com/ssoj13/codec-simd-rs.git",
     "ssh://git@github.com/ssoj13/crashdump-rs.git",

@@ -10,6 +10,7 @@ mod csg_scene_host;
 mod cuda_crowd;
 mod demo_anim;
 mod fft_bloom;
+mod flight_stats;
 mod gpu_export;
 mod mp4_muxer;
 mod nvtx;
@@ -2526,6 +2527,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         bound_hdr_tex: bool,
         last_jitter: [f32; 2],
         last_saved_msg: Option<String>,
+        /// Rail fly-through statistics, fed from `FrameReady` while the rail drives the camera.
+        flight: crate::flight_stats::FlightStats,
+        /// Rail id and Auto-Drive state the Flight stats were accumulated for (a new cassette or
+        /// an Auto-Drive start resets them).
+        flight_rail_id: String,
+        flight_rail_active: bool,
         bus: AppBus,
         ui_cmd_scratch: Vec<appbus::BoxedEvent>,
         render_ev_scratch: Vec<appbus::BoxedEvent>,
@@ -3183,6 +3190,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 bound_hdr_tex: false,
                 last_jitter: [0.0, 0.0],
                 last_saved_msg: startup_msg,
+                flight: crate::flight_stats::FlightStats::new(),
+                flight_rail_id: String::new(),
+                flight_rail_active: false,
                 bus,
                 ui_cmd_scratch: Vec::with_capacity(16),
                 render_ev_scratch: Vec::with_capacity(32),
@@ -3329,17 +3339,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 path: run.args.out.clone(),
                 frames,
                 warmup: run.args.warmup,
+                image: run.args.image.clone(),
             };
             run.phase = crate::bench::BenchPhase::Running;
             self.tod_transition = None;
             self.rail_blend_remaining = 0.0;
-            self.send_render(start);
             self.shutter_in_flight = false;
+            // Lockstep first: from here on the worker renders only the subframes this thread
+            // sends, so the perf log (and its frame index reset) starts on the first rail frame.
             self.send_render(RenderControl::SetRecording {
                 active: true,
                 fixed_fps: RECORD_FPS,
                 shutter_subframes: 1,
             });
+            self.send_render(start);
         }
 
         fn notify_recording(&mut self, active: bool) {
@@ -3525,6 +3538,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
+            // Flight stats belong to one Auto-Drive run of one cassette.
+            let rail_active = self.camera_rail.is_active();
+            if rail_active
+                && (!self.flight_rail_active
+                    || self.flight_rail_id != self.camera_rail.selected_rail_id)
+            {
+                self.flight.reset();
+                self.flight_rail_id
+                    .clone_from(&self.camera_rail.selected_rail_id);
+            }
+            self.flight_rail_active = rail_active;
+
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
             let mut scene_rails_updated = false;
@@ -3593,6 +3618,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.rt_fps,
                         );
                         self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
+                        if rail_active {
+                            let st = &msg.csg_stats;
+                            self.flight.push(
+                                &msg.perf,
+                                self.camera_rail.time_s,
+                                self.camera_rail.duration_s,
+                                msg.rendered_camera.fwd,
+                                crate::flight_stats::SceneLoad {
+                                    visible: st.visible_instances,
+                                    lod: [st.lod0_count, st.lod1_count, st.lod2_count],
+                                    culled: st.culled_count,
+                                    paths: st.path_instances,
+                                },
+                            );
+                        }
                     }
                     RenderEvent::SceneMetaUpdated(meta) => {
                         self.loaded_scene_key = Some((meta.scene_idx, meta.variant_idx));
@@ -3816,6 +3856,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     .render_fatal
                     .as_deref()
                     .or(self.last_saved_msg.as_deref()),
+                flight: &mut self.flight,
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                 egui::Panel::top("top_toolbar").show(ui, |ui| {
@@ -3838,6 +3879,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut save_png_requested = false;
             let mut save_jpeg_requested = false;
             let mut export_sdg_json_requested = false;
+            let mut export_flight_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
             let mut pick_possess_uv: Option<(f32, f32)> = None;
@@ -3866,6 +3908,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     UiCommand::SaveStill(StillFormat::Png) => save_png_requested = true,
                     UiCommand::SaveStill(StillFormat::Jpeg) => save_jpeg_requested = true,
                     UiCommand::ExportSdgJson => export_sdg_json_requested = true,
+                    UiCommand::ExportFlightCsv => export_flight_requested = true,
                     UiCommand::ToggleRecord => toggle_record_requested = true,
                     UiCommand::ReloadShader => reload_shader_requested = true,
                     UiCommand::SelectScene {
@@ -4463,6 +4506,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if self.settings.csg_mode > 0 && self.settings.csg_freeze_pose {
                     companion_sdg_requested = true;
                 }
+            }
+            if export_flight_requested {
+                let dir = std::path::Path::new(RENDERS_DIR);
+                self.last_saved_msg = Some(match std::fs::create_dir_all(dir) {
+                    Err(e) => format!("Failed to create {RENDERS_DIR}/: {e}"),
+                    Ok(()) => {
+                        let path = dir.join(output_file_name("nv-demo-flight", ".csv"));
+                        match self.flight.export_csv(&path) {
+                            Ok(()) => format!(
+                                "Flight stats: {} frames written to {}",
+                                self.flight.frames(),
+                                path.display()
+                            ),
+                            Err(e) => format!("Flight stats export failed: {e}"),
+                        }
+                    }
+                });
             }
             if (export_sdg_json_requested || companion_sdg_requested) && self.settings.csg_mode > 0 {
                 let dir = std::path::Path::new(RENDERS_DIR);

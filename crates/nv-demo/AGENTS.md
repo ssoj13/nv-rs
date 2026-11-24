@@ -43,13 +43,16 @@ Async OptiX Render Worker (renderer.rs, rig.stream, live optix::LogFn)
 Every RT timing and A/B uses the rail benchmark, never a free-running session:
 
 ```text
-nv-demo --bench-rail road_cruise --scene gundo --out rail.csv [--frames N] [--warmup 60]
+nv-demo --bench-rail road_cruise --scene gundo --out rail.csv [--frames N] [--warmup 60] [--image last.pfm]
 ```
 
 - `bench.rs` parses the arguments (an unknown argument, a missing `--out`, or a rail id the scene does not have is an error and exit code 1; the error lists the scene's rail ids). `gundo` rails: `road_cruise` ("Street Navigation (24s)"), `landmark_slalom`, `urban_canyon`, `grand_tour`.
 - The run forces Freeze Pose (traffic and crowd static), a free Pinhole camera, no demo animation and no time-of-day transition; it drops UI commands (stray clicks cannot possess or change the rail) and never writes `~/.nv-rs/nv-demo.json`. Everything else (resolution = viewport size, spp, bounces, sky, LOD) comes from the saved config, so restore the same config before each arm.
 - The rail starts at time 0 and advances `time_scale / 60 s` per frame in lockstep with the renderer (the Smooth 60 FPS recording path, one rendered frame per step, damper snapped to the rail pose). Default `--frames` is one rail loop (`road_cruise`: 1440). Two runs of the same build render the identical eye sequence (checked on the CSV `eye_*` columns).
 - The CSV (`perf_log.rs`, written via temp file + `sync_all` + rename) has the engine times plus `possessed, projection, eye_x/y/z, width, height, spp, bounces` per frame; reject a run whose state columns differ from the other arm. The process exits 0 after the CSV is written.
+- `StartPerfLog` restarts the sample frame index at 0, so two runs of one build render bit-identical frames; `--image` writes the last measured frame's linear colour as PFM for a pixel A/B (compare max / mean abs diff and changed-pixel share).
+- Foreign GPU load only adds time: with interleaved rounds, compare the per-frame minimum over rounds (frame i is the same work in every run) and report median / p95 of that.
+- Flight stats (`flight_stats.rs`, collapsible subsection of "Cinema & Camera Rail"): while Auto-Drive flies, every `FrameReady` carries the frame's `PerfSample` (the same value the perf CSV records) plus `CsgStats` scene load (visible instances, LOD 0/1/2, culled, evaluation paths `[prim, union, exact union, RPN]`); the panel shows live speed / turn rate, RT min / median / p95 / max, a histogram, the five slowest rail positions (click = jump), RT vs rail time with the previous loop overlaid, visible instances and LOD 0 share vs rail time, and exports the frames in the bench CSV schema. Ring buffers are sized once; a new cassette, Auto-Drive start or Reset clears them. Not available (no source): height above ground (shows world `y`), rays / Mrays (no ray counter), visible crowd vs traffic split.
 - `NV_DEMO_PERF_CSV` / `NV_DEMO_PERF_FRAMES` / `NV_DEMO_PERF_WARMUP` still log a free-running session; such numbers depend on camera state and traffic and are not A/B evidence.
 
 ## Traps & Future Improvements

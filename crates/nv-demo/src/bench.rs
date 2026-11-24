@@ -20,11 +20,11 @@ use std::path::PathBuf;
 
 /// Usage text printed on a command-line error.
 pub const USAGE: &str = "usage: nv-demo [--bench-rail <rail-id> --out <csv> [--scene <scene-id>] \
-[--frames <n>] [--warmup <n>]]\n  --bench-rail  scene rail cassette id (e.g. road_cruise); unknown \
+[--frames <n>] [--warmup <n>] [--image <pfm>]]\n  --bench-rail  scene rail cassette id (e.g. road_cruise); unknown \
 ids list the available ones\n  --out         CSV written when the run ends (atomic rename)\n  \
 --scene       scene descriptor id (default: the saved scene)\n  --frames      measured frames \
 (default: one rail loop at 60 fps * time_scale)\n  --warmup      frames rendered and discarded \
-before measuring (default 60)";
+before measuring (default 60)\n  --image       linear colour of the last frame as PFM (pixel A/B)";
 
 /// Default number of discarded frames at the start of the rail.
 pub const DEFAULT_WARMUP: u32 = 60;
@@ -42,6 +42,8 @@ pub struct BenchRailArgs {
     pub frames: Option<u32>,
     /// Discarded frames before measuring.
     pub warmup: u32,
+    /// PFM written with the last measured frame's linear colour.
+    pub image: Option<PathBuf>,
 }
 
 /// Parses the process arguments after the program name. `Ok(None)` = no arguments (normal
@@ -54,6 +56,7 @@ pub fn parse_args(
     let mut scene = None;
     let mut frames = None;
     let mut warmup = DEFAULT_WARMUP;
+    let mut image = None;
     let mut it = args.into_iter();
     let mut any = false;
     while let Some(flag) = it.next() {
@@ -74,6 +77,7 @@ pub fn parse_args(
                 frames = Some(n);
             }
             "--warmup" => warmup = count(value("--warmup")?, "--warmup")?,
+            "--image" => image = Some(PathBuf::from(value("--image")?)),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -91,6 +95,7 @@ pub fn parse_args(
         scene,
         frames,
         warmup,
+        image,
     }))
 }
 
@@ -185,12 +190,20 @@ mod tests {
                 scene: Some("gundo".into()),
                 frames: Some(120),
                 warmup: 10,
+                image: None,
             }
         );
         let d = args(&["--out", "y.csv", "--bench-rail", "r"])
             .expect("valid")
             .expect("bench");
-        assert_eq!((d.frames, d.warmup, d.scene), (None, DEFAULT_WARMUP, None));
+        assert_eq!(
+            (d.frames, d.warmup, d.scene, d.image),
+            (None, DEFAULT_WARMUP, None, None)
+        );
+        let i = args(&["--bench-rail", "r", "--out", "o.csv", "--image", "x.pfm"])
+            .expect("valid")
+            .expect("bench");
+        assert_eq!(i.image, Some(PathBuf::from("x.pfm")));
     }
 
     #[test]

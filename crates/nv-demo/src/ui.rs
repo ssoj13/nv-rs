@@ -574,6 +574,8 @@ pub struct UiContext<'a> {
     pub smart_view_seed: &'a mut u64,
     pub last_smart_view: Option<SmartViewResult>,
     pub last_saved_msg: Option<&'a str>,
+    /// Rail fly-through statistics (Flight stats subsection of the rail panel).
+    pub flight: &'a mut crate::flight_stats::FlightStats,
 }
 
 impl TabViewer for UiContext<'_> {
@@ -3648,6 +3650,33 @@ impl UiContext<'_> {
                             }
                         }
                     });
+                    // 5. Flight stats of the running rail (accumulated while Auto-Drive flies).
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("{}  Flight stats", ic::CHART_LINE)).strong(),
+                    )
+                    .id_salt("flight_stats")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if let Some(t) = flight_stats_ui(
+                            ui,
+                            &mut self.scratch.label_buf,
+                            self.flight,
+                            rail,
+                            s.csg_lod_bias,
+                            &self.csg_stats,
+                            self.crowd_actor_count,
+                            self.rt_ms,
+                            self.bus,
+                        ) {
+                            rail.time_s = t;
+                            if let Some(p) =
+                                rail.evaluate_at(t, cur_pose.znear, cur_pose.zfar.max(2000.0))
+                            {
+                                snap_pose = Some(p);
+                            }
+                        }
+                    });
                 },
             );
         }
@@ -4614,6 +4643,300 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
             }
         });
     });
+}
+
+/// Height of one Flight stats graph.
+const FLIGHT_GRAPH_H: f32 = 64.0;
+
+/// Flight stats subsection of the rail panel (`crate::flight_stats`). Returns a rail time to jump
+/// to when a slow spot was clicked.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one immediate-mode panel reading disjoint UiContext fields next to the borrowed rail"
+)]
+fn flight_stats_ui(
+    ui: &mut Ui,
+    buf: &mut String,
+    flight: &mut crate::flight_stats::FlightStats,
+    rail: &CameraRail,
+    lod_bias: f32,
+    csg: &CsgStats,
+    crowd_actors: u32,
+    rt_ms: f32,
+    bus: &AppBus,
+) -> Option<f32> {
+    let mut jump = None;
+    let dur = rail.duration_s.max(0.5);
+    let label = rail.active_label();
+    stat_row(ui, "Cassette", &label);
+    stat_row(
+        ui,
+        "Rail Time",
+        fmt_into(
+            buf,
+            format_args!(
+                "{:.1} / {:.1} s ({:.0} %), loop {}",
+                rail.time_s,
+                dur,
+                100.0 * rail.time_s / dur,
+                flight.loops + 1
+            ),
+        ),
+    );
+    stat_row(
+        ui,
+        "Camera",
+        fmt_into(
+            buf,
+            format_args!(
+                "{:.1} m/s  {:.0} deg/s",
+                flight.speed_mps, flight.turn_dps
+            ),
+        ),
+    );
+    if let Some(last) = flight.latest() {
+        stat_row(
+            ui,
+            "Altitude",
+            fmt_into(buf, format_args!("y {:.1} m (world)", last.state.eye[1])),
+        );
+        stat_row(
+            ui,
+            "Launch",
+            fmt_into(
+                buf,
+                format_args!(
+                    "{}x{}  {} spp  {} bounces",
+                    last.state.width, last.state.height, last.state.spp, last.state.bounces
+                ),
+            ),
+        );
+    }
+    stat_row(ui, "LOD Bias", fmt_into(buf, format_args!("{lod_bias:.2}")));
+    let load = flight.load;
+    stat_row(
+        ui,
+        "Visible",
+        fmt_into(
+            buf,
+            format_args!(
+                "{} inst, {} GAS, {} crowd actors",
+                load.visible, csg.compounds, crowd_actors
+            ),
+        ),
+    );
+    stat_row(
+        ui,
+        "Paths",
+        fmt_into(
+            buf,
+            format_args!(
+                "prim {}  union {}  exact union {}  RPN {}",
+                load.paths[0], load.paths[1], load.paths[2], load.paths[3]
+            ),
+        ),
+    );
+    stat_row(
+        ui,
+        "LOD 0/1/2",
+        fmt_into(
+            buf,
+            format_args!(
+                "{} / {} / {}, culled {}",
+                load.lod[0], load.lod[1], load.lod[2], load.culled
+            ),
+        ),
+    );
+    stat_row(ui, "RT", fmt_into(buf, format_args!("{rt_ms:.1} ms")));
+    let summary = flight.summary();
+    if let Some(sm) = summary {
+        stat_row(
+            ui,
+            "RT min/med",
+            fmt_into(buf, format_args!("{:.1} / {:.1} ms", sm.min, sm.median)),
+        );
+        stat_row(
+            ui,
+            "RT p95/max",
+            fmt_into(
+                buf,
+                format_args!("{:.1} / {:.1} ms ({} frames)", sm.p95, sm.max, sm.frames),
+            ),
+        );
+    } else {
+        ui.label(RichText::new("Start Auto-Drive to collect flight stats.").weak());
+    }
+
+    let w = ui.available_width().max(60.0);
+    let dark = ui.visuals().dark_mode;
+    let cur_col = Color32::from_rgb(118, 185, 0);
+    let prev_col = if dark {
+        Color32::from_gray(110)
+    } else {
+        Color32::from_gray(150)
+    };
+    let load_col = Color32::from_rgb(90, 160, 230);
+    let lod_col = Color32::from_rgb(230, 170, 60);
+
+    // Graph 1: RT ms vs rail time, previous loop under the current one.
+    ui.label(RichText::new("RT ms vs rail time (grey: previous loop)").size(10.5).weak());
+    let rt_max = flight
+        .cur_loop()
+        .iter()
+        .chain(flight.prev_loop())
+        .map(|p| p.rt_ms)
+        .fold(1.0_f32, f32::max);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    paint_flight_curve(&painter, rect, flight.prev_loop(), dur, rt_max, |p| p.rt_ms, prev_col);
+    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, rt_max, |p| p.rt_ms, cur_col);
+    painter.text(
+        rect.left_top() + egui::vec2(3.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        fmt_into(buf, format_args!("{rt_max:.0} ms")),
+        egui::FontId::proportional(10.0),
+        ui.visuals().weak_text_color(),
+    );
+
+    // Graph 2: scene load vs rail time.
+    ui.label(
+        RichText::new("Visible instances (blue) and LOD 0 share (orange) vs rail time")
+            .size(10.5)
+            .weak(),
+    );
+    let vis_max = flight
+        .cur_loop()
+        .iter()
+        .map(|p| p.visible as f32)
+        .fold(1.0_f32, f32::max);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, vis_max, |p| p.visible as f32, load_col);
+    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, 1.0, |p| p.lod0_share, lod_col);
+    painter.text(
+        rect.left_top() + egui::vec2(3.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        fmt_into(buf, format_args!("{vis_max:.0} inst")),
+        egui::FontId::proportional(10.0),
+        ui.visuals().weak_text_color(),
+    );
+
+    // RT histogram over the accumulated frames.
+    if let Some(sm) = summary {
+        ui.label(
+            RichText::new(fmt_into(
+                buf,
+                format_args!("RT histogram {:.0}..{:.0} ms", sm.min, sm.max),
+            ))
+            .size(10.5)
+            .weak(),
+        );
+        let mut bins = [0u32; crate::flight_stats::HIST_BINS];
+        flight.histogram(sm.min, sm.max, &mut bins);
+        let peak = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H * 0.6), Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        let bw = rect.width() / bins.len() as f32;
+        for (i, &c) in bins.iter().enumerate() {
+            let h = (rect.height() - 2.0) * c as f32 / peak;
+            let x0 = rect.left() + i as f32 * bw;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0 + 0.5, rect.bottom() - h),
+                    egui::pos2(x0 + bw - 0.5, rect.bottom()),
+                ),
+                0.0,
+                cur_col,
+            );
+        }
+    }
+
+    // Slowest rail positions (click: jump the rail there).
+    let mut any_slow = false;
+    for spot in flight.slow_spots() {
+        if !any_slow {
+            ui.label(RichText::new("Slowest positions (click to jump)").size(10.5).weak());
+            any_slow = true;
+        }
+        let txt = fmt_into(
+            buf,
+            format_args!(
+                "{:.1} ms at {:.2} s  ({:.0}, {:.0}, {:.0})",
+                spot.rt_ms, spot.rail_t, spot.eye[0], spot.eye[1], spot.eye[2]
+            ),
+        );
+        if ui
+            .add_sized([w, ROW_H], egui::Button::new(RichText::new(txt).size(11.0)))
+            .clicked()
+        {
+            jump = Some(spot.rail_t);
+        }
+    }
+
+    equal_grid(ui, 2, 2, |ui, idx, bw| match idx {
+        0 => {
+            if ui
+                .add_sized(
+                    [bw, ROW_H + 2.0],
+                    egui::Button::new(format!("{}  Reset", ic::ARROW_COUNTER_CLOCKWISE)),
+                )
+                .on_hover_text("Clear the accumulated flight stats (also done on a new cassette or Auto-Drive start).")
+                .clicked()
+            {
+                flight.reset();
+            }
+        }
+        _ => {
+            if ui
+                .add_enabled(
+                    flight.frames() > 0,
+                    egui::Button::new(format!("{}  Export CSV", ic::FLOPPY_DISK))
+                        .min_size(egui::vec2(bw, ROW_H + 2.0)),
+                )
+                .on_hover_text("Write the accumulated frames as a perf CSV (same columns as --bench-rail).")
+                .clicked()
+            {
+                bus.emit_ui(UiCommand::ExportFlightCsv);
+            }
+        }
+    });
+    jump
+}
+
+/// Draws `pts` (x = rail time over `[0, x_max]`, y = `y(p)` over `[0, y_max]`) into `rect` as line
+/// segments, at most one segment per horizontal pixel; allocates nothing.
+fn paint_flight_curve(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    pts: &[crate::flight_stats::LoopPoint],
+    x_max: f32,
+    y_max: f32,
+    y: impl Fn(&crate::flight_stats::LoopPoint) -> f32,
+    color: Color32,
+) {
+    if pts.len() < 2 || x_max <= 0.0 || y_max <= 0.0 {
+        return;
+    }
+    let stride = (pts.len() as f32 / rect.width().max(1.0)).ceil().max(1.0) as usize;
+    let to_screen = |p: &crate::flight_stats::LoopPoint| {
+        egui::pos2(
+            rect.left() + rect.width() * (p.rail_t / x_max).clamp(0.0, 1.0),
+            rect.bottom() - 1.0 - (rect.height() - 2.0) * (y(p) / y_max).clamp(0.0, 1.0),
+        )
+    };
+    let stroke = egui::Stroke::new(1.25, color);
+    let mut prev = to_screen(&pts[0]);
+    for p in pts.iter().step_by(stride).skip(1) {
+        let cur = to_screen(p);
+        // A backwards jump in rail time (scrub) starts a new segment instead of a long chord.
+        if cur.x >= prev.x {
+            painter.line_segment([prev, cur], stroke);
+        }
+        prev = cur;
+    }
 }
 
 fn sparkline_row(

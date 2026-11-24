@@ -103,6 +103,8 @@ pub enum UiCommand {
     SaveStill(StillFormat),
     /// Export exact 2D/3D actor keypoints, bone-OBB bounding boxes, and occlusion labels as JSON.
     ExportSdgJson,
+    /// Write the accumulated rail Flight stats frames as a perf CSV (`--bench-rail` schema).
+    ExportFlightCsv,
     /// Start or stop MP4 video recording.
     ToggleRecord,
     /// Recompile `raytracer.cu` via NVRTC on the render worker.
@@ -224,12 +226,15 @@ pub enum RenderControl {
     /// Hot-reload `raytracer.cu` from disk via NVRTC.
     ReloadShader,
     /// Start (or restart) the per-frame performance log: skip `warmup` frames, keep `frames`,
-    /// then write the CSV to `path` and emit [`RenderEvent::PerfLogWritten`]. Sent by the rail
-    /// benchmark (`crate::bench`); `NV_DEMO_PERF_CSV` starts the same log from the environment.
+    /// then write the CSV to `path` (and the last frame's linear colour as a PFM to `image`) and
+    /// emit [`RenderEvent::PerfLogWritten`]. Restarts the sample-sequence frame index at 0 so two
+    /// runs of the same camera sequence render identical images. Sent by the rail benchmark
+    /// (`crate::bench`); `NV_DEMO_PERF_CSV` starts the same log from the environment.
     StartPerfLog {
         path: std::path::PathBuf,
         frames: u32,
         warmup: u32,
+        image: Option<std::path::PathBuf>,
     },
     /// Gracefully terminate the render worker thread.
     Shutdown,

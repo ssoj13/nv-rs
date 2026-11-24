@@ -225,6 +225,33 @@ fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPl
     CompoundGasPlan::GeneralRpn
 }
 
+/// Counts `instances` by the OptiX evaluation path of their compound: `[single primitive,
+/// pure-union multi-AABB, first-hit-union multi-AABB, general RPN]`. The path is the compound's
+/// SBT offset (what the hardware actually invokes), SBT 10 split by `SINGLE_PRIM`; a compound
+/// without a GAS slot counts as RPN.
+fn evaluation_path_counts(
+    instances: &[GpuInstance],
+    sbt_offsets: &[u32],
+    compounds: &[GpuCompound],
+) -> [u32; 4] {
+    let mut counts = [0u32; 4];
+    for inst in instances {
+        let cid = inst.compound_id as usize;
+        let path = match sbt_offsets.get(cid) {
+            Some(&CSG_SBT_PRIM_OFFSET) => {
+                let single = compounds
+                    .get(cid)
+                    .is_some_and(|c| (c.flags & compound_flags::SINGLE_PRIM) != 0);
+                usize::from(!single)
+            }
+            Some(&CSG_SBT_UNION_OFFSET) => 2,
+            _ => 3,
+        };
+        counts[path] = counts[path].saturating_add(1);
+    }
+    counts
+}
+
 /// OptiX `BuildOptions` for per-compound CSG custom-primitive GASes (`compact = false` eliminates
 /// ~246 synchronous GPU compaction stalls on every scene or road-mode switch).
 #[inline]
@@ -395,6 +422,10 @@ pub struct CsgStats {
     pub lod2_count: u32,
     /// Total instances/parts culled this frame (frustum + detail tier + screen-px + budget).
     pub culled_count: u32,
+    /// Visible instances by OptiX evaluation path: `[single primitive, pure-union multi-AABB,
+    /// first-hit-union multi-AABB (exact per-part rule), general RPN]` (`compound_gas_plan`; SBT
+    /// offsets `10`, `10`, `12`, `8`).
+    pub path_instances: [u32; 4],
 }
 
 /// Scene metadata delivered once to the UI thread whenever a new CSG scene finishes building.
@@ -2195,6 +2226,11 @@ impl CsgGpuHost {
                 lod1_count: lod_stats.lod1,
                 lod2_count: lod_stats.lod2,
                 culled_count,
+                path_instances: evaluation_path_counts(
+                    self.packed.instances_slice(),
+                    &self.compound_sbt_offsets,
+                    &scene.world.library.compounds,
+                ),
             };
             if camera_repack_needed {
                 self.last_pack_cam = cam.eye;
@@ -3300,6 +3336,32 @@ mod tests {
         let sub_plan = compound_gas_plan(&lib, &lib.compounds[sub_id.0 as usize]);
         assert_eq!(sub_plan, CompoundGasPlan::GeneralRpn);
         assert_eq!(sub_plan.sbt_offset(), CSG_SBT_OFFSET);
+
+        // Flight stats path counts follow the same plans: 1 single, 2 pure union, 1 first-hit
+        // union, 1 RPN.
+        let sbt: Vec<u32> = lib
+            .compounds
+            .iter()
+            .map(|c| compound_gas_plan(&lib, c).sbt_offset())
+            .collect();
+        let inst = |cid: u32| GpuInstance {
+            xform: [0.0; 12],
+            compound_id: cid,
+            user_id: 0,
+            mat_override: 0,
+            flags: 0,
+        };
+        let insts = [
+            inst(single_id.0),
+            inst(union_id.0),
+            inst(union_id.0),
+            inst(overlap_id.0),
+            inst(sub_id.0),
+        ];
+        assert_eq!(
+            evaluation_path_counts(&insts, &sbt, &lib.compounds),
+            [1, 2, 1, 1]
+        );
     }
 
     #[test]
@@ -3706,6 +3768,7 @@ mod tests {
                 culled_count: ls
                     .total_culled()
                     .saturating_add(u32::try_from(packed.stats.instances_culled_budget).unwrap_or(u32::MAX)),
+                path_instances: [0; 4],
             }
         };
 

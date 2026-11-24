@@ -1173,6 +1173,8 @@ pub struct FrameReady {
     pub crowd_active_backend: ActiveCrowdBackend,
     /// Number of articulated crowd actors currently simulated.
     pub crowd_actor_count: u32,
+    /// The frame's timings and launch state, the same sample the perf CSV records.
+    pub perf: crate::perf_log::PerfSample,
 }
 
 struct TonemapKernel {
@@ -3952,6 +3954,8 @@ pub fn spawn_render_thread(
                     None
                 }
             };
+            // PFM written with the frame that completes the perf log (`StartPerfLog::image`).
+            let mut perf_image: Option<PathBuf> = None;
 
             // Unrecoverable errors emit `RenderEvent::Fatal` once and `break 'render`, so the
             // thread ends and drops `rig` in its normal order.
@@ -4416,12 +4420,16 @@ pub fn spawn_render_thread(
                             path,
                             frames,
                             warmup,
+                            image,
                         } => {
                             perf_log = Some(crate::perf_log::PerfLog::new(
                                 path.clone(),
                                 *frames,
                                 *warmup,
                             ));
+                            perf_image.clone_from(image);
+                            // Same sample sequence in every run of the same camera sequence.
+                            frame_index = 0;
                         }
                         RenderControl::ReloadShader => {
                             let disk_path = PathBuf::from(RAYTRACER_CU_PATH);
@@ -5862,32 +5870,53 @@ pub fn spawn_render_thread(
                         (0.0, 0.0, 0.0, 0.0, 0.0)
                     };
 
-                if let Some(log) = perf_log.as_mut() {
-                    let fence_done = Instant::now();
-                    let ms = |d: Duration| d.as_secs_f32() * 1000.0;
-                    let written = log.record(crate::perf_log::PerfSample {
-                        host_prep_ms: ms(launch_start.duration_since(frame_start)),
-                        launch_to_fence_ms: ms(fence_done.duration_since(launch_start)),
-                        frame_work_ms: ms(fence_done.duration_since(frame_start)),
-                        rt_ms,
-                        denoise_ms,
-                        bloom_ms,
-                        tonemap_ms,
-                        cuda_compute_ms,
-                        crowd_step_ms: last_crowd_step_ms,
-                        state: crate::perf_log::PerfState {
-                            possessed: rig.csg_host.is_possessing(),
-                            projection: lp.camera_projection,
-                            eye: [lp.cam_pos[0], lp.cam_pos[1], lp.cam_pos[2]],
-                            width: lp.width,
-                            height: lp.height,
-                            spp: lp.spp,
-                            bounces: lp.bounces,
-                        },
-                    });
-                    if let Some(result) = written {
-                        bus.emit_render_event(RenderEvent::PerfLogWritten(result));
+                // One sample per frame feeds both the perf CSV and the UI (Flight stats).
+                let fence_done = Instant::now();
+                let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+                let perf_sample = crate::perf_log::PerfSample {
+                    host_prep_ms: ms(launch_start.duration_since(frame_start)),
+                    launch_to_fence_ms: ms(fence_done.duration_since(launch_start)),
+                    frame_work_ms: ms(fence_done.duration_since(frame_start)),
+                    rt_ms,
+                    denoise_ms,
+                    bloom_ms,
+                    tonemap_ms,
+                    cuda_compute_ms,
+                    crowd_step_ms: last_crowd_step_ms,
+                    state: crate::perf_log::PerfState {
+                        possessed: rig.csg_host.is_possessing(),
+                        projection: lp.camera_projection,
+                        eye: [lp.cam_pos[0], lp.cam_pos[1], lp.cam_pos[2]],
+                        width: lp.width,
+                        height: lp.height,
+                        spp: lp.spp,
+                        bounces: lp.bounces,
+                    },
+                };
+                if let Some(log) = perf_log.as_mut()
+                    && let Some(mut result) = log.record(perf_sample)
+                {
+                    if let (Ok(_), Some(img)) = (&result, perf_image.take()) {
+                        // After the end-of-frame fence: `color_f32` holds this frame.
+                        let n = cur_w as usize * cur_h as usize;
+                        let mut rgba = vec![[0.0f32; 4]; n];
+                        // SAFETY: the stream was synchronised above; `color_f32` holds at least
+                        // `cur_w * cur_h` pixels and `rgba` exactly that many.
+                        let rc = unsafe {
+                            cu::cuMemcpyDtoH_v2(
+                                rgba.as_mut_ptr().cast(),
+                                rig.color_f32.cu_deviceptr(),
+                                n * std::mem::size_of::<[f32; 4]>(),
+                            )
+                        };
+                        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                            result = Err(format!("bench image readback failed ({rc:?})"));
+                        } else if let Err(e) = crate::perf_log::write_pfm(&img, cur_w, cur_h, &rgba)
+                        {
+                            result = Err(e);
+                        }
                     }
+                    bus.emit_render_event(RenderEvent::PerfLogWritten(result));
                 }
 
                 if let Some((jpeg_path, quality)) = pending_jpeg.take() {
@@ -6043,6 +6072,7 @@ pub fn spawn_render_thread(
                     crowd_step_ms: last_crowd_step_ms,
                     crowd_active_backend: last_crowd_backend,
                     crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
+                    perf: perf_sample,
                 }));
             }
         })

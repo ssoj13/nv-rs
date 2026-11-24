@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::renderer::DemoSettings;
 
+/// Exposure multiplier range shared by the viewport-toolbar `EV` box, the Sky & Lighting slider
+/// and the animator clamp. The widgets clamp to their range every frame, so two ranges would
+/// fight (F06).
+pub const EXPOSURE_RANGE: RangeInclusive<f32> = 0.05..=8.0;
+
 /// One animatable `DemoSettings` parameter: its persisted key and its `[min, max]` range, which
 /// is both the slider range and the oscillation clamp.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -214,7 +219,7 @@ anim_params! {
     "sun_elevation" => anim_f32(sun_elevation), 2.0, 88.0;
     "sky_intensity" => anim_f32(sky_intensity), 0.1, 2.0;
     "horizon_haze" => anim_f32(horizon_haze), 0.4, 2.5;
-    "exposure" => anim_f32(exposure), 0.25, 2.0;
+    "exposure" => anim_f32(exposure), *EXPOSURE_RANGE.start(), *EXPOSURE_RANGE.end();
     // Environment (per-sky_mode)
     "env_cloud_cover" => anim_f32(env.cloud_cover), 0.0, 1.0;
     "env_cloud_density" => anim_f32(env.cloud_density), 0.0, 1.5;

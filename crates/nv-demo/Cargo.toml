@@ -36,7 +36,7 @@ wgpu = "30"
 egui = { version = "0.36", features = ["default_fonts"] }
 egui-wgpu = "0.36"
 egui-winit = "0.36"
-egui_dock = "0.21"
+egui_dock = { version = "0.21", features = ["serde"] }
 egui-phosphor = "0.14"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }

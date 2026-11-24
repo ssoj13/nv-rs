@@ -15,7 +15,7 @@ use crate::app_events::{
 };
 use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
-use crate::demo_anim::DemoAnimator;
+use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::{CameraProjection, CaptureSource, DemoSettings};
 use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
@@ -50,10 +50,6 @@ const AOV_HUD_TAGS: [&str; 11] = [
 ];
 
 const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
-
-/// Exposure multiplier range shared by the viewport-toolbar `EV` box and the Sky & Lighting
-/// slider. Both widgets clamp to their range every frame, so two ranges would fight (F06).
-pub(crate) const EXPOSURE_RANGE: RangeInclusive<f32> = 0.05..=8.0;
 
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
@@ -288,7 +284,7 @@ pub fn world_to_wgs84(origin_lat: f64, origin_lon: f64, pos: [f32; 3]) -> (f64, 
     (lat_deg, lon_deg, alt_m)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DockTab {
     Viewport,
     Fractal,
@@ -297,6 +293,13 @@ pub enum DockTab {
 }
 
 impl DockTab {
+    pub const ALL: [Self; 4] = [
+        Self::Viewport,
+        Self::Fractal,
+        Self::RenderFloor,
+        Self::CameraStats,
+    ];
+
     pub fn title(self) -> &'static str {
         static TITLES: LazyLock<[String; 4]> = LazyLock::new(|| {
             [
@@ -1563,7 +1566,6 @@ impl UiContext<'_> {
                         "bulb_power",
                         "Power",
                         &mut s.bulb_power,
-                        2.0..=16.0,
                         2,
                         false,
                     );
@@ -1573,7 +1575,6 @@ impl UiContext<'_> {
                         "bulb_bailout",
                         "Bailout",
                         &mut s.bulb_bailout,
-                        2.0..=32.0,
                         1,
                         false,
                     );
@@ -1584,7 +1585,6 @@ impl UiContext<'_> {
                         "bulb_theta_mult",
                         "Theta Mult",
                         &mut s.bulb_theta_mult,
-                        0.25..=2.5,
                         2,
                         false,
                     );
@@ -1594,7 +1594,6 @@ impl UiContext<'_> {
                         "bulb_phi_mult",
                         "Phi Mult",
                         &mut s.bulb_phi_mult,
-                        0.25..=2.5,
                         2,
                         false,
                     );
@@ -1604,7 +1603,6 @@ impl UiContext<'_> {
                         "bulb_theta_phase",
                         "Theta Ph",
                         &mut s.bulb_theta_phase,
-                        -90.0..=90.0,
                         1,
                         false,
                     );
@@ -1614,7 +1612,6 @@ impl UiContext<'_> {
                         "bulb_phi_phase",
                         "Phi Ph",
                         &mut s.bulb_phi_phase,
-                        -180.0..=180.0,
                         1,
                         false,
                     );
@@ -1626,7 +1623,6 @@ impl UiContext<'_> {
                             "bulb_c",
                             "Julia C",
                             &mut s.bulb_c,
-                            -1.5..=1.5,
                             0.01,
                         );
                     }
@@ -1638,7 +1634,6 @@ impl UiContext<'_> {
                         "box_scale",
                         "Scale",
                         &mut s.box_scale,
-                        -3.5..=3.5,
                         2,
                         false,
                     );
@@ -1648,7 +1643,6 @@ impl UiContext<'_> {
                         "box_fold",
                         "Fold",
                         &mut s.box_fold,
-                        0.2..=2.2,
                         2,
                         false,
                     );
@@ -1658,7 +1652,6 @@ impl UiContext<'_> {
                         "box_fold_mult",
                         "Fold Mult",
                         &mut s.box_fold_mult,
-                        1.2..=3.0,
                         2,
                         false,
                     );
@@ -1668,7 +1661,6 @@ impl UiContext<'_> {
                         "box_min_r",
                         "Min R",
                         &mut s.box_min_r,
-                        0.05..=1.2,
                         2,
                         false,
                     );
@@ -1678,7 +1670,6 @@ impl UiContext<'_> {
                         "box_fixed_r",
                         "Fixed R",
                         &mut s.box_fixed_r,
-                        0.4..=2.5,
                         2,
                         false,
                     );
@@ -1688,7 +1679,6 @@ impl UiContext<'_> {
                         "box_iter_rot",
                         "Iter Rot",
                         &mut s.box_iter_rot,
-                        -45.0..=45.0,
                         1,
                         false,
                     );
@@ -1699,7 +1689,6 @@ impl UiContext<'_> {
                         "box_bailout",
                         "Bailout",
                         &mut s.box_bailout,
-                        4.0..=128.0,
                         1,
                         false,
                     );
@@ -1711,7 +1700,6 @@ impl UiContext<'_> {
                         "kifs_scale",
                         "Scale",
                         &mut s.kifs_scale,
-                        1.3..=3.5,
                         2,
                         false,
                     );
@@ -1721,7 +1709,6 @@ impl UiContext<'_> {
                         "kifs_rot1",
                         "Rot Y",
                         &mut s.kifs_rot1,
-                        -180.0..=180.0,
                         1,
                         false,
                     );
@@ -1731,7 +1718,6 @@ impl UiContext<'_> {
                         "kifs_rot2",
                         "Rot X",
                         &mut s.kifs_rot2,
-                        -180.0..=180.0,
                         1,
                         false,
                     );
@@ -1741,7 +1727,6 @@ impl UiContext<'_> {
                         "kifs_offset",
                         "Offset",
                         &mut s.kifs_offset,
-                        0.1..=2.0,
                         0.01,
                     );
                     anim_slider_f32(
@@ -1750,7 +1735,6 @@ impl UiContext<'_> {
                         "kifs_thickness",
                         "Thickness",
                         &mut s.kifs_thickness,
-                        0.005..=0.25,
                         3,
                         false,
                     );
@@ -1760,7 +1744,6 @@ impl UiContext<'_> {
                         "kifs_z_bias",
                         "Z Bias",
                         &mut s.kifs_z_bias,
-                        0.0..=1.5,
                         2,
                         false,
                     );
@@ -1771,7 +1754,6 @@ impl UiContext<'_> {
                         "kifs_bailout",
                         "Bailout",
                         &mut s.kifs_bailout,
-                        4.0..=32.0,
                         1,
                         false,
                     );
@@ -1791,7 +1773,6 @@ impl UiContext<'_> {
                     "fractal_translate",
                     "Translate",
                     &mut s.fractal_translate,
-                    -500.0..=500.0,
                     0.05,
                 );
                 anim_slider_f32(
@@ -1800,7 +1781,6 @@ impl UiContext<'_> {
                     "rot_x",
                     "Rot X",
                     &mut s.rot_x,
-                    -180.0..=180.0,
                     1,
                     false,
                 );
@@ -1810,7 +1790,6 @@ impl UiContext<'_> {
                     "rot_y",
                     "Rot Y",
                     &mut s.rot_y,
-                    -180.0..=180.0,
                     1,
                     false,
                 );
@@ -1820,7 +1799,6 @@ impl UiContext<'_> {
                     "rot_z",
                     "Rot Z",
                     &mut s.rot_z,
-                    -180.0..=180.0,
                     1,
                     false,
                 );
@@ -1830,7 +1808,6 @@ impl UiContext<'_> {
                     "obj_scale",
                     "Scale",
                     &mut s.obj_scale,
-                    0.05..=50.0,
                     2,
                     true,
                 );
@@ -1865,7 +1842,6 @@ impl UiContext<'_> {
                     "detail_eps",
                     "Detail Eps",
                     &mut s.detail_eps,
-                    0.00002..=0.005,
                     5,
                     true,
                 );
@@ -1875,7 +1851,6 @@ impl UiContext<'_> {
                     "norm_eps",
                     "Normal Eps",
                     &mut s.norm_eps,
-                    0.00002..=0.005,
                     5,
                     true,
                 );
@@ -1886,7 +1861,6 @@ impl UiContext<'_> {
                     "fudge",
                     "Fudge",
                     &mut s.fudge,
-                    0.3..=1.1,
                     2,
                     false,
                 );
@@ -1897,7 +1871,6 @@ impl UiContext<'_> {
                     "metallic",
                     "Metallic",
                     &mut s.metallic,
-                    0.0..=1.0,
                     2,
                     false,
                 );
@@ -1907,7 +1880,6 @@ impl UiContext<'_> {
                     "roughness",
                     "Roughness",
                     &mut s.roughness,
-                    0.02..=0.85,
                     2,
                     false,
                 );
@@ -1917,7 +1889,6 @@ impl UiContext<'_> {
                     "trap_scale",
                     "Trap Scale",
                     &mut s.trap_scale,
-                    0.1..=3.0,
                     2,
                     false,
                 );
@@ -1927,7 +1898,6 @@ impl UiContext<'_> {
                     "palette_shift",
                     "Hue Shift",
                     &mut s.palette_shift,
-                    0.0..=1.0,
                     2,
                     false,
                 );
@@ -2146,7 +2116,6 @@ impl UiContext<'_> {
                         "csg_wetness",
                         "Wetness",
                         &mut s.csg_wetness,
-                        0.0..=1.0,
                         2,
                         false,
                     );
@@ -2159,7 +2128,6 @@ impl UiContext<'_> {
                                 "csg_traffic_speed",
                                 "Traffic Spd",
                                 &mut s.csg_traffic_speed,
-                                0.0..=3.0,
                                 2,
                                 false,
                             );
@@ -2344,7 +2312,6 @@ impl UiContext<'_> {
                     "csg_lod_bias",
                     "LOD Bias",
                     &mut s.csg_lod_bias,
-                    0.25..=4.0,
                     2,
                     true,
                 );
@@ -2417,7 +2384,6 @@ impl UiContext<'_> {
                 "sun_intensity",
                 "Sun Power",
                 &mut s.sun_intensity,
-                0.0..=4.0,
                 2,
                 false,
             );
@@ -2427,7 +2393,6 @@ impl UiContext<'_> {
                 "sun_azimuth",
                 "Sun Azimuth",
                 &mut s.sun_azimuth,
-                -180.0..=180.0,
                 1,
                 false,
             );
@@ -2437,7 +2402,6 @@ impl UiContext<'_> {
                 "sun_elevation",
                 "Sun Elev",
                 &mut s.sun_elevation,
-                2.0..=88.0,
                 1,
                 false,
             );
@@ -2447,7 +2411,6 @@ impl UiContext<'_> {
                 "sky_intensity",
                 "Sky Power",
                 &mut s.sky_intensity,
-                0.1..=2.0,
                 2,
                 false,
             );
@@ -2457,7 +2420,6 @@ impl UiContext<'_> {
                 "horizon_haze",
                 "Haze",
                 &mut s.horizon_haze,
-                0.4..=2.5,
                 2,
                 false,
             );
@@ -2467,45 +2429,44 @@ impl UiContext<'_> {
                 "exposure",
                 "Exposure",
                 &mut s.exposure,
-                EXPOSURE_RANGE,
                 2,
                 true,
             );
 
             match s.sky_mode {
                 0 | 1 => {
-                    anim_slider_f32(ui, anim, "env_cloud_cover", "Cloud Cover", &mut s.env.cloud_cover, 0.0..=1.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_cloud_density", "Cloud Density", &mut s.env.cloud_density, 0.0..=1.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_cloud_cover", "Cloud Cover", &mut s.env.cloud_cover, 2, false);
+                    anim_slider_f32(ui, anim, "env_cloud_density", "Cloud Density", &mut s.env.cloud_density, 2, false);
                 }
                 2 => {
-                    anim_slider_f32(ui, anim, "env_softbox_power", "Panel Power", &mut s.env.softbox_power, 0.2..=3.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_softbox_softness", "Edge Softness", &mut s.env.softbox_softness, 0.02..=0.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_softbox_power", "Panel Power", &mut s.env.softbox_power, 2, false);
+                    anim_slider_f32(ui, anim, "env_softbox_softness", "Edge Softness", &mut s.env.softbox_softness, 2, false);
                 }
                 3 => {
-                    anim_slider_f32(ui, anim, "env_nebula_density", "Nebula Density", &mut s.env.nebula_density, 0.2..=2.5, 2, false);
-                    anim_slider_f32(ui, anim, "env_nebula_contrast", "Contrast", &mut s.env.nebula_contrast, 0.5..=3.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_nebula_dust", "Dark Dust", &mut s.env.nebula_dust, 0.0..=3.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_nebula_scale", "Cloud Scale", &mut s.env.nebula_scale, 0.5..=4.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 0.0..=2.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 0.0..=4.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_density", "Nebula Density", &mut s.env.nebula_density, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_contrast", "Contrast", &mut s.env.nebula_contrast, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_dust", "Dark Dust", &mut s.env.nebula_dust, 2, false);
+                    anim_slider_f32(ui, anim, "env_nebula_scale", "Cloud Scale", &mut s.env.nebula_scale, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 2, false);
                 }
                 4 => {
-                    anim_slider_f32(ui, anim, "env_grid_glow", "Grid Glow", &mut s.env.grid_glow, 0.1..=3.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_grid_density", "Grid Density", &mut s.env.grid_density, 4.0..=32.0, 1, false);
+                    anim_slider_f32(ui, anim, "env_grid_glow", "Grid Glow", &mut s.env.grid_glow, 2, false);
+                    anim_slider_f32(ui, anim, "env_grid_density", "Grid Density", &mut s.env.grid_density, 1, false);
                 }
                 5 => {
-                    anim_slider_f32(ui, anim, "env_elev_cloud_cover", "Cloud Cover", &mut s.env.elev_cloud_cover, 0.0..=1.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_elev_fog", "Valley Fog", &mut s.env.elev_fog, 0.2..=2.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_elev_cloud_cover", "Cloud Cover", &mut s.env.elev_cloud_cover, 2, false);
+                    anim_slider_f32(ui, anim, "env_elev_fog", "Valley Fog", &mut s.env.elev_fog, 2, false);
                 }
                 6 => {
-                    anim_slider_f32(ui, anim, "env_city_fog", "City Fog", &mut s.env.city_fog, 0.2..=2.5, 2, false);
-                    anim_slider_f32(ui, anim, "env_city_windows", "Window Glow", &mut s.env.city_windows, 0.0..=3.0, 2, false);
+                    anim_slider_f32(ui, anim, "env_city_fog", "City Fog", &mut s.env.city_fog, 2, false);
+                    anim_slider_f32(ui, anim, "env_city_windows", "Window Glow", &mut s.env.city_windows, 2, false);
                 }
                 7 => {
-                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 0.0..=2.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 0.0..=4.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_colony_glow", "Colony Glow", &mut s.env.colony_glow, 0.0..=3.0, 2, false);
-                    anim_slider_f32(ui, anim, "env_planet_limb", "Planet Limb", &mut s.env.planet_limb, 0.0..=2.5, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_density", "Star Density", &mut s.env.star_density, 2, false);
+                    anim_slider_f32(ui, anim, "env_star_brightness", "Star Bright", &mut s.env.star_brightness, 2, false);
+                    anim_slider_f32(ui, anim, "env_colony_glow", "Colony Glow", &mut s.env.colony_glow, 2, false);
+                    anim_slider_f32(ui, anim, "env_planet_limb", "Planet Limb", &mut s.env.planet_limb, 2, false);
                 }
                 _ => {}
             }
@@ -2518,7 +2479,6 @@ impl UiContext<'_> {
                 "aperture",
                 "Aperture",
                 &mut s.aperture,
-                0.0..=0.12,
                 3,
                 false,
             );
@@ -2528,7 +2488,6 @@ impl UiContext<'_> {
                 "focus_dist",
                 "Focus Dist",
                 &mut s.focus_dist,
-                0.5..=12.0,
                 2,
                 false,
             );
@@ -2546,7 +2505,6 @@ impl UiContext<'_> {
                     "floor_roughness",
                     "Roughness",
                     &mut s.floor_roughness,
-                    0.03..=0.80,
                     2,
                     false,
                 );
@@ -2556,7 +2514,6 @@ impl UiContext<'_> {
                     "floor_scratch",
                     "Scratches",
                     &mut s.floor_scratch,
-                    0.0..=1.5,
                     2,
                     false,
                 );
@@ -2566,7 +2523,6 @@ impl UiContext<'_> {
                     "floor_scale",
                     "Tile Scale",
                     &mut s.floor_scale,
-                    0.3..=5.0,
                     2,
                     false,
                 );
@@ -2576,7 +2532,6 @@ impl UiContext<'_> {
                     "floor_metallic",
                     "Metallic",
                     &mut s.floor_metallic,
-                    0.0..=1.0,
                     2,
                     false,
                 );
@@ -2605,7 +2560,6 @@ impl UiContext<'_> {
                     "sat_size_min",
                     "Min Size",
                     &mut s.sat_size_min,
-                    0.001..=0.80,
                     3,
                     false,
                 );
@@ -2615,7 +2569,6 @@ impl UiContext<'_> {
                     "sat_size_max",
                     "Max Size",
                     &mut s.sat_size_max,
-                    0.001..=0.80,
                     3,
                     false,
                 );
@@ -2625,7 +2578,6 @@ impl UiContext<'_> {
                     "sat_orbit_min",
                     "Min Orbit",
                     &mut s.sat_orbit_min,
-                    0.6..=4.5,
                     2,
                     false,
                 );
@@ -2635,7 +2587,6 @@ impl UiContext<'_> {
                     "sat_orbit_max",
                     "Max Orbit",
                     &mut s.sat_orbit_max,
-                    0.6..=4.5,
                     2,
                     false,
                 );
@@ -2645,7 +2596,6 @@ impl UiContext<'_> {
                     "sat_height_min",
                     "Min Height",
                     &mut s.sat_height_min,
-                    -1.0..=2.0,
                     2,
                     false,
                 );
@@ -2655,7 +2605,6 @@ impl UiContext<'_> {
                     "sat_height_max",
                     "Max Height",
                     &mut s.sat_height_max,
-                    -1.0..=2.0,
                     2,
                     false,
                 );
@@ -2665,7 +2614,6 @@ impl UiContext<'_> {
                     "sat_speed_min",
                     "Min Speed",
                     &mut s.sat_speed_min,
-                    -3.0..=3.0,
                     2,
                     false,
                 );
@@ -2675,7 +2623,6 @@ impl UiContext<'_> {
                     "sat_speed_max",
                     "Max Speed",
                     &mut s.sat_speed_max,
-                    -3.0..=3.0,
                     2,
                     false,
                 );
@@ -2685,7 +2632,6 @@ impl UiContext<'_> {
                     "sat_bob_amp_min",
                     "Bob Amp Min",
                     &mut s.sat_bob_amp_min,
-                    0.0..=0.80,
                     2,
                     false,
                 );
@@ -2695,7 +2641,6 @@ impl UiContext<'_> {
                     "sat_bob_amp_max",
                     "Bob Amp Max",
                     &mut s.sat_bob_amp_max,
-                    0.0..=0.80,
                     2,
                     false,
                 );
@@ -2705,7 +2650,6 @@ impl UiContext<'_> {
                     "sat_bob_freq_min",
                     "Bob Frq Min",
                     &mut s.sat_bob_freq_min,
-                    0.0..=5.0,
                     2,
                     false,
                 );
@@ -2715,7 +2659,6 @@ impl UiContext<'_> {
                     "sat_bob_freq_max",
                     "Bob Frq Max",
                     &mut s.sat_bob_freq_max,
-                    0.0..=5.0,
                     2,
                     false,
                 );
@@ -2725,7 +2668,6 @@ impl UiContext<'_> {
                     "sat_hue_spread",
                     "Hue Spread",
                     &mut s.sat_hue_spread,
-                    0.0..=1.0,
                     2,
                     false,
                 );
@@ -2735,7 +2677,6 @@ impl UiContext<'_> {
                     "glass_ior",
                     "Glass IOR",
                     &mut s.glass_ior,
-                    1.05..=2.40,
                     2,
                     false,
                 );
@@ -2745,7 +2686,6 @@ impl UiContext<'_> {
                     "glass_roughness",
                     "Glass Rough",
                     &mut s.glass_roughness,
-                    0.0..=0.35,
                     3,
                     false,
                 );
@@ -2755,7 +2695,6 @@ impl UiContext<'_> {
                     "glass_absorb",
                     "Absorb",
                     &mut s.glass_absorb,
-                    0.0..=12.0,
                     2,
                     false,
                 );
@@ -2801,7 +2740,6 @@ impl UiContext<'_> {
                         "bloom_threshold",
                         "Threshold",
                         &mut s.bloom_threshold,
-                        0.2..=5.0,
                         2,
                         false,
                     );
@@ -2811,7 +2749,6 @@ impl UiContext<'_> {
                         "bloom_intensity",
                         "Intensity",
                         &mut s.bloom_intensity,
-                        0.0..=2.0,
                         2,
                         false,
                     );
@@ -2829,7 +2766,6 @@ impl UiContext<'_> {
                     "split_x",
                     "Split X",
                     &mut s.split_x,
-                    0.02..=0.98,
                     2,
                     false,
                 );
@@ -2990,7 +2926,6 @@ impl UiContext<'_> {
                         "dlss_sharpness",
                         "DLSS Sharp",
                         &mut s.dlss_sharpness,
-                        0.0..=1.0,
                         2,
                         false,
                     );
@@ -4517,20 +4452,31 @@ fn anim_toggle_btn_disabled(ui: &mut Ui) {
     resp.on_hover_text("This parameter cannot be animated");
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "row helper behind every animatable slider; a parameter struct would only rename the arguments"
-)]
+/// Row for a key that is missing from `demo_anim::ANIM_PARAMS` (a caller typo; a debug assertion
+/// and `anim_slider_keys_are_all_animatable` catch it). Shows the problem instead of a slider
+/// with an invented range.
+fn unknown_anim_key_row(ui: &mut Ui, key: &str, label: &str) {
+    debug_assert!(false, "`{key}` is not in demo_anim::ANIM_PARAMS");
+    prop_row(ui, label, |ui| {
+        ui.colored_label(ui.visuals().error_fg_color, format!("unknown parameter `{key}`"));
+    });
+}
+
+/// Slider row for the animatable `key`; its range is `demo_anim::anim_range(key)`, the same range
+/// the animator clamps the oscillation to.
 fn anim_slider_f32(
     ui: &mut Ui,
     anim: &mut DemoAnimator,
     key: &str,
     label: &str,
     val: &mut f32,
-    range: RangeInclusive<f32>,
     decimals: usize,
     log: bool,
 ) {
+    let Some(range) = anim_range(key) else {
+        unknown_anim_key_row(ui, key, label);
+        return;
+    };
     prop_row(ui, label, |ui| {
         let gap = 4.0;
         let (track_w, val_w) = slider_control_widths(ui.available_width());
@@ -4617,9 +4563,12 @@ fn anim_vec3(
     key: &str,
     label: &str,
     v: &mut [f32; 3],
-    range: RangeInclusive<f32>,
     speed: f32,
 ) {
+    let Some(range) = anim_range(key) else {
+        unknown_anim_key_row(ui, key, label);
+        return;
+    };
     prop_row(ui, label, |ui| {
         let gap = 4.0;
         let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(18.0);
@@ -4721,6 +4670,34 @@ fn sparkline_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `anim_slider_f32` / `anim_vec3` row takes its range from `demo_anim::anim_range`, so a
+    /// key missing from `ANIM_PARAMS` would render an error row: scan this file's call sites (the
+    /// key is the first string literal of each call) and require every key to be animatable.
+    #[test]
+    fn anim_slider_keys_are_all_animatable() {
+        let src = include_str!("ui.rs");
+        let mut calls = 0;
+        // Split literals, so the needles do not match their own spelling in this test.
+        for name in [concat!("anim_slider", "_f32("), concat!("anim_", "vec3(")] {
+            for (at, _) in src.match_indices(name) {
+                if src[..at].ends_with("fn ") {
+                    continue;
+                }
+                let rest = &src[at + name.len()..];
+                let Some(open) = rest.find('"') else {
+                    panic!("call at byte {at} has no key literal");
+                };
+                let Some(len) = rest[open + 1..].find('"') else {
+                    panic!("unterminated key literal at byte {at}");
+                };
+                let key = &rest[open + 1..open + 1 + len];
+                assert!(anim_range(key).is_some(), "`{key}` is not in ANIM_PARAMS");
+                calls += 1;
+            }
+        }
+        assert!(calls > 80, "found only {calls} call sites");
+    }
 
     #[test]
     fn scene_wgs84_origin_maps_osm_scenes_and_skips_non_geo() {

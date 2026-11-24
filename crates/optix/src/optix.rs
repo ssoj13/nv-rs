@@ -47,7 +47,7 @@ pub mod xform;
 
 pub use accel::{
     Aabb, Accel, BuildOptions, CurveType, Curves, CustomPrimitives, DeviceInstances, Emit,
-    GeometryFlags, INSTANCE_STAGING_BYTES, Indices, Instance, InstanceBuffer, Keys, Radii, Relink,
+    GeometryFlags, INSTANCE_STAGING_BYTES, INSTANCE_STAGING_MAX_BYTES, Indices, Instance, InstanceBuffer, Keys, Radii, Relink,
     RelocationInfo, SbtOffsets, Scratch, Spheres, TriangleMesh, VertexFormat, Vertices,
 };
 pub use cluster::{

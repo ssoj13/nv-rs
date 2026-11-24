@@ -3091,7 +3091,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 crate::persist::PersistWorker::spawn()
             };
 
-            let dock_state = default_dock_state();
+            // APP:F19: `persist::load_from` keeps only a layout that decodes and holds every tab
+            // once, so a decode failure here means the file changed underneath; say so and
+            // start from the default layout.
+            let dock_state = match persisted
+                .dock
+                .as_ref()
+                .map(crate::persist::dock_state_from_value)
+            {
+                Some(Ok(dock)) => dock,
+                Some(Err(e)) => {
+                    if startup_msg.is_none() {
+                        startup_msg = Some(format!("Saved panel layout ignored: {e}"));
+                    }
+                    default_dock_state()
+                }
+                None => default_dock_state(),
+            };
             let theme = persisted.theme;
             let dock_style = theme.apply(&egui_ctx);
 
@@ -3285,6 +3301,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 viewport_toolbar: crate::persist::PersistedToolbar {
                     edge: self.viewport_toolbar.edge,
                     expanded: self.viewport_toolbar.expanded,
+                },
+                dock: match crate::persist::dock_state_to_value(&self.dock_state) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        // Keep the layout last written rather than erasing it from the file.
+                        eprintln!("nv-demo config: {e}");
+                        self.last_saved_state.dock.clone()
+                    }
                 },
             }
         }

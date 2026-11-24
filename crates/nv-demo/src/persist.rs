@@ -1,9 +1,8 @@
 //! Persistent user preferences and window geometry stored in `~/.nv-rs/nv-demo.json`.
 //!
 //! What: serializes window position/size/maximized state, [`DemoSettings`], camera navigation
-//! settings/pose, the selected scene (by descriptor id) and the viewport toolbar edge to JSON
-//! using atomic write-and-rename. The `egui_dock` layout is not persisted (the crate is built
-//! without its `serde` feature).
+//! settings/pose, the selected scene (by descriptor id), the viewport toolbar edge and the
+//! `egui_dock` panel layout (APP:F19) to JSON using atomic write-and-rename.
 //! Why: preserves scene tuning across sessions without losing defaults when new fields are
 //! added (`#[serde(default)]`).
 //! How: [`load_from`] reads the file section by section (one top-level key at a time), so one
@@ -26,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::demo_anim::DemoAnimator;
 use crate::renderer::DemoSettings;
-use crate::ui::UiTheme;
+use crate::ui::{DockTab, UiTheme};
 use crate::viewport_toolbar::ToolbarEdge;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +204,50 @@ pub struct PersistedState {
     pub camera_rail: crate::camera_rail::CameraRail,
     pub scene: Option<SavedScene>,
     pub viewport_toolbar: PersistedToolbar,
+    /// `egui_dock::DockState<DockTab>` as JSON (`DockState` has no `PartialEq`, which the
+    /// save-on-change check needs). [`load_from`] only keeps a layout that
+    /// [`dock_state_from_value`] accepts.
+    pub dock: Option<serde_json::Value>,
+}
+
+/// Serializes the live dock layout for [`PersistedState::dock`].
+///
+/// Node rectangles are layout output that `DockArea` recomputes every frame: they are zeroed, so
+/// a resize alone does not mark the file dirty, and a node not shown yet (`Rect::NOTHING`, made of
+/// infinities, which JSON writes as `null` and cannot read back) still saves. The result is
+/// decoded once more, so a layout this module could not load is never written.
+pub fn dock_state_to_value(
+    dock: &egui_dock::DockState<DockTab>,
+) -> Result<serde_json::Value, String> {
+    let mut dock = dock.clone();
+    for (_, node) in dock.iter_all_nodes_mut() {
+        node.set_rect(egui::Rect::ZERO);
+        if let Some(leaf) = node.get_leaf_mut() {
+            leaf.viewport = egui::Rect::ZERO;
+        }
+    }
+    let value = serde_json::to_value(&dock)
+        .map_err(|e| format!("dock layout serialization failed: {e}"))?;
+    dock_state_from_value(&value)
+        .map_err(|e| format!("dock layout does not read back ({e}); not saved"))?;
+    Ok(value)
+}
+
+/// Decodes a persisted dock layout. It must hold every [`DockTab`] exactly once: tabs cannot be
+/// closed in the UI, so a layout missing one (or holding one twice) was not written by us and
+/// would leave a panel unreachable.
+pub fn dock_state_from_value(
+    value: &serde_json::Value,
+) -> Result<egui_dock::DockState<DockTab>, String> {
+    let dock: egui_dock::DockState<DockTab> =
+        serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    for tab in DockTab::ALL {
+        let n = dock.iter_all_tabs().filter(|(_, t)| **t == tab).count();
+        if n != 1 {
+            return Err(format!("layout holds the {tab:?} tab {n} times (expected once)"));
+        }
+    }
+    Ok(dock)
 }
 
 /// Result of reading the config file.
@@ -295,6 +338,11 @@ fn parse_sections(text: &str) -> (PersistedState, Vec<String>) {
     section(obj, "camera_rail", &mut st.camera_rail, &mut errors);
     section(obj, "scene", &mut st.scene, &mut errors);
     section(obj, "viewport_toolbar", &mut st.viewport_toolbar, &mut errors);
+    section(obj, "dock", &mut st.dock, &mut errors);
+    if let Some(Err(e)) = st.dock.as_ref().map(dock_state_from_value) {
+        errors.push(format!("section 'dock': {e}"));
+        st.dock = None;
+    }
     (st, errors)
 }
 
@@ -728,6 +776,88 @@ mod tests {
         let loaded = load_from(&path).state;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(loaded.settings.sat_count, 23);
+    }
+
+    /// Serializes `dock` like [`dock_state_to_value`] but without its read-back check, to build
+    /// layouts that the loader must reject.
+    fn unchecked_dock_value(dock: &egui_dock::DockState<DockTab>) -> serde_json::Value {
+        let mut dock = dock.clone();
+        for (_, node) in dock.iter_all_nodes_mut() {
+            node.set_rect(egui::Rect::ZERO);
+            if let Some(leaf) = node.get_leaf_mut() {
+                leaf.viewport = egui::Rect::ZERO;
+            }
+        }
+        serde_json::to_value(&dock).expect("serialize")
+    }
+
+    /// APP:F19: a rearranged dock layout survives save + load through the atomic writer.
+    #[test]
+    fn dock_layout_round_trips() {
+        // A never-shown layout (infinite `Rect::NOTHING` node rectangles) still saves and loads.
+        let default_layout = dock_state_to_value(&crate::ui::default_dock_state())
+            .expect("default layout serializes and reads back");
+        dock_state_from_value(&default_layout).expect("default layout decodes");
+        // A layout holding a tab twice is rejected on load and never written.
+        let mut doubled = crate::ui::default_dock_state();
+        let _ = doubled.main_surface_mut().split_above(
+            egui_dock::NodeIndex::root(),
+            0.25,
+            vec![DockTab::Fractal],
+        );
+        assert!(dock_state_from_value(&unchecked_dock_value(&doubled)).is_err());
+        assert!(dock_state_to_value(&doubled).is_err());
+
+        let mut state = PersistedState::default();
+        let dir = std::env::temp_dir().join(format!("nv_demo_dock_{}", std::process::id()));
+        let path = dir.join("nv-demo.json");
+        let custom = {
+            let mut d = egui_dock::DockState::new(vec![DockTab::Viewport, DockTab::CameraStats]);
+            let s = d.main_surface_mut();
+            let [_, right] =
+                s.split_right(egui_dock::NodeIndex::root(), 0.6, vec![DockTab::Fractal]);
+            let _ = s.split_below(right, 0.5, vec![DockTab::RenderFloor]);
+            d
+        };
+        state.dock = Some(dock_state_to_value(&custom).expect("serialize"));
+        save_to(&path, &state).expect("save_to");
+        let report = load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.problem, None);
+        assert_eq!(report.state, state);
+        let restored =
+            dock_state_from_value(report.state.dock.as_ref().expect("dock")).expect("decode");
+        let tabs: Vec<DockTab> = restored.iter_all_tabs().map(|(_, t)| *t).collect();
+        let expected: Vec<DockTab> = custom.iter_all_tabs().map(|(_, t)| *t).collect();
+        assert_eq!(tabs, expected);
+    }
+
+    /// APP:F19 + F07: an invalid dock section is a load problem (so the file is not overwritten)
+    /// and only that section falls back to the default layout.
+    #[test]
+    fn invalid_dock_section_is_reported_and_dropped() {
+        let dir = std::env::temp_dir().join(format!("nv_demo_baddock_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("nv-demo.json");
+        let only_viewport = egui_dock::DockState::new(vec![DockTab::Viewport]);
+        let mut json = serde_json::to_value(PersistedState {
+            window: WindowState {
+                width: 1500,
+                ..WindowState::default()
+            },
+            ..PersistedState::default()
+        })
+        .expect("to_value");
+        json["dock"] = unchecked_dock_value(&only_viewport);
+        std::fs::write(&path, serde_json::to_string(&json).expect("to_string")).expect("write");
+
+        let report = load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let problem = report.problem.expect("problem reported");
+        assert!(problem.contains("section 'dock'"), "{problem}");
+        assert!(problem.contains("0 times"), "{problem}");
+        assert_eq!(report.state.dock, None);
+        assert_eq!(report.state.window.width, 1500);
     }
 
     /// F21: the on-disk names are PascalCase (`"FpsFly"`), while `camera`'s serde derives use

@@ -64,6 +64,21 @@ pub use texture::{
     vk_image_view_raw,
 };
 
+/// Longest [`InteropContext::submit_vulkan_commands`] waits for its submission. Windows resets a
+/// GPU that does not respond for 2 s (TDR), so a submission still running after this is hung.
+pub const VULKAN_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The error a bounded submission wait reports: a timeout is [`Error::Timeout`], everything else
+/// stays [`Error::Poll`].
+fn submit_wait_error(err: wgpu::PollError) -> Error {
+    match err {
+        wgpu::PollError::Timeout => Error::Timeout {
+            what: "submit_vulkan_commands (VULKAN_SUBMIT_TIMEOUT)",
+        },
+        other => Error::Poll(other),
+    }
+}
+
 /// Vulkan image layout transitions recorded via [`InteropContext::vk_image_barrier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VkImageTransition {
@@ -305,7 +320,12 @@ impl InteropContext {
     /// Lets `f` record commands into the primary `VkCommandBuffer` of a fresh `wgpu` command
     /// encoder (`*mut c_void` = `VkCommandBuffer`; `f` must not end or free it), submits it with
     /// `wgpu::Queue::submit`, and blocks until that submission completes, so every resource the
-    /// commands reference may be dropped once this returns.
+    /// commands reference may be dropped once this returns `Ok`.
+    ///
+    /// The wait is bounded by [`VULKAN_SUBMIT_TIMEOUT`]: a submission still running then (a hung
+    /// GPU or a TDR) returns [`Error::Timeout`] instead of blocking the caller forever. After a
+    /// timeout the submission may still execute, so the GPU must be treated as lost: raw Vulkan
+    /// objects the commands reference must not be destroyed or reused until the device is idle.
     ///
     /// The submission is ordered after `wgpu`'s pending `write_buffer` / `write_texture` uploads
     /// and is safe next to other threads' `wgpu` submits and presents. `f` runs without any
@@ -325,10 +345,12 @@ impl InteropContext {
             platform::submit_vulkan_raw(&self.device, &self.queue, None, None, |cmd| {
                 f(cmd.as_raw() as usize as *mut c_void)
             })?;
-        self.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(index),
-            timeout: None,
-        })?;
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(VULKAN_SUBMIT_TIMEOUT),
+            })
+            .map_err(submit_wait_error)?;
         Ok(value)
     }
 
@@ -416,5 +438,24 @@ impl InteropContext {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A submission wait that hits `VULKAN_SUBMIT_TIMEOUT` is a typed `Timeout`, not a generic
+    /// poll failure, so callers can tell a hung GPU from a bad submission index.
+    #[test]
+    fn submit_wait_timeout_is_typed() {
+        assert!(matches!(
+            submit_wait_error(wgpu::PollError::Timeout),
+            Error::Timeout { what } if what.contains("submit_vulkan_commands")
+        ));
+        assert!(matches!(
+            submit_wait_error(wgpu::PollError::WrongSubmissionIndex(3, 2)),
+            Error::Poll(wgpu::PollError::WrongSubmissionIndex(3, 2))
+        ));
     }
 }

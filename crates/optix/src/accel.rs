@@ -896,9 +896,15 @@ impl DeviceInstances {
     }
 }
 
-/// Default pinned host staging capacity (`256 KiB` = 3,276 `OptixInstance` records) for
-/// asynchronous H2D DMA transfers in [`InstanceBuffer`].
+/// Initial pinned host staging capacity (`256 KiB` = 3,276 `OptixInstance` records) for
+/// asynchronous H2D DMA transfers in [`InstanceBuffer`]; it grows on demand up to
+/// [`INSTANCE_STAGING_MAX_BYTES`].
 pub const INSTANCE_STAGING_BYTES: usize = 256 * 1024;
+
+/// Most page-locked staging an [`InstanceBuffer`] grows to (`64 MiB` = 838,860 `OptixInstance`
+/// records). Larger payloads are copied from pageable memory: page-locked memory is a scarce
+/// system resource, and one structure that size is far beyond any frame-rate workload.
+pub const INSTANCE_STAGING_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Reusable page-locked host staging buffer (`cuMemAllocHost_v2` / `cuMemFreeHost`) and the event
 /// that marks the end of the last asynchronous copy out of it.
@@ -950,14 +956,17 @@ impl Drop for PinnedHostStaging {
     }
 }
 
-/// Persistent, grow-only device `OptixInstance` array paired with a reusable `256 KiB` pinned
-/// host staging buffer for zero-churn per-frame IAS builds and partial dynamic updates.
+/// Persistent, grow-only device `OptixInstance` array paired with a reusable pinned host staging
+/// buffer (initially [`INSTANCE_STAGING_BYTES`], grown on demand) for zero-churn per-frame IAS
+/// builds and partial dynamic updates.
 ///
 /// An upload waits until the previous asynchronous copy out of the staging buffer has run
 /// (one event wait, which returns at once when it has), so back-to-back uploads before the
-/// stream drains never tear. Payloads above [`INSTANCE_STAGING_BYTES`], and every payload when
-/// the staging buffer could not be allocated ([`InstanceBuffer::staging_error`]), are copied from
-/// pageable memory, which the driver stages before the copy call returns.
+/// stream drains never tear. Growing replaces the staging buffer; the old one is freed only
+/// after its last copy has run. Payloads above [`INSTANCE_STAGING_MAX_BYTES`], and payloads that
+/// do not fit when the staging buffer could not be allocated or grown
+/// ([`InstanceBuffer::staging_error`]), are copied from pageable memory, which the driver stages
+/// before the copy call returns.
 pub struct InstanceBuffer {
     ctx: Arc<DeviceContext>,
     stream: Arc<Stream>,
@@ -967,14 +976,14 @@ pub struct InstanceBuffer {
     raw_scratch: Vec<sys::OptixInstance>,
     children: Vec<Child>,
     pinned: Option<PinnedHostStaging>,
-    // Why `pinned` is `None`.
+    // Why `pinned` is `None` or could not grow; growth is not retried after a failure.
     staging_error: Option<Error>,
 }
 
 impl InstanceBuffer {
     /// Creates an empty persistent instance buffer bound to `ctx` and `stream`, pre-allocating
-    /// a `256 KiB` page-locked host staging buffer for async DMA uploads. If that allocation
-    /// fails the buffer still works through pageable copies, and
+    /// an [`INSTANCE_STAGING_BYTES`] page-locked host staging buffer for async DMA uploads. If that
+    /// allocation fails the buffer still works through pageable copies, and
     /// [`InstanceBuffer::staging_error`] reports why.
     pub fn new(ctx: &Arc<DeviceContext>, stream: &Arc<Stream>) -> Self {
         let (pinned, staging_error) =
@@ -995,10 +1004,41 @@ impl InstanceBuffer {
         }
     }
 
-    /// Why the pinned staging buffer is missing (every upload then copies from pageable memory);
-    /// `None` when uploads that fit [`INSTANCE_STAGING_BYTES`] are staged through pinned memory.
+    /// Why the pinned staging buffer is missing or could not grow (uploads that do not fit then
+    /// copy from pageable memory; growth is not retried); `None` while every upload up to
+    /// [`INSTANCE_STAGING_MAX_BYTES`] is staged through pinned memory.
     pub fn staging_error(&self) -> Option<&Error> {
         self.staging_error.as_ref()
+    }
+
+    /// Current pinned staging capacity in bytes (`0` when none could be allocated).
+    pub fn staging_capacity_bytes(&self) -> usize {
+        self.pinned.as_ref().map_or(0, |p| p.bytes)
+    }
+
+    /// Makes the pinned staging buffer hold `bytes`, growing it to the next power of two (at most
+    /// [`INSTANCE_STAGING_MAX_BYTES`]); `false` when the payload must take the pageable path.
+    fn ensure_staging(&mut self, bytes: usize) -> bool {
+        if self.pinned.as_ref().is_some_and(|p| p.bytes >= bytes) {
+            return true;
+        }
+        if bytes > INSTANCE_STAGING_MAX_BYTES || self.staging_error.is_some() {
+            return false;
+        }
+        let grown = bytes
+            .next_power_of_two()
+            .clamp(INSTANCE_STAGING_BYTES, INSTANCE_STAGING_MAX_BYTES);
+        match PinnedHostStaging::new(self.ctx.cuda(), grown) {
+            Ok(p) => {
+                // Dropping the old staging buffer waits for its last copy before freeing it.
+                self.pinned = Some(p);
+                true
+            }
+            Err(e) => {
+                self.staging_error = Some(e);
+                false
+            }
+        }
     }
 
     /// Number of active instances currently resident in the device buffer.
@@ -1075,8 +1115,8 @@ impl InstanceBuffer {
     }
 
     /// Updates a contiguous subrange `[offset .. offset + instances.len()]` in place via the
-    /// reusable `256 KiB` pinned host staging buffer (**zero** VRAM allocations, **zero** frees,
-    /// and **zero** host `Vec` allocations once warm).
+    /// reusable pinned host staging buffer (**zero** VRAM allocations, **zero** frees, and
+    /// **zero** host `Vec` or pinned allocations once warm).
     pub fn update_prefix(
         &mut self,
         stream: &Arc<Stream>,
@@ -1117,10 +1157,10 @@ impl InstanceBuffer {
         Ok(())
     }
 
-    /// Streams `self.raw_scratch` to `base_ptr + byte_offset`, using the pinned `256 KiB` host
-    /// staging buffer when the payload fits in one async DMA transfer (or direct H2D otherwise).
+    /// Streams `self.raw_scratch` to `base_ptr + byte_offset` through the pinned host staging
+    /// buffer (grown to fit, see [`Self::ensure_staging`]), or as a pageable H2D copy otherwise.
     fn copy_raw_range_to_device(
-        &self,
+        &mut self,
         stream: &Arc<Stream>,
         base_ptr: u64,
         byte_offset: u64,
@@ -1135,7 +1175,9 @@ impl InstanceBuffer {
             ));
         }
         let dst_ptr = base_ptr + byte_offset;
-        if let Some(ref pinned) = self.pinned
+        let staged = self.ensure_staging(total_bytes);
+        if staged
+            && let Some(ref pinned) = self.pinned
             && total_bytes <= pinned.bytes
         {
             // The previous copy out of the staging bytes must have read them before they are

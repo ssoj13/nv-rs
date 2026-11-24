@@ -91,9 +91,8 @@ struct LaunchParams {
     fractal_p1: [f32; 4],
     fractal_p2: [f32; 4],
     fractal_p3: [f32; 4],
-    /// Unread by `raytracer.cu` (the fractal TRS lives in the TLAS instance transform); kept so
-    /// the 640-byte layout and every later offset stay fixed.
-    fractal_xform: [f32; 4],
+    /// `env_params` slots `0..4` of the crossfade source sky `sky_mode_from` (zero outside a fade).
+    env_from_lo: [f32; 4],
     fractal_r0: [f32; 4],
     fractal_r1: [f32; 4],
     time: f32,
@@ -113,8 +112,8 @@ struct LaunchParams {
     prev_cam_forward: [f32; 4],
     prev_cam_right: [f32; 4],
     prev_cam_up: [f32; 4],
-    /// Unread by `raytracer.cu`; kept so the 640-byte layout and every later offset stay fixed.
-    sat_pos: [f32; 4],
+    /// `env_params` slots `4..8` of the crossfade source sky `sky_mode_from` (zero outside a fade).
+    env_from_hi: [f32; 4],
     /// `[ior, absorption, roughness, unread]`; `raytracer.cu` never reads `[3]`.
     glass_params: [f32; 4],
     aov_mode: u32,
@@ -148,16 +147,200 @@ struct LaunchParams {
     sdg_ray_queries: u64,
     sdg_ray_results: u64,
     sdg_ray_count: u32,
-    _pad2: u32,
+    /// Valid entries of `classic_motion`.
+    classic_motion_count: u32,
+    /// Device pointer to `[f32; 12]` row-major 3x4 "current world -> previous world" transforms,
+    /// one per classic (non-CSG) IAS instance, indexed by bits `16..24` of its instance id
+    /// ([`ClassicMotion`]); `0` disables classic object motion.
+    classic_motion: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 640);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 648);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_prev_xforms) == 592);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, out_semantic_u32) == 600);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, out_instance_u32) == 608);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_queries) == 616);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_results) == 624);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, sdg_ray_count) == 632);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, classic_motion_count) == 636);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, classic_motion) == 640);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, env_from_lo) == 192);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, env_from_hi) == 384);
+
+/// Most orbiting glass spheres the classic stage instances.
+const MAX_SATELLITES: usize = 24;
+/// Classic IAS instances: floor, fractal, up to [`MAX_SATELLITES`] spheres, neon, OMM halo.
+const CLASSIC_MOTION_SLOTS: usize = MAX_SATELLITES + 4;
+/// Bytes of the device classic motion table (`[f32; 12]` per slot).
+const CLASSIC_MOTION_BYTES: usize = CLASSIC_MOTION_SLOTS * std::mem::size_of::<[f32; 12]>();
+/// Bit position of the classic slot index inside a classic instance id (`raytracer.cu` reads bits
+/// `16..24`; bits `0..8` are the slot kind, `8..16` the sphere hue).
+const CLASSIC_SLOT_SHIFT: u32 = 16;
+const _: () = assert!(CLASSIC_MOTION_SLOTS <= 0xFF);
+
+const IDENTITY_3X4: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+/// Row-major 3x4 object-to-world transforms of the classic IAS instances, in IAS order, keyed by
+/// their instance ids; one snapshot per rendered frame feeds the classic object motion (GPU:D03).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClassicXforms {
+    len: usize,
+    ids: [u32; CLASSIC_MOTION_SLOTS],
+    xforms: [[f32; 12]; CLASSIC_MOTION_SLOTS],
+}
+
+impl Default for ClassicXforms {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            ids: [0; CLASSIC_MOTION_SLOTS],
+            xforms: [IDENTITY_3X4; CLASSIC_MOTION_SLOTS],
+        }
+    }
+}
+
+impl ClassicXforms {
+    /// Snapshot of `classic` (the classic prefix of the IAS instance list, at most
+    /// [`CLASSIC_MOTION_SLOTS`] long by construction in [`build_ias_into`]).
+    fn capture(classic: &[Instance]) -> Self {
+        let mut out = Self::default();
+        for (slot, inst) in classic.iter().take(CLASSIC_MOTION_SLOTS).enumerate() {
+            out.ids[slot] = inst.id;
+            out.xforms[slot] = inst.transform;
+        }
+        out.len = classic.len().min(CLASSIC_MOTION_SLOTS);
+        out
+    }
+
+    /// Fills `out[..n]` with the "current world -> previous world" transform of each current
+    /// instance (`prev * self^-1`) and returns `n`. An instance whose slot in `prev` holds a
+    /// different id (the instance list changed) or whose current transform is singular gets the
+    /// identity, i.e. no object motion, which is the most that can be said without history.
+    fn motion_to(&self, prev: &Self, out: &mut [[f32; 12]; CLASSIC_MOTION_SLOTS]) -> u32 {
+        let same_layout = prev.len == self.len;
+        for (slot, row) in out.iter_mut().enumerate().take(self.len) {
+            *row = if same_layout && prev.ids[slot] == self.ids[slot] {
+                let cur = affine_from_rows(&self.xforms[slot]);
+                if cur.matrix3.determinant().abs() > 1e-12 {
+                    rows_from_affine(&(affine_from_rows(&prev.xforms[slot]) * cur.inverse()))
+                } else {
+                    IDENTITY_3X4
+                }
+            } else {
+                IDENTITY_3X4
+            };
+        }
+        self.len as u32
+    }
+}
+
+fn affine_from_rows(m: &[f32; 12]) -> glam::Affine3A {
+    glam::Affine3A::from_cols(
+        glam::Vec3A::new(m[0], m[4], m[8]),
+        glam::Vec3A::new(m[1], m[5], m[9]),
+        glam::Vec3A::new(m[2], m[6], m[10]),
+        glam::Vec3A::new(m[3], m[7], m[11]),
+    )
+}
+
+fn rows_from_affine(a: &glam::Affine3A) -> [f32; 12] {
+    let (x, y, z, t) = (a.matrix3.x_axis, a.matrix3.y_axis, a.matrix3.z_axis, a.translation);
+    [x.x, y.x, z.x, t.x, x.y, y.y, z.y, t.y, x.z, y.z, z.z, t.z]
+}
+
+/// Bytes of one [`LaunchUpload`] block: `LaunchParams`, then the classic motion table.
+const LAUNCH_UPLOAD_BYTES: usize = std::mem::size_of::<LaunchParams>() + CLASSIC_MOTION_BYTES;
+
+/// Page-locked staging for the per-launch uploads (`LaunchParams` and the classic motion table),
+/// so they are stream-ordered `cuMemcpyHtoDAsync` copies instead of `copy_from_host`, which
+/// synchronises the stream on every call.
+///
+/// The block is rewritten only after `done` (recorded behind the last copies out of it) has
+/// completed. With one render launch per frame behind the frame fence that wait returns at once;
+/// it blocks only when a second upload (probe / SDG launch, shutter subframe) arrives before the
+/// stream reached the first one's copy.
+struct LaunchUpload {
+    host: cuda_core::PinnedHostBuffer<u8>,
+    done: cuda_core::Event,
+}
+
+impl LaunchUpload {
+    fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
+        let host = cuda_core::PinnedHostBuffer::zeroed(cuda, LAUNCH_UPLOAD_BYTES)
+            .map_err(|e| format!("LaunchParams pinned staging alloc failed: {e}"))?;
+        let done = cuda
+            .new_event_with_flags(None)
+            .map_err(|e| format!("LaunchParams upload event creation failed: {e}"))?;
+        Ok(Self { host, done })
+    }
+
+    /// Enqueues `lp -> params_dst` and, when given, `classic -> classic_dst` on `stream`.
+    fn upload(
+        &mut self,
+        stream: &Stream,
+        lp: &LaunchParams,
+        params_dst: &mut DeviceBuffer<u8>,
+        classic: Option<(&[[f32; 12]; CLASSIC_MOTION_SLOTS], &mut DeviceBuffer<u8>)>,
+    ) -> Result<(), String> {
+        self.done
+            .synchronize()
+            .map_err(|e| format!("LaunchParams staging wait failed: {e}"))?;
+        let queued = self.enqueue(stream, lp, params_dst, classic).and_then(|()| {
+            self.done
+                .record(stream)
+                .map_err(|e| format!("LaunchParams upload event record failed: {e}"))
+        });
+        if let Err(e) = queued {
+            // `done` does not cover what was queued, so the next upload could not wait for it:
+            // drain the stream before the staging block can be rewritten.
+            stream
+                .synchronize()
+                .map_err(|s| format!("{e}; stream sync failed: {s}"))?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn enqueue(
+        &mut self,
+        stream: &Stream,
+        lp: &LaunchParams,
+        params_dst: &mut DeviceBuffer<u8>,
+        classic: Option<(&[[f32; 12]; CLASSIC_MOTION_SLOTS], &mut DeviceBuffer<u8>)>,
+    ) -> Result<(), String> {
+        const LP: usize = std::mem::size_of::<LaunchParams>();
+        // `copy_from_host_async_unchecked` panics on a length mismatch; report it instead.
+        if params_dst.len() != LP
+            || classic
+                .as_ref()
+                .is_some_and(|(_, dst)| dst.len() != CLASSIC_MOTION_BYTES)
+        {
+            return Err("launch upload destination has the wrong size".to_string());
+        }
+        self.host.as_mut_slice()[..LP].copy_from_slice(bytemuck::bytes_of(lp));
+        // SAFETY: `host[..LP]` is page-locked memory owned by `self`; `upload` does not rewrite
+        // it before `done`, recorded behind this copy, has completed (or the stream drained),
+        // and `Drop` waits for `done` before freeing it.
+        unsafe { params_dst.copy_from_host_async_unchecked(stream, &self.host.as_slice()[..LP]) }
+            .map_err(|e| format!("LaunchParams upload failed: {e}"))?;
+        if let Some((table, classic_dst)) = classic {
+            self.host.as_mut_slice()[LP..].copy_from_slice(bytemuck::cast_slice(table));
+            // SAFETY: as above, for the classic table bytes `host[LP..]`.
+            unsafe {
+                classic_dst.copy_from_host_async_unchecked(stream, &self.host.as_slice()[LP..])
+            }
+            .map_err(|e| format!("classic motion table upload failed: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LaunchUpload {
+    fn drop(&mut self) {
+        // The copies out of the staging block must have read it before it is freed.
+        self.host.context().record_err(self.done.synchronize());
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -414,33 +597,20 @@ impl EnvSettings {
         }
     }
 
-    /// Number of leading `env_params` slots `raytracer.cu` reads for `sky_mode` (`0` for modes
-    /// that read none, such as Coastal Night `8`).
-    const fn used_slots(sky_mode: u32) -> usize {
-        match sky_mode {
-            0 | 1 | 2 | 4 | 5 | 6 => 2,
-            3 => 6,
-            7 => 4,
-            _ => 0,
-        }
-    }
-
-    /// Packs `env_params` for a sky crossfade from `from_mode` to `to_mode`.
+    /// Packs the two parameter blocks of a sky crossfade from `from_mode` to `to_mode`:
+    /// `(env_params, env_from)`.
     ///
-    /// `sky_color` in `raytracer.cu` evaluates both modes during the fade from one `env_params`
-    /// block, so the block must serve both: when only one of the two modes reads parameters, or
-    /// both read the same ones (Day `0` and Sunset `1`), that block is exact for the whole fade.
-    /// Two modes reading different parameters cannot share one block; the target mode wins, and
-    /// only a second parameter block in `Params` can fix that case.
-    pub fn pack_crossfade(&self, from_mode: u32, to_mode: u32, blend: f32) -> [f32; 8] {
-        let to = self.pack(to_mode);
-        // Same blend window as `sky_color`: outside it only `to_mode` is evaluated.
+    /// `sky_color` in `raytracer.cu` evaluates `sky_mode_from` with `env_from` and `sky_mode` with
+    /// `env_params`, so every pair of modes fades with each sky's own parameters. Outside the fade
+    /// window (the same test as `sky_color`) only the target is evaluated and `env_from` is zero.
+    pub fn pack_crossfade(&self, from_mode: u32, to_mode: u32, blend: f32) -> ([f32; 8], [f32; 8]) {
         let fading = blend > 1e-4 && blend < 0.9999 && from_mode != to_mode;
-        if fading && Self::used_slots(to_mode) == 0 {
+        let from = if fading {
             self.pack(from_mode)
         } else {
-            to
-        }
+            [0.0; 8]
+        };
+        (self.pack(to_mode), from)
     }
 }
 
@@ -1020,6 +1190,12 @@ struct OptixRig {
     semantic_u32: Option<DeviceBuffer<u32>>,
     instance_u32: Option<DeviceBuffer<u32>>,
     params_buf: DeviceBuffer<u8>,
+    /// Device copy of the classic motion table (`LaunchParams::classic_motion`).
+    classic_motion_buf: DeviceBuffer<u8>,
+    /// Pinned staging for `params_buf` / `classic_motion_buf` uploads.
+    launch_upload: LaunchUpload,
+    /// Classic instance transforms of the current IAS ([`build_ias_into`]).
+    classic_xforms: ClassicXforms,
     tonemap: TonemapKernel,
     /// cuFFT bloom pass, or why it could not be created (reported when Bloom is requested).
     bloom: Result<FftBloomPass, String>,
@@ -1151,6 +1327,17 @@ fn classic_animation(settings: &DemoSettings, burst_active: bool) -> (bool, bool
         && settings.sat_count > 0
         && !burst_active;
     (spin, orbit)
+}
+
+/// Whether the render launch about to run becomes the motion-history reference (`prev_camera`
+/// and the classic instance poses) for the next one.
+///
+/// Shutter subframes (`!publish_frame`) share the history of their published frame. During an SDG
+/// burst a frame accumulates over several launches, so the history moves only when a burst frame
+/// completes (done next to the burst bookkeeping): every accumulated launch of burst frame `N`
+/// and its exported motion AOV then refer to burst frame `N - 1`.
+fn commits_motion_history(publish_frame: bool, burst_active: bool) -> bool {
+    publish_frame && !burst_active
 }
 
 /// Returns `true` when a crowd LOD change on a non-stepping frame is applied by the CUDA crowd
@@ -1873,6 +2060,85 @@ pub fn fractal_instance_transform(
     ]
 }
 
+/// Fractal shape fields of `LaunchParams`: every launch whose IAS can contain the fractal must
+/// carry them, or `__intersection__fractal` marches a different shape (GPU:D21).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FractalLaunch {
+    kind: u32,
+    /// `fractal_p0..p3`.
+    p: [[f32; 4]; 4],
+    /// `[detail_eps, fudge, normal_eps, march_steps]`.
+    r0: [f32; 4],
+    /// `[metallic, trap_scale, palette_shift, sun_intensity]`.
+    r1: [f32; 4],
+}
+
+impl FractalLaunch {
+    fn from_settings(s: &DemoSettings) -> Self {
+        let p = match s.fractal_kind {
+            1 => [
+                [
+                    s.box_scale,
+                    s.box_bailout,
+                    s.box_fold,
+                    s.box_min_r,
+                ],
+                [s.box_fixed_r, 0.0, s.box_iter as f32, 0.0],
+                [0.0; 4],
+                [
+                    s.box_fold_mult,
+                    s.box_iter_rot.to_radians(),
+                    0.0,
+                    0.0,
+                ],
+            ],
+            2 => [
+                [s.kifs_scale, s.kifs_bailout, 0.0, 0.0],
+                [
+                    s.kifs_rot1.to_radians(),
+                    s.kifs_rot2.to_radians(),
+                    s.kifs_iter as f32,
+                    0.0,
+                ],
+                [
+                    s.kifs_offset[0],
+                    s.kifs_offset[1],
+                    s.kifs_offset[2],
+                    0.0,
+                ],
+                [s.kifs_thickness, s.kifs_z_bias, 0.0, 0.0],
+            ],
+            _ => [
+                [
+                    s.bulb_power,
+                    s.bulb_bailout,
+                    if s.bulb_julia { 1.0 } else { 0.0 },
+                    0.0,
+                ],
+                [0.0, 0.0, s.bulb_iter as f32, 0.0],
+                [
+                    s.bulb_c[0],
+                    s.bulb_c[1],
+                    s.bulb_c[2],
+                    0.0,
+                ],
+                [
+                    s.bulb_theta_mult,
+                    s.bulb_phi_mult,
+                    s.bulb_theta_phase.to_radians(),
+                    s.bulb_phi_phase.to_radians(),
+                ],
+            ],
+        };
+        Self {
+            kind: s.fractal_kind,
+            p,
+            r0: [s.detail_eps, s.fudge, s.norm_eps, s.march_steps as f32],
+            r1: [s.metallic, s.trap_scale, s.palette_shift, s.sun_intensity],
+        }
+    }
+}
+
 struct SceneState {
     sat_angle: f32,
     sat_count: u32,
@@ -2034,10 +2300,10 @@ fn build_ias_into(
     csg_host: &CsgGpuHost,
     instances: &mut Vec<Instance>,
     state: SceneState,
-) -> Result<usize, String> {
+) -> Result<ClassicXforms, String> {
     instances.clear();
     if state.show_classic {
-        let count = state.sat_count.min(24) as usize;
+        let count = (state.sat_count as usize).min(MAX_SATELLITES);
         let mut i0 = Instance::new(gas.floor);
         i0.id = 0;
         i0.sbt_offset = 0;
@@ -2142,7 +2408,11 @@ fn build_ias_into(
         }
     }
 
-    let classic_count = instances.len();
+    // Bits 16..24 of a classic id name its slot in the classic motion table.
+    for (slot, inst) in instances.iter_mut().enumerate() {
+        inst.id |= (slot as u32) << CLASSIC_SLOT_SHIFT;
+    }
+    let classic = ClassicXforms::capture(instances);
     csg_host.append_optix_instances(instances);
 
     if instances.is_empty() {
@@ -2169,7 +2439,7 @@ fn build_ias_into(
         )
     }
     .map_err(|e| format!("IAS build failed: {e}"))?;
-    Ok(classic_count)
+    Ok(classic)
 }
 
 #[cfg(has_embedded_ptx)]
@@ -2399,7 +2669,7 @@ fn init_optix(
     let mut ias: Option<Arc<Accel>> = None;
     let (_, initial_fractal_transform) = compute_ias_classic_state(initial_settings, 0.0, 0.0);
 
-    let ias_classic_count = build_ias_into(
+    let classic_xforms = build_ias_into(
         &optix_ctx,
         &stream,
         &mut scratch,
@@ -2428,6 +2698,9 @@ fn init_optix(
         DeviceBuffer::zeroed(&stream, n).map_err(|e| format!("normal_f32 alloc failed: {e}"))?;
     let params_buf = DeviceBuffer::zeroed(&stream, std::mem::size_of::<LaunchParams>())
         .map_err(|e| format!("LaunchParams buffer alloc failed: {e}"))?;
+    let classic_motion_buf = DeviceBuffer::zeroed(&stream, CLASSIC_MOTION_BYTES)
+        .map_err(|e| format!("classic motion table alloc failed: {e}"))?;
+    let launch_upload = LaunchUpload::new(cuda)?;
     let bloom = FftBloomPass::new(cuda);
     let gpu_profiler = match GpuPassProfiler::new(cuda) {
         Ok(p) => Some(p),
@@ -2456,7 +2729,7 @@ fn init_optix(
         omm_anyhit_gas,
         ias,
         d_optix_instances,
-        ias_classic_count,
+        ias_classic_count: classic_xforms.len,
         pipeline,
         sbt,
         probe_sbt,
@@ -2480,6 +2753,9 @@ fn init_optix(
         semantic_u32: None,
         instance_u32: None,
         params_buf,
+        classic_motion_buf,
+        launch_upload,
+        classic_xforms,
         tonemap,
         bloom,
         gpu_profiler,
@@ -2674,6 +2950,7 @@ struct OptixViewProber<'a> {
     probe_sbt: &'a ShaderBindingTable,
     stream: &'a Arc<Stream>,
     params_buf: &'a mut DeviceBuffer<u8>,
+    launch_upload: &'a mut LaunchUpload,
     ias_handle: u64,
     csg_ptrs: crate::csg_scene_host::CsgDevicePointers,
     candidates_buf: &'a mut Option<DeviceBuffer<u8>>,
@@ -2820,9 +3097,9 @@ impl ViewProbeBackend for OptixViewProber<'_> {
             probe_samples: samp_buf.cu_deviceptr(),
             ..LaunchParams::zeroed()
         };
-        self.params_buf
-            .copy_from_host(self.stream, bytemuck::bytes_of(&lp))
-            .map_err(|e| format!("OptiX probe LaunchParams upload failed: {e}"))?;
+        self.launch_upload
+            .upload(self.stream, &lp, self.params_buf, None)
+            .map_err(|e| format!("OptiX probe: {e}"))?;
 
         // SAFETY: `params_buf` matches `Params` layout; `cand_buf` and `samp_buf` are sized for
         // `candidates.len() * grid_w * grid_h` and stay alive through `stream.synchronize()`.
@@ -2911,6 +3188,7 @@ fn score_views_on_rig(
                 probe_sbt: &rig.probe_sbt,
                 stream: &rig.stream,
                 params_buf: &mut rig.params_buf,
+                launch_upload: &mut rig.launch_upload,
                 ias_handle: probe_ias.handle(),
                 csg_ptrs,
                 candidates_buf: &mut rig.probe_candidates_buf,
@@ -2995,6 +3273,7 @@ impl RayOccluder for OptixBatchedOccluder {
 fn trace_sdg_occluder_optix(
     rig: &mut OptixRig,
     sdg_cam: &SdgCamera,
+    fractal: &FractalLaunch,
 ) -> Result<OptixBatchedOccluder, String> {
     let ias_handle = rig
         .ias
@@ -3140,11 +3419,20 @@ fn trace_sdg_occluder_optix(
         sdg_ray_queries: q_ptr,
         sdg_ray_results: r_ptr,
         sdg_ray_count: query_count as u32,
+        // The live IAS can hold the fractal; without its shape the occlusion rays would march a
+        // different (zero-parameter) fractal than the frame shows (GPU:D21).
+        fractal_kind: fractal.kind,
+        fractal_p0: fractal.p[0],
+        fractal_p1: fractal.p[1],
+        fractal_p2: fractal.p[2],
+        fractal_p3: fractal.p[3],
+        fractal_r0: fractal.r0,
+        fractal_r1: fractal.r1,
         ..LaunchParams::zeroed()
     };
-    rig.params_buf
-        .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
-        .map_err(|e| format!("OptiX SDG LaunchParams upload failed: {e}"))?;
+    rig.launch_upload
+        .upload(&rig.stream, &lp, &mut rig.params_buf, None)
+        .map_err(|e| format!("OptiX SDG: {e}"))?;
 
     // SAFETY: `params_buf` matches `Params` layout; `sdg_queries_buf` and `sdg_results_buf` are
     // sized for `query_count` entries and remain live through `rig.stream.synchronize()`.
@@ -3204,12 +3492,13 @@ fn export_sdg_json_with_backend(
     frame_index: u32,
     time_s: f32,
     backend: SdgOccluderBackend,
+    fractal: &FractalLaunch,
 ) -> Result<SdgExportOutcome, String> {
     sync_cuda_crowd_to_cpu(rig, true)?;
     let optix_result = match backend {
         SdgOccluderBackend::Cpu => None,
-        SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, &sdg_cam)?)),
-        SdgOccluderBackend::Auto => Some(trace_sdg_occluder_optix(rig, &sdg_cam)),
+        SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, &sdg_cam, fractal)?)),
+        SdgOccluderBackend::Auto => Some(trace_sdg_occluder_optix(rig, &sdg_cam, fractal)),
     };
     match optix_result {
         Some(Ok(occluder)) => {
@@ -3485,6 +3774,9 @@ pub fn spawn_render_thread(
             let mut settings = init_snap.settings;
             let mut camera = init_snap.camera;
             let mut prev_camera = camera;
+            // Classic instance poses of the frame `prev_camera` belongs to (GPU:D03).
+            let mut prev_classic_xforms = ClassicXforms::default();
+            let mut classic_motion_table = [IDENTITY_3X4; CLASSIC_MOTION_SLOTS];
             let mut possess_free_yaw = init_snap.possess_free_yaw;
             let mut possess_free_pitch = init_snap.possess_free_pitch;
             let mut possess_auto_level = init_snap.possess_auto_level;
@@ -3616,6 +3908,7 @@ pub fn spawn_render_thread(
                                 frame_index,
                                 traffic_time,
                                 *occluder,
+                                &FractalLaunch::from_settings(&settings),
                             ) {
                                 Ok(outcome) => {
                                     bus.emit_render_event(RenderEvent::StatusMessage(format!(
@@ -4631,7 +4924,10 @@ pub fn spawn_render_thread(
                             scene_state(&settings, sat_angle, fractal_transform),
                         );
                         match built {
-                            Ok(classic_count) => rig.ias_classic_count = classic_count,
+                            Ok(classic) => {
+                                rig.ias_classic_count = classic.len;
+                                rig.classic_xforms = classic;
+                            }
                             Err(e) => {
                                 bus.emit_render_event(RenderEvent::Fatal(e));
                                 break 'render;
@@ -4870,61 +5166,17 @@ pub fn spawn_render_thread(
                     )));
                 }
 
-                let (fractal_p0, fractal_p1, fractal_p2, fractal_p3) = match settings.fractal_kind {
-                    1 => (
-                        [
-                            settings.box_scale,
-                            settings.box_bailout,
-                            settings.box_fold,
-                            settings.box_min_r,
-                        ],
-                        [settings.box_fixed_r, 0.0, settings.box_iter as f32, 0.0],
-                        [0.0; 4],
-                        [
-                            settings.box_fold_mult,
-                            settings.box_iter_rot.to_radians(),
-                            0.0,
-                            0.0,
-                        ],
-                    ),
-                    2 => (
-                        [settings.kifs_scale, settings.kifs_bailout, 0.0, 0.0],
-                        [
-                            settings.kifs_rot1.to_radians(),
-                            settings.kifs_rot2.to_radians(),
-                            settings.kifs_iter as f32,
-                            0.0,
-                        ],
-                        [
-                            settings.kifs_offset[0],
-                            settings.kifs_offset[1],
-                            settings.kifs_offset[2],
-                            0.0,
-                        ],
-                        [settings.kifs_thickness, settings.kifs_z_bias, 0.0, 0.0],
-                    ),
-                    _ => (
-                        [
-                            settings.bulb_power,
-                            settings.bulb_bailout,
-                            if settings.bulb_julia { 1.0 } else { 0.0 },
-                            0.0,
-                        ],
-                        [0.0, 0.0, settings.bulb_iter as f32, 0.0],
-                        [
-                            settings.bulb_c[0],
-                            settings.bulb_c[1],
-                            settings.bulb_c[2],
-                            0.0,
-                        ],
-                        [
-                            settings.bulb_theta_mult,
-                            settings.bulb_phi_mult,
-                            settings.bulb_theta_phase.to_radians(),
-                            settings.bulb_phi_phase.to_radians(),
-                        ],
-                    ),
-                };
+                let fractal = FractalLaunch::from_settings(&settings);
+                let (env_params, env_from) = settings.env.pack_crossfade(
+                    settings.sky_mode_from,
+                    settings.sky_mode,
+                    settings.sky_blend,
+                );
+                // GPU:D03: maps each classic instance from this frame's pose to the pose of the
+                // frame the motion history (`prev_camera`) belongs to.
+                let classic_motion_count = rig
+                    .classic_xforms
+                    .motion_to(&prev_classic_xforms, &mut classic_motion_table);
 
                 let az = settings.sun_azimuth.to_radians();
                 let el = settings.sun_elevation.to_radians();
@@ -5015,27 +5267,16 @@ pub fn spawn_render_thread(
                         active_camera.tan_half_fov,
                     ],
                     sun_dir: [sun_x, sun_y, sun_z, settings.roughness],
-                    fractal_p0,
-                    fractal_p1,
-                    fractal_p2,
-                    fractal_p3,
-                    // Fractal TRS is applied in the OptiX TLAS instance transform; keep ABI slot identity.
-                    fractal_xform: [1.0, 0.0, 0.0, 0.0],
-                    fractal_r0: [
-                        settings.detail_eps,
-                        settings.fudge,
-                        settings.norm_eps,
-                        settings.march_steps as f32,
-                    ],
-                    fractal_r1: [
-                        settings.metallic,
-                        settings.trap_scale,
-                        settings.palette_shift,
-                        settings.sun_intensity,
-                    ],
+                    fractal_p0: fractal.p[0],
+                    fractal_p1: fractal.p[1],
+                    fractal_p2: fractal.p[2],
+                    fractal_p3: fractal.p[3],
+                    env_from_lo: [env_from[0], env_from[1], env_from[2], env_from[3]],
+                    fractal_r0: fractal.r0,
+                    fractal_r1: fractal.r1,
                     time: spin_angle,
                     enable_shadows: u32::from(settings.shadows_on),
-                    fractal_kind: settings.fractal_kind,
+                    fractal_kind: fractal.kind,
                     bounces: launch_bounces,
                     floor_params: [
                         settings.floor_roughness,
@@ -5079,7 +5320,7 @@ pub fn spawn_render_thread(
                         prev_camera.up[2],
                         prev_camera.tan_half_fov,
                     ],
-                    sat_pos: [0.0; 4],
+                    env_from_hi: [env_from[4], env_from[5], env_from[6], env_from[7]],
                     glass_params: [
                         settings.glass_ior,
                         settings.glass_absorb,
@@ -5090,11 +5331,7 @@ pub fn spawn_render_thread(
                     jitter_x: jitter[0],
                     jitter_y: jitter[1],
                     _pad1: 0,
-                    env_params: settings.env.pack_crossfade(
-                        settings.sky_mode_from,
-                        settings.sky_mode,
-                        settings.sky_blend,
-                    ),
+                    env_params,
                     out_diffuse_albedo_f32: if rr_export {
                         rig.diffuse_albedo_f32
                             .as_ref()
@@ -5133,18 +5370,20 @@ pub fn spawn_render_thread(
                     sdg_ray_queries: 0,
                     sdg_ray_results: 0,
                     sdg_ray_count: 0,
-                    _pad2: 0,
+                    classic_motion_count,
+                    classic_motion: rig.classic_motion_buf.cu_deviceptr(),
                 };
-                if publish_frame && active_burst.is_none() {
+                if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
+                    prev_classic_xforms = rig.classic_xforms;
                 }
-                if let Err(e) = rig
-                    .params_buf
-                    .copy_from_host(&rig.stream, bytemuck::bytes_of(&lp))
-                {
-                    bus.emit_render_event(RenderEvent::Fatal(format!(
-                        "LaunchParams upload failed: {e}"
-                    )));
+                if let Err(e) = rig.launch_upload.upload(
+                    &rig.stream,
+                    &lp,
+                    &mut rig.params_buf,
+                    Some((&classic_motion_table, &mut rig.classic_motion_buf)),
+                ) {
+                    bus.emit_render_event(RenderEvent::Fatal(e));
                     break 'render;
                 }
                 if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
@@ -5541,6 +5780,7 @@ pub fn spawn_render_thread(
                                 fidx,
                                 traffic_time,
                                 burst.occluder,
+                                &fractal,
                             )
                         });
                         match json_res {
@@ -5563,7 +5803,9 @@ pub fn spawn_render_thread(
                                 });
                                 burst.current_frame += 1;
                                 burst.stepped_current_frame = false;
+                                // The next burst frame's motion is relative to this one.
                                 prev_camera = active_camera;
+                                prev_classic_xforms = rig.classic_xforms;
                                 if burst.current_frame >= burst.total_frames {
                                     let manifest = SdgBurstManifest {
                                         schema_version: "1.0".to_string(),
@@ -5694,7 +5936,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 640);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 648);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -5711,9 +5953,110 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_queries), 616);
         assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_results), 624);
         assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_count), 632);
-        assert_eq!(std::mem::offset_of!(LaunchParams, _pad2), 636);
+        assert_eq!(std::mem::offset_of!(LaunchParams, classic_motion_count), 636);
+        assert_eq!(std::mem::offset_of!(LaunchParams, classic_motion), 640);
+        assert_eq!(std::mem::offset_of!(LaunchParams, env_from_lo), 192);
+        assert_eq!(std::mem::offset_of!(LaunchParams, env_from_hi), 384);
         assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);
         assert_eq!(std::mem::size_of::<GpuSdgRayQuery>(), 32);
+    }
+
+    fn classic_with(xforms: &[[f32; 12]], ids: &[u32]) -> ClassicXforms {
+        let mut c = ClassicXforms {
+            len: xforms.len(),
+            ..ClassicXforms::default()
+        };
+        c.xforms[..xforms.len()].copy_from_slice(xforms);
+        c.ids[..ids.len()].copy_from_slice(ids);
+        c
+    }
+
+    fn apply_3x4(m: &[f32; 12], p: glam::Vec3) -> glam::Vec3 {
+        glam::Vec3::new(
+            m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3],
+            m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7],
+            m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11],
+        )
+    }
+
+    /// GPU:D03: the classic motion transform takes a point on the moved instance this frame back
+    /// to where the same surface point was in the history frame (what `raytracer.cu` projects
+    /// with the previous camera); static instances get the identity.
+    #[test]
+    fn classic_motion_maps_current_hit_to_previous_pose() {
+        let floor = IDENTITY_3X4;
+        let fractal_prev = fractal_instance_transform([1.0, 2.0, -3.0], [10.0, 20.0, 30.0], 1.5);
+        let fractal_cur = fractal_instance_transform([4.0, 1.0, 0.5], [15.0, 50.0, -5.0], 1.5);
+        let sphere_prev = [0.3, 0.0, 0.0, 2.0, 0.0, 0.3, 0.0, 1.0, 0.0, 0.0, 0.3, -1.0];
+        let sphere_cur = [0.3, 0.0, 0.0, 1.5, 0.0, 0.3, 0.0, 1.2, 0.0, 0.0, 0.3, -0.4];
+        let ids = [0, 1 | (1 << CLASSIC_SLOT_SHIFT), 2 | (0x7A << 8) | (2 << CLASSIC_SLOT_SHIFT)];
+        let prev = classic_with(&[floor, fractal_prev, sphere_prev], &ids);
+        let cur = classic_with(&[floor, fractal_cur, sphere_cur], &ids);
+
+        let mut table = [[f32::NAN; 12]; CLASSIC_MOTION_SLOTS];
+        assert_eq!(cur.motion_to(&prev, &mut table), 3);
+        assert_eq!(table[0], IDENTITY_3X4);
+        for (slot, (p, c)) in [(1, (fractal_prev, fractal_cur)), (2, (sphere_prev, sphere_cur))] {
+            for obj in [glam::Vec3::new(0.2, -0.7, 0.9), glam::Vec3::new(-1.1, 0.4, 0.05)] {
+                let hit_now = apply_3x4(&c, obj);
+                let was = apply_3x4(&p, obj);
+                let mapped = apply_3x4(&table[slot], hit_now);
+                assert!((mapped - was).length() < 1e-4, "slot {slot}: {mapped} vs {was}");
+            }
+        }
+        // No movement -> identity (zero object motion).
+        let mut still = [[f32::NAN; 12]; CLASSIC_MOTION_SLOTS];
+        assert_eq!(cur.motion_to(&cur, &mut still), 3);
+        for m in &still[..3] {
+            for (a, b) in m.iter().zip(IDENTITY_3X4.iter()) {
+                assert!((a - b).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// Without matching history (instance list changed, first frame) or with a singular current
+    /// transform there is no object motion, never a garbage transform.
+    #[test]
+    fn classic_motion_without_matching_history_is_identity() {
+        let a = fractal_instance_transform([1.0, 0.0, 0.0], [0.0, 30.0, 0.0], 1.0);
+        let b = fractal_instance_transform([2.0, 0.0, 0.0], [0.0, 60.0, 0.0], 1.0);
+        let cur = classic_with(&[IDENTITY_3X4, b], &[0, 1 | (1 << CLASSIC_SLOT_SHIFT)]);
+        let mut table = [[f32::NAN; 12]; CLASSIC_MOTION_SLOTS];
+
+        assert_eq!(cur.motion_to(&ClassicXforms::default(), &mut table), 2);
+        assert_eq!(&table[..2], &[IDENTITY_3X4; 2]);
+
+        let other_ids = classic_with(&[IDENTITY_3X4, a], &[0, 3 | (1 << CLASSIC_SLOT_SHIFT)]);
+        assert_eq!(cur.motion_to(&other_ids, &mut table), 2);
+        assert_eq!(table[1], IDENTITY_3X4);
+
+        let singular = classic_with(&[[0.0; 12]], &[1]);
+        let prev = classic_with(&[a], &[1]);
+        assert_eq!(singular.motion_to(&prev, &mut table), 1);
+        assert_eq!(table[0], IDENTITY_3X4);
+    }
+
+    /// The motion history moves with every published interactive frame, never on shutter
+    /// subframes, and not per accumulated launch of an SDG burst frame.
+    #[test]
+    fn motion_history_commits_only_on_published_non_burst_frames() {
+        assert!(commits_motion_history(true, false));
+        assert!(!commits_motion_history(false, false));
+        assert!(!commits_motion_history(true, true));
+        assert!(!commits_motion_history(false, true));
+    }
+
+    /// The classic slot index fits the 8 bits `raytracer.cu` decodes and leaves the slot kind
+    /// (bits 0..8) and hue (bits 8..16) intact; OptiX ids are limited to 28 bits.
+    #[test]
+    fn classic_slot_encoding_fits_instance_id() {
+        let max_layout = 2 + MAX_SATELLITES + 2;
+        assert!(max_layout <= CLASSIC_MOTION_SLOTS);
+        let id = 2 | (0xFF << 8) | (((CLASSIC_MOTION_SLOTS - 1) as u32) << CLASSIC_SLOT_SHIFT);
+        assert_eq!(id & 0xFF, 2);
+        assert_eq!((id >> 8) & 0xFF, 0xFF);
+        assert_eq!(((id >> CLASSIC_SLOT_SHIFT) & 0xFF) as usize, CLASSIC_MOTION_SLOTS - 1);
+        assert!(id < (1 << 28));
     }
 
     #[test]
@@ -5933,24 +6276,26 @@ mod tests {
     }
 
     #[test]
-    fn sky_crossfade_keeps_source_parameters_when_target_reads_none() {
+    fn sky_crossfade_packs_each_sky_with_its_own_parameters() {
         let env = EnvSettings {
             cloud_cover: 0.7,
             cloud_density: 1.3,
             ..Default::default()
         };
         let day = env.pack(0);
+        let nebula = env.pack(3);
         assert_ne!(day, [0.0; 8]);
-        // Day -> Coastal Night: Night reads no parameters, so the fading Day sky keeps its clouds.
-        assert_eq!(env.pack_crossfade(0, 8, 0.5), day);
-        // Night -> Day already carried the Day parameters.
-        assert_eq!(env.pack_crossfade(8, 0, 0.5), day);
-        // Outside the fade window only the target is evaluated.
-        assert_eq!(env.pack_crossfade(0, 8, 0.0), env.pack(8));
-        assert_eq!(env.pack_crossfade(0, 8, 1.0), env.pack(8));
-        assert_eq!(env.pack_crossfade(0, 8, f32::NAN), env.pack(8));
-        // Two parameterised modes cannot share the block: the target wins.
-        assert_eq!(env.pack_crossfade(3, 0, 0.5), day);
+        assert_ne!(nebula, day);
+        // Day -> Coastal Night: the fading Day sky keeps its clouds in `env_from`.
+        assert_eq!(env.pack_crossfade(0, 8, 0.5), (env.pack(8), day));
+        assert_eq!(env.pack_crossfade(8, 0, 0.5), (day, env.pack(8)));
+        // RND:R10: two parameterised skies each keep their own block for the whole fade.
+        assert_eq!(env.pack_crossfade(3, 0, 0.5), (day, nebula));
+        // Outside the fade window only the target is evaluated and `env_from` is zero.
+        for blend in [0.0, 1.0, f32::NAN] {
+            assert_eq!(env.pack_crossfade(3, 0, blend), (day, [0.0; 8]));
+        }
+        assert_eq!(env.pack_crossfade(0, 0, 0.5), (day, [0.0; 8]));
     }
 
     #[test]

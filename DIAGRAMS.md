@@ -79,7 +79,7 @@ flowchart TD
   Worker --> Step["CsgGpuHost::step_dynamic (TrafficStateSoA + SceneBuilt::crowd, Freeze Pose zero-motion snap)"]
   Step --> Sync["CsgGpuHost::sync (GrowDeviceBuffer + dual 2 MiB pinned DMA (grows to 16 MiB) for instances & prev_xforms)"]
   Sync --> IAS["Persistent Uncompacted IAS (Accel::instances_into, compact=false, allow_update=true)"]
-  IAS --> RT["OptiX 9 RT Cores (640 B Params, SBT records 0..11 (CSG at 8/9 and 10/11), 11-GAS crowd on the single-primitive group, SER, OMM, Motion AOV 3x3 inv, 4x RGSS AA AOVs)"]
+  IAS --> RT["OptiX 9 RT Cores (648 B Params, SBT records 0..11 (CSG at 8/9 and 10/11), 11-GAS crowd on the single-primitive group, SER, OMM, Motion AOV 3x3 inv, 4x RGSS AA AOVs)"]
   RT --> Tensor["Tensor Cores (OptiX Aov/TemporalAov Denoiser or NGX DLSS SR/RR)"]
   Tensor --> Post["CUDA Compute (cuFFT Bloom -> Tonemap / HDR scRGB / DLSS-RR Pack)"]
   Post --> Fence["Single End-of-Frame stream.synchronize() + 3-slot cuEventQuery GpuPassProfiler"]

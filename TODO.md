@@ -1,3 +1,4 @@
+> 2026-11-23: nv-demo follow-up wave done and gated (`audit/2026-11-23/wave_nvdemo_followups.md`): GPU:D03 classic motion (ABI 648 B), GPU:D21 SDG fractal params, prev_camera rule centralised, RND:R10 env crossfade, anim_range sliders, async params upload, dock layout persistence (APP:F19), optix staging growth (RND:H13), nv-wgpu submit timeout. Still open: APP:F27 unbounded waits in nv-wgpu Drop paths and `device.poll` in main.rs; GPU:D07/D08; visual check of classic motion under DLSS, sky crossfade, SDG fractal occlusion.
 > 2026-11-23: csg-rs adoption merged (`csg-rs` `24b22f5`, branch `csg-rs-adoption-v2`): gate green (clippy clean, 467 passed / 0 failed / 205 ignored, nv-demo ignored GPU tests 5/5, release app renders Marina with CUDA crowd 180 and DLSS RR, empty logs). Next on the csg-rs side: R00 (GPU crowd steering into a csg-rs-owned kernel), R00b (GPU traffic).
 
 # TODO - execution tracker for `plan2.md`

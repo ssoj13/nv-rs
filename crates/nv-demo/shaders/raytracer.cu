@@ -19,7 +19,7 @@ struct Params {
     float fractal_p1[4];  // [fixed_radius/rot1, rot2, max_iter, 0]
     float fractal_p2[4];  // [c.x, c.y, c.z, 0] (julia_c or kifs offset)
     float fractal_p3[4];  // formula-specific extra coefficients
-    float fractal_xform[4]; // reserved: unread on device (fractal TRS lives in the TLAS instance transform)
+    float env_from_lo[4];   // env_params[0..4] of the crossfade source sky_mode_from (0 outside a fade)
     float fractal_r0[4];  // [detail_eps, fudge, normal_eps, march_steps]
     float fractal_r1[4];  // [metallic, trap_scale, palette_shift, sun_intensity]
     float time;
@@ -38,7 +38,7 @@ struct Params {
     float prev_cam_forward[4];
     float prev_cam_right[4];
     float prev_cam_up[4];
-    float sat_pos[4];      // reserved: unread on device (orbiting spheres live in the TLAS)
+    float env_from_hi[4];  // env_params[4..8] of the crossfade source sky_mode_from (0 outside a fade)
     float glass_params[4]; // [ior, absorption, roughness, enable]
     unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId
     float jitter_x;
@@ -72,16 +72,21 @@ struct Params {
     unsigned long long sdg_ray_queries;  // device ptr to GpuSdgRayQuery[sdg_ray_count]
     unsigned long long sdg_ray_results;  // device ptr to uint32[sdg_ray_count] (0xFFFFFFFFu on miss)
     unsigned int sdg_ray_count;          // number of active rays for __raygen__sdg_keypoints
-    unsigned int _pad2;                  // 16-byte struct tail alignment
+    unsigned int classic_motion_count;   // valid entries of classic_motion
+    unsigned long long classic_motion;   // device ptr to float[12] row-major 3x4 current-world -> previous-world per classic instance (index = instance id bits 16..23)
 };
 
-static_assert(sizeof(Params) == 640, "Params size must match LaunchParams (640 B)");
+static_assert(sizeof(Params) == 648, "Params size must match LaunchParams (648 B)");
 static_assert(__builtin_offsetof(Params, csg_prev_xforms) == 592, "Params::csg_prev_xforms offset must be 592");
 static_assert(__builtin_offsetof(Params, out_semantic_u32) == 600, "Params::out_semantic_u32 offset must be 600");
 static_assert(__builtin_offsetof(Params, out_instance_u32) == 608, "Params::out_instance_u32 offset must be 608");
 static_assert(__builtin_offsetof(Params, sdg_ray_queries) == 616, "Params::sdg_ray_queries offset must be 616");
 static_assert(__builtin_offsetof(Params, sdg_ray_results) == 624, "Params::sdg_ray_results offset must be 624");
 static_assert(__builtin_offsetof(Params, sdg_ray_count) == 632, "Params::sdg_ray_count offset must be 632");
+static_assert(__builtin_offsetof(Params, classic_motion_count) == 636, "Params::classic_motion_count offset must be 636");
+static_assert(__builtin_offsetof(Params, classic_motion) == 640, "Params::classic_motion offset must be 640");
+static_assert(__builtin_offsetof(Params, env_from_lo) == 192, "Params::env_from_lo offset must be 192");
+static_assert(__builtin_offsetof(Params, env_from_hi) == 384, "Params::env_from_hi offset must be 384");
 
 struct GpuSdgRayQuery {
     float origin_tmin[4]; // xyz = world origin, w = tmin
@@ -625,7 +630,7 @@ static __forceinline__ __device__ float3 sky_starfield(
     return f3_mul(stars, brightness * expf(-dust_occ));
 }
 
-static __noinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_elevated(const float* env, float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     float y = fmaxf(0.0f, dir.y);
@@ -637,7 +642,7 @@ static __noinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, b
         f3_mul(make_float3(0.08f, 0.20f, 0.48f), 0.65f * powf(y, 0.5f))
     );
     if (dir.y > 0.02f) {
-        float elev_cover = params.env_params[0];
+        float elev_cover = env[0];
         float ct = 500.0f / dir.y;
         float3 cl = elevated_noised(dir.x * ct * 0.0008f, dir.z * ct * 0.0008f);
         float cl2 = elevated_noised(dir.x * ct * 0.0017f + 3.1f, dir.z * ct * 0.0017f - 1.7f).x;
@@ -685,7 +690,7 @@ static __noinline__ __device__ float3 sky_elevated(float3 dir, float3 sun_dir, b
 
             float3 lit = f3_mul(base, dif * 1.35f + amb * 0.35f);
             // Distance & valley exponential fog
-            float fog = 1.0f - expf(-t * (0.00085f * haze_k * fmaxf(0.1f, params.env_params[1])));
+            float fog = 1.0f - expf(-t * (0.00085f * haze_k * fmaxf(0.1f, env[1])));
             float3 fog_col = f3_add(f3_mul(sky_col, 0.75f), make_float3(0.20f, 0.24f, 0.30f));
             float3 col = f3_add(f3_mul(lit, 1.0f - fog), f3_mul(fog_col, fog));
             return f3_mul(col, sky_i);
@@ -741,7 +746,7 @@ static __forceinline__ __device__ float unprogress_map(float3 p, float* out_win)
     return fminf(d_obj, d_cell);
 }
 
-static __noinline__ __device__ float3 sky_unprogress(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_unprogress(const float* env, float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
     float y = fmaxf(0.0f, dir.y);
@@ -787,9 +792,9 @@ static __noinline__ __device__ float3 sky_unprogress(float3 dir, float3 sun_dir,
             if (win > 0.5f && n.y < 0.5f) {
                 float tint = sky_hash2(floorf(p.x * 2.0f), floorf(p.y * 2.0f));
                 float3 wc = (tint > 0.65f) ? make_float3(0.95f, 0.52f, 0.18f) : make_float3(0.24f, 0.72f, 0.95f);
-                lit = f3_add(lit, f3_mul(wc, 0.85f * params.env_params[1]));
+                lit = f3_add(lit, f3_mul(wc, 0.85f * env[1]));
             }
-            float fog = 1.0f - expf(-t * (0.042f * haze_k * fmaxf(0.1f, params.env_params[0])));
+            float fog = 1.0f - expf(-t * (0.042f * haze_k * fmaxf(0.1f, env[0])));
             float3 fog_col = f3_add(overcast, f3_mul(make_float3(0.18f, 0.28f, 0.36f), glow));
             return f3_mul(f3_add(f3_mul(lit, 1.0f - fog), f3_mul(fog_col, fog)), sky_i);
         }
@@ -829,18 +834,18 @@ static __forceinline__ __device__ float colonies_map(float3 p, float* out_emissi
     return fminf(d_ring, d_rib);
 }
 
-static __noinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, bool is_camera_ray) {
+static __noinline__ __device__ float3 sky_colonies(const float* env, float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
 
     // Deep space background + subtle atmospheric planet limb + pinpoint stars
     float3 col = make_float3(0.004f, 0.006f, 0.014f);
     float limb = expf(-fabsf(dir.y + 0.35f) * 8.0f) * fmaxf(0.0f, 0.6f - fabsf(dir.x));
-    col = f3_add(col, f3_mul(make_float3(0.08f, 0.24f, 0.48f), limb * 0.8f * params.env_params[3]));
+    col = f3_add(col, f3_mul(make_float3(0.08f, 0.24f, 0.48f), limb * 0.8f * env[3]));
     col = f3_add(col, f3_mul(make_float3(0.85f, 0.90f, 1.0f), powf(sun_dot, 32.0f) * 0.45f));
 
     if (is_camera_ray) {
-        col = f3_add(col, sky_starfield(dir, params.env_params[0], params.env_params[1], 0.0f));
+        col = f3_add(col, sky_starfield(dir, env[0], env[1], 0.0f));
     }
 
     // Raymarch the orbital colony megastructure
@@ -873,18 +878,19 @@ static __noinline__ __device__ float3 sky_colonies(float3 dir, float3 sun_dir, b
         float3 metal = make_float3(0.14f, 0.16f, 0.20f);
         col = f3_add(f3_mul(metal, dif * 1.8f + 0.10f), f3_mul(make_float3(0.22f, 0.42f, 0.68f), rim * 0.35f));
         if (em > 0.5f) {
-            col = f3_add(col, f3_mul(make_float3(0.35f, 0.85f, 1.15f), params.env_params[2]));
+            col = f3_add(col, f3_mul(make_float3(0.35f, 0.85f, 1.15f), env[2]));
         }
     }
     return f3_mul(col, sky_i);
 }
 
-static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float3 sun_dir, bool is_camera_ray) {
+// `env` is the 8-float parameter block of `mode` (`params.env_params` or the crossfade source).
+static __noinline__ __device__ float3 sky_color_mode(int mode, const float* env, float3 dir, float3 sun_dir, bool is_camera_ray) {
     float sky_i = fmaxf(0.05f, params.sky_params[0]);
     float haze_k = fmaxf(0.5f, params.sky_params[2]);
-    if (mode == 5) return sky_elevated(dir, sun_dir, is_camera_ray);
-    if (mode == 6) return sky_unprogress(dir, sun_dir, is_camera_ray);
-    if (mode == 7) return sky_colonies(dir, sun_dir, is_camera_ray);
+    if (mode == 5) return sky_elevated(env, dir, sun_dir, is_camera_ray);
+    if (mode == 6) return sky_unprogress(env, dir, sun_dir, is_camera_ray);
+    if (mode == 7) return sky_colonies(env, dir, sun_dir, is_camera_ray);
     float y = fmaxf(0.0f, dir.y);
     float horizon_band = expf(-fabsf(dir.y) * (6.0f / haze_k));
 
@@ -922,13 +928,13 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
         float3 haze_col = make_float3(1.0f, 0.62f, 0.28f);
         col = f3_add(col, f3_mul(haze_col, horizon_band * 0.42f));
         float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
-        if (dir.y > 0.015f && params.env_params[0] > 0.01f) {
+        if (dir.y > 0.015f && env[0] > 0.01f) {
             float ct = 620.0f / (dir.y + 0.04f);
             float n1 = elevated_noised(dir.x * ct * 0.0007f, dir.z * ct * 0.0007f).x;
             float n2 = elevated_noised(dir.x * ct * 0.0019f + 4.3f, dir.z * ct * 0.0019f - 2.1f).x;
-            float thresh = 0.78f - 0.50f * fmaxf(0.0f, fminf(1.0f, params.env_params[0]));
+            float thresh = 0.78f - 0.50f * fmaxf(0.0f, fminf(1.0f, env[0]));
             float cloud = sky_smoothstep(thresh, thresh + 0.26f, n1 * 0.65f + n2 * 0.35f)
-                        * sky_smoothstep(0.015f, 0.12f, dir.y) * fminf(1.5f, params.env_params[1]);
+                        * sky_smoothstep(0.015f, 0.12f, dir.y) * fminf(1.5f, env[1]);
             float3 dark_base = make_float3(0.18f, 0.10f, 0.16f);
             float3 lit_rim = make_float3(1.25f, 0.56f, 0.24f);
             float rim = powf(sun_dot, 4.0f) * 0.85f + (1.0f - n2) * 0.35f;
@@ -954,7 +960,7 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
         float3 col = (dir.y >= 0.0f)
             ? f3_add(f3_mul(mid, 1.0f - y), f3_mul(top, y))
             : f3_add(f3_mul(mid, 1.0f + dir.y), f3_mul(bot, -dir.y));
-        float soft = fmaxf(0.02f, params.env_params[1]);
+        float soft = fmaxf(0.02f, env[1]);
         float box_top = sky_smoothstep(0.68f - soft, 0.68f + soft, dir.y)
                       * (1.0f - sky_smoothstep(0.45f - soft, 0.45f + soft, fabsf(dir.x)))
                       * (1.0f - sky_smoothstep(0.45f - soft, 0.45f + soft, fabsf(dir.z)));
@@ -964,7 +970,7 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
         float box_r = sky_smoothstep(0.62f - soft, 0.62f + soft, dir.x)
                     * (1.0f - sky_smoothstep(0.28f - soft, 0.28f + soft, fabsf(dir.y - 0.12f)))
                     * (1.0f - sky_smoothstep(0.44f - soft, 0.44f + soft, fabsf(dir.z)));
-        float panel_gain = (is_camera_ray ? 1.15f : 2.2f) * params.env_params[0];
+        float panel_gain = (is_camera_ray ? 1.15f : 2.2f) * env[0];
         col = f3_add(col, f3_mul(make_float3(0.95f, 0.97f, 1.0f), box_top * panel_gain));
         col = f3_add(col, f3_mul(make_float3(0.65f, 0.82f, 1.0f), box_l * panel_gain * 0.85f));
         col = f3_add(col, f3_mul(make_float3(1.0f, 0.86f, 0.70f), box_r * panel_gain * 0.75f));
@@ -973,12 +979,12 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
 
     if (mode == 3) {
         // Deep Nebula: domain-warped 3D FBM cosmic clouds + dark dust lanes + cube-projected PSF starfield
-        float neb_dens = params.env_params[0];
-        float neb_cont = params.env_params[1];
-        float neb_dust = params.env_params[2];
-        float neb_scale = fmaxf(0.4f, params.env_params[3]);
-        float star_dens = params.env_params[4];
-        float star_bright = params.env_params[5];
+        float neb_dens = env[0];
+        float neb_cont = env[1];
+        float neb_dust = env[2];
+        float neb_scale = fmaxf(0.4f, env[3]);
+        float star_dens = env[4];
+        float star_bright = env[5];
 
         float3 p = f3_mul(dir, neb_scale);
         float band = expf(-fabsf(dir.y * 0.82f + dir.x * 0.48f - 0.08f) * 2.1f);
@@ -1021,7 +1027,7 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
         float3 zenith = make_float3(0.015f, 0.025f, 0.07f);
         float3 horiz  = make_float3(0.045f, 0.09f, 0.18f);
         float3 col = f3_add(f3_mul(horiz, 1.0f - powf(y, 0.6f)), f3_mul(zenith, powf(y, 0.6f)));
-        float freq = fmaxf(4.0f, params.env_params[1]);
+        float freq = fmaxf(4.0f, env[1]);
         float lon = atan2f(dir.z, dir.x) * (freq / 3.14159265f);
         float lat = asinf(fmaxf(-1.0f, fminf(1.0f, dir.y))) * (freq / 3.14159265f);
         float gx = fabsf(lon - floorf(lon + 0.5f));
@@ -1032,7 +1038,7 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
             1.0f - sky_smoothstep(0.015f, 0.055f, gy)
         );
         float3 grid_col = make_float3(0.12f, 0.68f, 0.95f);
-        col = f3_add(col, f3_mul(grid_col, line * (is_camera_ray ? 0.55f : 0.30f) * params.env_params[0]));
+        col = f3_add(col, f3_mul(grid_col, line * (is_camera_ray ? 0.55f : 0.30f) * env[0]));
         col = f3_add(col, f3_mul(make_float3(0.10f, 0.45f, 0.75f), horizon_band * 0.25f));
         return f3_mul(col, sky_i);
     }
@@ -1047,13 +1053,13 @@ static __noinline__ __device__ float3 sky_color_mode(int mode, float3 dir, float
     col = f3_add(col, f3_mul(haze_col, horizon_band * 0.22f));
 
     float sun_dot = fmaxf(0.0f, f3_dot(dir, sun_dir));
-    if (dir.y > 0.015f && params.env_params[0] > 0.01f) {
+    if (dir.y > 0.015f && env[0] > 0.01f) {
         float ct = 560.0f / (dir.y + 0.04f);
         float n1 = elevated_noised(dir.x * ct * 0.0008f, dir.z * ct * 0.0008f).x;
         float n2 = elevated_noised(dir.x * ct * 0.0021f + 2.7f, dir.z * ct * 0.0021f - 1.3f).x;
-        float thresh = 0.78f - 0.50f * fmaxf(0.0f, fminf(1.0f, params.env_params[0]));
+        float thresh = 0.78f - 0.50f * fmaxf(0.0f, fminf(1.0f, env[0]));
         float cloud = sky_smoothstep(thresh, thresh + 0.25f, n1 * 0.65f + n2 * 0.35f)
-                    * sky_smoothstep(0.015f, 0.14f, dir.y) * fminf(1.5f, params.env_params[1]);
+                    * sky_smoothstep(0.015f, 0.14f, dir.y) * fminf(1.5f, env[1]);
         float3 cloud_col = f3_add(make_float3(0.88f, 0.91f, 0.96f), f3_mul(make_float3(0.30f, 0.24f, 0.16f), powf(sun_dot, 8.0f)));
         col = f3_add(f3_mul(col, 1.0f - cloud * 0.72f), f3_mul(cloud_col, cloud * 0.72f));
     }
@@ -1079,11 +1085,16 @@ static __noinline__ __device__ float3 sky_color(float3 dir, float3 sun_dir, bool
     float blend = params.sky_blend;
     int from_mode = (int)params.sky_mode_from;
     if (blend > 1e-4f && blend < 0.9999f && from_mode != to_mode) {
-        float3 c0 = sky_color_mode(from_mode, dir, sun_dir, is_camera_ray);
-        float3 c1 = sky_color_mode(to_mode, dir, sun_dir, is_camera_ray);
+        // Each sky fades with its own parameters (RND:R10): the source block lives in env_from_*.
+        float env_from[8] = {
+            params.env_from_lo[0], params.env_from_lo[1], params.env_from_lo[2], params.env_from_lo[3],
+            params.env_from_hi[0], params.env_from_hi[1], params.env_from_hi[2], params.env_from_hi[3]
+        };
+        float3 c0 = sky_color_mode(from_mode, env_from, dir, sun_dir, is_camera_ray);
+        float3 c1 = sky_color_mode(to_mode, params.env_params, dir, sun_dir, is_camera_ray);
         return f3_add(f3_mul(c0, 1.0f - blend), f3_mul(c1, blend));
     }
-    return sky_color_mode(to_mode, dir, sun_dir, is_camera_ray);
+    return sky_color_mode(to_mode, params.env_params, dir, sun_dir, is_camera_ray);
 }
 
 // --- Render-Time Analytical CSG Helpers & Procedural Urban Shading ---
@@ -2245,6 +2256,17 @@ extern "C" __global__ void __raygen__render() {
                 } else {
                     first_sem_id = classic_semantic_id(p6);
                     first_part_id = 0u;
+                    // GPU:D03: moving classic instances (fractal TRS, orbiting spheres) map the
+                    // current hit back to where that surface point was in the previous frame.
+                    unsigned int classic_slot = (p6 >> 16u) & 0xFFu;
+                    if (has_prev_cam
+                        && params.classic_motion != 0ull
+                        && classic_slot < params.classic_motion_count)
+                    {
+                        const float* to_prev = ((const float*)params.classic_motion)
+                            + ((unsigned long long)classic_slot * 12ull);
+                        prev_world_pos = csg_xform_pt_ldg(to_prev, hit_pos);
+                    }
                 }
                 first_inst_id = hit_instance_id(p0, p6);
                 float2 prev_px;

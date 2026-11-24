@@ -3685,6 +3685,46 @@ fn instance_buffer_back_to_back_updates_do_not_tear() {
     );
 }
 
+/// RND:H13: a payload above the initial 256 KiB staging grows the pinned staging buffer instead
+/// of taking the pageable path, and growing while earlier copies are still queued keeps every
+/// copy's data (the old buffer is freed only after its last copy has run).
+#[test]
+#[ignore = "GPU"]
+fn instance_buffer_staging_grows_for_large_uploads() {
+    let mut rig = rig(Cfg::default());
+    let gas = default_gas(&mut rig, 0.0, BuildOptions::default());
+    let s = rig.stream.clone();
+    let mut buf = InstanceBuffer::new(&rig.ctx, &s);
+    assert_eq!(buf.staging_capacity_bytes(), optix::INSTANCE_STAGING_BYTES);
+    // 1024 instances fit the initial staging; 8192 (640 KiB) do not.
+    const SMALL: u32 = 1024;
+    const LARGE: u32 = 8192;
+    buf.upload_all(&s, &numbered(&gas, 0, LARGE)).expect("upload");
+    s.synchronize().expect("sync");
+    let grown = buf.staging_capacity_bytes();
+    assert!(
+        grown >= LARGE as usize * 80 && grown <= optix::INSTANCE_STAGING_MAX_BYTES,
+        "staging grew to {grown} bytes"
+    );
+    assert!(buf.staging_error().is_none(), "{:?}", buf.staging_error());
+
+    // Queue a small update, then a full upload twice as large (forcing another growth) while the
+    // stream is held, so the first copy is still pending when its staging buffer is replaced.
+    let mut fresh = InstanceBuffer::new(&rig.ctx, &s);
+    fresh.upload_all(&s, &numbered(&gas, 0, LARGE)).expect("upload");
+    s.synchronize().expect("sync");
+    hold(&s, 300);
+    fresh
+        .update_prefix(&s, 0, &numbered(&gas, 10_000, SMALL))
+        .expect("small update");
+    fresh
+        .upload_all(&s, &numbered(&gas, 50_000, 2 * LARGE))
+        .expect("larger upload");
+    assert!(fresh.staging_capacity_bytes() >= 2 * LARGE as usize * 80);
+    let want: Vec<u32> = (50_000..50_000 + 2 * LARGE).collect();
+    assert_eq!(resident_ids(&s, &fresh), want);
+}
+
 /// One-stream rule: an instance structure must be built on the stream its acceleration-structure
 /// children were built on. Every instance path rejects a child of another stream; the same
 /// instances on the build stream (also through a fresh `Arc` of it) are accepted.

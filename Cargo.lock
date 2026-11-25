@@ -2653,6 +2653,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "serde_json",
+ "sl-config",
  "wgpu",
  "winit",
 ]
@@ -3936,6 +3937,16 @@ checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
 dependencies = [
  "bytemuck",
  "read-fonts",
+]
+
+[[package]]
+name = "sl-config"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/egui-widgets-rs.git?branch=main#10a361590d7dd0cebf8e48b010857e9723cbf089"
+dependencies = [
+ "egui",
+ "serde",
+ "unicode-segmentation",
 ]
 
 [[package]]

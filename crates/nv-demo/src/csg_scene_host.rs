@@ -30,14 +30,15 @@ use csg_actors::{
 };
 use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
-use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat, Ray};
+use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat};
 use csg_scene::{
     CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
     GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec,
     SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
     SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
     generate_random_rail, inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
-    lookup_instance_and_assembly, pick_possessable_instance_with_crowd,
+    crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id, encode_static_inst_id,
+    lookup_instance_and_assembly,
     resolve_possess_pose_with_crowd,
 };
 
@@ -1685,35 +1686,140 @@ impl CsgGpuHost {
         Ok(())
     }
 
-    /// Casts an exact CSG ray against live dynamic + static instances (including articulated crowd
-    /// actors) and enters `Possess` mode.
-    pub fn pick_possess(&mut self, origin: [f32; 3], dir: [f32; 3]) -> Result<PossessInfo, String> {
-        let Some(ref scene) = self.scene else {
-            return Err("Load a CSG scene before picking an object to possess".to_string());
-        };
+    /// Maps a GPU pick (primary-hit instance `key` + world hit point) to the scene instance it
+    /// belongs to. The hit itself comes from the primary launch (`crate::pick`); this is a point
+    /// lookup, not a ray query: candidates are the visible instances whose world bounds contain
+    /// the point, the instance whose `user_id` equals the key wins (smallest bounds first, since
+    /// generated OSM ids may repeat), and a crowd key resolves to its actor through the bone
+    /// that carries it. Keys without a user id (`0xFF000000 | packed index`) fall back to the
+    /// smallest containing instance.
+    fn resolve_pick(&self, key: u32, pos: [f32; 3]) -> Option<PickTarget> {
+        let scene = self.scene.as_ref()?;
         let world = &scene.world;
-        let d = Vec3::new(dir[0], dir[1], dir[2]).norm();
-        let ray = Ray::new(Vec3::new(origin[0], origin[1], origin[2]), d, 0.05, 1500.0);
-        let Some((inst_id, _t, mounts)) =
-            pick_possessable_instance_with_crowd(world, &scene.crowd, ray)
-        else {
-            return Err("No possessable object hit under cursor".to_string());
+        let p = Vec3::new(pos[0], pos[1], pos[2]);
+        // Bounds are conservative; the pad absorbs float error at surfaces and the CPU / GPU
+        // crowd pose difference of one frame.
+        let contains = |b: CsgAabb| {
+            let b = b.pad(PICK_POINT_PAD_M);
+            p.x >= b.min.x && p.y >= b.min.y && p.z >= b.min.z && p.x <= b.max.x && p.y <= b.max.y && p.z <= b.max.z
         };
-        let assembly_name = if let Some(actor_idx) =
-            find_crowd_actor_for_inst(world, &scene.crowd, inst_id)
-        {
-            crowd_actor_display_name(&scene.crowd, actor_idx)
+        let volume = |b: CsgAabb| {
+            let e = b.max - b.min;
+            (e.x * e.y * e.z).abs()
+        };
+        let has_user_id = key & 0xFF00_0000 != 0xFF00_0000;
+        let mut exact: Option<(f32, PickTarget)> = None;
+        let mut mounted: Option<(f32, PickTarget)> = None;
+        let mut any: Option<(f32, PickTarget)> = None;
+        let mut consider = |vol: f32, t: PickTarget, user_id: u32| {
+            if has_user_id && user_id == key && exact.as_ref().is_none_or(|(v, _)| vol < *v) {
+                exact = Some((vol, t.clone()));
+            }
+            if !t.mounts.is_empty() && mounted.as_ref().is_none_or(|(v, _)| vol < *v) {
+                mounted = Some((vol, t.clone()));
+            }
+            if any.as_ref().is_none_or(|(v, _)| vol < *v) {
+                any = Some((vol, t));
+            }
+        };
+        for (dyn_idx, inst) in world.dynamic_instances().iter().enumerate() {
+            if !inst.is_visible() {
+                continue;
+            }
+            let Some(asm) = world.assembly(inst.assembly_id) else {
+                continue;
+            };
+            let inst_id = encode_dynamic_inst_id(dyn_idx);
+            if let Some(actor) = find_crowd_actor_for_inst(world, &scene.crowd, inst_id) {
+                // All bones of an actor share its user id: the key alone names the actor.
+                if has_user_id && inst.user_id == key {
+                    return Some(PickTarget {
+                        inst_id,
+                        name: crowd_actor_display_name(&scene.crowd, actor),
+                        mounts: crowd_actor_mounts(),
+                    });
+                }
+                continue;
+            }
+            let b = inst.xform.xform_aabb(asm.local_aabb);
+            if contains(b) {
+                let t = PickTarget { inst_id, name: asm.name.clone(), mounts: asm.camera_mounts.clone() };
+                consider(volume(b), t, inst.user_id);
+            }
+        }
+        let mut flat_idx = 0usize;
+        for chunk in world.chunks() {
+            let n = chunk.len();
+            if contains(chunk.bounds) {
+                for (i, inst) in chunk.instances().iter().enumerate() {
+                    if !inst.is_visible() {
+                        continue;
+                    }
+                    let Some(asm) = world.assembly(inst.assembly_id) else {
+                        continue;
+                    };
+                    let b = inst.xform.xform_aabb(asm.local_aabb);
+                    if contains(b) {
+                        let t = PickTarget {
+                            inst_id: encode_static_inst_id(flat_idx + i),
+                            name: asm.name.clone(),
+                            mounts: asm.camera_mounts.clone(),
+                        };
+                        consider(volume(b), t, inst.user_id);
+                    }
+                }
+            }
+            flat_idx += n;
+        }
+        let best = exact.or(any)?.1;
+        // A click on a part without mounts (a wheel, a door) of a mounted body possesses the
+        // body: the smallest mounted instance around the hit point.
+        Some(if best.mounts.is_empty() { mounted.map_or(best, |(_, m)| m) } else { best })
+    }
+
+    /// The scene object behind a pick record, for the selection status (`crate::pick`).
+    pub fn describe_pick(&self, rec: &crate::pick::PickRecordPod) -> crate::pick::PickedObject {
+        let name = if !rec.is_csg() {
+            "classic stage geometry".to_string()
         } else {
-            lookup_instance_and_assembly(world, inst_id)
-                .map(|(_, asm)| asm.name.clone())
-                .unwrap_or_else(|| format!("Object #{inst_id}"))
+            self.resolve_pick(rec.inst_id, rec.world_pos)
+                .map_or_else(|| format!("Object #{:#010x}", rec.inst_id), |t| t.name)
+        };
+        crate::pick::PickedObject {
+            key: rec.inst_id,
+            name,
+            part_id: rec.part_id,
+            world_pos: rec.world_pos,
+            // csg-scene carries no OSM provenance yet (csg-rs P42).
+            osm: None,
+        }
+    }
+
+    /// Enters `Possess` mode on the object of a GPU pick (instance `key`, world hit point).
+    /// Objects without explicit camera mounts get the default orbit mount around their bounds.
+    pub fn possess_pick(&mut self, key: u32, pos: [f32; 3]) -> Result<PossessInfo, String> {
+        if self.scene.is_none() {
+            return Err("Load a CSG scene before picking an object to possess".to_string());
+        }
+        let target = self
+            .resolve_pick(key, pos)
+            .ok_or_else(|| "No possessable object under the cursor".to_string())?;
+        let mounts = if target.mounts.is_empty() {
+            let aabb = self
+                .scene
+                .as_ref()
+                .and_then(|s| lookup_instance_and_assembly(&s.world, target.inst_id))
+                .map_or(CsgAabb::EMPTY, |(_, asm)| asm.local_aabb);
+            vec![default_orbit_mount(aabb)]
+        } else {
+            target.mounts
         };
         let info = PossessInfo {
-            inst_id,
-            assembly_name,
+            inst_id: target.inst_id,
+            assembly_name: target.name,
             mounts,
             mount_idx: 0,
-            is_dynamic: is_dynamic_inst_id(inst_id),
+            is_dynamic: is_dynamic_inst_id(target.inst_id),
         };
         self.active_possess = Some(info.clone());
         Ok(info)
@@ -2591,6 +2697,20 @@ fn xform_to_bits(xf: [f32; 12]) -> [u32; 12] {
     out
 }
 
+/// Metres a world bound is padded by when testing whether it contains a GPU pick point.
+const PICK_POINT_PAD_M: f32 = 0.05;
+
+/// The scene instance a GPU pick resolved to ([`CsgGpuHost::resolve_pick`]).
+#[derive(Clone, Debug)]
+struct PickTarget {
+    /// Encoded possessable instance id (`DYNAMIC_INST_BIT` for moving instances).
+    inst_id: u32,
+    /// Assembly or crowd actor display name.
+    name: String,
+    /// Explicit camera mounts (empty: the default orbit mount is synthesised on possession).
+    mounts: Vec<csg_scene::CameraMount>,
+}
+
 /// Human-readable display label matching `csg_scene::list_possess_targets_with_crowd`.
 fn crowd_actor_display_name(crowd: &CrowdSim, actor_idx: usize) -> String {
     let prefix = match crowd.descs.get(actor_idx).map(|d| d.archetype_id) {
@@ -3109,43 +3229,25 @@ mod tests {
                     }
                     let asm = scene.world.assembly(inst.assembly_id)?;
                     if !asm.camera_mounts.is_empty() && inst.xform.0[7] > 20.0 {
-                        Some((
-                            asm.name.clone(),
-                            inst.xform,
-                            asm.local_aabb,
-                            scene.hints.elevation.sample(inst.xform.0[3], inst.xform.0[11]),
-                        ))
+                        Some((asm.name.clone(), inst.xform, asm.local_aabb, inst.user_id))
                     } else {
                         None
                     }
                 })
                 .expect("expected moving car at bluff elevation y > 20 m in gundo_osm")
         };
-        let (car_name, car_xform, car_aabb, _dem_y) = car_sample;
+        let (car_name, car_xform, car_aabb, car_key) = car_sample;
         let car_pos = [car_xform.0[3], car_xform.0[7], car_xform.0[11]];
         let car_y = car_pos[1];
-        let target = car_xform.xform_pt(car_aabb.center());
-        let cam_eye = Vec3::new(target.x, target.y + 8.0, target.z - 4.0);
-        let fwd = (target - cam_eye).norm();
-        let right = fwd.cross(Vec3::Y).norm();
-        let up = right.cross(fwd).norm();
-        let cam_frame = CameraFrame {
-            eye: [cam_eye.x, cam_eye.y, cam_eye.z],
-            fwd: [fwd.x, fwd.y, fwd.z],
-            right: [right.x, right.y, right.z],
-            up: [up.x, up.y, up.z],
-            tan_half_fov: (0.5 * 55.0_f32.to_radians()).tan(),
-        };
-        let (origin, dir) = crate::renderer::camera_projection_ray(
-            &cam_frame,
-            CameraProjection::Pinhole,
-            0.5,
-            0.5,
-            16.0 / 9.0,
-        )
-        .expect("center click ray");
+        // What the GPU pick record reports for a click on the car: its instance key (user id)
+        // and a world point on it (the top centre of its bounds).
+        let top = car_xform.xform_pt(Vec3::new(
+            car_aabb.center().x,
+            car_aabb.max.y,
+            car_aabb.center().z,
+        ));
         let info = host
-            .pick_possess(origin, dir)
+            .possess_pick(car_key, [top.x, top.y, top.z])
             .expect("Ctrl+Click on moving car must pick the car");
         let pose = host
             .resolve_active_possess(0.0, 0.0, true)

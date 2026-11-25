@@ -18,6 +18,7 @@ mod optix_sdk;
 mod overlay;
 mod perf_log;
 mod persist;
+mod pick;
 mod profiler;
 mod renderer;
 mod sdg_export;
@@ -48,7 +49,7 @@ mod demo_app {
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
         CameraFrame, CaptureSource, DEFAULT_H, DEFAULT_W, DLSS_QUALITY_MODES, DemoSettings,
-        DlssRrBufferPtrs, align_render_size, camera_projection_ray, dlss_quality_index,
+        DlssRrBufferPtrs, align_render_size, dlss_quality_index,
         spawn_render_thread,
     };
     use crate::ui::{DockTab, UiContext, UiScratch, UiTheme, default_dock_state, install_fonts};
@@ -3681,6 +3682,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.camera_rail.push_generated_rail(rail_spec.clone());
                         self.rail_blend_remaining = RAIL_BLEND_SECS;
                     }
+                    RenderEvent::SelectionChanged(sel) => {
+                        self.last_saved_msg = Some(crate::pick::selection_status(sel));
+                    }
                     RenderEvent::PossessChanged(info) => {
                         if let Some(pinfo) = info {
                             self.camera_rail.set_playing(false);
@@ -3891,7 +3895,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let mut export_flight_requested = false;
             let mut toggle_record_requested = false;
             let mut reload_shader_requested = false;
-            let mut pick_possess_uv: Option<(f32, f32)> = None;
             let mut possess_next_vehicle_requested = false;
             let mut select_possess_mount: Option<usize> = None;
             let mut cycle_possess_mount_delta: i32 = 0;
@@ -3939,9 +3942,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                     UiCommand::SnapCamera => cam_snap_requested = true,
                     UiCommand::BlendRail => rail_blend_requested = true,
-                    UiCommand::PickPossess { norm_x, norm_y } => {
-                        pick_possess_uv = Some((norm_x, norm_y));
-                    }
+                    UiCommand::Pick(req) => self.send_render(RenderControl::Pick(req)),
                     UiCommand::PossessNextVehicle => possess_next_vehicle_requested = true,
                     UiCommand::SelectPossessMount { mount_idx } => {
                         select_possess_mount = Some(mount_idx);
@@ -4786,21 +4787,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.send_render(RenderControl::EjectPossess);
                 }
                 self.send_render(RenderControl::GenerateRandomRail { seed });
-            }
-            if let Some((norm_x, norm_y)) = pick_possess_uv {
-                let active_cam = self.last_rendered_camera;
-                let aspect = self.render_w as f32 / self.render_h.max(1) as f32;
-                if let Some((origin, dir)) = camera_projection_ray(
-                    &active_cam,
-                    self.settings.camera_projection,
-                    norm_x,
-                    norm_y,
-                    aspect,
-                ) {
-                    self.send_render(RenderControl::PickPossess { origin, dir });
-                } else {
-                    self.last_saved_msg = Some("Click inside the fisheye sensor circle to pick".to_string());
-                }
             }
             if possess_next_vehicle_requested {
                 self.send_render(RenderControl::PossessNextVehicle);

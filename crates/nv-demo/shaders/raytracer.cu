@@ -72,7 +72,7 @@ struct Params {
     unsigned int aov_mode; // 0=Beauty, 1=Albedo, 2=Normal, 3=Depth, 4=Motion, 5=SemanticId, 6=InstanceId, ..., 11=AOV_WIREFRAME
     float jitter_x;
     float jitter_y;
-    unsigned int _pad1;
+    unsigned int pick_px;  // pixel to pick, x | y << 16; NV_PICK_NONE = no pick this launch (pick.rs)
     float env_params[8];
     unsigned long long out_diffuse_albedo_f32;
     unsigned long long out_spec_albedo_f32;
@@ -103,9 +103,12 @@ struct Params {
     unsigned int sdg_ray_count;          // number of active rays for __raygen__sdg_keypoints
     unsigned int classic_motion_count;   // valid entries of classic_motion
     unsigned long long classic_motion;   // device ptr to float[12] row-major 3x4 current-world -> previous-world per classic instance (index = instance id bits 16..23)
+    unsigned long long pick_record;      // device ptr to one NvPickRecord, written for `pick_px` (0 = none)
 };
 
-static_assert(sizeof(Params) == 648, "Params size must match LaunchParams (648 B)");
+static_assert(sizeof(Params) == 656, "Params size must match LaunchParams (656 B)");
+static_assert(__builtin_offsetof(Params, pick_px) == 428, "Params::pick_px offset must be 428");
+static_assert(__builtin_offsetof(Params, pick_record) == 648, "Params::pick_record offset must be 648");
 static_assert(__builtin_offsetof(Params, csg_prev_xforms) == 592, "Params::csg_prev_xforms offset must be 592");
 static_assert(__builtin_offsetof(Params, out_semantic_u32) == 600, "Params::out_semantic_u32 offset must be 600");
 static_assert(__builtin_offsetof(Params, out_instance_u32) == 608, "Params::out_instance_u32 offset must be 608");
@@ -142,6 +145,55 @@ static_assert(sizeof(GpuProbeSample) == 16, "GpuProbeSample must match csg_scene
 
 extern "C" {
 __constant__ Params params;
+
+// GPU pick record (`pick.rs` `PickRecordPod`, asserted on both sides). The raygen thread of the
+// pixel `params.pick_px` writes it from the primary ray it traces anyway, so a pick costs one
+// 32-byte store and is exactly what the image shows (same lens, culling, LOD and crowd pose).
+//   inst_id    primary-hit instance key (`hit_instance_id`: CSG user_id, else 0xFF000000 | packed
+//              index; classic 0xFFFFFF00 | slot), the selection key space of the overlay
+//   part_id    CSG part id (0xFFFFFFFF for classic geometry)
+//   t          camera-to-hit distance, metres
+//   world_pos  world hit point
+//   flags      NV_PICK_FLAG_*
+//   frame      params.frame_index of the writing launch (the host rejects any other frame's record)
+#define NV_PICK_NONE 0xFFFFFFFFu
+#define NV_PICK_FLAG_HIT 1u
+#define NV_PICK_FLAG_CSG 2u
+struct NvPickRecord {
+    unsigned int inst_id;
+    unsigned int part_id;
+    float t;
+    float world_pos[3];
+    unsigned int flags;
+    unsigned int frame;
+};
+static_assert(sizeof(NvPickRecord) == 32, "NvPickRecord must stay 32 bytes");
+static_assert(__builtin_offsetof(NvPickRecord, part_id) == 4, "NvPickRecord::part_id");
+static_assert(__builtin_offsetof(NvPickRecord, t) == 8, "NvPickRecord::t");
+static_assert(__builtin_offsetof(NvPickRecord, world_pos) == 12, "NvPickRecord::world_pos");
+static_assert(__builtin_offsetof(NvPickRecord, flags) == 24, "NvPickRecord::flags");
+static_assert(__builtin_offsetof(NvPickRecord, frame) == 28, "NvPickRecord::frame");
+
+// True for the one raygen thread that answers this launch's pick (uniform `false` otherwise).
+static __forceinline__ __device__ bool nv_pick_here(uint3 idx) {
+    return params.pick_px != NV_PICK_NONE && params.pick_record != 0ull
+        && idx.x == (params.pick_px & 0xFFFFu) && idx.y == (params.pick_px >> 16u);
+}
+
+static __forceinline__ __device__ void nv_pick_write(
+    unsigned int key, unsigned int part_id, float t, float3 pos, unsigned int flags
+) {
+    NvPickRecord r;
+    r.inst_id = key;
+    r.part_id = part_id;
+    r.t = t;
+    r.world_pos[0] = pos.x;
+    r.world_pos[1] = pos.y;
+    r.world_pos[2] = pos.z;
+    r.flags = flags;
+    r.frame = params.frame_index;
+    *reinterpret_cast<NvPickRecord*>(params.pick_record) = r;
+}
 }
 
 static __forceinline__ __device__ unsigned int pcg_hash(unsigned int v) {
@@ -2075,6 +2127,8 @@ extern "C" __global__ void __raygen__render() {
     // never faded).
     float wire_diam = 1e6f;
     const unsigned int ctr_tap = aov_wire ? 0u : 4u;
+    // The sample that answers a pick: the pixel-centre tap of AOV passes, else sample 0.
+    const unsigned int pick_tap = aov_aa ? ctr_tap : 0u;
     const unsigned int loop_spp = aov_wire ? 1u : (aov_aa ? 5u : spp);
     float3 aov_accum = make_float3(0.0f, 0.0f, 0.0f);
     float aov_w_accum = 0.0f;
@@ -2165,6 +2219,9 @@ extern "C" __global__ void __raygen__render() {
         }
 
         if (masked) {
+            if (s == pick_tap && nv_pick_here(idx)) {
+                nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
+            }
             if (s == 0u || aov_aa) {
                 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
                 first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
@@ -2210,6 +2267,9 @@ extern "C" __global__ void __raygen__render() {
             trace_primary(origin, dir, (bounce == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
 
             if (p0 == 0u) {
+                if (bounce == 0 && s == pick_tap && nv_pick_here(idx)) {
+                    nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
+                }
                 if (!aov_geom_only) {
                     float3 sky = sky_color(dir, sun_dir, bounce == 0);
                     sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
@@ -2305,6 +2365,10 @@ extern "C" __global__ void __raygen__render() {
                     }
                 }
                 first_inst_id = hit_instance_id(p0, p6);
+                if (s == pick_tap && nv_pick_here(idx)) {
+                    nv_pick_write(first_inst_id, is_csg ? p7 : 0xFFFFFFFFu, first_range, hit_pos,
+                                  NV_PICK_FLAG_HIT | (is_csg ? NV_PICK_FLAG_CSG : 0u));
+                }
                 float2 prev_px;
                 if (has_prev_cam
                     && project_prev_pixel(

@@ -121,8 +121,8 @@ pub enum UiCommand {
     SnapCamera,
     /// Smoothly glide `CameraDamper` into a newly started or switched camera rail cassette.
     BlendRail,
-    /// Pick and possess the object under normalized viewport coordinates `(norm_x, norm_y)` (`[0, 1]`).
-    PickPossess { norm_x: f32, norm_y: f32 },
+    /// Pick the object under the click (`crate::pick`): select it or possess it.
+    Pick(crate::pick::PickRequest),
     /// Jump straight into the next moving vehicle (prioritizing `Robotaxi`) with 1 click.
     PossessNextVehicle,
     /// Switch the active possessed object to a specific `CameraMount` index.
@@ -211,8 +211,8 @@ pub enum RenderControl {
     },
     /// Synthesize a deterministic exact-CSG random rail for the active scene on the worker thread.
     GenerateRandomRail { seed: u64 },
-    /// Cast an exact world-space CSG pick ray and possess the hit object.
-    PickPossess { origin: [f32; 3], dir: [f32; 3] },
+    /// Answer a viewport click with the GPU pick record of the next launch (`crate::pick`).
+    Pick(crate::pick::PickRequest),
     /// Possess the next dynamic vehicle (prioritizing `Robotaxi`) or mounted scene object.
     PossessNextVehicle,
     /// Switch active camera mount index on the currently possessed object.
@@ -253,6 +253,8 @@ pub enum RenderEvent {
     RailGenerated(RailSpec),
     /// Active possessed body or mount changed (`None` = ejected to free camera).
     PossessChanged(Option<PossessInfo>),
+    /// The viewport selection changed (GPU pick or scene switch).
+    SelectionChanged(crate::pick::SelectionInfo),
     /// A `Smart View` scoring run selected a top viewpoint.
     SmartViewReady(SmartViewResult),
     /// Render worker transitioned between compile/build/IAS/rendering phases.

@@ -1298,14 +1298,26 @@ impl UiContext<'_> {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         let pick_active = self.settings.csg_mode != 0 && *self.pick_possess_mode && !toolbar_blocking;
-        // Double-click / double-tap anywhere in the viewport (or click in Pick crosshair mode)
-        // possesses the vehicle, pedestrian, or camera mount under the cursor.
+        // Viewport click model (`crate::pick`, shared with warpbro-rs / squarebob-rs through
+        // `sl_config::sel_mods`, modifiers latched at the press): a click selects the object
+        // under the cursor (Shift toggles it in the selection; empty space clears unless Shift
+        // is held); Ctrl + click, a double click or a click in Pick crosshair mode possesses it.
+        // Both are answered by the GPU pick record of the next launch.
+        let mods = sl_config::list::sel_mods(ui.ctx());
+        let clicked = !split_dragging && !toolbar_blocking && resp.clicked_by(egui::PointerButton::Primary);
         let pick_clicked = !split_dragging
             && !toolbar_blocking
             && self.settings.csg_mode != 0
             && (resp.double_clicked_by(egui::PointerButton::Primary)
-                || (*self.pick_possess_mode && resp.clicked_by(egui::PointerButton::Primary)));
-        if pick_clicked
+                || (clicked && (*self.pick_possess_mode || mods.toggle)));
+        let action = if pick_clicked {
+            Some(crate::pick::PickAction::Possess)
+        } else if clicked {
+            Some(crate::pick::PickAction::Select { add: mods.range })
+        } else {
+            None
+        };
+        if let Some(action) = action
             && let Some(pos) = resp.interact_pointer_pos()
             && img_rect.width() > 2.0
             && img_rect.height() > 2.0
@@ -1314,8 +1326,10 @@ impl UiContext<'_> {
             let norm_x = ((pos.x - img_rect.left()) / img_rect.width()).clamp(0.0, 1.0);
             let norm_y = ((pos.y - img_rect.top()) / img_rect.height()).clamp(0.0, 1.0);
             self.bus
-                .emit_ui(UiCommand::PickPossess { norm_x, norm_y });
-            *self.pick_possess_mode = false;
+                .emit_ui(UiCommand::Pick(crate::pick::PickRequest { norm_x, norm_y, action }));
+            if pick_clicked {
+                *self.pick_possess_mode = false;
+            }
         }
 
         let kb_free = !ui.ctx().egui_wants_keyboard_input();

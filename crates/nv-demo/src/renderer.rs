@@ -153,7 +153,9 @@ struct LaunchParams {
     aov_mode: u32,
     jitter_x: f32,
     jitter_y: f32,
-    _pad1: u32,
+    /// Pixel whose primary ray writes the pick record, `x | y << 16`; [`crate::pick::PICK_NONE`]
+    /// = no pick this launch.
+    pick_px: u32,
     env_params: [f32; 8],
     out_diffuse_albedo_f32: u64,
     out_spec_albedo_f32: u64,
@@ -187,9 +189,14 @@ struct LaunchParams {
     /// one per classic (non-CSG) IAS instance, indexed by bits `16..24` of its instance id
     /// ([`ClassicMotion`]); `0` disables classic object motion.
     classic_motion: u64,
+    /// Device pointer to one `NvPickRecord` (`crate::pick::PickRecordPod`), written by the raygen
+    /// thread of `pick_px`; `0` = no pick buffer.
+    pick_record: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 648);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 656);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_px) == 428);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_record) == 648);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_prev_xforms) == 592);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, out_semantic_u32) == 600);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, out_instance_u32) == 608);
@@ -385,7 +392,7 @@ struct GpuSdgRayQuery {
 
 const _: () = assert!(std::mem::size_of::<GpuSdgRayQuery>() == 32);
 
-/// Optical sensor projection model for primary ray generation and `Ctrl+Click` Pick-to-Possess.
+/// Optical sensor projection model for primary ray generation (the GPU pick uses the same rays).
 #[repr(u32)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -427,64 +434,6 @@ impl CameraProjection {
     pub const fn is_omnidirectional(self) -> bool {
         !matches!(self, Self::Pinhole)
     }
-}
-
-/// Generates an exact world-space primary ray `(origin, unit_dir)` matching `__raygen__render`
-/// for all 4 optical sensor projections (`norm_x`, `norm_y` in `[0, 1]`, top-left origin).
-///
-/// Returns `None` if `(norm_x, norm_y)` falls outside the circular mask of `Fisheye180`.
-pub fn camera_projection_ray(
-    cam: &CameraFrame,
-    proj: CameraProjection,
-    norm_x: f32,
-    norm_y: f32,
-    aspect: f32,
-) -> Option<([f32; 3], [f32; 3])> {
-    let fwd = glam::Vec3::from_array(cam.fwd);
-    let rgt = glam::Vec3::from_array(cam.right);
-    let up = glam::Vec3::from_array(cam.up);
-    let safe_aspect = aspect.clamp(0.1, 10.0);
-    let u01 = norm_x.clamp(0.0, 1.0);
-    let v01 = norm_y.clamp(0.0, 1.0);
-
-    let dir = match proj {
-        CameraProjection::Pinhole => {
-            let u = u01 * 2.0 - 1.0;
-            let v = 1.0 - v01 * 2.0;
-            (fwd + rgt * (u * safe_aspect * cam.tan_half_fov) + up * (v * cam.tan_half_fov))
-                .normalize_or_zero()
-        }
-        CameraProjection::Fisheye180 => {
-            let sx = safe_aspect.max(1.0);
-            let sy = (1.0 / safe_aspect).max(1.0);
-            let dx = (u01 - 0.5) * 2.0 * sx;
-            let dy = (0.5 - v01) * 2.0 * sy;
-            let r = (dx * dx + dy * dy).sqrt();
-            if r > 1.0 {
-                return None;
-            }
-            let theta = r * std::f32::consts::FRAC_PI_2;
-            let phi = dy.atan2(dx);
-            let radial = rgt * phi.cos() + up * phi.sin();
-            (fwd * theta.cos() + radial * theta.sin()).normalize_or_zero()
-        }
-        CameraProjection::Equirect360 => {
-            let yaw = (u01 - 0.5) * std::f32::consts::TAU;
-            let pitch = (0.5 - v01) * std::f32::consts::PI;
-            let hdir = fwd * yaw.cos() + rgt * yaw.sin();
-            (hdir * pitch.cos() + up * pitch.sin()).normalize_or_zero()
-        }
-        CameraProjection::SlitCam => {
-            let yaw = (u01 - 0.5) * std::f32::consts::TAU;
-            let hdir = fwd * yaw.cos() + rgt * yaw.sin();
-            let v_off = (0.5 - v01) * 2.0 * cam.tan_half_fov;
-            (hdir + up * v_off).normalize_or_zero()
-        }
-    };
-    if dir.length_squared() < 1e-8 {
-        return None;
-    }
-    Some((cam.eye, dir.to_array()))
 }
 
 #[repr(C)]
@@ -3162,6 +3111,90 @@ struct OverlayRig {
     reported: [u32; 3],
 }
 
+/// Device side of the GPU pick (`pick.rs`): the 32-byte record the primary launch writes, its
+/// pinned readback slot and the event that tells the next frame the copy finished.
+///
+/// Why an event and pinned memory: the record is read on the following frame with a
+/// non-blocking `cuEventQuery`, so picking never adds a stream synchronisation.
+struct PickRig {
+    ctx: Arc<CudaContext>,
+    /// `NvPickRecord` as 8 words.
+    record: DeviceBuffer<u32>,
+    staging: crate::csg_scene_host::PinnedStagingBuffer,
+    done: cu::CUevent,
+}
+
+impl PickRig {
+    fn new(rig: &OptixRig) -> Result<Self, String> {
+        let record = DeviceBuffer::zeroed(&rig.stream, 8).map_err(|e| format!("pick record allocation failed: {e}"))?;
+        let staging = crate::csg_scene_host::PinnedStagingBuffer::try_new(&rig.tonemap.cuda, 32)
+            .ok_or("pick pinned staging allocation failed")?;
+        let mut done: cu::CUevent = std::ptr::null_mut();
+        // SAFETY: the render context is current on this thread (`PinnedStagingBuffer::try_new`
+        // bound it); `done` is a valid out-pointer. Timing is not needed.
+        let rc = unsafe { cu::cuEventCreate(&mut done, cu::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS || done.is_null() {
+            return Err(format!("pick cuEventCreate failed ({rc:?})"));
+        }
+        Ok(Self { ctx: rig.tonemap.cuda.clone(), record, staging, done })
+    }
+
+    /// Marks the record unwritten (all ones, so its frame tag can match no launch) before the
+    /// launch that carries a pick.
+    fn arm(&self, stream: &Stream) -> Result<(), String> {
+        // SAFETY: `record` holds 8 words and lives until the end-of-frame fence.
+        let rc = unsafe { cu::cuMemsetD32Async(self.record.cu_deviceptr(), u32::MAX, 8, stream.cu_stream()) };
+        if rc == cu::cudaError_enum_CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("pick record reset failed ({rc:?})"))
+        }
+    }
+
+    /// Queues the record copy into pinned memory and the completion event after the launch.
+    fn readback(&mut self, stream: &Stream) -> Result<(), String> {
+        // SAFETY: 32 bytes from the 8-word record into the 32-byte pinned block, ordered after the
+        // launch on `stream`; the block is read only after `done` completed.
+        let rc = unsafe { cu::cuMemcpyDtoHAsync_v2(self.staging.as_mut_ptr(), self.record.cu_deviceptr(), 32, stream.cu_stream()) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("pick record readback failed ({rc:?})"));
+        }
+        // SAFETY: `done` is a live event of this context, `stream` is live.
+        let rc = unsafe { cu::cuEventRecord(self.done, stream.cu_stream()) };
+        if rc == cu::cudaError_enum_CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("pick event record failed ({rc:?})"))
+        }
+    }
+
+    /// The read-back record once the copy completed (`None` while it is still in flight).
+    fn poll(&mut self) -> Result<Option<crate::pick::PickRecordPod>, String> {
+        // SAFETY: `done` is a live event of this context.
+        let rc = unsafe { cu::cuEventQuery(self.done) };
+        if rc == cu::cudaError_enum_CUDA_ERROR_NOT_READY {
+            return Ok(None);
+        }
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("pick cuEventQuery failed ({rc:?})"));
+        }
+        // SAFETY: the copy into the 32-byte pinned block completed (event done).
+        Ok(Some(unsafe { std::ptr::read_unaligned(self.staging.as_mut_ptr().cast::<crate::pick::PickRecordPod>()) }))
+    }
+}
+
+impl Drop for PickRig {
+    fn drop(&mut self) {
+        if !self.done.is_null() && self.ctx.bind_to_thread().is_ok() {
+            // SAFETY: `done` was created by `cuEventCreate` on `self.ctx`, now current.
+            let rc = unsafe { cu::cuEventDestroy_v2(self.done) };
+            if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                eprintln!("nv-demo: pick cuEventDestroy failed ({rc:?})");
+            }
+        }
+    }
+}
+
 /// Largest CPU-provider segment count per frame (CPU providers draw small sets only).
 const OVERLAY_CPU_SEG_MAX: usize = 16_384;
 /// Weight of the new frame in the overlay coverage history (exponential, like a TAA resolve).
@@ -4636,6 +4669,10 @@ pub fn spawn_render_thread(
             let mut overlay_list = crate::overlay::OverlayList::default();
             let mut contour_provider = crate::overlay::ContourProvider::default();
             let mut axes_provider = crate::overlay::AxesProvider;
+            // GPU picking and the viewport selection it drives (`pick.rs`).
+            let mut pick = crate::pick::PickState::default();
+            let mut pick_rig: Option<PickRig> = None;
+            let mut selection = crate::pick::Selection::default();
             let mut overlay_status: Option<String> = None;
             // A camera / scene cut since the last overlay frame: its coverage history is stale.
             let mut overlay_history_cut = false;
@@ -4898,26 +4935,7 @@ pub fn spawn_render_thread(
                                 }
                             }
                         }
-                        RenderControl::PickPossess { origin, dir } => {
-                            if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
-                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                    "CUDA crowd sync before pick failed: {e}"
-                                )));
-                            }
-                            match rig.csg_host.pick_possess(*origin, *dir) {
-                                Ok(info) => {
-                                    possess_damper.snap(camera_frame_to_core_pose(last_rendered_camera));
-                                    possess_blend_rem = 0.9;
-                                    accum_count = 0;
-                                    temporal_history_cut = true;
-                                    emit_possess_status(&bus, &info);
-                                    bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
-                                }
-                                Err(e) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
-                                }
-                            }
-                        }
+                        RenderControl::Pick(req) => pick.request(*req),
                         RenderControl::PossessNextVehicle => {
                             if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
                                 bus.emit_render_event(RenderEvent::StatusMessage(format!(
@@ -5240,6 +5258,77 @@ pub fn spawn_render_thread(
                     possess_zoom_offset = snap.possess_zoom_offset;
                 }
 
+                // GPU pick record of the previous launch (non-blocking event query; the end-of-frame
+                // fence has normally completed it already).
+                if pick.in_flight()
+                    && let Some(pr) = pick_rig.as_mut()
+                {
+                    match pr.poll() {
+                        Ok(None) => {}
+                        Ok(Some(record)) => match pick.consume(record) {
+                            Some(crate::pick::PickOutcome::Ready(req, rec)) => {
+                                let hit = rec.is_hit().then_some(rec.inst_id);
+                                match req.action {
+                                    crate::pick::PickAction::Select { add } => {
+                                        let changed = selection.click(hit, add);
+                                        let active = hit.map(|_| rig.csg_host.describe_pick(&rec));
+                                        if changed || active.is_some() {
+                                            bus.emit_render_event(RenderEvent::SelectionChanged(
+                                                crate::pick::SelectionInfo {
+                                                    keys: selection.keys().to_vec(),
+                                                    active,
+                                                },
+                                            ));
+                                        }
+                                    }
+                                    crate::pick::PickAction::Possess if rec.is_hit() && rec.is_csg() => {
+                                        // The possession pose follows the CPU crowd state.
+                                        if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                                "CUDA crowd sync before possess failed: {e}"
+                                            )));
+                                        }
+                                        match rig.csg_host.possess_pick(rec.inst_id, rec.world_pos) {
+                                            Ok(info) => {
+                                                possess_damper
+                                                    .snap(camera_frame_to_core_pose(last_rendered_camera));
+                                                possess_blend_rem = 0.9;
+                                                accum_count = 0;
+                                                temporal_history_cut = true;
+                                                emit_possess_status(&bus, &info);
+                                                bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
+                                                selection.select_only(rec.inst_id);
+                                                bus.emit_render_event(RenderEvent::SelectionChanged(
+                                                    crate::pick::SelectionInfo {
+                                                        keys: selection.keys().to_vec(),
+                                                        active: Some(rig.csg_host.describe_pick(&rec)),
+                                                    },
+                                                ));
+                                            }
+                                            Err(e) => bus.emit_render_event(RenderEvent::StatusMessage(e)),
+                                        }
+                                    }
+                                    crate::pick::PickAction::Possess => {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(
+                                            "No possessable object under the cursor".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(crate::pick::PickOutcome::Lost(_)) => {
+                                bus.emit_render_event(RenderEvent::StatusMessage(
+                                    "Pick dropped: the launch wrote no pick record".to_string(),
+                                ));
+                            }
+                            None => {}
+                        },
+                        Err(e) => {
+                            pick.reset();
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!("Pick readback failed: {e}")));
+                        }
+                    }
+                }
+
                 // Strict 1-to-1 deterministic lockstep for ANY Smooth 60 FPS recording
                 // (`rec_shutter_subframes >= 1`): render thread advances traffic, crowd, and
                 // encodes exactly one frame per `RenderShutterSubframe` batch from UI.
@@ -5281,6 +5370,7 @@ pub fn spawn_render_thread(
                     && !rec_active
                     && pending_jpeg.is_none()
                     && !rig.csg_host.has_pending_metadata()
+                    && pick.is_idle()
                     && settings.max_accum > 0
                     && accum_count >= settings.max_accum;
 
@@ -5597,6 +5687,15 @@ pub fn spawn_render_thread(
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
                 temporal_history_cut |= building_scene;
+                if building_scene {
+                    // Selection keys and queued clicks belong to the old scene.
+                    pick.reset();
+                    if selection.clear() {
+                        bus.emit_render_event(RenderEvent::SelectionChanged(
+                            crate::pick::SelectionInfo::default(),
+                        ));
+                    }
+                }
                 if building_scene {
                     if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
                         cc.mark_scene_dirty();
@@ -6086,6 +6185,27 @@ pub fn spawn_render_thread(
                     (0, 0)
                 };
 
+                // GPU pick (`pick.rs`): the launch answers at most one queued click.
+                if !pick.is_idle() && pick_rig.is_none() {
+                    match PickRig::new(&rig) {
+                        Ok(p) => pick_rig = Some(p),
+                        Err(e) => {
+                            pick.reset();
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!("Pick unavailable: {e}")));
+                        }
+                    }
+                }
+                let pick_px = if pick_rig.is_some() {
+                    pick.launch(frame_index, cur_w, cur_h)
+                } else {
+                    crate::pick::PICK_NONE
+                };
+                if pick_px != crate::pick::PICK_NONE
+                    && let Some(Err(e)) = pick_rig.as_ref().map(|p| p.arm(&rig.stream))
+                {
+                    bus.emit_render_event(RenderEvent::Fatal(e));
+                    break 'render;
+                }
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
@@ -6183,7 +6303,7 @@ pub fn spawn_render_thread(
                     aov_mode: launch_aov,
                     jitter_x: jitter[0],
                     jitter_y: jitter[1],
-                    _pad1: 0,
+                    pick_px,
                     env_params,
                     out_diffuse_albedo_f32: if rr_export {
                         rig.diffuse_albedo_f32
@@ -6225,6 +6345,7 @@ pub fn spawn_render_thread(
                     sdg_ray_count: 0,
                     classic_motion_count,
                     classic_motion: rig.classic_motion_buf.cu_deviceptr(),
+                    pick_record: pick_rig.as_ref().map_or(0, |p| p.record.cu_deviceptr()),
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -6266,6 +6387,12 @@ pub fn spawn_render_thread(
                 }
                 if let (Some(prof), Some(slot)) = (rig.gpu_profiler.as_ref(), prof_slot) {
                     prof.mark_rt_end(slot, &rig.stream);
+                }
+                if pick_px != crate::pick::PICK_NONE
+                    && let Some(Err(e)) = pick_rig.as_mut().map(|p| p.readback(&rig.stream))
+                {
+                    bus.emit_render_event(RenderEvent::Fatal(e));
+                    break 'render;
                 }
 
                 if !publish_frame {
@@ -6502,7 +6629,7 @@ pub fn spawn_render_thread(
                             camera: active_camera,
                             projection: settings.camera_projection,
                             filter: settings.overlay,
-                            selected: &[],
+                            selected: selection.keys(),
                             csg: rig.csg_host.device_pointers(),
                             dst8: buf_ptrs[buf_idx],
                             dst16: hdr_ptrs.map_or(0, |p| p[buf_idx]),
@@ -6939,7 +7066,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 648);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 656);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -7090,40 +7217,6 @@ mod tests {
             occ.test_visibility(eye, p_world, 0.08, uid),
             KeypointVis::OccludedWorld
         );
-    }
-
-    #[test]
-    fn camera_projection_rays_match_cardinal_axes_and_fisheye_mask() {
-        let cam = CameraFrame {
-            eye: [1.0, 2.0, 3.0],
-            fwd: [0.0, 0.0, 1.0],
-            right: [1.0, 0.0, 0.0],
-            up: [0.0, 1.0, 0.0],
-            tan_half_fov: 0.5,
-        };
-        for proj in CameraProjection::ALL {
-            let (orig, dir) =
-                camera_projection_ray(&cam, proj, 0.5, 0.5, 16.0 / 9.0).expect("center ray");
-            assert_eq!(orig, cam.eye);
-            assert!(
-                (dir[2] - 1.0).abs() < 1e-5 && dir[0].abs() < 1e-5 && dir[1].abs() < 1e-5,
-                "{proj:?} center must point straight along +fwd: {dir:?}"
-            );
-        }
-        // Corner of 16:9 viewport lies outside the inscribed 180-degree fisheye circle -> masked None.
-        assert!(camera_projection_ray(&cam, CameraProjection::Fisheye180, 0.0, 0.0, 16.0 / 9.0).is_none());
-        // Equirect360 & SlitCam edges (norm_x = 0.0 / 1.0) wrap 180 degrees to -fwd.
-        for proj in [CameraProjection::Equirect360, CameraProjection::SlitCam] {
-            let (_, back) = camera_projection_ray(&cam, proj, 0.0, 0.5, 16.0 / 9.0).expect("edge");
-            assert!(
-                (back[2] + 1.0).abs() < 1e-5,
-                "{proj:?} left seam must look behind (-fwd): {back:?}"
-            );
-        }
-        // Equirect360 poles look straight up / down.
-        let (_, zenith) =
-            camera_projection_ray(&cam, CameraProjection::Equirect360, 0.5, 0.0, 2.0).expect("top");
-        assert!((zenith[1] - 1.0).abs() < 1e-5, "equirect top = +up: {zenith:?}");
     }
 
     #[test]

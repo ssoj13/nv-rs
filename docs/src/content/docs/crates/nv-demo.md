@@ -26,8 +26,8 @@ On Windows, `ngx` (`ngx-sys`) is enabled by default (`default = ["ngx"]`) and au
 `CsgGpuHost` (`src/csg_scene_host.rs`) owns `Option<SceneBuilt>` directly from `csg_scenes::default_scene_registry()` (backed by the **23-crate** `csg-rs` workspace at `24b22f5` with **13** analytical primitives `0..12`, an **84-slot** `MaterialPalette`, and a **15-class** `GasLedger` capped at **`246 / 256`** GASes):
 
 - **Gundo & GundoOSM**: coastal El Segundo refinery, 3-tier `RivetedPipeBridge`, catenary power lines, Road Work zones, `TrafficStateSoA` arterial traffic, Seawall Promenade & sidewalk biome crowds, and Vista Del Mar beach.
-- **Marina del Rey**: procedurally instanced 16-story Marina City Club crescent towers, furnished `4316 Marina City Dr — 3F Balcony` (`csg-kit-marina-furniture`), yacht harbor, and promenade crowds.
-- **San Francisco House of AI**: 40 Boardman Pl interior/exterior SoMa block with transmissive glazing and urban pedestrian crowds.
+- **Marina del Rey**: procedurally instanced 16-story Marina City Club crescent towers, furnished Marina Club balcony (`csg-kit-marina-furniture`), yacht harbor, and promenade crowds.
+- **San Francisco House of AI**: SoMa venue interior/exterior block with transmissive glazing and urban pedestrian crowds.
 - **Studio Asset Inspector (`110` variants)**: variants `0..108` (`VehicleKit`, `Robotaxi`, `RivetedPipeBridge`, Road Work, Marina furniture, foliage) plus variant **`109` — `Actors: 4-Archetype Crowd Showcase`** featuring Urban Human, comedic `RoadSignStickman`, `QuadrupedDog`, and 5-finger `SdgMannequin` compiled onto a shared **11-GAS `SINGLE_PRIM | IDENTITY`** SBT 10 actor bank.
 - **Live 4-Way `Road Mode`**: switch `Watertight3D`, `TangentPlaneC1`, `HybridC1Sdf`, and `FRepTile` (`PrimKind::RoadTerrainTile = 12`) live in `CSG World` with quantized `(s, lat)` road micro-shading.
 

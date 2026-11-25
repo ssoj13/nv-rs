@@ -31,6 +31,7 @@ use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 use crate::profiler::GpuPassProfiler;
+use crate::semantic_filter as sf;
 use crate::sdg_export::{
     ActiveCrowdBackend, ActiveSdgOccluder, CrowdBackend, SdgBurstFrameEntry, SdgBurstManifest,
     SdgExrFrame, SdgOccluderBackend, write_sdg_exr_atomic, write_sdg_manifest_atomic,
@@ -197,9 +198,15 @@ struct LaunchParams {
     is_counters: u64,
     /// Semantic ids not rendered (bit `s` = id `s`; `crate::semantic_filter`); `0` = all shown.
     hidden_semantics: u64,
+    /// Device bitset over the CSG instance slots: bit set = the instance is partially hidden and
+    /// its intersection program rejects per hit; clear = unaffected, the reject test is skipped
+    /// (`semantic_filter::fill_partial_bits`). `0` = every instance partial. Read only while
+    /// `hidden_semantics != 0`.
+    csg_sem_partial: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 672);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 680);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sem_partial) == 672);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, hidden_semantics) == 664);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, is_counters) == 656);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_px) == 428);
@@ -2327,9 +2334,6 @@ enum IasClassicState {
         /// not rebuild the IAS.
         sat_angle: f32,
         fractal_transform: [f32; 12],
-        /// Hidden-semantics bits of the classes classic instances carry (`classic_semantic`),
-        /// so hiding a CSG-only class never rebuilds the IAS.
-        classic_hidden: u64,
     },
 }
 
@@ -2340,12 +2344,6 @@ enum IasClassicState {
 fn classic_instance_flags(kind: u32) -> u32 {
     let sem = if kind == 0 { csg_core::ast::semantic::GROUND } else { csg_core::ast::semantic::UNKNOWN };
     csg_scene::inst_flags::with_semantic(0, Some(sem)).unwrap_or(0)
-}
-
-/// Semantic id of a classic instance, resolved through `inst_flags::resolve_semantic` (the host
-/// twin of csg-device `csg_instance_semantic`).
-fn classic_semantic(kind: u32) -> u16 {
-    csg_scene::inst_flags::resolve_semantic(classic_instance_flags(kind), csg_core::ast::semantic::UNKNOWN).0
 }
 
 /// Computes the classic-stage IAS state, guarding `sat_angle` and `fractal_transform` strictly
@@ -2398,8 +2396,6 @@ fn compute_ias_classic_state(
         sat_hue_spread: settings.sat_hue_spread,
         sat_angle,
         fractal_transform,
-        classic_hidden: settings.hidden_semantics
-            & (0..5u32).fold(0u64, |m, k| m | crate::semantic_filter::bit(classic_semantic(k))),
     }
 }
 
@@ -2417,6 +2413,8 @@ fn build_ias_into(
     csg_host: &CsgGpuHost,
     instances: &mut Vec<Instance>,
     state: &IasClassicState,
+    hidden: u64,
+    force_rebuild: bool,
 ) -> Result<ClassicXforms, String> {
     instances.clear();
     if let IasClassicState::Visible {
@@ -2542,20 +2540,16 @@ fn build_ias_into(
         }
     }
 
-    // Bits 16..24 of a classic id name its slot in the classic motion table. A classic instance
-    // whose class is hidden (viewport category filter) leaves every ray type: visibility mask 0.
-    let classic_hidden = match *state {
-        IasClassicState::Visible { classic_hidden, .. } => classic_hidden,
-        IasClassicState::Hidden => 0,
-    };
+    // Bits 16..24 of a classic id name its slot in the classic motion table. Classic instances go
+    // through the same category-filter rule as CSG instances (`semantic_filter::classify` on
+    // their override flags); their class is exact, so they are hidden or unaffected, never partial.
     for (slot, inst) in instances.iter_mut().enumerate() {
-        if classic_hidden & crate::semantic_filter::bit(classic_semantic(inst.id & 0xFF)) != 0 {
-            inst.mask = 0;
-        }
+        let m = sf::instance_semantic_mask(classic_instance_flags(inst.id & 0xFF));
+        inst.mask = sf::visibility_mask(inst.mask, sf::classify(m, hidden));
         inst.id |= (slot as u32) << CLASSIC_SLOT_SHIFT;
     }
     let classic = ClassicXforms::capture(instances);
-    csg_host.append_optix_instances(instances);
+    csg_host.append_optix_instances(instances, hidden);
 
     if instances.is_empty() {
         let mut dummy = Instance::new(gas.floor);
@@ -2568,7 +2562,8 @@ fn build_ias_into(
         .upload_all(stream, instances)
         .map_err(|e| format!("IAS instance upload failed: {e}"))?;
     // SAFETY: all ray-tracing launches on `stream` are strictly ordered before this build.
-    // `Ok(bool)` only says whether OptiX updated or rebuilt; this call always forces a rebuild.
+    // `Ok(bool)` only says whether OptiX updated or rebuilt. Without `force_rebuild` (only the
+    // visibility masks changed) OptiX updates in place when the instance count is unchanged.
     unsafe {
         Accel::instances_into(
             optix_ctx,
@@ -2576,7 +2571,7 @@ fn build_ias_into(
             scratch,
             d_instances,
             ias_build_opts(),
-            true,
+            force_rebuild,
             target_ias,
         )
     }
@@ -2852,6 +2847,9 @@ fn init_optix(
         &csg_host,
         &mut ias_instances_scratch,
         &initial_classic,
+        // The first frame's `apply_semantic_filter` applies the saved mask (one UPDATE).
+        csg_host.semantic_hidden(),
+        true,
     )?;
 
     let n = (DEFAULT_W * DEFAULT_H) as usize;
@@ -4130,7 +4128,7 @@ fn score_views_on_rig(
             // Build an omnidirectional CSG-only IAS for accurate city-wide OptiX probing.
             rig.ias_instances_scratch.clear();
             rig.csg_host
-                .append_optix_instances(&mut rig.ias_instances_scratch);
+                .append_optix_instances(&mut rig.ias_instances_scratch, 0);
             if rig.ias_instances_scratch.is_empty() {
                 return Err("Active CSG scene has zero instances to probe".to_string());
             }
@@ -4384,6 +4382,10 @@ fn trace_sdg_occluder_optix(
         sdg_ray_queries: q_ptr,
         sdg_ray_results: r_ptr,
         sdg_ray_count: query_count as u32,
+        // The live IAS carries the category filter's visibility masks; the occlusion rays use
+        // the same per-hit rule so a hidden class never occludes a keypoint.
+        hidden_semantics: csg_ptrs.hidden_semantics,
+        csg_sem_partial: csg_ptrs.sem_partial,
         // The live IAS can hold the fractal; without its shape the occlusion rays would march a
         // different (zero-parameter) fractal than the frame shows (GPU:D21).
         fractal_kind: fractal.kind,
@@ -5942,10 +5944,27 @@ pub fn spawn_render_thread(
                 }
                 let ias_state = compute_ias_classic_state(&settings, spin_angle, sat_angle);
                 let classic_changed = ias_state != last_ias_state;
+                // Category filter (`semantic_filter.rs`): the per-instance state changes only with
+                // the hidden mask or the packed instances; a mask change re-emits the IAS
+                // instances with their new visibility masks as one UPDATE (same count).
+                let filter_changed = match rig
+                    .csg_host
+                    .apply_semantic_filter(&rig.stream, settings.hidden_semantics)
+                {
+                    Ok(changed) => changed,
+                    Err(e) => {
+                        // The bitset stays empty (every instance partial: exact, slower);
+                        // re-emit the masks once in case the hidden mask changed.
+                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                            "Category filter upload failed (per-hit filtering only): {e}"
+                        )));
+                        true
+                    }
+                };
                 // The traffic prefix is in `d_optix_instances` but the refit was left to the
                 // CUDA crowd step; refit below if that step does not.
                 let mut ias_refit_pending = false;
-                match (classic_changed, csg_sync) {
+                match (classic_changed || filter_changed, csg_sync) {
                     (false, CsgSyncResult::Unchanged) => {}
                     (false, CsgSyncResult::TrafficOnly { dynamic_count })
                         if rig.ias.is_some()
@@ -6019,6 +6038,11 @@ pub fn spawn_render_thread(
                             &rig.csg_host,
                             &mut rig.ias_instances_scratch,
                             &ias_state,
+                            rig.csg_host.semantic_hidden(),
+                            // A filter-only change keeps the instance list: UPDATE in place.
+                            classic_changed
+                                || !filter_changed
+                                || matches!(csg_sync, CsgSyncResult::FullRepack),
                         );
                         match built {
                             Ok(classic) => {
@@ -6516,7 +6540,9 @@ pub fn spawn_render_thread(
                     classic_motion: rig.classic_motion_buf.cu_deviceptr(),
                     pick_record: pick_rig.as_ref().map_or(0, |p| p.record.cu_deviceptr()),
                     is_counters: if count_is { is_rig.as_ref().map_or(0, |c| c.words.cu_deviceptr()) } else { 0 },
-                    hidden_semantics: settings.hidden_semantics,
+                    // The mask the IAS visibility masks and the partial bitset were built for.
+                    hidden_semantics: csg_ptrs.hidden_semantics,
+                    csg_sem_partial: csg_ptrs.sem_partial,
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -7246,7 +7272,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 672);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 680);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);

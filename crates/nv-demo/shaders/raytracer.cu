@@ -106,9 +106,11 @@ struct Params {
     unsigned long long pick_record;      // device ptr to one NvPickRecord, written for `pick_px` (0 = none)
     unsigned long long is_counters;      // device ptr to u64[NV_IS_GROUPS * NV_IS_STRIPES]; 0 = counting off (uniform per launch)
     unsigned long long hidden_semantics; // bit s set = semantic id s is not rendered (semantic_filter.rs); 0 = all shown
+    unsigned long long csg_sem_partial;  // device u32 bitset over CSG instance slots: bit set = partially hidden (per-hit reject); 0 = all partial
 };
 
-static_assert(sizeof(Params) == 672, "Params size must match LaunchParams (672 B)");
+static_assert(sizeof(Params) == 680, "Params size must match LaunchParams (680 B)");
+static_assert(__builtin_offsetof(Params, csg_sem_partial) == 672, "Params::csg_sem_partial offset must be 672");
 static_assert(__builtin_offsetof(Params, hidden_semantics) == 664, "Params::hidden_semantics offset must be 664");
 static_assert(__builtin_offsetof(Params, is_counters) == 656, "Params::is_counters offset must be 656");
 static_assert(__builtin_offsetof(Params, pick_px) == 428, "Params::pick_px offset must be 428");
@@ -223,8 +225,28 @@ static __forceinline__ __device__ void nv_is_count_road(unsigned int prim_idx) {
 // reflections too, per part. Mask 0: one uniform branch. csg-rs guarantees ids below 64.
 #define NV_HIDDEN_RETRACE_MAX 8
 
+// Visibility mask of every render ray (camera, bounce, shadow, probe, SDG). Bit 0x80 is reserved
+// for csg-rs LINES_OCCLUDER rays (semantic_filter.rs LINES_OCCLUDER_MASK): an instance hidden by
+// the category filter keeps only that bit, so render rays never traverse it.
+#define NV_RENDER_RAY_MASK 0x7Fu
+
 static __forceinline__ __device__ bool nv_sem_hidden(unsigned int sem) {
     return params.hidden_semantics != 0ull && sem < 64u && ((params.hidden_semantics >> sem) & 1ull) != 0ull;
+}
+
+// Category filter fast path (semantic_filter.rs classify). The host sorts every instance by its
+// effective semantic mask M against the hidden mask H: fully hidden instances carry no render
+// bit in their visibility mask (never traversed), unaffected ones (M & H == 0) skip the reject
+// test below, and only partially hidden ones pay the per-hit reject (RPN re-trace, radiance
+// intersector in the shadow programs). Input: params.csg_sem_partial, one bit per CSG instance
+// slot (bit set = partial), or 0 = every slot partial (the host passes 0 when no slot is
+// unaffected, which saves the bitset load). Invariant: inst_idx < params.csg_instance_count,
+// checked by every caller; the bitset covers that many slots. H == 0: one uniform branch.
+static __forceinline__ __device__ bool nv_filter_partial(unsigned int inst_idx) {
+    if (params.hidden_semantics == 0ull) return false;
+    if (params.csg_sem_partial == 0ull) return true;
+    const unsigned int w = __ldg(reinterpret_cast<const unsigned int*>(params.csg_sem_partial) + (inst_idx >> 5u));
+    return ((w >> (inst_idx & 31u)) & 1u) != 0u;
 }
 
 // True for the one raygen thread that answers this launch's pick (uniform `false` otherwise).
@@ -1642,7 +1664,7 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                 break;
             }
             // Exact horizontal wall-tangent projection preserves undistorted brick proportions
-            // on arbitrary-angle OSM streets (e.g. 45-degree SF SoMa Boardman Pl & curved arcs).
+            // on arbitrary-angle OSM streets (e.g. 45-degree SoMa streets and curved arcs).
             float horiz = sqrtf(n.x * n.x + n.z * n.z);
             float tx = (horiz > 1e-4f) ? (-n.z / horiz) : 1.0f;
             float tz = (horiz > 1e-4f) ? ( n.x / horiz) : 0.0f;
@@ -1898,7 +1920,7 @@ static __forceinline__ __device__ void trace_primary(
             (OptixTraversableHandle)params.handle,
             origin, dir,
             tmin, 1e16f, 0.0f,
-            OptixVisibilityMask(255),
+            OptixVisibilityMask(NV_RENDER_RAY_MASK),
             OPTIX_RAY_FLAG_NONE,
             0, 2, 0,
             p0, p1, p2, p3, p4, p5, p6, p7
@@ -1920,7 +1942,7 @@ static __forceinline__ __device__ void trace_primary(
             (OptixTraversableHandle)params.handle,
             origin, dir,
             tmin, 1e16f, 0.0f,
-            OptixVisibilityMask(255),
+            OptixVisibilityMask(NV_RENDER_RAY_MASK),
             OPTIX_RAY_FLAG_NONE,
             0, 2, 0,
             p0, p1, p2, p3, p4, p5, p6, p7
@@ -1935,7 +1957,7 @@ static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, f
         (OptixTraversableHandle)params.handle,
         origin, dir,
         1.0e-5f, max_t, 0.0f,
-        OptixVisibilityMask(255),
+        OptixVisibilityMask(NV_RENDER_RAY_MASK),
         OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
         1, 2, 1,
         hit
@@ -3007,7 +3029,7 @@ extern "C" __global__ void __raygen__score_views() {
         (OptixTraversableHandle)params.handle,
         eye, dir,
         0.05f, 600.0f, 0.0f,
-        OptixVisibilityMask(255),
+        OptixVisibilityMask(NV_RENDER_RAY_MASK),
         OPTIX_RAY_FLAG_NONE,
         0, 2, 0,
         p0, p1, p2, p3, p4, p5, p6, p7
@@ -3064,7 +3086,7 @@ extern "C" __global__ void __raygen__sdg_keypoints() {
         (OptixTraversableHandle)params.handle,
         orig, dir,
         tmin, tmax, 0.0f,
-        OptixVisibilityMask(255),
+        OptixVisibilityMask(NV_RENDER_RAY_MASK),
         OPTIX_RAY_FLAG_NONE,
         0, 2, 0,
         p0, p1, p2, p3, p4, p5, p6, p7
@@ -3404,7 +3426,8 @@ extern "C" __global__ void __intersection__csg() {
 
     // Pass CsgSceneView by value and return CsgHit by value (zero &view/&hit .local spills),
     // skipping redundant compound AABB test already performed by OptiX BVH hardware.
-    CsgHit hit = (params.hidden_semantics != 0ull)
+    const bool filt = nv_filter_partial(inst_idx);
+    CsgHit hit = filt
         ? nv_csg_trace_visible(compound_id, flags, orig, dir, tmin, tmax)
         : csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, tmin, tmax, true);
     if (hit.t >= 0.0f) {
@@ -3414,7 +3437,7 @@ extern "C" __global__ void __intersection__csg() {
         // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
         // shared actor bone compound drawn as a pedestrian or as an animal.
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
-        if (nv_sem_hidden(sem_id)) return;
+        if (filt && nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3448,7 +3471,7 @@ extern "C" __global__ void __intersection__csg_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
-    if (params.hidden_semantics != 0ull) {
+    if (nv_filter_partial(inst_idx)) {
         if (nv_csg_trace_visible(compound_id, flags, orig, dir, tmin, tmax).t >= 0.0f) {
             optixReportIntersection(tmin, 0u);
         }
@@ -3492,7 +3515,7 @@ extern "C" __global__ void __intersection__csg_prim() {
         // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
         // shared actor bone compound drawn as a pedestrian or as an animal.
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
-        if (nv_sem_hidden(sem_id)) return;
+        if (nv_filter_partial(inst_idx) && nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3526,7 +3549,7 @@ extern "C" __global__ void __intersection__csg_prim_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
-    if (params.hidden_semantics != 0ull) {
+    if (nv_filter_partial(inst_idx)) {
         // The shadow test has no class; take the radiance intersector to see the hit's class.
         CsgHit h = csg_intersect_prim_idx(
             reinterpret_cast<const CsgGpuPrim*>(params.csg_prims),
@@ -3578,7 +3601,7 @@ extern "C" __global__ void __intersection__csg_union_part() {
             ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
-        if (nv_sem_hidden(sem_id)) return;
+        if (nv_filter_partial(inst_idx) && nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3612,7 +3635,7 @@ extern "C" __global__ void __intersection__csg_union_part_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
-    if (params.hidden_semantics != 0ull) {
+    if (nv_filter_partial(inst_idx)) {
         CsgHit h = csg_union_part_hit(make_csg_view(), compound_id, optixGetPrimitiveIndex(), orig, dir, tmin, tmax);
         if (h.t >= 0.0f && !nv_sem_hidden(csg_instance_semantic(flags, h.sem_id))) {
             optixReportIntersection(tmin, 0u);

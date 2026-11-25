@@ -8,6 +8,10 @@
 //! steady-state GPU buffer reallocations, and synthesizes exact-CSG random rails on demand.
 //! Why: keeps `nv-demo` completely decoupled from scene-specific coordinates, presets, or rails
 //! while delivering smooth frame times across 10k-100k+ CSG instances.
+//! Category filter: the host also owns the per-instance filter state of the viewport eye dropdown
+//! (`apply_semantic_filter`: IAS visibility masks of fully hidden instances and the device bitset
+//! of partially hidden ones, see `crate::semantic_filter`), recomputed only when the hidden mask
+//! or the packed instances change.
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
 use std::collections::{HashMap, VecDeque};
@@ -45,6 +49,7 @@ use csg_scene::{
 use crate::app_events::PossessInfo;
 use crate::cuda_crowd::CrowdLodParams;
 use crate::renderer::{CameraFrame, CameraProjection};
+use crate::semantic_filter as sf;
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
 /// paired with shadow hit group `CSG_SBT_OFFSET + 1` under `SBT_STRIDE = 2`).
@@ -460,6 +465,12 @@ pub struct CsgDevicePointers {
     /// Compounds `0..gas_count` own an OptiX GAS; an instance of any other compound is in the
     /// IAS with visibilityMask 0 (`optix_slot_gas`), so device-side overlays skip it too.
     pub gas_count: u32,
+    /// Hidden-semantics mask the IAS and `sem_partial` were built for (`LaunchParams::
+    /// hidden_semantics` of launches that trace the live IAS, so they agree with its masks).
+    pub hidden_semantics: u64,
+    /// Device partial bitset over the instance slots (`semantic_filter::fill_partial_bits`);
+    /// 0 = every instance partial (per-hit reject).
+    pub sem_partial: u64,
 }
 
 /// Structural configuration key that triggers a full `WorldScene` + GAS rebuild.
@@ -1167,6 +1178,17 @@ pub struct CsgGpuHost {
     materials_buf: GrowDeviceBuffer<GpuMaterial>,
     instances_buf: GrowDeviceBuffer<GpuInstance>,
     prev_xforms_buf: GrowDeviceBuffer<[f32; 12]>,
+    /// Hidden-semantics mask the IAS visibility masks and `sem_partial_buf` describe
+    /// (viewport category filter, [`Self::apply_semantic_filter`]).
+    sem_hidden: u64,
+    /// The packed instances changed since `sem_partial_buf` was filled (recomputed lazily, only
+    /// while something is hidden).
+    sem_partial_stale: bool,
+    /// Host copy of the partial bitset (`semantic_filter::fill_partial_bits`), reused.
+    sem_partial_host: Vec<u32>,
+    /// Device partial bitset; empty (device pointer 0 = every instance partial) when no slot is
+    /// unaffected, so the intersection programs skip the bitset load entirely.
+    sem_partial_buf: GrowDeviceBuffer<u32>,
     pinned_staging: Option<PinnedStagingBuffer>,
     pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
@@ -1226,6 +1248,10 @@ impl CsgGpuHost {
             materials_buf: GrowDeviceBuffer::default(),
             instances_buf: GrowDeviceBuffer::default(),
             prev_xforms_buf: GrowDeviceBuffer::default(),
+            sem_hidden: 0,
+            sem_partial_stale: true,
+            sem_partial_host: Vec::new(),
+            sem_partial_buf: GrowDeviceBuffer::default(),
             pinned_staging: None,
             pinned_prev_staging: None,
             prev_packed_len: 0,
@@ -1677,6 +1703,7 @@ impl CsgGpuHost {
         };
         scene.world.pack_all(cam_pos, &mut self.packed);
         self.ias_dirty = true;
+        self.sem_partial_stale = true;
         if upload_gpu {
             self.instances_buf
                 .upload(stream, self.packed.instances_slice())?;
@@ -1933,7 +1960,49 @@ impl CsgGpuHost {
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
             gas_count: self.compound_gases.len() as u32,
+            hidden_semantics: self.sem_hidden,
+            // A stale bitset describes other slots: 0 makes every instance partial (exact).
+            sem_partial: if self.sem_partial_stale { 0 } else { self.sem_partial_buf.device_ptr() },
         }
+    }
+
+    /// Hidden-semantics mask the IAS visibility masks are emitted with
+    /// ([`Self::append_optix_instances`], [`Self::fill_dynamic_optix_instances`]).
+    pub fn semantic_hidden(&self) -> u64 {
+        self.sem_hidden
+    }
+
+    /// Applies the viewport category filter `hidden` (call once per frame after [`Self::sync`]).
+    ///
+    /// Returns `true` when `hidden` changed, so the caller re-emits the IAS instances with the
+    /// new visibility masks (an `UPDATE`, the instance count is unchanged). The device partial
+    /// bitset is refilled only when `hidden` or the packed instances changed and something is
+    /// hidden; with nothing hidden the device never reads it, so there is no work at all.
+    pub fn apply_semantic_filter(&mut self, stream: &Arc<Stream>, hidden: u64) -> Result<bool, String> {
+        let changed = hidden != self.sem_hidden;
+        if changed {
+            self.sem_hidden = hidden;
+            self.sem_partial_stale = true;
+        }
+        if self.sem_partial_stale && hidden != 0 {
+            let uploaded = self.packed.len().min(self.instances_buf.len_elems);
+            let slots = &self.packed.instances_slice()[..uploaded];
+            let partial = crate::semantic_filter::fill_partial_bits(
+                slots.iter().map(|i| i.flags),
+                hidden,
+                &mut self.sem_partial_host,
+            );
+            // Not stale any more even if the upload fails: a failed upload leaves the buffer
+            // empty (pointer 0 = every slot partial, exact), and is not retried every frame.
+            self.sem_partial_stale = false;
+            if partial == uploaded {
+                // Every slot partial: pointer 0 says so without a per-invocation bitset load.
+                self.sem_partial_buf.clear();
+            } else {
+                self.sem_partial_buf.upload(stream, &self.sem_partial_host)?;
+            }
+        }
+        Ok(changed)
     }
 
     /// Advances dynamic 3D Frenet traffic and articulated crowd actors in-place before resolving
@@ -2323,6 +2392,7 @@ impl CsgGpuHost {
                 self.dyn_prev_lods
                     .resize(scene.world.dynamic_instance_count(), PREV_LOD_NONE);
                 self.dyn_prev_lods.fill(PREV_LOD_NONE);
+                self.sem_partial_stale = true;
                 CsgSyncResult::FullRepack
             };
 
@@ -2368,11 +2438,15 @@ impl CsgGpuHost {
 
     /// Fills `out_instances` with ONLY the leading `dynamic_count` moving CSG instances (`0..D`),
     /// avoiding a full 50k+ static instance rebuild on `CsgSyncResult::TrafficOnly` frames.
+    ///
+    /// Visibility masks follow the category filter [`Self::semantic_hidden`] (a fully hidden
+    /// instance leaves every render ray), as in [`Self::append_optix_instances`].
     pub fn fill_dynamic_optix_instances(
         &self,
         dynamic_count: usize,
         out_instances: &mut Vec<Instance>,
     ) {
+        let hidden = self.sem_hidden;
         out_instances.clear();
         if !self.is_active() {
             return;
@@ -2390,9 +2464,11 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
-            if !visible {
-                inst.mask = 0;
-            }
+            inst.mask = if visible {
+                sf::visibility_mask(inst.mask, sf::classify(sf::instance_semantic_mask(gpu_inst.flags), hidden))
+            } else {
+                0
+            };
             inst.id = idx as u32;
             inst.sbt_offset = self
                 .compound_sbt_offsets
@@ -2413,7 +2489,10 @@ impl CsgGpuHost {
     /// compounds to `CSG_SBT_UNION_OFFSET` (`12`), and general RPN compounds
     /// to `CSG_SBT_OFFSET` (`8`). Only instances present in `instances_buf` are appended, so a
     /// failed upload never leaves IAS instances indexing missing `csg_instances` entries.
-    pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>) {
+    /// Visibility masks follow the category filter `hidden` (`semantic_filter::classify`): the
+    /// live IAS passes [`Self::semantic_hidden`], the city-wide probe IAS passes 0 (it scores
+    /// every class, like its launch).
+    pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>, hidden: u64) {
         if !self.is_active() {
             return;
         }
@@ -2430,9 +2509,11 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
-            if !visible {
-                inst.mask = 0;
-            }
+            inst.mask = if visible {
+                sf::visibility_mask(inst.mask, sf::classify(sf::instance_semantic_mask(gpu_inst.flags), hidden))
+            } else {
+                0
+            };
             inst.id = idx as u32;
             inst.sbt_offset = self
                 .compound_sbt_offsets
@@ -2512,6 +2593,7 @@ impl CsgGpuHost {
         self.materials_buf.clear();
         self.instances_buf.clear();
         self.prev_xforms_buf.clear();
+        self.sem_partial_stale = true;
         self.prev_packed_len = 0;
         self.prev_dyn_sig.clear();
         self.prev_non_crowd_dyn_count = 0;

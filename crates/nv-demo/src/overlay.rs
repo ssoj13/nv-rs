@@ -189,8 +189,10 @@ pub struct GpuOverlayCamera {
     /// 1 = Selected scope: only records whose `inst_id` is in the selection table are drawn
     /// (an empty selection draws nothing), 0 = no selection filter.
     pub scope_selected: u32,
-    /// Keeps the record at 80 bytes (16-byte multiple).
-    pub pad: f32,
+    /// Part-level LOD of the object axes ([`OverlayFilter::axes_min_px`]): a packed part's triad
+    /// is drawn only when the part's own projected bounds reach this size (the former pad word,
+    /// so the record stays 80 bytes).
+    pub axes_min_px: f32,
 }
 const _: () = assert!(std::mem::size_of::<GpuOverlayCamera>() == 80);
 
@@ -301,6 +303,11 @@ pub struct OverlayFilter {
     pub temporal: bool,
     /// Object axis length in screen pixels, constant at any distance (a gizmo, not geometry).
     pub axis_px: f32,
+    /// Part-level LOD of the object axes: a packed part's triad is drawn only when the part's
+    /// own projected bounding-sphere diameter reaches this many pixels (it fades in up to three
+    /// times that). Why: axes are per packed part until csg-rs P42 groups parts into objects;
+    /// without this, street-level views show a wall of triads on kerbs, walls and fences.
+    pub axes_min_px: f32,
 }
 
 impl Default for OverlayFilter {
@@ -314,6 +321,7 @@ impl Default for OverlayFilter {
             min_screen_px: 2.0,
             temporal: true,
             axis_px: AXIS_PX_DEFAULT,
+            axes_min_px: AXES_MIN_PX_DEFAULT,
         }
     }
 }
@@ -365,6 +373,10 @@ struct Polyline {
 
 /// Default [`OverlayFilter::axis_px`].
 pub const AXIS_PX_DEFAULT: f32 = 40.0;
+/// Default [`OverlayFilter::axes_min_px`] (chosen on `gundo` street level, see AGENTS.md).
+pub const AXES_MIN_PX_DEFAULT: f32 = 96.0;
+/// Range of [`OverlayFilter::axes_min_px`] (toolbar drag value).
+pub const AXES_MIN_PX_RANGE: std::ops::RangeInclusive<f32> = 0.0..=1000.0;
 /// Range of [`OverlayFilter::axis_px`] (toolbar drag value and the provider clamp).
 pub const AXIS_PX_RANGE: std::ops::RangeInclusive<f32> = 8.0..=200.0;
 
@@ -749,7 +761,7 @@ pub fn axes_emit(
     } else {
         2.0 * rad * height as f32 / (2.0 * cam.tan_half_fov.max(1e-4) * z.max(1e-3))
     };
-    if !selected && proj_px < min_px {
+    if !selected && axes_lod_px(proj_px, min_px, cam.axes_min_px).is_none() {
         return None;
     }
     let len = axis_px * 2.0 * cam.tan_half_fov * zo / height.max(1) as f32;
@@ -765,9 +777,40 @@ pub fn axes_emit(
     Some(AxesEmit { origin, ends, proj_px })
 }
 
+/// CPU mirror of the part-level axes LOD of `ovl_axes`: `None` when a part whose bounds
+/// project to `proj_px` is below `max(min_px, axes_min_px)`, else the record size handed to the
+/// shared line-LOD fade (rescaled so the fade spans `[axes_min, 3 axes_min]`). Test-only.
+#[cfg(test)]
+pub fn axes_lod_px(proj_px: f32, min_px: f32, axes_min_px: f32) -> Option<f32> {
+    let axes_min = min_px.max(axes_min_px);
+    if proj_px < axes_min {
+        return None;
+    }
+    Some(if min_px > 0.0 && axes_min > min_px { proj_px * (min_px / axes_min) } else { proj_px })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn axes_part_lod_threshold_and_fade_window() {
+        // Below the axes threshold: culled, even when above the line LOD.
+        assert_eq!(axes_lod_px(50.0, 2.0, 96.0), None);
+        // At the threshold the rescaled size sits at the start of the shared fade (min_px) ...
+        assert_eq!(axes_lod_px(96.0, 2.0, 96.0), Some(2.0));
+        // ... and at three times the threshold at its end (3 * min_px): fully drawn.
+        assert_eq!(axes_lod_px(288.0, 2.0, 96.0), Some(6.0));
+        // No axes threshold: the line LOD alone, size unchanged.
+        assert_eq!(axes_lod_px(50.0, 2.0, 0.0), Some(50.0));
+        assert_eq!(axes_lod_px(1.0, 2.0, 0.0), None);
+        // Line LOD off: cull at the axes threshold, no fade rescale.
+        assert_eq!(axes_lod_px(120.0, 0.0, 96.0), Some(120.0));
+        let tonemap = include_str!("../shaders/tonemap.cu");
+        assert!(tonemap.contains("const float axes_min = fmaxf(c.min_px, c.axes_min_px);"));
+        assert!(tonemap.contains("proj_px * (c.min_px / axes_min)"));
+        assert_eq!(OverlayFilter::default().axes_min_px, AXES_MIN_PX_DEFAULT);
+    }
 
     fn ctx(projection: CameraProjection) -> OverlayCtx<'static> {
         OverlayCtx {
@@ -923,7 +966,7 @@ mod tests {
             radius: 0.0,
             min_px: 2.0,
             scope_selected: 0,
-            pad: 0.0,
+            axes_min_px: 0.0,
         }
     }
 

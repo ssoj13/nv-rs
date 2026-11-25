@@ -3537,7 +3537,7 @@ fn run_overlay(
         radius: if f.filter.scope == ov::OverlayScope::WithinRadius { f.filter.radius_m } else { 0.0 },
         min_px: f.filter.min_screen_px,
         scope_selected: u32::from(f.filter.scope == ov::OverlayScope::Selected),
-        pad: 0.0,
+        axes_min_px: f.filter.axes_min_px.clamp(*ov::AXES_MIN_PX_RANGE.start(), *ov::AXES_MIN_PX_RANGE.end()),
     };
     // SAFETY: the staging block holds `OverlayStaging::BYTES` (styles, camera, CPU segments,
     // counter); `n_styles <= MAX_STYLES`, `n_cpu <= OVERLAY_CPU_SEG_MAX`; the previous frame's

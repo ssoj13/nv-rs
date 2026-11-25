@@ -304,7 +304,7 @@ struct OvlCamera {
     float radius;                // WithinRadius scope (view depth / distance), <= 0 = off
     float min_px;                // line LOD: records whose proj_size_px is below this are not drawn
     unsigned int scope_selected; // 1 = draw only records whose inst_id is in the selection table
-    float pad;
+    float axes_min_px;           // part-level axes LOD: a part's triad needs this projected size (ovl_axes)
 };
 
 #define OVL_DEPTH_ALWAYS 0u
@@ -575,7 +575,8 @@ extern "C" __global__ void ovl_composite(
 //           (ground / water planes have no meaningful frame), the Selected scope's non-members,
 //           the WithinRadius scope's far origins, and non-pinhole lenses (UNPROJECTABLE fault);
 //   cull    origin within OVL_AXES_NEAR of the eye plane, bounding sphere outside the frustum,
-//           or smaller than `min_px` on screen (the selection is never size-culled);
+//           or smaller than max(`min_px`, `axes_min_px`) on screen (part-level axes LOD; the
+//           selection is never size-culled);
 //   emit    X / Y / Z from the origin along the normalised transform columns, length
 //           `axis_px * 2 tan(fov/2) z / height` (constant on screen), SCREEN_CONSTANT_WIDTH, the
 //           SELECTED flag for selection members, plus the 12 oriented-box edges of a selected
@@ -686,7 +687,13 @@ extern "C" __global__ void ovl_axes(
     const float proj_px = (dist <= rad)
         ? INFINITY
         : 2.0f * rad * (float)height / (2.0f * fmaxf(c.tan_half_fov, 1e-4f) * fmaxf(pz, 1e-3f));
-    if (!selected && proj_px < c.min_px) return;
+    // Part-level LOD (overlay::axes_lod): axes are per packed part until csg-rs P42 groups parts
+    // into objects, so a part's triad needs its own projected size >= axes_min_px (else a wall of
+    // triads on kerbs and walls). The record size is rescaled so the shared line-LOD fade of
+    // ovl_splat ([min_px, 3 min_px]) fades the triad in over [axes_min, 3 axes_min].
+    const float axes_min = fmaxf(c.min_px, c.axes_min_px);
+    if (!selected && proj_px < axes_min) return;
+    const float lod_px = (c.min_px > 0.0f && axes_min > c.min_px) ? proj_px * (c.min_px / axes_min) : proj_px;
 
     const unsigned int sflags = NV_OVERLAY_FLAG_WORLD | NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH
         | (selected ? NV_OVERLAY_FLAG_SELECTED : 0u);
@@ -698,7 +705,7 @@ extern "C" __global__ void ovl_axes(
         if (n <= 1e-8f) continue;
         const float s = len / n;
         ovl_push_world(segs, counter, cap, o, make_float3(o.x + col.x * s, o.y + col.y * s, o.z + col.z * s),
-                       sflags, NV_OVERLAY_CLASS_AXIS, key, styles[k], proj_px);
+                       sflags, NV_OVERLAY_CLASS_AXIS, key, styles[k], lod_px);
     }
     if (!selected) return;
     // Selection highlight: the 12 edges of the instance's oriented local bounds.

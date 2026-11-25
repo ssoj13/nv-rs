@@ -1051,6 +1051,17 @@ impl UiContext<'_> {
                                 .suffix(" px"),
                         )
                         .on_hover_text("Object axis length on screen (constant at any distance)");
+                        ui.add(
+                            egui::DragValue::new(&mut ov.axes_min_px)
+                                .range(crate::overlay::AXES_MIN_PX_RANGE)
+                                .speed(1.0)
+                                .prefix("LOD ")
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "Axes LOD: a part's axes are drawn only when the part itself spans at least this \
+                             many pixels on screen (they fade in up to 3x); the selection always shows",
+                        );
                     }
                     if ov.scope == OverlayScope::WithinRadius {
                         ui.add(egui::DragValue::new(&mut ov.radius_m).range(1.0..=5000.0).speed(1.0).suffix(" m"))

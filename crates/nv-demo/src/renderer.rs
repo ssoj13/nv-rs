@@ -1171,9 +1171,6 @@ pub struct FrameReady {
     pub crowd_actor_count: u32,
     /// The frame's timings and launch state, the same sample the perf CSV records.
     pub perf: crate::perf_log::PerfSample,
-    /// Intersection counts of the latest counted launch, sent once when they arrive (the launch
-    /// before this frame); `None` on frames without fresh counts (`is_counters.rs`).
-    pub is_counts: Option<crate::is_counters::IsCounts>,
 }
 
 struct TonemapKernel {
@@ -5431,12 +5428,12 @@ pub fn spawn_render_thread(
                                         let changed = selection.click(hit, add);
                                         let active = hit.map(|_| rig.csg_host.describe_pick(&rec));
                                         if changed || active.is_some() {
-                                            bus.emit_render_event(RenderEvent::SelectionChanged(
+                                            bus.emit_render_event(RenderEvent::SelectionChanged(Box::new(
                                                 crate::pick::SelectionInfo {
                                                     keys: selection.keys().to_vec(),
                                                     active,
                                                 },
-                                            ));
+                                            )));
                                         }
                                     }
                                     crate::pick::PickAction::Possess if rec.is_hit() && rec.is_csg() => {
@@ -5456,12 +5453,12 @@ pub fn spawn_render_thread(
                                                 emit_possess_status(&bus, &info);
                                                 bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
                                                 selection.select_only(rec.inst_id);
-                                                bus.emit_render_event(RenderEvent::SelectionChanged(
+                                                bus.emit_render_event(RenderEvent::SelectionChanged(Box::new(
                                                     crate::pick::SelectionInfo {
                                                         keys: selection.keys().to_vec(),
                                                         active: Some(rig.csg_host.describe_pick(&rec)),
                                                     },
-                                                ));
+                                                )));
                                             }
                                             Err(e) => bus.emit_render_event(RenderEvent::StatusMessage(e)),
                                         }
@@ -5849,9 +5846,7 @@ pub fn spawn_render_thread(
                     // Selection keys and queued clicks belong to the old scene.
                     pick.reset();
                     if selection.clear() {
-                        bus.emit_render_event(RenderEvent::SelectionChanged(
-                            crate::pick::SelectionInfo::default(),
-                        ));
+                        bus.emit_render_event(RenderEvent::SelectionChanged(Box::default()));
                     }
                 }
                 if building_scene {
@@ -7144,6 +7139,11 @@ pub fn spawn_render_thread(
                     }
                 }
 
+                // Counts of the previous counted launch go out right before this frame's
+                // `FrameReady`, so the UI pairs them with it (`is_counters.rs`).
+                if let Some(counts) = fresh_is_counts.take() {
+                    bus.emit_render_event(RenderEvent::IsCounts(counts));
+                }
                 bus.emit_render_event(RenderEvent::FrameReady(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
@@ -7164,7 +7164,6 @@ pub fn spawn_render_thread(
                     crowd_active_backend: last_crowd_backend,
                     crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
                     perf: perf_sample,
-                    is_counts: fresh_is_counts.take(),
                 }));
             }
         })

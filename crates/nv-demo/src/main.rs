@@ -3687,6 +3687,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
             let mut scene_rails_updated = false;
+            // Counts arrive in their own event just before the FrameReady they belong to.
+            let mut frame_is_counts: Option<crate::is_counters::IsCounts> = None;
             let mut bench_frame: Option<(f32, crate::perf_log::PerfState, Option<crate::is_counters::IsCounts>)> = None;
             let mut perf_log_written: Option<Result<std::path::PathBuf, String>> = None;
             let mut fatal_reason: Option<String> = None;
@@ -3730,12 +3732,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.crowd_active_backend = msg.crowd_active_backend;
                         self.crowd_actor_count = msg.crowd_actor_count;
                         self.fast_preview = msg.fast_preview;
-                        if msg.is_counts.is_some() {
-                            self.is_counts = msg.is_counts;
+                        let is_counts = frame_is_counts.take();
+                        if is_counts.is_some() {
+                            self.is_counts = is_counts;
                         }
                         // Lockstep (the only mode a views run uses) has one frame in flight, so
                         // at most one FrameReady arrives per UI frame.
-                        bench_frame = Some((msg.perf.rt_ms, msg.perf.state, msg.is_counts));
+                        bench_frame = Some((msg.perf.rt_ms, msg.perf.state, is_counts));
                         self.engine_phase = crate::app_events::EnginePhase::Rendering;
                         self.last_possess_camera = msg.possess_camera;
                         self.last_rendered_camera = msg.rendered_camera;
@@ -3814,6 +3817,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.camera_rail.push_generated_rail(rail_spec.clone());
                         self.rail_blend_remaining = RAIL_BLEND_SECS;
                     }
+                    RenderEvent::IsCounts(c) => frame_is_counts = Some(*c),
                     RenderEvent::SelectionChanged(sel) => {
                         self.last_saved_msg = Some(crate::pick::selection_status(sel));
                     }

@@ -28,9 +28,9 @@
 //! - **Projections**: world-space CPU primitives are projected with the pinhole camera; with
 //!   another lens they are not drawn and [`OverlayList::status`] says so (no silently wrong
 //!   lines). Screen-space primitives and GPU sources work with every lens.
-//! - **Picking** (later wave): the mouse pixel goes up with the launch parameters and the
-//!   primary launch writes a 32 B `{inst_id, part_id, t, world_pos}` record that is read back
-//!   asynchronously; the overlay's selected scope will key on that id.
+//! - **Selection** (`crate::pick`): the primary launch writes a 32 B pick record for a clicked
+//!   pixel; the resulting selection keys go up as a small device table that the Selected scope
+//!   and the GPU providers' highlight read.
 
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};

@@ -253,8 +253,11 @@ pub enum RenderEvent {
     RailGenerated(RailSpec),
     /// Active possessed body or mount changed (`None` = ejected to free camera).
     PossessChanged(Option<PossessInfo>),
-    /// The viewport selection changed (GPU pick or scene switch).
-    SelectionChanged(crate::pick::SelectionInfo),
+    /// Intersection counts of the latest counted launch (`crate::is_counters`), sent once when
+    /// they arrive, immediately before the `FrameReady` of the frame that read them back.
+    IsCounts(crate::is_counters::IsCounts),
+    /// The viewport selection changed (GPU pick or scene switch); boxed, it carries strings.
+    SelectionChanged(Box<crate::pick::SelectionInfo>),
     /// A `Smart View` scoring run selected a top viewpoint.
     SmartViewReady(SmartViewResult),
     /// Render worker transitioned between compile/build/IAS/rendering phases.

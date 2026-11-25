@@ -4792,7 +4792,7 @@ pub fn spawn_render_thread(
             let mut possess_free_pitch = init_snap.possess_free_pitch;
             let mut possess_auto_level = init_snap.possess_auto_level;
             let mut possess_zoom_offset = init_snap.possess_zoom_offset;
-            let mut possess_damper = crate::camera_rail::CameraDamper::default();
+            let mut possess_damper = crate::flight::CameraDamper::default();
             possess_damper.snap(camera_frame_to_core_pose(camera));
             let mut possess_blend_rem: f32 = 0.0;
             let mut last_rendered_camera = camera;
@@ -5109,20 +5109,6 @@ pub fn spawn_render_thread(
                                 possess_zoom_offset: *p_zoom,
                             });
                         }
-                        RenderControl::GenerateRandomRail { seed } => {
-                            match rig.csg_host.generate_random_rail(*seed) {
-                                Ok(rail) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                        "Generated rail: {}",
-                                        rail.label
-                                    )));
-                                    bus.emit_render_event(RenderEvent::RailGenerated(rail));
-                                }
-                                Err(e) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
-                                }
-                            }
-                        }
                         RenderControl::Pick(req) => pick.request(*req),
                         RenderControl::PossessNextVehicle => {
                             if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
@@ -5235,90 +5221,6 @@ pub fn spawn_render_thread(
                                             ));
                                         }
                                     }
-                                }
-                            }
-                        }
-                        RenderControl::RunSmartRail { seed, backend } => {
-                            let t0 = Instant::now();
-                            match rig.csg_host.build_smart_rail_candidates(*seed) {
-                                Err(e) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
-                                }
-                                Ok(mut rails) if !rails.is_empty() => {
-                                    const SAMPLES_PER_RAIL: usize = 8;
-                                    let mut cands =
-                                        Vec::with_capacity(rails.len() * SAMPLES_PER_RAIL);
-                                    for rail in &rails {
-                                        let compiled = rail.compile();
-                                        for s_idx in 0..SAMPLES_PER_RAIL {
-                                            let u = (s_idx as f32 + 0.5) / SAMPLES_PER_RAIL as f32;
-                                            let sample = compiled.eval_at_fraction(u);
-                                            cands.push(ViewCandidate {
-                                                eye: sample.eye,
-                                                forward: sample.forward,
-                                                up: sample.up,
-                                                vfov_deg: sample.vfov_deg,
-                                                target_sem: None,
-                                            });
-                                        }
-                                    }
-                                    match score_views_on_rig(&mut rig, *backend, &cands, 16, 12) {
-                                        Ok(scores) => {
-                                            let mut best_rail_idx = 0usize;
-                                            let mut best_avg = -1.0f32;
-                                            let mut used_backend = ProbeBackendKind::Cpu;
-                                            for (ri, chunk) in
-                                                scores.chunks(SAMPLES_PER_RAIL).enumerate()
-                                            {
-                                                if ri >= rails.len() || chunk.is_empty() {
-                                                    break;
-                                                }
-                                                used_backend = chunk[0].backend;
-                                                let avg =
-                                                    chunk.iter().map(|s| s.composite).sum::<f32>()
-                                                        / chunk.len() as f32;
-                                                if avg > best_avg {
-                                                    best_avg = avg;
-                                                    best_rail_idx = ri;
-                                                }
-                                            }
-                                            if rig.csg_host.eject_possess() {
-                                                bus.emit_render_event(
-                                                    RenderEvent::PossessChanged(None),
-                                                );
-                                            }
-                                            let mut winner = rails.swap_remove(best_rail_idx);
-                                            winner.label = format!(
-                                                "{} ({:.2})",
-                                                winner.label,
-                                                best_avg.max(0.0)
-                                            );
-                                            let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                                            bus.emit_render_event(RenderEvent::StatusMessage(
-                                                format!(
-                                                    "Smart Rail ({}): avg {:.2} across {} rails in {:.1} ms",
-                                                    used_backend.label(),
-                                                    best_avg.max(0.0),
-                                                    scores.len() / SAMPLES_PER_RAIL,
-                                                    elapsed_ms
-                                                ),
-                                            ));
-                                            bus.emit_render_event(RenderEvent::RailGenerated(
-                                                winner,
-                                            ));
-                                            accum_count = 0;
-                                        }
-                                        Err(e) => {
-                                            bus.emit_render_event(RenderEvent::StatusMessage(
-                                                format!("Smart Rail scoring failed: {e}"),
-                                            ));
-                                        }
-                                    }
-                                }
-                                Ok(_) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(
-                                        "Smart Rail generated zero verified candidates".to_string(),
-                                    ));
                                 }
                             }
                         }
@@ -7249,7 +7151,7 @@ pub fn spawn_render_thread(
                 if let Some(counts) = fresh_is_counts.take() {
                     bus.emit_render_event(RenderEvent::IsCounts(counts));
                 }
-                bus.emit_render_event(RenderEvent::FrameReady(FrameReady {
+                bus.emit_render_event(RenderEvent::FrameReady(Box::new(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
                     accum_count,
@@ -7269,7 +7171,7 @@ pub fn spawn_render_thread(
                     crowd_active_backend: last_crowd_backend,
                     crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
                     perf: perf_sample,
-                }));
+                })));
             }
         })
         .expect("spawn optix-render thread")

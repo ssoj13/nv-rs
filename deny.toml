@@ -33,6 +33,7 @@ exceptions = [
     # Private, unpublished ssoj13 crates (git dependencies, no `license` field): proprietary.
     { crate = "flex-geom", allow = ["LicenseRef-Proprietary"] },
     { crate = "nodes-core", allow = ["LicenseRef-Proprietary"] },
+    { crate = "sl-config", allow = ["LicenseRef-Proprietary"] },
     { crate = "ui-theme", allow = ["LicenseRef-Proprietary"] },
 ]
 
@@ -44,6 +45,11 @@ license-files = []
 
 [[licenses.clarify]]
 crate = "nodes-core"
+expression = "LicenseRef-Proprietary"
+license-files = []
+
+[[licenses.clarify]]
+crate = "sl-config"
 expression = "LicenseRef-Proprietary"
 license-files = []
 
@@ -73,11 +79,14 @@ allow-git = [
     "ssh://git@github.com/ssoj13/appbus-rs.git",
     "ssh://git@github.com/ssoj13/box-rs.git",
     "ssh://git@github.com/ssoj13/byte-cache-rs.git",
+    "ssh://git@github.com/ssoj13/camera-guide-rs.git",
     "ssh://git@github.com/ssoj13/camera-rs.git",
     "ssh://git@github.com/ssoj13/codec-simd-rs.git",
     "ssh://git@github.com/ssoj13/crashdump-rs.git",
     "ssh://git@github.com/ssoj13/csg-rs.git",
+    "ssh://git@github.com/ssoj13/egui-widgets-rs.git",
     "ssh://git@github.com/ssoj13/exr-rs.git",
+    "ssh://git@github.com/ssoj13/flight-navigator-rs.git",
     "ssh://git@github.com/ssoj13/fsio-rs.git",
     "ssh://git@github.com/ssoj13/graph-layout-rs.git",
     "ssh://git@github.com/ssoj13/jph-rs.git",

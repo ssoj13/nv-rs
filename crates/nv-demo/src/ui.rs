@@ -13,7 +13,6 @@ use egui_phosphor::regular as ic;
 use crate::app_events::{
     AppBus, EnginePhase, PossessInfo, SmartViewResult, StillFormat, UiCommand,
 };
-use crate::camera_rail::CameraRail;
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
@@ -330,23 +329,29 @@ pub enum DockTab {
     Fractal,
     RenderFloor,
     CameraStats,
+    FlightLab,
+    FlightPlayer,
 }
 
 impl DockTab {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Viewport,
         Self::Fractal,
         Self::RenderFloor,
         Self::CameraStats,
+        Self::FlightLab,
+        Self::FlightPlayer,
     ];
 
     pub fn title(self) -> &'static str {
-        static TITLES: LazyLock<[String; 4]> = LazyLock::new(|| {
+        static TITLES: LazyLock<[String; 6]> = LazyLock::new(|| {
             [
                 format!("{}  Viewport", ic::APERTURE),
                 format!("{}  Fractal", ic::CUBE),
                 format!("{}  Render & Floor", ic::SUN),
                 format!("{}  Camera & Stats", ic::GAUGE),
+                format!("{}  Flight Lab", ic::FILM_SLATE),
+                format!("{}  Player", ic::PLAYLIST),
             ]
         });
         let idx = match self {
@@ -354,6 +359,8 @@ impl DockTab {
             Self::Fractal => 1,
             Self::RenderFloor => 2,
             Self::CameraStats => 3,
+            Self::FlightLab => 4,
+            Self::FlightPlayer => 5,
         };
         TITLES[idx].as_str()
     }
@@ -374,7 +381,11 @@ pub fn install_fonts(ctx: &egui::Context) {
 pub fn default_dock_state() -> DockState<DockTab> {
     let mut state = DockState::new(vec![DockTab::Viewport]);
     let surface = state.main_surface_mut();
-    let [vp, _left] = surface.split_left(NodeIndex::root(), 0.17, vec![DockTab::CameraStats]);
+    let [vp, _left] = surface.split_left(
+        NodeIndex::root(),
+        0.17,
+        vec![DockTab::CameraStats, DockTab::FlightPlayer, DockTab::FlightLab],
+    );
     let [_vp, right] = surface.split_right(vp, 0.70, vec![DockTab::Fractal]);
     let [_top, _bot] = surface.split_below(right, 0.41, vec![DockTab::RenderFloor]);
     state
@@ -541,7 +552,8 @@ pub struct UiContext<'a> {
     pub cam_driver: &'a mut CameraDriver,
     pub cam_home: CameraPose,
     pub cam_pose: &'a mut CameraPose,
-    pub camera_rail: &'a mut CameraRail,
+    pub flight_workspace: &'a mut crate::flight::FlightWorkspace,
+    pub active_scene_label: &'a str,
     pub cam_fixed_dt: Option<f32>,
     pub last_cam_raw_input: &'a mut Option<camera::input::RawInput>,
     pub scratch: &'a mut UiScratch,
@@ -578,7 +590,6 @@ pub struct UiContext<'a> {
     pub crowd_actor_count: u32,
     pub scene_descriptors: &'a [SceneDescriptor],
     pub scene_viewpoints: &'a [SceneViewpoint],
-    pub rail_random_seed: &'a mut u64,
     pub dlss_rr_available: bool,
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
@@ -618,6 +629,8 @@ impl TabViewer for UiContext<'_> {
             DockTab::Fractal => dock_scroll(ui, |ui| self.ui_fractal(ui)),
             DockTab::RenderFloor => dock_scroll(ui, |ui| self.ui_render_floor(ui)),
             DockTab::CameraStats => dock_scroll(ui, |ui| self.ui_camera_stats(ui)),
+            DockTab::FlightLab => dock_scroll(ui, |ui| self.ui_flight_lab_tab(ui)),
+            DockTab::FlightPlayer => dock_scroll(ui, |ui| self.ui_flight_player_tab(ui)),
         }
     }
 }
@@ -710,7 +723,7 @@ impl UiContext<'_> {
                 .on_hover_text("Reset the camera back to the active scene's default viewpoint (above terrain).")
                 .clicked()
             {
-                self.camera_rail.playing = false;
+                self.flight_workspace.player.pause();
                 let (home_pose, orbit_dist) =
                     resolve_home_pose(self.settings.csg_mode, self.scene_viewpoints, self.cam_home);
                 self.cam_driver.controller_mut().set_pose(home_pose);
@@ -725,7 +738,7 @@ impl UiContext<'_> {
                 .on_hover_text("Automatically zoom and center the camera on the fractal (shortcut: A).")
                 .clicked()
             {
-                self.camera_rail.playing = false;
+                self.flight_workspace.player.pause();
                 let center = glam::Vec3::from_array(self.settings.fractal_translate);
                 let ext = 1.35 * self.settings.obj_scale.clamp(0.05, 50.0);
                 self.cam_driver.controller_mut().apply_intent(
@@ -1413,8 +1426,8 @@ impl UiContext<'_> {
                 }
             }
         } else if !split_dragging && !toolbar_blocking && !pick_clicked && !pick_active {
-            if resp.dragged() && self.camera_rail.playing {
-                self.camera_rail.playing = false;
+            if resp.dragged() && self.flight_workspace.player.is_active() {
+                self.flight_workspace.player.pause();
             }
             let fly_scene_radius = 2.0 * altitude_speed_multiplier(self.cam_pose.eye.y);
             let df = match self.cam_fixed_dt {
@@ -1442,7 +1455,7 @@ impl UiContext<'_> {
                 && ui.input(|i| i.key_pressed(egui::Key::A));
 
             if df.requests.frame_selected || f_pressed {
-                self.camera_rail.playing = false;
+                self.flight_workspace.player.pause();
                 let cur = self.cam_driver.controller().pose();
                 let dist = cur.eye.length().max(0.25);
                 let fwd = if cur.eye.length_squared() > 1e-6 {
@@ -1463,7 +1476,7 @@ impl UiContext<'_> {
                 *self.cam_pose = self.cam_driver.controller().pose();
                 self.bus.emit_ui(UiCommand::SnapCamera);
             } else if a_pressed {
-                self.camera_rail.playing = false;
+                self.flight_workspace.player.pause();
                 let center = glam::Vec3::from_array(self.settings.fractal_translate);
                 let ext = 1.35 * self.settings.obj_scale.clamp(0.05, 50.0);
                 self.cam_driver.controller_mut().apply_intent(
@@ -1478,7 +1491,7 @@ impl UiContext<'_> {
                 *self.cam_pose = self.cam_driver.controller().pose();
                 self.bus.emit_ui(UiCommand::SnapCamera);
             } else if df.requests.home {
-                self.camera_rail.playing = false;
+                self.flight_workspace.player.pause();
                 let (home_pose, orbit_dist) =
                     resolve_home_pose(self.settings.csg_mode, self.scene_viewpoints, self.cam_home);
                 self.cam_driver.controller_mut().set_pose(home_pose);
@@ -1487,7 +1500,7 @@ impl UiContext<'_> {
                 }
                 *self.cam_pose = self.cam_driver.controller().pose();
                 self.bus.emit_ui(UiCommand::SnapCamera);
-            } else if !self.camera_rail.is_active() {
+            } else if !self.flight_workspace.player.is_active() {
                 *self.cam_pose = df.pose;
             }
         }
@@ -2133,7 +2146,7 @@ impl UiContext<'_> {
     }
 
     fn aim_camera(&mut self, eye: [f32; 3], target: [f32; 3]) {
-        self.camera_rail.playing = false;
+        self.flight_workspace.player.pause();
         let eye_v = glam::Vec3::from_array(eye);
         let tgt_v = glam::Vec3::from_array(target);
         let delta = tgt_v - eye_v;
@@ -3495,267 +3508,147 @@ impl UiContext<'_> {
         });
     }
 
+    /// Shared dispatcher for [`DockTab::FlightLab`] and [`DockTab::FlightPlayer`].
+    fn ui_flight_tab(
+        &mut self,
+        ui: &mut Ui,
+        render: fn(&mut Ui, &mut crate::flight::ui::FlightUiArgs<'_>),
+    ) {
+        let mut seek_pose: Option<CameraPose> = None;
+        {
+            let bus = self.bus;
+            let cur_pose = *self.cam_pose;
+            let s = &mut *self.settings;
+            let csg_lod_bias = s.csg_lod_bias;
+            let mut on_cmd = |cmd: crate::flight::FlightCommand| {
+                bus.emit_ui(UiCommand::Flight(cmd));
+            };
+            let mut on_export = || {
+                bus.emit_ui(UiCommand::ExportFlightCsv);
+            };
+            let mut on_seek = |pose: CameraPose| {
+                seek_pose = Some(pose);
+            };
+            let mut args = crate::flight::ui::FlightUiArgs {
+                workspace: self.flight_workspace,
+                flight_stats: self.flight,
+                csg_stats: &self.csg_stats,
+                csg_lod_bias,
+                crowd_actor_count: self.crowd_actor_count,
+                rt_ms: self.rt_ms,
+                is_counters: &mut s.is_counters,
+                last_is_counts: self.is_counts.as_ref(),
+                active_scene_label: self.active_scene_label,
+                cur_pose,
+                is_recording: self.is_recording,
+                time_scale: &mut s.time_scale,
+                cam_smooth_tau: &mut s.cam_smooth_tau,
+                label_buf: &mut self.scratch.label_buf,
+                on_command: &mut on_cmd,
+                on_export_flight_csv: &mut on_export,
+                on_seek_pose: &mut on_seek,
+            };
+            render(ui, &mut args);
+        }
+        if let Some(pose) = seek_pose {
+            self.flight_workspace.player.pause();
+            self.cam_driver.controller_mut().set_pose(pose);
+            *self.cam_pose = pose;
+            self.bus.emit_ui(UiCommand::SnapCamera);
+        }
+    }
+
+    fn ui_flight_lab_tab(&mut self, ui: &mut Ui) {
+        self.ui_flight_tab(ui, crate::flight::ui::ui_flight_lab);
+    }
+
+    fn ui_flight_player_tab(&mut self, ui: &mut Ui) {
+        self.ui_flight_tab(ui, crate::flight::ui::ui_flight_player);
+    }
+
     fn ui_camera_stats(&mut self, ui: &mut Ui) {
-        let mut snap_pose: Option<CameraPose> = None;
-        let mut request_blend = false;
-        let mut request_gen_rail = false;
         {
             let s = &mut *self.settings;
-            let rail = &mut *self.camera_rail;
-            let cur_pose = *self.cam_pose;
-            let has_scenes = !self.scene_descriptors.is_empty();
             collapsing_section(
                 ui,
-                "sec_cinema",
+                "sec_view_possess",
                 ic::VIDEO_CAMERA,
-                "Cinema & Camera Rail",
+                "View & Possess",
                 |ui| {
-                    // 1. Toggleable Auto-Drive ON/OFF button (never erases custom keyframes).
-                    {
-                        let active = rail.is_active();
-                        let can_play = rail.can_play() || (s.csg_mode == 0 && has_scenes);
-                        let dark = ui.visuals().dark_mode;
-                        let lbl = if active {
-                            format!("{}  Auto-Drive: ON (Stop)", ic::PAUSE)
-                        } else {
-                            format!("{}  Auto-Drive: OFF (Start)", ic::PLAY)
-                        };
-                        let mut btn = egui::Button::new(if active {
-                            RichText::new(lbl).color(if dark {
-                                Color32::from_rgb(220, 248, 228)
-                            } else {
-                                Color32::from_rgb(22, 86, 46)
-                            })
-                        } else {
-                            RichText::new(lbl)
-                        });
-                        if active {
-                            btn = btn
-                                .fill(if dark {
-                                    Color32::from_rgb(32, 86, 56)
-                                } else {
-                                    Color32::from_rgb(204, 238, 216)
-                                })
-                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)));
-                        }
-                        let tip = if active {
-                            "Turn Auto-Drive OFF to immediately regain manual camera control without wiping your custom keyframes."
-                        } else if rail.can_play() {
-                            "Turn Auto-Drive ON to fly the selected cassette smoothly along the active CSG scene."
-                        } else if s.csg_mode == 0 && has_scenes {
-                            "Activate the default CSG world and start Auto-Drive."
-                        } else {
-                            "Load a CSG scene or add at least 2 Custom keyframes (+ KF) to enable Auto-Drive."
-                        };
-                        if ui
-                            .add_enabled(
-                                active || can_play,
-                                btn.min_size(egui::vec2(ui.available_width(), ROW_H + 4.0)),
-                            )
-                            .on_hover_text(tip)
-                            .clicked()
-                        {
-                            if active {
-                                rail.set_playing(false);
-                            } else if rail.can_play() {
-                                if rail.set_playing(true) {
-                                    request_blend = true;
-                                }
-                            } else if s.csg_mode == 0 && has_scenes {
-                                // Not routed through `SelectScene` (that pauses the rail this
-                                // starts), so apply its other effects here (F25).
-                                s.csg_mode = 1;
-                                if let Some(d) = self.scene_descriptors.first() {
-                                    let tod_u32 = match d.default_tod {
-                                        TimeOfDay::Day => 0,
-                                        TimeOfDay::Sunset => 1,
-                                        TimeOfDay::Night => 2,
-                                    };
-                                    s.csg_wetness = d.default_wetness.clamp(0.0, 1.0);
-                                    apply_csg_time_of_day_preset(s, tod_u32);
-                                    s.csg_asset_idx = s.csg_asset_idx.min(
-                                        u32::try_from(d.variant_labels.len().saturating_sub(1))
-                                            .unwrap_or(0),
-                                    );
-                                }
-                                if self.possess_info.is_some() {
-                                    self.bus.emit_ui(UiCommand::EjectPossess);
-                                }
-                                rail.playing = true;
-                                request_blend = true;
+                    let csg_active = s.csg_mode != 0;
+                    equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                        0 => {
+                            if ui
+                                .add_enabled(
+                                    csg_active,
+                                    egui::Button::new(format!("{}  Possess Car", ic::CAR))
+                                        .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                )
+                                .on_hover_text(
+                                    "Jump directly into a driving Robotaxi / vehicle or mounted landmark (cycles targets on each click; Ctrl+Click viewport to pick any object).",
+                                )
+                                .clicked()
+                            {
+                                self.bus.emit_ui(UiCommand::PossessNextVehicle);
                             }
                         }
-                    }
-                    ui.add_space(2.0);
-                    // 2. Dynamic Scene Cassette Deck + Independent Custom Deck.
-                    prop_row(ui, "Cassette", |ui| {
-                        let sel_text = rail.active_label();
-                        let active_scene_idx = rail.active_scene_rail_index();
-                        let mut picked_scene: Option<usize> = None;
-                        let mut picked_custom = false;
-                        egui::ComboBox::from_id_salt("cinema_cassette_combo")
-                            .width(ui.available_width().max(32.0))
-                            .truncate()
-                            .selected_text(sel_text)
-                            .show_ui(ui, |ui| {
-                                for (i, cr) in rail.scene_rails().iter().enumerate() {
-                                    let selected = active_scene_idx == Some(i);
-                                    if ui
-                                        .selectable_label(selected, &cr.spec.label)
-                                        .on_hover_text(&cr.spec.description)
-                                        .clicked()
-                                    {
-                                        picked_scene = Some(i);
-                                    }
-                                }
-                                let custom_lbl = format!("Custom ({} KF)", rail.keyframes.len());
-                                if ui
-                                    .selectable_label(rail.is_custom_selected(), custom_lbl)
-                                    .on_hover_text("Play your own Custom keyframes (+ KF / Pop KF / Clear) independently of scene cassettes.")
-                                    .clicked()
-                                {
-                                    picked_custom = true;
-                                }
-                            });
-                        if let Some(idx) = picked_scene {
-                            let changed = active_scene_idx != Some(idx);
-                            rail.select_scene_rail(idx);
-                            if changed && rail.is_active() {
-                                request_blend = true;
-                            }
-                        } else if picked_custom {
-                            let changed = !rail.is_custom_selected();
-                            rail.select_custom();
-                            if changed && rail.is_active() {
-                                request_blend = true;
+                        _ => {
+                            if ui
+                                .add_enabled(
+                                    csg_active,
+                                    egui::Button::new(format!("{}  Smart View", ic::EYE))
+                                        .min_size(egui::vec2(w, ROW_H + 2.0)),
+                                )
+                                .on_hover_text(
+                                    "Score 64 city viewpoints on OptiX 9 / WGPU / CPU and smoothly glide to the best composition.",
+                                )
+                                .clicked()
+                            {
+                                *self.smart_view_seed = self
+                                    .smart_view_seed
+                                    .wrapping_add(1)
+                                    .max(1);
+                                self.bus.emit_ui(UiCommand::RunSmartView {
+                                    seed: *self.smart_view_seed,
+                                    backend: s.probe_backend,
+                                });
                             }
                         }
                     });
-                    // 3. On-demand exact-CSG Random Rail, Possess Body & GPU Smart View controls.
-                    {
-                        let gen_enabled = s.csg_mode != 0;
-                        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
-                            0 => {
-                                let gen_lbl = format!(
-                                    "{}  Random Rail",
-                                    ic::SHUFFLE,
-                                );
-                                if ui
-                                    .add_enabled(
-                                        gen_enabled,
-                                        egui::Button::new(gen_lbl)
-                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                                    )
-                                    .on_hover_text(
-                                        "Synthesize a fresh, exact-CSG collision-verified random cinema rail for the active city scene.",
-                                    )
-                                    .clicked()
-                                {
-                                    *self.rail_random_seed = self
-                                        .rail_random_seed
-                                        .wrapping_add(1)
-                                        .max(1);
-                                    request_gen_rail = true;
+                    prop_row(ui, "Probe", |ui| {
+                        egui::ComboBox::from_id_salt("cinema_probe_backend")
+                            .width(ui.available_width().max(32.0))
+                            .truncate()
+                            .selected_text(s.probe_backend.label())
+                            .show_ui(ui, |ui| {
+                                for kind in [
+                                    ProbeBackendKind::Auto,
+                                    ProbeBackendKind::Optix,
+                                    ProbeBackendKind::Wgpu,
+                                    ProbeBackendKind::Cpu,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut s.probe_backend,
+                                        kind,
+                                        kind.label(),
+                                    );
                                 }
-                            }
-                            _ => {
-                                if ui
-                                    .add_enabled(
-                                        gen_enabled,
-                                        egui::Button::new(format!("{}  Smart Rail", ic::SPARKLE))
-                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                                    )
-                                    .on_hover_text(
-                                        "Generate 4 candidate cinema rails, score their vistas on the selected GPU/CPU backend, and fly the winner.",
-                                    )
-                                    .clicked()
-                                {
-                                    *self.rail_random_seed = self
-                                        .rail_random_seed
-                                        .wrapping_add(1)
-                                        .max(1);
-                                    self.bus.emit_ui(UiCommand::RunSmartRail {
-                                        seed: *self.rail_random_seed,
-                                        backend: s.probe_backend,
-                                    });
-                                }
-                            }
-                        });
-                        ui.add_space(2.0);
-                        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
-                            0 => {
-                                if ui
-                                    .add_enabled(
-                                        gen_enabled,
-                                        egui::Button::new(format!("{}  Possess Car", ic::CAR))
-                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                                    )
-                                    .on_hover_text(
-                                        "Jump directly into a driving Robotaxi / vehicle or mounted landmark (cycles targets on each click; Ctrl+Click viewport to pick any object).",
-                                    )
-                                    .clicked()
-                                {
-                                    self.bus.emit_ui(UiCommand::PossessNextVehicle);
-                                }
-                            }
-                            _ => {
-                                if ui
-                                    .add_enabled(
-                                        gen_enabled,
-                                        egui::Button::new(format!("{}  Smart View", ic::EYE))
-                                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                                    )
-                                    .on_hover_text(
-                                        "Score 64 city viewpoints on OptiX 9 / WGPU / CPU and smoothly glide to the best composition.",
-                                    )
-                                    .clicked()
-                                {
-                                    *self.smart_view_seed = self
-                                        .smart_view_seed
-                                        .wrapping_add(1)
-                                        .max(1);
-                                    self.bus.emit_ui(UiCommand::RunSmartView {
-                                        seed: *self.smart_view_seed,
-                                        backend: s.probe_backend,
-                                    });
-                                }
-                            }
-                        });
-                        prop_row(ui, "Probe", |ui| {
-                            egui::ComboBox::from_id_salt("cinema_probe_backend")
-                                .width(ui.available_width().max(32.0))
-                                .truncate()
-                                .selected_text(s.probe_backend.label())
-                                .show_ui(ui, |ui| {
-                                    for kind in [
-                                        ProbeBackendKind::Auto,
-                                        ProbeBackendKind::Optix,
-                                        ProbeBackendKind::Wgpu,
-                                        ProbeBackendKind::Cpu,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut s.probe_backend,
-                                            kind,
-                                            kind.label(),
-                                        );
-                                    }
-                                });
-                        });
-                        if let Some(sv) = self.last_smart_view {
-                            let sv_txt = fmt_into(
-                                &mut self.scratch.label_buf,
-                                format_args!(
-                                    "{}: {:.2} ({}v, ent {:.2}, depth {:.2}, {:.1} ms)",
-                                    sv.score.backend.label(),
-                                    sv.score.composite,
-                                    sv.candidates_evaluated,
-                                    sv.score.semantic_entropy,
-                                    sv.score.depth_stratification,
-                                    sv.elapsed_ms
-                                ),
-                            );
-                            ui.label(RichText::new(sv_txt).size(10.5).weak());
-                        }
+                            });
+                    });
+                    if let Some(sv) = self.last_smart_view {
+                        let sv_txt = fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!(
+                                "{}: {:.2} ({}v, ent {:.2}, depth {:.2}, {:.1} ms)",
+                                sv.score.backend.label(),
+                                sv.score.composite,
+                                sv.candidates_evaluated,
+                                sv.score.semantic_entropy,
+                                sv.score.depth_stratification,
+                                sv.elapsed_ms
+                            ),
+                        );
+                        ui.label(RichText::new(sv_txt).size(10.5).weak());
                     }
                     prop_slider_f32(
                         ui,
@@ -3773,141 +3666,8 @@ impl UiContext<'_> {
                         2,
                         "x",
                     );
-                    ui.add_space(2.0);
-                    equal_grid(ui, 2, 2, |ui, idx, w| match idx {
-                        0 => {
-                            let tint = rail.looping.then(|| active_accent_tint(ui));
-                            if cycle_toggle_btn(
-                                ui,
-                                w,
-                                "Loop",
-                                if rail.looping { "On" } else { "Off" },
-                                "Continuously wrap the camera rail with C1 periodic continuity.",
-                                true,
-                                tint,
-                            ) != 0
-                            {
-                                rail.looping = !rail.looping;
-                                rail.sync_lut();
-                            }
-                        }
-                        _ => {
-                            let tint = rail.ease_io.then(|| active_accent_tint(ui));
-                            if cycle_toggle_btn(
-                                ui,
-                                w,
-                                "Ease",
-                                if rail.ease_io { "I/O" } else { "Lin" },
-                                "Smoothstep ease-in / ease-out vs constant arc-length speed along the rail.",
-                                true,
-                                tint,
-                            ) != 0
-                            {
-                                rail.ease_io = !rail.ease_io;
-                            }
-                        }
-                    });
-                    prop_slider_f32(
-                        ui,
-                        "Duration",
-                        &mut rail.duration_s,
-                        2.0..=120.0,
-                        1,
-                        "s",
-                    );
-                    if rail.can_play() {
-                        let dur = rail.duration_s.max(0.5);
-                        let prev_t = rail.time_s;
-                        prop_slider_f32(ui, "Rail Time", &mut rail.time_s, 0.0..=dur, 2, "s");
-                        if (rail.time_s - prev_t).abs() > 1e-5
-                            && let Some(p) =
-                                rail.evaluate_current(cur_pose.znear, cur_pose.zfar.max(2000.0))
-                        {
-                            snap_pose = Some(p);
-                        }
-                    }
-                    ui.add_space(2.0);
-                    // 4. Independent Custom Keyframe controls (preserved across scene & cassette switches).
-                    equal_grid(ui, 3, 3, |ui, idx, w| match idx {
-                        0 => {
-                            let lbl = format!("+ KF ({})", rail.keyframes.len());
-                            if ui
-                                .add_sized([w, ROW_H + 2.0], egui::Button::new(lbl))
-                                .on_hover_text("Append the current camera pose to your Custom keyframe deck.")
-                                .clicked()
-                            {
-                                rail.push_pose(cur_pose);
-                            }
-                        }
-                        1 => {
-                            if ui
-                                .add_enabled(
-                                    !rail.keyframes.is_empty(),
-                                    egui::Button::new("Pop KF").min_size(egui::vec2(w, ROW_H + 2.0)),
-                                )
-                                .on_hover_text("Remove the last Custom keyframe.")
-                                .clicked()
-                            {
-                                rail.pop_keyframe();
-                            }
-                        }
-                        _ => {
-                            if ui
-                                .add_enabled(
-                                    !rail.keyframes.is_empty(),
-                                    egui::Button::new("Clear").min_size(egui::vec2(w, ROW_H + 2.0)),
-                                )
-                                .on_hover_text("Clear all Custom keyframes without affecting scene cassettes.")
-                                .clicked()
-                            {
-                                rail.clear();
-                            }
-                        }
-                    });
-                    // 5. Flight stats of the running rail (accumulated while Auto-Drive flies).
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new(
-                        RichText::new(format!("{}  Flight stats", ic::CHART_LINE)).strong(),
-                    )
-                    .id_salt("flight_stats")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if let Some(t) = flight_stats_ui(
-                            ui,
-                            &mut self.scratch.label_buf,
-                            self.flight,
-                            rail,
-                            s.csg_lod_bias,
-                            &self.csg_stats,
-                            self.crowd_actor_count,
-                            self.rt_ms,
-                            self.bus,
-                            &mut s.is_counters,
-                            self.is_counts.as_ref(),
-                        ) {
-                            rail.time_s = t;
-                            if let Some(p) =
-                                rail.evaluate_at(t, cur_pose.znear, cur_pose.zfar.max(2000.0))
-                            {
-                                snap_pose = Some(p);
-                            }
-                        }
-                    });
                 },
             );
-        }
-        if request_blend {
-            self.bus.emit_ui(UiCommand::BlendRail);
-        }
-        if request_gen_rail {
-            self.bus.emit_ui(UiCommand::GenerateRandomRail {
-                seed: *self.rail_random_seed,
-            });
-        }
-        if let Some(pose) = snap_pose {
-            self.cam_driver.controller_mut().set_pose(pose);
-            *self.cam_pose = pose;
-            self.bus.emit_ui(UiCommand::SnapCamera);
         }
 
         collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", |ui| {
@@ -4861,9 +4621,6 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     });
 }
 
-/// Height of one Flight stats graph.
-const FLIGHT_GRAPH_H: f32 = 64.0;
-
 /// The viewport toolbar "eye" dropdown (`crate::semantic_filter`): which semantic categories are
 /// rendered. Same pattern as the sl-studio viewport visibility popover used by warpbro-rs (an eye
 /// `MenuButton` over a grid of `sl_config::icons::tool_toggle` eye toggles, closing on a click
@@ -4937,313 +4694,6 @@ fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64) {
         ui.add_enabled(false, egui::Label::new(RichText::new(sf::OSM_SECTION_STATUS).italics()));
     });
     resp.on_hover_text(tip);
-}
-
-/// Flight stats subsection of the rail panel (`crate::flight_stats`). Returns a rail time to jump
-/// to when a slow spot was clicked.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one immediate-mode panel reading disjoint UiContext fields next to the borrowed rail"
-)]
-fn flight_stats_ui(
-    ui: &mut Ui,
-    buf: &mut String,
-    flight: &mut crate::flight_stats::FlightStats,
-    rail: &CameraRail,
-    lod_bias: f32,
-    csg: &CsgStats,
-    crowd_actors: u32,
-    rt_ms: f32,
-    bus: &AppBus,
-    is_counters: &mut bool,
-    is_counts: Option<&crate::is_counters::IsCounts>,
-) -> Option<f32> {
-    let mut jump = None;
-    // Intersection counters (`is_counters.rs`, debug, also `--is-counters`): the P37 A/B
-    // measures them next to the RT time; counted frames are slower, so the RT row is not a
-    // timing while the toggle is on.
-    ui.checkbox(is_counters, "IS counters (debug)").on_hover_text(
-        "Count intersection-program invocations per hit group and traced rays (atomics: \
-         counted frames are slower; time with the toggle off or with --bench-views)",
-    );
-    if *is_counters && let Some(c) = is_counts {
-        stat_row(ui, "RT (counted)", fmt_into(buf, format_args!("{rt_ms:.2} ms (inflated by counting)")));
-        for g in crate::is_counters::IsGroup::ALL {
-            stat_row(ui, g.label(), fmt_into(buf, format_args!("{}", c.get(g))));
-        }
-        stat_row(ui, "IS total", fmt_into(buf, format_args!("{}", c.total_is())));
-    }
-    let dur = rail.duration_s.max(0.5);
-    let label = rail.active_label();
-    stat_row(ui, "Cassette", &label);
-    stat_row(
-        ui,
-        "Rail Time",
-        fmt_into(
-            buf,
-            format_args!(
-                "{:.1} / {:.1} s ({:.0} %), loop {}",
-                rail.time_s,
-                dur,
-                100.0 * rail.time_s / dur,
-                flight.loops + 1
-            ),
-        ),
-    );
-    stat_row(
-        ui,
-        "Camera",
-        fmt_into(
-            buf,
-            format_args!(
-                "{:.1} m/s  {:.0} deg/s",
-                flight.speed_mps, flight.turn_dps
-            ),
-        ),
-    );
-    if let Some(last) = flight.latest() {
-        stat_row(
-            ui,
-            "Altitude",
-            fmt_into(buf, format_args!("y {:.1} m (world)", last.state.eye[1])),
-        );
-        stat_row(
-            ui,
-            "Launch",
-            fmt_into(
-                buf,
-                format_args!(
-                    "{}x{}  {} spp  {} bounces",
-                    last.state.width, last.state.height, last.state.spp, last.state.bounces
-                ),
-            ),
-        );
-    }
-    stat_row(ui, "LOD Bias", fmt_into(buf, format_args!("{lod_bias:.2}")));
-    let load = flight.load;
-    stat_row(
-        ui,
-        "Visible",
-        fmt_into(
-            buf,
-            format_args!(
-                "{} inst, {} GAS, {} crowd actors",
-                load.visible, csg.compounds, crowd_actors
-            ),
-        ),
-    );
-    stat_row(
-        ui,
-        "Paths",
-        fmt_into(
-            buf,
-            format_args!(
-                "prim {}  union {}  exact union {}  RPN {}",
-                load.paths[0], load.paths[1], load.paths[2], load.paths[3]
-            ),
-        ),
-    );
-    stat_row(
-        ui,
-        "LOD 0/1/2",
-        fmt_into(
-            buf,
-            format_args!(
-                "{} / {} / {}, culled {}",
-                load.lod[0], load.lod[1], load.lod[2], load.culled
-            ),
-        ),
-    );
-    stat_row(ui, "RT", fmt_into(buf, format_args!("{rt_ms:.1} ms")));
-    let summary = flight.summary();
-    if let Some(sm) = summary {
-        stat_row(
-            ui,
-            "RT min/med",
-            fmt_into(buf, format_args!("{:.1} / {:.1} ms", sm.min, sm.median)),
-        );
-        stat_row(
-            ui,
-            "RT p95/max",
-            fmt_into(
-                buf,
-                format_args!("{:.1} / {:.1} ms ({} frames)", sm.p95, sm.max, sm.frames),
-            ),
-        );
-    } else {
-        ui.label(RichText::new("Start Auto-Drive to collect flight stats.").weak());
-    }
-
-    let w = ui.available_width().max(60.0);
-    let dark = ui.visuals().dark_mode;
-    let cur_col = Color32::from_rgb(118, 185, 0);
-    let prev_col = if dark {
-        Color32::from_gray(110)
-    } else {
-        Color32::from_gray(150)
-    };
-    let load_col = Color32::from_rgb(90, 160, 230);
-    let lod_col = Color32::from_rgb(230, 170, 60);
-
-    // Graph 1: RT ms vs rail time, previous loop under the current one.
-    ui.label(RichText::new("RT ms vs rail time (grey: previous loop)").size(10.5).weak());
-    let rt_max = flight
-        .cur_loop()
-        .iter()
-        .chain(flight.prev_loop())
-        .map(|p| p.rt_ms)
-        .fold(1.0_f32, f32::max);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    paint_flight_curve(&painter, rect, flight.prev_loop(), dur, rt_max, |p| p.rt_ms, prev_col);
-    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, rt_max, |p| p.rt_ms, cur_col);
-    painter.text(
-        rect.left_top() + egui::vec2(3.0, 2.0),
-        egui::Align2::LEFT_TOP,
-        fmt_into(buf, format_args!("{rt_max:.0} ms")),
-        egui::FontId::proportional(10.0),
-        ui.visuals().weak_text_color(),
-    );
-
-    // Graph 2: scene load vs rail time.
-    ui.label(
-        RichText::new("Visible instances (blue) and LOD 0 share (orange) vs rail time")
-            .size(10.5)
-            .weak(),
-    );
-    let vis_max = flight
-        .cur_loop()
-        .iter()
-        .map(|p| p.visible as f32)
-        .fold(1.0_f32, f32::max);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H), Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, vis_max, |p| p.visible as f32, load_col);
-    paint_flight_curve(&painter, rect, flight.cur_loop(), dur, 1.0, |p| p.lod0_share, lod_col);
-    painter.text(
-        rect.left_top() + egui::vec2(3.0, 2.0),
-        egui::Align2::LEFT_TOP,
-        fmt_into(buf, format_args!("{vis_max:.0} inst")),
-        egui::FontId::proportional(10.0),
-        ui.visuals().weak_text_color(),
-    );
-
-    // RT histogram over the accumulated frames.
-    if let Some(sm) = summary {
-        ui.label(
-            RichText::new(fmt_into(
-                buf,
-                format_args!("RT histogram {:.0}..{:.0} ms", sm.min, sm.max),
-            ))
-            .size(10.5)
-            .weak(),
-        );
-        let mut bins = [0u32; crate::flight_stats::HIST_BINS];
-        flight.histogram(sm.min, sm.max, &mut bins);
-        let peak = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, FLIGHT_GRAPH_H * 0.6), Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-        let bw = rect.width() / bins.len() as f32;
-        for (i, &c) in bins.iter().enumerate() {
-            let h = (rect.height() - 2.0) * c as f32 / peak;
-            let x0 = rect.left() + i as f32 * bw;
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x0 + 0.5, rect.bottom() - h),
-                    egui::pos2(x0 + bw - 0.5, rect.bottom()),
-                ),
-                0.0,
-                cur_col,
-            );
-        }
-    }
-
-    // Slowest rail positions (click: jump the rail there).
-    let mut any_slow = false;
-    for spot in flight.slow_spots() {
-        if !any_slow {
-            ui.label(RichText::new("Slowest positions (click to jump)").size(10.5).weak());
-            any_slow = true;
-        }
-        let txt = fmt_into(
-            buf,
-            format_args!(
-                "{:.1} ms at {:.2} s  ({:.0}, {:.0}, {:.0})",
-                spot.rt_ms, spot.rail_t, spot.eye[0], spot.eye[1], spot.eye[2]
-            ),
-        );
-        if ui
-            .add_sized([w, ROW_H], egui::Button::new(RichText::new(txt).size(11.0)))
-            .clicked()
-        {
-            jump = Some(spot.rail_t);
-        }
-    }
-
-    equal_grid(ui, 2, 2, |ui, idx, bw| match idx {
-        0 => {
-            if ui
-                .add_sized(
-                    [bw, ROW_H + 2.0],
-                    egui::Button::new(format!("{}  Reset", ic::ARROW_COUNTER_CLOCKWISE)),
-                )
-                .on_hover_text("Clear the accumulated flight stats (also done on a new cassette or Auto-Drive start).")
-                .clicked()
-            {
-                flight.reset();
-            }
-        }
-        _ => {
-            if ui
-                .add_enabled(
-                    flight.frames() > 0,
-                    egui::Button::new(format!("{}  Export CSV", ic::FLOPPY_DISK))
-                        .min_size(egui::vec2(bw, ROW_H + 2.0)),
-                )
-                .on_hover_text("Write the accumulated frames as a perf CSV (same columns as --bench-rail).")
-                .clicked()
-            {
-                bus.emit_ui(UiCommand::ExportFlightCsv);
-            }
-        }
-    });
-    jump
-}
-
-/// Draws `pts` (x = rail time over `[0, x_max]`, y = `y(p)` over `[0, y_max]`) into `rect` as line
-/// segments, at most one segment per horizontal pixel; allocates nothing.
-fn paint_flight_curve(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    pts: &[crate::flight_stats::LoopPoint],
-    x_max: f32,
-    y_max: f32,
-    y: impl Fn(&crate::flight_stats::LoopPoint) -> f32,
-    color: Color32,
-) {
-    if pts.len() < 2 || x_max <= 0.0 || y_max <= 0.0 {
-        return;
-    }
-    let stride = (pts.len() as f32 / rect.width().max(1.0)).ceil().max(1.0) as usize;
-    let to_screen = |p: &crate::flight_stats::LoopPoint| {
-        egui::pos2(
-            rect.left() + rect.width() * (p.rail_t / x_max).clamp(0.0, 1.0),
-            rect.bottom() - 1.0 - (rect.height() - 2.0) * (y(p) / y_max).clamp(0.0, 1.0),
-        )
-    };
-    let stroke = egui::Stroke::new(1.25, color);
-    let mut prev = to_screen(&pts[0]);
-    for p in pts.iter().step_by(stride).skip(1) {
-        let cur = to_screen(p);
-        // A backwards jump in rail time (scrub) starts a new segment instead of a long chord.
-        if cur.x >= prev.x {
-            painter.line_segment([prev, cur], stroke);
-        }
-        prev = cur;
-    }
 }
 
 fn sparkline_row(

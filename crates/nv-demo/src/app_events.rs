@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use appbus::{BoxedEvent, EventBus, StateSlot};
-use csg_scene::{CameraMount, ProbeBackendKind, RailSpec, ViewScore};
+use csg_scene::{CameraMount, ProbeBackendKind, ViewScore};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady, OverlayOutPtrs};
@@ -115,12 +115,10 @@ pub enum UiCommand {
     SetRoadMode(u8),
     /// Toggle `Freeze Pose` (pauses dynamic traffic/crowd stepping for clean multi-spp SDG accumulation).
     ToggleFreezePose,
-    /// Synthesize a fresh exact-CSG collision-verified random camera rail with `seed`.
-    GenerateRandomRail { seed: u64 },
+    /// Typed Flight Lab / Flight Player command (`crate::flight::FlightCommand`).
+    Flight(crate::flight::FlightCommand),
     /// Snap `CameraDamper` immediately onto the current camera pose (teleport / preset / scrub).
     SnapCamera,
-    /// Smoothly glide `CameraDamper` into a newly started or switched camera rail cassette.
-    BlendRail,
     /// Pick the object under the click (`crate::pick`): select it or possess it.
     Pick(crate::pick::PickRequest),
     /// Jump straight into the next moving vehicle (prioritizing `Robotaxi`) with 1 click.
@@ -133,8 +131,6 @@ pub enum UiCommand {
     EjectPossess,
     /// Score 64 city viewpoints on the selected `ProbeBackendKind` and glide to the highest-scoring view.
     RunSmartView { seed: u64, backend: ProbeBackendKind },
-    /// Generate multiple candidate rails, score their key vistas on `backend`, and activate the best rail.
-    RunSmartRail { seed: u64, backend: ProbeBackendKind },
     /// Trigger an interactive poke impulse on the nearest actor (or all actors in the `Inspector` crowd showcase).
     PokeCrowd { impulse: f32, all: bool },
     /// Spawn (or toggle) the 2,000-actor GPU/CPU crowd stress grid around the camera.
@@ -211,8 +207,6 @@ pub enum RenderControl {
         possess_auto_level: bool,
         possess_zoom_offset: f32,
     },
-    /// Synthesize a deterministic exact-CSG random rail for the active scene on the worker thread.
-    GenerateRandomRail { seed: u64 },
     /// Answer a viewport click with the GPU pick record of the next launch (`crate::pick`).
     Pick(crate::pick::PickRequest),
     /// Possess the next dynamic vehicle (prioritizing `Robotaxi`) or mounted scene object.
@@ -223,8 +217,6 @@ pub enum RenderControl {
     EjectPossess,
     /// Evaluate 64 scenic viewpoints using the requested probe backend and return the winner.
     RunSmartView { seed: u64, backend: ProbeBackendKind },
-    /// Score multiple candidate random rails using the requested probe backend and activate the winner.
-    RunSmartRail { seed: u64, backend: ProbeBackendKind },
     /// Hot-reload `raytracer.cu` from disk via NVRTC.
     ReloadShader,
     /// Start (or restart) the per-frame performance log: skip `warmup` frames, keep `frames`,
@@ -247,12 +239,10 @@ pub enum RenderControl {
 /// Typed events emitted by the OptiX render worker back to the 60+ FPS UI thread.
 #[derive(Clone, Debug)]
 pub enum RenderEvent {
-    /// A newly rendered viewport frame is ready in shared GPU memory.
-    FrameReady(FrameReady),
+    /// A newly rendered viewport frame is ready in shared GPU memory (boxed to keep `RenderEvent` small).
+    FrameReady(Box<FrameReady>),
     /// A newly built CSG scene exported its viewpoints and collision-verified camera rails.
     SceneMetaUpdated(SceneLoadedMetadata),
-    /// An on-demand exact-CSG random rail finished generating.
-    RailGenerated(RailSpec),
     /// Active possessed body or mount changed (`None` = ejected to free camera).
     PossessChanged(Option<PossessInfo>),
     /// Intersection counts of the latest counted launch (`crate::is_counters`), sent once when
@@ -285,7 +275,7 @@ pub enum RenderEvent {
 pub struct RenderStateSnapshot {
     /// Latest effective render settings (after `DemoAnimator` evaluation).
     pub settings: DemoSettings,
-    /// Latest camera basis (after `CameraRail` and `CameraDamper` evaluation).
+    /// Latest camera basis (after `FlightPlayer` and `CameraDamper` evaluation).
     pub camera: CameraFrame,
     /// Deadline until which interactive fast-preview (`1 spp`, `bounces <= 2`) remains active.
     pub interacting_until: Option<Instant>,
@@ -505,7 +495,7 @@ mod tests {
 
         bus.emit_ui(UiCommand::ResetAccum);
         bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
-        bus.emit_ui(UiCommand::GenerateRandomRail { seed: 42 });
+        bus.emit_ui(UiCommand::Flight(crate::flight::FlightCommand::Play));
         bus.emit_ui(UiCommand::ToggleFreezePose);
         bus.emit_ui(UiCommand::ExportSdgJson);
         bus.emit_ui(UiCommand::PokeCrowd {
@@ -525,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[2]),
-            Some(&UiCommand::GenerateRandomRail { seed: 42 })
+            Some(&UiCommand::Flight(crate::flight::FlightCommand::Play))
         );
         assert_eq!(
             downcast_event::<UiCommand>(&scratch[3]),

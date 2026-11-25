@@ -430,6 +430,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-guide"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/camera-guide-rs.git?branch=main#d0893501102c8d23c58627a42a3dd304f5dec2d2"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1551,6 +1559,99 @@ dependencies = [
 ]
 
 [[package]]
+name = "flight-navigator"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "camera-guide",
+ "fnav-core",
+ "fnav-harmony",
+ "fnav-interest",
+ "fnav-plan",
+ "fnav-space",
+ "fnav-tune",
+ "glam",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fnav-core"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "blake3",
+ "camera-core",
+ "camera-guide",
+ "glam",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fnav-harmony"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "fnav-core",
+ "fnav-interest",
+ "glam",
+ "serde",
+]
+
+[[package]]
+name = "fnav-interest"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "fnav-core",
+ "fnav-space",
+ "glam",
+ "serde",
+]
+
+[[package]]
+name = "fnav-plan"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "blake3",
+ "camera-guide",
+ "fnav-core",
+ "fnav-harmony",
+ "fnav-interest",
+ "fnav-space",
+ "glam",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fnav-space"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "blake3",
+ "fnav-core",
+ "glam",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fnav-tune"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+dependencies = [
+ "fnav-core",
+ "fnav-harmony",
+ "fnav-interest",
+ "serde",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2640,6 +2741,7 @@ dependencies = [
  "egui-winit",
  "egui_dock",
  "exr-core",
+ "flight-navigator",
  "glam",
  "imath-rs",
  "ngx",

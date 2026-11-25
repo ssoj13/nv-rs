@@ -30,6 +30,7 @@ csg-scene = { workspace = true, features = ["wgpu"] }
 csg-device = { workspace = true }
 csg-scenes = { workspace = true }
 exr-core = { workspace = true }
+flight-navigator = { workspace = true }
 imath-rs = { workspace = true }
 
 wgpu = "30"

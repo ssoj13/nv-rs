@@ -1,12 +1,14 @@
-//! Deterministic benchmarks: the camera-rail benchmark (`--bench-rail`) and the fixed camera set
-//! benchmark (`--bench-views`), plus the `--is-counters` debug flag.
+//! Deterministic benchmarks: camera-rail (`--bench-rail`), frozen `flight-navigator-rs` track
+//! (`--bench-track`) and playlist (`--bench-playlist`), and fixed camera set (`--bench-views`),
+//! plus the `--is-counters` debug flag.
 //!
 //! **What.** Parses the command line ([`parse_args`] -> [`CliArgs`]) and holds the run state
-//! ([`BenchRun`]). A rail run loads a scene, freezes traffic and crowd poses, puts the free camera
-//! (Pinhole, never possessed) on one scene rail cassette from rail time 0, steps it in lockstep
-//! with the renderer at the fixed `1 / 60 s * time_scale` rail clock (one rendered frame per
-//! step, the Smooth 60 FPS recording path without a video file), records `warmup + frames`
-//! frames through [`crate::perf_log::PerfLog`] and exits with the CSV written atomically.
+//! ([`BenchRun`]). A rail, track, or playlist run loads a scene (tracks carry their own
+//! `scene.id` metadata; `--scene` overrides it or picks the rail scene), freezes traffic and crowd
+//! poses, steps the free camera (Pinhole, never possessed) in lockstep with the renderer at the
+//! fixed `1 / 60 s * time_scale` clock (one rendered frame per step, the Smooth 60 FPS recording
+//! path without a video file), records `warmup + frames` frames through
+//! [`crate::perf_log::PerfLog`] and exits with the CSV written atomically.
 //! A views run ([`ViewRun`]) visits a fixed list of cameras ([`ViewSpec`], a built-in set or a
 //! file): per view it switches scene if needed, renders `warmup` frames, measures `frames`
 //! frames (RT ms from `GpuPassProfiler`), then renders `count_frames` frames with the
@@ -14,14 +16,16 @@
 //! / min / p95, intersection-program invocations per hit group and rays per frame.
 //! **Why.** Free-running timings depend on wall-clock pacing, traffic positions and whatever the
 //! camera happens to be doing; an A/B needs every run to render exactly the same cameras over
-//! exactly the same geometry. The views run is the A/B harness of each csg-rs P37 wave (sweep
+//! exactly the same geometry. Frozen `.fnav.json` tracks and `.fnav-playlist.json` playlists give
+//! reproducible multi-scene flight-navigator benchmarks while `--bench-rail` remains for
+//! historical `Gundo` baselines. The views run is the A/B harness of each csg-rs P37 wave (sweep
 //! tiles replacing box chains): RT time and the intersection work it explains, side by side.
 //! **How.** `main` parses the arguments before the event loop; `DemoApp::new` applies the scene
-//! and freeze overrides and never writes the user config in bench mode; the rail run starts when
-//! the scene's rails arrive (`RenderEvent::SceneMetaUpdated`), the views run when the first
-//! view's scene is loaded; `RenderEvent::PerfLogWritten` (rail) or the last view row (views)
-//! ends the process (exit code 0 on success). Counted frames are never timed: the counters cost
-//! atomics, so RT ms comes from the measured frames before them.
+//! and freeze overrides and never writes the user config in bench mode; the rail/track/playlist
+//! run starts when the scene metadata arrives (`RenderEvent::SceneMetaUpdated`), the views run
+//! when the first view's scene is loaded; `RenderEvent::PerfLogWritten` (rail/track/playlist) or
+//! the last view row (views) ends the process (exit code 0 on success). Counted frames are never
+//! timed: the counters cost atomics, so RT ms comes from the measured frames before them.
 //! **Used by** `main.rs`. Documented in `crates/nv-demo/AGENTS.md` (Benchmark).
 
 use std::ffi::OsString;
@@ -30,19 +34,21 @@ use std::path::PathBuf;
 use crate::is_counters::{IsCounts, IsGroup};
 
 /// Usage text printed on a command-line error.
-pub const USAGE: &str = "usage: nv-demo [--is-counters] [--bench-rail <rail-id> | --bench-views <set|file>] --out <csv> \
+pub const USAGE: &str = "usage: nv-demo [--is-counters] [--bench-rail <rail-id> | --bench-track <file.fnav.json> | --bench-playlist <file.fnav-playlist.json> | --bench-views <set|file>] --out <csv> \
 [--scene <scene-id>] [--frames <n>] [--warmup <n>] [--count-frames <n>] [--image <pfm>] [--png-dir <dir>]\n  \
---is-counters  count intersection-program invocations per hit group (debug; Flight stats shows them)\n  \
---bench-rail   scene rail cassette id (e.g. road_cruise); unknown ids list the available ones\n  \
---bench-views  fixed camera set: a built-in set (p37) or a file of `name scene viewpoint <id>` /\n                 \
+--is-counters     count intersection-program invocations per hit group (debug; Flight stats shows them)\n  \
+--bench-rail      scene rail cassette id (e.g. road_cruise); unknown ids list the available ones\n  \
+--bench-track     frozen flight-navigator recording (*.fnav.json); carries its own scene.id\n  \
+--bench-playlist  frozen flight-navigator playlist (*.fnav-playlist.json) of track recordings\n  \
+--bench-views     fixed camera set: a built-in set (p37) or a file of `name scene viewpoint <id>` /\n                    \
 `name scene eye x y z target x y z fov deg` lines\n  \
---out          CSV written when the run ends (atomic rename)\n  \
---scene        scene descriptor id for --bench-rail (default: the saved scene); views name their scene\n  \
---frames       measured frames (rail default: one loop at 60 fps * time_scale; views default 60 per view)\n  \
---warmup       frames rendered and discarded before measuring (rail default 60, views default 30 per view)\n  \
---count-frames views: frames per view rendered with the IS counters on after the measured ones (default 4)\n  \
---image        rail: linear colour of the last frame as PFM (pixel A/B)\n  \
---png-dir      rail: every frame's displayed image as PNG (temporal A/B)";
+--out             CSV written when the run ends (atomic rename)\n  \
+--scene           scene descriptor id for rail/track/playlist (rail default: saved scene; track/playlist default: track's scene.id); views name their scene\n  \
+--frames          measured frames (rail/track/playlist default: full duration at 60 fps * time_scale; views default 60 per view)\n  \
+--warmup          frames rendered and discarded before measuring (rail/track/playlist default 60, views default 30 per view)\n  \
+--count-frames    views: frames per view rendered with the IS counters on after the measured ones (default 4)\n  \
+--image           rail/track/playlist: linear colour of the last frame as PFM (pixel A/B)\n  \
+--png-dir         rail/track/playlist: every frame's displayed image as PNG (temporal A/B)";
 
 /// Default number of discarded frames at the start of the rail.
 pub const DEFAULT_WARMUP: u32 = 60;
@@ -131,31 +137,37 @@ pub fn load_views(arg: &str) -> Result<Vec<ViewSpec>, String> {
 /// What a benchmark run renders.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BenchTarget {
-    /// One scene rail cassette (`RailSpec::id`).
+    /// One scene rail cassette (`RailSpec::id`), kept for historical `Gundo` baselines.
     Rail(String),
-    /// A fixed camera set.
+    /// A frozen `flight-navigator-rs` track recording (`*.fnav.json`) carrying its own `scene.id`.
+    Track(PathBuf),
+    /// A frozen `flight-navigator-rs` playlist (`*.fnav-playlist.json`) of track recordings.
+    Playlist(PathBuf),
+    /// A fixed camera set (`--bench-views <set|file>`).
     Views(Vec<ViewSpec>),
 }
 
 /// Benchmark command line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BenchArgs {
-    /// Rail or camera set.
+    /// Rail, frozen flight track, playlist, or camera set.
     pub target: BenchTarget,
     /// CSV output path.
     pub out: PathBuf,
-    /// Scene descriptor id of a rail run; `None` keeps the saved scene.
+    /// Scene descriptor id for rail/track/playlist runs; `None` keeps the saved scene (rail) or
+    /// uses the track's embedded `scene.id` (track/playlist).
     pub scene: Option<String>,
-    /// Measured frames (rail: `None` = one loop; views: per view).
+    /// Measured frames (rail/track/playlist: `None` = full duration; views: per view).
     pub frames: Option<u32>,
-    /// Discarded frames before measuring (rail: once; views: per view).
+    /// Discarded frames before measuring (rail/track/playlist: once; views: per view).
     pub warmup: u32,
     /// Views: counted frames per view.
     pub count_frames: u32,
-    /// PFM written with the last measured frame's linear colour (rail).
+    /// PFM written with the last measured frame's linear colour (rail/track/playlist).
     pub image: Option<PathBuf>,
     /// Directory receiving every rendered frame's displayed image (tonemap + overlay) as
-    /// `frame_NNNNN.png` (rail): temporal artefacts such as line shimmer need a sequence.
+    /// `frame_NNNNN.png` (rail/track/playlist): temporal artefacts such as line shimmer need a
+    /// sequence.
     pub png_dir: Option<PathBuf>,
 }
 
@@ -172,6 +184,8 @@ pub struct CliArgs {
 /// any unknown argument is an error.
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs, String> {
     let mut rail = None;
+    let mut track = None;
+    let mut playlist = None;
     let mut views = None;
     let mut out = None;
     let mut scene = None;
@@ -194,6 +208,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs, S
         match flag.as_str() {
             "--is-counters" => is_counters = true,
             "--bench-rail" => rail = Some(utf8(value("--bench-rail")?, "--bench-rail")?),
+            "--bench-track" => track = Some(PathBuf::from(value("--bench-track")?)),
+            "--bench-playlist" => playlist = Some(PathBuf::from(value("--bench-playlist")?)),
             "--bench-views" => views = Some(utf8(value("--bench-views")?, "--bench-views")?),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             "--scene" => scene = Some(utf8(value("--scene")?, "--scene")?),
@@ -220,10 +236,23 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs, S
     if !any_bench {
         return Ok(CliArgs { bench: None, is_counters });
     }
-    let target = match (rail, views) {
-        (Some(_), Some(_)) => return Err("--bench-rail and --bench-views are exclusive".to_string()),
-        (None, None) => return Err("--bench-rail <rail-id> or --bench-views <set|file> is required".to_string()),
-        (Some(r), None) => {
+    let chosen_flags: Vec<&str> = [
+        rail.is_some().then_some("--bench-rail"),
+        track.is_some().then_some("--bench-track"),
+        playlist.is_some().then_some("--bench-playlist"),
+        views.is_some().then_some("--bench-views"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if chosen_flags.len() > 1 {
+        return Err(format!(
+            "{} are mutually exclusive",
+            chosen_flags.join(", ")
+        ));
+    }
+    let target = match (rail, track, playlist, views) {
+        (Some(r), None, None, None) => {
             if r.is_empty() {
                 return Err("--bench-rail needs a non-empty rail id".to_string());
             }
@@ -232,11 +261,35 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliArgs, S
             }
             BenchTarget::Rail(r)
         }
-        (None, Some(v)) => {
+        (None, Some(p), None, None) => {
+            if p.as_os_str().is_empty() {
+                return Err("--bench-track needs a non-empty file path".to_string());
+            }
+            if count_frames.is_some() {
+                return Err("--count-frames applies to --bench-views only".to_string());
+            }
+            BenchTarget::Track(p)
+        }
+        (None, None, Some(p), None) => {
+            if p.as_os_str().is_empty() {
+                return Err("--bench-playlist needs a non-empty file path".to_string());
+            }
+            if count_frames.is_some() {
+                return Err("--count-frames applies to --bench-views only".to_string());
+            }
+            BenchTarget::Playlist(p)
+        }
+        (None, None, None, Some(v)) => {
             if scene.is_some() || image.is_some() || png_dir.is_some() {
-                return Err("--scene / --image / --png-dir apply to --bench-rail only (views name their scene)".to_string());
+                return Err("--scene / --image / --png-dir do not apply to --bench-views (views name their scene)".to_string());
             }
             BenchTarget::Views(load_views(&v)?)
+        }
+        _ => {
+            return Err(
+                "one of --bench-rail <rail-id>, --bench-track <file.fnav.json>, --bench-playlist <file.fnav-playlist.json>, or --bench-views <set|file> is required"
+                    .to_string(),
+            );
         }
     };
     let out = out.ok_or("--out <csv> is required")?;
@@ -307,7 +360,7 @@ impl BenchRun {
                 args.frames.unwrap_or(DEFAULT_VIEW_FRAMES),
                 args.count_frames,
             )),
-            BenchTarget::Rail(_) => None,
+            BenchTarget::Rail(_) | BenchTarget::Track(_) | BenchTarget::Playlist(_) => None,
         };
         Self { args, phase: BenchPhase::WaitingForRails, views }
     }
@@ -590,6 +643,127 @@ mod tests {
         assert!(args(&["--bench-views", "p37", "--scene", "gundo", "--out", "x"]).is_err());
         assert!(args(&["--bench-views", "no_such_set_or_file", "--out", "x"]).is_err());
         assert!(args(&["--bench-rail", "r", "--out", "x", "--count-frames", "2"]).is_err());
+    }
+
+    #[test]
+    fn parses_bench_track_and_playlist_with_optional_scene_and_outputs() {
+        let t = args(&["--bench-track", "tracks/tour.fnav.json", "--out", "t.csv"])
+            .expect("valid track")
+            .bench
+            .expect("bench");
+        assert_eq!(
+            t,
+            BenchArgs {
+                target: BenchTarget::Track(PathBuf::from("tracks/tour.fnav.json")),
+                out: PathBuf::from("t.csv"),
+                scene: None,
+                frames: None,
+                warmup: DEFAULT_WARMUP,
+                count_frames: DEFAULT_COUNT_FRAMES,
+                image: None,
+                png_dir: None,
+            }
+        );
+        assert!(BenchRun::new(t).views.is_none());
+
+        let t_full = args(&[
+            "--bench-track",
+            "tracks/tour.fnav.json",
+            "--out",
+            "t.csv",
+            "--scene",
+            "gundo",
+            "--frames",
+            "240",
+            "--warmup",
+            "15",
+            "--image",
+            "last.pfm",
+            "--png-dir",
+            "frames_out",
+        ])
+        .expect("valid full track")
+        .bench
+        .expect("bench");
+        assert_eq!(
+            t_full,
+            BenchArgs {
+                target: BenchTarget::Track(PathBuf::from("tracks/tour.fnav.json")),
+                out: PathBuf::from("t.csv"),
+                scene: Some("gundo".into()),
+                frames: Some(240),
+                warmup: 15,
+                count_frames: DEFAULT_COUNT_FRAMES,
+                image: Some(PathBuf::from("last.pfm")),
+                png_dir: Some(PathBuf::from("frames_out")),
+            }
+        );
+
+        let p = args(&[
+            "--bench-playlist",
+            "lists/suite.fnav-playlist.json",
+            "--out",
+            "p.csv",
+            "--image",
+            "p.pfm",
+            "--png-dir",
+            "p_pngs",
+        ])
+        .expect("valid playlist")
+        .bench
+        .expect("bench");
+        assert_eq!(
+            p,
+            BenchArgs {
+                target: BenchTarget::Playlist(PathBuf::from("lists/suite.fnav-playlist.json")),
+                out: PathBuf::from("p.csv"),
+                scene: None,
+                frames: None,
+                warmup: DEFAULT_WARMUP,
+                count_frames: DEFAULT_COUNT_FRAMES,
+                image: Some(PathBuf::from("p.pfm")),
+                png_dir: Some(PathBuf::from("p_pngs")),
+            }
+        );
+        assert!(BenchRun::new(p).views.is_none());
+    }
+
+    #[test]
+    fn rejects_mutually_exclusive_targets_and_invalid_track_playlist_flags() {
+        let pairs: &[&[&str]] = &[
+            &["--bench-rail", "r", "--bench-track", "a.fnav.json", "--out", "x.csv"],
+            &["--bench-rail", "r", "--bench-playlist", "a.fnav-playlist.json", "--out", "x.csv"],
+            &["--bench-track", "a.fnav.json", "--bench-playlist", "b.fnav-playlist.json", "--out", "x.csv"],
+            &["--bench-track", "a.fnav.json", "--bench-views", "p37", "--out", "x.csv"],
+            &["--bench-playlist", "a.fnav-playlist.json", "--bench-views", "p37", "--out", "x.csv"],
+            &["--bench-rail", "r", "--bench-track", "a.fnav.json", "--bench-views", "p37", "--out", "x.csv"],
+        ];
+        for argv in pairs {
+            let err = args(argv).expect_err("mutually exclusive targets must fail");
+            assert!(
+                err.contains("mutually exclusive"),
+                "expected mutual-exclusion error for {argv:?}, got: {err}"
+            );
+        }
+        assert!(args(&["--bench-track", "", "--out", "x.csv"]).is_err());
+        assert!(args(&["--bench-playlist", "", "--out", "x.csv"]).is_err());
+        assert!(args(&["--bench-track", "a.fnav.json"]).is_err(), "--out missing");
+        assert!(args(&["--bench-playlist", "a.fnav-playlist.json"]).is_err(), "--out missing");
+        assert!(
+            args(&["--bench-track", "a.fnav.json", "--out", "x.csv", "--count-frames", "2"])
+                .is_err()
+        );
+        assert!(
+            args(&[
+                "--bench-playlist",
+                "a.fnav-playlist.json",
+                "--out",
+                "x.csv",
+                "--count-frames",
+                "2",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

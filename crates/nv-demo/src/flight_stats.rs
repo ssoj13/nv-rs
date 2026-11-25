@@ -1,4 +1,4 @@
-//! Rail fly-through statistics shown in the "Cinema & Camera Rail" panel (Flight stats).
+//! Rail fly-through statistics shown in the "Flight Lab" panel (Flight stats).
 //!
 //! **What.** [`FlightStats`] accumulates one entry per rendered frame while the camera rail
 //! drives the camera: the frame's [`PerfSample`] (the same struct the render worker hands to the

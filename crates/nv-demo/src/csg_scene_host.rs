@@ -4,8 +4,8 @@
 //! What: loads any registered [`csg_scene::SceneModule`] from [`csg_scenes::default_scene_registry`]
 //! (`Gundo`, `Marina del Rey`, `SF House of AI`, `Studio Asset Inspector`, or future scenes),
 //! batches all compound `OptixAabb`s in a single H2D upload while caching one custom-primitive GAS
-//! per unique `GpuCompound`, refreshes material palettes and 3D Frenet traffic in-place with zero
-//! steady-state GPU buffer reallocations, and synthesizes exact-CSG random rails on demand.
+//! per unique `GpuCompound`, and refreshes material palettes and 3D Frenet traffic in-place with
+//! zero steady-state GPU buffer reallocations.
 //! Why: keeps `nv-demo` completely decoupled from scene-specific coordinates, presets, or rails
 //! while delivering smooth frame times across 10k-100k+ CSG instances.
 //! Category filter: the host also owns the per-instance filter state of the viewport eye dropdown
@@ -37,10 +37,10 @@ use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat};
 use csg_scene::{
     CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
-    GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailGenConfig, RailSpec,
+    GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailSpec,
     SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
     SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
-    generate_random_rail, inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
+    inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
     crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id, encode_static_inst_id,
     lookup_instance_and_assembly,
     resolve_possess_pose_with_crowd,
@@ -1312,51 +1312,6 @@ impl CsgGpuHost {
     /// Takes freshly built scene metadata (viewpoints + collision-verified rails) once per rebuild.
     pub fn take_loaded_metadata(&mut self) -> Option<SceneLoadedMetadata> {
         self.pending_metadata.take()
-    }
-
-    /// Synthesizes a fresh deterministic, exact-CSG collision-verified random rail for the active scene.
-    pub fn generate_random_rail(&self, seed: u64) -> Result<RailSpec, String> {
-        let Some(ref scene) = self.scene else {
-            return Err("Load a CSG scene before generating a random rail".to_string());
-        };
-        let cfg = RailGenConfig {
-            seed,
-            ..RailGenConfig::default()
-        };
-        generate_random_rail(&scene.world, &scene.hints, seed, &cfg)
-            .map_err(|e| format!("Random rail gen failed: {e}"))
-    }
-
-    /// Synthesizes up to 4 distinct collision-verified multi-landmark & street-network smart rail
-    /// candidates using the active scene's `world`, `hints`, and curated `viewpoints`.
-    pub fn build_smart_rail_candidates(&self, seed: u64) -> Result<Vec<RailSpec>, String> {
-        let Some(ref scene) = self.scene else {
-            return Err("Load a CSG scene before running Smart Rail".to_string());
-        };
-        let cfg = RailGenConfig {
-            seed,
-            ..RailGenConfig::default()
-        };
-        let rails = csg_scene::rail_gen::build_smart_rail_candidates(
-            &scene.world,
-            &scene.hints,
-            &scene.viewpoints,
-            seed,
-            &cfg,
-        );
-        if rails.is_empty() {
-            let single = csg_scene::rail_gen::build_smart_rail(
-                &scene.world,
-                &scene.hints,
-                &scene.viewpoints,
-                seed,
-                &cfg,
-            )
-            .map_err(|e| format!("Smart rail gen failed: {e}"))?;
-            Ok(vec![single])
-        } else {
-            Ok(rails)
-        }
     }
 
     /// Returns references to the active `WorldScene` and `SceneHints`, if a CSG scene is loaded.
@@ -3824,46 +3779,6 @@ mod tests {
             unmapped, 0,
             "every crowd bone must stay mapped after mark_crowd_bones_visible so GPU scatter can revive culled actors"
         );
-    }
-
-    #[test]
-    fn smart_rail_candidates_builds_verified_multi_landmark_rails_for_gundo() {
-        let mut host = CsgGpuHost::new();
-        let gundo_idx = host
-            .registry
-            .descriptors()
-            .iter()
-            .position(|d| d.id == "gundo")
-            .expect("gundo registered");
-        let module = host
-            .registry
-            .get_by_index(gundo_idx)
-            .expect("gundo module");
-        let built = module.build(&SceneBuildConfig::default()).expect("scene builds");
-        host.scene_key = CsgSceneKey {
-            scene_idx: (gundo_idx + 1) as u32,
-            variant_idx: 0,
-            seed: 2026,
-            road_mode: 2,
-        };
-        host.active_reg_idx = Some(gundo_idx);
-        host.scene = Some(built);
-
-        let rails = host
-            .build_smart_rail_candidates(42)
-            .expect("build_smart_rail_candidates on Gundo");
-        assert!(
-            !rails.is_empty(),
-            "build_smart_rail_candidates must return at least one verified rail"
-        );
-        for rail in &rails {
-            assert!(
-                rail.waypoints.len() >= 4,
-                "smart rail '{}' should visit multiple waypoints, got {}",
-                rail.label,
-                rail.waypoints.len()
-            );
-        }
     }
 
     #[test]

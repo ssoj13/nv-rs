@@ -1,0 +1,443 @@
+{
+  "format_version": 1,
+  "id": "50b8a52982be652d2bff137e410885a54c90df8b676c04b8a7eaca207e02e4d4",
+  "name": "Gundo Coastal Demo",
+  "created_utc": "2026-11-25T08:30:00Z",
+  "scene": {
+    "id": "gundo",
+    "content_hash": ""
+  },
+  "generator": null,
+  "plan": null,
+  "track": {
+    "segments": [
+      {
+        "Shot": {
+          "params": {
+            "Establishing": {
+              "eye_start": [
+                -55.0,
+                38.0,
+                -140.0
+              ],
+              "eye_end": [
+                -36.0,
+                26.0,
+                -85.0
+              ],
+              "target_start": [
+                40.0,
+                14.0,
+                -10.0
+              ],
+              "target_end": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "lens_start": {
+                "focal_mm": 28.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              },
+              "lens_end": {
+                "focal_mm": 35.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            }
+          },
+          "duration_s": 8.0,
+          "speed_profile": {
+            "kind": "Normal",
+            "keys": [
+              {
+                "s": 0.0,
+                "v": 7.4267254,
+                "rule": "Base"
+              }
+            ],
+            "chases": []
+          },
+          "time_law": null,
+          "limits": {
+            "lateral_accel": 12.0,
+            "yaw_rate_deg_s": 30.0,
+            "bank_k": 0.6,
+            "max_bank_deg": 35.0,
+            "bank_rate_deg_s": 60.0,
+            "bank_accel_deg_s2": 216.0,
+            "long_accel": 3.0,
+            "long_decel": 4.0,
+            "jerk": 4.0,
+            "v_min": 1.0
+          }
+        }
+      },
+      {
+        "Transition": {
+          "from": {
+            "state": {
+              "eye": [
+                -36.0,
+                26.0,
+                -85.0
+              ],
+              "orientation": [
+                0.021338442,
+                0.9393761,
+                0.05947742,
+                -0.33701566
+              ],
+              "target": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "lens": {
+                "focal_mm": 35.000004,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            },
+            "vel": [
+              2.3750305,
+              -1.499939,
+              6.8763733
+            ],
+            "acc": [
+              0.0,
+              0.0,
+              0.30517578
+            ],
+            "ang_vel": [
+              -0.0030720606,
+              0.010561943,
+              0.002527982
+            ],
+            "zoom_rate": 0.027871132
+          },
+          "to": {
+            "state": {
+              "eye": [
+                -2.487072,
+                26.0,
+                -50.126774
+              ],
+              "orientation": [
+                0.034289718,
+                0.94506323,
+                0.105374165,
+                -0.30753213
+              ],
+              "target": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "lens": {
+                "focal_mm": 35.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            },
+            "vel": [
+              5.7662964,
+              0.0,
+              -4.197693
+            ],
+            "acc": [
+              0.0,
+              0.0,
+              1.0681152
+            ],
+            "ang_vel": [
+              0.0000037252903,
+              -0.1150012,
+              0.0000014901161
+            ],
+            "zoom_rate": 0.000023841858
+          },
+          "duration_s": 4.0,
+          "route": [],
+          "aim": "Squad",
+          "time_law": null,
+          "speed_profile": {
+            "kind": "Normal",
+            "keys": [
+              {
+                "s": 0.0,
+                "v": 12.09147,
+                "rule": "Base"
+              }
+            ],
+            "chases": []
+          },
+          "limits": {
+            "lateral_accel": 12.0,
+            "yaw_rate_deg_s": 30.0,
+            "bank_k": 0.6,
+            "max_bank_deg": 35.0,
+            "bank_rate_deg_s": 60.0,
+            "bank_accel_deg_s2": 216.0,
+            "long_accel": 3.0,
+            "long_decel": 4.0,
+            "jerk": 4.0,
+            "v_min": 1.0
+          }
+        }
+      },
+      {
+        "Shot": {
+          "params": {
+            "Orbit": {
+              "center": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "target": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "radius_m": 62.0,
+              "height_offset_m": 14.0,
+              "start_az_rad": -2.2,
+              "sweep_rad": 1.15,
+              "lens": {
+                "focal_mm": 35.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            }
+          },
+          "duration_s": 10.0,
+          "speed_profile": {
+            "kind": "Normal",
+            "keys": [
+              {
+                "s": 0.0,
+                "v": 7.1299996,
+                "rule": "Base"
+              }
+            ],
+            "chases": []
+          },
+          "time_law": null,
+          "limits": {
+            "lateral_accel": 12.0,
+            "yaw_rate_deg_s": 30.0,
+            "bank_k": 0.6,
+            "max_bank_deg": 35.0,
+            "bank_rate_deg_s": 60.0,
+            "bank_accel_deg_s2": 216.0,
+            "long_accel": 3.0,
+            "long_decel": 4.0,
+            "jerk": 4.0,
+            "v_min": 1.0
+          }
+        }
+      },
+      {
+        "Transition": {
+          "from": {
+            "state": {
+              "eye": [
+                64.8494,
+                26.0,
+                -53.78024
+              ],
+              "orientation": [
+                -0.02853048,
+                0.96033645,
+                0.10707714,
+                0.25587964
+              ],
+              "target": [
+                34.0,
+                12.0,
+                0.0
+              ],
+              "lens": {
+                "focal_mm": 35.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            },
+            "vel": [
+              6.188965,
+              0.0,
+              3.5495758
+            ],
+            "acc": [
+              0.30517578,
+              0.0,
+              0.91552734
+            ],
+            "ang_vel": [
+              -0.0000033527617,
+              -0.11503102,
+              0.0000014901163
+            ],
+            "zoom_rate": -0.000023841858
+          },
+          "to": {
+            "state": {
+              "eye": [
+                -24.0,
+                16.0,
+                45.0
+              ],
+              "orientation": [
+                -0.012223103,
+                -0.47181255,
+                -0.0065416056,
+                0.8815899
+              ],
+              "target": [
+                36.0,
+                14.0,
+                5.0
+              ],
+              "lens": {
+                "focal_mm": 32.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            },
+            "vel": [
+              -4.666519,
+              2.9996872,
+              8.333969
+            ],
+            "acc": [
+              0.0,
+              0.076293945,
+              -0.15258789
+            ],
+            "ang_vel": [
+              -0.02123788,
+              0.06018877,
+              -0.031845085
+            ],
+            "zoom_rate": 0.000047683716
+          },
+          "duration_s": 3.0,
+          "route": [],
+          "aim": "Squad",
+          "time_law": null,
+          "speed_profile": {
+            "kind": "Normal",
+            "keys": [
+              {
+                "s": 0.0,
+                "v": 44.4119,
+                "rule": "Base"
+              }
+            ],
+            "chases": []
+          },
+          "limits": {
+            "lateral_accel": 12.0,
+            "yaw_rate_deg_s": 30.0,
+            "bank_k": 0.6,
+            "max_bank_deg": 35.0,
+            "bank_rate_deg_s": 60.0,
+            "bank_accel_deg_s2": 216.0,
+            "long_accel": 3.0,
+            "long_decel": 4.0,
+            "jerk": 4.0,
+            "v_min": 1.0
+          }
+        }
+      },
+      {
+        "Shot": {
+          "params": {
+            "PullOut": {
+              "eye_start": [
+                -24.0,
+                16.0,
+                45.0
+              ],
+              "eye_end": [
+                -52.0,
+                34.0,
+                95.0
+              ],
+              "target": [
+                36.0,
+                14.0,
+                5.0
+              ],
+              "lens": {
+                "focal_mm": 32.0,
+                "film": {
+                  "width_mm": 36.0,
+                  "height_mm": 24.0
+                },
+                "focus_m": null,
+                "f_stop": null
+              }
+            }
+          },
+          "duration_s": 6.0,
+          "speed_profile": {
+            "kind": "Normal",
+            "keys": [
+              {
+                "s": 0.0,
+                "v": 10.011106,
+                "rule": "Base"
+              }
+            ],
+            "chases": []
+          },
+          "time_law": null,
+          "limits": {
+            "lateral_accel": 12.0,
+            "yaw_rate_deg_s": 30.0,
+            "bank_k": 0.6,
+            "max_bank_deg": 35.0,
+            "bank_rate_deg_s": 60.0,
+            "bank_accel_deg_s2": 216.0,
+            "long_accel": 3.0,
+            "long_decel": 4.0,
+            "jerk": 4.0,
+            "v_min": 1.0
+          }
+        }
+      }
+    ],
+    "looping": true
+  }
+}

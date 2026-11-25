@@ -5,11 +5,11 @@
 
 mod app_events;
 mod bench;
-mod camera_rail;
 mod csg_scene_host;
 mod cuda_crowd;
 mod demo_anim;
 mod fft_bloom;
+mod flight;
 mod flight_stats;
 mod gpu_export;
 mod is_counters;
@@ -2900,7 +2900,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         scene_descriptors: Vec<csg_scene::SceneDescriptor>,
         scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
         pending_scene_auto_frame: Option<(u32, u32)>,
-        rail_random_seed: u64,
         smart_view_seed: u64,
         possess_info: Option<PossessInfo>,
         possess_free_yaw: f32,
@@ -2929,8 +2928,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
-        camera_rail: crate::camera_rail::CameraRail,
-        cam_damper: crate::camera_rail::CameraDamper,
+        flight_workspace: crate::flight::FlightWorkspace,
+        cam_damper: crate::flight::CameraDamper,
         rail_blend_remaining: f32,
         cam_driver: CameraDriver,
         last_cam_raw_input: Option<camera::input::RawInput>,
@@ -3055,6 +3054,24 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // A views run starts in its first view's scene.
                 let scene = match &b.target {
                     crate::bench::BenchTarget::Rail(_) => b.scene.clone(),
+                    crate::bench::BenchTarget::Track(path) => b.scene.clone().or_else(|| {
+                        flight_navigator::load_plan_track(path)
+                            .ok()
+                            .map(|tf| tf.scene.id)
+                            .filter(|id| !id.is_empty())
+                    }),
+                    crate::bench::BenchTarget::Playlist(path) => b.scene.clone().or_else(|| {
+                        let mut probe = crate::flight::player::FlightPlayer::new(
+                            crate::flight::default_repo_flights_dir(),
+                            crate::flight::default_user_flights_dir(),
+                        );
+                        probe.load_playlist(path).ok()?;
+                        probe
+                            .queue
+                            .first()
+                            .map(|s| s.scene_id.clone())
+                            .filter(|id| !id.is_empty())
+                    }),
                     crate::bench::BenchTarget::Views(v) => v.first().map(|v| v.scene.clone()),
                 };
                 if let Some(id) = scene {
@@ -3571,7 +3588,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 scene_descriptors,
                 scene_viewpoints: Vec::new(),
                 pending_scene_auto_frame: None,
-                rail_random_seed: 2026,
                 smart_view_seed: 42,
                 possess_info: None,
                 possess_free_yaw: 0.0,
@@ -3607,9 +3623,17 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
-                camera_rail: persisted.camera_rail.clone(),
+                flight_workspace: {
+                    let mut fw = crate::flight::FlightWorkspace::new(
+                        crate::flight::default_repo_flights_dir(),
+                        crate::flight::default_user_flights_dir(),
+                    );
+                    fw.lab.apply_persisted(&persisted.flight_lab);
+                    fw.player.apply_persisted(&persisted.flight_player);
+                    fw
+                },
                 cam_damper: {
-                    let mut d = crate::camera_rail::CameraDamper::default();
+                    let mut d = crate::flight::CameraDamper::default();
                     d.snap(cam_pose);
                     d
                 },
@@ -3641,8 +3665,57 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
 
+        /// Switches to the registered CSG scene matching `scene_id` without pausing `FlightPlayer`
+        /// (which may be waiting in `PlayerState::Loading` for `SceneMetaUpdated`).
+        fn request_scene_by_id(&mut self, scene_id: &str) {
+            let Some(pos) = self
+                .scene_descriptors
+                .iter()
+                .position(|d| d.id == scene_id)
+            else {
+                self.flight_workspace.player.status_msg =
+                    format!("Scene `{scene_id}` is not registered");
+                self.flight_workspace.player.stop();
+                return;
+            };
+            let scene_idx = (pos as u32) + 1;
+            if self.loaded_scene_key.map(|(s, _)| s) == Some(scene_idx) {
+                let variant_idx = self.loaded_scene_key.map_or(0, |(_, v)| v);
+                let scene_hash = format!(
+                    "{scene_id}:v{variant_idx}:r{}",
+                    self.flight_workspace.player.curated.len()
+                );
+                self.flight_workspace
+                    .player
+                    .notify_scene_loaded(scene_id, &scene_hash);
+                return;
+            }
+            if self.settings.csg_mode == scene_idx {
+                // Scene build is already in flight; wait for `RenderEvent::SceneMetaUpdated`.
+                return;
+            }
+            self.settings.csg_mode = scene_idx;
+            self.settings.csg_asset_idx = 0;
+            if self.bench.is_none()
+                && let Some(desc) = self.scene_descriptors.get(pos)
+            {
+                let tod_u32 = match desc.default_tod {
+                    csg_scene::TimeOfDay::Day => 0,
+                    csg_scene::TimeOfDay::Sunset => 1,
+                    csg_scene::TimeOfDay::Night => 2,
+                };
+                self.settings.csg_wetness = desc.default_wetness.clamp(0.0, 1.0);
+                crate::ui::apply_csg_time_of_day_preset(&mut self.settings, tod_u32);
+            }
+            self.pending_scene_auto_frame = None;
+            if self.possess_info.is_some() {
+                self.send_render(RenderControl::EjectPossess);
+            }
+        }
+
         /// Starts a waiting benchmark once the scene's rails are installed: selects the
-        /// requested cassette at rail time 0, starts the perf log and the 60 FPS lockstep.
+        /// requested rail, frozen track, or playlist at time 0, starts the perf log and the
+        /// 60 FPS lockstep.
         fn start_bench_if_ready(&mut self) {
             let Some(run) = self.bench.as_mut() else {
                 return;
@@ -3657,8 +3730,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if run.phase != crate::bench::BenchPhase::WaitingForRails {
                 return;
             }
-            let rail_id = match &run.args.target {
-                crate::bench::BenchTarget::Rail(id) => id.clone(),
+            let target = run.args.target.clone();
+            let scene_override = run.args.scene.clone();
+            let req_frames = run.args.frames;
+            let out_path = run.args.out.clone();
+            let warmup = run.args.warmup;
+            let image = run.args.image.clone();
+            let png_dir = run.args.png_dir.clone();
+
+            let total_dur_s: f32 = match target {
                 crate::bench::BenchTarget::Views(_) => {
                     run.phase = crate::bench::BenchPhase::Running;
                     self.tod_transition = None;
@@ -3672,38 +3752,126 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.bench_view_begin();
                     return;
                 }
+                crate::bench::BenchTarget::Rail(rail_id) => {
+                    if self
+                        .flight_workspace
+                        .player
+                        .select_curated_by_id(&rail_id)
+                        .is_none()
+                    {
+                        let ids: Vec<&str> = self
+                            .flight_workspace
+                            .player
+                            .curated
+                            .iter()
+                            .map(|c| c.id.as_str())
+                            .collect();
+                        run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                            "rail {:?} not in this scene (available: {})",
+                            rail_id,
+                            ids.join(", ")
+                        )));
+                        return;
+                    }
+                    self.flight_workspace.player.duration_s() as f32
+                }
+                crate::bench::BenchTarget::Track(path) => {
+                    if let Err(err) = self.flight_workspace.player.load_bench_track(&path) {
+                        run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                            "bench track {}: {err}",
+                            path.display()
+                        )));
+                        return;
+                    }
+                    let track_scene = self
+                        .flight_workspace
+                        .player
+                        .active_slot()
+                        .map(|s| s.scene_id.clone())
+                        .unwrap_or_default();
+                    if scene_override.is_none()
+                        && !track_scene.is_empty()
+                        && self.flight_workspace.player.active_scene_id != track_scene
+                    {
+                        let Some(pos) = self
+                            .scene_descriptors
+                            .iter()
+                            .position(|d| d.id == track_scene)
+                        else {
+                            let ids: Vec<&str> =
+                                self.scene_descriptors.iter().map(|d| d.id).collect();
+                            run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                                "bench track {}: scene {:?} is not registered (available: {})",
+                                path.display(),
+                                track_scene,
+                                ids.join(", ")
+                            )));
+                            return;
+                        };
+                        self.settings.csg_mode = (pos as u32) + 1;
+                        self.settings.csg_asset_idx = 0;
+                        return;
+                    }
+                    self.flight_workspace.player.duration_s() as f32
+                }
+                crate::bench::BenchTarget::Playlist(path) => {
+                    if let Err(err) = self.flight_workspace.player.load_bench_playlist(&path) {
+                        run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                            "bench playlist {}: {err}",
+                            path.display()
+                        )));
+                        return;
+                    }
+                    if scene_override.is_some() {
+                        let pinned = self.flight_workspace.player.active_scene_id.clone();
+                        for slot in &mut self.flight_workspace.player.queue {
+                            slot.scene_id.clone_from(&pinned);
+                        }
+                        let _ = self.flight_workspace.player.play();
+                    } else if let crate::flight::player::PlayerState::Loading { scene_id } =
+                        self.flight_workspace.player.state.clone()
+                    {
+                        let Some(pos) = self
+                            .scene_descriptors
+                            .iter()
+                            .position(|d| d.id == scene_id)
+                        else {
+                            let ids: Vec<&str> =
+                                self.scene_descriptors.iter().map(|d| d.id).collect();
+                            run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                                "bench playlist {}: scene {:?} is not registered (available: {})",
+                                path.display(),
+                                scene_id,
+                                ids.join(", ")
+                            )));
+                            return;
+                        };
+                        self.settings.csg_mode = (pos as u32) + 1;
+                        self.settings.csg_asset_idx = 0;
+                        return;
+                    }
+                    self.flight_workspace
+                        .player
+                        .queue
+                        .iter()
+                        .map(|s| s.track.duration_s() + f64::from(s.hold_s.max(0.0)))
+                        .sum::<f64>() as f32
+                }
             };
-            let rails = self.camera_rail.scene_rails();
-            let Some(idx) = rails.iter().position(|r| r.spec.id == rail_id) else {
-                let ids: Vec<&str> = rails.iter().map(|r| r.spec.id.as_str()).collect();
-                run.phase = crate::bench::BenchPhase::Done(Err(format!(
-                    "rail {:?} not in this scene (available: {})",
-                    rail_id,
-                    ids.join(", ")
-                )));
-                return;
-            };
-            self.camera_rail.select_scene_rail(idx);
-            if !self.camera_rail.set_playing(true) {
-                run.phase = crate::bench::BenchPhase::Done(Err(format!(
-                    "rail {:?} cannot play",
-                    rail_id
-                )));
-                return;
-            }
-            let frames = run.args.frames.unwrap_or_else(|| {
+
+            let frames = req_frames.unwrap_or_else(|| {
                 crate::bench::loop_frames(
-                    self.camera_rail.duration_s,
+                    total_dur_s,
                     RECORD_FPS,
                     self.settings.clamped_time_scale(),
                 )
             });
             let start = RenderControl::StartPerfLog {
-                path: run.args.out.clone(),
+                path: out_path,
                 frames,
-                warmup: run.args.warmup,
-                image: run.args.image.clone(),
-                png_dir: run.args.png_dir.clone(),
+                warmup,
+                image,
+                png_dir,
             };
             run.phase = crate::bench::BenchPhase::Running;
             self.tod_transition = None;
@@ -3780,7 +3948,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 self.cam_pose.znear,
                 self.cam_pose.zfar.max(2000.0),
             );
-            self.camera_rail.set_playing(false);
+            self.flight_workspace.player.stop();
             self.cam_driver.controller_mut().set_pose(pose);
             self.cam_driver.controller_mut().set_orbit_distance(dist);
             self.cam_pose = self.cam_driver.controller().pose();
@@ -3846,7 +4014,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.cam_feel,
                     self.cam_pose,
                 ),
-                camera_rail: self.camera_rail.clone(),
+                flight_lab: self.flight_workspace.lab.to_persisted(),
+                flight_player: self.flight_workspace.player.to_persisted(),
                 scene: saved_scene_of(
                     &self.scene_descriptors,
                     self.settings.csg_mode,
@@ -3993,15 +4162,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
 
-            // Flight stats belong to one Auto-Drive run of one cassette.
-            let rail_active = self.camera_rail.is_active();
+            // Flight stats belong to one playback run of one active track.
+            let rail_active = self.flight_workspace.player.is_active();
+            let active_track_id = self.flight_workspace.player.active_id();
             if rail_active
-                && (!self.flight_rail_active
-                    || self.flight_rail_id != self.camera_rail.selected_rail_id)
+                && (!self.flight_rail_active || self.flight_rail_id != active_track_id)
             {
                 self.flight.reset();
-                self.flight_rail_id
-                    .clone_from(&self.camera_rail.selected_rail_id);
+                self.flight_rail_id.clear();
+                self.flight_rail_id.push_str(active_track_id);
             }
             self.flight_rail_active = rail_active;
 
@@ -4087,8 +4256,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             let st = &msg.csg_stats;
                             self.flight.push(
                                 &msg.perf,
-                                self.camera_rail.time_s,
-                                self.camera_rail.duration_s,
+                                self.flight_workspace.player.time_s as f32,
+                                self.flight_workspace.player.duration_s() as f32,
                                 msg.rendered_camera.fwd,
                                 crate::flight_stats::SceneLoad {
                                     visible: st.visible_instances,
@@ -4102,15 +4271,29 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     RenderEvent::SceneMetaUpdated(meta) => {
                         self.loaded_scene_key = Some((meta.scene_idx, meta.variant_idx));
                         self.scene_viewpoints = meta.viewpoints.clone();
-                        self.camera_rail.set_scene_rails(meta.rails.clone());
-                        if self.camera_rail.is_active() {
+                        let scene_id = meta
+                            .scene_idx
+                            .checked_sub(1)
+                            .and_then(|i| self.scene_descriptors.get(i as usize))
+                            .map_or("classic", |d| d.id);
+                        let scene_hash =
+                            format!("{scene_id}:v{}:r{}", meta.variant_idx, meta.rails.len());
+                        self.flight_workspace.player.set_curated_rails(
+                            scene_id,
+                            &scene_hash,
+                            &meta.rails,
+                        );
+                        self.flight_workspace
+                            .player
+                            .notify_scene_loaded(scene_id, &scene_hash);
+                        if self.flight_workspace.player.is_active() {
                             self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
                         }
                         scene_rails_updated = true;
                         if self.pending_scene_auto_frame == Some((meta.scene_idx, meta.variant_idx))
                         {
                             self.pending_scene_auto_frame = None;
-                            if !self.camera_rail.is_active()
+                            if !self.flight_workspace.player.is_active()
                                 && let Some(vp) = self.scene_viewpoints.first()
                             {
                                 let eye_v = glam::Vec3::new(vp.eye.x, vp.eye.y, vp.eye.z);
@@ -4134,17 +4317,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             }
                         }
                     }
-                    RenderEvent::RailGenerated(rail_spec) => {
-                        self.camera_rail.push_generated_rail(rail_spec.clone());
-                        self.rail_blend_remaining = RAIL_BLEND_SECS;
-                    }
                     RenderEvent::IsCounts(c) => frame_is_counts = Some(*c),
                     RenderEvent::SelectionChanged(sel) => {
                         self.last_saved_msg = Some(crate::pick::selection_status(sel));
                     }
                     RenderEvent::PossessChanged(info) => {
                         if let Some(pinfo) = info {
-                            self.camera_rail.set_playing(false);
+                            self.flight_workspace.player.pause();
                             self.possess_free_yaw = 0.0;
                             self.possess_free_pitch = 0.0;
                             self.possess_zoom_offset = 0.0;
@@ -4186,7 +4365,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     RenderEvent::SmartViewReady(sv) => {
                         self.last_smart_view = Some(*sv);
-                        self.camera_rail.set_playing(false);
+                        self.flight_workspace.player.pause();
                         let pose = CameraPose::from_eye_forward_up(
                             Vec3::from_array(sv.eye),
                             Vec3::from_array(sv.forward),
@@ -4267,6 +4446,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             } else {
                 None
             };
+            let active_scene_label: &str = self
+                .settings
+                .csg_mode
+                .checked_sub(1)
+                .and_then(|idx| self.scene_descriptors.get(idx as usize))
+                .map_or("Classic", |d| d.name);
             let mut ui_ctx = UiContext {
                 bus: &self.bus,
                 settings: &mut self.settings,
@@ -4278,7 +4463,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 cam_driver: &mut self.cam_driver,
                 cam_home: self.cam_home,
                 cam_pose: &mut self.cam_pose,
-                camera_rail: &mut self.camera_rail,
+                flight_workspace: &mut self.flight_workspace,
+                active_scene_label,
                 cam_fixed_dt,
                 last_cam_raw_input: &mut self.last_cam_raw_input,
                 scratch: &mut self.ui_scratch,
@@ -4311,7 +4497,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 crowd_actor_count: self.crowd_actor_count,
                 scene_descriptors: &self.scene_descriptors,
                 scene_viewpoints: &self.scene_viewpoints,
-                rail_random_seed: &mut self.rail_random_seed,
                 dlss_rr_available: self.dlss_rr_available,
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
@@ -4347,9 +4532,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
             let mut reset_accum_requested = false;
             let mut cam_snap_requested = false;
-            let mut rail_blend_requested = false;
             let mut select_scene_target: Option<(u32, u32)> = None;
-            let mut generate_random_rail_seed: Option<u64> = None;
+            let mut flight_commands: Vec<crate::flight::FlightCommand> = Vec::new();
             let mut save_png_requested = false;
             let mut save_jpeg_requested = false;
             let mut export_sdg_json_requested = false;
@@ -4361,7 +4545,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let mut cycle_possess_mount_delta: i32 = 0;
             let mut eject_possess_requested = false;
             let mut run_smart_view: Option<(u64, csg_scene::ProbeBackendKind)> = None;
-            let mut run_smart_rail: Option<(u64, csg_scene::ProbeBackendKind)> = None;
             let mut poke_crowd_req: Option<(f32, bool)> = None;
             let mut spawn_crowd_stress: Option<usize> = None;
             let mut start_sdg_burst: Option<u32> = None;
@@ -4376,7 +4559,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 let Some(cmd) = downcast_event::<UiCommand>(boxed) else {
                     continue;
                 };
-                match *cmd {
+                match cmd {
                     UiCommand::ResetAccum => reset_accum_requested = true,
                     UiCommand::SaveStill(StillFormat::Png) => save_png_requested = true,
                     UiCommand::SaveStill(StillFormat::Jpeg) => save_jpeg_requested = true,
@@ -4388,48 +4571,44 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         scene_idx,
                         variant_idx,
                     } => {
-                        select_scene_target = Some((scene_idx, variant_idx));
+                        select_scene_target = Some((*scene_idx, *variant_idx));
                     }
                     UiCommand::SetRoadMode(mode) => {
-                        self.settings.csg_road_mode = mode.min(3);
+                        self.settings.csg_road_mode = (*mode).min(3);
                         reset_accum_requested = true;
                     }
                     UiCommand::ToggleFreezePose => {
                         self.settings.csg_freeze_pose = !self.settings.csg_freeze_pose;
                         reset_accum_requested = true;
                     }
-                    UiCommand::GenerateRandomRail { seed } => {
-                        generate_random_rail_seed = Some(seed);
+                    UiCommand::Flight(fcmd) => {
+                        flight_commands.push(fcmd.clone());
                     }
                     UiCommand::SnapCamera => cam_snap_requested = true,
-                    UiCommand::BlendRail => rail_blend_requested = true,
-                    UiCommand::Pick(req) => self.send_render(RenderControl::Pick(req)),
+                    UiCommand::Pick(req) => self.send_render(RenderControl::Pick(*req)),
                     UiCommand::PossessNextVehicle => possess_next_vehicle_requested = true,
                     UiCommand::SelectPossessMount { mount_idx } => {
-                        select_possess_mount = Some(mount_idx);
+                        select_possess_mount = Some(*mount_idx);
                     }
                     UiCommand::CyclePossessMount { delta } => {
-                        cycle_possess_mount_delta += delta;
+                        cycle_possess_mount_delta += *delta;
                     }
                     UiCommand::EjectPossess => eject_possess_requested = true,
                     UiCommand::RunSmartView { seed, backend } => {
-                        run_smart_view = Some((seed, backend));
-                    }
-                    UiCommand::RunSmartRail { seed, backend } => {
-                        run_smart_rail = Some((seed, backend));
+                        run_smart_view = Some((*seed, *backend));
                     }
                     UiCommand::PokeCrowd { impulse, all } => {
-                        poke_crowd_req = Some((impulse, all));
+                        poke_crowd_req = Some((*impulse, *all));
                     }
                     UiCommand::SpawnCrowdStress { target_count } => {
-                        spawn_crowd_stress = Some(target_count);
+                        spawn_crowd_stress = Some(*target_count);
                     }
                     UiCommand::StartSdgBurst { frames } => {
-                        start_sdg_burst = Some(frames);
+                        start_sdg_burst = Some(*frames);
                     }
                     UiCommand::CancelSdgBurst => cancel_sdg_burst_requested = true,
                     UiCommand::SetTimeOfDay(tod) => {
-                        let target_tod = tod.min(2);
+                        let target_tod = (*tod).min(2);
                         if self.settings.tod_transition_enabled
                             && self.settings.tod_transition_secs > 0.05
                         {
@@ -4446,6 +4625,33 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             );
                         }
                     }
+                }
+            }
+            for fcmd in flight_commands {
+                let outcome = self.flight_workspace.apply_command(fcmd, self.cam_pose);
+                if outcome.snap_cam {
+                    if let Some(pose) = self.flight_workspace.player.evaluate_current(
+                        self.cam_pose.znear,
+                        self.cam_pose.zfar.max(2000.0),
+                    ) {
+                        self.cam_pose = pose;
+                        self.cam_driver.controller_mut().set_pose(pose);
+                        self.cam_damper.snap(pose);
+                        self.rail_blend_remaining = 0.0;
+                    }
+                    cam_snap_requested = true;
+                }
+                if outcome.reset_stats {
+                    self.flight.reset();
+                }
+                if outcome.toggle_record_playlist {
+                    toggle_record_requested = true;
+                }
+                if let Some(scene_id) = outcome.request_scene_id {
+                    self.request_scene_by_id(&scene_id);
+                }
+                if self.flight_workspace.player.is_active() && self.possess_info.is_some() {
+                    eject_possess_requested = true;
                 }
             }
             if self.theme != prev_theme {
@@ -5076,6 +5282,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.export_worker.finish_video(active.session_id, None);
                     self.last_saved_msg = Some("Finalizing MP4...".to_string());
                     self.is_recording = false;
+                    self.flight_workspace.player.recording_playlist = false;
                     self.record_frames = 0;
                     self.notify_recording(false);
                 } else if self.render_fatal.is_some() {
@@ -5264,16 +5471,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     // Classic unloads the CSG world: returning to the previous scene rebuilds it.
                     self.loaded_scene_key = None;
                 }
-                self.camera_rail.set_playing(false);
+                if !matches!(
+                    self.flight_workspace.player.state,
+                    crate::flight::player::PlayerState::Loading { .. }
+                ) {
+                    self.flight_workspace.player.pause();
+                }
                 if self.possess_info.is_some() {
                     self.send_render(RenderControl::EjectPossess);
                 }
-            }
-            if let Some(seed) = generate_random_rail_seed {
-                if self.possess_info.is_some() {
-                    self.send_render(RenderControl::EjectPossess);
-                }
-                self.send_render(RenderControl::GenerateRandomRail { seed });
             }
             if possess_next_vehicle_requested {
                 self.send_render(RenderControl::PossessNextVehicle);
@@ -5294,9 +5500,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let Some((seed, backend)) = run_smart_view {
                 self.send_render(RenderControl::RunSmartView { seed, backend });
             }
-            if let Some((seed, backend)) = run_smart_rail {
-                self.send_render(RenderControl::RunSmartRail { seed, backend });
-            }
             if reload_shader_requested {
                 self.send_render(RenderControl::ReloadShader);
             }
@@ -5310,12 +5513,6 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             } else {
                 1
             };
-            if rail_blend_requested {
-                if self.possess_info.is_some() {
-                    self.send_render(RenderControl::EjectPossess);
-                }
-                self.rail_blend_remaining = RAIL_BLEND_SECS;
-            }
             if cam_snap_requested {
                 self.rail_blend_remaining = 0.0;
                 self.cam_damper.snap(self.cam_pose);
@@ -5336,28 +5533,40 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     let frame_dt = time_scale / RECORD_FPS as f32;
                     let mut final_settings = self.last_sent_settings;
                     let mut final_cam = self.last_sent_camera;
+                    let mut stop_playlist_record = false;
                     for sub_idx in 0..shutter_n {
                         let sub_dt =
-                            crate::camera_rail::shutter_subframe_dt(frame_dt, sub_idx, shutter_n);
+                            crate::flight::shutter_subframe_dt(frame_dt, sub_idx, shutter_n);
                         self.demo_anim.tick(sub_dt);
                         if let Some(tr) = self.tod_transition.as_mut()
                             && tr.step(&mut self.settings, sub_dt)
                         {
                             self.tod_transition = None;
                         }
-                        if self.camera_rail.is_active() {
-                            self.camera_rail.tick(sub_dt);
-                            if let Some(rp) = self
-                                .camera_rail
-                                .evaluate_current(self.cam_pose.znear, self.cam_pose.zfar.max(2000.0))
-                            {
-                                self.cam_pose = rp;
-                                self.cam_driver.controller_mut().set_pose(rp);
-                                if bench_lockstep {
-                                    // The benchmark renders the rail pose itself, not a glide
+                        if self.flight_workspace.player.is_active() {
+                            let was_rec_pl = self.flight_workspace.player.recording_playlist;
+                            if let Some(eval) = self.flight_workspace.player.tick(
+                                f64::from(sub_dt),
+                                self.cam_pose.znear,
+                                self.cam_pose.zfar.max(2000.0),
+                            ) {
+                                self.cam_pose = eval.pose;
+                                self.cam_driver.controller_mut().set_pose(eval.pose);
+                                if eval.cut_before {
+                                    self.rail_blend_remaining = 0.0;
+                                    self.cam_damper.snap(eval.pose);
+                                    self.reset_seq = self.reset_seq.wrapping_add(1);
+                                } else if bench_lockstep {
+                                    // The benchmark renders the track pose itself, not a glide
                                     // from wherever the camera was when the scene loaded.
-                                    self.cam_damper.snap(rp);
+                                    self.cam_damper.snap(eval.pose);
                                 }
+                                if let Some(req_scene) = eval.request_scene_id {
+                                    self.request_scene_by_id(&req_scene);
+                                }
+                            }
+                            if was_rec_pl && !self.flight_workspace.player.recording_playlist {
+                                stop_playlist_record = true;
                             }
                         } else if self.possess_info.is_none() {
                             let raw = lockstep_subframe_raw_input(
@@ -5419,6 +5628,16 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         possess_zoom_offset: self.possess_zoom_offset,
                     });
                     self.shutter_in_flight = true;
+                    if stop_playlist_record
+                        && self.is_recording
+                        && let Some(active) = self.video_recorder.take()
+                    {
+                        self.export_worker.finish_video(active.session_id, None);
+                        self.last_saved_msg = Some("Playlist recorded; finalizing MP4...".to_string());
+                        self.is_recording = false;
+                        self.record_frames = 0;
+                        self.notify_recording(false);
+                    }
                 } else {
                     let mut effective_settings = self.demo_anim.apply(&self.settings);
                     if !self.demo_anim.playing {
@@ -5446,21 +5665,44 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             } else {
                 let (step_dt, damper_dt) =
-                    live_step_dts(dt, time_scale, self.camera_rail.is_active());
+                    live_step_dts(dt, time_scale, self.flight_workspace.player.is_active());
                 self.demo_anim.tick(step_dt);
                 if let Some(tr) = self.tod_transition.as_mut()
                     && tr.step(&mut self.settings, step_dt)
                 {
                     self.tod_transition = None;
                 }
-                if self.camera_rail.is_active() {
-                    self.camera_rail.tick(step_dt);
-                    if let Some(rp) = self
-                        .camera_rail
-                        .evaluate_current(self.cam_pose.znear, self.cam_pose.zfar.max(2000.0))
+                let mut cut_reset = false;
+                if self.flight_workspace.player.is_active() {
+                    let was_rec_pl = self.flight_workspace.player.recording_playlist;
+                    if let Some(eval) = self.flight_workspace.player.tick(
+                        f64::from(step_dt),
+                        self.cam_pose.znear,
+                        self.cam_pose.zfar.max(2000.0),
+                    ) {
+                        self.cam_pose = eval.pose;
+                        self.cam_driver.controller_mut().set_pose(eval.pose);
+                        if eval.cut_before {
+                            self.rail_blend_remaining = 0.0;
+                            self.cam_damper.snap(eval.pose);
+                            self.reset_seq = self.reset_seq.wrapping_add(1);
+                            cut_reset = true;
+                        }
+                        if let Some(req_scene) = eval.request_scene_id {
+                            self.request_scene_by_id(&req_scene);
+                        }
+                    }
+                    if was_rec_pl
+                        && !self.flight_workspace.player.recording_playlist
+                        && self.is_recording
+                        && let Some(active) = self.video_recorder.take()
                     {
-                        self.cam_pose = rp;
-                        self.cam_driver.controller_mut().set_pose(rp);
+                        self.export_worker.finish_video(active.session_id, None);
+                        self.last_saved_msg =
+                            Some("Playlist recorded; finalizing MP4...".to_string());
+                        self.is_recording = false;
+                        self.record_frames = 0;
+                        self.notify_recording(false);
                     }
                 }
                 let effective_tau = if self.rail_blend_remaining > 0.0 {
@@ -5478,13 +5720,14 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 let cam_frame = pose_to_frame(render_pose);
                 if reset_accum_requested
+                    || cut_reset
                     || effective_settings != self.last_sent_settings
                     || cam_frame != self.last_sent_camera
                     || possess_look != self.last_sent_possess_look
                 {
                     let automated_motion = self.is_recording
                         || self.demo_anim.is_running()
-                        || self.camera_rail.is_active()
+                        || self.flight_workspace.player.is_active()
                         || self.tod_transition.is_some();
                     self.interacting_until = if automated_motion {
                         None

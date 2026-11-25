@@ -204,7 +204,8 @@ pub struct PersistedState {
     pub settings: DemoSettings,
     pub demo_anim: DemoAnimator,
     pub camera: CameraState,
-    pub camera_rail: crate::camera_rail::CameraRail,
+    pub flight_lab: crate::flight::lab::PersistedLabPrefs,
+    pub flight_player: crate::flight::player::PersistedPlayerPrefs,
     pub scene: Option<SavedScene>,
     pub viewport_toolbar: PersistedToolbar,
     /// `egui_dock::DockState<DockTab>` as JSON (`DockState` has no `PartialEq`, which the
@@ -338,7 +339,8 @@ fn parse_sections(text: &str) -> (PersistedState, Vec<String>) {
     section(obj, "settings", &mut st.settings, &mut errors);
     section(obj, "demo_anim", &mut st.demo_anim, &mut errors);
     section(obj, "camera", &mut st.camera, &mut errors);
-    section(obj, "camera_rail", &mut st.camera_rail, &mut errors);
+    section(obj, "flight_lab", &mut st.flight_lab, &mut errors);
+    section(obj, "flight_player", &mut st.flight_player, &mut errors);
     section(obj, "scene", &mut st.scene, &mut errors);
     section(obj, "viewport_toolbar", &mut st.viewport_toolbar, &mut errors);
     section(obj, "dock", &mut st.dock, &mut errors);
@@ -587,22 +589,23 @@ mod tests {
         state.settings.cam_smooth_tau = 0.25;
         state.settings.time_scale = 0.5;
         state.settings.record_shutter_subframes = 4;
-        state.camera_rail.selected_rail_id = "landmark_slalom".to_string();
-        state.camera_rail.keyframes = vec![
-            crate::camera_rail::CameraKeyframe::from_look_at(
-                [-12.0, 4.0, -30.0],
-                [10.0, 5.0, 0.0],
-                50.0,
-            ),
-            crate::camera_rail::CameraKeyframe::from_look_at(
-                [18.0, 8.0, 40.0],
-                [40.0, 12.0, 90.0],
-                54.0,
-            ),
+        state.flight_player.selected_track_id = "landmark_slalom".to_string();
+        state.flight_player.shuffle = true;
+        state.flight_player.shuffle_seed = 99;
+        state.flight_lab.duration_s = 22.0;
+        state.flight_lab.manual_looping = false;
+        state.flight_lab.manual_keyframes = vec![
+            crate::flight::lab::ManualKeyframe {
+                pos: [-12.0, 4.0, -30.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                focal_mm: 35.0,
+            },
+            crate::flight::lab::ManualKeyframe {
+                pos: [18.0, 8.0, 40.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                focal_mm: 50.0,
+            },
         ];
-        state.camera_rail.duration_s = 22.0;
-        state.camera_rail.looping = true;
-        state.camera_rail.ease_io = false;
         state.camera = CameraState::from_runtime(
             NavMode::Trackball,
             NavMode::QuatFlightLocked,
@@ -639,8 +642,8 @@ mod tests {
         assert_eq!(report.problem, None);
         let loaded = report.state;
         assert_eq!(loaded, state);
-        assert_eq!(loaded.camera_rail.selected_rail_id, "landmark_slalom");
-        assert_eq!(loaded.camera_rail.keyframes.len(), 2);
+        assert_eq!(loaded.flight_player.selected_track_id, "landmark_slalom");
+        assert_eq!(loaded.flight_lab.manual_keyframes.len(), 2);
         assert_eq!(loaded.camera.nav_mode(), NavMode::Trackball);
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::QuatFlightLocked);
         assert_eq!(loaded.camera.nav_scheme(), NavScheme::Blender);
@@ -677,8 +680,8 @@ mod tests {
         assert_eq!(loaded.settings.cam_smooth_tau, 0.0);
         assert_eq!(loaded.settings.time_scale, 1.0);
         assert_eq!(loaded.settings.record_shutter_subframes, 1);
-        assert!(loaded.camera_rail.selected_rail_id.is_empty());
-        assert!(loaded.camera_rail.keyframes.is_empty());
+        assert!(loaded.flight_player.selected_track_id.is_empty());
+        assert!(loaded.flight_lab.manual_keyframes.is_empty());
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::FpsFly);
     }
 
@@ -730,7 +733,7 @@ mod tests {
     }
 
     /// F07: one unreadable section (unknown enum variant) only resets itself; the rest (here the
-    /// Custom rail keyframes and the window) still loads, and the problem is reported.
+    /// Flight Lab manual keyframes and the window) still loads, and the problem is reported.
     #[test]
     fn unreadable_section_keeps_the_other_sections() {
         let dir = std::env::temp_dir().join(format!("nv_demo_section_{}", std::process::id()));
@@ -738,9 +741,17 @@ mod tests {
         let path = dir.join("nv-demo.json");
         let mut good = PersistedState::default();
         good.window.width = 1500;
-        good.camera_rail.keyframes = vec![
-            crate::camera_rail::CameraKeyframe::from_look_at([0.0, 2.0, -9.0], [0.0, 1.0, 0.0], 50.0),
-            crate::camera_rail::CameraKeyframe::from_look_at([5.0, 3.0, 4.0], [0.0, 1.0, 0.0], 50.0),
+        good.flight_lab.manual_keyframes = vec![
+            crate::flight::lab::ManualKeyframe {
+                pos: [0.0, 2.0, -9.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                focal_mm: 35.0,
+            },
+            crate::flight::lab::ManualKeyframe {
+                pos: [5.0, 3.0, 4.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+                focal_mm: 50.0,
+            },
         ];
         let mut json: serde_json::Value = serde_json::to_value(&good).expect("to_value");
         json["theme"] = serde_json::Value::String("NoSuchThemeVariant".to_string());
@@ -751,7 +762,7 @@ mod tests {
         let problem = report.problem.expect("problem reported");
         assert!(problem.contains("theme"), "{problem}");
         assert_eq!(report.state.window.width, 1500);
-        assert_eq!(report.state.camera_rail.keyframes.len(), 2);
+        assert_eq!(report.state.flight_lab.manual_keyframes.len(), 2);
         assert_eq!(report.state.theme, UiTheme::default());
     }
 
@@ -819,7 +830,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nv_demo_dock_{}", std::process::id()));
         let path = dir.join("nv-demo.json");
         let custom = {
-            let mut d = egui_dock::DockState::new(vec![DockTab::Viewport, DockTab::CameraStats]);
+            let mut d = egui_dock::DockState::new(vec![
+                DockTab::Viewport,
+                DockTab::CameraStats,
+                DockTab::FlightPlayer,
+                DockTab::FlightLab,
+            ]);
             let s = d.main_surface_mut();
             let [_, right] =
                 s.split_right(egui_dock::NodeIndex::root(), 0.6, vec![DockTab::Fractal]);

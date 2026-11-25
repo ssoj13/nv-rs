@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "name": "Demo Showcase",
+  "entries": [
+    {
+      "track": {
+        "id": "50b8a52982be652d2bff137e410885a54c90df8b676c04b8a7eaca207e02e4d4",
+        "file_hint": "gundo_demo.fnav.json"
+      },
+      "transition_in": "Cut",
+      "hold_s": 0.0
+    }
+  ],
+  "repeat": "All",
+  "shuffle": false,
+  "shuffle_seed": 0
+}

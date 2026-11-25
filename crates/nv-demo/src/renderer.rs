@@ -2819,6 +2819,9 @@ fn init_optix(
         seed: initial_settings.csg_seed,
         road_mode: initial_settings.csg_road_mode.min(3),
     };
+    let initial_gpu_crowd = initial_settings.csg_mode > 0
+        && !initial_settings.csg_freeze_pose
+        && initial_settings.crowd_backend != CrowdBackend::Cpu;
     if let Err(err) = csg_host.sync(
         &optix_ctx,
         &stream,
@@ -2836,7 +2839,7 @@ fn init_optix(
             lod_config: initial_settings.csg_lod_config(),
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
-        false,
+        initial_gpu_crowd,
     ) {
         init_warnings.push(format!("Initial CSG scene sync failed: {err}"));
     }
@@ -5814,10 +5817,24 @@ pub fn spawn_render_thread(
                     lod_config: settings.csg_lod_config(),
                     omnidirectional: settings.camera_projection.is_omnidirectional(),
                 };
+                // Pack all crowd bones unculled both when GPU crowd runs this frame and on the
+                // initial scene-build frame (e.g. Classic -> CSG), when `has_crowd()` is still
+                // false before `sync` builds the new scene.
+                let sync_gpu_crowd = run_cuda_crowd_after_sync
+                    || (building_scene
+                        && settings.csg_mode > 0
+                        && !settings.csg_freeze_pose
+                        && settings.crowd_backend != CrowdBackend::Cpu);
                 let need_crowd_sync_before_csg = !building_scene
-                    && (rig.csg_host.will_camera_repack(csg_key, csg_cam_params)
+                    && (rig
+                        .csg_host
+                        .will_camera_repack(csg_key, csg_cam_params, sync_gpu_crowd)
                         || (!run_cuda_crowd_after_sync
-                            && rig.csg_host.will_upload_instances(csg_key, csg_cam_params)));
+                            && rig.csg_host.will_upload_instances(
+                                csg_key,
+                                csg_cam_params,
+                                sync_gpu_crowd,
+                            )));
                 if need_crowd_sync_before_csg
                     && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
                 {
@@ -5833,7 +5850,7 @@ pub fn spawn_render_thread(
                     settings.csg_wetness,
                     settings.csg_time_of_day,
                     csg_cam_params,
-                    run_cuda_crowd_after_sync,
+                    sync_gpu_crowd,
                 ) {
                     Ok(sync_res) => {
                         last_csg_sync_err = None;

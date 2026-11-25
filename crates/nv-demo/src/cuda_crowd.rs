@@ -384,6 +384,10 @@ extern "C" __global__ void prepare_crowd_steering_and_grounds(
                 const uint32_t start = span.x;
                 const uint32_t len = span.y;
                 if (len >= 2u) {
+                    // Clear stale CPU crosswalk yield-stop bit when GPU steering owns this
+                    // walkway-bound actor (matching CPU `CrowdNav::steer`), so switching from
+                    // `CrowdBackend::Cpu` to `Cuda` while yielding never freezes it.
+                    intent.flags &= ~ACTOR_INTENT_YIELD_STOP;
                     const uint32_t last_idx = len - 1u;
                     if (wp_idx > last_idx) wp_idx = last_idx;
                     float2 wp = walkway_pts[start + wp_idx];
@@ -2184,6 +2188,241 @@ mod tests {
         assert_eq!(
             vis_disabled, vis_400,
             "disabling LOD must keep full LOD0 bones regardless of lod_bias=0.25"
+        );
+    }
+
+    #[test]
+    #[ignore = "GPU"]
+    fn cuda_crowd_lod2_actors_move_in_vram_after_camera_repack() {
+        use crate::csg_scene_host::{
+            CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgSyncResult, default_scene_descriptors,
+        };
+        use csg_scene::{GpuInstance, LodConfig};
+        use optix::{DeviceContext, Scratch};
+
+        let ctx = CudaContext::new(0).expect("CUDA context on device 0");
+        ctx.bind_to_thread().expect("bind CUDA context");
+        let stream = ctx.default_stream();
+        let optix_ctx = DeviceContext::new(&ctx, None, 0, false).expect("OptiX context");
+        let mut scratch = Scratch::new(&stream);
+        let mut backend = CudaCrowdBackend::new(&ctx).expect("NVRTC compile actor_sim.cuh");
+        let mut host = CsgGpuHost::new();
+
+        let marina_idx = default_scene_descriptors()
+            .iter()
+            .position(|d| d.id == "marina")
+            .expect("marina registered");
+        let key = CsgSceneKey {
+            scene_idx: (marina_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+
+        // Initial build + pack with `gpu_crowd_active = true` (matches cold-start / Classic->CSG).
+        let init_cam = CsgCameraParams {
+            eye: [0.0, 2.0, -5.0],
+            fwd: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: std::f32::consts::FRAC_PI_3,
+            lod_config: LodConfig::default(),
+            omnidirectional: false,
+        };
+        let sync0 = host
+            .sync(
+                &optix_ctx,
+                &stream,
+                &mut scratch,
+                key,
+                0.0,
+                0,
+                init_cam,
+                true,
+            )
+            .expect("initial Marina sync");
+        assert_eq!(sync0, CsgSyncResult::FullRepack);
+
+        // Move to Marina viewpoint 0 (`vp0`), where ~88% of visible actors are in LOD2.
+        let vp = host
+            .take_loaded_metadata()
+            .and_then(|m| m.viewpoints.into_iter().next())
+            .expect("marina vp0");
+        let fwd = (vp.target - vp.eye).norm();
+        let vp0_cam = CsgCameraParams {
+            eye: [vp.eye.x, vp.eye.y, vp.eye.z],
+            fwd: [fwd.x, fwd.y, fwd.z],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: vp.vfov_deg.to_radians(),
+            lod_config: LodConfig::default(),
+            omnidirectional: false,
+        };
+        let lod = CrowdLodParams::default();
+        let dt = 1.0 / 60.0;
+
+        // Warmup GPU step at `vp0` so LOD2 actors emit `lod2_pawn_compound` on their root bone,
+        // then `sync_cpu_snapshot(..., true)` writes those pawn assemblies into `scene.world`
+        // right before the camera repack (reproducing the Marina `vp0` repack sequence).
+        {
+            let scene = host.active_scene_mut().expect("marina scene");
+            backend
+                .step_gpu_direct(&stream, scene, dt, dt, vp0_cam.eye, lod, None, false)
+                .expect("warmup GPU step at vp0");
+            stream.synchronize().expect("warmup fence");
+            backend
+                .sync_cpu_snapshot(&stream, scene, true)
+                .expect("sync_cpu_snapshot before repack");
+        }
+
+        let sync1 = host
+            .sync(
+                &optix_ctx,
+                &stream,
+                &mut scratch,
+                key,
+                0.0,
+                0,
+                vp0_cam,
+                true,
+            )
+            .expect("vp0 FullRepack");
+        assert_eq!(sync1, CsgSyncResult::FullRepack);
+
+        let mut slot_map = Vec::new();
+        let mut gas_handles = Vec::new();
+        host.fill_crowd_bone_slot_map(&mut slot_map);
+        host.fill_compound_gas_handles(&mut gas_handles);
+        let unmatched = slot_map.iter().filter(|&&s| s == u32::MAX).count();
+        assert_eq!(
+            unmatched, 0,
+            "all crowd bones (including LOD2 pawn roots) must map after camera repack"
+        );
+        backend
+            .upload_scatter_topology(&stream, &slot_map, &gas_handles, host.compound_sbt_offsets())
+            .expect("upload_scatter_topology");
+
+        // Also seed a stale `YIELD_STOP` flag on one patrolling LOD2 actor to verify GPU steering
+        // clears it (CPU->CUDA switch regression ratchet).
+        {
+            let scene = host.active_scene_mut().expect("marina scene");
+            let pawn_cid = scene
+                .crowd
+                .lod2_pawn_compound
+                .expect("marina must define lod2_pawn_compound");
+            let yield_actor = scene.crowd.descs.iter().enumerate().find_map(|(i, d)| {
+                let root = scene.crowd.bone_outs[d.bone_offset as usize];
+                let intent = scene.crowd.intents[i];
+                let is_vis_lod2_patrol = (root.flags & csg_actors::BONE_OUT_VISIBLE) != 0
+                    && root.compound_id == pawn_cid
+                    && (intent.flags & intent_flags::FREEZE_POSE) == 0
+                    && decode_walkway_target(intent.target_id).is_some();
+                is_vis_lod2_patrol.then_some(i)
+            });
+            let aidx = yield_actor.expect("Marina vp0 must have a visible patrolling LOD2 actor");
+            scene.crowd.intents[aidx].flags |= intent_flags::YIELD_STOP;
+            backend.mark_intents_dirty();
+        }
+
+        let ptrs = host.device_pointers();
+        let inst_count = ptrs.instance_count as usize;
+        assert!(ptrs.instances != 0 && inst_count > 0);
+        let scatter = GpuScatterTarget {
+            csg_instances_ptr: ptrs.instances,
+            csg_prev_xforms_ptr: ptrs.prev_xforms,
+            max_csg_instances: ptrs.instance_count,
+            optix_instances_ptr: 0,
+            optix_slot_offset: 0,
+            max_optix_instances: 0,
+        };
+
+        let download_instances = |stream: &Stream| -> Vec<GpuInstance> {
+            stream.synchronize().expect("fence before D2H");
+            let mut buf = vec![GpuInstance::default(); inst_count];
+            let bytes = inst_count * std::mem::size_of::<GpuInstance>();
+            // SAFETY: `ptrs.instances` holds `inst_count` `GpuInstance` pods (`bytes` bytes) on
+            // `ctx` and `stream.synchronize()` completed all prior scatter writes.
+            let rc = unsafe { cu::cuMemcpyDtoH_v2(buf.as_mut_ptr().cast(), ptrs.instances, bytes) };
+            assert_eq!(rc, cu::cudaError_enum_CUDA_SUCCESS, "cuMemcpyDtoH_v2 failed");
+            buf
+        };
+
+        // Baseline scattered VRAM state, then 30 frames of GPU-direct stepping (~0.5 s).
+        {
+            let scene = host.active_scene_mut().expect("marina scene");
+            backend
+                .step_gpu_direct(
+                    &stream,
+                    scene,
+                    dt,
+                    2.0 * dt,
+                    vp0_cam.eye,
+                    lod,
+                    Some(scatter),
+                    false,
+                )
+                .expect("baseline GPU scatter step");
+        }
+        let before = download_instances(&stream);
+        let mut mid = Vec::new();
+        for step in 0..30 {
+            let t = (step + 3) as f32 * dt;
+            let scene = host.active_scene_mut().expect("marina scene");
+            backend
+                .step_gpu_direct(&stream, scene, dt, t, vp0_cam.eye, lod, Some(scatter), false)
+                .expect("GPU scatter step");
+            if step == 14 {
+                mid = download_instances(&stream);
+            }
+        }
+        let after = download_instances(&stream);
+
+        let crowd = host.active_crowd().expect("marina crowd");
+        let pawn_cid = crowd
+            .lod2_pawn_compound
+            .expect("marina must define lod2_pawn_compound");
+        let disp_of = |a: &GpuInstance, b: &GpuInstance| -> f32 {
+            let dx = b.xform[3] - a.xform[3];
+            let dy = b.xform[7] - a.xform[7];
+            let dz = b.xform[11] - a.xform[11];
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        };
+        let mut lod2_checked = 0usize;
+        let mut lod2_frozen = 0usize;
+        for (aidx, desc) in crowd.descs.iter().enumerate() {
+            let root_gidx = desc.bone_offset as usize;
+            let slot = slot_map[root_gidx] as usize;
+            let b0 = &before[slot];
+            let bm = &mid[slot];
+            let b1 = &after[slot];
+            let is_vis_lod2 = (b0.flags & inst_flags::VISIBLE) != 0
+                && (b1.flags & inst_flags::VISIBLE) != 0
+                && b0.compound_id == pawn_cid
+                && b1.compound_id == pawn_cid;
+            if !is_vis_lod2 {
+                continue;
+            }
+            let intent = crowd.intents[aidx];
+            if (intent.flags & intent_flags::FREEZE_POSE) != 0
+                || decode_walkway_target(intent.target_id).is_none()
+            {
+                continue;
+            }
+            lod2_checked += 1;
+            let max_disp = disp_of(b0, bm).max(disp_of(b0, b1));
+            if !max_disp.is_finite() || max_disp <= 0.1 {
+                lod2_frozen += 1;
+            }
+        }
+        assert!(
+            lod2_checked > 0,
+            "Marina vp0 must have visible patrolling LOD2 actors to verify"
+        );
+        assert_eq!(
+            lod2_frozen, 0,
+            "{lod2_frozen}/{lod2_checked} visible patrolling LOD2 actors remained frozen (disp <= 0.1 m) in VRAM"
         );
     }
 }

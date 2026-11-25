@@ -88,8 +88,8 @@ const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
 
 const LABEL_W: f32 = 84.0;
 const VAL_W: f32 = 56.0;
-const ANIM_BTN_W: f32 = 16.0;
-const ROW_H: f32 = 14.0;
+pub(crate) const ANIM_BTN_W: f32 = 16.0;
+pub(crate) const ROW_H: f32 = 14.0;
 
 /// WGS84 semi-major equatorial radius in meters.
 const WGS84_A: f64 = 6_378_137.0;
@@ -106,6 +106,19 @@ fn active_geo_origin(descs: &[SceneDescriptor], csg_mode: u32) -> Option<csg_sce
         .checked_sub(1)
         .and_then(|i| descs.get(i as usize))
         .and_then(|d| d.geo_origin)
+}
+
+/// Maps a registered CSG scene identifier to its Phosphor icon for the single-row scene strip.
+fn scene_icon(scene_id: &str) -> &'static str {
+    match scene_id {
+        "gundo" | "gundo2" => ic::FACTORY,
+        "gundo_osm" => ic::MAP_TRIFOLD,
+        "marina" => ic::ANCHOR,
+        "sf_house_of_ai" | "sf_house" => ic::BUILDINGS,
+        "inspector" => ic::WRENCH,
+        "proving_ground_marina" | "proving_ground" => ic::COMPASS,
+        _ => ic::GLOBE,
+    }
 }
 
 /// `Inspector` variant index of the 4-archetype crowd showcase.
@@ -184,7 +197,7 @@ impl Default for UiScratch {
 
 /// Formats `args` into `buf` in place (clearing previous contents with zero reallocation once warmed).
 #[inline]
-fn fmt_into<'a>(buf: &'a mut String, args: std::fmt::Arguments<'_>) -> &'a str {
+pub(crate) fn fmt_into<'a>(buf: &'a mut String, args: std::fmt::Arguments<'_>) -> &'a str {
     buf.clear();
     // `std::fmt::Write` for `String` is infallible.
     let Ok(()) = std::fmt::write(buf, args) else {
@@ -2180,22 +2193,34 @@ impl UiContext<'_> {
                 let prev_mode = s.csg_mode;
                 let total_choices = descs.len() + 1;
 
-                // Scene selector buttons driven strictly by `SceneRegistry::descriptors()`.
-                let cols = total_choices.clamp(1, 3);
-                equal_grid(ui, cols, total_choices, |ui, idx, w| {
-                    let (mode, label, tip) = if idx == 0 {
-                        (0u32, "Off", "Classic SDF fractal + stage floor")
+                // Single-row Phosphor icon strip driven strictly by `SceneRegistry::descriptors()`.
+                equal_grid(ui, total_choices, total_choices, |ui, idx, w| {
+                    let (mode, icon, label, tip) = if idx == 0 {
+                        (
+                            0u32,
+                            ic::CUBE,
+                            "Off (Classic SDF Fractal)",
+                            "Classic SDF fractal + stage floor",
+                        )
                     } else if let Some(d) = descs.get(idx - 1) {
-                        (idx as u32, d.name, d.description)
+                        (idx as u32, scene_icon(d.id), d.name, d.description)
                     } else {
-                        (0u32, "Off", "")
+                        (0u32, ic::CUBE, "Off (Classic SDF Fractal)", "")
+                    };
+                    let mut btn = egui::Button::new(RichText::new(icon).size(13.0));
+                    if s.csg_mode == mode {
+                        btn = btn
+                            .fill(active_accent_tint(ui))
+                            .stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
+                    }
+                    let hover_tip = if tip.is_empty() {
+                        label.to_owned()
+                    } else {
+                        format!("{label}\n{tip}")
                     };
                     if ui
-                        .add_sized(
-                            [w, ROW_H + 2.0],
-                            egui::Button::selectable(s.csg_mode == mode, label),
-                        )
-                        .on_hover_text(tip)
+                        .add_sized([w, ROW_H + 6.0], btn)
+                        .on_hover_text(hover_tip)
                         .clicked()
                     {
                         s.csg_mode = mode;
@@ -2207,6 +2232,8 @@ impl UiContext<'_> {
                 } else {
                     descs.get((s.csg_mode as usize).saturating_sub(1))
                 };
+                let active_label = active_desc.map_or("Off (Classic SDF Fractal)", |d| d.name);
+                stat_row(ui, "Scene", active_label);
 
                 if s.csg_mode != prev_mode {
                     if let Some(desc) = active_desc {
@@ -4094,6 +4121,13 @@ fn section_accent(id_salt: &str) -> Color32 {
         "sec_cinema" => Color32::from_rgb(232, 148, 112),
         "sec_telemetry" => Color32::from_rgb(112, 172, 216),
         "sec_perf" => Color32::from_rgb(112, 184, 156),
+        "sec_flab_author" => Color32::from_rgb(92, 184, 224),
+        "sec_flab_dynamics" => Color32::from_rgb(104, 192, 186),
+        "sec_flab_contact" => Color32::from_rgb(216, 156, 78),
+        "sec_flab_stats" => Color32::from_rgb(112, 184, 156),
+        "sec_fplay_deck" => Color32::from_rgb(232, 148, 112),
+        "sec_fplay_queue" => Color32::from_rgb(138, 164, 212),
+        "sec_fplay_library" => Color32::from_rgb(166, 209, 137),
         _ => Color32::from_rgb(142, 149, 163),
     }
 }
@@ -4115,6 +4149,15 @@ const SECTION_GROUPS: &[&[&str]] = &[
     ],
     // Camera & Stats panel
     &["sec_cinema", "sec_telemetry", "sec_perf"],
+    // Flight Lab panel
+    &[
+        "sec_flab_author",
+        "sec_flab_dynamics",
+        "sec_flab_contact",
+        "sec_flab_stats",
+    ],
+    // Flight Player panel
+    &["sec_fplay_deck", "sec_fplay_queue", "sec_fplay_library"],
 ];
 
 fn section_group_for(id_salt: &str) -> &'static [&'static str] {
@@ -4137,10 +4180,15 @@ fn section_default_open(id_salt: &str) -> bool {
             | "sec_lod"
             | "sec_sky"
             | "sec_pt"
+            | "sec_flab_author"
+            | "sec_flab_dynamics"
+            | "sec_fplay_deck"
+            | "sec_fplay_queue"
+            | "sec_fplay_library"
     )
 }
 
-fn collapsing_section(
+pub(crate) fn collapsing_section(
     ui: &mut Ui,
     id_salt: &str,
     icon: &str,
@@ -4251,7 +4299,7 @@ fn collapsing_section(
     });
 }
 
-fn active_accent_tint(ui: &Ui) -> Color32 {
+pub(crate) fn active_accent_tint(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
         Color32::from_rgb(38, 70, 110)
     } else {
@@ -4259,7 +4307,7 @@ fn active_accent_tint(ui: &Ui) -> Color32 {
     }
 }
 
-fn hdr_amber_tint(ui: &Ui) -> Color32 {
+pub(crate) fn hdr_amber_tint(ui: &Ui) -> Color32 {
     if ui.visuals().dark_mode {
         Color32::from_rgb(106, 78, 30)
     } else {
@@ -4268,7 +4316,7 @@ fn hdr_amber_tint(ui: &Ui) -> Color32 {
 }
 
 /// Compact cyclic toggle button: LMB steps forward (`+1`), RMB steps backward (`-1`).
-fn cycle_toggle_btn(
+pub(crate) fn cycle_toggle_btn(
     ui: &mut Ui,
     width: f32,
     label: &str,
@@ -4298,7 +4346,7 @@ fn cycle_toggle_btn(
 
 /// Computes adaptive `(label_w, rem_w)` column widths for a property row so labels shrink
 /// gracefully on narrow dock panes without clipping control columns.
-fn prop_row_widths(total_w: f32) -> (f32, f32) {
+pub(crate) fn prop_row_widths(total_w: f32) -> (f32, f32) {
     let row_gap = 6.0;
     let safe_w = if total_w.is_finite() {
         total_w.max(130.0)
@@ -4312,7 +4360,7 @@ fn prop_row_widths(total_w: f32) -> (f32, f32) {
 
 /// Computes adaptive `(track_w, val_w)` widths inside a property row's control column so
 /// numeric `DragValue` boxes and the animation toggle stay visible with zero horizontal overflow.
-fn slider_control_widths(rem_w: f32) -> (f32, f32) {
+pub(crate) fn slider_control_widths(rem_w: f32) -> (f32, f32) {
     let ctrl_gap = 4.0;
     let avail = (rem_w - ANIM_BTN_W - ctrl_gap * 2.0).max(52.0);
     let val_w = VAL_W.min((avail - 16.0).max(36.0));
@@ -4320,15 +4368,16 @@ fn slider_control_widths(rem_w: f32) -> (f32, f32) {
     (track_w, val_w)
 }
 
-fn equal_grid(
+pub(crate) fn equal_grid(
     ui: &mut Ui,
     cols: usize,
     count: usize,
     mut item_ui: impl FnMut(&mut Ui, usize, f32),
 ) {
     let gap = 4.0;
+    let cols = cols.max(1);
     let total_w = ui.available_width().max(48.0);
-    let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(24.0);
+    let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(20.0);
     let mut idx = 0;
     while idx < count {
         ui.horizontal(|ui| {
@@ -4352,7 +4401,7 @@ fn equal_grid(
     }
 }
 
-fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
+pub(crate) fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
     let total_w = ui.available_width().max(130.0);
     let gap = 6.0;
     let (label_w, rem_w) = prop_row_widths(total_w);
@@ -4433,7 +4482,7 @@ fn anim_toggle_btn(ui: &mut Ui, anim: &mut DemoAnimator, key: &str) {
     }
 }
 
-fn anim_toggle_btn_disabled(ui: &mut Ui) {
+pub(crate) fn anim_toggle_btn_disabled(ui: &mut Ui) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ANIM_BTN_W, ROW_H), Sense::hover());
     if ui.is_rect_visible(rect) {
         let col = ui.visuals().weak_text_color().gamma_multiply(0.45);
@@ -4496,7 +4545,7 @@ fn anim_slider_f32(
     });
 }
 
-fn prop_slider_f32(
+pub(crate) fn prop_slider_f32(
     ui: &mut Ui,
     label: &str,
     val: &mut f32,
@@ -4532,7 +4581,7 @@ fn prop_slider_f32(
     });
 }
 
-fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
+pub(crate) fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: RangeInclusive<u32>, log: bool) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
         let (track_w, val_w) = slider_control_widths(ui.available_width());
@@ -4585,7 +4634,7 @@ fn anim_vec3(
     });
 }
 
-fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
+pub(crate) fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
     prop_row(ui, label, |ui| {
         let gap = 4.0;
         let check_w = (ui.available_width() - ANIM_BTN_W - gap).max(24.0);
@@ -4603,7 +4652,7 @@ fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) {
     });
 }
 
-fn stat_row(ui: &mut Ui, label: &str, value: &str) {
+pub(crate) fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     prop_row(ui, label, |ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let resp = ui.add(

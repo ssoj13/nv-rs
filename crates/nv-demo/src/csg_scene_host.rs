@@ -1205,6 +1205,9 @@ pub struct CsgGpuHost {
     last_pack_cam_params: Option<CsgCameraParams>,
     last_pack_lod_key: Option<LodConfigKey>,
     last_pack_omni: bool,
+    /// `gpu_crowd_active` mode used for the last completed `FullRepack`, so switching between
+    /// CPU crowd culling and GPU-direct all-bone scatter forces an immediate full repack.
+    last_pack_gpu_crowd: bool,
     last_traffic_bits: u32,
     ias_dirty: bool,
     traffic_dirty: bool,
@@ -1268,6 +1271,7 @@ impl CsgGpuHost {
             last_pack_cam_params: None,
             last_pack_lod_key: None,
             last_pack_omni: false,
+            last_pack_gpu_crowd: false,
             last_traffic_bits: u32::MAX,
             ias_dirty: false,
             traffic_dirty: false,
@@ -1383,8 +1387,30 @@ impl CsgGpuHost {
                     gidx += 1;
                     continue;
                 };
+                // `WorldScene::pack_visible` emits the compound bound to `world_inst.assembly_id`.
+                // After `sync_crowd_to_world`, a LOD2 actor's root bone switches its assembly to
+                // `lod2_pawn_compound` (`bone_outs[gidx].compound_id`) while
+                // `bones[gidx].compound_id` stays the LOD0 pelvis compound. Resolve from
+                // `world_inst`'s assembly (falling back to `bone_outs` / `bones`) so cold-start,
+                // LOD0/LOD1, and LOD2 pawn bones all match 1:1 instead of falling through to
+                // `u32::MAX`.
+                let expected_cid = scene
+                    .world
+                    .assembly(world_inst.assembly_id)
+                    .and_then(|asm| asm.parts.first())
+                    .and_then(|part| part.lods.compounds_for_lod(0).first())
+                    .map(|cid| cid.0)
+                    .unwrap_or_else(|| {
+                        scene
+                            .crowd
+                            .bone_outs
+                            .get(gidx)
+                            .map(|b| b.compound_id)
+                            .filter(|&cid| cid != 0)
+                            .unwrap_or(scene.crowd.bones[gidx].compound_id)
+                    });
                 if world_inst.user_id == gpu_inst.user_id
-                    && scene.crowd.bones[gidx].compound_id == gpu_inst.compound_id
+                    && expected_cid == gpu_inst.compound_id
                     && xform_to_bits(world_inst.xform.0) == target_bits
                 {
                     out[gidx] = slot as u32;
@@ -1400,24 +1426,30 @@ impl CsgGpuHost {
         }
     }
 
-    /// Returns `true` if calling [`Self::sync`] with `(key, cam)` will trigger a full frustum
-    /// repack (`camera_repack_needed` or scene rebuild).
-    pub fn will_camera_repack(&self, key: CsgSceneKey, cam: CsgCameraParams) -> bool {
+    /// Returns `true` if calling [`Self::sync`] with `(key, cam, gpu_crowd_active)` will trigger a
+    /// full frustum repack (`camera_repack_needed` or scene rebuild).
+    pub fn will_camera_repack(
+        &self,
+        key: CsgSceneKey,
+        cam: CsgCameraParams,
+        gpu_crowd_active: bool,
+    ) -> bool {
         if key != self.scene_key {
             return true;
         }
         if key.scene_idx == 0 || self.scene.is_none() {
             return self.ias_dirty;
         }
-        self.camera_repack_needed(cam)
+        self.camera_repack_needed(cam, gpu_crowd_active)
     }
 
     /// The repack predicate shared by [`Self::will_camera_repack`] and [`Self::sync`]: a pending
-    /// `ias_dirty`, a viewport / FOV / LOD / projection change, `> 1 m` of camera travel or
-    /// `> ~3.1°` of rotation (perspective only). It stays inside the `1.35x` padded frustum margin
-    /// so objects near viewport edges never pop out prematurely.
-    fn camera_repack_needed(&self, cam: CsgCameraParams) -> bool {
-        if self.ias_dirty {
+    /// `ias_dirty`, a `gpu_crowd_active` mode transition (switching between CPU crowd culling and
+    /// GPU-direct all-bone scatter), a viewport / FOV / LOD / projection change, `> 1 m` of camera
+    /// travel or `> ~3.1°` of rotation (perspective only). It stays inside the `1.35x` padded
+    /// frustum margin so objects near viewport edges never pop out prematurely.
+    fn camera_repack_needed(&self, cam: CsgCameraParams, gpu_crowd_active: bool) -> bool {
+        if self.ias_dirty || gpu_crowd_active != self.last_pack_gpu_crowd {
             return true;
         }
         let cam_dist_sq = (cam.eye[0] - self.last_pack_cam[0]).powi(2)
@@ -1440,11 +1472,17 @@ impl CsgGpuHost {
             || (!cam.omnidirectional && (!fwd_dot.is_finite() || fwd_dot < 0.9985))
     }
 
-    /// Returns `true` if calling [`Self::sync`] with `(key, cam)` will pack and upload instance
-    /// buffers from CPU (`FullRepack` or `TrafficOnly`). Traffic moves only through
-    /// [`Self::step_dynamic`], which sets `traffic_dirty`, so it must run first in the frame.
-    pub fn will_upload_instances(&self, key: CsgSceneKey, cam: CsgCameraParams) -> bool {
-        if self.will_camera_repack(key, cam) {
+    /// Returns `true` if calling [`Self::sync`] with `(key, cam, gpu_crowd_active)` will pack and
+    /// upload instance buffers from CPU (`FullRepack` or `TrafficOnly`). Traffic moves only
+    /// through [`Self::step_dynamic`], which sets `traffic_dirty`, so it must run first in the
+    /// frame.
+    pub fn will_upload_instances(
+        &self,
+        key: CsgSceneKey,
+        cam: CsgCameraParams,
+        gpu_crowd_active: bool,
+    ) -> bool {
+        if self.will_camera_repack(key, cam, gpu_crowd_active) {
             return true;
         }
         key.scene_idx != 0 && self.scene.is_some() && self.traffic_dirty
@@ -2206,7 +2244,8 @@ impl CsgGpuHost {
 
         // Distinguish camera/topology repacks from traffic-only frames.
         let lod_key = LodConfigKey::from_config(cam.lod_config);
-        let camera_repack_needed = rebuilt_scene || self.camera_repack_needed(cam);
+        let camera_repack_needed =
+            rebuilt_scene || self.camera_repack_needed(cam, gpu_crowd_active);
         let traffic_dirty = self.traffic_dirty;
 
         if (camera_repack_needed || traffic_dirty)
@@ -2348,6 +2387,7 @@ impl CsgGpuHost {
                     .resize(scene.world.dynamic_instance_count(), PREV_LOD_NONE);
                 self.dyn_prev_lods.fill(PREV_LOD_NONE);
                 self.sem_partial_stale = true;
+                self.last_pack_gpu_crowd = gpu_crowd_active;
                 CsgSyncResult::FullRepack
             };
 
@@ -2562,6 +2602,7 @@ impl CsgGpuHost {
         self.last_pack_cam_params = None;
         self.last_pack_lod_key = None;
         self.last_pack_omni = false;
+        self.last_pack_gpu_crowd = false;
         self.active_possess = None;
         self.next_vehicle_cursor = 0;
         self.last_traffic_bits = u32::MAX;
@@ -2970,10 +3011,10 @@ mod tests {
         // traffic, so nothing schedules an upload (the old predicate compared the clock bits and
         // `sync` then stepped the vehicles anyway).
         assert!(!host.step_dynamic(0.0, 4.25, cam.eye, CrowdLodParams::default(), false, false));
-        assert!(!host.will_upload_instances(key, cam));
+        assert!(!host.will_upload_instances(key, cam, false));
         // A real traffic step does.
         assert!(host.step_dynamic(0.0, 4.5, cam.eye, CrowdLodParams::default(), false, true));
-        assert!(host.will_upload_instances(key, cam));
+        assert!(host.will_upload_instances(key, cam, false));
     }
 
     #[test]
@@ -3656,7 +3697,7 @@ mod tests {
         host.ias_dirty = false;
 
         assert!(
-            !host.will_camera_repack(key, base_cam),
+            !host.will_camera_repack(key, base_cam, false),
             "unchanged camera and lod_config must not spuriously force FullRepack"
         );
         let high_cam = CsgCameraParams {
@@ -3667,7 +3708,7 @@ mod tests {
             ..base_cam
         };
         assert!(
-            host.will_camera_repack(key, high_cam),
+            host.will_camera_repack(key, high_cam, false),
             "changing lod_bias from 0.25 to 4.0 must always trigger FullRepack even when camera is stationary"
         );
         // Non-finite lod_bias must safely normalize to 1.0 and trigger repack from 0.25.
@@ -3678,7 +3719,7 @@ mod tests {
             },
             ..base_cam
         };
-        assert!(host.will_camera_repack(key, nan_cam));
+        assert!(host.will_camera_repack(key, nan_cam, false));
 
         // Pack Gundo at lod_bias = 0.25, 1.0, and 4.0 and verify visible instance count increases.
         let make_view = |bias: f32| {
@@ -3782,6 +3823,125 @@ mod tests {
     }
 
     #[test]
+    fn fill_crowd_bone_slot_map_matches_lod2_pawn_root_bones() {
+        let mut host = CsgGpuHost::new();
+        let marina_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "marina")
+            .expect("marina registered");
+        let module = host
+            .registry
+            .get_by_index(marina_idx)
+            .expect("marina module");
+        let built = module
+            .build(&SceneBuildConfig::default())
+            .expect("marina builds");
+        let vp = built.viewpoints[0].clone();
+        let fwd = (vp.target - vp.eye).norm();
+        let key = CsgSceneKey {
+            scene_idx: (marina_idx + 1) as u32,
+            variant_idx: 0,
+            seed: 2026,
+            road_mode: 2,
+        };
+        host.scene_key = key;
+        host.active_reg_idx = Some(marina_idx);
+        host.scene = Some(built);
+
+        // Step with tight `lod2_dist_m = 10.0` so visible actors switch their root bone
+        // (`bone_outs[gidx].compound_id` and `world_inst.assembly_id`) to `lod2_pawn_compound`
+        // while `bones[gidx].compound_id` remains the LOD0 pelvis compound.
+        let tight_lod = CrowdLodParams {
+            lod1_dist_m: 5.0,
+            lod2_dist_m: 10.0,
+            cull_dist_m: 600.0,
+            ..CrowdLodParams::default()
+        };
+        assert!(host.step_dynamic(
+            1.0 / 60.0,
+            1.0 / 60.0,
+            [vp.eye.x, vp.eye.y, vp.eye.z],
+            tight_lod,
+            false,
+            false,
+        ));
+
+        let cam_view = CameraView::perspective(
+            vp.eye,
+            fwd,
+            Vec3::Y,
+            (vp.vfov_deg.to_radians() * 1.35).clamp(0.15, 2.7),
+            16.0 / 9.0,
+            [0.05, CSG_VIEW_FAR_M],
+            720.0,
+        );
+        let (n_bones, lod2_pawn_roots) = {
+            let scene = host.scene.as_mut().expect("marina scene");
+            let pawn_cid = scene
+                .crowd
+                .lod2_pawn_compound
+                .expect("marina must define lod2_pawn_compound");
+            let pawn_roots = scene
+                .crowd
+                .bones
+                .iter()
+                .zip(&scene.crowd.bone_outs)
+                .filter(|(b, out)| out.compound_id == pawn_cid && b.compound_id != pawn_cid)
+                .count();
+            scene
+                .sync_crowd_to_world()
+                .expect("sync_crowd_to_world with LOD2 pawn assemblies");
+            mark_crowd_bones_visible(scene);
+            scene.world.set_crowd_culling(false);
+            scene.world.pack_visible(&cam_view, &mut host.packed);
+            (scene.crowd.bone_count(), pawn_roots)
+        };
+        assert!(
+            lod2_pawn_roots > 0,
+            "tight lod2_dist_m=10.0 must switch at least one actor root bone to lod2_pawn_compound"
+        );
+
+        let mut slot_map = Vec::new();
+        host.fill_crowd_bone_slot_map(&mut slot_map);
+        assert_eq!(slot_map.len(), n_bones);
+        let unmatched = slot_map.iter().filter(|&&s| s == u32::MAX).count();
+        assert_eq!(
+            unmatched, 0,
+            "all {n_bones} crowd bones (including {lod2_pawn_roots} LOD2 pawn roots) must map 1:1"
+        );
+
+        // Switching `gpu_crowd_active` from `false` -> `true` must force `FullRepack` even when
+        // the camera is stationary, so a Frame 0 / Classic->CSG or CPU->CUDA switch never leaves
+        // culled crowd bones unmapped.
+        let cam = CsgCameraParams {
+            eye: [vp.eye.x, vp.eye.y, vp.eye.z],
+            fwd: [fwd.x, fwd.y, fwd.z],
+            up: [0.0, 1.0, 0.0],
+            viewport_w: 1280,
+            viewport_h: 720,
+            vfov_rad: vp.vfov_deg.to_radians(),
+            lod_config: LodConfig::default(),
+            omnidirectional: false,
+        };
+        host.last_pack_cam = cam.eye;
+        host.last_pack_fwd = cam.fwd;
+        host.last_pack_cam_params = Some(cam);
+        host.last_pack_lod_key = Some(LodConfigKey::from_config(cam.lod_config));
+        host.last_pack_omni = false;
+        host.last_pack_gpu_crowd = false;
+        host.ias_dirty = false;
+        host.traffic_dirty = false;
+        assert!(!host.will_camera_repack(key, cam, false));
+        assert!(host.will_camera_repack(key, cam, true));
+        assert!(host.will_upload_instances(key, cam, true));
+        host.last_pack_gpu_crowd = true;
+        assert!(!host.will_camera_repack(key, cam, true));
+        assert!(host.will_camera_repack(key, cam, false));
+    }
+
+    #[test]
     fn lod_config_force_lod_disable_and_distance_sliders_trigger_repack_and_update_stats() {
         let mut host = CsgGpuHost::new();
         let gundo_idx = host
@@ -3826,7 +3986,7 @@ mod tests {
         host.last_pack_lod_key = Some(LodConfigKey::from_config(default_cfg));
         host.last_pack_omni = false;
         host.ias_dirty = false;
-        assert!(!host.will_camera_repack(key, base_cam));
+        assert!(!host.will_camera_repack(key, base_cam, false));
 
         // Every individual LodConfig slider/toggle must trigger immediate FullRepack.
         let variants = [
@@ -3846,7 +4006,7 @@ mod tests {
                 ..base_cam
             };
             assert!(
-                host.will_camera_repack(key, cam),
+                host.will_camera_repack(key, cam, false),
                 "LodConfig variant #{idx} ({cfg:?}) must trigger immediate FullRepack"
             );
         }

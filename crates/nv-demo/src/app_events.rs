@@ -18,7 +18,7 @@ use appbus::{BoxedEvent, EventBus, StateSlot};
 use csg_scene::{CameraMount, ProbeBackendKind, RailSpec, ViewScore};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
-use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady};
+use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady, OverlayOutPtrs};
 use crate::sdg_export::SdgOccluderBackend;
 
 /// Duration after the last camera or setting change during which interactive fast-preview stays active.
@@ -159,6 +159,8 @@ pub enum RenderControl {
         motion_ptrs: [u64; 2],
         hdr_ptrs: Option<[u64; 2]>,
         rr_ptrs: Option<DlssRrBufferPtrs>,
+        /// Output-resolution overlay layer while DLSS is on (`renderer::OverlayOutPtrs`).
+        overlay_out: Option<OverlayOutPtrs>,
         gen_id: u64,
     },
     /// Return a previously presented shared buffer index back to the render thread's free pool.

@@ -79,6 +79,14 @@ mod demo_app {
         motion_view: wgpu::TextureView,
         output_out: SharedTexture,
         output_view: wgpu::TextureView,
+        /// Displayed (and captured) image: the DLSS output plus the overlay layer, written by
+        /// `DlssSrComposite` after every evaluation.
+        display: wgpu::Texture,
+        display_view: wgpu::TextureView,
+        /// `DlssSrComposite` bind groups per shared frame index.
+        composite_bgs: [wgpu::BindGroup; 2],
+        /// `OverlayLayer::gen_id` the bind groups read, `None` = no layer (the dummy buffer).
+        overlay_gen: Option<u64>,
         render_w: u32,
         render_h: u32,
         out_w: u32,
@@ -88,9 +96,15 @@ mod demo_app {
     }
 
     impl DlssPass {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "explicit render/output dimensions and the shared display pass resources"
+        )]
         fn new(
             interop: &InteropContext,
             ngx: &ngx::NgxVulkan,
+            composite: &DlssSrComposite,
+            dummy_overlay: &wgpu::Buffer,
             render_w: u32,
             render_h: u32,
             out_w: u32,
@@ -147,6 +161,23 @@ mod demo_app {
             let output_view = output_out
                 .wgpu_texture()
                 .create_view(&wgpu::TextureViewDescriptor::default());
+            let display = interop.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("dlss-display"),
+                size: wgpu::Extent3d { width: out_w, height: out_h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+            let composite_bgs = [
+                composite.bind_group(interop.device(), &output_view, dummy_overlay),
+                composite.bind_group(interop.device(), &output_view, dummy_overlay),
+            ];
 
             let ngx_q = DLSS_QUALITY_MODES[dlss_quality_index(quality)].ngx;
             let flags = ngx::DlssFeatureFlags::MV_LOW_RES | ngx::DlssFeatureFlags::DO_SHARPENING;
@@ -178,6 +209,10 @@ mod demo_app {
                 motion_view,
                 output_out,
                 output_view,
+                display,
+                display_view,
+                composite_bgs,
+                overlay_gen: None,
                 render_w,
                 render_h,
                 out_w,
@@ -185,6 +220,26 @@ mod demo_app {
                 quality,
                 reset_next: true,
             })
+        }
+
+        /// Points the display pass at `layer` (rebuilt only when the layer changed); a layer of
+        /// another size than the output is not bound.
+        fn bind_overlay(
+            &mut self,
+            composite: &DlssSrComposite,
+            device: &wgpu::Device,
+            layer: Option<&OverlayLayer>,
+            dummy: &wgpu::Buffer,
+        ) {
+            let layer = layer.filter(|l| (l.width, l.height) == (self.out_w, self.out_h));
+            let want = layer.map(|l| l.gen_id);
+            if want == self.overlay_gen {
+                return;
+            }
+            self.composite_bgs = [0, 1].map(|i| {
+                composite.bind_group(device, &self.output_view, layer.map_or(dummy, |l| l.bufs[i].wgpu_buffer()))
+            });
+            self.overlay_gen = want;
         }
 
         fn vk_info(
@@ -323,24 +378,28 @@ mod demo_app {
         }
     }
 
+    // DLSS-RR display tonemap. The overlay layer (`renderer::OverlayOutPtrs`: premultiplied linear
+    // RGBA16F at the output resolution, two f16 per u32) is blended here, after DLSS and in
+    // linear light before the display encoding, so overlay lines are drawn at the display
+    // resolution and never pass through the upscaler.
     const HDR_TONEMAP_WGSL: &str = r#"
 struct TonemapParams {
     exposure: f32,
     width: u32,
     height: u32,
-    _pad: u32,
+    overlay: u32,
 };
 
 @group(0) @binding(0) var src_hdr: texture_2d<f32>;
 @group(0) @binding(1) var dst_ldr: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2) var<uniform> u: TonemapParams;
+@group(0) @binding(3) var<storage, read> ovl: array<vec2<u32>>;
 
-fn aces_channel(v: f32) -> f32 {
+fn aces_lin(v: f32) -> f32 {
     let x = max(v, 0.0);
     let num = x * (2.51 * x + 0.03);
     let den = x * (2.43 * x + 0.59) + 0.14;
-    let r = clamp(num / den, 0.0, 1.0);
-    return pow(r, 1.0 / 2.2);
+    return clamp(num / den, 0.0, 1.0);
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -350,11 +409,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let c = textureLoad(src_hdr, vec2<i32>(gid.xy), 0);
     let e = max(u.exposure, 0.0);
-    let rgb = vec3<f32>(
-        aces_channel(c.r * e),
-        aces_channel(c.g * e),
-        aces_channel(c.b * e),
-    );
+    var lin = vec3<f32>(aces_lin(c.r * e), aces_lin(c.g * e), aces_lin(c.b * e));
+    if (u.overlay != 0u) {
+        let o = ovl[gid.y * u.width + gid.x];
+        let rg = unpack2x16float(o.x);
+        let ba = unpack2x16float(o.y);
+        lin = lin * (1.0 - ba.y) + vec3<f32>(rg, ba.x);
+    }
+    let rgb = pow(clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
     textureStore(dst_ldr, vec2<i32>(gid.xy), vec4<f32>(rgb, 1.0));
 }
 "#;
@@ -364,12 +426,13 @@ struct TonemapParams {
     exposure: f32,
     width: u32,
     height: u32,
-    _pad: u32,
+    overlay: u32,
 };
 
 @group(0) @binding(0) var src_hdr: texture_2d<f32>;
 @group(0) @binding(1) var dst_scrgb: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u: TonemapParams;
+@group(0) @binding(3) var<storage, read> ovl: array<vec2<u32>>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -388,7 +451,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let compressed = knee + span * (excess / (excess + span));
         nits = nits * (compressed / mx);
     }
-    textureStore(dst_scrgb, vec2<i32>(gid.xy), vec4<f32>(nits * 0.0125, 1.0));
+    var o_rgb = nits * 0.0125;
+    if (u.overlay != 0u) {
+        // Lines at paper white (203 nits = 203/80 scRGB), as in the CUDA composite.
+        let o = ovl[gid.y * u.width + gid.x];
+        let rg = unpack2x16float(o.x);
+        let ba = unpack2x16float(o.y);
+        o_rgb = o_rgb * (1.0 - ba.y) + vec3<f32>(rg, ba.x) * (203.0 / 80.0);
+    }
+    textureStore(dst_scrgb, vec2<i32>(gid.xy), vec4<f32>(o_rgb, 1.0));
+}
+"#;
+
+    // DLSS-SR display pass: copies the DLSS output into the displayed texture and blends the
+    // overlay layer (premultiplied linear) in linear light. A fragment pass because the NGX
+    // output barrier (`GeneralToShaderRead`) makes the image visible to fragment shaders.
+    const DLSS_SR_COMPOSITE_WGSL: &str = r#"
+struct CompositeParams {
+    exposure: f32,
+    width: u32,
+    height: u32,
+    overlay: u32,
+};
+
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read> ovl: array<vec2<u32>>;
+@group(0) @binding(2) var<uniform> u: CompositeParams;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<u32>(pos.xy);
+    let c = textureLoad(src, vec2<i32>(p), 0);
+    if (u.overlay == 0u || p.x >= u.width || p.y >= u.height) {
+        return vec4<f32>(c.rgb, 1.0);
+    }
+    let o = ovl[p.y * u.width + p.x];
+    let rg = unpack2x16float(o.x);
+    let ba = unpack2x16float(o.y);
+    // The SR output carries the CUDA tonemap's 1/2.2 encoding: decode, blend, re-encode.
+    let lin = pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(2.2)) * (1.0 - ba.y) + vec3<f32>(rg, ba.x);
+    return vec4<f32>(pow(clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2)), 1.0);
 }
 "#;
 
@@ -398,7 +507,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         exposure: f32,
         width: u32,
         height: u32,
-        _pad: u32,
+        /// 1 = blend the overlay layer bound at binding 3 (its size matches the output).
+        overlay: u32,
     }
 
     struct HdrTonemapPipeline {
@@ -407,6 +517,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         scrgb_pipeline: wgpu::ComputePipeline,
         scrgb_bgl: wgpu::BindGroupLayout,
         uniform_buf: wgpu::Buffer,
+        /// Bound at the overlay slot while there is no overlay layer (`overlay = 0`): bind
+        /// groups need a buffer even when the shader does not read it.
+        dummy_overlay: wgpu::Buffer,
     }
 
     impl HdrTonemapPipeline {
@@ -453,6 +566,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             },
                             count: None,
                         },
+                        overlay_layer_entry(3, wgpu::ShaderStages::COMPUTE),
                     ],
                 })
             };
@@ -490,12 +604,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+            let dummy_overlay = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay-layer-dummy"),
+                size: 8,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
             Self {
                 pipeline,
                 bgl,
                 scrgb_pipeline,
                 scrgb_bgl,
                 uniform_buf,
+                dummy_overlay,
             }
         }
 
@@ -504,6 +625,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             device: &wgpu::Device,
             src_hdr_view: &wgpu::TextureView,
             dst_ldr_view: &wgpu::TextureView,
+            overlay: &wgpu::Buffer,
         ) -> wgpu::BindGroup {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("dlss-rr-hdr-tonemap-bg"),
@@ -521,6 +643,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         binding: 2,
                         resource: self.uniform_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: overlay.as_entire_binding(),
+                    },
                 ],
             })
         }
@@ -530,6 +656,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             device: &wgpu::Device,
             src_hdr_view: &wgpu::TextureView,
             dst_scrgb_view: &wgpu::TextureView,
+            overlay: &wgpu::Buffer,
         ) -> wgpu::BindGroup {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("dlss-rr-hdr-scrgb-bg"),
@@ -547,6 +674,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         binding: 2,
                         resource: self.uniform_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: overlay.as_entire_binding(),
+                    },
                 ],
             })
         }
@@ -556,16 +687,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             queue: &wgpu::Queue,
             encoder: &mut wgpu::CommandEncoder,
             bind_group: &wgpu::BindGroup,
-            (width, height): (u32, u32),
-            exposure: f32,
+            uniform: HdrTonemapUniform,
             hdr_scrgb: bool,
         ) {
-            let uniform = HdrTonemapUniform {
-                exposure,
-                width,
-                height,
-                _pad: 0,
-            };
+            let (width, height) = (uniform.width, uniform.height);
             queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dlss-rr-hdr-tonemap-pass"),
@@ -578,6 +703,176 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             });
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+    }
+
+    /// Bind-group-layout entry of the overlay layer (read-only storage buffer of `vec2<u32>` =
+    /// premultiplied linear RGBA16F per output pixel).
+    fn overlay_layer_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    /// The output-resolution overlay layer shared with the render worker (`renderer::
+    /// OverlayOutPtrs`), allocated while DLSS is on.
+    ///
+    /// Why: under DLSS the viewport shows the upscaled image, so overlay lines are rasterised at
+    /// that resolution by CUDA and blended here after DLSS and its tonemap (one buffer per shared
+    /// frame index, like the other shared targets).
+    struct OverlayLayer {
+        bufs: [SharedBuffer; 2],
+        width: u32,
+        height: u32,
+        /// `buf_gen` at allocation: display passes rebuild their bind groups when it changes.
+        gen_id: u64,
+    }
+
+    impl OverlayLayer {
+        fn new(interop: &InteropContext, width: u32, height: u32, gen_id: u64) -> Result<Self, nv_wgpu::Error> {
+            let bytes = u64::from(width) * u64::from(height) * 8; // premultiplied RGBA16F
+            let make = |label: &str| {
+                interop.create_buffer(&SharedBufferDescriptor {
+                    label: Some(label),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            };
+            Ok(Self { bufs: [make("overlay-layer-0")?, make("overlay-layer-1")?], width, height, gen_id })
+        }
+
+        fn ptrs(&self) -> crate::renderer::OverlayOutPtrs {
+            crate::renderer::OverlayOutPtrs {
+                ptrs: [self.bufs[0].cu_deviceptr(), self.bufs[1].cu_deviceptr()],
+                width: self.width,
+                height: self.height,
+            }
+        }
+    }
+
+    /// DLSS-SR display pass (`DLSS_SR_COMPOSITE_WGSL`): DLSS output -> displayed texture with the
+    /// overlay layer blended in.
+    struct DlssSrComposite {
+        pipeline: wgpu::RenderPipeline,
+        bgl: wgpu::BindGroupLayout,
+        uniform_buf: wgpu::Buffer,
+    }
+
+    impl DlssSrComposite {
+        fn new(device: &wgpu::Device) -> Self {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("dlss-sr-composite-wgsl"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(DLSS_SR_COMPOSITE_WGSL)),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("dlss-sr-composite-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    overlay_layer_entry(1, wgpu::ShaderStages::FRAGMENT),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dlss-sr-composite-layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("dlss-sr-composite"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dlss-sr-composite-uniform"),
+                size: std::mem::size_of::<HdrTonemapUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            Self { pipeline, bgl, uniform_buf }
+        }
+
+        fn bind_group(&self, device: &wgpu::Device, src: &wgpu::TextureView, overlay: &wgpu::Buffer) -> wgpu::BindGroup {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dlss-sr-composite-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                    wgpu::BindGroupEntry { binding: 1, resource: overlay.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.uniform_buf.as_entire_binding() },
+                ],
+            })
+        }
+
+        /// Records the copy + blend of frame buffer `idx` into `pass`'s display texture.
+        fn draw(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, pass: &DlssPass, idx: usize) {
+            let uniform = HdrTonemapUniform {
+                exposure: 1.0,
+                width: pass.out_w,
+                height: pass.out_h,
+                overlay: u32::from(pass.overlay_gen.is_some()),
+            };
+            queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("dlss-sr-composite-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &pass.display_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.pipeline);
+            rp.set_bind_group(0, &pass.composite_bgs[idx & 1], &[]);
+            rp.draw(0..3, 0..1);
         }
     }
 
@@ -660,10 +955,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         output_hdr_view: wgpu::TextureView,
         display_ldr: wgpu::Texture,
         display_view: wgpu::TextureView,
-        tonemap_bg: wgpu::BindGroup,
+        /// Tonemap bind groups per shared frame index (the overlay layer is double-buffered).
+        tonemap_bg: [wgpu::BindGroup; 2],
         display_hdr: wgpu::Texture,
         display_hdr_view: wgpu::TextureView,
-        scrgb_bg: wgpu::BindGroup,
+        scrgb_bg: [wgpu::BindGroup; 2],
+        /// `OverlayLayer::gen_id` the bind groups read, `None` = no layer (the dummy buffer).
+        overlay_gen: Option<u64>,
         render_w: u32,
         render_h: u32,
         out_w: u32,
@@ -787,14 +1085,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let normals_view = view_of(normals_in.wgpu_texture());
             let output_hdr_view = view_of(output_hdr.wgpu_texture());
             let display_view = view_of(&display_ldr);
-            let tonemap_bg =
-                tonemap.create_bind_group(interop.device(), &output_hdr_view, &display_view);
+            let dummy = &tonemap.dummy_overlay;
+            let tonemap_bg = [0, 1]
+                .map(|_| tonemap.create_bind_group(interop.device(), &output_hdr_view, &display_view, dummy));
             let display_hdr_view = view_of(&display_hdr);
-            let scrgb_bg = tonemap.create_scrgb_bind_group(
-                interop.device(),
-                &output_hdr_view,
-                &display_hdr_view,
-            );
+            let scrgb_bg = [0, 1].map(|_| {
+                tonemap.create_scrgb_bind_group(interop.device(), &output_hdr_view, &display_hdr_view, dummy)
+            });
 
             let config = ngx::DlssRrCreateParams {
                 render_width: render_w,
@@ -845,6 +1142,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 display_hdr,
                 display_hdr_view,
                 scrgb_bg,
+                overlay_gen: None,
                 render_w,
                 render_h,
                 out_w,
@@ -852,6 +1150,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 quality,
                 reset_next: true,
             })
+        }
+
+        /// Points the tonemap at `layer` (rebuilt only when the layer changed); a layer of
+        /// another size than the output is not bound.
+        fn bind_overlay(&mut self, tonemap: &HdrTonemapPipeline, device: &wgpu::Device, layer: Option<&OverlayLayer>) {
+            let layer = layer.filter(|l| (l.width, l.height) == (self.out_w, self.out_h));
+            let want = layer.map(|l| l.gen_id);
+            if want == self.overlay_gen {
+                return;
+            }
+            let buf = |i: usize| layer.map_or(&tonemap.dummy_overlay, |l| l.bufs[i].wgpu_buffer());
+            self.tonemap_bg =
+                [0, 1].map(|i| tonemap.create_bind_group(device, &self.output_hdr_view, &self.display_view, buf(i)));
+            self.scrgb_bg = [0, 1].map(|i| {
+                tonemap.create_scrgb_bind_group(device, &self.output_hdr_view, &self.display_hdr_view, buf(i))
+            });
+            self.overlay_gen = want;
         }
 
         fn evaluate(
@@ -2503,6 +2818,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ngx_init_error: Option<String>,
         interop: InteropContext,
         hdr_tonemap: HdrTonemapPipeline,
+        sr_composite: DlssSrComposite,
+        /// Output-resolution overlay layer while DLSS is on (`OverlayLayer`).
+        overlay_layer: Option<OverlayLayer>,
         rr_last_exposure: Option<f32>,
         egui_ctx: egui::Context,
         egui_winit: egui_winit::State,
@@ -2711,7 +3029,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     Some(copy_texture_for_cuda(
                         &self.interop,
                         &mut self.still_readback,
-                        dlss.output_out.wgpu_texture(),
+                        &dlss.display,
                         dlss.out_w,
                         dlss.out_h,
                     ))
@@ -2891,6 +3209,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 None => (false, None),
             };
             let hdr_tonemap = HdrTonemapPipeline::new(interop.device());
+            let sr_composite = DlssSrComposite::new(interop.device());
 
             let mut surface_config = surface
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -3176,6 +3495,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ngx_init_error,
                 interop,
                 hdr_tonemap,
+                sr_composite,
+                overlay_layer: None,
                 rr_last_exposure: None,
                 egui_ctx,
                 egui_winit,
@@ -4248,10 +4569,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let drop_rr_bufs = !self.settings.dlss_rr_on && self.rr_shared.is_some();
             let needs_hdr_bufs = need_hdr_buf && self.shared_hdr.is_none();
             let drop_hdr_bufs = !need_hdr_buf && self.shared_hdr.is_some();
+            // The overlay layer follows the DLSS output size (the displayed image).
+            let needs_ovl_layer = dlss_any
+                && self.overlay_layer.as_ref().is_none_or(|l| (l.width, l.height) != (out_w, out_h));
+            let drop_ovl_layer = !dlss_any && self.overlay_layer.is_some();
             if self.render_fatal.is_none()
                 && resize_allowed(
                     target_w != self.render_w || target_h != self.render_h,
-                    needs_rr_bufs || drop_rr_bufs || needs_hdr_bufs || drop_hdr_bufs,
+                    needs_rr_bufs
+                        || drop_rr_bufs
+                        || needs_hdr_bufs
+                        || drop_hdr_bufs
+                        || needs_ovl_layer
+                        || drop_ovl_layer,
                     self.last_resize_at.elapsed().as_millis() >= 120,
                     dlss_toggled,
                     self.resize_acked,
@@ -4328,6 +4658,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         {
                             old_rr.retire_into(self.buf_gen, &mut self.retired_buffers);
                         }
+                        let new_layer = if dlss_any {
+                            match OverlayLayer::new(&self.interop, out_w, out_h, self.buf_gen.wrapping_add(1)) {
+                                Ok(l) => Some(l),
+                                Err(e) => {
+                                    self.last_saved_msg = Some(format!("Overlay layer allocation failed: {e}"));
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(old) = std::mem::replace(&mut self.overlay_layer, new_layer) {
+                            self.retired_buffers.push((self.buf_gen, old.bufs));
+                        }
                         self.display_texture = new_tex;
                         self.display_view = new_view;
                         self.display_texture_hdr = new_hdr_tex;
@@ -4351,6 +4695,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             motion_ptrs: new_motion_ptrs,
                             hdr_ptrs: new_hdr_ptrs,
                             rr_ptrs: new_rr_ptrs,
+                            overlay_out: self.overlay_layer.as_ref().map(OverlayLayer::ptrs),
                             gen_id: self.buf_gen,
                         });
                     }
@@ -4505,6 +4850,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         match DlssPass::new(
                             &self.interop,
                             ngx,
+                            &self.sr_composite,
+                            &self.hdr_tonemap.dummy_overlay,
                             self.render_w,
                             self.render_h,
                             out_w,
@@ -4516,7 +4863,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                                     &mut self.egui_renderer,
                                     self.egui_renderer_hdr.as_mut(),
                                     self.interop.device(),
-                                    &pass.output_view,
+                                    &pass.display_view,
                                     self.display_tex_id,
                                 );
                                 self.using_dlss_tex = true;
@@ -5365,13 +5712,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         let rec_wants_sdr = self.video_recorder.as_ref().is_some_and(|r| {
                             r.profile == crate::gpu_export::VideoProfile::SdrH264
                         });
+                        // The overlay layer of the displayed frame is blended by the tonemap.
+                        rr.bind_overlay(&self.hdr_tonemap, self.interop.device(), self.overlay_layer.as_ref());
+                        let ovl_idx = self.front_buf_idx & 1;
+                        let tm = HdrTonemapUniform {
+                            exposure: self.settings.exposure,
+                            width: rr.out_w,
+                            height: rr.out_h,
+                            overlay: u32::from(rr.overlay_gen.is_some()),
+                        };
                         if !hdr_active || rec_wants_sdr {
                             self.hdr_tonemap.dispatch(
                                 self.interop.queue(),
                                 &mut encoder,
-                                &rr.tonemap_bg,
-                                (rr.out_w, rr.out_h),
-                                self.settings.exposure,
+                                &rr.tonemap_bg[ovl_idx],
+                                tm,
                                 false,
                             );
                         }
@@ -5379,9 +5734,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.hdr_tonemap.dispatch(
                                 self.interop.queue(),
                                 &mut encoder,
-                                &rr.scrgb_bg,
-                                (rr.out_w, rr.out_h),
-                                self.settings.exposure,
+                                &rr.scrgb_bg[ovl_idx],
+                                tm,
                                 true,
                             );
                         }
@@ -5475,6 +5829,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                             self.last_saved_msg = Some(format!("DLSS evaluate failed: {e}"));
                         } else {
                             self.dlss_ms = t_dlss.elapsed().as_secs_f32() * 1000.0;
+                            // DLSS output -> displayed texture, overlay layer blended at the
+                            // output resolution (`DlssSrComposite`).
+                            dlss.bind_overlay(
+                                &self.sr_composite,
+                                self.interop.device(),
+                                self.overlay_layer.as_ref(),
+                                &self.hdr_tonemap.dummy_overlay,
+                            );
+                            self.sr_composite.draw(self.interop.queue(), &mut encoder, dlss, self.front_buf_idx);
                         }
                     }
                 } else if self.viewport_tex_dirty {
@@ -5748,7 +6111,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         && let Some(ref dlss) = self.dlss_pass
                     {
                         Some((
-                            dlss.output_out.wgpu_texture(),
+                            &dlss.display,
                             dlss.out_w & !1,
                             dlss.out_h & !1,
                             4,

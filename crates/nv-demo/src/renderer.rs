@@ -1137,6 +1137,23 @@ pub struct CameraFrame {
     pub tan_half_fov: f32,
 }
 
+/// Output-resolution overlay layer shared with the display (`main.rs` `OverlayLayer`): one
+/// premultiplied linear RGBA16F buffer per shared frame index, `width x height` = the DLSS output.
+///
+/// Why: under DLSS the display is the upscaled image; lines composited into the render-resolution
+/// input would be upscaled and temporally smeared (SR) or lost (RR, whose input is the untonemapped
+/// colour). The overlay is rasterised at the output resolution instead and blended after DLSS and
+/// the tonemap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlayOutPtrs {
+    /// Device pointers, indexed by the shared buffer index of the frame.
+    pub ptrs: [u64; 2],
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+}
+
 /// Double-buffered CUDA device pointers for optional DLSS Ray Reconstruction FP16 AOV buffers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DlssRrBufferPtrs {
@@ -3396,6 +3413,13 @@ struct OverlayFrame<'a> {
     depth: u64,
     /// Backward motion in pixels (0 when not allocated: no temporal stabilisation).
     motion: u64,
+    /// Size of `depth` and `motion` (the render resolution; smaller than `w x h` when the
+    /// overlay is drawn at the DLSS output resolution).
+    src_w: u32,
+    src_h: u32,
+    /// Output-resolution overlay layer (premultiplied linear RGBA16F, `w x h`) blended by the
+    /// display pass after DLSS; 0 = blend into `dst8` / `dst16` here.
+    dst_ovl: u64,
     /// The camera jumped (scene switch, snap): the coverage history must not be reused.
     history_cut: bool,
     /// The wireframe contour G-buffer and smoothed vertices exist this frame.
@@ -3437,6 +3461,16 @@ fn run_overlay(
     if n_cpu == 0 && list.gpu_sources().is_empty() {
         if let Some(o) = rig.overlay.as_mut() {
             o.hist_valid = false;
+        }
+        if f.dst_ovl != 0 {
+            // Nothing to draw: the output layer must still not show last frame's lines.
+            // SAFETY: `dst_ovl` holds `w * h` 8-byte texels until the end-of-frame fence.
+            let rc = unsafe {
+                cu::cuMemsetD32Async(f.dst_ovl, 0, 2 * f.w as usize * f.h as usize, rig.stream.cu_stream())
+            };
+            if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                return Err(format!("overlay layer clear failed ({rc:?})"));
+            }
         }
         return Ok(list.status.map(str::to_owned));
     }
@@ -3663,8 +3697,9 @@ fn run_overlay(
     let mut cam_dev = cam_ptr;
     let mut sel_dev = sel_ptr;
     let mut depth = f.depth;
+    let (mut src_w, mut src_h) = (f.src_w, f.src_h);
     let mut cov = cov_ptr;
-    let mut splat_args: [*mut c_void; 11] = [
+    let mut splat_args: [*mut c_void; 13] = [
         (&raw mut segs).cast(),
         (&raw mut counter).cast(),
         (&raw mut cap).cast(),
@@ -3673,6 +3708,8 @@ fn run_overlay(
         (&raw mut cam_dev).cast(),
         (&raw mut sel_dev).cast(),
         (&raw mut depth).cast(),
+        (&raw mut src_w).cast(),
+        (&raw mut src_h).cast(),
         (&raw mut cov).cast(),
         (&raw mut w).cast(),
         (&raw mut h).cast(),
@@ -3681,8 +3718,8 @@ fn run_overlay(
     // each block one segment at a time.
     let blocks = seg_cap.clamp(1, 8192);
     // SAFETY: `ovl_splat(const NvOverlaySegment*, unsigned*, u32, const OvlStyle*, u32, const
-    // OvlCamera*, const unsigned*, const float*, unsigned*, u32, u32)`; `sel` holds
-    // `MAX_SELECTED` words; `depth` is 0 or a `w * h` float buffer; all live until the fence.
+    // OvlCamera*, const unsigned*, const float*, u32, u32, unsigned*, u32, u32)`; `sel` holds
+    // `MAX_SELECTED` words; `depth` is 0 or a `src_w * src_h` float buffer; all live until the fence.
     let rc = unsafe {
         cu::cuLaunchKernel(
             rig.tonemap.ovl_splat,
@@ -3701,12 +3738,13 @@ fn run_overlay(
     if rc != cu::cudaError_enum_CUDA_SUCCESS {
         return Err(format!("ovl_splat cuLaunchKernel failed ({rc:?})"));
     }
-    let (mut dst8, mut dst16) = (f.dst8, f.dst16);
+    let (mut dst8, mut dst16, mut dst_ovl) = (f.dst8, f.dst16, f.dst_ovl);
     let (mut h_in, mut h_out, mut motion) = (hist_in, hist_out, if temporal { f.motion } else { 0 });
     let mut blend = OVERLAY_TEMPORAL_BLEND;
-    // SAFETY: `ovl_composite(const unsigned*, const unsigned*, unsigned*, const float2*, f32,
-    // const OvlStyle*, u32, uchar4*, ushort4*, u32, u32)`; history / motion / targets are 0 or
-    // `w * h` buffers, `h_in != h_out`; all live until the end-of-frame fence.
+    // SAFETY: `ovl_composite(const unsigned*, const unsigned*, unsigned*, const float2*, u32, u32,
+    // f32, const OvlStyle*, u32, uchar4*, ushort4*, ushort4*, u32, u32)`; history / targets are 0
+    // or `w * h` buffers, motion is 0 or `src_w * src_h`, `h_in != h_out`; all live until the
+    // end-of-frame fence.
     unsafe {
         launch_px_kernel(
             rig,
@@ -3718,11 +3756,14 @@ fn run_overlay(
                 (&raw mut h_in).cast(),
                 (&raw mut h_out).cast(),
                 (&raw mut motion).cast(),
+                (&raw mut src_w).cast(),
+                (&raw mut src_h).cast(),
                 (&raw mut blend).cast(),
                 (&raw mut styles).cast(),
                 (&raw mut style_count).cast(),
                 (&raw mut dst8).cast(),
                 (&raw mut dst16).cast(),
+                (&raw mut dst_ovl).cast(),
                 (&raw mut w).cast(),
                 (&raw mut h).cast(),
             ],
@@ -4779,6 +4820,7 @@ pub fn spawn_render_thread(
             let mut motion_ptrs = initial_motion_ptrs;
             let mut hdr_ptrs: Option<[u64; 2]> = None;
             let mut rr_ptrs: Option<DlssRrBufferPtrs> = None;
+            let mut overlay_out: Option<OverlayOutPtrs> = None;
             let mut free_bufs = VecDeque::from([0usize, 1usize]);
             let mut accum_count: u32 = 0;
             let mut frame_index: u32 = 0;
@@ -4856,6 +4898,7 @@ pub fn spawn_render_thread(
                             motion_ptrs: new_motion_ptrs,
                             hdr_ptrs: new_hdr_ptrs,
                             rr_ptrs: new_rr_ptrs,
+                            overlay_out: new_overlay_out,
                             gen_id,
                         } => {
                             if *width != cur_w || *height != cur_h {
@@ -4878,6 +4921,7 @@ pub fn spawn_render_thread(
                             motion_ptrs = *new_motion_ptrs;
                             hdr_ptrs = *new_hdr_ptrs;
                             rr_ptrs = *new_rr_ptrs;
+                            overlay_out = *new_overlay_out;
                             cur_gen = *gen_id;
                             free_bufs.clear();
                             free_bufs.push_back(0);
@@ -6817,25 +6861,60 @@ pub fn spawn_render_thread(
                     }
                     let overlay_shown = settings.overlay.enabled
                         && (settings.overlay.in_captures || !settings.capture_active);
-                    if overlay_shown && skip_tonemap {
+                    // The display shows the DLSS output (RR owns it, or SR upscales the tonemapped
+                    // image): the overlay goes into the output-resolution layer that main.rs
+                    // blends after DLSS and its tonemap, never into the render-resolution image.
+                    let display_is_dlss = skip_tonemap || (dlss_any && !rr_export);
+                    let ovl_out = overlay_out.filter(|_| display_is_dlss);
+                    // A layer not drawn this frame must not show a stale overlay.
+                    if let Some(o) = overlay_out
+                        && !(overlay_shown && ovl_out.is_some())
+                    {
+                        // SAFETY: `o.ptrs[buf_idx]` holds `width * height` 8-byte texels
+                        // (`2 * width * height` u32), alive until the end-of-frame fence.
+                        let rc = unsafe {
+                            cu::cuMemsetD32Async(
+                                o.ptrs[buf_idx],
+                                0,
+                                2 * o.width as usize * o.height as usize,
+                                rig.stream.cu_stream(),
+                            )
+                        };
+                        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                            bus.emit_render_event(RenderEvent::Fatal(format!(
+                                "overlay layer clear failed ({rc:?})"
+                            )));
+                            break 'render;
+                        }
+                    }
+                    if overlay_shown && display_is_dlss && ovl_out.is_none() {
                         report_overlay_status(
                             &bus,
                             &mut overlay_status,
-                            Some("overlay not drawn while DLSS-RR owns the display".to_owned()),
+                            Some("overlay waits for its DLSS output-resolution layer".to_owned()),
                         );
                     } else if overlay_shown {
+                        // Output resolution under DLSS (depth / motion stay at the render
+                        // resolution and are read at the nearest texel), else the frame itself.
+                        let (ow, oh, dst8, dst16, dst_ovl) = match ovl_out {
+                            Some(o) => (o.width, o.height, 0, 0, o.ptrs[buf_idx]),
+                            None => (cur_w, cur_h, buf_ptrs[buf_idx], hdr_ptrs.map_or(0, |p| p[buf_idx]), 0),
+                        };
                         let frame = OverlayFrame {
-                            w: cur_w,
-                            h: cur_h,
+                            w: ow,
+                            h: oh,
                             camera: active_camera,
                             projection: settings.camera_projection,
                             filter: settings.overlay,
                             selected: selection.keys(),
                             csg: rig.csg_host.device_pointers(),
-                            dst8: buf_ptrs[buf_idx],
-                            dst16: hdr_ptrs.map_or(0, |p| p[buf_idx]),
+                            dst8,
+                            dst16,
                             depth: rig.depth_f32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
                             motion: rig.motion_f32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
+                            src_w: cur_w,
+                            src_h: cur_h,
+                            dst_ovl,
                             history_cut: overlay_history_cut,
                             wire: wireframe && rig.wire_cls_u32.is_some(),
                             wire_line_px: settings.wire_line_px,

@@ -272,6 +272,8 @@ extern "C" __global__ void tonemap_f32_to_scrgb_f16(
 //                  (selected instance, radius), then every pixel near the segment gets the
 //                  analytic coverage of a constant-width stroke (dashes, fade, optional depth
 //                  test against the primary-hit depth) as `coverage << 24 | style` (max wins).
+//                  Under DLSS the raster is the output resolution and the depth (render
+//                  resolution, DLSS outputs none) is read at the nearest texel.
 //   ovl_composite  temporal stabilisation (the previous frame's coverage reprojected with the
 //                  motion vectors, clamped to the current 3x3 coverage range, exponentially
 //                  blended) and a linear-light blend into the tonemapped outputs.
@@ -349,6 +351,8 @@ extern "C" __global__ void ovl_splat(
     const OvlCamera* cam,
     const unsigned int* sel,
     const float* depth,
+    unsigned int depth_w,
+    unsigned int depth_h,
     unsigned int* cov,
     unsigned int width,
     unsigned int height
@@ -437,7 +441,11 @@ extern "C" __global__ void ovl_splat(
                 && pa.z > 0.0f && pb.z > 0.0f) {
                 // Perspective-correct view depth along the segment vs. the primary hit.
                 const float z = 1.0f / ((1.0f - t) / pa.z + t / pb.z) - s.depth_bias;
-                const float d = depth[(unsigned int)py * width + (unsigned int)px];
+                // Nearest depth texel when the overlay raster is finer than the depth (output
+                // resolution after DLSS): a real surface's depth, never an edge blend.
+                const unsigned int dx = (unsigned int)px * depth_w / width;
+                const unsigned int dy = (unsigned int)py * depth_h / height;
+                const float d = depth[dy * depth_w + dx];
                 hidden = z > d * 1.002f + 1e-3f;
                 if (hidden && st.depth_mode == OVL_DEPTH_SKIP_HIDDEN) continue;
             }
@@ -473,17 +481,24 @@ static __forceinline__ __device__ float ovl_f16_to_f32(unsigned short h) {
 // `hist_out` receives the result (ping-pong, never the same buffer as `hist_in`). RGBA8 is
 // sRGB-encoded (the tonemap's 1/2.2 curve): decoded, blended in linear light, re-encoded;
 // scRGB is linear (1.0 = 80 nits, lines at paper white). `motion` / `hist_in` may be null
-// (no stabilisation).
+// (no stabilisation). `motion` is `motion_w x motion_h` (the render resolution): when this raster
+// is the DLSS output resolution, the nearest motion texel is scaled to output pixels.
+// `dst_ovl` (output resolution under DLSS, else null) receives the overlay as premultiplied
+// linear RGBA for every pixel (zero where nothing is drawn); the display passes (main.rs: the
+// DLSS-RR wgpu tonemap, `DlssSrComposite`) blend it after DLSS, so the lines are not upscaled.
 extern "C" __global__ void ovl_composite(
     const unsigned int* cov,
     const unsigned int* hist_in,
     unsigned int* hist_out,
     const float2* motion,
+    unsigned int motion_w,
+    unsigned int motion_h,
     float blend,
     const OvlStyle* styles,
     unsigned int style_count,
     uchar4* dst8,
     ushort4* dst16,
+    ushort4* dst_ovl,
     unsigned int width,
     unsigned int height
 ) {
@@ -505,9 +520,12 @@ extern "C" __global__ void ovl_composite(
                 hi = fmaxf(hi, na);
             }
         }
-        const float2 m = motion[i];
-        const int hx = (int)floorf((float)x + 0.5f + m.x);
-        const int hy = (int)floorf((float)y + 0.5f + m.y);
+        // Motion of the nearest motion texel, scaled from its resolution to this raster's.
+        const unsigned int mi = (y * motion_h / height) * motion_w + x * motion_w / width;
+        const float2 m = motion[mi];
+        const float sx = (float)width / (float)motion_w, sy = (float)height / (float)motion_h;
+        const int hx = (int)floorf((float)x + 0.5f + m.x * sx);
+        const int hy = (int)floorf((float)y + 0.5f + m.y * sy);
         if (hx >= 0 && hy >= 0 && hx < (int)width && hy < (int)height) {
             const unsigned int hv = hist_in[(unsigned int)hy * width + (unsigned int)hx];
             const float ha = fminf(hi, fmaxf(lo, (float)(hv >> 24u) / 255.0f));
@@ -516,8 +534,15 @@ extern "C" __global__ void ovl_composite(
         }
         hist_out[i] = ((unsigned int)(fminf(1.0f, a) * 255.0f + 0.5f) << 24u) | si;
     }
-    if (a <= 0.0f || si >= style_count) return;
+    if (a <= 0.0f || si >= style_count) {
+        if (dst_ovl != nullptr) dst_ovl[i] = pack_f16_4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
     const OvlStyle st = styles[si];
+    if (dst_ovl != nullptr) {
+        // Output-resolution layer (DLSS): premultiplied linear light, blended by the display pass.
+        dst_ovl[i] = pack_f16_4(st.r * a, st.g * a, st.b * a, a);
+    }
     if (dst8 != nullptr) {
         uchar4 d = dst8[i];
         auto mix8 = [&](unsigned char c, float l) -> unsigned char {

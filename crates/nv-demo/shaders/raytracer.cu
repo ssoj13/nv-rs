@@ -104,9 +104,11 @@ struct Params {
     unsigned int classic_motion_count;   // valid entries of classic_motion
     unsigned long long classic_motion;   // device ptr to float[12] row-major 3x4 current-world -> previous-world per classic instance (index = instance id bits 16..23)
     unsigned long long pick_record;      // device ptr to one NvPickRecord, written for `pick_px` (0 = none)
+    unsigned long long is_counters;      // device ptr to u64[NV_IS_GROUPS * NV_IS_STRIPES]; 0 = counting off (uniform per launch)
 };
 
-static_assert(sizeof(Params) == 656, "Params size must match LaunchParams (656 B)");
+static_assert(sizeof(Params) == 664, "Params size must match LaunchParams (664 B)");
+static_assert(__builtin_offsetof(Params, is_counters) == 656, "Params::is_counters offset must be 656");
 static_assert(__builtin_offsetof(Params, pick_px) == 428, "Params::pick_px offset must be 428");
 static_assert(__builtin_offsetof(Params, pick_record) == 648, "Params::pick_record offset must be 648");
 static_assert(__builtin_offsetof(Params, csg_prev_xforms) == 592, "Params::csg_prev_xforms offset must be 592");
@@ -173,6 +175,44 @@ static_assert(__builtin_offsetof(NvPickRecord, t) == 8, "NvPickRecord::t");
 static_assert(__builtin_offsetof(NvPickRecord, world_pos) == 12, "NvPickRecord::world_pos");
 static_assert(__builtin_offsetof(NvPickRecord, flags) == 24, "NvPickRecord::flags");
 static_assert(__builtin_offsetof(NvPickRecord, frame) == 28, "NvPickRecord::frame");
+
+// Measurement counters for the csg-rs P37 A/B (`is_counters.rs`, `--is-counters`, `--bench-views`):
+// intersection-program invocations per hit group plus traced rays. Why: P37 replaces box chains by
+// sweep tiles, so each wave must show what it does to the IS work, not only to the RT time.
+// Zero cost when off: `params.is_counters` is 0 for the whole launch, so every call site is one
+// constant-bank load and a uniform branch. On: one 64-bit atomic per event into one of
+// NV_IS_STRIPES copies per group (stripe = launch x & 31) to spread contention; the host sums
+// the stripes. Counted frames run slower and are never used for timing.
+#define NV_IS_CSG_RPN 0u
+#define NV_IS_CSG_RPN_SHADOW 1u
+#define NV_IS_CSG_PRIM 2u
+#define NV_IS_CSG_PRIM_SHADOW 3u
+#define NV_IS_UNION_PART 4u
+#define NV_IS_UNION_PART_SHADOW 5u
+#define NV_IS_ROAD_TILE 6u
+#define NV_IS_FRACTAL 7u
+#define NV_IS_SPHERE 8u
+#define NV_IS_RAYS_RADIANCE 9u
+#define NV_IS_RAYS_SHADOW 10u
+#define NV_IS_GROUPS 12u
+#define NV_IS_STRIPES 32u
+#define NV_CSG_PRIM_ROAD_TERRAIN_TILE 12u  // CSG_PRIM_ROAD_TERRAIN_TILE (csg-device)
+
+static __forceinline__ __device__ void nv_is_count(unsigned int group) {
+    if (params.is_counters != 0ull) {
+        unsigned long long* c = reinterpret_cast<unsigned long long*>(params.is_counters);
+        atomicAdd(c + group * NV_IS_STRIPES + (optixGetLaunchIndex().x & (NV_IS_STRIPES - 1u)), 1ull);
+    }
+}
+
+// Road-tile share of the single-primitive / pure-union route (the RPN route evaluates road tiles
+// inside csg-rs code and is not split out).
+static __forceinline__ __device__ void nv_is_count_road(unsigned int prim_idx) {
+    if (params.is_counters != 0ull
+        && reinterpret_cast<const CsgGpuPrim*>(params.csg_prims)[prim_idx].kind == NV_CSG_PRIM_ROAD_TERRAIN_TILE) {
+        nv_is_count(NV_IS_ROAD_TILE);
+    }
+}
 
 // True for the one raygen thread that answers this launch's pick (uniform `false` otherwise).
 static __forceinline__ __device__ bool nv_pick_here(uint3 idx) {
@@ -1839,6 +1879,7 @@ static __forceinline__ __device__ void trace_primary(
     unsigned int& p0, unsigned int& p1, unsigned int& p2, unsigned int& p3,
     unsigned int& p4, unsigned int& p5, unsigned int& p6, unsigned int& p7
 ) {
+    nv_is_count(NV_IS_RAYS_RADIANCE);
     if (params.enable_ser != 0u) {
         optixTraverse(
             (OptixTraversableHandle)params.handle,
@@ -1875,6 +1916,7 @@ static __forceinline__ __device__ void trace_primary(
 }
 
 static __forceinline__ __device__ bool trace_shadow(float3 origin, float3 dir, float max_t) {
+    nv_is_count(NV_IS_RAYS_SHADOW);
     unsigned int hit = 1u;
     optixTrace(
         (OptixTraversableHandle)params.handle,
@@ -3089,6 +3131,7 @@ static __forceinline__ __device__ bool fractal_aux_launch() {
 }
 
 extern "C" __global__ void __intersection__fractal() {
+    nv_is_count(NV_IS_FRACTAL);
     float3 orig    = optixGetObjectRayOrigin();
     float3 raw_dir = optixGetObjectRayDirection();
     float dir_len  = f3_len(raw_dir);
@@ -3187,6 +3230,7 @@ extern "C" __global__ void __intersection__fractal() {
 }
 
 extern "C" __global__ void __intersection__fractal_shadow() {
+    nv_is_count(NV_IS_FRACTAL);
     float3 orig    = optixGetObjectRayOrigin();
     float3 raw_dir = optixGetObjectRayDirection();
     float dir_len  = f3_len(raw_dir);
@@ -3252,6 +3296,7 @@ extern "C" __global__ void __closesthit__fractal() {
 }
 
 extern "C" __global__ void __intersection__sphere() {
+    nv_is_count(NV_IS_SPHERE);
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
@@ -3284,6 +3329,7 @@ extern "C" __global__ void __intersection__sphere() {
 }
 
 extern "C" __global__ void __intersection__sphere_shadow() {
+    nv_is_count(NV_IS_SPHERE);
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
@@ -3307,6 +3353,7 @@ extern "C" __global__ void __intersection__sphere_shadow() {
 }
 
 extern "C" __global__ void __intersection__csg() {
+    nv_is_count(NV_IS_CSG_RPN);
     if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
@@ -3347,6 +3394,7 @@ extern "C" __global__ void __intersection__csg() {
 }
 
 extern "C" __global__ void __intersection__csg_shadow() {
+    nv_is_count(NV_IS_CSG_RPN_SHADOW);
     if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
@@ -3371,6 +3419,7 @@ extern "C" __global__ void __intersection__csg_shadow() {
 }
 
 extern "C" __global__ void __intersection__csg_prim() {
+    nv_is_count(NV_IS_CSG_PRIM);
     if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
@@ -3383,6 +3432,7 @@ extern "C" __global__ void __intersection__csg_prim() {
     // Host sets CustomPrimitives::primitive_offset = first_prim_idx for both SINGLE_PRIM and
     // Multi-AABB PURE_UNION GASes, so optixGetPrimitiveIndex() is the exact global prim_idx.
     unsigned int prim_idx = optixGetPrimitiveIndex();
+    nv_is_count_road(prim_idx);
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
@@ -3415,6 +3465,7 @@ extern "C" __global__ void __intersection__csg_prim() {
 }
 
 extern "C" __global__ void __intersection__csg_prim_shadow() {
+    nv_is_count(NV_IS_CSG_PRIM_SHADOW);
     if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
@@ -3427,6 +3478,7 @@ extern "C" __global__ void __intersection__csg_prim_shadow() {
     }
 
     unsigned int prim_idx = optixGetPrimitiveIndex();
+    nv_is_count_road(prim_idx);
     float3 orig = optixGetObjectRayOrigin();
     float3 dir  = optixGetObjectRayDirection();
     float tmin  = optixGetRayTmin();
@@ -3448,6 +3500,7 @@ extern "C" __global__ void __intersection__csg_prim_shadow() {
 // `6e84ff6`). Kept out of `__intersection__csg_prim` because its register footprint would tax
 // every single-primitive instance.
 extern "C" __global__ void __intersection__csg_union_part() {
+    nv_is_count(NV_IS_UNION_PART);
     if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;
@@ -3486,6 +3539,7 @@ extern "C" __global__ void __intersection__csg_union_part() {
 }
 
 extern "C" __global__ void __intersection__csg_union_part_shadow() {
+    nv_is_count(NV_IS_UNION_PART_SHADOW);
     if (params.csg_instances == 0ull || params.csg_prims == 0ull) return;
     unsigned int inst_idx = optixGetInstanceId();
     if (inst_idx >= params.csg_instance_count) return;

@@ -12,6 +12,7 @@ mod demo_anim;
 mod fft_bloom;
 mod flight_stats;
 mod gpu_export;
+mod is_counters;
 mod mp4_muxer;
 mod nvtx;
 mod optix_sdk;
@@ -2552,6 +2553,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         accum_count: u32,
         total_samples: u32,
         rt_ms: f32,
+        /// Intersection counts of the latest counted launch (`is_counters.rs`).
+        is_counts: Option<crate::is_counters::IsCounts>,
         denoise_ms: f32,
         bloom_ms: f32,
         tonemap_ms: f32,
@@ -2720,7 +2723,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pub fn new(
             window: Arc<Window>,
             loaded: crate::persist::LoadReport,
-            bench_args: Option<crate::bench::BenchRailArgs>,
+            bench_args: Option<crate::bench::BenchArgs>,
+            is_counters: bool,
         ) -> Self {
             let crate::persist::LoadReport {
                 state: mut persisted,
@@ -2729,9 +2733,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if let Some(b) = bench_args.as_ref() {
                 // Identical geometry and camera model in every benchmark run: frozen traffic and
                 // crowd, free Pinhole camera, no demo animation; the rail drives the camera.
-                if let Some(id) = b.scene.as_ref() {
+                // A views run starts in its first view's scene.
+                let scene = match &b.target {
+                    crate::bench::BenchTarget::Rail(_) => b.scene.clone(),
+                    crate::bench::BenchTarget::Views(v) => v.first().map(|v| v.scene.clone()),
+                };
+                if let Some(id) = scene {
                     persisted.scene = Some(crate::persist::SavedScene {
-                        id: id.clone(),
+                        id,
                         variant: String::new(),
                     });
                 }
@@ -3068,6 +3077,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 run
             });
             let mut settings = persisted.settings;
+            settings.is_counters = is_counters;
             let mut startup_intent = StartupIntent::default();
             if settings.hdr_display && !hdr_surface_supported {
                 settings.hdr_display = false;
@@ -3213,6 +3223,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 accum_count: 0,
                 total_samples: 0,
                 rt_ms: 0.0,
+                is_counts: None,
                 denoise_ms: 0.0,
                 bloom_ms: 0.0,
                 tonemap_ms: 0.0,
@@ -3314,15 +3325,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let Some(run) = self.bench.as_mut() else {
                 return;
             };
+            if run.views.as_ref().is_some_and(|v| v.phase == crate::bench::ViewPhase::WaitScene)
+                && run.phase == crate::bench::BenchPhase::Running
+            {
+                // A views run switched scene: the new scene is in, place the camera.
+                self.bench_view_begin();
+                return;
+            }
             if run.phase != crate::bench::BenchPhase::WaitingForRails {
                 return;
             }
+            let rail_id = match &run.args.target {
+                crate::bench::BenchTarget::Rail(id) => id.clone(),
+                crate::bench::BenchTarget::Views(_) => {
+                    run.phase = crate::bench::BenchPhase::Running;
+                    self.tod_transition = None;
+                    self.rail_blend_remaining = 0.0;
+                    self.shutter_in_flight = false;
+                    self.send_render(RenderControl::SetRecording {
+                        active: true,
+                        fixed_fps: RECORD_FPS,
+                        shutter_subframes: 1,
+                    });
+                    self.bench_view_begin();
+                    return;
+                }
+            };
             let rails = self.camera_rail.scene_rails();
-            let Some(idx) = rails.iter().position(|r| r.spec.id == run.args.rail) else {
+            let Some(idx) = rails.iter().position(|r| r.spec.id == rail_id) else {
                 let ids: Vec<&str> = rails.iter().map(|r| r.spec.id.as_str()).collect();
                 run.phase = crate::bench::BenchPhase::Done(Err(format!(
                     "rail {:?} not in this scene (available: {})",
-                    run.args.rail,
+                    rail_id,
                     ids.join(", ")
                 )));
                 return;
@@ -3331,7 +3365,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if !self.camera_rail.set_playing(true) {
                 run.phase = crate::bench::BenchPhase::Done(Err(format!(
                     "rail {:?} cannot play",
-                    run.args.rail
+                    rail_id
                 )));
                 return;
             }
@@ -3361,6 +3395,96 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 shutter_subframes: 1,
             });
             self.send_render(start);
+        }
+
+        /// Puts the current view of a `--bench-views` run in place: requests its scene when
+        /// another one is loaded (`start_bench_if_ready` calls back on `SceneMetaUpdated`), else
+        /// sets the camera and starts the view's warm-up. Past the last view, writes the CSV.
+        fn bench_view_begin(&mut self) {
+            let Some(run) = self.bench.as_mut() else {
+                return;
+            };
+            let Some(vr) = run.views.as_mut() else {
+                return;
+            };
+            self.settings.is_counters = false;
+            let Some(view) = vr.views.get(vr.idx).cloned() else {
+                run.phase = crate::bench::BenchPhase::Done(
+                    crate::bench::write_views_csv(&run.args.out, &vr.rows).map(|()| run.args.out.clone()),
+                );
+                return;
+            };
+            let Some(pos) = self.scene_descriptors.iter().position(|d| d.id == view.scene) else {
+                let ids: Vec<&str> = self.scene_descriptors.iter().map(|d| d.id).collect();
+                run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                    "view {:?}: scene {:?} is not registered (available: {})",
+                    view.name,
+                    view.scene,
+                    ids.join(", ")
+                )));
+                return;
+            };
+            let scene_idx = pos as u32 + 1;
+            if self.loaded_scene_key != Some((scene_idx, 0)) {
+                vr.phase = crate::bench::ViewPhase::WaitScene;
+                self.settings.csg_mode = scene_idx;
+                self.settings.csg_asset_idx = 0;
+                return;
+            }
+            let (eye, target, vfov_deg) = match &view.cam {
+                crate::bench::ViewCam::Explicit { eye, target, vfov_deg } => (*eye, *target, *vfov_deg),
+                crate::bench::ViewCam::Viewpoint(id) => {
+                    let Some(vp) = self.scene_viewpoints.iter().find(|v| &v.id == id) else {
+                        let ids: Vec<&str> = self.scene_viewpoints.iter().map(|v| v.id.as_str()).collect();
+                        run.phase = crate::bench::BenchPhase::Done(Err(format!(
+                            "view {:?}: viewpoint {id:?} not in scene {:?} (available: {})",
+                            view.name,
+                            view.scene,
+                            ids.join(", ")
+                        )));
+                        return;
+                    };
+                    ([vp.eye.x, vp.eye.y, vp.eye.z], [vp.target.x, vp.target.y, vp.target.z], vp.vfov_deg)
+                }
+            };
+            let eye_v = glam::Vec3::from_array(eye);
+            let delta = glam::Vec3::from_array(target) - eye_v;
+            let dist = delta.length().max(0.25);
+            let pose = CameraPose::from_eye_forward_up(
+                eye_v,
+                delta / dist,
+                glam::Vec3::Y,
+                vfov_deg.clamp(15.0, 110.0).to_radians(),
+                self.cam_pose.znear,
+                self.cam_pose.zfar.max(2000.0),
+            );
+            self.camera_rail.set_playing(false);
+            self.cam_driver.controller_mut().set_pose(pose);
+            self.cam_driver.controller_mut().set_orbit_distance(dist);
+            self.cam_pose = self.cam_driver.controller().pose();
+            self.rail_blend_remaining = 0.0;
+            self.cam_damper.snap(self.cam_pose);
+            vr.begin_view();
+        }
+
+        /// Feeds one rendered frame to a running `--bench-views` run.
+        fn bench_view_frame(
+            &mut self,
+            rt_ms: f32,
+            state: crate::perf_log::PerfState,
+            counts: Option<crate::is_counters::IsCounts>,
+        ) {
+            let Some(run) = self.bench.as_mut().filter(|r| r.is_running()) else {
+                return;
+            };
+            let Some(vr) = run.views.as_mut() else {
+                return;
+            };
+            match vr.on_frame(rt_ms, state, counts) {
+                crate::bench::ViewEvent::None => {}
+                crate::bench::ViewEvent::SetCounters(on) => self.settings.is_counters = on,
+                crate::bench::ViewEvent::ViewDone { .. } => self.bench_view_begin(),
+            }
         }
 
         fn notify_recording(&mut self, active: bool) {
@@ -3562,6 +3686,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
             let mut scene_rails_updated = false;
+            let mut bench_frame: Option<(f32, crate::perf_log::PerfState, Option<crate::is_counters::IsCounts>)> = None;
             let mut perf_log_written: Option<Result<std::path::PathBuf, String>> = None;
             let mut fatal_reason: Option<String> = None;
             self.bus.poll_render_events(&mut self.render_ev_scratch);
@@ -3604,6 +3729,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         self.crowd_active_backend = msg.crowd_active_backend;
                         self.crowd_actor_count = msg.crowd_actor_count;
                         self.fast_preview = msg.fast_preview;
+                        if msg.is_counts.is_some() {
+                            self.is_counts = msg.is_counts;
+                        }
+                        // Lockstep (the only mode a views run uses) has one frame in flight, so
+                        // at most one FrameReady arrives per UI frame.
+                        bench_frame = Some((msg.perf.rt_ms, msg.perf.state, msg.is_counts));
                         self.engine_phase = crate::app_events::EnginePhase::Rendering;
                         self.last_possess_camera = msg.possess_camera;
                         self.last_rendered_camera = msg.rendered_camera;
@@ -3759,6 +3890,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
+            if let Some((rt_ms, state, counts)) = bench_frame {
+                self.bench_view_frame(rt_ms, state, counts);
+            }
             if scene_rails_updated {
                 self.start_bench_if_ready();
             }
@@ -3832,6 +3966,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 accum_count: self.accum_count,
                 total_samples: self.total_samples,
                 rt_ms: self.rt_ms,
+                is_counts: self.is_counts,
                 denoise_ms: self.denoise_ms,
                 bloom_ms: self.bloom_ms,
                 tonemap_ms: self.tonemap_ms,
@@ -6087,8 +6222,10 @@ fn compute_next_ui_tick(now: Instant, prev_deadline: Instant, interval: Duration
 struct Runner {
     app: Option<DemoApp>,
     next_redraw_at: Option<Instant>,
-    /// `--bench-rail` arguments, handed to the app when it is created.
-    bench: Option<bench::BenchRailArgs>,
+    /// `--bench-rail` / `--bench-views` arguments, handed to the app when it is created.
+    bench: Option<bench::BenchArgs>,
+    /// `--is-counters`: start with the intersection counters on.
+    is_counters: bool,
 }
 
 impl ApplicationHandler for Runner {
@@ -6104,7 +6241,7 @@ impl ApplicationHandler for Runner {
                 attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
             }
             let win = Arc::new(event_loop.create_window(attrs).expect("window"));
-            self.app = Some(DemoApp::new(win, loaded, self.bench.take()));
+            self.app = Some(DemoApp::new(win, loaded, self.bench.take(), self.is_counters));
             let now = Instant::now();
             self.next_redraw_at = Some(now);
             event_loop.set_control_flow(ControlFlow::WaitUntil(now));
@@ -6182,8 +6319,8 @@ fn teardown_report(drained: &cuda_core_ext::teardown::Drained) -> Vec<String> {
 
 fn main() -> std::process::ExitCode {
     nvtx::name_current_thread(c"nv-demo-main");
-    let bench = match bench::parse_args(std::env::args_os().skip(1)) {
-        Ok(b) => b,
+    let cli = match bench::parse_args(std::env::args_os().skip(1)) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("nv-demo: {e}\n{}", bench::USAGE);
             return std::process::ExitCode::FAILURE;
@@ -6193,7 +6330,8 @@ fn main() -> std::process::ExitCode {
         .map_err(|e| format!("event loop creation failed: {e}"))
         .and_then(|event_loop| {
             let mut runner = Runner {
-                bench,
+                bench: cli.bench,
+                is_counters: cli.is_counters,
                 ..Runner::default()
             };
             event_loop

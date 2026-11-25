@@ -192,9 +192,13 @@ struct LaunchParams {
     /// Device pointer to one `NvPickRecord` (`crate::pick::PickRecordPod`), written by the raygen
     /// thread of `pick_px`; `0` = no pick buffer.
     pick_record: u64,
+    /// Device pointer to the intersection counters (`crate::is_counters`, `IS_WORDS` u64);
+    /// `0` = counting off for the whole launch (one uniform branch per call site).
+    is_counters: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 656);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 664);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, is_counters) == 656);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_px) == 428);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_record) == 648);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_prev_xforms) == 592);
@@ -753,6 +757,10 @@ pub struct DemoSettings {
     /// `overlay.in_captures == false` the overlay is left out of the frames it records.
     #[serde(skip)]
     pub capture_active: bool,
+    /// Count intersection-program invocations per hit group (`is_counters.rs`; debug flag from
+    /// `--is-counters` or the Flight stats toggle, not persisted). Counted frames are slower.
+    #[serde(skip)]
+    pub is_counters: bool,
     pub render_scale: f32,
     pub denoiser_on: bool,
     pub temporal_denoise: bool,
@@ -969,6 +977,7 @@ impl Default for DemoSettings {
             wire_line_px: crate::wireframe::WIRE_LINE_PX_DEFAULT,
             overlay: crate::overlay::OverlayFilter::default(),
             capture_active: false,
+            is_counters: false,
             render_scale: 1.0,
             denoiser_on: false,
             temporal_denoise: false,
@@ -1155,6 +1164,9 @@ pub struct FrameReady {
     pub crowd_actor_count: u32,
     /// The frame's timings and launch state, the same sample the perf CSV records.
     pub perf: crate::perf_log::PerfSample,
+    /// Intersection counts of the latest counted launch, sent once when they arrive (the launch
+    /// before this frame); `None` on frames without fresh counts (`is_counters.rs`).
+    pub is_counts: Option<crate::is_counters::IsCounts>,
 }
 
 struct TonemapKernel {
@@ -3195,6 +3207,100 @@ impl Drop for PickRig {
     }
 }
 
+/// Device side of the intersection counters (`is_counters.rs`): the striped `u64` buffer the
+/// launch increments, its pinned readback block and the completion event.
+///
+/// Why the same event pattern as the pick: the counts are read on the next frame with a
+/// non-blocking `cuEventQuery`, so counting never adds a stream synchronisation.
+struct IsCounterRig {
+    ctx: Arc<CudaContext>,
+    words: DeviceBuffer<u64>,
+    staging: crate::csg_scene_host::PinnedStagingBuffer,
+    done: cu::CUevent,
+    /// A counted launch's readback has not been consumed yet (the next launch is not counted).
+    in_flight: bool,
+}
+
+impl IsCounterRig {
+    const BYTES: usize = crate::is_counters::IS_WORDS * 8;
+
+    fn new(rig: &OptixRig) -> Result<Self, String> {
+        let words = DeviceBuffer::zeroed(&rig.stream, crate::is_counters::IS_WORDS)
+            .map_err(|e| format!("counter allocation failed: {e}"))?;
+        let staging = crate::csg_scene_host::PinnedStagingBuffer::try_new(&rig.tonemap.cuda, Self::BYTES)
+            .ok_or("counter pinned staging allocation failed")?;
+        let mut done: cu::CUevent = std::ptr::null_mut();
+        // SAFETY: the render context is current (bound by `PinnedStagingBuffer::try_new`).
+        let rc = unsafe { cu::cuEventCreate(&mut done, cu::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS || done.is_null() {
+            return Err(format!("counter cuEventCreate failed ({rc:?})"));
+        }
+        Ok(Self { ctx: rig.tonemap.cuda.clone(), words, staging, done, in_flight: false })
+    }
+
+    /// Zeroes the counters before a counted launch.
+    fn arm(&self, stream: &Stream) -> Result<(), String> {
+        // SAFETY: `words` holds `IS_WORDS` u64 = `2 * IS_WORDS` u32 and lives until the fence.
+        let rc = unsafe {
+            cu::cuMemsetD32Async(self.words.cu_deviceptr(), 0, crate::is_counters::IS_WORDS * 2, stream.cu_stream())
+        };
+        if rc == cu::cudaError_enum_CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("counter reset failed ({rc:?})"))
+        }
+    }
+
+    /// Queues the copy into pinned memory and the completion event after the counted launch.
+    fn readback(&mut self, stream: &Stream) -> Result<(), String> {
+        // SAFETY: `BYTES` from the counter buffer into the `BYTES` pinned block, ordered after
+        // the launch; the block is read only after `done` completed.
+        let rc = unsafe {
+            cu::cuMemcpyDtoHAsync_v2(self.staging.as_mut_ptr(), self.words.cu_deviceptr(), Self::BYTES, stream.cu_stream())
+        };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("counter readback failed ({rc:?})"));
+        }
+        // SAFETY: `done` is a live event of this context, `stream` is live.
+        let rc = unsafe { cu::cuEventRecord(self.done, stream.cu_stream()) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("counter event record failed ({rc:?})"));
+        }
+        self.in_flight = true;
+        Ok(())
+    }
+
+    /// The summed counts once the copy completed (`None` while still in flight).
+    fn poll(&mut self) -> Result<Option<crate::is_counters::IsCounts>, String> {
+        // SAFETY: `done` is a live event of this context.
+        let rc = unsafe { cu::cuEventQuery(self.done) };
+        if rc == cu::cudaError_enum_CUDA_ERROR_NOT_READY {
+            return Ok(None);
+        }
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("counter cuEventQuery failed ({rc:?})"));
+        }
+        self.in_flight = false;
+        // SAFETY: the copy into the `BYTES` pinned block completed (event done).
+        let words = unsafe {
+            std::ptr::read_unaligned(self.staging.as_mut_ptr().cast::<[u64; crate::is_counters::IS_WORDS]>())
+        };
+        Ok(Some(crate::is_counters::IsCounts::from_stripes(&words)))
+    }
+}
+
+impl Drop for IsCounterRig {
+    fn drop(&mut self) {
+        if !self.done.is_null() && self.ctx.bind_to_thread().is_ok() {
+            // SAFETY: `done` was created by `cuEventCreate` on `self.ctx`, now current.
+            let rc = unsafe { cu::cuEventDestroy_v2(self.done) };
+            if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                eprintln!("nv-demo: counter cuEventDestroy failed ({rc:?})");
+            }
+        }
+    }
+}
+
 /// Largest CPU-provider segment count per frame (CPU providers draw small sets only).
 const OVERLAY_CPU_SEG_MAX: usize = 16_384;
 /// Weight of the new frame in the overlay coverage history (exponential, like a TAA resolve).
@@ -4673,6 +4779,10 @@ pub fn spawn_render_thread(
             let mut pick = crate::pick::PickState::default();
             let mut pick_rig: Option<PickRig> = None;
             let mut selection = crate::pick::Selection::default();
+            // Intersection counters (`is_counters.rs`): device rig and the counts consumed this
+            // frame (sent once with the next `FrameReady`).
+            let mut is_rig: Option<IsCounterRig> = None;
+            let mut fresh_is_counts: Option<crate::is_counters::IsCounts> = None;
             let mut overlay_status: Option<String> = None;
             // A camera / scene cut since the last overlay frame: its coverage history is stale.
             let mut overlay_history_cut = false;
@@ -5234,6 +5344,7 @@ pub fn spawn_render_thread(
                     tmp.overlay = settings.overlay;
                     tmp.wire_line_px = settings.wire_line_px;
                     tmp.capture_active = settings.capture_active;
+                    tmp.is_counters = settings.is_counters;
                     if s.aov_mode < 3 && settings.aov_mode < 3 {
                         tmp.aov_mode = settings.aov_mode;
                     }
@@ -5256,6 +5367,18 @@ pub fn spawn_render_thread(
                     possess_free_pitch = snap.possess_free_pitch;
                     possess_auto_level = snap.possess_auto_level;
                     possess_zoom_offset = snap.possess_zoom_offset;
+                }
+
+                // Intersection counters of the previous counted launch (non-blocking event query).
+                if let Some(c) = is_rig.as_mut().filter(|c| c.in_flight) {
+                    match c.poll() {
+                        Ok(Some(counts)) => fresh_is_counts = Some(counts),
+                        Ok(None) => {}
+                        Err(e) => {
+                            is_rig = None;
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!("IS counter readback failed: {e}")));
+                        }
+                    }
                 }
 
                 // GPU pick record of the previous launch (non-blocking event query; the end-of-frame
@@ -6206,6 +6329,22 @@ pub fn spawn_render_thread(
                     bus.emit_render_event(RenderEvent::Fatal(e));
                     break 'render;
                 }
+                // Intersection counters (`is_counters.rs`): only while the debug flag is on, and
+                // never while the previous counted launch is still being read back.
+                if settings.is_counters && is_rig.is_none() {
+                    match IsCounterRig::new(&rig) {
+                        Ok(c) => is_rig = Some(c),
+                        Err(e) => {
+                            settings.is_counters = false;
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!("IS counters unavailable: {e}")));
+                        }
+                    }
+                }
+                let count_is = settings.is_counters && is_rig.as_ref().is_some_and(|c| !c.in_flight);
+                if count_is && let Some(Err(e)) = is_rig.as_ref().map(|c| c.arm(&rig.stream)) {
+                    bus.emit_render_event(RenderEvent::Fatal(e));
+                    break 'render;
+                }
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
@@ -6346,6 +6485,7 @@ pub fn spawn_render_thread(
                     classic_motion_count,
                     classic_motion: rig.classic_motion_buf.cu_deviceptr(),
                     pick_record: pick_rig.as_ref().map_or(0, |p| p.record.cu_deviceptr()),
+                    is_counters: if count_is { is_rig.as_ref().map_or(0, |c| c.words.cu_deviceptr()) } else { 0 },
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -6391,6 +6531,10 @@ pub fn spawn_render_thread(
                 if pick_px != crate::pick::PICK_NONE
                     && let Some(Err(e)) = pick_rig.as_mut().map(|p| p.readback(&rig.stream))
                 {
+                    bus.emit_render_event(RenderEvent::Fatal(e));
+                    break 'render;
+                }
+                if count_is && let Some(Err(e)) = is_rig.as_mut().map(|c| c.readback(&rig.stream)) {
                     bus.emit_render_event(RenderEvent::Fatal(e));
                     break 'render;
                 }
@@ -6984,6 +7128,7 @@ pub fn spawn_render_thread(
                     crowd_active_backend: last_crowd_backend,
                     crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
                     perf: perf_sample,
+                    is_counts: fresh_is_counts.take(),
                 }));
             }
         })
@@ -7066,7 +7211,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 656);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 664);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);

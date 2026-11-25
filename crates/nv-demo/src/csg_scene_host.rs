@@ -3945,4 +3945,89 @@ mod tests {
             "tight distance/tier/screen-px sliders must increase culled_count and activate LOD1/LOD2: tight={stats_tight_cull:?}, disabled={stats_disabled:?}"
         );
     }
+
+    /// Semantic ids that occur in the city scenes, counted per packed instance part (an
+    /// instance override counts once, otherwise each distinct primitive semantic of the part's
+    /// compound), plus the scenes' viewpoints (the ids the `--bench-views` sets reference).
+    /// Asserts the csg-rs ABI invariant that every semantic id is below 64 (the bit width of the
+    /// hidden-semantics mask). Prints a table: run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "builds the full city scenes (slow); diagnostic table for the semantics / views report"]
+    fn city_scene_semantic_census_and_viewpoints() {
+        let host = CsgGpuHost::new();
+        for (idx, d) in host.registry.descriptors().iter().enumerate() {
+            if !["gundo", "gundo_osm", "marina"].iter().any(|k| d.id.starts_with(k)) {
+                continue;
+            }
+            let module = host.registry.get_by_index(idx).expect("module");
+            let mut built = module.build(&SceneBuildConfig::default()).expect("scene builds");
+            let mut packed = PackedGpuScene::new();
+            built.world.pack_all(Vec3::new(0.0, 2.0, 0.0), &mut packed);
+            let lib = &built.world.library;
+            let mut counts = [0u64; 64];
+            let mut seen = [false; 64];
+            for gi in packed.instances_slice() {
+                if let Some(sem) = inst_flags::semantic(gi.flags) {
+                    assert!(sem.0 < 64, "{}: instance semantic {} >= 64", d.id, sem.0);
+                    counts[sem.0 as usize] += 1;
+                    continue;
+                }
+                let Some(comp) = lib.compounds.get(gi.compound_id as usize) else { continue };
+                seen.fill(false);
+                let start = comp.op_offset as usize;
+                for op in lib.ops.get(start..start + comp.op_count as usize).unwrap_or(&[]) {
+                    if op.opcode == opcode::PUSH_PRIM && let Some(prim) = lib.prims.get(op.arg0 as usize) {
+                        let sem = (prim.mat_sem >> 16) as usize;
+                        assert!(sem < 64, "{}: primitive semantic {sem} >= 64", d.id);
+                        if !seen[sem] {
+                            seen[sem] = true;
+                            counts[sem] += 1;
+                        }
+                    }
+                }
+            }
+            let row: Vec<String> =
+                counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| format!("{i}:{c}")).collect();
+            eprintln!("SEMANTICS {} ({} parts): {}", d.id, packed.len(), row.join(" "));
+            // Road parts (semantic 1) nearest each viewpoint target: street-level and grazing
+            // cameras of the bench view sets are placed on them.
+            let road_parts: Vec<(Vec3, Vec3)> = packed
+                .instances_slice()
+                .iter()
+                .filter_map(|gi| {
+                    let comp = lib.compounds.get(gi.compound_id as usize)?;
+                    let start = comp.op_offset as usize;
+                    let ops = lib.ops.get(start..start + comp.op_count as usize)?;
+                    let road = ops.iter().any(|op| {
+                        op.opcode == opcode::PUSH_PRIM
+                            && lib.prims.get(op.arg0 as usize).is_some_and(|p| p.mat_sem >> 16 == 1)
+                    });
+                    let m = Mat3x4(gi.xform);
+                    let b = m.xform_aabb(CsgAabb::new(
+                        Vec3::new(comp.aabb_min[0], comp.aabb_min[1], comp.aabb_min[2]),
+                        Vec3::new(comp.aabb_max[0], comp.aabb_max[1], comp.aabb_max[2]),
+                    ));
+                    (road && b.is_finite() && b.diameter() < 500.0).then_some((b.min, b.max))
+                })
+                .collect();
+            for vp in &built.viewpoints {
+                if let Some((lo, hi)) = road_parts.iter().min_by(|a, b| {
+                    let d = |r: &(Vec3, Vec3)| ((r.0 + r.1) * 0.5 - vp.target).len();
+                    d(a).total_cmp(&d(b))
+                }) {
+                    eprintln!(
+                        "ROAD {} near {:?}: min ({:.1}, {:.1}, {:.1}) max ({:.1}, {:.1}, {:.1})",
+                        d.id, vp.id, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+                    );
+                }
+            }
+            for vp in &built.viewpoints {
+                eprintln!(
+                    "VIEWPOINT {} {:?} {:?} eye ({:.1}, {:.1}, {:.1}) target ({:.1}, {:.1}, {:.1}) fov {:.0}",
+                    d.id, vp.id, vp.label, vp.eye.x, vp.eye.y, vp.eye.z, vp.target.x, vp.target.y, vp.target.z, vp.vfov_deg
+                );
+            }
+            built.viewpoints.clear();
+        }
+    }
 }

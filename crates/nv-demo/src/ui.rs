@@ -555,6 +555,8 @@ pub struct UiContext<'a> {
     pub accum_count: u32,
     pub total_samples: u32,
     pub rt_ms: f32,
+    /// Intersection counts of the latest counted launch (`is_counters.rs`).
+    pub is_counts: Option<crate::is_counters::IsCounts>,
     pub denoise_ms: f32,
     pub bloom_ms: f32,
     pub tonemap_ms: f32,
@@ -3865,6 +3867,8 @@ impl UiContext<'_> {
                             self.crowd_actor_count,
                             self.rt_ms,
                             self.bus,
+                            &mut s.is_counters,
+                            self.is_counts.as_ref(),
                         ) {
                             rail.time_s = t;
                             if let Some(p) =
@@ -4861,8 +4865,24 @@ fn flight_stats_ui(
     crowd_actors: u32,
     rt_ms: f32,
     bus: &AppBus,
+    is_counters: &mut bool,
+    is_counts: Option<&crate::is_counters::IsCounts>,
 ) -> Option<f32> {
     let mut jump = None;
+    // Intersection counters (`is_counters.rs`, debug, also `--is-counters`): the P37 A/B
+    // measures them next to the RT time; counted frames are slower, so the RT row is not a
+    // timing while the toggle is on.
+    ui.checkbox(is_counters, "IS counters (debug)").on_hover_text(
+        "Count intersection-program invocations per hit group and traced rays (atomics: \
+         counted frames are slower; time with the toggle off or with --bench-views)",
+    );
+    if *is_counters && let Some(c) = is_counts {
+        stat_row(ui, "RT (counted)", fmt_into(buf, format_args!("{rt_ms:.2} ms (inflated by counting)")));
+        for g in crate::is_counters::IsGroup::ALL {
+            stat_row(ui, g.label(), fmt_into(buf, format_args!("{}", c.get(g))));
+        }
+        stat_row(ui, "IS total", fmt_into(buf, format_args!("{}", c.total_is())));
+    }
     let dur = rail.duration_s.max(0.5);
     let label = rail.active_label();
     stat_row(ui, "Cassette", &label);

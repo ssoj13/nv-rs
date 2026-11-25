@@ -213,11 +213,6 @@ impl Selection {
         &self.keys
     }
 
-    /// The most recently selected object.
-    pub fn active(&self) -> Option<u32> {
-        self.keys.last().copied()
-    }
-
     /// Applies a select click: `hit` is the picked key (`None` = empty space). Returns whether
     /// the selection changed. Plain click: select only `hit` (clear on a miss). `add`
     /// (Shift): toggle `hit`, keep the rest; a miss keeps everything.
@@ -356,7 +351,7 @@ mod tests {
         assert!(sel.click(Some(2), true));
         assert!(sel.click(Some(3), true));
         assert_eq!(sel.keys(), &[1, 2, 3]);
-        assert_eq!(sel.active(), Some(3));
+        assert_eq!(sel.keys().last(), Some(&3), "the last selected is the active object");
         assert!(sel.click(Some(2), true), "Shift toggles a member out");
         assert_eq!(sel.keys(), &[1, 3]);
         assert!(!sel.click(None, true), "Shift + empty space keeps the selection");
@@ -364,7 +359,7 @@ mod tests {
         assert_eq!(sel.keys(), &[9]);
         assert!(sel.click(None, false), "plain click on empty space clears");
         assert!(sel.keys().is_empty());
-        assert!(sel.select_only(5) && sel.clear() && sel.active().is_none());
+        assert!(sel.select_only(5) && sel.clear() && sel.keys().is_empty());
     }
 
     #[test]

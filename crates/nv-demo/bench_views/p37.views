@@ -1,0 +1,11 @@
+# Built-in camera set of `nv-demo --bench-views p37` (bench.rs): the A/B harness of each csg-rs
+# P37 wave (sweep tiles replacing kerb / sidewalk / wall / rail box chains).
+# One view per line: `name scene viewpoint <id>` or `name scene eye x y z target x y z fov deg`.
+# Street-level and grazing cameras sit on road parts found by the csg_scene_host census test
+# (`city_scene_semantic_census_and_viewpoints`); re-check them when csg-rs moves roads.
+osm_beach_bookmark  gundo_osm viewpoint gundo_osm_beach_ocean
+osm_refinery        gundo_osm viewpoint gundo_osm_refinery_hero
+osm_street_grazing  gundo_osm eye 40.3 40.2 -20.0 target 40.3 39.0 60.0 fov 55
+osm_topdown         gundo_osm eye 45.0 260.0 10.0 target 45.0 38.0 12.0 fov 50
+marina_street       marina    eye 72.5 5.9 -40.0 target 72.5 5.0 40.0 fov 60
+marina_grazing      marina    eye -70.0 5.5 -65.5 target 40.0 4.0 -65.5 fov 50

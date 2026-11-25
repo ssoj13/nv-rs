@@ -334,8 +334,7 @@ pub enum DepthMode {
     /// Hidden parts are not drawn.
     #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
     SkipHidden = 1,
-    /// Hidden parts are drawn faded and dashed.
-    #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
+    /// Hidden parts are drawn faded and dashed (object axes).
     FadeHidden = 2,
 }
 
@@ -674,11 +673,13 @@ impl OverlayProvider for AxesProvider {
 }
 
 /// Near limit (metres along the view axis) below which `ovl_axes` draws no axes: the triad
-/// length scales with the origin depth and would collapse to nothing.
+/// length scales with the origin depth and would collapse to nothing (`OVL_AXES_NEAR`).
+#[cfg(test)]
 pub const AXES_NEAR_M: f32 = 0.05;
 
 /// What `ovl_axes` emits for one instance: the three axis end points from `origin` and the
 /// projected size of the instance bounds that drives the screen-size cull and the line LOD.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AxesEmit {
     /// Instance origin (translation column of the 3x4 transform), world metres.
@@ -697,7 +698,9 @@ pub struct AxesEmit {
 /// `aabb` the compound's local bounds. Returns `None` when the instance is culled: origin behind
 /// the near limit, bounds outside the frustum, or bounds smaller than `min_px` on screen (unless
 /// `selected`). The axis length is `axis_px` pixels at the origin depth, so it reads the same at
-/// any distance: `L = axis_px * 2 tan(fov/2) z / height`.
+/// any distance: `L = axis_px * 2 tan(fov/2) z / height`. Test-only: the kernel is the
+/// production path; this mirror exists so the formulas are pinned by unit tests.
+#[cfg(test)]
 pub fn axes_emit(
     cam: &GpuOverlayCamera,
     height: u32,

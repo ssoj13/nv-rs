@@ -23,6 +23,7 @@ mod pick;
 mod profiler;
 mod renderer;
 mod sdg_export;
+mod semantic_filter;
 mod ui;
 mod viewport_toolbar;
 mod wireframe;

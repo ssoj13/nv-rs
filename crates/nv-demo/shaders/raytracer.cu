@@ -105,9 +105,11 @@ struct Params {
     unsigned long long classic_motion;   // device ptr to float[12] row-major 3x4 current-world -> previous-world per classic instance (index = instance id bits 16..23)
     unsigned long long pick_record;      // device ptr to one NvPickRecord, written for `pick_px` (0 = none)
     unsigned long long is_counters;      // device ptr to u64[NV_IS_GROUPS * NV_IS_STRIPES]; 0 = counting off (uniform per launch)
+    unsigned long long hidden_semantics; // bit s set = semantic id s is not rendered (semantic_filter.rs); 0 = all shown
 };
 
-static_assert(sizeof(Params) == 664, "Params size must match LaunchParams (664 B)");
+static_assert(sizeof(Params) == 672, "Params size must match LaunchParams (672 B)");
+static_assert(__builtin_offsetof(Params, hidden_semantics) == 664, "Params::hidden_semantics offset must be 664");
 static_assert(__builtin_offsetof(Params, is_counters) == 656, "Params::is_counters offset must be 656");
 static_assert(__builtin_offsetof(Params, pick_px) == 428, "Params::pick_px offset must be 428");
 static_assert(__builtin_offsetof(Params, pick_record) == 648, "Params::pick_record offset must be 648");
@@ -212,6 +214,17 @@ static __forceinline__ __device__ void nv_is_count_road(unsigned int prim_idx) {
         && reinterpret_cast<const CsgGpuPrim*>(params.csg_prims)[prim_idx].kind == NV_CSG_PRIM_ROAD_TERRAIN_TILE) {
         nv_is_count(NV_IS_ROAD_TILE);
     }
+}
+
+// Viewport category filter (`semantic_filter.rs`, toolbar eye dropdown). A hit whose class
+// (`csg_instance_semantic`: instance override, else primitive class) has its bit set in
+// `params.hidden_semantics` is rejected by the intersection program, so every ray type (camera,
+// bounce, shadow) continues to the next surface and the class vanishes from shadows and
+// reflections too, per part. Mask 0: one uniform branch. csg-rs guarantees ids below 64.
+#define NV_HIDDEN_RETRACE_MAX 8
+
+static __forceinline__ __device__ bool nv_sem_hidden(unsigned int sem) {
+    return params.hidden_semantics != 0ull && sem < 64u && ((params.hidden_semantics >> sem) & 1ull) != 0ull;
 }
 
 // True for the one raygen thread that answers this launch's pick (uniform `false` otherwise).
@@ -3352,6 +3365,25 @@ extern "C" __global__ void __intersection__sphere_shadow() {
     optixReportIntersection(t, 0u);
 }
 
+// General RPN compound: the closest boundary whose class is not hidden. The evaluator returns
+// one boundary per call, so a hidden part is skipped by re-tracing just past it (bounded).
+static __forceinline__ __device__ CsgHit nv_csg_trace_visible(
+    unsigned int compound_id, unsigned int flags, float3 orig, float3 dir, float tmin, float tmax
+) {
+    CsgHit hit = csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, tmin, tmax, true);
+    for (int k = 0; k < NV_HIDDEN_RETRACE_MAX && hit.t >= 0.0f
+         && nv_sem_hidden(csg_instance_semantic(flags, hit.sem_id)); ++k) {
+        const float t_next = hit.t + fmaxf(1e-4f, hit.t * 1e-5f);
+        if (t_next >= tmax) {
+            hit.t = -1.0f;
+            break;
+        }
+        hit = csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, t_next, tmax, true);
+    }
+    if (hit.t >= 0.0f && nv_sem_hidden(csg_instance_semantic(flags, hit.sem_id))) hit.t = -1.0f;
+    return hit;
+}
+
 extern "C" __global__ void __intersection__csg() {
     nv_is_count(NV_IS_CSG_RPN);
     if (params.csg_instances == 0ull || params.csg_compounds == 0ull) return;
@@ -3372,7 +3404,9 @@ extern "C" __global__ void __intersection__csg() {
 
     // Pass CsgSceneView by value and return CsgHit by value (zero &view/&hit .local spills),
     // skipping redundant compound AABB test already performed by OptiX BVH hardware.
-    CsgHit hit = csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, tmin, tmax, true);
+    CsgHit hit = (params.hidden_semantics != 0ull)
+        ? nv_csg_trace_visible(compound_id, flags, orig, dir, tmin, tmax)
+        : csg_trace_compound_val(make_csg_view(), compound_id, orig, dir, tmin, tmax, true);
     if (hit.t >= 0.0f) {
         unsigned int mat_id = (mat_override != CSG_MAT_OVERRIDE_NONE)
             ? (mat_override & 0xFFFFu)
@@ -3380,6 +3414,7 @@ extern "C" __global__ void __intersection__csg() {
         // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
         // shared actor bone compound drawn as a pedestrian or as an animal.
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        if (nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3413,6 +3448,12 @@ extern "C" __global__ void __intersection__csg_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
+    if (params.hidden_semantics != 0ull) {
+        if (nv_csg_trace_visible(compound_id, flags, orig, dir, tmin, tmax).t >= 0.0f) {
+            optixReportIntersection(tmin, 0u);
+        }
+        return;
+    }
     if (csg_trace_shadow(make_csg_view(), compound_id, orig, dir, tmin, tmax, true)) {
         optixReportIntersection(tmin, 0u);
     }
@@ -3451,6 +3492,7 @@ extern "C" __global__ void __intersection__csg_prim() {
         // The instance may override the primitive's semantic class (flags bits 16..24), e.g. a
         // shared actor bone compound drawn as a pedestrian or as an animal.
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        if (nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3484,6 +3526,17 @@ extern "C" __global__ void __intersection__csg_prim_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
+    if (params.hidden_semantics != 0ull) {
+        // The shadow test has no class; take the radiance intersector to see the hit's class.
+        CsgHit h = csg_intersect_prim_idx(
+            reinterpret_cast<const CsgGpuPrim*>(params.csg_prims),
+            reinterpret_cast<const float4*>(params.csg_aux_planes),
+            prim_idx, orig, dir, tmin, tmax);
+        if (h.t >= 0.0f && !nv_sem_hidden(csg_instance_semantic(flags, h.sem_id))) {
+            optixReportIntersection(tmin, 0u);
+        }
+        return;
+    }
     if (csg_intersect_prim_idx_shadow(
             reinterpret_cast<const CsgGpuPrim*>(params.csg_prims),
             reinterpret_cast<const float4*>(params.csg_aux_planes),
@@ -3525,6 +3578,7 @@ extern "C" __global__ void __intersection__csg_union_part() {
             ? (mat_override & 0xFFFFu)
             : (hit.mat_id & 0xFFFFu);
         unsigned int sem_id = csg_instance_semantic(flags, hit.sem_id);
+        if (nv_sem_hidden(sem_id)) return;
         unsigned int mat_sem = (mat_id & 0xFFFFu) | ((sem_id & 0xFFFFu) << 16u);
         optixReportIntersection(
             hit.t,
@@ -3558,6 +3612,13 @@ extern "C" __global__ void __intersection__csg_union_part_shadow() {
     float tmin  = optixGetRayTmin();
     float tmax  = optixGetRayTmax();
 
+    if (params.hidden_semantics != 0ull) {
+        CsgHit h = csg_union_part_hit(make_csg_view(), compound_id, optixGetPrimitiveIndex(), orig, dir, tmin, tmax);
+        if (h.t >= 0.0f && !nv_sem_hidden(csg_instance_semantic(flags, h.sem_id))) {
+            optixReportIntersection(tmin, 0u);
+        }
+        return;
+    }
     if (csg_union_part_shadow(
             make_csg_view(), compound_id, optixGetPrimitiveIndex(), orig, dir, tmin, tmax)) {
         optixReportIntersection(tmin, 0u);

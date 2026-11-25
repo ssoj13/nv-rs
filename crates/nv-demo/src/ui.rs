@@ -1087,6 +1087,10 @@ impl UiContext<'_> {
                 });
                 tb_separator(ui);
 
+                // 1c. Viewport category filter (`semantic_filter.rs`): the eye dropdown.
+                semantic_filter_menu(ui, &mut self.settings.hidden_semantics);
+                tb_separator(ui);
+
                 // 2. Day / Sunset / Night (routed through the smooth transition)
                 for (tod, icon, tip) in [
                     (0u32, ic::SUN, "Daylight"),
@@ -4848,6 +4852,81 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
 
 /// Height of one Flight stats graph.
 const FLIGHT_GRAPH_H: f32 = 64.0;
+
+/// The viewport toolbar "eye" dropdown (`crate::semantic_filter`): which semantic categories are
+/// rendered. Same pattern as the sl-studio viewport visibility popover used by warpbro-rs (an eye
+/// `MenuButton` over a grid of `sl_config::icons::tool_toggle` eye toggles, closing on a click
+/// outside); nv-demo adds All / None, per-id sub-rows (Buildings > Windows) and a badge with the
+/// number of hidden ids on the icon. The OSM class section is disabled until csg-scene carries
+/// per-instance OSM provenance (csg-rs P42). The mask is persisted and resets accumulation.
+fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64) {
+    use crate::semantic_filter::{self as sf, Hidden};
+    let hidden = sf::hidden_count(*mask);
+    let label = if hidden > 0 {
+        RichText::new(format!("{} {hidden}", ic::EYE_SLASH)).size(vt::TB_ICON_SIZE).color(Color32::from_rgb(255, 196, 64))
+    } else {
+        RichText::new(ic::EYE).size(vt::TB_ICON_SIZE)
+    };
+    let tip = if hidden > 0 {
+        format!("Visible categories: {hidden} semantic classes hidden (also from shadows and reflections)")
+    } else {
+        "Visible categories: everything is rendered".to_string()
+    };
+    let config = egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let (resp, _) = egui::containers::menu::MenuButton::new(label).config(config).ui(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("All").on_hover_text("Render every category").clicked() {
+                *mask = 0;
+            }
+            if ui.button("None").on_hover_text("Hide every category").clicked() {
+                *mask = sf::all_mask();
+            }
+        });
+        ui.separator();
+        ui.label(RichText::new("Semantic groups").strong());
+        egui::Grid::new("semantic_filter_grid").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
+            for g in sf::GROUPS {
+                if let Some(reason) = g.pending {
+                    ui.add_enabled(false, egui::Label::new(g.label));
+                    ui.add_enabled(false, egui::Label::new(RichText::new(reason).italics()));
+                    ui.end_row();
+                    continue;
+                }
+                let state = sf::group_hidden(*mask, g);
+                let icon = if state == Hidden::All { ic::EYE_SLASH } else { ic::EYE };
+                let tip = match state {
+                    Hidden::None => "Shown: click to hide the whole group",
+                    Hidden::Some => "Partly hidden: click to show the whole group",
+                    Hidden::All => "Hidden: click to show the whole group",
+                };
+                if sl_config::icons::tool_toggle(ui, state == Hidden::None, icon, tip).clicked() {
+                    *mask = sf::set_group(*mask, g, state != Hidden::None);
+                }
+                ui.label(g.label);
+                ui.end_row();
+                if g.ids.len() > 1 {
+                    for &id in g.ids {
+                        let on = *mask & sf::bit(id) == 0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            let icon = if on { ic::EYE } else { ic::EYE_SLASH };
+                            if sl_config::icons::tool_toggle(ui, on, icon, "Show / hide this class").clicked() {
+                                *mask ^= sf::bit(id);
+                            }
+                        });
+                        ui.label(RichText::new(sf::semantic_name(id)).weak());
+                        ui.end_row();
+                    }
+                }
+            }
+        });
+        ui.separator();
+        ui.add_enabled(false, egui::Label::new(RichText::new("OSM classes").strong()));
+        ui.add_enabled(false, egui::Label::new(RichText::new(sf::OSM_SECTION_STATUS).italics()));
+    });
+    resp.on_hover_text(tip);
+}
 
 /// Flight stats subsection of the rail panel (`crate::flight_stats`). Returns a rail time to jump
 /// to when a slow spot was clicked.

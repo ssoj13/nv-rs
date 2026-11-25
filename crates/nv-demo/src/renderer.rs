@@ -195,9 +195,12 @@ struct LaunchParams {
     /// Device pointer to the intersection counters (`crate::is_counters`, `IS_WORDS` u64);
     /// `0` = counting off for the whole launch (one uniform branch per call site).
     is_counters: u64,
+    /// Semantic ids not rendered (bit `s` = id `s`; `crate::semantic_filter`); `0` = all shown.
+    hidden_semantics: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 664);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 672);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, hidden_semantics) == 664);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, is_counters) == 656);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_px) == 428);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, pick_record) == 648);
@@ -753,6 +756,9 @@ pub struct DemoSettings {
     pub wire_line_px: f32,
     /// Shared overlay visibility state (`overlay.rs`): one filter for every overlay provider.
     pub overlay: crate::overlay::OverlayFilter,
+    /// Semantic ids not rendered (`crate::semantic_filter`, toolbar eye dropdown): bit `s` hides
+    /// id `s` from every ray type. Persisted; a change resets the accumulation.
+    pub hidden_semantics: u64,
     /// A video recording is running (set by `main.rs` every frame, not persisted): with
     /// `overlay.in_captures == false` the overlay is left out of the frames it records.
     #[serde(skip)]
@@ -976,6 +982,7 @@ impl Default for DemoSettings {
             display_mode: crate::wireframe::DisplayMode::Csg,
             wire_line_px: crate::wireframe::WIRE_LINE_PX_DEFAULT,
             overlay: crate::overlay::OverlayFilter::default(),
+            hidden_semantics: 0,
             capture_active: false,
             is_counters: false,
             render_scale: 1.0,
@@ -2323,7 +2330,25 @@ enum IasClassicState {
         /// not rebuild the IAS.
         sat_angle: f32,
         fractal_transform: [f32; 12],
+        /// Hidden-semantics bits of the classes classic instances carry (`classic_semantic`),
+        /// so hiding a CSG-only class never rebuilds the IAS.
+        classic_hidden: u64,
     },
+}
+
+/// Instance flags of a classic stage instance of slot kind `kind` (`id & 0xFF`): the semantic
+/// override field (bits 16..24 = id + 1), the same rule CSG instances use. Only the floor has a
+/// class (GROUND); the showcase objects (fractal, glass spheres, neon, OMM halo) have none in
+/// csg-core, so they are UNKNOWN (matches `classic_semantic_id` in raytracer.cu).
+fn classic_instance_flags(kind: u32) -> u32 {
+    let sem = if kind == 0 { csg_core::ast::semantic::GROUND } else { csg_core::ast::semantic::UNKNOWN };
+    csg_scene::inst_flags::with_semantic(0, Some(sem)).unwrap_or(0)
+}
+
+/// Semantic id of a classic instance, resolved through `inst_flags::resolve_semantic` (the host
+/// twin of csg-device `csg_instance_semantic`).
+fn classic_semantic(kind: u32) -> u16 {
+    csg_scene::inst_flags::resolve_semantic(classic_instance_flags(kind), csg_core::ast::semantic::UNKNOWN).0
 }
 
 /// Computes the classic-stage IAS state, guarding `sat_angle` and `fractal_transform` strictly
@@ -2376,6 +2401,8 @@ fn compute_ias_classic_state(
         sat_hue_spread: settings.sat_hue_spread,
         sat_angle,
         fractal_transform,
+        classic_hidden: settings.hidden_semantics
+            & (0..5u32).fold(0u64, |m, k| m | crate::semantic_filter::bit(classic_semantic(k))),
     }
 }
 
@@ -2518,8 +2545,16 @@ fn build_ias_into(
         }
     }
 
-    // Bits 16..24 of a classic id name its slot in the classic motion table.
+    // Bits 16..24 of a classic id name its slot in the classic motion table. A classic instance
+    // whose class is hidden (viewport category filter) leaves every ray type: visibility mask 0.
+    let classic_hidden = match *state {
+        IasClassicState::Visible { classic_hidden, .. } => classic_hidden,
+        IasClassicState::Hidden => 0,
+    };
     for (slot, inst) in instances.iter_mut().enumerate() {
+        if classic_hidden & crate::semantic_filter::bit(classic_semantic(inst.id & 0xFF)) != 0 {
+            inst.mask = 0;
+        }
         inst.id |= (slot as u32) << CLASSIC_SLOT_SHIFT;
     }
     let classic = ClassicXforms::capture(instances);
@@ -6486,6 +6521,7 @@ pub fn spawn_render_thread(
                     classic_motion: rig.classic_motion_buf.cu_deviceptr(),
                     pick_record: pick_rig.as_ref().map_or(0, |p| p.record.cu_deviceptr()),
                     is_counters: if count_is { is_rig.as_ref().map_or(0, |c| c.words.cu_deviceptr()) } else { 0 },
+                    hidden_semantics: settings.hidden_semantics,
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -7211,7 +7247,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 664);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 672);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);

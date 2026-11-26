@@ -1125,7 +1125,11 @@ impl UiContext<'_> {
                 tb_separator(ui);
 
                 // 1c. Viewport category filter (`semantic_filter.rs`): the eye dropdown.
-                semantic_filter_menu(ui, &mut self.settings.hidden_semantics);
+                semantic_filter_menu(
+                    ui,
+                    &mut self.settings.hidden_semantics,
+                    &mut self.settings.hidden_osm_classes,
+                );
                 tb_separator(ui);
 
                 // 2. Day / Sunset / Night (routed through the smooth transition)
@@ -4672,77 +4676,213 @@ pub(crate) fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     });
 }
 
-/// The viewport toolbar "eye" dropdown (`crate::semantic_filter`): which semantic categories are
-/// rendered. Same pattern as the sl-studio viewport visibility popover used by warpbro-rs (an eye
-/// `MenuButton` over a grid of `sl_config::icons::tool_toggle` eye toggles, closing on a click
-/// outside); nv-demo adds All / None, per-id sub-rows (Buildings > Windows) and a badge with the
-/// number of hidden ids on the icon. The OSM class section is disabled until csg-scene carries
-/// per-instance OSM provenance (csg-rs P42). The mask is persisted and resets accumulation.
-fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64) {
+/// Partition predicate for the eye-dropdown OSM provenance section: returns `true` for OSM /
+/// terrain feature classes (`Building..=Poi`, `Terrain`) and `false` for generated / dynamic /
+/// unknown classes (`Procedural..=DynamicRig`, `Unknown`).
+fn is_osm_feature_class(cls: csg_scene::provenance::OsmFeatureClass) -> bool {
+    use csg_scene::provenance::OsmFeatureClass as C;
+    matches!(
+        cls,
+        C::Building
+            | C::Road
+            | C::Water
+            | C::LandUse
+            | C::Vegetation
+            | C::Barrier
+            | C::Industrial
+            | C::Power
+            | C::Railway
+            | C::Marine
+            | C::StreetFurniture
+            | C::Poi
+            | C::Terrain
+    )
+}
+
+/// Compact two-column checkbox grid over a group of [`csg_scene::provenance::OsmFeatureClass`]
+/// entries, mutating `osm_mask` via [`crate::semantic_filter::toggle_osm_class`].
+fn osm_class_grid(
+    ui: &mut Ui,
+    id_salt: &str,
+    classes: impl Iterator<Item = csg_scene::provenance::OsmFeatureClass>,
+    osm_mask: &mut u32,
+) {
+    use crate::semantic_filter as sf;
+    egui::Grid::new(id_salt)
+        .num_columns(2)
+        .spacing([12.0, 2.0])
+        .show(ui, |ui| {
+            let mut col = 0usize;
+            for cls in classes {
+                let mut visible = (*osm_mask & sf::osm_class_bit(cls)) == 0;
+                if ui.checkbox(&mut visible, cls.label()).changed() {
+                    *osm_mask = sf::toggle_osm_class(*osm_mask, cls, visible);
+                }
+                col += 1;
+                if col.is_multiple_of(2) {
+                    ui.end_row();
+                }
+            }
+            if !col.is_multiple_of(2) {
+                ui.end_row();
+            }
+        });
+}
+
+/// The viewport toolbar "eye" dropdown (`crate::semantic_filter`): which semantic categories and
+/// P42 OSM / source feature classes are rendered. Same pattern as the sl-studio viewport
+/// visibility popover used by warpbro-rs (an eye `MenuButton` over a grid of
+/// `sl_config::icons::tool_toggle` eye toggles, closing on a click outside); nv-demo adds Show all
+/// / None, per-id sub-rows (Buildings > Windows), per-class P42 OSM / source checkboxes, and a
+/// combined badge with the total number of hidden classes on the icon. Both masks are persisted
+/// and reset accumulation on change.
+fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64, osm_mask: &mut u32) {
     use crate::semantic_filter::{self as sf, Hidden};
-    let hidden = sf::hidden_count(*mask);
+    use csg_scene::provenance::OsmFeatureClass;
+    let sem_hidden = sf::hidden_count(*mask);
+    let osm_hidden = sf::osm_hidden_count(*osm_mask);
+    let hidden = sf::combined_hidden_count(*mask, *osm_mask);
     let label = if hidden > 0 {
-        RichText::new(format!("{} {hidden}", ic::EYE_SLASH)).size(vt::TB_ICON_SIZE).color(Color32::from_rgb(255, 196, 64))
+        RichText::new(format!("{} {hidden}", ic::EYE_SLASH))
+            .size(vt::TB_ICON_SIZE)
+            .color(Color32::from_rgb(255, 196, 64))
     } else {
         RichText::new(ic::EYE).size(vt::TB_ICON_SIZE)
     };
-    let tip = if hidden > 0 {
-        format!("Visible categories: {hidden} semantic classes hidden (also from shadows and reflections)")
-    } else {
-        "Visible categories: everything is rendered".to_string()
+    let tip = match (sem_hidden, osm_hidden) {
+        (0, 0) => "Visible categories: everything is rendered".to_string(),
+        (s, 0) => format!(
+            "Visible categories: {s} semantic classes hidden (also from shadows and reflections)"
+        ),
+        (0, o) => format!(
+            "Visible categories: {o} OSM / source classes hidden (also from shadows and reflections)"
+        ),
+        (s, o) => format!(
+            "Visible categories: {s} semantic and {o} OSM / source classes hidden (also from shadows and reflections)"
+        ),
     };
     let config = egui::containers::menu::MenuConfig::new()
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     let (resp, _) = egui::containers::menu::MenuButton::new(label).config(config).ui(ui, |ui| {
         ui.horizontal(|ui| {
-            if ui.button("All").on_hover_text("Render every category").clicked() {
+            if ui
+                .button("Show all")
+                .on_hover_text("Render every semantic and OSM / source class")
+                .clicked()
+            {
                 *mask = 0;
+                *osm_mask = 0;
             }
-            if ui.button("None").on_hover_text("Hide every category").clicked() {
+            if ui
+                .button("None")
+                .on_hover_text("Hide every semantic category")
+                .clicked()
+            {
                 *mask = sf::all_mask();
             }
         });
         ui.separator();
-        ui.label(RichText::new("Semantic groups").strong());
-        egui::Grid::new("semantic_filter_grid").num_columns(2).spacing([8.0, 2.0]).show(ui, |ui| {
-            for g in sf::GROUPS {
-                if let Some(reason) = g.pending {
-                    ui.add_enabled(false, egui::Label::new(g.label));
-                    ui.add_enabled(false, egui::Label::new(RichText::new(reason).italics()));
-                    ui.end_row();
-                    continue;
-                }
-                let state = sf::group_hidden(*mask, g);
-                let icon = if state == Hidden::All { ic::EYE_SLASH } else { ic::EYE };
-                let tip = match state {
-                    Hidden::None => "Shown: click to hide the whole group",
-                    Hidden::Some => "Partly hidden: click to show the whole group",
-                    Hidden::All => "Hidden: click to show the whole group",
-                };
-                if sl_config::icons::tool_toggle(ui, state == Hidden::None, icon, tip).clicked() {
-                    *mask = sf::set_group(*mask, g, state != Hidden::None);
-                }
-                ui.label(g.label);
-                ui.end_row();
-                if g.ids.len() > 1 {
-                    for &id in g.ids {
-                        let on = *mask & sf::bit(id) == 0;
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            let icon = if on { ic::EYE } else { ic::EYE_SLASH };
-                            if sl_config::icons::tool_toggle(ui, on, icon, "Show / hide this class").clicked() {
-                                *mask ^= sf::bit(id);
+        egui::ScrollArea::vertical()
+            .id_salt("semantic_filter_scroll")
+            .max_height(560.0)
+            .show(ui, |ui| {
+                ui.label(RichText::new("Semantic groups").strong());
+                egui::Grid::new("semantic_filter_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        for g in sf::GROUPS {
+                            if let Some(reason) = g.pending {
+                                ui.add_enabled(false, egui::Label::new(g.label));
+                                ui.add_enabled(
+                                    false,
+                                    egui::Label::new(RichText::new(reason).italics()),
+                                );
+                                ui.end_row();
+                                continue;
                             }
-                        });
-                        ui.label(RichText::new(sf::semantic_name(id)).weak());
-                        ui.end_row();
+                            let state = sf::group_hidden(*mask, g);
+                            let icon = if state == Hidden::All {
+                                ic::EYE_SLASH
+                            } else {
+                                ic::EYE
+                            };
+                            let tip = match state {
+                                Hidden::None => "Shown: click to hide the whole group",
+                                Hidden::Some => "Partly hidden: click to show the whole group",
+                                Hidden::All => "Hidden: click to show the whole group",
+                            };
+                            if sl_config::icons::tool_toggle(ui, state == Hidden::None, icon, tip)
+                                .clicked()
+                            {
+                                *mask = sf::set_group(*mask, g, state != Hidden::None);
+                            }
+                            ui.label(g.label);
+                            ui.end_row();
+                            if g.ids.len() > 1 {
+                                for &id in g.ids {
+                                    let on = *mask & sf::bit(id) == 0;
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(12.0);
+                                        let icon = if on { ic::EYE } else { ic::EYE_SLASH };
+                                        if sl_config::icons::tool_toggle(
+                                            ui,
+                                            on,
+                                            icon,
+                                            "Show / hide this class",
+                                        )
+                                        .clicked()
+                                        {
+                                            *mask ^= sf::bit(id);
+                                        }
+                                    });
+                                    ui.label(RichText::new(sf::semantic_name(id)).weak());
+                                    ui.end_row();
+                                }
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("OSM / Source Classes").strong());
+                    if ui
+                        .small_button("Show all")
+                        .on_hover_text("Show all OSM and generated / dynamic classes")
+                        .clicked()
+                    {
+                        *osm_mask = 0;
                     }
-                }
-            }
-        });
-        ui.separator();
-        ui.add_enabled(false, egui::Label::new(RichText::new("OSM classes").strong()));
-        ui.add_enabled(false, egui::Label::new(RichText::new(sf::OSM_SECTION_STATUS).italics()));
+                    if ui
+                        .small_button("Hide all")
+                        .on_hover_text("Hide all OSM and generated / dynamic classes")
+                        .clicked()
+                    {
+                        *osm_mask = sf::osm_all_mask();
+                    }
+                });
+                ui.label(RichText::new("OSM Features").weak().small());
+                osm_class_grid(
+                    ui,
+                    "osm_features_filter_grid",
+                    OsmFeatureClass::ALL
+                        .iter()
+                        .copied()
+                        .filter(|&c| is_osm_feature_class(c)),
+                    osm_mask,
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("Generated / Dynamic").weak().small());
+                osm_class_grid(
+                    ui,
+                    "osm_generated_filter_grid",
+                    OsmFeatureClass::ALL
+                        .iter()
+                        .copied()
+                        .filter(|&c| !is_osm_feature_class(c) && c != OsmFeatureClass::Unknown)
+                        .chain(std::iter::once(OsmFeatureClass::Unknown)),
+                    osm_mask,
+                );
+            });
     });
     resp.on_hover_text(tip);
 }
@@ -5126,5 +5266,28 @@ mod tests {
         }
         let (nan_inner, nan_cell) = lod_strip_widths(f32::NAN);
         assert!(nan_inner.is_finite() && nan_cell.is_finite() && nan_cell >= 24.0);
+    }
+
+    #[test]
+    fn osm_feature_class_partition_covers_all_variants_once() {
+        use csg_scene::provenance::OsmFeatureClass;
+        let osm: Vec<_> = OsmFeatureClass::ALL
+            .iter()
+            .copied()
+            .filter(|&c| is_osm_feature_class(c))
+            .collect();
+        let generated: Vec<_> = OsmFeatureClass::ALL
+            .iter()
+            .copied()
+            .filter(|&c| !is_osm_feature_class(c) && c != OsmFeatureClass::Unknown)
+            .chain(std::iter::once(OsmFeatureClass::Unknown))
+            .collect();
+        assert_eq!(osm.len() + generated.len(), OsmFeatureClass::ALL.len());
+        assert_eq!(generated.last(), Some(&OsmFeatureClass::Unknown));
+        for &cls in OsmFeatureClass::ALL {
+            let count = osm.iter().filter(|&&c| c == cls).count()
+                + generated.iter().filter(|&&c| c == cls).count();
+            assert_eq!(count, 1, "OsmFeatureClass::{cls:?} must appear exactly once");
+        }
     }
 }

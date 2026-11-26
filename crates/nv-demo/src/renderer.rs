@@ -770,6 +770,11 @@ pub struct DemoSettings {
     /// Semantic ids not rendered (`crate::semantic_filter`, toolbar eye dropdown): bit `s` hides
     /// id `s` from every ray type. Persisted; a change resets the accumulation.
     pub hidden_semantics: u64,
+    /// OSM / source feature classes not rendered (`crate::semantic_filter`, toolbar eye dropdown):
+    /// bit `osm_class_bit(cls)` hides every CSG instance whose P42 provenance carries `cls` from
+    /// every render ray. Persisted; a change resets the accumulation.
+    #[serde(default)]
+    pub hidden_osm_classes: u32,
     /// A video recording is running (set by `main.rs` every frame, not persisted): with
     /// `overlay.in_captures == false` the overlay is left out of the frames it records.
     #[serde(skip)]
@@ -994,6 +999,7 @@ impl Default for DemoSettings {
             wire_line_px: crate::wireframe::WIRE_LINE_PX_DEFAULT,
             overlay: crate::overlay::OverlayFilter::default(),
             hidden_semantics: 0,
+            hidden_osm_classes: 0,
             capture_active: false,
             is_counters: false,
             render_scale: 1.0,
@@ -2436,6 +2442,7 @@ fn build_ias_into(
     instances: &mut Vec<Instance>,
     state: &IasClassicState,
     hidden: u64,
+    hidden_osm: u32,
     force_rebuild: bool,
 ) -> Result<ClassicXforms, String> {
     instances.clear();
@@ -2571,7 +2578,7 @@ fn build_ias_into(
         inst.id |= (slot as u32) << CLASSIC_SLOT_SHIFT;
     }
     let classic = ClassicXforms::capture(instances);
-    csg_host.append_optix_instances(instances, hidden);
+    csg_host.append_optix_instances(instances, hidden, hidden_osm);
 
     if instances.is_empty() {
         let mut dummy = Instance::new(gas.floor);
@@ -2872,8 +2879,9 @@ fn init_optix(
         &csg_host,
         &mut ias_instances_scratch,
         &initial_classic,
-        // The first frame's `apply_semantic_filter` applies the saved mask (one UPDATE).
+        // The first frame's `apply_semantic_filter` applies the saved masks (one UPDATE).
         csg_host.semantic_hidden(),
+        csg_host.osm_hidden(),
         true,
     )?;
 
@@ -3676,7 +3684,8 @@ fn run_overlay(
                 let mut sel_dev = sel_ptr;
                 let (mut sx, mut sy, mut sz, mut sb) = (x.0, y.0, z.0, bounds.0);
                 let mut len_px = axis_px;
-                let mut args: [*mut c_void; 16] = [
+                let mut obj_keys_ptr = f.csg.instance_obj_keys;
+                let mut args: [*mut c_void; 17] = [
                     (&raw mut insts).cast(),
                     (&raw mut inst_count).cast(),
                     (&raw mut comps).cast(),
@@ -3693,12 +3702,14 @@ fn run_overlay(
                     (&raw mut sz).cast(),
                     (&raw mut sb).cast(),
                     (&raw mut len_px).cast(),
+                    (&raw mut obj_keys_ptr).cast(),
                 ];
                 // SAFETY: `ovl_axes(const float4*, u32, const float4*, u32, u32, const OvlCamera*,
                 // const unsigned*, NvOverlaySegment*, unsigned*, u32, u32, u32, u32, u32, u32,
-                // f32)`; the instance / compound buffers hold `inst_count` / `comp_count` 64-byte
-                // records (csg-device layouts) and live in `CsgGpuHost` until the end-of-frame
-                // fence; writes are bounded by `cap`.
+                // f32, const unsigned*)`; the instance / compound / `instance_obj_keys` buffers
+                // hold `inst_count` / `comp_count` / `inst_count` records (csg-device layouts;
+                // `obj_keys_ptr` may be 0 when unavailable) and live in `CsgGpuHost` until the
+                // end-of-frame fence; writes are bounded by `cap`.
                 let rc = unsafe {
                     cu::cuLaunchKernel(
                         rig.tonemap.ovl_axes,
@@ -4197,7 +4208,7 @@ fn score_views_on_rig(
             // Build an omnidirectional CSG-only IAS for accurate city-wide OptiX probing.
             rig.ias_instances_scratch.clear();
             rig.csg_host
-                .append_optix_instances(&mut rig.ias_instances_scratch, 0);
+                .append_optix_instances(&mut rig.ias_instances_scratch, 0, 0);
             if rig.ias_instances_scratch.is_empty() {
                 return Err("Active CSG scene has zero instances to probe".to_string());
             }
@@ -5439,16 +5450,28 @@ pub fn spawn_render_thread(
                         Ok(None) => {}
                         Ok(Some(record)) => match pick.consume(record) {
                             Some(crate::pick::PickOutcome::Ready(req, rec)) => {
-                                let hit = rec.is_hit().then_some(rec.inst_id);
+                                let resolved = rec.is_hit().then(|| {
+                                    if rec.is_csg() {
+                                        rig.csg_host
+                                            .resolve_picked_csg(
+                                                rec.inst_id,
+                                                rec.part_id,
+                                                rec.world_pos,
+                                            )
+                                            .unwrap_or_else(|| rig.csg_host.describe_pick(&rec))
+                                    } else {
+                                        rig.csg_host.describe_pick(&rec)
+                                    }
+                                });
                                 match req.action {
                                     crate::pick::PickAction::Select { add } => {
-                                        let changed = selection.click(hit, add);
-                                        let active = hit.map(|_| rig.csg_host.describe_pick(&rec));
-                                        if changed || active.is_some() {
+                                        let hit_key = resolved.as_ref().map(|obj| obj.key);
+                                        let changed = selection.click(hit_key, add);
+                                        if changed || resolved.is_some() {
                                             bus.emit_render_event(RenderEvent::SelectionChanged(Box::new(
                                                 crate::pick::SelectionInfo {
                                                     keys: selection.keys().to_vec(),
-                                                    active,
+                                                    active: resolved,
                                                 },
                                             )));
                                         }
@@ -5469,11 +5492,14 @@ pub fn spawn_render_thread(
                                                 temporal_history_cut = true;
                                                 emit_possess_status(&bus, &info);
                                                 bus.emit_render_event(RenderEvent::PossessChanged(Some(info)));
-                                                selection.select_only(rec.inst_id);
+                                                let sel_key = resolved
+                                                    .as_ref()
+                                                    .map_or(rec.inst_id, |obj| obj.key);
+                                                selection.select_only(sel_key);
                                                 bus.emit_render_event(RenderEvent::SelectionChanged(Box::new(
                                                     crate::pick::SelectionInfo {
                                                         keys: selection.keys().to_vec(),
-                                                        active: Some(rig.csg_host.describe_pick(&rec)),
+                                                        active: resolved,
                                                     },
                                                 )));
                                             }
@@ -5986,10 +6012,11 @@ pub fn spawn_render_thread(
                 // Category filter (`semantic_filter.rs`): the per-instance state changes only with
                 // the hidden mask or the packed instances; a mask change re-emits the IAS
                 // instances with their new visibility masks as one UPDATE (same count).
-                let filter_changed = match rig
-                    .csg_host
-                    .apply_semantic_filter(&rig.stream, settings.hidden_semantics)
-                {
+                let filter_changed = match rig.csg_host.apply_semantic_filter(
+                    &rig.stream,
+                    settings.hidden_semantics,
+                    settings.hidden_osm_classes,
+                ) {
                     Ok(changed) => changed,
                     Err(e) => {
                         // The bitset stays empty (every instance partial: exact, slower);
@@ -6078,6 +6105,7 @@ pub fn spawn_render_thread(
                             &mut rig.ias_instances_scratch,
                             &ias_state,
                             rig.csg_host.semantic_hidden(),
+                            rig.csg_host.osm_hidden(),
                             // A filter-only change keeps the instance list: UPDATE in place.
                             classic_changed
                                 || !filter_changed
@@ -6143,6 +6171,11 @@ pub fn spawn_render_thread(
                         optix_slot_offset: rig.ias_classic_count as u32,
                         max_optix_instances: rig.d_optix_instances.len() as u32,
                         hidden_semantics: rig.csg_host.semantic_hidden(),
+                        hide_dynamic_actors: (rig.csg_host.osm_hidden()
+                            & sf::osm_class_bit(
+                                csg_scene::provenance::OsmFeatureClass::DynamicActor,
+                            ))
+                            != 0,
                     };
 
                     let need_topo = rig

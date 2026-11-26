@@ -15,9 +15,11 @@
 //!   index of its launch; [`PickState::consume`] validates the record against that tag. The
 //!   result drives [`Selection`] (plain click selects only the hit object, Shift+click toggles it,
 //!   a click on empty space clears unless Shift is held) or possession (Ctrl+click, double click,
-//!   Pick mode). Selection keys are the primary-hit instance keys (`hit_instance_id` in
-//!   raytracer.cu: the CSG `user_id`, else `0xFF000000 | packed index`), the key space the
-//!   overlay filter and the axes highlight use.
+//!   Pick mode). Selection keys follow P42 logical object grouping via [`csg_selection_key`]:
+//!   grouped CSG instances key on [`OBJECT_KEY_BIT`]-tagged `object_id`, ungrouped CSG instances
+//!   key on `inst_user_id & !OBJECT_KEY_BIT`, and classic stage geometry uses
+//!   `0xFF000000 | packed index` — the shared key space used by the overlay filter and GPU
+//!   `ovl_axes` highlight.
 //! - **Used by**: `renderer.rs` (render loop: request, launch parameters, readback, consume),
 //!   `ui.rs` (click gestures), `main.rs` (forwarding, status line).
 
@@ -25,6 +27,21 @@ use bytemuck::{Pod, Zeroable};
 
 /// `LaunchParams::pick_px` value meaning "no pick this launch" (`NV_PICK_NONE` in raytracer.cu).
 pub const PICK_NONE: u32 = u32::MAX;
+
+/// High-bit tag distinguishing a P42 logical `object_id` selection key from an ungrouped
+/// instance `user_id` key (mirrored verbatim in `shaders/tonemap.cu` `ovl_axes`).
+pub const OBJECT_KEY_BIT: u32 = 1 << 31;
+
+/// Computes the canonical selection key for a packed CSG instance (`object_id` when grouped,
+/// else ungrouped `inst_user_id`), matching `ovl_axes` on the GPU 1-to-1.
+#[inline]
+pub const fn csg_selection_key(object_id: u32, inst_user_id: u32) -> u32 {
+    if object_id != csg_scene::provenance::OBJECT_ID_NONE {
+        OBJECT_KEY_BIT | (object_id & !OBJECT_KEY_BIT)
+    } else {
+        inst_user_id & !OBJECT_KEY_BIT
+    }
+}
 
 /// Flag bits of [`PickRecordPod::flags`] (`NV_PICK_FLAG_*` in raytracer.cu).
 pub mod pick_flags {
@@ -173,23 +190,66 @@ impl PickState {
     }
 }
 
-/// OSM provenance of a picked object (feature class, kind, OSM id). Typed slot for csg-rs P42
-/// (per-instance provenance record with a device copy); csg-scene carries no provenance yet, so
-/// every pick reports `None` and the UI says so instead of guessing from names.
+/// P42 OSM and logical-object provenance of a picked CSG instance, populated in O(1) from
+/// `csg-scene`'s `WorldScene::resolve_packed_provenance`.
+///
+/// Why: surfaces exact typed feature class, sub-kind, OSM element reference, and logical
+/// `object_id` grouping in the status line and inspector without guessing from assembly names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OsmProvenance {
-    /// `OsmFeatureClass` discriminant (osm-rs feature family: road, building, water, ...).
-    pub class: u16,
-    /// Kind within the class (osm-rs `RoadKind`, `BuildingKind`, ...).
+    /// Coarse feature family (`Building`, `Road`, `DynamicVehicle`, ...).
+    pub source: csg_scene::provenance::OsmFeatureClass,
+    /// Typed sub-kind code within [`Self::source`] (decoded via `csg_scene::provenance::kind_name`).
     pub kind: u16,
-    /// OSM element id.
+    /// OSM element namespace (`None`, `Node`, `Way`, or `Relation`).
+    pub elem_kind: csg_scene::provenance::OsmElemKind,
+    /// Source OSM element id (`0` when non-OSM).
     pub osm_id: u64,
+    /// Logical object id (`OBJECT_ID_NONE` = `0` when ungrouped).
+    pub object_id: u32,
+}
+
+impl OsmProvenance {
+    /// Formats a compact human-readable provenance label (e.g.
+    /// `"Building/Apartments way/12345 obj#42"`, `"Poi node/99"`, or
+    /// `"DynamicVehicle/Robotaxi obj#12"`).
+    ///
+    /// Why: single formatter shared by the status bar and inspector so class/sub-kind, OSM
+    /// element tags, and logical object ids stay uniform everywhere.
+    pub fn format_label(&self) -> String {
+        let cls = self.source.label();
+        let kind = csg_scene::provenance::kind_name(self.source, self.kind);
+        let mut out = if kind != cls {
+            format!("{cls}/{kind}")
+        } else {
+            cls.to_string()
+        };
+        if self.osm_id != 0 {
+            let tag = match self.elem_kind {
+                csg_scene::provenance::OsmElemKind::None => None,
+                csg_scene::provenance::OsmElemKind::Node => Some("node"),
+                csg_scene::provenance::OsmElemKind::Way => Some("way"),
+                csg_scene::provenance::OsmElemKind::Relation => Some("rel"),
+            };
+            if let Some(tag) = tag {
+                out.push(' ');
+                out.push_str(tag);
+                out.push('/');
+                out.push_str(&self.osm_id.to_string());
+            }
+        }
+        if self.object_id != csg_scene::provenance::OBJECT_ID_NONE {
+            out.push_str(" obj#");
+            out.push_str(&self.object_id.to_string());
+        }
+        out
+    }
 }
 
 /// The scene object behind a pick, as reported to the UI.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PickedObject {
-    /// Selection key (primary-hit instance key).
+    /// Selection key ([`csg_selection_key`] for CSG instances, else classic key).
     pub key: u32,
     /// Assembly / actor display name, or `Object #key` when the scene has no instance for it.
     pub name: String,
@@ -197,7 +257,7 @@ pub struct PickedObject {
     pub part_id: u32,
     /// World hit point.
     pub world_pos: [f32; 3],
-    /// OSM provenance; `None` until csg-scene publishes it (P42).
+    /// P42 OSM and logical-object provenance (`None` for classic non-CSG geometry).
     pub osm: Option<OsmProvenance>,
 }
 
@@ -263,15 +323,36 @@ pub struct SelectionInfo {
     pub active: Option<PickedObject>,
 }
 
-/// Status-line text for a selection change.
+/// Status-line text for a selection change, including [`OsmProvenance::format_label`] when the
+/// active object carries P42 provenance.
 pub fn selection_status(sel: &SelectionInfo) -> String {
     match (&sel.active, sel.keys.len()) {
         (_, 0) => "Selection cleared".to_string(),
-        (Some(a), 1) => format!(
-            "Selected {} (key {:#010x}, part {}) at ({:.1}, {:.1}, {:.1})",
-            a.name, a.key, a.part_id, a.world_pos[0], a.world_pos[1], a.world_pos[2]
-        ),
-        (Some(a), n) => format!("{n} objects selected; last: {} (key {:#010x})", a.name, a.key),
+        (Some(a), 1) => match a.osm {
+            Some(osm) => format!(
+                "Selected {} [{}] (key {:#010x}, part {}) at ({:.1}, {:.1}, {:.1})",
+                a.name,
+                osm.format_label(),
+                a.key,
+                a.part_id,
+                a.world_pos[0],
+                a.world_pos[1],
+                a.world_pos[2]
+            ),
+            None => format!(
+                "Selected {} (key {:#010x}, part {}) at ({:.1}, {:.1}, {:.1})",
+                a.name, a.key, a.part_id, a.world_pos[0], a.world_pos[1], a.world_pos[2]
+            ),
+        },
+        (Some(a), n) => match a.osm {
+            Some(osm) => format!(
+                "{n} objects selected; last: {} [{}] (key {:#010x})",
+                a.name,
+                osm.format_label(),
+                a.key
+            ),
+            None => format!("{n} objects selected; last: {} (key {:#010x})", a.name, a.key),
+        },
         (None, n) => format!("{n} objects selected"),
     }
 }
@@ -378,5 +459,107 @@ mod tests {
         assert!(r.is_hit() && r.is_csg());
         let miss = PickRecordPod { flags: 0, ..r };
         assert!(!miss.is_hit() && !miss.is_csg());
+    }
+
+    #[test]
+    fn csg_selection_key_separates_grouped_and_ungrouped_namespaces() {
+        use csg_scene::provenance::OBJECT_ID_NONE;
+        assert_eq!(OBJECT_KEY_BIT, 0x8000_0000);
+        // Grouped object: tagged with OBJECT_KEY_BIT and ignores inst_user_id.
+        assert_eq!(csg_selection_key(42, 999), OBJECT_KEY_BIT | 42);
+        assert_eq!(csg_selection_key(OBJECT_KEY_BIT | 42, 999), OBJECT_KEY_BIT | 42);
+        // Ungrouped object: strips OBJECT_KEY_BIT so it never aliases a grouped object key.
+        assert_eq!(csg_selection_key(OBJECT_ID_NONE, 7), 7);
+        assert_eq!(csg_selection_key(OBJECT_ID_NONE, OBJECT_KEY_BIT | 7), 7);
+        assert_ne!(csg_selection_key(7, 7), csg_selection_key(OBJECT_ID_NONE, 7));
+    }
+
+    #[test]
+    fn osm_provenance_format_label_and_selection_status() {
+        use csg_scene::provenance::{OBJECT_ID_NONE, OsmElemKind, OsmFeatureClass, prov_kind};
+
+        let bldg = OsmProvenance {
+            source: OsmFeatureClass::Building,
+            kind: prov_kind::building::APARTMENTS,
+            elem_kind: OsmElemKind::Way,
+            osm_id: 12345,
+            object_id: 42,
+        };
+        assert_eq!(bldg.format_label(), "Building/Apartments way/12345 obj#42");
+
+        // When kind_name equals class.label() (Poi/0 or unknown sub-kind), omit "/{kind}".
+        let poi = OsmProvenance {
+            source: OsmFeatureClass::Poi,
+            kind: 0,
+            elem_kind: OsmElemKind::Node,
+            osm_id: 99,
+            object_id: OBJECT_ID_NONE,
+        };
+        assert_eq!(poi.format_label(), "Poi node/99");
+
+        let rel = OsmProvenance {
+            source: OsmFeatureClass::Building,
+            kind: 9999,
+            elem_kind: OsmElemKind::Relation,
+            osm_id: 777,
+            object_id: 5,
+        };
+        assert_eq!(rel.format_label(), "Building rel/777 obj#5");
+
+        let veh = OsmProvenance {
+            source: OsmFeatureClass::DynamicVehicle,
+            kind: prov_kind::vehicle::ROBOTAXI,
+            elem_kind: OsmElemKind::None,
+            osm_id: 0,
+            object_id: 12,
+        };
+        assert_eq!(veh.format_label(), "DynamicVehicle/Robotaxi obj#12");
+
+        // Zero osm_id or OsmElemKind::None suppresses the element tag.
+        let no_elem = OsmProvenance {
+            source: OsmFeatureClass::Road,
+            kind: prov_kind::road::PRIMARY,
+            elem_kind: OsmElemKind::None,
+            osm_id: 555,
+            object_id: OBJECT_ID_NONE,
+        };
+        assert_eq!(no_elem.format_label(), "Road/Primary");
+
+        let zero_id = OsmProvenance {
+            source: OsmFeatureClass::Road,
+            kind: prov_kind::road::PRIMARY,
+            elem_kind: OsmElemKind::Way,
+            osm_id: 0,
+            object_id: OBJECT_ID_NONE,
+        };
+        assert_eq!(zero_id.format_label(), "Road/Primary");
+
+        let unk = OsmProvenance {
+            source: OsmFeatureClass::Unknown,
+            kind: 0,
+            elem_kind: OsmElemKind::None,
+            osm_id: 0,
+            object_id: OBJECT_ID_NONE,
+        };
+        assert_eq!(unk.format_label(), "Unknown");
+
+        // Status line incorporates format_label() for both single and multi-object selections.
+        let obj = PickedObject {
+            key: csg_selection_key(42, 7),
+            name: "AptBlock".into(),
+            part_id: 3,
+            world_pos: [10.0, 20.0, 30.0],
+            osm: Some(bldg),
+        };
+        let one = SelectionInfo { keys: vec![obj.key], active: Some(obj.clone()) };
+        assert_eq!(
+            selection_status(&one),
+            "Selected AptBlock [Building/Apartments way/12345 obj#42] (key 0x8000002a, part 3) at (10.0, 20.0, 30.0)"
+        );
+        let many = SelectionInfo { keys: vec![1, obj.key], active: Some(obj) };
+        assert_eq!(
+            selection_status(&many),
+            "2 objects selected; last: AptBlock [Building/Apartments way/12345 obj#42] (key 0x8000002a)"
+        );
     }
 }

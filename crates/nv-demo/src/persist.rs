@@ -589,6 +589,8 @@ mod tests {
         state.settings.cam_smooth_tau = 0.25;
         state.settings.time_scale = 0.5;
         state.settings.record_shutter_subframes = 4;
+        state.settings.hidden_semantics = 0b101;
+        state.settings.hidden_osm_classes = 0b1101;
         state.flight_player.selected_track_id = "landmark_slalom".to_string();
         state.flight_player.shuffle = true;
         state.flight_player.shuffle_seed = 99;
@@ -642,6 +644,8 @@ mod tests {
         assert_eq!(report.problem, None);
         let loaded = report.state;
         assert_eq!(loaded, state);
+        assert_eq!(loaded.settings.hidden_semantics, 0b101);
+        assert_eq!(loaded.settings.hidden_osm_classes, 0b1101);
         assert_eq!(loaded.flight_player.selected_track_id, "landmark_slalom");
         assert_eq!(loaded.flight_lab.manual_keyframes.len(), 2);
         assert_eq!(loaded.camera.nav_mode(), NavMode::Trackball);
@@ -680,6 +684,8 @@ mod tests {
         assert_eq!(loaded.settings.cam_smooth_tau, 0.0);
         assert_eq!(loaded.settings.time_scale, 1.0);
         assert_eq!(loaded.settings.record_shutter_subframes, 1);
+        assert_eq!(loaded.settings.hidden_semantics, 0);
+        assert_eq!(loaded.settings.hidden_osm_classes, 0);
         assert!(loaded.flight_player.selected_track_id.is_empty());
         assert!(loaded.flight_lab.manual_keyframes.is_empty());
         assert_eq!(loaded.camera.nav_fly_mode(), NavMode::FpsFly);

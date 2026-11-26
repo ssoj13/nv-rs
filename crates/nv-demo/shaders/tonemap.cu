@@ -567,21 +567,28 @@ extern "C" __global__ void ovl_composite(
 // Why on the device: the instance transforms live here (`csg_instances`, also written in place by
 // the GPU crowd), so the axes cost one thread per instance and no host copy.
 // Inputs: the frame's CSG instance records (csg-device `CsgGpuInstance`, 64 B: row-major 3x4
-// xform, compound_id @48, user_id @52, flags @60) and compound records (`CsgGpuCompound`, 64 B:
-// flags @12, local aabb_min @16, aabb_max @32); `gas_count` = compounds that own an OptiX GAS
-// (an instance of any other compound has visibilityMask 0 in the IAS and is skipped).
+// xform, compound_id @48, user_id @52, flags @60), compound records (`CsgGpuCompound`, 64 B:
+// flags @12, local aabb_min @16, aabb_max @32), `gas_count` = compounds that own an OptiX GAS
+// (an instance of any other compound has visibilityMask 0 in the IAS and is skipped), and optional
+// trailing P42 `inst_obj_keys` (`u32[inst_count]`, nullable: bit 31 = `is_primary`, low 31 bits =
+// logical `object_id`, `0` = ungrouped).
 // One thread per instance:
-//   skip    not VISIBLE, crowd bones (they get skeletons), mask-0 instances, unbounded compounds
-//           (ground / water planes have no meaningful frame), the Selected scope's non-members,
-//           the WithinRadius scope's far origins, and non-pinhole lenses (UNPROJECTABLE fault);
-//   cull    origin within OVL_AXES_NEAR of the eye plane, bounding sphere outside the frustum,
-//           or smaller than max(`min_px`, `axes_min_px`) on screen (part-level axes LOD; the
-//           selection is never size-culled);
-//   emit    X / Y / Z from the origin along the normalised transform columns, length
-//           `axis_px * 2 tan(fov/2) z / height` (constant on screen), SCREEN_CONSTANT_WIDTH, the
-//           SELECTED flag for selection members, plus the 12 oriented-box edges of a selected
-//           instance's bounds. Instance key = `hit_instance_id` of raytracer.cu (user_id, else
-//           0xFF000000 | instance index): the key space of the pick record and the contours.
+//   skip    not VISIBLE, mask-0 instances, unbounded compounds (ground / water planes have no
+//           meaningful frame), ungrouped/legacy crowd bones when `inst_obj_keys` is null or
+//           `obj_id == 0`, the Selected scope's non-members, unselected non-primary parts, the
+//           WithinRadius scope's far origins, and non-pinhole lenses (UNPROJECTABLE fault);
+//   cull    origin within OVL_AXES_NEAR of the eye plane (for triads / unselected parts),
+//           bounding sphere outside the frustum, or smaller than max(`min_px`, `axes_min_px`) on
+//           screen (the selection is never size-culled);
+//   emit    when `is_primary` is true (and `zo > OVL_AXES_NEAR`), X / Y / Z from the origin along
+//           the normalised transform columns, length `axis_px * 2 tan(fov/2) z / height` (constant
+//           on screen), SCREEN_CONSTANT_WIDTH, and the SELECTED flag for selection members — giving
+//           every multi-part building, vehicle+wheels, or 19-bone crowd actor exactly ONE triad at
+//           its primary root; plus the 12 oriented-box selection edges for EVERY `selected` part so
+//           the entire logical object highlights together.
+// Selection key space: when `inst_obj_keys != nullptr`, matches `pick::csg_selection_key`
+// (`(0x80000000 | obj_id)` when `obj_id != 0`, else `user_id & 0x7FFFFFFF`); when null, falls back
+// to `user_id` with `is_primary = true`.
 #define OVL_CSG_INST_VISIBLE 1u       // CSG_INST_FLAG_VISIBLE
 #define OVL_CSG_INST_CROWD_BONE 16u   // CSG_INST_FLAG_CROWD_BONE
 #define OVL_CSG_COMPOUND_UNBOUNDED 1u // CSG_COMPOUND_FLAG_UNBOUNDED
@@ -625,7 +632,8 @@ extern "C" __global__ void ovl_axes(
     unsigned int style_y,
     unsigned int style_z,
     unsigned int style_box,
-    float axis_px
+    float axis_px,
+    const unsigned int* __restrict__ inst_obj_keys
 ) {
     const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= inst_count) return;
@@ -641,15 +649,30 @@ extern "C" __global__ void ovl_axes(
     const unsigned int compound_id = __float_as_uint(meta.x);
     const unsigned int user_id = __float_as_uint(meta.y);
     const unsigned int flags = __float_as_uint(meta.w);
-    if ((flags & OVL_CSG_INST_VISIBLE) == 0u || (flags & OVL_CSG_INST_CROWD_BONE) != 0u) return;
+    if ((flags & OVL_CSG_INST_VISIBLE) == 0u) return;
     if (compound_id >= gas_count || compound_id >= compound_count) return;
     const float4 c0 = __ldg(compounds + 4u * compound_id + 0u);
     const float4 c1 = __ldg(compounds + 4u * compound_id + 1u);
     const float4 c2 = __ldg(compounds + 4u * compound_id + 2u);
     if ((__float_as_uint(c0.w) & OVL_CSG_COMPOUND_UNBOUNDED) != 0u) return;
-    const unsigned int key = (user_id != 0u) ? user_id : (0xFF000000u | (i & 0x00FFFFFFu));
+
+    // Resolve P42 logical object key & primary-triad flag (nullable fallback when host did not
+    // upload `inst_obj_keys`). Why: prevents 19 overlapping triads on crowd actors or 5 on
+    // vehicles while letting every part of a selected object highlight its oriented bounds.
+    bool is_primary = true;
+    unsigned int key = user_id;
+    if (inst_obj_keys != nullptr) {
+        const unsigned int obj_word = __ldg(inst_obj_keys + i);
+        const unsigned int obj_id = obj_word & 0x7FFFFFFFu;
+        is_primary = (obj_word & 0x80000000u) != 0u;
+        key = (obj_id != 0u) ? (0x80000000u | obj_id) : (user_id & 0x7FFFFFFFu);
+        if ((flags & OVL_CSG_INST_CROWD_BONE) != 0u && obj_id == 0u) return;
+    } else {
+        if ((flags & OVL_CSG_INST_CROWD_BONE) != 0u) return;
+    }
     const bool selected = ovl_is_selected(sel, c.sel_count, key);
     if (c.scope_selected != 0u && !selected) return;
+    if (!is_primary && !selected) return;
 
     const float m[12] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w, r2.x, r2.y, r2.z, r2.w};
     const float3 eye = make_float3(c.eye[0], c.eye[1], c.eye[2]);
@@ -659,7 +682,7 @@ extern "C" __global__ void ovl_axes(
     const float3 o = make_float3(m[3], m[7], m[11]);
     const float3 vo = make_float3(o.x - eye.x, o.y - eye.y, o.z - eye.z);
     const float zo = vo.x * fwd.x + vo.y * fwd.y + vo.z * fwd.z;
-    if (zo <= OVL_AXES_NEAR) return;
+    if (!selected && zo <= OVL_AXES_NEAR) return;
     if (c.radius > 0.0f && sqrtf(vo.x * vo.x + vo.y * vo.y + vo.z * vo.z) > c.radius) return;
 
     // Bounding sphere of the transformed local AABB (centre M*c, half extents |M| h).
@@ -687,28 +710,29 @@ extern "C" __global__ void ovl_axes(
     const float proj_px = (dist <= rad)
         ? INFINITY
         : 2.0f * rad * (float)height / (2.0f * fmaxf(c.tan_half_fov, 1e-4f) * fmaxf(pz, 1e-3f));
-    // Part-level LOD (overlay::axes_lod): axes are per packed part until csg-rs P42 groups parts
-    // into objects, so a part's triad needs its own projected size >= axes_min_px (else a wall of
-    // triads on kerbs and walls). The record size is rescaled so the shared line-LOD fade of
-    // ovl_splat ([min_px, 3 min_px]) fades the triad in over [axes_min, 3 axes_min].
+    // Object-level LOD (overlay::axes_lod): a primary root's triad needs projected size >=
+    // axes_min_px so small distant props don't flood the viewport. The record size is rescaled so
+    // the shared line-LOD fade of ovl_splat ([min_px, 3 min_px]) fades in over [axes_min, 3 axes_min].
     const float axes_min = fmaxf(c.min_px, c.axes_min_px);
     if (!selected && proj_px < axes_min) return;
     const float lod_px = (c.min_px > 0.0f && axes_min > c.min_px) ? proj_px * (c.min_px / axes_min) : proj_px;
 
     const unsigned int sflags = NV_OVERLAY_FLAG_WORLD | NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH
         | (selected ? NV_OVERLAY_FLAG_SELECTED : 0u);
-    const float len = axis_px * 2.0f * c.tan_half_fov * zo / (float)max(height, 1u);
-    const unsigned int styles[3] = {style_x, style_y, style_z};
-    for (int k = 0; k < 3; ++k) {
-        const float3 col = make_float3(m[k], m[4 + k], m[8 + k]);
-        const float n = sqrtf(col.x * col.x + col.y * col.y + col.z * col.z);
-        if (n <= 1e-8f) continue;
-        const float s = len / n;
-        ovl_push_world(segs, counter, cap, o, make_float3(o.x + col.x * s, o.y + col.y * s, o.z + col.z * s),
-                       sflags, NV_OVERLAY_CLASS_AXIS, key, styles[k], lod_px);
+    if (is_primary && zo > OVL_AXES_NEAR) {
+        const float len = axis_px * 2.0f * c.tan_half_fov * zo / (float)max(height, 1u);
+        const unsigned int styles[3] = {style_x, style_y, style_z};
+        for (int k = 0; k < 3; ++k) {
+            const float3 col = make_float3(m[k], m[4 + k], m[8 + k]);
+            const float n = sqrtf(col.x * col.x + col.y * col.y + col.z * col.z);
+            if (n <= 1e-8f) continue;
+            const float s = len / n;
+            ovl_push_world(segs, counter, cap, o, make_float3(o.x + col.x * s, o.y + col.y * s, o.z + col.z * s),
+                           sflags, NV_OVERLAY_CLASS_AXIS, key, styles[k], lod_px);
+        }
     }
     if (!selected) return;
-    // Selection highlight: the 12 edges of the instance's oriented local bounds.
+    // Selection highlight: the 12 edges of every selected part's oriented local bounds.
     float3 corner[8];
     for (int k = 0; k < 8; ++k) {
         const float q[3] = {(k & 1) ? hi[0] : lo[0], (k & 2) ? hi[1] : lo[1], (k & 4) ? hi[2] : lo[2]};

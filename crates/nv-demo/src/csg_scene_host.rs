@@ -8,10 +8,11 @@
 //! zero steady-state GPU buffer reallocations.
 //! Why: keeps `nv-demo` completely decoupled from scene-specific coordinates, presets, or rails
 //! while delivering smooth frame times across 10k-100k+ CSG instances.
-//! Category filter: the host also owns the per-instance filter state of the viewport eye dropdown
-//! (`apply_semantic_filter`: IAS visibility masks of fully hidden instances and the device bitset
-//! of partially hidden ones, see `crate::semantic_filter`), recomputed only when the hidden mask
-//! or the packed instances change.
+//! Category filter & P42 provenance: the host owns the per-instance filter state of the viewport
+//! eye dropdown (`apply_semantic_filter`: IAS visibility masks for both semantic classes and P42
+//! OSM feature classes, plus the device partial bitset, see `crate::semantic_filter`), the
+//! parallel `instance_obj_keys` device buffer driving single-triad-per-object axes & multi-part
+//! selection highlights (`ovl_axes`), and O(1) GPU pick resolution (`resolve_picked_csg`).
 //! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
 
 use std::collections::{HashMap, VecDeque};
@@ -37,13 +38,13 @@ use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat};
 use csg_scene::{
     AssemblyPart, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
-    GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailSpec,
-    SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
-    SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
-    inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
-    crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id, encode_static_inst_id,
-    lookup_instance_and_assembly, resolve_possess_attach,
-    resolve_possess_pose_with_crowd,
+    GpuMaterial, InstanceProvenance, LodConfig, MAT_OVERRIDE_NONE, OBJECT_ID_NONE, OsmElemKind,
+    OsmFeatureClass, PackedGpuScene, PackedInstanceSource, RailSpec, SHADOW_GUARD_MIN_DIAMETER,
+    SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints, SceneRegistry, SceneViewpoint,
+    TimeOfDay, WorldScene, crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id,
+    encode_static_inst_id, find_crowd_actor_for_inst, inst_flags, is_dynamic_inst_id, kind_name,
+    list_possess_targets_with_crowd, lookup_instance_and_assembly, part_role,
+    resolve_possess_attach, resolve_possess_pose_with_crowd,
 };
 
 use crate::app_events::PossessInfo;
@@ -475,6 +476,10 @@ pub struct CsgDevicePointers {
     /// Device partial bitset over the instance slots (`semantic_filter::fill_partial_bits`);
     /// 0 = every instance partial (per-hit reject).
     pub sem_partial: u64,
+    /// Parallel per-slot P42 object key words (`(is_primary << 31) | (object_id & 0x7FFF_FFFF)`),
+    /// aligned 1-to-1 with `instances` for `ovl_axes` single-triad-per-object axes and multi-part
+    /// selection highlights (`0` when empty or unuploaded, triggering safe null fallback).
+    pub instance_obj_keys: u64,
 }
 
 /// Structural configuration key that triggers a full `WorldScene` + GAS rebuild.
@@ -665,7 +670,7 @@ impl<T: Pod> GrowDeviceBuffer<T> {
     /// Uploads `items`. `len_elems` reaches `items.len()` only after the allocation and copy
     /// were enqueued; on any failure it stays `0`, so `device_ptr()` returns `0` and no consumer
     /// indexes past a smaller old allocation.
-    fn upload(&mut self, stream: &Arc<Stream>, items: &[T]) -> Result<(), String> {
+    fn upload(&mut self, stream: &Stream, items: &[T]) -> Result<(), String> {
         self.len_elems = 0;
         if items.is_empty() {
             return Ok(());
@@ -1358,6 +1363,9 @@ pub struct CsgGpuHost {
     /// Hidden-semantics mask the IAS visibility masks and `sem_partial_buf` describe
     /// (viewport category filter, [`Self::apply_semantic_filter`]).
     sem_hidden: u64,
+    /// Hidden-OSM feature-class bitmask the IAS visibility masks and `sem_partial_buf` describe
+    /// (viewport eye-filter OSM section, [`Self::apply_semantic_filter`]).
+    osm_hidden: u32,
     /// The packed instances changed since `sem_partial_buf` was filled (recomputed lazily, only
     /// while something is hidden).
     sem_partial_stale: bool,
@@ -1366,6 +1374,13 @@ pub struct CsgGpuHost {
     /// Device partial bitset; empty (device pointer 0 = every instance partial) when no slot is
     /// unaffected, so the intersection programs skip the bitset load entirely.
     sem_partial_buf: GrowDeviceBuffer<u32>,
+    /// Host scratch for P42 per-slot object key words (`(is_primary << 31) | object_id`), reused.
+    instance_obj_keys_host: Vec<u32>,
+    /// Reusable per-`object_id` scratch table (`u32::MAX` when idle) ensuring O(visible) primary
+    /// slot selection with zero steady-state allocations.
+    obj_primary_slot_scratch: Vec<u32>,
+    /// Parallel device array of P42 object key words (`u32[instance_count]`) read by `ovl_axes`.
+    instance_obj_keys_buf: GrowDeviceBuffer<u32>,
     pinned_staging: Option<PinnedStagingBuffer>,
     pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
@@ -1430,9 +1445,13 @@ impl CsgGpuHost {
             instances_buf: GrowDeviceBuffer::default(),
             prev_xforms_buf: GrowDeviceBuffer::default(),
             sem_hidden: 0,
+            osm_hidden: 0,
             sem_partial_stale: true,
             sem_partial_host: Vec::new(),
             sem_partial_buf: GrowDeviceBuffer::default(),
+            instance_obj_keys_host: Vec::new(),
+            obj_primary_slot_scratch: Vec::new(),
+            instance_obj_keys_buf: GrowDeviceBuffer::default(),
             pinned_staging: None,
             pinned_prev_staging: None,
             prev_packed_len: 0,
@@ -1886,6 +1905,8 @@ impl CsgGpuHost {
         scene.world.pack_all(cam_pos, &mut self.packed);
         self.ias_dirty = true;
         self.sem_partial_stale = true;
+        // Drop live object keys so probe packs never expose stale `object_id` metadata to `ovl_axes`.
+        self.instance_obj_keys_buf.clear();
         if upload_gpu {
             self.instances_buf
                 .upload(stream, self.packed.instances_slice())?;
@@ -1986,6 +2007,75 @@ impl CsgGpuHost {
         Some(if best.mounts.is_empty() { mounted.map_or(best, |(_, m)| m) } else { best })
     }
 
+    /// Resolves a GPU-picked CSG packed instance slot into a [`crate::pick::PickedObject`]
+    /// carrying its P42 logical selection key (`object_id` when grouped), human-readable label,
+    /// and [`crate::pick::OsmProvenance`].
+    ///
+    /// Why: O(1) lookup via `PackedGpuScene::packed_sources` eliminates spatial AABB point scans
+    /// and guarantees multi-part buildings, vehicles+wheels, and articulated crowd actors all
+    /// resolve to one shared logical selection key and authoritative OSM metadata.
+    pub fn resolve_picked_csg(
+        &self,
+        packed_slot: u32,
+        part_id: u32,
+        world_pos: [f32; 3],
+    ) -> Option<crate::pick::PickedObject> {
+        let scene = self.scene.as_ref()?;
+        let slot = packed_slot as usize;
+        let gpu_inst = self.packed.instances_slice().get(slot)?;
+        let src = self
+            .packed
+            .packed_sources_slice()
+            .get(slot)
+            .copied()
+            .unwrap_or(PackedInstanceSource::NONE);
+
+        let (osm, object_id) = if let Some(prov) = scene.world.resolve_packed_provenance(src) {
+            (
+                Some(crate::pick::OsmProvenance {
+                    source: prov.source,
+                    kind: prov.kind,
+                    elem_kind: prov.osm_elem,
+                    osm_id: prov.osm_id,
+                    object_id: prov.object_id,
+                }),
+                prov.object_id,
+            )
+        } else {
+            let obj_id = self
+                .packed
+                .instance_object_ids_slice()
+                .get(slot)
+                .copied()
+                .unwrap_or(OBJECT_ID_NONE);
+            let prov_word = self
+                .packed
+                .instance_prov_slice()
+                .get(slot)
+                .copied()
+                .unwrap_or(0);
+            let osm = csg_scene::unpack_class(prov_word).map(|source| crate::pick::OsmProvenance {
+                source,
+                kind: csg_scene::unpack_kind(prov_word),
+                elem_kind: OsmElemKind::None,
+                osm_id: 0,
+                object_id: obj_id,
+            });
+            (osm, obj_id)
+        };
+
+        let key = crate::pick::csg_selection_key(object_id, gpu_inst.user_id);
+        let name = format_picked_csg_name(scene, src, osm, key);
+
+        Some(crate::pick::PickedObject {
+            key,
+            name,
+            part_id,
+            world_pos,
+            osm,
+        })
+    }
+
     /// The scene object behind a pick record, for the selection status (`crate::pick`).
     pub fn describe_pick(&self, rec: &crate::pick::PickRecordPod) -> crate::pick::PickedObject {
         let name = if !rec.is_csg() {
@@ -1999,7 +2089,6 @@ impl CsgGpuHost {
             name,
             part_id: rec.part_id,
             world_pos: rec.world_pos,
-            // csg-scene carries no OSM provenance yet (csg-rs P42).
             osm: None,
         }
     }
@@ -2149,6 +2238,7 @@ impl CsgGpuHost {
             return CsgDevicePointers::default();
         };
         let world = &scene.world;
+        let instance_count = self.packed.len().min(self.instances_buf.len_elems) as u32;
         CsgDevicePointers {
             compounds: self.compounds_buf.device_ptr(),
             ops: self.ops_buf.device_ptr(),
@@ -2160,13 +2250,19 @@ impl CsgGpuHost {
             instances: self.instances_buf.device_ptr(),
             prev_xforms: self.prev_xforms_buf.device_ptr(),
             // Never more than were uploaded: after a failed upload the buffer reports 0.
-            instance_count: self.packed.len().min(self.instances_buf.len_elems) as u32,
+            instance_count,
             material_count: world.materials.len() as u32,
             compound_count: world.library.compounds.len() as u32,
             gas_count: self.compound_gases.len() as u32,
             hidden_semantics: self.sem_hidden,
             // A stale bitset describes other slots: 0 makes every instance partial (exact).
             sem_partial: if self.sem_partial_stale { 0 } else { self.sem_partial_buf.device_ptr() },
+            // Guard length so `ovl_axes` never reads past a failed/unbuilt upload (0 = null fallback).
+            instance_obj_keys: if self.instance_obj_keys_buf.len_elems >= instance_count as usize {
+                self.instance_obj_keys_buf.device_ptr()
+            } else {
+                0
+            },
         }
     }
 
@@ -2176,25 +2272,46 @@ impl CsgGpuHost {
         self.sem_hidden
     }
 
-    /// Applies the viewport category filter `hidden` (call once per frame after [`Self::sync`]).
+    /// Hidden-OSM feature-class bitmask the IAS visibility masks and partial bitset are built for
+    /// (viewport eye-filter OSM section, [`Self::apply_semantic_filter`]).
+    pub fn osm_hidden(&self) -> u32 {
+        self.osm_hidden
+    }
+
+    /// Applies the viewport category filter `(hidden_semantics, hidden_osm)` (call once per frame
+    /// after [`Self::sync`]).
     ///
-    /// Returns `true` when `hidden` changed, so the caller re-emits the IAS instances with the
+    /// Returns `true` when either mask changed, so the caller re-emits the IAS instances with the
     /// new visibility masks (an `UPDATE`, the instance count is unchanged). The device partial
-    /// bitset is refilled only when `hidden` or the packed instances changed and something is
-    /// hidden; with nothing hidden the device never reads it, so there is no work at all.
-    pub fn apply_semantic_filter(&mut self, stream: &Arc<Stream>, hidden: u64) -> Result<bool, String> {
-        let changed = hidden != self.sem_hidden;
+    /// bitset is refilled only when either mask or the packed instances changed and
+    /// `hidden_semantics != 0` (OSM hiding is whole-instance via IAS visibility mask, so with
+    /// `hidden_semantics == 0` the device skips per-hit semantic rejection altogether).
+    pub fn apply_semantic_filter(
+        &mut self,
+        stream: &Stream,
+        hidden_semantics: u64,
+        hidden_osm: u32,
+    ) -> Result<bool, String> {
+        let changed = hidden_semantics != self.sem_hidden || hidden_osm != self.osm_hidden;
         if changed {
-            self.sem_hidden = hidden;
+            self.sem_hidden = hidden_semantics;
+            self.osm_hidden = hidden_osm;
             self.sem_partial_stale = true;
         }
-        if self.sem_partial_stale && hidden != 0 {
+        if self.sem_partial_stale && hidden_semantics != 0 {
             let uploaded = self.packed.len().min(self.instances_buf.len_elems);
             let slots = &self.packed.instances_slice()[..uploaded];
-            let partial = crate::semantic_filter::fill_partial_bits(
+            let prov = self
+                .packed
+                .instance_prov_slice()
+                .get(..uploaded)
+                .unwrap_or(self.packed.instance_prov_slice());
+            let partial = sf::fill_partial_bits(
                 slots,
                 &self.compound_semantic_masks,
-                hidden,
+                prov,
+                hidden_semantics,
+                hidden_osm,
                 &mut self.sem_partial_host,
             );
             // Not stale any more even if the upload fails: a failed upload leaves the buffer
@@ -2503,11 +2620,19 @@ impl CsgGpuHost {
             // (or ONLY non-crowd traffic vehicles when `gpu_crowd_active` scatters crowd bones
             // directly in VRAM) against the cached frustum camera, leaving the 10k-100k static
             // tail untouched in `self.packed.instances[D..]`.
+            // P42 invariant: when `same_dyn_topology` succeeds, the exact same dynamic instances
+            // stay in the exact same prefix slots `0..dyn_count` in deterministic order, so
+            // `instance_prov`, `instance_object_ids`, `packed_sources`, and `instance_obj_keys_buf`
+            // remain 1-to-1 aligned with `instances` without repacking or re-uploading metadata.
             let can_try_dyn_only = !camera_repack_needed
                 && !self.prev_dyn_sig.is_empty()
                 && self.prev_packed_len == self.packed.instances.len()
                 && self.packed.motion_prev_xforms.len() == self.packed.instances.len()
+                && self.packed.instance_prov.len() == self.packed.instances.len()
+                && self.packed.instance_object_ids.len() == self.packed.instances.len()
+                && self.packed.packed_sources.len() == self.packed.instances.len()
                 && self.prev_xforms_buf.len_elems == self.packed.instances.len()
+                && self.instance_obj_keys_buf.len_elems == self.packed.instances.len()
                 && self.prev_dyn_sig.len() <= self.packed.instances.len();
 
             let mut handled_traffic_only = None;
@@ -2576,6 +2701,14 @@ impl CsgGpuHost {
                     .count();
                 self.instances_buf.upload(stream, slice)?;
                 self.prev_xforms_buf.upload(stream, prev_slice)?;
+                fill_instance_obj_keys(
+                    &scene.world,
+                    &self.packed,
+                    &mut self.instance_obj_keys_host,
+                    &mut self.obj_primary_slot_scratch,
+                );
+                self.instance_obj_keys_buf
+                    .upload(stream, &self.instance_obj_keys_host)?;
                 self.prev_packed_len = slice.len();
                 self.prev_dyn_sig.clear();
                 self.prev_dyn_sig.reserve(dyn_count);
@@ -2609,7 +2742,8 @@ impl CsgGpuHost {
             let gpu_bytes = self.static_gpu_bytes
                 + self.materials_buf.active_bytes()
                 + self.instances_buf.active_bytes()
-                + self.prev_xforms_buf.active_bytes();
+                + self.prev_xforms_buf.active_bytes()
+                + self.instance_obj_keys_buf.active_bytes();
             let lod_stats = self.packed.lod_stats;
             let culled_count = lod_stats
                 .total_culled()
@@ -2646,17 +2780,46 @@ impl CsgGpuHost {
         Ok(CsgSyncResult::Unchanged)
     }
 
+    /// Classifies packed slot `idx` against both the P42 OSM provenance mask (`hidden_osm`) and
+    /// the semantic class mask (`hidden_semantics`). OSM hiding short-circuits directly to
+    /// [`sf::InstanceFilter::Hidden`] so hidden OSM layers pay zero OptiX intersection cost.
+    #[inline]
+    fn classify_packed_slot(
+        &self,
+        idx: usize,
+        gpu_inst: &GpuInstance,
+        hidden_semantics: u64,
+        hidden_osm: u32,
+    ) -> sf::InstanceFilter {
+        let prov_word = self
+            .packed
+            .instance_prov_slice()
+            .get(idx)
+            .copied()
+            .unwrap_or(0);
+        if sf::osm_prov_hidden(prov_word, hidden_osm) {
+            return sf::InstanceFilter::Hidden;
+        }
+        let cm = self
+            .compound_semantic_masks
+            .get(gpu_inst.compound_id as usize)
+            .copied()
+            .unwrap_or(u64::MAX);
+        sf::classify(sf::instance_semantic_mask(gpu_inst.flags, cm), hidden_semantics)
+    }
+
     /// Fills `out_instances` with ONLY the leading `dynamic_count` moving CSG instances (`0..D`),
     /// avoiding a full 50k+ static instance rebuild on `CsgSyncResult::TrafficOnly` frames.
     ///
-    /// Visibility masks follow the category filter [`Self::semantic_hidden`] (a fully hidden
-    /// instance leaves every render ray), as in [`Self::append_optix_instances`].
+    /// Visibility masks follow both [`Self::semantic_hidden`] and [`Self::osm_hidden`] (a fully
+    /// hidden instance leaves every render ray), as in [`Self::append_optix_instances`].
     pub fn fill_dynamic_optix_instances(
         &self,
         dynamic_count: usize,
         out_instances: &mut Vec<Instance>,
     ) {
         let hidden = self.sem_hidden;
+        let hidden_osm = self.osm_hidden;
         out_instances.clear();
         if !self.is_active() {
             return;
@@ -2674,15 +2837,10 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
-            let cm = self
-                .compound_semantic_masks
-                .get(cid)
-                .copied()
-                .unwrap_or(u64::MAX);
             inst.mask = if visible {
                 sf::visibility_mask(
                     inst.mask,
-                    sf::classify(sf::instance_semantic_mask(gpu_inst.flags, cm), hidden),
+                    self.classify_packed_slot(idx, gpu_inst, hidden, hidden_osm),
                 )
             } else {
                 0
@@ -2707,10 +2865,16 @@ impl CsgGpuHost {
     /// compounds to `CSG_SBT_UNION_OFFSET` (`12`), and general RPN compounds
     /// to `CSG_SBT_OFFSET` (`8`). Only instances present in `instances_buf` are appended, so a
     /// failed upload never leaves IAS instances indexing missing `csg_instances` entries.
-    /// Visibility masks follow the category filter `hidden` (`semantic_filter::classify`): the
-    /// live IAS passes [`Self::semantic_hidden`], the city-wide probe IAS passes 0 (it scores
-    /// every class, like its launch).
-    pub fn append_optix_instances(&self, out_instances: &mut Vec<Instance>, hidden: u64) {
+    /// Visibility masks follow both `hidden` (`semantic_filter::classify`) and `hidden_osm`
+    /// (`semantic_filter::osm_prov_hidden`): the live IAS passes
+    /// `([Self::semantic_hidden], [Self::osm_hidden])`, while the city-wide probe IAS passes
+    /// `(0, 0)` (it scores every class, like its launch).
+    pub fn append_optix_instances(
+        &self,
+        out_instances: &mut Vec<Instance>,
+        hidden: u64,
+        hidden_osm: u32,
+    ) {
         if !self.is_active() {
             return;
         }
@@ -2727,15 +2891,10 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
-            let cm = self
-                .compound_semantic_masks
-                .get(cid)
-                .copied()
-                .unwrap_or(u64::MAX);
             inst.mask = if visible {
                 sf::visibility_mask(
                     inst.mask,
-                    sf::classify(sf::instance_semantic_mask(gpu_inst.flags, cm), hidden),
+                    self.classify_packed_slot(idx, gpu_inst, hidden, hidden_osm),
                 )
             } else {
                 0
@@ -2820,6 +2979,9 @@ impl CsgGpuHost {
         self.materials_buf.clear();
         self.instances_buf.clear();
         self.prev_xforms_buf.clear();
+        self.instance_obj_keys_buf.clear();
+        self.instance_obj_keys_host.clear();
+        self.obj_primary_slot_scratch.clear();
         self.sem_partial_stale = true;
         self.prev_packed_len = 0;
         self.prev_dyn_sig.clear();
@@ -3007,6 +3169,186 @@ fn xform_to_bits(xf: [f32; 12]) -> [u32; 12] {
         *dst = if v == 0.0 { 0.0f32 } else { v }.to_bits();
     }
     out
+}
+
+/// Bit 31 of each `instance_obj_keys` word marking the single authoritative primary packed slot
+/// that emits the 3-axis orientation triad for its logical object in `ovl_axes`.
+const OBJ_KEY_PRIMARY_BIT: u32 = 0x8000_0000;
+
+/// Mask of the 31-bit logical `object_id` payload stored in `instance_obj_keys` (`0` = ungrouped).
+const OBJ_KEY_ID_MASK: u32 = 0x7FFF_FFFF;
+
+/// Looks up the raw P42 [`InstanceProvenance`] for a packed reverse-map entry in O(1).
+#[inline]
+fn packed_source_provenance(
+    world: &WorldScene,
+    src: PackedInstanceSource,
+) -> Option<InstanceProvenance> {
+    if let Some(dyn_idx) = src.dynamic_index() {
+        return world.dynamic_provenance_at(dyn_idx);
+    }
+    if let Some((chunk_idx, local_idx)) = src.static_indices() {
+        return world
+            .chunks()
+            .get(chunk_idx)?
+            .provenance()
+            .get(local_idx)
+            .copied();
+    }
+    None
+}
+
+/// Looks up the source `WorldScene` [`csg_scene::Instance`] for a packed reverse-map entry in O(1).
+#[inline]
+fn packed_source_instance(
+    world: &WorldScene,
+    src: PackedInstanceSource,
+) -> Option<&csg_scene::Instance> {
+    if let Some(dyn_idx) = src.dynamic_index() {
+        return world.dynamic_instances().get(dyn_idx);
+    }
+    if let Some((chunk_idx, local_idx)) = src.static_indices() {
+        return world.chunks().get(chunk_idx)?.instances().get(local_idx);
+    }
+    None
+}
+
+/// Builds the parallel per-slot P42 `instance_obj_keys` array (`(is_primary << 31) | object_id`)
+/// aligned 1-to-1 with `packed.instances_slice()`.
+///
+/// Why two linear passes with a reusable scratch table: guarantees that EVERY visible grouped
+/// `object_id != OBJECT_ID_NONE` receives **exactly one** `OBJ_KEY_PRIMARY_BIT` slot (preferring
+/// the first packed slot with `part_role::PRIMARY`, or promoting the first visible slot when the
+/// primary part was frustum/LOD-culled) in O(`packed.len()`) time with zero steady-state heap
+/// allocations. Ungrouped slots (`OBJECT_ID_NONE`) always carry `OBJ_KEY_PRIMARY_BIT`.
+fn fill_instance_obj_keys(
+    world: &WorldScene,
+    packed: &PackedGpuScene,
+    out: &mut Vec<u32>,
+    primary_slot_scratch: &mut Vec<u32>,
+) {
+    let n = packed.len();
+    out.clear();
+    out.reserve(n);
+
+    let obj_cap = world.objects().len();
+    if primary_slot_scratch.len() < obj_cap {
+        primary_slot_scratch.resize(obj_cap, u32::MAX);
+    }
+
+    let obj_ids = packed.instance_object_ids_slice();
+    let sources = packed.packed_sources_slice();
+
+    // Pass 1: record raw `object_id`s in `out` and choose the single winning primary slot per
+    // grouped `object_id` in `primary_slot_scratch[obj_id]`:
+    //   `u32::MAX`                   -> not yet seen in `packed`
+    //   `slot` (bit 31 = 0)          -> first visible fallback slot (no `PRIMARY` seen yet)
+    //   `slot | OBJ_KEY_PRIMARY_BIT` -> locked to the first visible `part_role::PRIMARY` slot
+    for i in 0..n {
+        let obj_id = obj_ids
+            .get(i)
+            .copied()
+            .unwrap_or(OBJECT_ID_NONE)
+            & OBJ_KEY_ID_MASK;
+        if obj_id == OBJECT_ID_NONE {
+            out.push(OBJ_KEY_PRIMARY_BIT);
+            continue;
+        }
+        out.push(obj_id);
+        let Some(slot_u32) = u32::try_from(i).ok().filter(|&v| v <= OBJ_KEY_ID_MASK) else {
+            continue;
+        };
+        let is_role_primary = sources
+            .get(i)
+            .and_then(|&src| packed_source_provenance(world, src))
+            .is_some_and(|p| p.part_role == part_role::PRIMARY);
+        if let Some(entry) = primary_slot_scratch.get_mut(obj_id as usize) {
+            if *entry == u32::MAX {
+                *entry = slot_u32 | if is_role_primary { OBJ_KEY_PRIMARY_BIT } else { 0 };
+            } else if is_role_primary && (*entry & OBJ_KEY_PRIMARY_BIT) == 0 {
+                *entry = slot_u32 | OBJ_KEY_PRIMARY_BIT;
+            }
+        } else if is_role_primary
+            && let Some(word) = out.last_mut()
+        {
+            *word |= OBJ_KEY_PRIMARY_BIT;
+        }
+    }
+
+    // Pass 2: stamp `OBJ_KEY_PRIMARY_BIT` onto the single chosen slot of every visible grouped
+    // object, then clear only the touched entries of `primary_slot_scratch` back to `u32::MAX`
+    // so the next repack runs in O(visible_instances) rather than O(world.objects().len()).
+    for (i, word) in out.iter_mut().enumerate() {
+        let obj_id = *word & OBJ_KEY_ID_MASK;
+        if obj_id == OBJECT_ID_NONE {
+            continue;
+        }
+        if let Some(&entry) = primary_slot_scratch.get(obj_id as usize)
+            && entry != u32::MAX
+            && (entry & OBJ_KEY_ID_MASK) as usize == i
+        {
+            *word = obj_id | OBJ_KEY_PRIMARY_BIT;
+        }
+    }
+    for &word in out.iter() {
+        let obj_id = word & OBJ_KEY_ID_MASK;
+        if obj_id != OBJECT_ID_NONE
+            && let Some(entry) = primary_slot_scratch.get_mut(obj_id as usize)
+        {
+            *entry = u32::MAX;
+        }
+    }
+}
+
+/// Formats a concise, human-readable label for a picked CSG slot from its P42 provenance and
+/// scene hierarchy without exposing street addresses.
+fn format_picked_csg_name(
+    scene: &SceneBuilt,
+    src: PackedInstanceSource,
+    osm: Option<crate::pick::OsmProvenance>,
+    key: u32,
+) -> String {
+    if let Some(dyn_idx) = src.dynamic_index()
+        && let Some(actor) =
+            find_crowd_actor_for_inst(&scene.world, &scene.crowd, encode_dynamic_inst_id(dyn_idx))
+    {
+        return crowd_actor_display_name(&scene.crowd, actor);
+    }
+    let asm_name = packed_source_instance(&scene.world, src)
+        .and_then(|inst| scene.world.assembly(inst.assembly_id))
+        .map(|asm| asm.name.as_str())
+        .filter(|name| !name.is_empty());
+    if let Some(prov) = osm {
+        match prov.source {
+            OsmFeatureClass::Unknown => {
+                if let Some(name) = asm_name {
+                    return name.to_string();
+                }
+            }
+            OsmFeatureClass::Procedural | OsmFeatureClass::Override => {
+                if let Some(name) = asm_name {
+                    return name.to_string();
+                }
+                let kn = kind_name(prov.source, prov.kind);
+                return if kn == prov.source.label() {
+                    kn.to_string()
+                } else {
+                    format!("{} ({kn})", prov.source.label())
+                };
+            }
+            source => {
+                let kn = kind_name(source, prov.kind);
+                return if kn == source.label() {
+                    kn.to_string()
+                } else {
+                    format!("{} ({kn})", source.label())
+                };
+            }
+        }
+    }
+    asm_name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Object #{key:#010x}"))
 }
 
 /// Metres a world bound is padded by when testing whether it contains a GPU pick point.
@@ -4573,5 +4915,199 @@ mod tests {
             host.active_possess_attach(0.0, 0.0, true).is_none(),
             "non-crowd possessed body must return None from active_possess_attach"
         );
+    }
+
+    #[test]
+    fn p42_instance_obj_keys_emits_one_primary_per_grouped_object_and_handles_culled_primary() {
+        let reg = csg_scenes::default_scene_registry();
+        let module = reg.get("marina").expect("marina registered");
+        let mut built = module
+            .build(&SceneBuildConfig::default())
+            .expect("marina scene builds");
+        let vp = &built.viewpoints[0];
+        let mut packed = PackedGpuScene::new();
+        built.world.pack_all(vp.eye, &mut packed);
+        assert!(!packed.is_empty(), "marina must pack visible instances");
+
+        let mut keys = Vec::new();
+        let mut scratch = Vec::new();
+        fill_instance_obj_keys(&built.world, &packed, &mut keys, &mut scratch);
+        assert_eq!(keys.len(), packed.len());
+        assert!(
+            scratch.iter().all(|&entry| entry == u32::MAX),
+            "scratch table must be fully reset to u32::MAX after fill_instance_obj_keys"
+        );
+
+        let mut per_obj: HashMap<u32, (usize, usize)> = HashMap::new();
+        for (i, &word) in keys.iter().enumerate() {
+            let expected_id = packed.instance_object_ids_slice()[i] & OBJ_KEY_ID_MASK;
+            let got_id = word & OBJ_KEY_ID_MASK;
+            let is_primary = (word & OBJ_KEY_PRIMARY_BIT) != 0;
+            assert_eq!(got_id, expected_id);
+            if expected_id == OBJECT_ID_NONE {
+                assert!(is_primary, "ungrouped slot {i} must emit its own triad");
+            } else {
+                let entry = per_obj.entry(expected_id).or_insert((0, 0));
+                entry.0 += 1;
+                if is_primary {
+                    entry.1 += 1;
+                }
+            }
+        }
+        let multi_part_objects = per_obj.values().filter(|&&(parts, _)| parts >= 2).count();
+        assert!(
+            multi_part_objects > 0,
+            "marina must contain multi-part grouped objects (vehicles+wheels, crowd actors)"
+        );
+        for (obj_id, (parts, primaries)) in &per_obj {
+            assert_eq!(
+                *primaries, 1,
+                "object_id {obj_id} ({parts} visible parts) must have exactly 1 primary triad slot"
+            );
+        }
+
+        // Simulate a culled primary part: copy only non-PRIMARY slots of a multi-part object
+        // into a synthetic `PackedGpuScene` and verify the first surviving part is promoted.
+        let target_obj = per_obj
+            .iter()
+            .find_map(|(&obj_id, &(parts, _))| {
+                if parts < 2 {
+                    return None;
+                }
+                let non_prim = (0..packed.len())
+                    .filter(|&i| {
+                        (packed.instance_object_ids_slice()[i] & OBJ_KEY_ID_MASK) == obj_id
+                            && packed_source_provenance(
+                                &built.world,
+                                packed.packed_sources_slice()[i],
+                            )
+                            .is_some_and(|p| p.part_role != part_role::PRIMARY)
+                    })
+                    .count();
+                (non_prim >= 2).then_some(obj_id)
+            })
+            .expect("expected a multi-part object with >=2 non-primary parts (e.g. wheels or crowd bones)");
+
+        let mut culled_packed = PackedGpuScene::new();
+        for i in 0..packed.len() {
+            let obj_id = packed.instance_object_ids_slice()[i] & OBJ_KEY_ID_MASK;
+            if obj_id != target_obj {
+                continue;
+            }
+            let src = packed.packed_sources_slice()[i];
+            let is_prim = packed_source_provenance(&built.world, src)
+                .is_some_and(|p| p.part_role == part_role::PRIMARY);
+            if !is_prim {
+                culled_packed.push_instance_with_prov(
+                    packed.instances_slice()[i],
+                    packed.motion_prev_xforms_slice()[i],
+                    packed.instance_prov_slice()[i],
+                    obj_id,
+                    src,
+                );
+            }
+        }
+        assert!(culled_packed.len() >= 2);
+        fill_instance_obj_keys(&built.world, &culled_packed, &mut keys, &mut scratch);
+        assert_eq!(keys.len(), culled_packed.len());
+        assert_eq!(
+            keys.iter().filter(|&&w| (w & OBJ_KEY_PRIMARY_BIT) != 0).count(),
+            1,
+            "when PRIMARY part is culled, exactly one surviving slot must be promoted"
+        );
+        assert_ne!(
+            keys[0] & OBJ_KEY_PRIMARY_BIT,
+            0,
+            "the first surviving visible slot must receive the promoted primary bit"
+        );
+    }
+
+    #[test]
+    fn resolve_picked_csg_returns_osm_provenance_and_object_keys_on_city_scenes() {
+        for scene_id in ["gundo_osm", "marina"] {
+            let mut host = CsgGpuHost::new();
+            let reg_idx = host
+                .registry
+                .descriptors()
+                .iter()
+                .position(|d| d.id == scene_id)
+                .expect("scene registered");
+            let module = host
+                .registry
+                .get_by_index(reg_idx)
+                .expect("scene module");
+            let built = module
+                .build(&SceneBuildConfig::default())
+                .expect("scene builds");
+            let vp_eye = built.viewpoints[0].eye;
+            host.scene_key = CsgSceneKey {
+                scene_idx: (reg_idx + 1) as u32,
+                variant_idx: 0,
+                seed: 1,
+                road_mode: 2,
+            };
+            host.active_reg_idx = Some(reg_idx);
+            host.scene = Some(built);
+
+            {
+                let scene = host.scene.as_mut().expect("scene");
+                scene.world.pack_all(vp_eye, &mut host.packed);
+            }
+            assert!(
+                host.resolve_picked_csg(u32::MAX, 0, [0.0; 3]).is_none(),
+                "{scene_id}: out-of-range slot must return None"
+            );
+
+            let mut found_osm = false;
+            let mut slots_by_obj: HashMap<u32, Vec<u32>> = HashMap::new();
+            for slot in 0..host.packed.len() {
+                let obj_id = host.packed.instance_object_ids_slice()[slot];
+                if obj_id != OBJECT_ID_NONE {
+                    slots_by_obj.entry(obj_id).or_default().push(slot as u32);
+                }
+                if !found_osm {
+                    let picked = host
+                        .resolve_picked_csg(slot as u32, 7, [1.0, 2.0, 3.0])
+                        .expect("valid slot resolves");
+                    if let Some(osm) = picked.osm
+                        && osm.source != OsmFeatureClass::Unknown
+                        && osm.elem_kind != OsmElemKind::None
+                        && osm.osm_id != 0
+                    {
+                        assert!(!picked.name.is_empty(), "{scene_id}: picked name non-empty");
+                        assert_eq!(picked.part_id, 7);
+                        assert_eq!(picked.world_pos, [1.0, 2.0, 3.0]);
+                        if osm.object_id != OBJECT_ID_NONE {
+                            assert_eq!(
+                                picked.key,
+                                crate::pick::OBJECT_KEY_BIT | (osm.object_id & OBJ_KEY_ID_MASK)
+                            );
+                        }
+                        found_osm = true;
+                    }
+                }
+            }
+            assert!(
+                found_osm,
+                "{scene_id}: expected at least one packed slot with non-Unknown OSM provenance and osm_id != 0"
+            );
+
+            // Multi-part grouped objects must share the exact same selection key across all parts.
+            let (grouped_obj, slots) = slots_by_obj
+                .iter()
+                .find(|(_, v)| v.len() >= 2)
+                .expect("expected at least one multi-part grouped object");
+            let first = host
+                .resolve_picked_csg(slots[0], 0, [0.0; 3])
+                .expect("first part");
+            let second = host
+                .resolve_picked_csg(slots[1], 1, [0.0; 3])
+                .expect("second part");
+            assert_eq!(first.key, second.key, "{scene_id}: grouped object {grouped_obj} parts must share one key");
+            assert_eq!(
+                first.key,
+                crate::pick::OBJECT_KEY_BIT | (*grouped_obj & OBJ_KEY_ID_MASK)
+            );
+        }
     }
 }

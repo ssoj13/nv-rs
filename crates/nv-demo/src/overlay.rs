@@ -29,8 +29,11 @@
 //!   another lens they are not drawn and [`OverlayList::status`] says so (no silently wrong
 //!   lines). Screen-space primitives and GPU sources work with every lens.
 //! - **Selection** (`crate::pick`): the primary launch writes a 32 B pick record for a clicked
-//!   pixel; the resulting selection keys go up as a small device table that the Selected scope
-//!   and the GPU providers' highlight read.
+//!   pixel; the resulting selection keys (P42 `inst_obj_keys` via [`crate::pick::csg_selection_key`],
+//!   tagging grouped logical `object_id`s with [`crate::pick::OBJECT_KEY_BIT`] and leaving
+//!   ungrouped instances in the low 31 bits) go up as a small device table that the Selected scope
+//!   and the GPU providers' highlight read. `ovl_axes` draws one triad per logical object on its
+//!   primary root pivot and whole-object selection bounds across all parts of a selected object.
 
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
@@ -132,8 +135,9 @@ pub struct OverlaySegmentPod {
     pub kind: u32,
     /// [`SegmentClass`] as `u32`.
     pub cls: u32,
-    /// Instance key (primary-hit instance id space), `u32::MAX` = none; the Selected scope
-    /// filters on it.
+    /// Selection key (`inst_obj_keys` / [`crate::pick::csg_selection_key`] space, with
+    /// [`crate::pick::OBJECT_KEY_BIT`] set for P42 logical `object_id`s), `u32::MAX` = none; the
+    /// Selected scope filters on it.
     pub inst_id: u32,
     /// Part within the instance, `u32::MAX` = none.
     pub part_id: u32,
@@ -189,9 +193,9 @@ pub struct GpuOverlayCamera {
     /// 1 = Selected scope: only records whose `inst_id` is in the selection table are drawn
     /// (an empty selection draws nothing), 0 = no selection filter.
     pub scope_selected: u32,
-    /// Part-level LOD of the object axes ([`OverlayFilter::axes_min_px`]): a packed part's triad
-    /// is drawn only when the part's own projected bounds reach this size (the former pad word,
-    /// so the record stays 80 bytes).
+    /// Object-level / ungrouped-part LOD of the object axes ([`OverlayFilter::axes_min_px`]): a
+    /// triad is drawn only when its projected bounds reach this size (the former pad word, so the
+    /// record stays 80 bytes).
     pub axes_min_px: f32,
 }
 const _: () = assert!(std::mem::size_of::<GpuOverlayCamera>() == 80);
@@ -228,7 +232,9 @@ pub const SEGS_PER_PIXEL: f32 = 0.5;
 pub enum OverlayKind {
     /// Wireframe contour lines (silhouettes, creases, instance borders).
     Contours,
-    /// Object axis triads (X red, Y green, Z blue) at every device CSG instance origin.
+    /// Object axis triads (X red, Y green, Z blue): one triad per P42 logical object on its
+    /// primary root pivot (or per ungrouped CSG instance), plus whole-object selection bounds on
+    /// all parts of selected objects.
     Axes,
 }
 
@@ -303,10 +309,11 @@ pub struct OverlayFilter {
     pub temporal: bool,
     /// Object axis length in screen pixels, constant at any distance (a gizmo, not geometry).
     pub axis_px: f32,
-    /// Part-level LOD of the object axes: a packed part's triad is drawn only when the part's
-    /// own projected bounding-sphere diameter reaches this many pixels (it fades in up to three
-    /// times that). Why: axes are per packed part until csg-rs P42 groups parts into objects;
-    /// without this, street-level views show a wall of triads on kerbs, walls and fences.
+    /// Screen-size LOD of the object axes: a triad is drawn only when its projected
+    /// bounding-sphere diameter reaches this many pixels (it fades in up to three times that).
+    /// Why: even with P42 `object_id` root-pivot grouping (one triad per logical object on its
+    /// primary root, suppressing secondary sub-parts), small or distant ungrouped features
+    /// (kerbs, walls, fences) would otherwise clutter street-level views.
     pub axes_min_px: f32,
 }
 
@@ -388,8 +395,11 @@ pub const AXIS_PX_RANGE: std::ops::RangeInclusive<f32> = 8.0..=200.0;
 pub enum GpuSource {
     /// Wireframe contours from the wireframe G-buffer (`wire_emit`).
     Contours { silhouette: StyleId, crease: StyleId },
-    /// Object axes from the device CSG instance records (`ovl_axes`): one style per axis plus
-    /// the selection's bounding-box style, and the axis length in pixels.
+    /// Object axes from the device CSG instance records (`ovl_axes` + P42 `inst_obj_keys`): one
+    /// triad per logical object on its primary root pivot (keyed with
+    /// [`crate::pick::OBJECT_KEY_BIT`]), whole-object selection bounds across all parts of a
+    /// selected object, one style per axis plus the selection's bounding-box style, and the axis
+    /// length in pixels.
     Axes { x: StyleId, y: StyleId, z: StyleId, bounds: StyleId, axis_px: f32 },
 }
 
@@ -406,7 +416,8 @@ pub struct OverlayCtx<'a> {
     pub height: u32,
     /// The shared visibility state every provider honours.
     pub filter: OverlayFilter,
-    /// Keys of the selected objects (primary-hit instance key space), for
+    /// Keys of the selected objects (`inst_obj_keys` / [`crate::pick::csg_selection_key`] space,
+    /// tagging P42 logical `object_id`s with [`crate::pick::OBJECT_KEY_BIT`]), for
     /// [`OverlayScope::Selected`] and the selection highlight.
     pub selected: &'a [u32],
     /// A primary-hit depth buffer is available for [`DepthMode`] tests this frame.
@@ -655,13 +666,15 @@ impl OverlayProvider for ContourProvider {
     }
 }
 
-/// The object axes provider: requests the GPU axes source (`ovl_axes` reads every device CSG
-/// instance record and appends three world-space axis segments per qualifying instance) with
-/// one style per axis and a bounds style for the selection.
+/// The object axes provider: requests the GPU axes source (`ovl_axes` reads the device CSG
+/// instance records and P42 `inst_obj_keys`, emitting one world-space axis triad per logical
+/// object on its primary root pivot and whole-object selection bounds across all parts of
+/// selected objects) with one style per axis and a bounds style for the selection.
 ///
-/// Why GPU: the transforms already live on the device (`csg_instances`, also written in place by
-/// the GPU crowd); a host copy of tens of thousands of instances per frame is exactly what the
-/// overlay layer exists to avoid.
+/// Why GPU: the transforms and P42 `inst_obj_keys` ([`crate::pick::OBJECT_KEY_BIT`]-tagged
+/// `object_id` or ungrouped `user_id`) already live on the device (`csg_instances`, also written
+/// in place by the GPU crowd/traffic); a host copy of tens of thousands of instances per frame is
+/// exactly what the overlay layer exists to avoid.
 #[derive(Debug, Default)]
 pub struct AxesProvider;
 
@@ -706,12 +719,15 @@ pub struct AxesEmit {
 /// CPU mirror of the per-instance math of `ovl_axes` (`shaders/tonemap.cu`); the unit tests pin
 /// the formulas, so a change on one side without the other fails them.
 ///
-/// `xform` is the row-major 3x4 object-to-world transform of the device instance record,
-/// `aabb` the compound's local bounds. Returns `None` when the instance is culled: origin behind
-/// the near limit, bounds outside the frustum, or bounds smaller than `min_px` on screen (unless
-/// `selected`). The axis length is `axis_px` pixels at the origin depth, so it reads the same at
-/// any distance: `L = axis_px * 2 tan(fov/2) z / height`. Test-only: the kernel is the
-/// production path; this mirror exists so the formulas are pinned by unit tests.
+/// `xform` is the row-major 3x4 object-to-world transform of the device instance record (under
+/// P42 `object_id` root-pivot grouping, `ovl_axes` emits the triad only for each logical object's
+/// primary root or ungrouped instances, while emitting selection bounds for every part whose
+/// `inst_obj_keys` entry matches the selection table), and `aabb` is the compound's local bounds.
+/// Returns `None` when the instance is culled: origin behind the near limit, bounds outside the
+/// frustum, or bounds smaller than `min_px` on screen (unless `selected`). The axis length is
+/// `axis_px` pixels at the origin depth, so it reads the same at any distance:
+/// `L = axis_px * 2 tan(fov/2) z / height`. Test-only: the kernel is the production path; this
+/// mirror exists so the formulas are pinned by unit tests.
 #[cfg(test)]
 pub fn axes_emit(
     cam: &GpuOverlayCamera,
@@ -878,6 +894,18 @@ mod tests {
         let segs = l.flatten(&c).to_vec();
         assert_eq!(segs.len(), 1);
         assert!(segs[0].a[2] > 400.0);
+        // P42 OBJECT_KEY_BIT-tagged logical object key matches Selected scope cleanly without
+        // aliasing the same numeric id in the ungrouped space.
+        let obj_key = crate::pick::csg_selection_key(8, 8);
+        let mut l2 = OverlayList::default();
+        let st2 = l2.style([1.0; 4], 1.0, [0.0, 0.0], DepthMode::Always).expect("style");
+        l2.polyline(SegmentClass::Path, Space::World, &[[0.0, 0.0, 5.0], [1.0, 0.0, 5.0]], false, st2, Some(8));
+        l2.polyline(SegmentClass::Path, Space::World, &[[0.0, 0.0, 10.0], [2.0, 0.0, 10.0]], false, st2, Some(obj_key));
+        let obj_sel = [obj_key];
+        c.selected = &obj_sel;
+        let obj_segs = l2.flatten(&c).to_vec();
+        assert_eq!(obj_segs.len(), 1);
+        assert_eq!(obj_segs[0].inst_id, obj_key);
         fish.filter.enabled = false;
         assert!(!fish.filter.shows(OverlayKind::Contours));
     }

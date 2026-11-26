@@ -229,6 +229,9 @@ pub struct GpuScatterTarget {
     /// Bitmask of hidden semantic classes (`bit s == 1` masks semantic id `s < 64` to
     /// `LINES_OCCLUDER_MASK = 0x80` on visible OptiX instances).
     pub hidden_semantics: u64,
+    /// When `true` (OSM eye-filter `OsmFeatureClass::DynamicActor` toggled off), mask every
+    /// visible crowd bone's OptiX instance to `LINES_OCCLUDER_MASK = 0x80` so render rays skip it.
+    pub hide_dynamic_actors: bool,
 }
 
 /// Summary returned from a single GPU crowd step.
@@ -242,7 +245,7 @@ pub struct CudaCrowdStepReport {
 }
 
 /// Minimal `nv-demo`-only CUDA host bridge: amortized IAS displacement check and bounds-checked
-/// CSG/OptiX scatter with `hidden_semantics` visibility masking.
+/// CSG/OptiX scatter with `hidden_semantics` and OSM `DynamicActor` visibility masking.
 const CROWD_BRIDGE_CUH: &str = r#"
 #if defined(__CUDACC_RTC__)
 typedef unsigned int uint32_t;
@@ -324,7 +327,8 @@ extern "C" __global__ void scatter_crowd_to_csg_and_optix(
     const uint64_t* __restrict__ compound_gas_handles,
     const uint32_t* __restrict__ compound_sbt_offsets,
     uint32_t compound_count,
-    uint64_t hidden_semantics) {
+    uint64_t hidden_semantics,
+    uint32_t hide_dynamic_actors) {
     const uint32_t gidx = blockIdx.x * blockDim.x + threadIdx.x;
     if (gidx >= total_bones) {
         return;
@@ -362,8 +366,11 @@ extern "C" __global__ void scatter_crowd_to_csg_and_optix(
                 ? compound_sbt_offsets[cid]
                 : 10u;
             const uint32_t over = (pod.flags >> 16u) & 0xFFu;
-            const bool sem_hidden = (over != 0u) && ((over - 1u) < 64u)
-                && (((hidden_semantics >> (over - 1u)) & 1ull) != 0ull);
+            // Honor both the semantic filter bitmask and the OSM `DynamicActor` eye-filter toggle:
+            // hidden crowd bones keep only `LINES_OCCLUDER_MASK` (`0x80`) so render rays skip them.
+            const bool sem_hidden = (hide_dynamic_actors != 0u)
+                || ((over != 0u) && ((over - 1u) < 64u)
+                    && (((hidden_semantics >> (over - 1u)) & 1ull) != 0ull));
             oi.visibilityMask = visible ? (sem_hidden ? 0x80u : 0xFFu) : 0u;
             oi.flags = 4u; // OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT
             oi.traversableHandle = (compound_gas_handles != nullptr && cid < compound_count)
@@ -1153,8 +1160,9 @@ impl CudaCrowdBackend {
             let mut compound_count =
                 self.d_gas_handles.len().min(self.d_sbt_offsets.len()) as u32;
             let mut hidden_sem = target.hidden_semantics;
+            let mut hide_actors = u32::from(target.hide_dynamic_actors);
 
-            let mut scat_args: [*mut c_void; 15] = [
+            let mut scat_args: [*mut c_void; 16] = [
                 (&raw mut p_src_bones).cast(),
                 (&raw mut p_src_prev).cast(),
                 (&raw mut p_slot_map).cast(),
@@ -1170,10 +1178,11 @@ impl CudaCrowdBackend {
                 (&raw mut p_sbt).cast(),
                 (&raw mut compound_count).cast(),
                 (&raw mut hidden_sem).cast(),
+                (&raw mut hide_actors).cast(),
             ];
             let s_block = 256u32;
             let s_grid = total_bones_u32.div_ceil(s_block).max(1);
-            // SAFETY: `self.scatter_fn` matches the 15-parameter ABI of
+            // SAFETY: `self.scatter_fn` matches the 16-parameter ABI of
             // `scatter_crowd_to_csg_and_optix`; all source slots hold `n_bones` items and
             // destination writes are bounds-checked against `max_csg_instances`/`max_optix_instances`.
             let rc = unsafe {
@@ -1525,6 +1534,7 @@ mod tests {
             optix_slot_offset: 0,
             max_optix_instances: 0,
             hidden_semantics: 0,
+            hide_dynamic_actors: false,
         };
 
         let download_instances = |stream: &Stream| -> Vec<GpuInstance> {

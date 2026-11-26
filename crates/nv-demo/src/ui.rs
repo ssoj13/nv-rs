@@ -3546,6 +3546,7 @@ impl UiContext<'_> {
             let bus = self.bus;
             let cur_pose = *self.cam_pose;
             let s = &mut *self.settings;
+            let is_csg_scene = s.csg_mode != 0;
             let csg_lod_bias = s.csg_lod_bias;
             let mut on_cmd = |cmd: crate::flight::FlightCommand| {
                 bus.emit_ui(UiCommand::Flight(cmd));
@@ -3560,6 +3561,7 @@ impl UiContext<'_> {
                 workspace: self.flight_workspace,
                 flight_stats: self.flight,
                 csg_stats: &self.csg_stats,
+                is_csg_scene,
                 csg_lod_bias,
                 crowd_actor_count: self.crowd_actor_count,
                 rt_ms: self.rt_ms,

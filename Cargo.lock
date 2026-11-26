@@ -1571,7 +1571,7 @@ dependencies = [
 [[package]]
 name = "flight-navigator"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "camera-guide 0.1.0 (git+ssh://git@github.com/ssoj13/camera-guide-rs.git?branch=main)",
  "fnav-core",
@@ -1588,7 +1588,7 @@ dependencies = [
 [[package]]
 name = "fnav-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "blake3",
  "camera-core",
@@ -1602,7 +1602,7 @@ dependencies = [
 [[package]]
 name = "fnav-harmony"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "fnav-core",
  "fnav-interest",
@@ -1613,7 +1613,7 @@ dependencies = [
 [[package]]
 name = "fnav-interest"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "fnav-core",
  "fnav-space",
@@ -1624,7 +1624,7 @@ dependencies = [
 [[package]]
 name = "fnav-plan"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "blake3",
  "camera-guide 0.1.0 (git+ssh://git@github.com/ssoj13/camera-guide-rs.git?branch=main)",
@@ -1641,7 +1641,7 @@ dependencies = [
 [[package]]
 name = "fnav-space"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "blake3",
  "fnav-core",
@@ -1653,7 +1653,7 @@ dependencies = [
 [[package]]
 name = "fnav-tune"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#7fc539f9deec08446fd29c868aae936a29a4a350"
+source = "git+ssh://git@github.com/ssoj13/flight-navigator-rs.git?branch=dev#92d30bd5494d76807b16127ddfd17d81b42d967c"
 dependencies = [
  "fnav-core",
  "fnav-harmony",
@@ -4241,7 +4241,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",

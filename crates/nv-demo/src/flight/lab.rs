@@ -1,16 +1,20 @@
-//! Flight Lab authoring state: manual keyframes, `camera-guide-rs` dynamics tuning, contact
-//! sheet inspection, and honest gating of automatic planning pending `csg-rs` R0+R1.
+//! Flight Lab authoring state: live `csg-scene` R0+R1 automatic planning, manual keyframes,
+//! `camera-guide-rs` dynamics tuning, and contact sheet inspection.
 //!
 //! **What.** Holds [`FlightLabState`], [`ManualKeyframe`], [`DynamicsCurvePlot`], [`LabMode`],
-//! [`PersistedLabPrefs`], and [`CSG_AUTO_PLAN_BLOCKED_REASON`].
-//! **Why.** Separates authoring & dynamics inspection state from Winamp-style playback state
-//! ([`crate::flight::player::FlightPlayer`]) while sharing one [`crate::flight::FlightWorkspace`]
-//! so previewing a manual track or re-timing the active track updates playback immediately with
-//! zero state duplication.
-//! **How.** Manual keyframes capture viewport [`camera::CameraPose`] values (storing focal length
-//! in mm on a 36x24 mm full-frame back), compile via [`crate::flight::convert::keyframes_to_track`],
-//! analyze/re-time tracks via [`crate::flight::convert::analyze_and_retime_track`], and persist
-//! verified `*.fnav.json` files atomically via [`flight_navigator::PlanTrackFile`].
+//! and [`PersistedLabPrefs`].
+//! **Why.** Separates authoring, auto-plan request/result state, and dynamics inspection from
+//! Winamp-style playback state ([`crate::flight::player::FlightPlayer`]) while sharing one
+//! [`crate::flight::FlightWorkspace`] so previewing an auto-planned or manual track or re-timing
+//! the active track updates playback immediately with zero state duplication.
+//! **How.** Auto-Plan builds sanitized [`flight_navigator::fnav_plan::PlanRequest`] values for
+//! [`crate::flight::oracle::CsgAutoPlanner`] (backed by `csg-scene` R0 `VoxelVolume` + R1
+//! `WorldRayQuery`) and installs validated [`flight_navigator::fnav_plan::RailPlan`] results into
+//! preview state; manual keyframes capture viewport [`camera::CameraPose`] values (storing focal
+//! length in mm on a 36x24 mm full-frame back), compile via
+//! [`crate::flight::convert::keyframes_to_track`], analyze/re-time tracks via
+//! [`crate::flight::convert::analyze_and_retime_track`], and persist verified `*.fnav.json` files
+//! atomically via [`flight_navigator::PlanTrackFile`].
 //! **Uses.** `camera`, `flight_navigator::{camera_guide, fnav_core, fnav_plan}`, `glam`, `serde`.
 //! **Used by.** `crate::flight`, `crate::flight::ui`, `crate::persist`.
 
@@ -21,16 +25,14 @@ use flight_navigator::camera_guide::{GuideLimits, LimitTerm, VerifyReport};
 use flight_navigator::fnav_core::{
     FilmBack, Lens, SceneRef, TRACK_FILE_EXT, Track, default_flight_limits,
 };
-use flight_navigator::fnav_plan::{Mode, RailPlan};
+use flight_navigator::fnav_plan::{Mode, PlanRequest, RailPlan};
 use flight_navigator::PlanTrackFile;
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::flight::convert::{analyze_and_retime_track, keyframes_to_track, safe_unit_quat};
+use crate::flight::oracle::AutoPlanStage;
 use crate::flight::{sanitize_file_stem, utc_now_iso8601};
-
-/// Explicit reason shown on the disabled `Auto Plan` button until `csg-rs` ships R0 + R1.
-pub const CSG_AUTO_PLAN_BLOCKED_REASON: &str = "Blocked: csg-rs 697a203 has not yet shipped R0 (VoxelVolume) + R1 (WorldRayQuery). Manual keyframe authoring, live camera-guide dynamics, curated track re-timing, library & playlists are active.";
 
 /// Minimum allowed Flight Lab tour duration (seconds).
 pub const LAB_DURATION_MIN_S: f32 = 15.0;
@@ -44,10 +46,11 @@ pub const LAB_DEFAULT_MAX_BANK_DEG: f32 = 35.0;
 /// Active authoring tab inside the Flight Lab dock panel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LabMode {
-    /// Automatic cinematic fly-through planner (gated until `csg-rs` ships R0 + R1).
+    /// Live automatic cinematic fly-through planner backed by `csg-scene` R0 `VoxelVolume` + R1
+    /// `WorldRayQuery`.
+    #[default]
     AutoPlan,
     /// Interactive keyframe authoring and live `camera-guide-rs` dynamics tuning.
-    #[default]
     ManualKeyframes,
 }
 
@@ -179,6 +182,8 @@ pub struct FlightLabState {
     pub preview_plan: Option<RailPlan>,
     /// Most recent `camera-guide-rs` speed/cap/bank curve plot.
     pub dynamics_plot: Option<DynamicsCurvePlot>,
+    /// Current stage of any background automatic flight planning job (`Idle` when not planning).
+    pub auto_plan_stage: AutoPlanStage,
     /// Human-readable status or error message from the latest Lab action.
     pub status_msg: String,
 }
@@ -190,11 +195,12 @@ impl Default for FlightLabState {
 }
 
 impl FlightLabState {
-    /// Creates a clean [`FlightLabState`] with default dynamics limits (`max_bank_deg = 35 deg`).
+    /// Creates a clean [`FlightLabState`] defaulting to live [`LabMode::AutoPlan`] with default
+    /// dynamics limits (`max_bank_deg = 35 deg`).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            mode: LabMode::ManualKeyframes,
+            mode: LabMode::AutoPlan,
             duration_s: LAB_DURATION_DEFAULT_S,
             seed: 42,
             plan_mode: Mode::Deterministic,
@@ -206,8 +212,61 @@ impl FlightLabState {
             preview_track: None,
             preview_plan: None,
             dynamics_plot: None,
+            auto_plan_stage: AutoPlanStage::Idle,
             status_msg: String::new(),
         }
+    }
+
+    /// Builds a sanitized [`PlanRequest`] from the current Flight Lab controls for submission
+    /// to [`crate::flight::oracle::CsgAutoPlanner`].
+    ///
+    /// Why: clamping `duration_s`, `cut_density`, and `limits` here guarantees UI drag values or
+    /// restored preferences cannot submit NaN or out-of-range parameters to `fnav-plan`.
+    #[must_use]
+    pub fn build_plan_request(&self) -> PlanRequest {
+        let duration_s = if self.duration_s.is_finite() {
+            self.duration_s.clamp(LAB_DURATION_MIN_S, LAB_DURATION_MAX_S)
+        } else {
+            LAB_DURATION_DEFAULT_S
+        };
+        let cut_density = if self.cut_density.is_finite() {
+            self.cut_density.clamp(0.0, 2.0)
+        } else {
+            1.0
+        };
+        PlanRequest {
+            duration_s,
+            seed: self.seed,
+            mode: self.plan_mode,
+            cut_density,
+            limits: sanitize_limits(self.limits),
+            edits: Vec::new(),
+        }
+    }
+
+    /// Installs a completed automatic [`RailPlan`] into Flight Lab preview state and refreshes
+    /// [`Self::dynamics_plot`] without mutating the validated plan track.
+    ///
+    /// Why: `fnav-plan` already verified clearance, handovers, and section 7.4 metric gates on
+    /// `plan.track`, so preserving `plan.track` verbatim as [`Self::preview_track`] keeps all
+    /// validated flight invariants intact while still driving the dynamics plot.
+    pub fn apply_auto_plan(&mut self, scene_id: String, plan: RailPlan, elapsed_ms: f32) {
+        let shot_count = plan.shots.len();
+        let dur_s = plan.track.duration_s();
+        self.dynamics_plot = analyze_and_retime_track(&plan.track, &self.limits)
+            .ok()
+            .map(|(_, plot)| plot);
+        self.preview_track = Some(plan.track.clone());
+        self.preview_plan = Some(plan);
+        let stem = sanitize_file_stem(&scene_id);
+        self.track_name = format!("{stem}_auto_{}", self.seed);
+        self.auto_plan_stage = AutoPlanStage::Idle;
+        self.status_msg = format!(
+            "Planned {} shots ({:.1} s) in {:.0} ms",
+            shot_count,
+            dur_s,
+            elapsed_ms.max(0.0)
+        );
     }
 
     /// Appends the current viewport camera pose as a new manual keyframe.
@@ -382,4 +441,44 @@ fn sanitize_limits(mut l: GuideLimits) -> GuideLimits {
     l.jerk = fix(l.jerk, 0.5, 50.0, def.jerk);
     l.v_min = fix(l.v_min, 0.1, 20.0, def.v_min);
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lab_state_defaults_to_live_auto_plan_and_idle_stage() {
+        let lab = FlightLabState::new();
+        assert_eq!(lab.mode, LabMode::AutoPlan);
+        assert_eq!(lab.auto_plan_stage, AutoPlanStage::Idle);
+        assert_eq!(lab.duration_s, LAB_DURATION_DEFAULT_S);
+        assert_eq!(lab.seed, 42);
+    }
+
+    #[test]
+    fn build_plan_request_clamps_ranges_and_sanitizes_nans() {
+        let mut lab = FlightLabState::new();
+        lab.duration_s = 500.0;
+        lab.seed = 9001;
+        lab.plan_mode = Mode::Creative;
+        lab.cut_density = -3.0;
+        lab.limits.max_bank_deg = 120.0;
+        lab.limits.jerk = f32::NAN;
+
+        let req = lab.build_plan_request();
+        assert_eq!(req.duration_s, LAB_DURATION_MAX_S);
+        assert_eq!(req.seed, 9001);
+        assert_eq!(req.mode, Mode::Creative);
+        assert_eq!(req.cut_density, 0.0);
+        assert_eq!(req.limits.max_bank_deg, 60.0);
+        assert!(req.limits.jerk.is_finite());
+        assert!(req.edits.is_empty());
+
+        lab.duration_s = f32::NAN;
+        lab.cut_density = f32::INFINITY;
+        let req2 = lab.build_plan_request();
+        assert_eq!(req2.duration_s, LAB_DURATION_DEFAULT_S);
+        assert_eq!(req2.cut_density, 1.0);
+    }
 }

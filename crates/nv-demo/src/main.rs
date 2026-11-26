@@ -1735,6 +1735,27 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         s
     }
 
+    /// Converts the serialized UI road-mode selector (`0..=3`) to [`csg_scene::RoadMode`],
+    /// matching [`crate::csg_scene_host::CsgGpuHost`] scene builds.
+    #[inline]
+    fn road_mode_from_u8(mode: u8) -> csg_scene::RoadMode {
+        match mode {
+            0 => csg_scene::RoadMode::Watertight3D,
+            1 => csg_scene::RoadMode::TangentPlaneC1,
+            3 => csg_scene::RoadMode::FRepTile,
+            _ => csg_scene::RoadMode::HybridC1Sdf,
+        }
+    }
+
+    /// Converts `(sun_azimuth_deg, sun_elevation_deg)` into the world-space unit sun vector,
+    /// mirroring the OptiX launch parameter formula in `renderer.rs`.
+    #[inline]
+    fn sun_dir_from_angles(azimuth_deg: f32, elevation_deg: f32) -> [f32; 3] {
+        let az = azimuth_deg.to_radians();
+        let el = elevation_deg.to_radians();
+        [el.cos() * az.sin(), el.sin(), el.cos() * az.cos()]
+    }
+
     /// Stable reference to the selected scene for persistence (F17).
     pub(crate) fn saved_scene_of(
         descs: &[csg_scene::SceneDescriptor],
@@ -2931,6 +2952,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
         flight_workspace: crate::flight::FlightWorkspace,
+        auto_planner: crate::flight::oracle::CsgAutoPlanner,
         cam_damper: crate::flight::CameraDamper,
         rail_blend_remaining: f32,
         cam_driver: CameraDriver,
@@ -3634,6 +3656,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     fw.player.apply_persisted(&persisted.flight_player);
                     fw
                 },
+                auto_planner: crate::flight::oracle::CsgAutoPlanner::new(),
                 cam_damper: {
                     let mut d = crate::flight::CameraDamper::default();
                     d.snap(cam_pose);
@@ -3712,6 +3735,47 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.pending_scene_auto_frame = None;
             if self.possess_info.is_some() {
                 self.send_render(RenderControl::EjectPossess);
+            }
+        }
+
+        /// Submits an asynchronous R0+R1 automatic flight planning job for the active CSG scene.
+        fn submit_auto_plan(&mut self) {
+            let Some(reg_idx) = self.settings.csg_mode.checked_sub(1) else {
+                self.flight_workspace.lab.status_msg =
+                    "Switch to a CSG world scene to run Auto-Plan.".to_string();
+                return;
+            };
+            let scene_id = self
+                .scene_descriptors
+                .get(reg_idx as usize)
+                .map_or_else(
+                    || self.flight_workspace.player.active_scene_id.clone(),
+                    |d| d.id.to_string(),
+                );
+            let job = crate::flight::oracle::AutoPlanJob {
+                scene_idx: self.settings.csg_mode,
+                scene_id,
+                road_mode: road_mode_from_u8(self.settings.csg_road_mode),
+                inspector_variant: self.settings.csg_asset_idx,
+                sun_dir: sun_dir_from_angles(
+                    self.settings.sun_azimuth,
+                    self.settings.sun_elevation,
+                ),
+                req: self.flight_workspace.lab.build_plan_request(),
+            };
+            match self.auto_planner.submit(job) {
+                Ok(()) => {
+                    self.flight_workspace.lab.auto_plan_stage =
+                        crate::flight::oracle::AutoPlanStage::BuildingScene;
+                    self.flight_workspace.lab.status_msg =
+                        crate::flight::oracle::AutoPlanStage::BuildingScene
+                            .label()
+                            .to_string();
+                    self.egui_ctx.request_repaint();
+                }
+                Err(err) => {
+                    self.flight_workspace.lab.status_msg = format!("Auto-plan busy: {err}");
+                }
             }
         }
 
@@ -4437,6 +4501,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 )));
             }
 
+            // Drain background R0+R1 auto-plan events before the egui pass so live progress and
+            // completed contact sheets appear on the same frame.
+            for ev in self.auto_planner.poll() {
+                self.flight_workspace.apply_auto_plan_event(ev);
+            }
+            let auto_plan_busy = self.auto_planner.is_busy();
+
             // 2. Docked egui pass (60+ FPS, zero blocking; camera_egui::drive steps the camera).
             let raw_input = self.egui_winit.take_egui_input(&self.window);
             let prev_theme = self.theme;
@@ -4520,6 +4591,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 flight: &mut self.flight,
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                if auto_plan_busy {
+                    ui.ctx().request_repaint();
+                }
                 egui::Panel::top("top_toolbar").show(ui, |ui| {
                     ui_ctx.ui_toolbar(ui);
                 });
@@ -4651,6 +4725,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 if let Some(scene_id) = outcome.request_scene_id {
                     self.request_scene_by_id(&scene_id);
+                }
+                if outcome.request_auto_plan {
+                    self.submit_auto_plan();
                 }
                 if self.flight_workspace.player.is_active() && self.possess_info.is_some() {
                     eject_possess_requested = true;

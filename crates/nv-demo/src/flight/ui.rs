@@ -1,10 +1,10 @@
 //! Native `egui` dock UI panels for **Flight Lab** and **Flight Player** (`nv-demo`).
 //!
-//! **What.** Renders [`ui_flight_lab`] (Flight Authoring with R0+R1 Auto Plan gate and Manual
-//! Keyframes + live `camera-guide-rs` Camera Dynamics sliders & curve painter + Contact Sheet +
-//! Flight Stats) and [`ui_flight_player`] (Playback Deck with Now Playing card, phosphor transport
-//! controls, interactive shot/cut/chase scrubber, Cam Smooth & Time Scale + Playlist Queue +
-//! Repo/User/Curated Flight Library Browser).
+//! **What.** Renders [`ui_flight_lab`] (Flight Authoring with live R0+R1 Auto Plan, contact sheet
+//! & actions, Manual Keyframes + live `camera-guide-rs` Camera Dynamics sliders & curve painter +
+//! Contact Sheet + Flight Stats) and [`ui_flight_player`] (Playback Deck with Now Playing card,
+//! phosphor transport controls, interactive shot/cut/chase scrubber, Cam Smooth & Time Scale +
+//! Playlist Queue + Repo/User/Curated Flight Library Browser).
 //! **Why.** Uses `crate::ui`'s canonical layout primitives (`collapsing_section`, `prop_row`,
 //! `prop_slider_f32`, `prop_toggle`, `stat_row`, `equal_grid`, `active_accent_tint`,
 //! `hdr_amber_tint`, `ROW_H`, `ANIM_BTN_W`) as the single source of truth so every label column,
@@ -21,16 +21,13 @@ use egui::{Align, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, 
 use egui_phosphor::regular as ic;
 use flight_navigator::camera_guide::RATIO_TOL;
 use flight_navigator::fnav_core::{
-    LibrarySource, Move, PlaylistTransition, RepeatMode, Segment, Track,
+    LibrarySource, Move, PlaylistTransition, ProfileKind, RepeatMode, Segment, Track,
 };
-use flight_navigator::fnav_plan::Mode;
+use flight_navigator::fnav_plan::{HandoverKind, Mode};
 
 use crate::csg_scene_host::CsgStats;
 use crate::flight::convert::limit_term_label;
-use crate::flight::lab::{
-    CSG_AUTO_PLAN_BLOCKED_REASON, DynamicsCurvePlot, LAB_DURATION_MAX_S, LAB_DURATION_MIN_S,
-    LabMode,
-};
+use crate::flight::lab::{DynamicsCurvePlot, LAB_DURATION_MAX_S, LAB_DURATION_MIN_S, LabMode};
 use crate::flight::player::{PlayerState, TrackOrigin};
 use crate::flight::{FlightCommand, FlightWorkspace};
 use crate::flight_stats::{FlightStats, HIST_BINS, LoopPoint};
@@ -57,6 +54,8 @@ pub struct FlightUiArgs<'a> {
     pub flight_stats: &'a mut FlightStats,
     /// Latest CSG scene instance/LOD/path telemetry.
     pub csg_stats: &'a CsgStats,
+    /// True when a CSG world scene (`csg_mode != 0`) is active; Auto-Plan requires CSG geometry.
+    pub is_csg_scene: bool,
     /// Active CSG LOD distance bias.
     pub csg_lod_bias: f32,
     /// Active crowd actor count in the scene.
@@ -109,7 +108,9 @@ pub fn ui_flight_lab(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                     }
                     if ui
                         .add_sized([w, ROW_H + 2.0], btn)
-                        .on_hover_text("Automatic cinematic planner (requires csg-rs R0 + R1).")
+                        .on_hover_text(
+                            "Automatic cinematic fly-through planner backed by CSG R0 voxel volume + R1 exact raycast.",
+                        )
                         .clicked()
                     {
                         args.workspace.lab.mode = LabMode::AutoPlan;
@@ -150,69 +151,272 @@ pub fn ui_flight_lab(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     status_footer(ui, &args.workspace.lab.status_msg);
 }
 
-/// Renders the **Auto Plan** subsection with honest R0+R1 gating and disabled Generate button.
+/// Renders the live **Auto Plan** subsection (parameters, async generation trigger, live stage
+/// progress spinner, and compact contact sheet + Preview/Save controls once a plan is ready).
 fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
-    let warn_bg = hdr_amber_tint(ui);
-    let warn_stroke = ui.visuals().warn_fg_color;
-    let text_col = ui.visuals().text_color();
+    let stage = args.workspace.lab.auto_plan_stage;
+    let busy = stage.is_busy();
+    let can_generate = args.is_csg_scene && !busy;
 
-    egui::Frame::NONE
-        .fill(warn_bg)
-        .stroke(Stroke::new(1.0, warn_stroke))
-        .corner_radius(3.0)
-        .inner_margin(egui::Margin::symmetric(6, 5))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(ic::WARNING).color(warn_stroke).strong());
-                ui.label(
-                    RichText::new(CSG_AUTO_PLAN_BLOCKED_REASON)
-                        .size(10.5)
-                        .color(text_col),
+    {
+        let lab = &mut args.workspace.lab;
+        prop_slider_f32(
+            ui,
+            "Duration",
+            &mut lab.duration_s,
+            LAB_DURATION_MIN_S..=LAB_DURATION_MAX_S,
+            1,
+            " s",
+        );
+        aligned_prop_row(ui, "Seed", |ui, ctrl_w| {
+            let prev_style = ui.style().override_text_style.clone();
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.add_sized(
+                [ctrl_w, ROW_H],
+                egui::DragValue::new(&mut lab.seed).speed(1.0),
+            );
+            ui.style_mut().override_text_style = prev_style;
+        });
+        aligned_prop_row(ui, "Plan Mode", |ui, ctrl_w| {
+            let cur_lbl = match lab.plan_mode {
+                Mode::Deterministic => "Deterministic",
+                Mode::Creative => "Creative",
+            };
+            egui::ComboBox::from_id_salt("flight_lab_plan_mode")
+                .width(ctrl_w)
+                .truncate()
+                .selected_text(cur_lbl)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut lab.plan_mode, Mode::Deterministic, "Deterministic");
+                    ui.selectable_value(&mut lab.plan_mode, Mode::Creative, "Creative");
+                });
+        });
+        prop_slider_f32(ui, "Cut Density", &mut lab.cut_density, 0.0..=2.0, 2, "x");
+        aligned_prop_row(ui, "Track Name", |ui, ctrl_w| {
+            ui.add_sized(
+                [ctrl_w, ROW_H],
+                egui::TextEdit::singleline(&mut lab.track_name),
+            );
+        });
+    }
+
+    ui.add_space(2.0);
+    let gen_btn = egui::Button::new(format!("{}  Generate Flight", ic::SPARKLE))
+        .truncate()
+        .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0));
+    let disabled_tip = if busy {
+        stage.label()
+    } else {
+        "Switch to a CSG world scene (e.g. Gundo, Marina) to run Auto-Plan."
+    };
+    if ui
+        .add_enabled(can_generate, gen_btn)
+        .on_hover_text("Plan a collision-free cinematic tour against the active CSG scene.")
+        .on_disabled_hover_text(disabled_tip)
+        .clicked()
+    {
+        (args.on_command)(FlightCommand::LabGenerateAutoPlan);
+    }
+
+    if busy {
+        prop_row(ui, "Progress", |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spinner();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(stage.label())
+                            .size(11.0)
+                            .color(ui.visuals().selection.stroke.color),
+                    )
+                    .truncate(),
                 );
             });
         });
+    }
 
+    let has_plan = args.workspace.lab.preview_plan.is_some();
+    if !has_plan {
+        return;
+    }
+
+    let save_name = args.workspace.lab.track_name.clone();
     ui.add_space(2.0);
-    let lab = &mut args.workspace.lab;
-    prop_slider_f32(
-        ui,
-        "Duration",
-        &mut lab.duration_s,
-        LAB_DURATION_MIN_S..=LAB_DURATION_MAX_S,
-        1,
-        " s",
-    );
-    aligned_prop_row(ui, "Seed", |ui, ctrl_w| {
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-        ui.add_sized(
-            [ctrl_w, ROW_H],
-            egui::DragValue::new(&mut lab.seed).speed(1.0),
+    equal_grid(ui, 3, 3, |ui, idx, w| match idx {
+        0 => {
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(format!("{}  Preview", ic::PLAY))
+                        .truncate()
+                        .min_size(egui::vec2(w, ROW_H + 2.0)),
+                )
+                .on_hover_text("Load this auto-planned flight into Flight Player and play it.")
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::LabPreviewTrack);
+            }
+        }
+        1 => {
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(format!("{}  Save User", ic::FLOPPY_DISK))
+                        .truncate()
+                        .min_size(egui::vec2(w, ROW_H + 2.0)),
+                )
+                .on_hover_text("Atomically save auto-planned track to ~/.nv-rs/flights/")
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::LabSaveTrack {
+                    name: save_name.clone(),
+                    to_repo: false,
+                });
+            }
+        }
+        _ => {
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(format!("{}  Save Repo", ic::FOLDER_OPEN))
+                        .truncate()
+                        .min_size(egui::vec2(w, ROW_H + 2.0)),
+                )
+                .on_hover_text("Atomically save auto-planned track to assets/flights/")
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::LabSaveTrack {
+                    name: save_name.clone(),
+                    to_repo: true,
+                });
+            }
+        }
+    });
+
+    if let Some(plan) = args.workspace.lab.preview_plan.as_ref() {
+        ui.add_space(2.0);
+        stat_row(
+            ui,
+            "Plan",
+            fmt_into(
+                args.label_buf,
+                format_args!(
+                    "{} shots | {} cuts | {:.1}s",
+                    plan.shots.len(),
+                    plan.report.cut_count,
+                    plan.report.duration_s
+                ),
+            ),
         );
-        ui.style_mut().override_text_style = prev_style;
-    });
-    aligned_prop_row(ui, "Plan Mode", |ui, ctrl_w| {
-        let cur_lbl = match lab.plan_mode {
-            Mode::Deterministic => "Deterministic",
-            Mode::Creative => "Creative",
+        let gate_icon = if plan.report.all_gates_passed {
+            ic::CHECK_CIRCLE
+        } else {
+            ic::WARNING
         };
-        egui::ComboBox::from_id_salt("flight_lab_plan_mode")
-            .width(ctrl_w)
-            .truncate()
-            .selected_text(cur_lbl)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut lab.plan_mode, Mode::Deterministic, "Deterministic");
-                ui.selectable_value(&mut lab.plan_mode, Mode::Creative, "Creative");
-            });
-    });
-    prop_slider_f32(ui, "Cut Density", &mut lab.cut_density, 0.0..=2.0, 2, "x");
+        let gate_lbl = if plan.report.all_gates_passed {
+            "PASS"
+        } else {
+            "WARN"
+        };
+        stat_row(
+            ui,
+            "Gates",
+            fmt_into(
+                args.label_buf,
+                format_args!(
+                    "{gate_icon} {gate_lbl} | clr {:.1}m | ret {:.0}%",
+                    plan.report.min_clearance_m,
+                    plan.report.retrace_ratio * 100.0
+                ),
+            ),
+        );
 
-    ui.add_space(2.0);
-    let gen_btn = egui::Button::new(format!("{}  Generate Flight", ic::LOCK))
-        .truncate()
-        .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0));
-    ui.add_enabled(false, gen_btn)
-        .on_disabled_hover_text(CSG_AUTO_PLAN_BLOCKED_REASON);
+        let mut jump_pose: Option<CameraPose> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("flight_lab_auto_plan_shots")
+            .max_height(124.0)
+            .show(ui, |ui| {
+                let w = ui.available_width().max(80.0);
+                for shot in &plan.shots {
+                    let handover = plan.handovers.iter().find(|h| h.from_shot == shot.index);
+                    let handover_tag = match handover.map(|h| &h.kind) {
+                        Some(HandoverKind::Cut(_)) => "Cut",
+                        Some(HandoverKind::Continuous { .. }) => "C2",
+                        None => "End",
+                    };
+                    let chase_tag = if matches!(shot.profile_kind, ProfileKind::Chase) {
+                        ic::LIGHTNING
+                    } else {
+                        ""
+                    };
+                    let txt = fmt_into(
+                        args.label_buf,
+                        format_args!(
+                            "#{:02} {:<12} {:>4.1}s {:>4.2} {:>3} {chase_tag}",
+                            shot.index + 1,
+                            shot.move_kind.label(),
+                            shot.duration_s,
+                            shot.quality,
+                            handover_tag
+                        ),
+                    );
+                    let resp = ui.add_sized(
+                        [w, ROW_H + 2.0],
+                        egui::Button::new(RichText::new(txt).monospace().size(10.5)).truncate(),
+                    );
+                    if resp.clicked() {
+                        jump_pose = Some(
+                            plan.track
+                                .eval(shot.start_s)
+                                .state
+                                .to_camera_pose(0.05, 5000.0),
+                        );
+                    }
+                    let handover_kind = handover.map(|h| &h.kind);
+                    resp.on_hover_ui(|ui| match handover_kind {
+                        Some(HandoverKind::Cut(c)) => {
+                            ui.label(format!(
+                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> Cut ({})",
+                                shot.index + 1,
+                                shot.move_kind.label(),
+                                shot.focal_mm,
+                                shot.duration_s,
+                                shot.quality,
+                                c.kind.label()
+                            ));
+                        }
+                        Some(HandoverKind::Continuous {
+                            connector,
+                            duration_s,
+                        }) => {
+                            ui.label(format!(
+                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> C2 {} ({:.1}s)",
+                                shot.index + 1,
+                                shot.move_kind.label(),
+                                shot.focal_mm,
+                                shot.duration_s,
+                                shot.quality,
+                                connector,
+                                duration_s
+                            ));
+                        }
+                        None => {
+                            ui.label(format!(
+                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) [click to inspect]",
+                                shot.index + 1,
+                                shot.move_kind.label(),
+                                shot.focal_mm,
+                                shot.duration_s,
+                                shot.quality
+                            ));
+                        }
+                    });
+                }
+            });
+        if let Some(pose) = jump_pose {
+            (args.on_seek_pose)(pose);
+        }
+    }
 }
 
 /// Renders the **Manual Keyframes** authoring subsection.

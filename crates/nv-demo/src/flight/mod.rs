@@ -4,11 +4,12 @@
 //! **What.** Owns [`FlightWorkspace`] (one single source of truth pairing [`player::FlightPlayer`]
 //! and [`lab::FlightLabState`]), typed [`FlightCommand`] actions routed through `AppBus`,
 //! [`CameraDamper`], [`shutter_subframe_dt`], library directory resolvers
-//! ([`default_repo_flights_dir`], [`default_user_flights_dir`]), and the four submodules
-//! [`convert`], [`lab`], [`player`], and [`ui`].
+//! ([`default_repo_flights_dir`], [`default_user_flights_dir`]), and the five submodules
+//! [`convert`], [`lab`], [`oracle`], [`player`], and [`ui`].
 //! **Why.** Replaces the legacy `camera_rail.rs` playback path with one scene-agnostic
-//! [`flight_navigator::fnav_core::Track`] pipeline covering curated rails, manual Flight Lab
-//! keyframes, `camera-guide-rs` dynamics tuning, Winamp-style playlists, and `--bench-*` hooks.
+//! [`flight_navigator::fnav_core::Track`] pipeline covering curated rails, live `csg-scene` R0+R1
+//! automatic flight planning, manual Flight Lab keyframes, `camera-guide-rs` dynamics tuning,
+//! Winamp-style playlists, and `--bench-*` hooks.
 //! **How.** [`FlightWorkspace::apply_command`] executes every [`FlightCommand`] against the shared
 //! player/lab state and returns [`FlightCommandOutcome`] so `main.rs` performs host side effects
 //! (camera damper snap, scene switch, flight-stats reset, MP4 playlist recording) cleanly.
@@ -25,8 +26,12 @@ use glam::Quat;
 /// Conversion from curated [`csg_scene::RailSpec`] / manual keyframes to [`fnav_core::Track`]
 /// and `camera-guide-rs` dynamics analysis.
 pub mod convert;
-/// Flight Lab authoring state (manual keyframes, dynamics tuning, contact sheet, R0+R1 gate).
+/// Flight Lab authoring state (live R0+R1 Auto Plan, manual keyframes, dynamics tuning, contact
+/// sheet).
 pub mod lab;
+/// Live `csg-scene` R0 (`VoxelVolume`) + R1 (`WorldRayQuery`) [`flight_navigator::fnav_space::SceneOracle`]
+/// bridge and asynchronous auto-plan worker.
+pub mod oracle;
 /// Winamp-style playback, playlist queue, library scanning, and C2 transitions.
 pub mod player;
 /// Native `egui` dock panels for Flight Lab and Flight Player.
@@ -182,6 +187,8 @@ pub enum FlightCommand {
     RescanLibrary,
     /// Toggle full-playlist MP4 video recording.
     ToggleRecordPlaylist,
+    /// Launch asynchronous automatic flight planning against the active CSG scene (R0+R1).
+    LabGenerateAutoPlan,
     /// Capture current viewport camera pose into Flight Lab manual keyframes.
     LabAddKeyframe,
     /// Remove the last manual keyframe from Flight Lab.
@@ -214,6 +221,8 @@ pub struct FlightCommandOutcome {
     pub toggle_record_playlist: bool,
     /// Request that the host switch to the named scene id before playback resumes.
     pub request_scene_id: Option<String>,
+    /// Request that the host submit an asynchronous [`oracle::AutoPlanJob`] for the active CSG scene.
+    pub request_auto_plan: bool,
 }
 
 /// Single source of truth shared between the **Flight Player** and **Flight Lab** dock panels.
@@ -351,6 +360,9 @@ impl FlightWorkspace {
                 }
                 out.toggle_record_playlist = true;
             }
+            FlightCommand::LabGenerateAutoPlan => {
+                out.request_auto_plan = true;
+            }
             FlightCommand::LabAddKeyframe => self.lab.push_pose(cur_pose),
             FlightCommand::LabPopKeyframe => self.lab.pop_keyframe(),
             FlightCommand::LabClearKeyframes => self.lab.clear_keyframes(),
@@ -418,6 +430,37 @@ impl FlightWorkspace {
             }
         }
         out
+    }
+
+    /// Applies one asynchronous [`oracle::AutoPlanEvent`] emitted by [`oracle::CsgAutoPlanner`]
+    /// into Flight Lab state.
+    ///
+    /// Why: keeping event reduction inside [`FlightWorkspace`] keeps `main.rs` free of Lab state
+    /// mutation details and makes stage/ready/error transitions directly unit-testable.
+    ///
+    /// Returns `true` when a newly generated [`flight_navigator::fnav_plan::RailPlan`] became
+    /// ready and was installed into [`Self::lab`], `false` for stage progress or error updates.
+    pub fn apply_auto_plan_event(&mut self, ev: oracle::AutoPlanEvent) -> bool {
+        match ev {
+            oracle::AutoPlanEvent::Stage(stage) => {
+                self.lab.auto_plan_stage = stage;
+                self.lab.status_msg = stage.label().to_string();
+                false
+            }
+            oracle::AutoPlanEvent::Ready {
+                scene_id,
+                plan,
+                elapsed_ms,
+            } => {
+                self.lab.apply_auto_plan(scene_id, *plan, elapsed_ms);
+                true
+            }
+            oracle::AutoPlanEvent::Failed(err) => {
+                self.lab.auto_plan_stage = oracle::AutoPlanStage::Idle;
+                self.lab.status_msg = format!("Auto-plan failed: {err}");
+                false
+            }
+        }
     }
 }
 
@@ -925,5 +968,27 @@ mod tests {
         assert_eq!(player.queue[0].scene_id, "gundo");
         assert_eq!(player.queue[0].track_id, tf.id);
         let _ = fs::remove_dir_all(&user_dir);
+    }
+
+    #[test]
+    fn workspace_auto_plan_command_and_stage_event_transitions() {
+        let dir = temp_dir("auto_plan_events");
+        let mut ws = FlightWorkspace::new(dir.join("repo"), dir.join("user"));
+        let outcome = ws.apply_command(FlightCommand::LabGenerateAutoPlan, sample_pose(0.0, 5.0, 0.0));
+        assert!(outcome.request_auto_plan);
+        assert!(!outcome.snap_cam);
+
+        assert!(!ws.apply_auto_plan_event(oracle::AutoPlanEvent::Stage(
+            oracle::AutoPlanStage::BakingVolume
+        )));
+        assert_eq!(ws.lab.auto_plan_stage, oracle::AutoPlanStage::BakingVolume);
+        assert_eq!(ws.lab.status_msg, oracle::AutoPlanStage::BakingVolume.label());
+
+        assert!(!ws.apply_auto_plan_event(oracle::AutoPlanEvent::Failed(
+            "no valid land".to_string()
+        )));
+        assert_eq!(ws.lab.auto_plan_stage, oracle::AutoPlanStage::Idle);
+        assert_eq!(ws.lab.status_msg, "Auto-plan failed: no valid land");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

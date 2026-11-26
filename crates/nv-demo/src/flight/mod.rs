@@ -23,8 +23,8 @@ use camera::CameraPose;
 use flight_navigator::fnav_core::{PlaylistTransition, RepeatMode};
 use glam::Quat;
 
-/// Conversion from curated [`csg_scene::RailSpec`] / manual keyframes to [`fnav_core::Track`]
-/// and `camera-guide-rs` dynamics analysis.
+/// Conversion from curated [`csg_scene::RailSpec`] / manual keyframes to
+/// [`flight_navigator::fnav_core::Track`] and `camera-guide-rs` dynamics analysis.
 pub mod convert;
 /// Flight Lab authoring state (live R0+R1 Auto Plan, manual keyframes, dynamics tuning, contact
 /// sheet).

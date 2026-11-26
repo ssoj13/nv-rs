@@ -42,6 +42,9 @@ egui-phosphor = "0.14"
 # Selection modifiers latched at the press (`SelMods` / `sel_mods`), shared with warpbro-rs and
 # squarebob-rs so the viewport click model is the same in every cglibs app.
 sl-config = { git = "ssh://git@github.com/ssoj13/egui-widgets-rs.git", branch = "main" }
+# Generic named preset store + compact preset bar (`sl_controls::preset`), sharing the same
+# `egui 0.36` and Phosphor icon vocabulary as `sl-config`.
+sl-controls = { git = "ssh://git@github.com/ssoj13/egui-widgets-rs.git", branch = "main" }
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 glam = "0.33.2"

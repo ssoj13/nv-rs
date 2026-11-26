@@ -1,17 +1,24 @@
 //! Native `egui` dock UI panels for **Flight Lab** and **Flight Player** (`nv-demo`).
 //!
-//! **What.** Renders [`ui_flight_lab`] (Flight Authoring with live R0+R1 Auto Plan, contact sheet
-//! & actions, Manual Keyframes + live `camera-guide-rs` Camera Dynamics sliders & curve painter +
-//! Contact Sheet + Flight Stats) and [`ui_flight_player`] (Playback Deck with Now Playing card,
-//! phosphor transport controls, interactive shot/cut/chase scrubber, Cam Smooth & Time Scale +
-//! Playlist Queue + Repo/User/Curated Flight Library Browser).
+//! **What.** Renders [`ui_flight_lab`] (Flight Authoring with live R0+R1 Auto Plan summary &
+//! actions, Manual Keyframes, live `camera-guide-rs` Camera Dynamics sliders & curve painter,
+//! one unified Contact Sheet, and Flight Stats) and [`ui_flight_player`] (Playback Deck with Now
+//! Playing card, phosphor transport controls, interactive shot/cut/chase scrubber, Cam Smooth &
+//! Time Scale, Playlist Queue, and Repo/User/Curated Flight Library Browser).
 //! **Why.** Uses `crate::ui`'s canonical layout primitives (`collapsing_section`, `prop_row`,
-//! `prop_slider_f32`, `prop_toggle`, `stat_row`, `equal_grid`, `active_accent_tint`,
-//! `hdr_amber_tint`, `ROW_H`, `ANIM_BTN_W`) as the single source of truth so every label column,
-//! slider track, numeric input, button grid, section accent header, and theme color matches
-//! `Render & Floor`, `Camera & Stats`, and `Fractal` to the pixel across all 5 themes.
+//! `prop_slider_f32`, `prop_toggle`, `stat_row`, `equal_grid`, `allocate_clamped_ui`,
+//! `active_accent_tint`, `hdr_amber_tint`, `ROW_H`, `ANIM_BTN_W`) as the single source of truth so
+//! every label column, slider track, numeric input, button grid, section accent header, and theme
+//! color matches `Render & Floor`, `Camera & Stats`, and `Fractal` to the pixel across all 5
+//! themes, while flowing all lists naturally inside the dock tab's outer `dock_scroll` without
+//! nested scroll jails or text/action overlaps.
 //! **How.** Both entry points take [`FlightUiArgs`] and emit typed [`FlightCommand`] actions via
 //! `args.on_command`, keeping UI rendering decoupled from the OptiX render loop and `main.rs`.
+//! `ui_lab_auto_plan` shows concise `Plan` & `Gates` summary rows (with a hover breakdown of
+//! `plan.report.gate_failures` on warnings) while `ui_lab_contact_sheet` renders the single
+//! authoritative shot/cut/segment list; Playlist Queue and Flight Library rows use font-measured
+//! columns (`allocate_clamped_ui`) and strip redundant trailing duration tags (`" (24s)"`) so
+//! titles never collide with right-aligned durations or action buttons.
 //! **Uses.** `camera`, `egui`, `egui_phosphor`, `flight_navigator`, `crate::ui`, `crate::flight`,
 //! `crate::flight_stats`, `crate::csg_scene_host`, `crate::is_counters`, `crate::renderer`.
 //! **Used by.** `crate::ui` (`DockTab::FlightLab` and `DockTab::FlightPlayer`).
@@ -23,7 +30,7 @@ use flight_navigator::camera_guide::RATIO_TOL;
 use flight_navigator::fnav_core::{
     LibrarySource, Move, PlaylistTransition, ProfileKind, RepeatMode, Segment, Track,
 };
-use flight_navigator::fnav_plan::{HandoverKind, Mode};
+use flight_navigator::fnav_plan::{HandoverKind, Mode, RailPlan};
 
 use crate::csg_scene_host::CsgStats;
 use crate::flight::convert::limit_term_label;
@@ -34,8 +41,9 @@ use crate::flight_stats::{FlightStats, HIST_BINS, LoopPoint};
 use crate::is_counters::{IsCounts, IsGroup};
 use crate::renderer::{TIME_SCALE_MAX, TIME_SCALE_MIN};
 use crate::ui::{
-    ANIM_BTN_W, ROW_H, active_accent_tint, anim_toggle_btn_disabled, collapsing_section,
-    equal_grid, fmt_into, hdr_amber_tint, prop_row, prop_slider_f32, prop_toggle, stat_row,
+    ANIM_BTN_W, ROW_H, active_accent_tint, allocate_clamped_ui, anim_toggle_btn_disabled,
+    collapsing_section, equal_grid, fmt_into, hdr_amber_tint, prop_row, prop_slider_f32,
+    prop_toggle, stat_row,
 };
 
 /// Height of the `camera-guide-rs` speed/cap/bank dynamics graph.
@@ -44,6 +52,20 @@ const DYNAMICS_GRAPH_H: f32 = 76.0;
 const STATS_GRAPH_H: f32 = 58.0;
 /// Height of the interactive Winamp-style timeline progress bar.
 const PROGRESS_BAR_H: f32 = 22.0;
+/// Standard horizontal spacing between controls inside Flight Lab / Player rows.
+const GAP_SM: f32 = 4.0;
+/// Standard button height matching `crate::ui::equal_grid`.
+const BTN_H: f32 = ROW_H + 2.0;
+/// Standard height of single-line list rows (keyframes, playlist queue, library browser).
+const LIST_ROW_H: f32 = ROW_H + 4.0;
+/// Font size for compact monospace metadata columns (durations, indices, playlist counts).
+const MONO_META_FONT: f32 = 10.0;
+/// Font size for Contact Sheet shot rows.
+const SHOT_FONT: f32 = 10.5;
+/// Font size for primary list item titles.
+const TITLE_FONT: f32 = 11.0;
+/// Font size for compact Phosphor action icons inside list rows.
+const ICON_BTN_FONT: f32 = 11.0;
 
 /// Shared arguments passed by `crate::ui` into [`ui_flight_lab`] and [`ui_flight_player`].
 pub struct FlightUiArgs<'a> {
@@ -152,7 +174,9 @@ pub fn ui_flight_lab(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
 }
 
 /// Renders the live **Auto Plan** subsection (parameters, async generation trigger, live stage
-/// progress spinner, and compact contact sheet + Preview/Save controls once a plan is ready).
+/// progress spinner, Preview/Save actions, and compact `Plan` & `Gates` summary rows with a hover
+/// breakdown of `plan.report.gate_failures` on warnings; full shot rows live once in
+/// [`ui_lab_contact_sheet`]).
 fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     let stage = args.workspace.lab.auto_plan_stage;
     let busy = stage.is_busy();
@@ -170,12 +194,15 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         );
         aligned_prop_row(ui, "Seed", |ui, ctrl_w| {
             let prev_style = ui.style().override_text_style.clone();
+            let prev_dv = ui.style().drag_value_text_style.clone();
             ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+            ui.style_mut().drag_value_text_style = egui::TextStyle::Monospace;
             ui.add_sized(
                 [ctrl_w, ROW_H],
                 egui::DragValue::new(&mut lab.seed).speed(1.0),
             );
             ui.style_mut().override_text_style = prev_style;
+            ui.style_mut().drag_value_text_style = prev_dv;
         });
         aligned_prop_row(ui, "Plan Mode", |ui, ctrl_w| {
             let cur_lbl = match lab.plan_mode {
@@ -201,19 +228,21 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     }
 
     ui.add_space(2.0);
-    let gen_btn = egui::Button::new(format!("{}  Generate Flight", ic::SPARKLE))
-        .truncate()
-        .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0));
+    let gen_w = ui.available_width();
     let disabled_tip = if busy {
         stage.label()
     } else {
         "Switch to a CSG world scene (e.g. Gundo, Marina) to run Auto-Plan."
     };
-    if ui
-        .add_enabled(can_generate, gen_btn)
-        .on_hover_text("Plan a collision-free cinematic tour against the active CSG scene.")
-        .on_disabled_hover_text(disabled_tip)
-        .clicked()
+    if sized_btn(
+        ui,
+        can_generate,
+        gen_w,
+        format!("{}  Generate Flight", ic::SPARKLE),
+    )
+    .on_hover_text("Plan a collision-free cinematic tour against the active CSG scene.")
+    .on_disabled_hover_text(disabled_tip)
+    .clicked()
     {
         (args.on_command)(FlightCommand::LabGenerateAutoPlan);
     }
@@ -226,7 +255,7 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 ui.add(
                     egui::Label::new(
                         RichText::new(stage.label())
-                            .size(11.0)
+                            .size(TITLE_FONT)
                             .color(ui.visuals().selection.stroke.color),
                     )
                     .truncate(),
@@ -244,13 +273,7 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     ui.add_space(2.0);
     equal_grid(ui, 3, 3, |ui, idx, w| match idx {
         0 => {
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(format!("{}  Preview", ic::PLAY))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, !busy, w, format!("{}  Preview", ic::PLAY))
                 .on_hover_text("Load this auto-planned flight into Flight Player and play it.")
                 .clicked()
             {
@@ -258,13 +281,7 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         1 => {
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(format!("{}  Save User", ic::FLOPPY_DISK))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, !busy, w, format!("{}  Save User", ic::FLOPPY_DISK))
                 .on_hover_text("Atomically save auto-planned track to ~/.nv-rs/flights/")
                 .clicked()
             {
@@ -275,13 +292,7 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         _ => {
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::Button::new(format!("{}  Save Repo", ic::FOLDER_OPEN))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, !busy, w, format!("{}  Save Repo", ic::FOLDER_OPEN))
                 .on_hover_text("Atomically save auto-planned track to assets/flights/")
                 .clicked()
             {
@@ -308,114 +319,51 @@ fn ui_lab_auto_plan(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 ),
             ),
         );
-        let gate_icon = if plan.report.all_gates_passed {
+        let gates_ok = plan.report.all_gates_passed;
+        let gate_icon = if gates_ok {
             ic::CHECK_CIRCLE
         } else {
             ic::WARNING
         };
-        let gate_lbl = if plan.report.all_gates_passed {
-            "PASS"
-        } else {
-            "WARN"
-        };
-        stat_row(
-            ui,
-            "Gates",
-            fmt_into(
-                args.label_buf,
-                format_args!(
-                    "{gate_icon} {gate_lbl} | clr {:.1}m | ret {:.0}%",
-                    plan.report.min_clearance_m,
-                    plan.report.retrace_ratio * 100.0
-                ),
+        let gate_lbl = if gates_ok { "PASS" } else { "WARN" };
+        let gate_txt = fmt_into(
+            args.label_buf,
+            format_args!(
+                "{gate_icon} {gate_lbl} | clr {:.1}m | ret {:.0}%",
+                plan.report.min_clearance_m,
+                plan.report.retrace_ratio * 100.0
             ),
         );
-
-        let mut jump_pose: Option<CameraPose> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("flight_lab_auto_plan_shots")
-            .max_height(124.0)
-            .show(ui, |ui| {
-                let w = ui.available_width().max(80.0);
-                for shot in &plan.shots {
-                    let handover = plan.handovers.iter().find(|h| h.from_shot == shot.index);
-                    let handover_tag = match handover.map(|h| &h.kind) {
-                        Some(HandoverKind::Cut(_)) => "Cut",
-                        Some(HandoverKind::Continuous { .. }) => "C2",
-                        None => "End",
-                    };
-                    let chase_tag = if matches!(shot.profile_kind, ProfileKind::Chase) {
-                        ic::LIGHTNING
-                    } else {
-                        ""
-                    };
-                    let txt = fmt_into(
-                        args.label_buf,
-                        format_args!(
-                            "#{:02} {:<12} {:>4.1}s {:>4.2} {:>3} {chase_tag}",
-                            shot.index + 1,
-                            shot.move_kind.label(),
-                            shot.duration_s,
-                            shot.quality,
-                            handover_tag
-                        ),
-                    );
-                    let resp = ui.add_sized(
-                        [w, ROW_H + 2.0],
-                        egui::Button::new(RichText::new(txt).monospace().size(10.5)).truncate(),
-                    );
-                    if resp.clicked() {
-                        jump_pose = Some(
-                            plan.track
-                                .eval(shot.start_s)
-                                .state
-                                .to_camera_pose(0.05, 5000.0),
+        prop_row(ui, "Gates", |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let col = if gates_ok {
+                    ui.visuals().text_color()
+                } else {
+                    ui.visuals().warn_fg_color
+                };
+                let resp = ui.add(
+                    egui::Label::new(RichText::new(gate_txt).size(11.5).color(col)).truncate(),
+                );
+                if !plan.report.gate_failures.is_empty() {
+                    resp.on_hover_ui(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  Gate warnings ({}):",
+                                ic::WARNING,
+                                plan.report.gate_failures.len()
+                            ))
+                            .strong()
+                            .color(ui.visuals().warn_fg_color),
                         );
-                    }
-                    let handover_kind = handover.map(|h| &h.kind);
-                    resp.on_hover_ui(|ui| match handover_kind {
-                        Some(HandoverKind::Cut(c)) => {
-                            ui.label(format!(
-                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> Cut ({})",
-                                shot.index + 1,
-                                shot.move_kind.label(),
-                                shot.focal_mm,
-                                shot.duration_s,
-                                shot.quality,
-                                c.kind.label()
-                            ));
-                        }
-                        Some(HandoverKind::Continuous {
-                            connector,
-                            duration_s,
-                        }) => {
-                            ui.label(format!(
-                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> C2 {} ({:.1}s)",
-                                shot.index + 1,
-                                shot.move_kind.label(),
-                                shot.focal_mm,
-                                shot.duration_s,
-                                shot.quality,
-                                connector,
-                                duration_s
-                            ));
-                        }
-                        None => {
-                            ui.label(format!(
-                                "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) [click to inspect]",
-                                shot.index + 1,
-                                shot.move_kind.label(),
-                                shot.focal_mm,
-                                shot.duration_s,
-                                shot.quality
-                            ));
+                        for reason in &plan.report.gate_failures {
+                            ui.label(format!("- {reason}"));
                         }
                     });
+                } else if resp.hovered() {
+                    resp.on_hover_text(gate_txt);
                 }
             });
-        if let Some(pose) = jump_pose {
-            (args.on_seek_pose)(pose);
-        }
+        });
     }
 }
 
@@ -438,11 +386,7 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
 
     equal_grid(ui, 3, 3, |ui, idx, w| match idx {
         0 => {
-            if ui
-                .add_sized(
-                    [w, ROW_H + 2.0],
-                    egui::Button::new(format!("{}  + KF", ic::PLUS)).truncate(),
-                )
+            if sized_btn(ui, true, w, format!("{}  + KF", ic::PLUS))
                 .on_hover_text("Capture the current viewport camera pose as a keyframe.")
                 .clicked()
             {
@@ -450,13 +394,7 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         1 => {
-            if ui
-                .add_enabled(
-                    kf_count > 0,
-                    egui::Button::new(format!("{}  Pop", ic::MINUS))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, kf_count > 0, w, format!("{}  Pop", ic::MINUS))
                 .on_hover_text("Remove the last captured keyframe.")
                 .clicked()
             {
@@ -464,13 +402,7 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         _ => {
-            if ui
-                .add_enabled(
-                    kf_count > 0,
-                    egui::Button::new(format!("{}  Clear", ic::TRASH))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, kf_count > 0, w, format!("{}  Clear", ic::TRASH))
                 .on_hover_text("Clear all manual keyframes.")
                 .clicked()
             {
@@ -503,13 +435,7 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     ui.add_space(2.0);
     equal_grid(ui, 2, 2, |ui, idx, w| match idx {
         0 => {
-            if ui
-                .add_enabled(
-                    kf_count >= 2,
-                    egui::Button::new(format!("{}  Build", ic::PATH))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, kf_count >= 2, w, format!("{}  Build", ic::PATH))
                 .on_hover_text("Compile manual keyframes through camera-guide-rs into a Track.")
                 .clicked()
             {
@@ -517,13 +443,7 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         _ => {
-            if ui
-                .add_enabled(
-                    has_preview,
-                    egui::Button::new(format!("{}  Preview", ic::PLAY))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
+            if sized_btn(ui, has_preview, w, format!("{}  Preview", ic::PLAY))
                 .on_hover_text("Load the built preview track into Flight Player and play it.")
                 .clicked()
             {
@@ -535,15 +455,14 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     let save_name = args.workspace.lab.track_name.clone();
     equal_grid(ui, 2, 2, |ui, idx, w| match idx {
         0 => {
-            if ui
-                .add_enabled(
-                    has_preview,
-                    egui::Button::new(format!("{}  Save User", ic::FLOPPY_DISK))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
-                .on_hover_text("Atomically save preview track to ~/.nv-rs/flights/")
-                .clicked()
+            if sized_btn(
+                ui,
+                has_preview,
+                w,
+                format!("{}  Save User", ic::FLOPPY_DISK),
+            )
+            .on_hover_text("Atomically save preview track to ~/.nv-rs/flights/")
+            .clicked()
             {
                 (args.on_command)(FlightCommand::LabSaveTrack {
                     name: save_name.clone(),
@@ -552,15 +471,14 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
         }
         _ => {
-            if ui
-                .add_enabled(
-                    has_preview,
-                    egui::Button::new(format!("{}  Save Repo", ic::FOLDER_OPEN))
-                        .truncate()
-                        .min_size(egui::vec2(w, ROW_H + 2.0)),
-                )
-                .on_hover_text("Atomically save preview track to assets/flights/")
-                .clicked()
+            if sized_btn(
+                ui,
+                has_preview,
+                w,
+                format!("{}  Save Repo", ic::FOLDER_OPEN),
+            )
+            .on_hover_text("Atomically save preview track to assets/flights/")
+            .clicked()
             {
                 (args.on_command)(FlightCommand::LabSaveTrack {
                     name: save_name.clone(),
@@ -572,55 +490,52 @@ fn ui_lab_manual_keyframes(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
 
     if kf_count > 0 {
         ui.add_space(2.0);
-        egui::ScrollArea::vertical()
-            .id_salt("flight_lab_kf_list")
-            .max_height(88.0)
-            .show(ui, |ui| {
-                let row_h = ROW_H + 4.0;
-                let btn_sz = ROW_H + 2.0;
-                let gap = 4.0;
-                for (i, kf) in args.workspace.lab.manual_keyframes.iter().enumerate() {
-                    let row_w = ui.available_width().max(80.0);
-                    let left_w = (row_w - btn_sz - gap).max(40.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(row_w, row_h),
+        let btn_w = icon_btn_w(ui);
+        for (i, kf) in args.workspace.lab.manual_keyframes.iter().enumerate() {
+            let row_w = ui.available_width().max(80.0);
+            let left_w = (row_w - btn_w - GAP_SM).max(40.0);
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(row_w, LIST_ROW_H),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = GAP_SM;
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(left_w, LIST_ROW_H),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_max_width(row_w);
-                            ui.spacing_mut().item_spacing.x = gap;
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(left_w, row_h),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.set_max_width(left_w);
-                                    let txt = fmt_into(
-                                        args.label_buf,
-                                        format_args!(
-                                            "#{:02} ({:.1}, {:.1}, {:.1}) {:.0}mm",
-                                            i + 1,
-                                            kf.pos[0],
-                                            kf.pos[1],
-                                            kf.pos[2],
-                                            kf.focal_mm
-                                        ),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(RichText::new(txt).monospace().size(10.5))
-                                            .truncate(),
-                                    );
-                                },
+                            let txt = fmt_into(
+                                args.label_buf,
+                                format_args!(
+                                    "#{:02} ({:.1}, {:.1}, {:.1}) {:.0}mm",
+                                    i + 1,
+                                    kf.pos[0],
+                                    kf.pos[1],
+                                    kf.pos[2],
+                                    kf.focal_mm
+                                ),
                             );
-                            if ui
-                                .add_sized([btn_sz, btn_sz], egui::Button::new(ic::EYE))
-                                .on_hover_text("Jump viewport camera to this keyframe.")
-                                .clicked()
-                            {
-                                (args.on_seek_pose)(kf.to_pose(0.05, 5000.0));
-                            }
+                            ui.add(
+                                egui::Label::new(RichText::new(txt).monospace().size(SHOT_FONT))
+                                    .truncate(),
+                            );
                         },
                     );
-                }
-            });
+                    if compact_icon_btn(
+                        ui,
+                        true,
+                        [btn_w, BTN_H],
+                        ic::EYE,
+                        "Jump viewport camera to this keyframe.",
+                    )
+                    .clicked()
+                    {
+                        (args.on_seek_pose)(kf.to_pose(0.05, 5000.0));
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -657,17 +572,17 @@ fn ui_lab_dynamics_section(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             prop_slider_f32(ui, "Jerk", &mut lim.jerk, 1.0..=20.0, 1, " m/s3");
 
             ui.add_space(2.0);
-            if ui
-                .add_enabled(
-                    has_active,
-                    egui::Button::new(format!("{}  Apply to Active Track", ic::LIGHTNING))
-                        .truncate()
-                        .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0)),
-                )
-                .on_hover_text(
-                    "Re-solve the active track through camera-guide-rs with these limits and plot cap/v/bank.",
-                )
-                .clicked()
+            let apply_w = ui.available_width();
+            if sized_btn(
+                ui,
+                has_active,
+                apply_w,
+                format!("{}  Apply to Active Track", ic::LIGHTNING),
+            )
+            .on_hover_text(
+                "Re-solve the active track through camera-guide-rs with these limits and plot cap/v/bank.",
+            )
+            .clicked()
             {
                 (args.on_command)(FlightCommand::LabApplyLimitsToActive);
             }
@@ -714,7 +629,7 @@ fn paint_dynamics_plot(
         fmt_into(
             buf,
             format_args!(
-                "{} {:.2} | {:.1} m/s | {:.1} deg",
+                "{} {:.2} | {:.1} m/s | {:.0} deg",
                 if ok { ic::CHECK_CIRCLE } else { ic::WARNING },
                 worst,
                 peak_v,
@@ -830,20 +745,77 @@ fn paint_dynamics_plot(
     ));
 }
 
-/// Renders the **Contact Sheet** listing segments/shots of the preview or active track.
-fn ui_lab_contact_sheet(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
-    let track_opt: Option<(Track, bool)> = args
-        .workspace
-        .player
-        .active_track()
-        .map(|t| (t.clone(), true))
-        .or_else(|| {
-            args.workspace
-                .lab
-                .preview_track
-                .as_ref()
-                .map(|t| (t.clone(), false))
+/// Authoritative track and optional matching [`RailPlan`] displayed in [`ui_lab_contact_sheet`].
+struct ContactSheetSource<'a> {
+    track: &'a Track,
+    plan: Option<&'a RailPlan>,
+    is_player_track: bool,
+}
+
+/// Resolves the single authoritative track (and optional matching [`RailPlan`] metadata) shown by
+/// [`ui_lab_contact_sheet`] without cloning the track.
+///
+/// Priority:
+/// 1. When the active Flight Player slot matches `lab.preview_track` by canonical hash, use the
+///    active slot (`is_player_track = true`) with either the slot's plan or `lab.preview_plan`.
+/// 2. When Flight Player is actively playing/transitioning a track and no un-previewed auto-plan
+///    is waiting in Flight Lab, show the active player slot.
+/// 3. When Flight Lab has a preview track (fresh auto-plan or manual build), show it immediately
+///    with its matching `preview_plan` so clicking Generate/Build updates Contact Sheet right away.
+/// 4. Otherwise fall back to the active Flight Player slot (e.g. default curated rail when Idle).
+fn resolve_contact_sheet_source<'a>(
+    workspace: &'a FlightWorkspace,
+) -> Option<ContactSheetSource<'a>> {
+    let matching_plan = |track: &Track, cand: Option<&'a RailPlan>| {
+        cand.filter(|p| p.track.canonical_hash() == track.canonical_hash())
+    };
+    let active_slot = workspace.player.active_slot();
+    let preview_track = workspace.lab.preview_track.as_ref();
+    let preview_plan = workspace.lab.preview_plan.as_ref();
+
+    if let (Some(slot), Some(preview)) = (active_slot, preview_track)
+        && slot.track.canonical_hash() == preview.canonical_hash()
+    {
+        let plan = matching_plan(&slot.track, slot.plan.as_ref())
+            .or_else(|| matching_plan(&slot.track, preview_plan));
+        return Some(ContactSheetSource {
+            track: &slot.track,
+            plan,
+            is_player_track: true,
         });
+    }
+
+    if workspace.player.is_active()
+        && preview_plan.is_none()
+        && let Some(slot) = active_slot
+    {
+        return Some(ContactSheetSource {
+            track: &slot.track,
+            plan: matching_plan(&slot.track, slot.plan.as_ref()),
+            is_player_track: true,
+        });
+    }
+
+    if let Some(preview) = preview_track {
+        return Some(ContactSheetSource {
+            track: preview,
+            plan: matching_plan(preview, preview_plan),
+            is_player_track: false,
+        });
+    }
+
+    active_slot.map(|slot| ContactSheetSource {
+        track: &slot.track,
+        plan: matching_plan(&slot.track, slot.plan.as_ref()),
+        is_player_track: true,
+    })
+}
+
+/// Renders the single authoritative **Contact Sheet** listing shots, cuts, and segments of the
+/// preview or active track, flowing naturally inside the dock tab's outer `dock_scroll`.
+fn ui_lab_contact_sheet(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
+    let workspace = &*args.workspace;
+    let source = resolve_contact_sheet_source(workspace);
 
     collapsing_section(
         ui,
@@ -851,129 +823,253 @@ fn ui_lab_contact_sheet(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         ic::FILM_STRIP,
         "Contact Sheet",
         |ui| {
-            let Some((track, is_player_track)) = track_opt else {
-                ui.label(RichText::new("No active or preview track.").size(11.0).weak());
+            let Some(src) = source else {
+                ui.label(
+                    RichText::new("No active or preview track.")
+                        .size(TITLE_FONT)
+                        .weak(),
+                );
                 return;
             };
+            let track = src.track;
+            let plan = src.plan;
+            let is_player_track = src.is_player_track;
+
             let seg_count = track.segments.len();
+            let shot_count = track
+                .segments
+                .iter()
+                .filter(|seg| matches!(seg, Segment::Shot(_)))
+                .count();
             let cuts = track.cut_times().len();
             let chases = track.chase_spans().len();
-            stat_row(
-                ui,
-                "Summary",
-                fmt_into(
-                    args.label_buf,
-                    format_args!(
-                        "{seg_count} seg | {cuts} cuts | {chases} chase | {:.1}s",
-                        track.duration_s()
+            let dur_s = track.duration_s();
+            let cut_unit = if cuts == 1 { "cut" } else { "cuts" };
+            let (count, unit) = if shot_count > 0 {
+                (shot_count, if chases > 0 { "sh" } else { "shots" })
+            } else {
+                (seg_count, "seg")
+            };
+            if chases > 0 {
+                stat_row(
+                    ui,
+                    "Summary",
+                    fmt_into(
+                        args.label_buf,
+                        format_args!(
+                            "{count} {unit} | {cuts} {cut_unit} | {} {chases} | {dur_s:.1}s",
+                            ic::LIGHTNING
+                        ),
                     ),
-                ),
-            );
+                );
+            } else {
+                stat_row(
+                    ui,
+                    "Summary",
+                    fmt_into(
+                        args.label_buf,
+                        format_args!("{count} {unit} | {cuts} {cut_unit} | {dur_s:.1}s"),
+                    ),
+                );
+            }
 
-            egui::ScrollArea::vertical()
-                .id_salt("flight_lab_contact_scroll")
-                .max_height(132.0)
-                .show(ui, |ui| {
-                    let mut t_acc = 0.0_f64;
-                    let mut shot_idx = 0usize;
-                    let w = ui.available_width().max(80.0);
-                    for seg in &track.segments {
-                        match seg {
-                            Segment::Cut(c) => {
-                                let txt = fmt_into(
+            let mut t_acc = 0.0_f64;
+            let mut shot_ordinal = 0usize;
+            let mut glide_ordinal = 0usize;
+            let w = ui.available_width().max(80.0);
+
+            for seg in &track.segments {
+                match seg {
+                    Segment::Cut(c) => {
+                        let txt = fmt_into(
+                            args.label_buf,
+                            format_args!("{}  {} @ {:.1}s", ic::SCISSORS, c.kind.label(), t_acc),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(txt)
+                                    .size(SHOT_FONT)
+                                    .color(ui.visuals().warn_fg_color),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    Segment::Shot(s) => {
+                        let planned = plan.and_then(|p| p.shots.get(shot_ordinal));
+                        let handover = plan.and_then(|p| {
+                            planned.and_then(|ps| {
+                                p.handovers.iter().find(|h| h.from_shot == ps.index)
+                            })
+                        });
+                        shot_ordinal += 1;
+                        let dur = s.duration_s.max(0.0);
+                        let focal = s.entry().state.lens.focal_mm;
+                        let is_chase = matches!(s.speed_profile.kind, ProfileKind::Chase)
+                            || planned
+                                .is_some_and(|ps| matches!(ps.profile_kind, ProfileKind::Chase));
+
+                        let txt = if let Some(ps) = planned {
+                            let handover_tag = match handover.map(|h| &h.kind) {
+                                Some(HandoverKind::Cut(_)) => "Cut",
+                                Some(HandoverKind::Continuous { .. }) => "C2",
+                                None => "End",
+                            };
+                            if is_chase {
+                                fmt_into(
                                     args.label_buf,
                                     format_args!(
-                                        "{}  {} @ {:.1} s",
-                                        ic::SCISSORS,
-                                        c.kind.label(),
-                                        t_acc
-                                    ),
-                                );
-                                ui.label(
-                                    RichText::new(txt)
-                                        .size(10.5)
-                                        .color(ui.visuals().warn_fg_color),
-                                );
-                            }
-                            Segment::Shot(s) => {
-                                shot_idx += 1;
-                                let dur = s.duration_s.max(0.0);
-                                let focal = s.entry().state.lens.focal_mm;
-                                let is_chase = matches!(
-                                    s.speed_profile.kind,
-                                    flight_navigator::fnav_core::ProfileKind::Chase
-                                );
-                                let chase_tag = if is_chase { ic::LIGHTNING } else { "" };
-                                let txt = fmt_into(
-                                    args.label_buf,
-                                    format_args!(
-                                        "S{:02}  {}  {:.1}s  {:.0}mm  {chase_tag}",
-                                        shot_idx,
-                                        s.kind().label(),
+                                        "#{:02} {:<10} {:>4.1}s {:>2.0}mm {:>4.2} {:>3} {}",
+                                        shot_ordinal,
+                                        ps.move_kind.label(),
                                         dur,
-                                        focal
+                                        focal,
+                                        ps.quality,
+                                        handover_tag,
+                                        ic::LIGHTNING
                                     ),
-                                );
-                                if ui
-                                    .add_sized(
-                                        [w, ROW_H + 2.0],
-                                        egui::Button::new(
-                                            RichText::new(txt).monospace().size(10.5),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text("Click to jump to this shot's start time.")
-                                    .clicked()
-                                {
-                                    if is_player_track {
-                                        (args.on_command)(FlightCommand::Seek(t_acc));
-                                    } else {
-                                        let pose =
-                                            track.eval(t_acc).state.to_camera_pose(0.05, 5000.0);
-                                        (args.on_seek_pose)(pose);
-                                    }
-                                }
-                                t_acc += dur;
+                                )
+                            } else {
+                                fmt_into(
+                                    args.label_buf,
+                                    format_args!(
+                                        "#{:02} {:<10} {:>4.1}s {:>2.0}mm {:>4.2} {:>3}",
+                                        shot_ordinal,
+                                        ps.move_kind.label(),
+                                        dur,
+                                        focal,
+                                        ps.quality,
+                                        handover_tag
+                                    ),
+                                )
                             }
-                            Segment::Transition(tr) => {
-                                let dur = tr.duration_s.max(0.0);
-                                if seg_count <= 24 || dur >= 1.0 {
-                                    shot_idx += 1;
-                                    let focal = tr.entry().state.lens.focal_mm;
-                                    let txt = fmt_into(
-                                        args.label_buf,
-                                        format_args!(
-                                            "T{:02}  Glide  {:.1}s  {:.0}mm",
-                                            shot_idx, dur, focal
-                                        ),
-                                    );
-                                    if ui
-                                        .add_sized(
-                                            [w, ROW_H + 2.0],
-                                            egui::Button::new(
-                                                RichText::new(txt).monospace().size(10.5),
-                                            )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text("Click to jump to this segment start.")
-                                        .clicked()
-                                    {
-                                        if is_player_track {
-                                            (args.on_command)(FlightCommand::Seek(t_acc));
-                                        } else {
-                                            let pose = track
-                                                .eval(t_acc)
-                                                .state
-                                                .to_camera_pose(0.05, 5000.0);
-                                            (args.on_seek_pose)(pose);
-                                        }
-                                    }
-                                }
-                                t_acc += dur;
+                        } else if is_chase {
+                            fmt_into(
+                                args.label_buf,
+                                format_args!(
+                                    "S{:02} {:<10} {:>4.1}s {:>3.0}mm {}",
+                                    shot_ordinal,
+                                    s.kind().label(),
+                                    dur,
+                                    focal,
+                                    ic::LIGHTNING
+                                ),
+                            )
+                        } else {
+                            fmt_into(
+                                args.label_buf,
+                                format_args!(
+                                    "S{:02} {:<10} {:>4.1}s {:>3.0}mm",
+                                    shot_ordinal,
+                                    s.kind().label(),
+                                    dur,
+                                    focal
+                                ),
+                            )
+                        };
+
+                        let resp = ui.add_sized(
+                            [w, BTN_H],
+                            egui::Button::new(RichText::new(txt).monospace().size(SHOT_FONT))
+                                .truncate(),
+                        );
+                        if resp.clicked() {
+                            if is_player_track {
+                                (args.on_command)(FlightCommand::Seek(t_acc));
+                            } else {
+                                let pose = track.eval(t_acc).state.to_camera_pose(0.05, 5000.0);
+                                (args.on_seek_pose)(pose);
                             }
                         }
+                        if let Some(ps) = planned {
+                            let handover_kind = handover.map(|h| &h.kind);
+                            resp.on_hover_ui(|ui| match handover_kind {
+                                Some(HandoverKind::Cut(c)) => {
+                                    ui.label(format!(
+                                        "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> Cut ({}) [click to jump]",
+                                        shot_ordinal,
+                                        ps.move_kind.label(),
+                                        ps.focal_mm,
+                                        dur,
+                                        ps.quality,
+                                        c.kind.label()
+                                    ));
+                                }
+                                Some(HandoverKind::Continuous {
+                                    connector,
+                                    duration_s,
+                                }) => {
+                                    ui.label(format!(
+                                        "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) -> C2 {} ({:.1}s) [click to jump]",
+                                        shot_ordinal,
+                                        ps.move_kind.label(),
+                                        ps.focal_mm,
+                                        dur,
+                                        ps.quality,
+                                        connector,
+                                        duration_s
+                                    ));
+                                }
+                                None => {
+                                    ui.label(format!(
+                                        "Shot #{}: {} ({:.0}mm, {:.1}s, score {:.2}) [click to jump]",
+                                        shot_ordinal,
+                                        ps.move_kind.label(),
+                                        ps.focal_mm,
+                                        dur,
+                                        ps.quality
+                                    ));
+                                }
+                            });
+                        } else {
+                            resp.on_hover_text(format!(
+                                "Shot #{}: {} ({:.0}mm, {:.1}s) [click to jump]",
+                                shot_ordinal,
+                                s.kind().label(),
+                                focal,
+                                dur
+                            ));
+                        }
+                        t_acc += dur;
                     }
-                });
+                    Segment::Transition(tr) => {
+                        let dur = tr.duration_s.max(0.0);
+                        let is_plan_connector = plan.is_some() && shot_count > 0;
+                        if !is_plan_connector && (seg_count <= 24 || dur >= 1.0) {
+                            glide_ordinal += 1;
+                            let focal = tr.entry().state.lens.focal_mm;
+                            let txt = fmt_into(
+                                args.label_buf,
+                                format_args!(
+                                    "T{:02} {:<10} {:>4.1}s {:>3.0}mm",
+                                    glide_ordinal, "Glide", dur, focal
+                                ),
+                            );
+                            if ui
+                                .add_sized(
+                                    [w, BTN_H],
+                                    egui::Button::new(
+                                        RichText::new(txt).monospace().size(SHOT_FONT),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "Segment #{glide_ordinal}: Glide ({focal:.0}mm, {dur:.1}s) [click to jump]"
+                                ))
+                                .clicked()
+                            {
+                                if is_player_track {
+                                    (args.on_command)(FlightCommand::Seek(t_acc));
+                                } else {
+                                    let pose =
+                                        track.eval(t_acc).state.to_camera_pose(0.05, 5000.0);
+                                    (args.on_seek_pose)(pose);
+                                }
+                            }
+                        }
+                        t_acc += dur;
+                    }
+                }
+            }
         },
     );
 }
@@ -1039,7 +1135,7 @@ fn ui_lab_flight_stats(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             fmt_into(
                 args.label_buf,
                 format_args!(
-                    "{} inst | {} GAS | {} crowd",
+                    "{} | {} GAS | {} crowd",
                     load.visible, args.csg_stats.compounds, args.crowd_actor_count
                 ),
             ),
@@ -1164,15 +1260,15 @@ fn ui_lab_flight_stats(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         }
 
         ui.add_space(2.0);
-        if ui
-            .add_enabled(
-                stats.frames() > 0,
-                egui::Button::new(format!("{}  Export CSV", ic::FLOPPY_DISK))
-                    .truncate()
-                    .min_size(egui::vec2(ui.available_width(), ROW_H + 2.0)),
-            )
-            .on_hover_text("Export accumulated flight telemetry frames to perf CSV.")
-            .clicked()
+        let export_w = ui.available_width();
+        if sized_btn(
+            ui,
+            stats.frames() > 0,
+            export_w,
+            format!("{}  Export CSV", ic::FLOPPY_DISK),
+        )
+        .on_hover_text("Export accumulated flight telemetry frames to perf CSV.")
+        .clicked()
         {
             (args.on_export_flight_csv)();
         }
@@ -1246,19 +1342,33 @@ fn ui_player_now_playing(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         .inner_margin(egui::Margin::symmetric(6, 5))
         .show(ui, |ui| {
             let row_w = ui.available_width().max(80.0);
-            let badge_w = 88.0_f32.min(row_w * 0.48);
-            let title_w = (row_w - badge_w - 4.0).max(40.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(row_w, ROW_H + 2.0),
+            let origin_tag = fmt_into(args.label_buf, format_args!("[{origin_lbl}]")).to_owned();
+            let badge_font = FontId::proportional(9.5);
+            let origin_w = ui
+                .painter()
+                .layout_no_wrap(origin_tag.clone(), badge_font.clone(), Color32::WHITE)
+                .size()
+                .x
+                .ceil();
+            let state_w = ui
+                .painter()
+                .layout_no_wrap(state_lbl.to_owned(), badge_font, Color32::WHITE)
+                .size()
+                .x
+                .ceil();
+            let badge_w = (origin_w + GAP_SM + state_w + 4.0).min(row_w * 0.60);
+            let title_w = (row_w - badge_w - GAP_SM).max(36.0);
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(row_w, BTN_H),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    ui.set_max_width(row_w);
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(title_w, ROW_H + 2.0),
+                    ui.spacing_mut().item_spacing.x = GAP_SM;
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(title_w, BTN_H),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_max_width(title_w);
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(player.active_title()).size(12.0).strong(),
@@ -1267,40 +1377,33 @@ fn ui_player_now_playing(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                             );
                         },
                     );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(badge_w, ROW_H + 2.0),
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(badge_w, BTN_H),
                         Layout::right_to_left(Align::Center),
                         |ui| {
-                            ui.set_max_width(badge_w);
-                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.spacing_mut().item_spacing.x = GAP_SM;
                             ui.label(
                                 RichText::new(state_lbl)
                                     .size(9.5)
                                     .strong()
                                     .color(state_col),
                             );
-                            ui.label(
-                                RichText::new(fmt_into(
-                                    args.label_buf,
-                                    format_args!("[{origin_lbl}]"),
-                                ))
-                                .size(9.5)
-                                .weak(),
-                            );
+                            ui.label(RichText::new(origin_tag).size(9.5).weak());
                         },
                     );
                 },
             );
 
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = GAP_SM;
                 let time_txt = fmt_into(
                     args.label_buf,
                     format_args!("{} / {}", format_mmss(cur_t), format_mmss(dur)),
                 );
-                ui.label(RichText::new(time_txt).monospace().size(11.0).strong());
+                ui.label(RichText::new(time_txt).monospace().size(TITLE_FONT).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.x = GAP_SM;
                     if player.last_active_chase {
                         ui.label(
                             RichText::new(format!("{} CHASE", ic::LIGHTNING))
@@ -1312,14 +1415,19 @@ fn ui_player_now_playing(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                     let kin_txt = fmt_into(
                         args.label_buf,
                         format_args!(
-                            "{:.1} m/s | {:.1} deg",
+                            "{:.1} m/s | {:.0} deg",
                             player.last_speed_mps,
                             player.last_bank_rad.to_degrees(),
                         ),
                     );
                     ui.add(
-                        egui::Label::new(RichText::new(kin_txt).monospace().size(10.0).weak())
-                            .truncate(),
+                        egui::Label::new(
+                            RichText::new(kin_txt)
+                                .monospace()
+                                .size(MONO_META_FONT)
+                                .weak(),
+                        )
+                        .truncate(),
                     );
                 });
             });
@@ -1343,14 +1451,15 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     let rec_fill = rec_col.gamma_multiply(0.32);
 
     equal_grid(ui, 7, 7, |ui, idx, w| {
-        let h = ROW_H + 2.0;
+        let prev_pad = ui.spacing().button_padding;
+        ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
         match idx {
             0 => {
                 if ui
-                    .add_enabled(
-                        has_queue,
-                        egui::Button::new(ic::SKIP_BACK).min_size(egui::vec2(w, h)),
-                    )
+                    .add_enabled_ui(has_queue, |ui| {
+                        ui.add_sized([w, BTN_H], egui::Button::new(ic::SKIP_BACK))
+                    })
+                    .inner
                     .on_hover_text("Previous track (or rewind if > 2 s).")
                     .clicked()
                 {
@@ -1359,12 +1468,13 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
             1 => {
                 let icon = if is_playing { ic::PAUSE } else { ic::PLAY };
-                let mut btn = egui::Button::new(icon).min_size(egui::vec2(w, h));
+                let mut btn = egui::Button::new(icon);
                 if is_playing {
                     btn = btn.fill(accent).stroke(accent_stroke);
                 }
                 if ui
-                    .add_enabled(is_playing || can_play, btn)
+                    .add_enabled_ui(is_playing || can_play, |ui| ui.add_sized([w, BTN_H], btn))
+                    .inner
                     .on_hover_text(if is_playing {
                         "Pause playback"
                     } else {
@@ -1381,10 +1491,10 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
             2 => {
                 if ui
-                    .add_enabled(
-                        is_playing || is_paused,
-                        egui::Button::new(ic::STOP).min_size(egui::vec2(w, h)),
-                    )
+                    .add_enabled_ui(is_playing || is_paused, |ui| {
+                        ui.add_sized([w, BTN_H], egui::Button::new(ic::STOP))
+                    })
+                    .inner
                     .on_hover_text("Stop playback and rewind to 0:00.")
                     .clicked()
                 {
@@ -1393,10 +1503,10 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             }
             3 => {
                 if ui
-                    .add_enabled(
-                        has_queue,
-                        egui::Button::new(ic::SKIP_FORWARD).min_size(egui::vec2(w, h)),
-                    )
+                    .add_enabled_ui(has_queue, |ui| {
+                        ui.add_sized([w, BTN_H], egui::Button::new(ic::SKIP_FORWARD))
+                    })
+                    .inner
                     .on_hover_text("Next track in playlist.")
                     .clicked()
                 {
@@ -1413,21 +1523,21 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                         RepeatMode::Off,
                     ),
                 };
-                let mut btn = egui::Button::new(icon).min_size(egui::vec2(w, h));
+                let mut btn = egui::Button::new(icon);
                 if repeat != RepeatMode::Off {
                     btn = btn.fill(accent).stroke(accent_stroke);
                 }
-                if ui.add_sized([w, h], btn).on_hover_text(tip).clicked() {
+                if ui.add_sized([w, BTN_H], btn).on_hover_text(tip).clicked() {
                     (args.on_command)(FlightCommand::SetRepeat(next_mode));
                 }
             }
             5 => {
-                let mut btn = egui::Button::new(ic::SHUFFLE).min_size(egui::vec2(w, h));
+                let mut btn = egui::Button::new(ic::SHUFFLE);
                 if shuffle {
                     btn = btn.fill(accent).stroke(accent_stroke);
                 }
                 if ui
-                    .add_sized([w, h], btn)
+                    .add_sized([w, BTN_H], btn)
                     .on_hover_text("Toggle deterministic seeded playlist shuffle.")
                     .clicked()
                 {
@@ -1435,12 +1545,13 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 }
             }
             _ => {
-                let mut btn = egui::Button::new(ic::RECORD).min_size(egui::vec2(w, h));
+                let mut btn = egui::Button::new(ic::RECORD);
                 if rec_active {
                     btn = btn.fill(rec_fill).stroke(Stroke::new(1.0, rec_col));
                 }
                 if ui
-                    .add_enabled(can_play || rec_active, btn)
+                    .add_enabled_ui(can_play || rec_active, |ui| ui.add_sized([w, BTN_H], btn))
+                    .inner
                     .on_hover_text(
                         "Record entire playlist pass to MP4 (auto-stops at playlist end).",
                     )
@@ -1450,6 +1561,7 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 }
             }
         }
+        ui.spacing_mut().button_padding = prev_pad;
     });
 }
 
@@ -1558,7 +1670,7 @@ fn ui_player_playlist_queue(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         if q_len == 0 {
             ui.label(
                 RichText::new("Queue is empty. Play or enqueue a track from the Library below.")
-                    .size(11.0)
+                    .size(TITLE_FONT)
                     .weak(),
             );
         } else {
@@ -1573,205 +1685,222 @@ fn ui_player_playlist_queue(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             );
             let accent = active_accent_tint(ui);
             let mut deferred_cmds: Vec<FlightCommand> = Vec::new();
-            let row_h = ROW_H + 4.0;
-            let btn_sz = ROW_H + 2.0;
-            let gap = 4.0;
+            let btn_w = icon_btn_w(ui);
+            let hold_lbl_w = ui
+                .painter()
+                .layout_no_wrap("Hold".to_owned(), FontId::proportional(MONO_META_FONT), Color32::WHITE)
+                .size()
+                .x
+                .ceil()
+                + 2.0;
+            let hold_w = (mono_chars_w(ui, SHOT_FONT, 5) + 12.0).max(48.0);
 
-            egui::ScrollArea::vertical()
-                .id_salt("flight_player_queue_scroll")
-                .max_height(168.0)
-                .show(ui, |ui| {
-                    for (idx, slot) in args.workspace.player.queue.iter().enumerate() {
-                        let is_active = idx == active_idx;
-                        let frame_fill = if is_active {
-                            accent.gamma_multiply(0.55)
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        egui::Frame::NONE
-                            .fill(frame_fill)
-                            .corner_radius(3.0)
-                            .inner_margin(egui::Margin::symmetric(4, 2))
-                            .show(ui, |ui| {
-                                let row_w = ui.available_width().max(80.0);
-                                let actions_w = btn_sz * 3.0 + gap * 3.0 + 28.0;
-                                let left_w = (row_w - actions_w - gap).max(36.0);
+            for (idx, slot) in args.workspace.player.queue.iter().enumerate() {
+                let is_active = idx == active_idx;
+                let frame_fill = if is_active {
+                    accent.gamma_multiply(0.55)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                egui::Frame::NONE
+                    .fill(frame_fill)
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        let row_w = ui.available_width().max(80.0);
+                        let dur_s = slot.track.duration_s();
+                        let dur_w = mono_chars_w(ui, MONO_META_FONT, duration_char_count(dur_s)) + 4.0;
+                        let right_w = dur_w + GAP_SM + btn_w * 3.0 + GAP_SM * 2.0;
+                        let left_w = (row_w - right_w - GAP_SM).max(36.0);
+                        let display_title = strip_trailing_duration_tag(&slot.title, dur_s);
 
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(row_w, row_h),
+                        allocate_clamped_ui(
+                            ui,
+                            egui::vec2(row_w, LIST_ROW_H),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = GAP_SM;
+                                allocate_clamped_ui(
+                                    ui,
+                                    egui::vec2(left_w, LIST_ROW_H),
                                     Layout::left_to_right(Align::Center),
                                     |ui| {
-                                        ui.set_max_width(row_w);
-                                        ui.spacing_mut().item_spacing.x = gap;
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(left_w, row_h),
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                ui.set_max_width(left_w);
-                                                ui.spacing_mut().item_spacing.x = gap;
-                                                let idx_txt = fmt_into(
-                                                    args.label_buf,
-                                                    format_args!("{:02}.", idx + 1),
-                                                );
-                                                ui.label(
-                                                    RichText::new(idx_txt)
-                                                        .monospace()
-                                                        .size(10.0)
-                                                        .weak(),
-                                                );
-                                                if slot.stale {
-                                                    stale_badge(
-                                                        ui,
-                                                        "Scene geometry hash changed since this track was saved.",
-                                                    );
-                                                }
-                                                let title_resp = ui
-                                                    .add(
-                                                        egui::Label::new(
-                                                            RichText::new(&slot.title).size(11.0),
-                                                        )
-                                                        .truncate()
-                                                        .sense(Sense::click()),
-                                                    )
-                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                    .on_hover_text(&slot.description);
-                                                if title_resp.clicked() {
-                                                    deferred_cmds
-                                                        .push(FlightCommand::SelectPlaylistEntry(idx));
-                                                }
-                                            },
+                                        ui.spacing_mut().item_spacing.x = GAP_SM;
+                                        let idx_txt = fmt_into(
+                                            args.label_buf,
+                                            format_args!("{:02}.", idx + 1),
                                         );
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(actions_w, row_h),
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                ui.set_max_width(actions_w);
-                                                ui.spacing_mut().item_spacing.x = gap;
-                                                if ui
-                                                    .add_sized(
-                                                        [btn_sz, btn_sz],
-                                                        egui::Button::new(ic::TRASH),
-                                                    )
-                                                    .on_hover_text("Remove from playlist")
-                                                    .clicked()
-                                                {
-                                                    deferred_cmds
-                                                        .push(FlightCommand::RemovePlaylistEntry(idx));
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        idx + 1 < q_len,
-                                                        egui::Button::new(ic::ARROW_DOWN)
-                                                            .min_size(egui::vec2(btn_sz, btn_sz)),
-                                                    )
-                                                    .on_hover_text("Move down")
-                                                    .clicked()
-                                                {
-                                                    deferred_cmds.push(
-                                                        FlightCommand::ReorderPlaylist {
-                                                            from: idx,
-                                                            to: idx + 1,
-                                                        },
-                                                    );
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        idx > 0,
-                                                        egui::Button::new(ic::ARROW_UP)
-                                                            .min_size(egui::vec2(btn_sz, btn_sz)),
-                                                    )
-                                                    .on_hover_text("Move up")
-                                                    .clicked()
-                                                {
-                                                    deferred_cmds.push(
-                                                        FlightCommand::ReorderPlaylist {
-                                                            from: idx,
-                                                            to: idx - 1,
-                                                        },
-                                                    );
-                                                }
-                                                let dur_txt = fmt_into(
-                                                    args.label_buf,
-                                                    format_args!("{:.0}s", slot.track.duration_s()),
-                                                );
-                                                ui.label(
-                                                    RichText::new(dur_txt)
-                                                        .monospace()
-                                                        .size(10.0)
-                                                        .weak(),
-                                                );
-                                            },
+                                        ui.label(
+                                            RichText::new(idx_txt)
+                                                .monospace()
+                                                .size(MONO_META_FONT)
+                                                .weak(),
                                         );
-                                    },
-                                );
-
-                                let hold_w = 42.0;
-                                let hold_lbl_w = 24.0;
-                                let combo_w = (row_w - hold_w - hold_lbl_w - gap * 3.0).max(52.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(row_w, row_h),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| {
-                                        ui.set_max_width(row_w);
-                                        ui.spacing_mut().item_spacing.x = gap;
-                                        let cur_tr_lbl = transition_label(slot.transition_in);
-                                        let mut new_tr = slot.transition_in;
-                                        egui::ComboBox::from_id_salt(("pl_tr", idx))
-                                            .width(combo_w)
-                                            .truncate()
-                                            .selected_text(cur_tr_lbl)
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut new_tr,
-                                                    PlaylistTransition::Cut,
-                                                    "Cut",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut new_tr,
-                                                    PlaylistTransition::FadeBlack { s: 0.75 },
-                                                    "Fade 0.75s",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut new_tr,
-                                                    PlaylistTransition::FlyThrough,
-                                                    "FlyThrough",
-                                                );
-                                            });
-                                        if new_tr != slot.transition_in {
-                                            deferred_cmds.push(
-                                                FlightCommand::SetEntryTransition {
-                                                    idx,
-                                                    transition: new_tr,
-                                                },
+                                        if slot.stale {
+                                            stale_badge(
+                                                ui,
+                                                "Scene geometry hash changed since this track was saved.",
                                             );
                                         }
-
-                                        ui.label(RichText::new("Hold").size(10.0).weak());
-                                        let mut hold_val = slot.hold_s;
-                                        let prev_style = ui.style().override_text_style.clone();
-                                        ui.style_mut().override_text_style =
-                                            Some(egui::TextStyle::Monospace);
-                                        if ui
-                                            .add_sized(
-                                                [hold_w, ROW_H],
-                                                egui::DragValue::new(&mut hold_val)
-                                                    .range(0.0..=30.0)
-                                                    .speed(0.1)
-                                                    .suffix("s"),
+                                        let title_resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(display_title).size(TITLE_FONT),
+                                                )
+                                                .truncate()
+                                                .sense(Sense::click()),
                                             )
-                                            .changed()
-                                        {
-                                            deferred_cmds.push(FlightCommand::SetEntryHold {
-                                                idx,
-                                                hold_s: hold_val,
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                            .on_hover_text(if slot.description.is_empty() {
+                                                slot.title.clone()
+                                            } else {
+                                                format!("{}\n{}", slot.title, slot.description)
                                             });
+                                        if title_resp.clicked() {
+                                            deferred_cmds
+                                                .push(FlightCommand::SelectPlaylistEntry(idx));
                                         }
-                                        ui.style_mut().override_text_style = prev_style;
                                     },
                                 );
-                            });
-                    }
-                });
+                                allocate_clamped_ui(
+                                    ui,
+                                    egui::vec2(dur_w, LIST_ROW_H),
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        let dur_txt = fmt_into(
+                                            args.label_buf,
+                                            format_args!("{dur_s:.0}s"),
+                                        );
+                                        ui.label(
+                                            RichText::new(dur_txt)
+                                                .monospace()
+                                                .size(MONO_META_FONT)
+                                                .weak(),
+                                        );
+                                    },
+                                );
+                                if compact_icon_btn(
+                                    ui,
+                                    idx > 0,
+                                    [btn_w, BTN_H],
+                                    ic::ARROW_UP,
+                                    "Move up",
+                                )
+                                .clicked()
+                                {
+                                    deferred_cmds.push(FlightCommand::ReorderPlaylist {
+                                        from: idx,
+                                        to: idx - 1,
+                                    });
+                                }
+                                if compact_icon_btn(
+                                    ui,
+                                    idx + 1 < q_len,
+                                    [btn_w, BTN_H],
+                                    ic::ARROW_DOWN,
+                                    "Move down",
+                                )
+                                .clicked()
+                                {
+                                    deferred_cmds.push(FlightCommand::ReorderPlaylist {
+                                        from: idx,
+                                        to: idx + 1,
+                                    });
+                                }
+                                if compact_icon_btn(
+                                    ui,
+                                    true,
+                                    [btn_w, BTN_H],
+                                    ic::TRASH,
+                                    "Remove from playlist",
+                                )
+                                .clicked()
+                                {
+                                    deferred_cmds.push(FlightCommand::RemovePlaylistEntry(idx));
+                                }
+                            },
+                        );
+
+                        let combo_w = (row_w - hold_w - hold_lbl_w - GAP_SM * 2.0).max(52.0);
+                        allocate_clamped_ui(
+                            ui,
+                            egui::vec2(row_w, LIST_ROW_H),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = GAP_SM;
+                                let cur_tr_lbl = transition_label(slot.transition_in);
+                                let mut new_tr = slot.transition_in;
+                                egui::ComboBox::from_id_salt(("pl_tr", idx))
+                                    .width(combo_w)
+                                    .truncate()
+                                    .selected_text(cur_tr_lbl)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut new_tr,
+                                            PlaylistTransition::Cut,
+                                            "Cut",
+                                        );
+                                        ui.selectable_value(
+                                            &mut new_tr,
+                                            PlaylistTransition::FadeBlack { s: 0.75 },
+                                            "Fade 0.75s",
+                                        );
+                                        ui.selectable_value(
+                                            &mut new_tr,
+                                            PlaylistTransition::FlyThrough,
+                                            "FlyThrough",
+                                        );
+                                    });
+                                if new_tr != slot.transition_in {
+                                    deferred_cmds.push(FlightCommand::SetEntryTransition {
+                                        idx,
+                                        transition: new_tr,
+                                    });
+                                }
+
+                                allocate_clamped_ui(
+                                    ui,
+                                    egui::vec2(hold_lbl_w, LIST_ROW_H),
+                                    Layout::right_to_left(Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("Hold").size(MONO_META_FONT).weak(),
+                                        );
+                                    },
+                                );
+                                let mut hold_val = slot.hold_s;
+                                let changed = allocate_clamped_ui(
+                                    ui,
+                                    egui::vec2(hold_w, ROW_H),
+                                    Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                    |ui| {
+                                        let font = FontId::monospace(SHOT_FONT);
+                                        let style = ui.style_mut();
+                                        style.drag_value_text_style = egui::TextStyle::Monospace;
+                                        style.override_text_style = Some(egui::TextStyle::Monospace);
+                                        style.override_font_id = Some(font.clone());
+                                        style.text_styles.insert(egui::TextStyle::Monospace, font);
+                                        style.spacing.button_padding.x = 2.0;
+                                        style.spacing.interact_size.x = hold_w;
+                                        ui.add(
+                                            egui::DragValue::new(&mut hold_val)
+                                                .range(0.0..=30.0)
+                                                .speed(0.1)
+                                                .suffix("s"),
+                                        )
+                                        .changed()
+                                    },
+                                );
+                                if changed {
+                                    deferred_cmds.push(FlightCommand::SetEntryHold {
+                                        idx,
+                                        hold_s: hold_val,
+                                    });
+                                }
+                            },
+                        );
+                    });
+            }
 
             for cmd in deferred_cmds {
                 (args.on_command)(cmd);
@@ -1789,13 +1918,7 @@ fn ui_player_playlist_queue(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         let pl_name = args.workspace.player.playlist_name.clone();
         equal_grid(ui, 2, 2, |ui, idx, w| match idx {
             0 => {
-                if ui
-                    .add_enabled(
-                        q_len > 0,
-                        egui::Button::new(format!("{}  Save User", ic::FLOPPY_DISK))
-                            .truncate()
-                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                    )
+                if sized_btn(ui, q_len > 0, w, format!("{}  Save User", ic::FLOPPY_DISK))
                     .on_hover_text("Save playlist atomically to ~/.nv-rs/flights/")
                     .clicked()
                 {
@@ -1806,13 +1929,7 @@ fn ui_player_playlist_queue(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 }
             }
             _ => {
-                if ui
-                    .add_enabled(
-                        q_len > 0,
-                        egui::Button::new(format!("{}  Save Repo", ic::FOLDER_OPEN))
-                            .truncate()
-                            .min_size(egui::vec2(w, ROW_H + 2.0)),
-                    )
+                if sized_btn(ui, q_len > 0, w, format!("{}  Save Repo", ic::FOLDER_OPEN))
                     .on_hover_text("Save playlist atomically to assets/flights/")
                     .clicked()
                 {
@@ -1836,12 +1953,8 @@ fn ui_player_library_browser(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         |ui| {
             let err_count = args.workspace.player.library.load_errors.len();
             if err_count == 0 {
-                if ui
-                    .add_sized(
-                        [ui.available_width(), ROW_H + 2.0],
-                        egui::Button::new(format!("{}  Rescan Library", ic::ARROWS_CLOCKWISE))
-                            .truncate(),
-                    )
+                let w = ui.available_width();
+                if sized_btn(ui, true, w, format!("{}  Rescan Library", ic::ARROWS_CLOCKWISE))
                     .on_hover_text("Rescan assets/flights and ~/.nv-rs/flights on disk.")
                     .clicked()
                 {
@@ -1849,13 +1962,8 @@ fn ui_player_library_browser(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 }
             } else {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if ui
-                        .add_sized(
-                            [86.0, ROW_H + 2.0],
-                            egui::Button::new(format!("{}  Rescan", ic::ARROWS_CLOCKWISE))
-                                .truncate(),
-                        )
+                    ui.spacing_mut().item_spacing.x = GAP_SM;
+                    if sized_btn(ui, true, 86.0, format!("{}  Rescan", ic::ARROWS_CLOCKWISE))
                         .on_hover_text("Rescan assets/flights and ~/.nv-rs/flights on disk.")
                         .clicked()
                     {
@@ -1872,7 +1980,7 @@ fn ui_player_library_browser(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                                         args.label_buf,
                                         format_args!("{} {err_count} errors", ic::WARNING),
                                     ))
-                                    .size(10.0)
+                                    .size(MONO_META_FONT)
                                     .color(ui.visuals().text_color()),
                                 )
                                 .truncate(),
@@ -1883,181 +1991,178 @@ fn ui_player_library_browser(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
 
             ui.add_space(2.0);
             let mut deferred: Vec<FlightCommand> = Vec::new();
-            egui::ScrollArea::vertical()
-                .id_salt("flight_player_lib_scroll")
-                .max_height(210.0)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Scene Curated").size(10.5).strong().weak());
-                    if args.workspace.player.curated.is_empty() {
-                        ui.label(
-                            RichText::new("  No curated rails for active scene.")
-                                .size(10.5)
-                                .weak(),
-                        );
-                    } else {
-                        for (i, c) in args.workspace.player.curated.iter().enumerate() {
-                            match library_item_row(
-                                ui,
-                                args.label_buf,
-                                &c.label,
-                                &c.description,
-                                TrackOrigin::Curated.label(),
-                                c.duration_s,
-                                false,
-                            ) {
-                                Some(LibraryRowAction::Play) => {
-                                    deferred.push(FlightCommand::PlayCuratedRail(i));
-                                }
-                                Some(LibraryRowAction::Enqueue) => {
-                                    deferred.push(FlightCommand::EnqueueCuratedRail(i));
-                                }
-                                None => {}
-                            }
-                        }
-                    }
+            let btn_w = icon_btn_w(ui);
 
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new("Repo (assets/flights)")
-                            .size(10.5)
-                            .strong()
-                            .weak(),
+            ui.label(RichText::new("Scene Curated").size(SHOT_FONT).strong().weak());
+            if args.workspace.player.curated.is_empty() {
+                ui.label(
+                    RichText::new("  No curated rails for active scene.")
+                        .size(SHOT_FONT)
+                        .weak(),
+                );
+            } else {
+                for (i, c) in args.workspace.player.curated.iter().enumerate() {
+                    match library_item_row(
+                        ui,
+                        args.label_buf,
+                        &c.label,
+                        &c.description,
+                        TrackOrigin::Curated.label(),
+                        c.duration_s,
+                        false,
+                        btn_w,
+                    ) {
+                        Some(LibraryRowAction::Play) => {
+                            deferred.push(FlightCommand::PlayCuratedRail(i));
+                        }
+                        Some(LibraryRowAction::Enqueue) => {
+                            deferred.push(FlightCommand::EnqueueCuratedRail(i));
+                        }
+                        None => {}
+                    }
+                }
+            }
+
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new("Repo (assets/flights)")
+                    .size(SHOT_FONT)
+                    .strong()
+                    .weak(),
+            );
+            let mut repo_any = false;
+            for t in &args.workspace.player.library.tracks {
+                if t.source == LibrarySource::Repo {
+                    repo_any = true;
+                    let tip = format!("Scene: {} ({})", t.scene_id, t.path.display());
+                    match library_item_row(
+                        ui,
+                        args.label_buf,
+                        &t.name,
+                        &tip,
+                        "Repo",
+                        t.duration_s,
+                        t.stale,
+                        btn_w,
+                    ) {
+                        Some(LibraryRowAction::Play) => {
+                            deferred.push(FlightCommand::PlayLibraryTrack(t.path.clone()));
+                        }
+                        Some(LibraryRowAction::Enqueue) => {
+                            deferred.push(FlightCommand::EnqueueLibraryTrack(t.path.clone()));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            if !repo_any {
+                ui.label(RichText::new("  No repo tracks found.").size(SHOT_FONT).weak());
+            }
+
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new("User (~/.nv-rs/flights)")
+                    .size(SHOT_FONT)
+                    .strong()
+                    .weak(),
+            );
+            let mut user_any = false;
+            for t in &args.workspace.player.library.tracks {
+                if t.source == LibrarySource::User {
+                    user_any = true;
+                    let tip = format!("Scene: {} ({})", t.scene_id, t.path.display());
+                    match library_item_row(
+                        ui,
+                        args.label_buf,
+                        &t.name,
+                        &tip,
+                        "User",
+                        t.duration_s,
+                        t.stale,
+                        btn_w,
+                    ) {
+                        Some(LibraryRowAction::Play) => {
+                            deferred.push(FlightCommand::PlayLibraryTrack(t.path.clone()));
+                        }
+                        Some(LibraryRowAction::Enqueue) => {
+                            deferred.push(FlightCommand::EnqueueLibraryTrack(t.path.clone()));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            if !user_any {
+                ui.label(
+                    RichText::new("  No user tracks saved yet.")
+                        .size(SHOT_FONT)
+                        .weak(),
+                );
+            }
+
+            if !args.workspace.player.library.playlists.is_empty() {
+                ui.add_space(3.0);
+                ui.label(RichText::new("Saved Playlists").size(SHOT_FONT).strong().weak());
+                for pl in &args.workspace.player.library.playlists {
+                    let row_w = ui.available_width().max(80.0);
+                    let src = match pl.source {
+                        LibrarySource::Repo => "Repo",
+                        LibrarySource::User => "User",
+                    };
+                    let meta = fmt_into(
+                        args.label_buf,
+                        format_args!("[{src}] {}t", pl.entry_count),
                     );
-                    let mut repo_any = false;
-                    for t in &args.workspace.player.library.tracks {
-                        if t.source == LibrarySource::Repo {
-                            repo_any = true;
-                            let tip = format!("Scene: {} ({})", t.scene_id, t.path.display());
-                            match library_item_row(
+                    let meta_w = mono_chars_w(ui, MONO_META_FONT, meta.len().max(9)) + 4.0;
+                    let right_w = meta_w + GAP_SM + btn_w;
+                    let left_w = (row_w - right_w - GAP_SM).max(36.0);
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(row_w, LIST_ROW_H),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = GAP_SM;
+                            allocate_clamped_ui(
                                 ui,
-                                args.label_buf,
-                                &t.name,
-                                &tip,
-                                "Repo",
-                                t.duration_s,
-                                t.stale,
-                            ) {
-                                Some(LibraryRowAction::Play) => {
-                                    deferred.push(FlightCommand::PlayLibraryTrack(t.path.clone()));
-                                }
-                                Some(LibraryRowAction::Enqueue) => {
-                                    deferred
-                                        .push(FlightCommand::EnqueueLibraryTrack(t.path.clone()));
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    if !repo_any {
-                        ui.label(RichText::new("  No repo tracks found.").size(10.5).weak());
-                    }
-
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new("User (~/.nv-rs/flights)")
-                            .size(10.5)
-                            .strong()
-                            .weak(),
-                    );
-                    let mut user_any = false;
-                    for t in &args.workspace.player.library.tracks {
-                        if t.source == LibrarySource::User {
-                            user_any = true;
-                            let tip = format!("Scene: {} ({})", t.scene_id, t.path.display());
-                            match library_item_row(
-                                ui,
-                                args.label_buf,
-                                &t.name,
-                                &tip,
-                                "User",
-                                t.duration_s,
-                                t.stale,
-                            ) {
-                                Some(LibraryRowAction::Play) => {
-                                    deferred.push(FlightCommand::PlayLibraryTrack(t.path.clone()));
-                                }
-                                Some(LibraryRowAction::Enqueue) => {
-                                    deferred
-                                        .push(FlightCommand::EnqueueLibraryTrack(t.path.clone()));
-                                }
-                                None => {}
-                            }
-                        }
-                    }
-                    if !user_any {
-                        ui.label(
-                            RichText::new("  No user tracks saved yet.")
-                                .size(10.5)
-                                .weak(),
-                        );
-                    }
-
-                    if !args.workspace.player.library.playlists.is_empty() {
-                        ui.add_space(3.0);
-                        ui.label(RichText::new("Saved Playlists").size(10.5).strong().weak());
-                        let row_h = ROW_H + 4.0;
-                        let btn_sz = ROW_H + 2.0;
-                        let gap = 4.0;
-                        for pl in &args.workspace.player.library.playlists {
-                            let row_w = ui.available_width().max(80.0);
-                            let actions_w = btn_sz + gap + 56.0;
-                            let left_w = (row_w - actions_w - gap).max(36.0);
-                            let src = match pl.source {
-                                LibrarySource::Repo => "Repo",
-                                LibrarySource::User => "User",
-                            };
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(row_w, row_h),
+                                egui::vec2(left_w, LIST_ROW_H),
                                 Layout::left_to_right(Align::Center),
                                 |ui| {
-                                    ui.set_max_width(row_w);
-                                    ui.spacing_mut().item_spacing.x = gap;
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(left_w, row_h),
-                                        Layout::left_to_right(Align::Center),
-                                        |ui| {
-                                            ui.set_max_width(left_w);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&pl.name).size(11.0),
-                                                )
-                                                .truncate(),
-                                            )
-                                            .on_hover_text(pl.path.display().to_string());
-                                        },
-                                    );
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(actions_w, row_h),
-                                        Layout::right_to_left(Align::Center),
-                                        |ui| {
-                                            ui.set_max_width(actions_w);
-                                            ui.spacing_mut().item_spacing.x = gap;
-                                            if ui
-                                                .add_sized(
-                                                    [btn_sz, btn_sz],
-                                                    egui::Button::new(ic::FOLDER_OPEN),
-                                                )
-                                                .on_hover_text("Load playlist into queue")
-                                                .clicked()
-                                            {
-                                                deferred.push(FlightCommand::LoadPlaylistFile(
-                                                    pl.path.clone(),
-                                                ));
-                                            }
-                                            let meta = fmt_into(
-                                                args.label_buf,
-                                                format_args!("[{src}] {}t", pl.entry_count),
-                                            );
-                                            ui.label(
-                                                RichText::new(meta).monospace().size(10.0).weak(),
-                                            );
-                                        },
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&pl.name).size(TITLE_FONT),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(pl.path.display().to_string());
+                                },
+                            );
+                            allocate_clamped_ui(
+                                ui,
+                                egui::vec2(meta_w, LIST_ROW_H),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(meta)
+                                            .monospace()
+                                            .size(MONO_META_FONT)
+                                            .weak(),
                                     );
                                 },
                             );
-                        }
-                    }
-                });
+                            if compact_icon_btn(
+                                ui,
+                                true,
+                                [btn_w, BTN_H],
+                                ic::FOLDER_OPEN,
+                                "Load playlist into queue",
+                            )
+                            .clicked()
+                            {
+                                deferred.push(FlightCommand::LoadPlaylistFile(pl.path.clone()));
+                            }
+                        },
+                    );
+                }
+            }
 
             for cmd in deferred {
                 (args.on_command)(cmd);
@@ -2073,6 +2178,7 @@ enum LibraryRowAction {
 }
 
 /// Renders one fixed-height single-line row in the Flight Library with Play and Enqueue icon buttons.
+#[expect(clippy::too_many_arguments, reason = "internal stateless row helper keeps call sites concise")]
 fn library_item_row(
     ui: &mut Ui,
     buf: &mut String,
@@ -2081,61 +2187,60 @@ fn library_item_row(
     badge: &str,
     duration_s: f64,
     stale: bool,
+    btn_w: f32,
 ) -> Option<LibraryRowAction> {
     let mut action = None;
-    let row_h = ROW_H + 4.0;
-    let btn_sz = ROW_H + 2.0;
-    let gap = 4.0;
     let row_w = ui.available_width().max(80.0);
-    let actions_w = btn_sz * 2.0 + gap * 2.0 + 30.0;
-    let left_w = (row_w - actions_w - gap).max(36.0);
+    let dur_w = mono_chars_w(ui, MONO_META_FONT, duration_char_count(duration_s)) + 4.0;
+    let right_w = dur_w + GAP_SM + btn_w * 2.0 + GAP_SM;
+    let left_w = (row_w - right_w - GAP_SM).max(36.0);
+    let display_name = strip_trailing_duration_tag(name, duration_s);
 
-    ui.allocate_ui_with_layout(
-        egui::vec2(row_w, row_h),
+    allocate_clamped_ui(
+        ui,
+        egui::vec2(row_w, LIST_ROW_H),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.set_max_width(row_w);
-            ui.spacing_mut().item_spacing.x = gap;
-            ui.allocate_ui_with_layout(
-                egui::vec2(left_w, row_h),
+            ui.spacing_mut().item_spacing.x = GAP_SM;
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(left_w, LIST_ROW_H),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    ui.set_max_width(left_w);
-                    ui.spacing_mut().item_spacing.x = gap;
+                    ui.spacing_mut().item_spacing.x = GAP_SM;
                     if stale {
                         stale_badge(
                             ui,
                             "Stale: scene content hash differs from when this track was created.",
                         );
                     }
-                    ui.add(egui::Label::new(RichText::new(name).size(11.0)).truncate())
+                    ui.add(egui::Label::new(RichText::new(display_name).size(TITLE_FONT)).truncate())
                         .on_hover_text(format!("[{badge}] {name}\n{tooltip}"));
                 },
             );
-            ui.allocate_ui_with_layout(
-                egui::vec2(actions_w, row_h),
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(dur_w, LIST_ROW_H),
                 Layout::right_to_left(Align::Center),
                 |ui| {
-                    ui.set_max_width(actions_w);
-                    ui.spacing_mut().item_spacing.x = gap;
-                    if ui
-                        .add_sized([btn_sz, btn_sz], egui::Button::new(ic::PLUS))
-                        .on_hover_text("Append to playlist queue")
-                        .clicked()
-                    {
-                        action = Some(LibraryRowAction::Enqueue);
-                    }
-                    if ui
-                        .add_sized([btn_sz, btn_sz], egui::Button::new(ic::PLAY))
-                        .on_hover_text("Play now")
-                        .clicked()
-                    {
-                        action = Some(LibraryRowAction::Play);
-                    }
-                    let meta = fmt_into(buf, format_args!("{:.0}s", duration_s));
-                    ui.label(RichText::new(meta).monospace().size(10.0).weak());
+                    let meta = fmt_into(buf, format_args!("{duration_s:.0}s"));
+                    ui.label(RichText::new(meta).monospace().size(MONO_META_FONT).weak());
                 },
             );
+            if compact_icon_btn(ui, true, [btn_w, BTN_H], ic::PLAY, "Play now").clicked() {
+                action = Some(LibraryRowAction::Play);
+            }
+            if compact_icon_btn(
+                ui,
+                true,
+                [btn_w, BTN_H],
+                ic::PLUS,
+                "Append to playlist queue",
+            )
+            .clicked()
+            {
+                action = Some(LibraryRowAction::Enqueue);
+            }
         },
     );
     action
@@ -2150,12 +2255,127 @@ fn library_item_row(
 /// slot so right edges align to the pixel across every row.
 fn aligned_prop_row(ui: &mut Ui, label: &str, add_ctrl: impl FnOnce(&mut Ui, f32)) {
     prop_row(ui, label, |ui| {
-        let gap = 4.0;
-        let ctrl_w = (ui.available_width() - ANIM_BTN_W - gap).max(40.0);
-        ui.spacing_mut().item_spacing.x = gap;
-        add_ctrl(ui, ctrl_w);
+        let ctrl_w = (ui.available_width() - ANIM_BTN_W - GAP_SM).max(40.0);
+        ui.spacing_mut().item_spacing.x = GAP_SM;
+        allocate_clamped_ui(
+            ui,
+            egui::vec2(ctrl_w, ROW_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                add_ctrl(ui, ctrl_w);
+            },
+        );
         anim_toggle_btn_disabled(ui);
     });
+}
+
+/// Renders an enabled/disabled text button locked to exact `[w, BTN_H]` dimensions.
+fn sized_btn(
+    ui: &mut Ui,
+    enabled: bool,
+    w: f32,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.add_sized([w, BTN_H], egui::Button::new(text).truncate())
+    })
+    .inner
+}
+
+/// Computes a uniform icon-button width wide enough for an [`ICON_BTN_FONT`] Phosphor glyph plus
+/// compact horizontal padding and 1 px stroke at the active UI scale so icon columns never
+/// overflow into adjacent titles or durations.
+fn icon_btn_w(ui: &Ui) -> f32 {
+    let glyph = ui
+        .ctx()
+        .fonts_mut(|f| f.glyph_width(&FontId::proportional(ICON_BTN_FONT), 'W'));
+    (glyph + 8.0).ceil().max(20.0)
+}
+
+/// Renders a fixed-size Phosphor icon action button with tight padding so its outer rect matches
+/// `size` exactly without expanding into sibling columns.
+fn compact_icon_btn(
+    ui: &mut Ui,
+    enabled: bool,
+    size: [f32; 2],
+    icon: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let prev_pad = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+    let resp = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.add_sized(
+                size,
+                egui::Button::new(RichText::new(icon).size(ICON_BTN_FONT)),
+            )
+        })
+        .inner;
+    ui.spacing_mut().button_padding = prev_pad;
+    resp.on_hover_text(tooltip)
+}
+
+/// Measures the exact width of `chars` monospace digits at font `size` (zero heap allocation).
+fn mono_chars_w(ui: &Ui, size: f32, chars: usize) -> f32 {
+    let font = FontId::monospace(size);
+    let cw = ui.ctx().fonts_mut(|f| f.glyph_width(&font, '0'));
+    (cw * chars as f32).ceil()
+}
+
+/// Character count needed for a rounded `{dur:.0}s` duration label (at least 4 chars for `"999s"`
+/// columnar alignment across rows).
+fn duration_char_count(duration_s: f64) -> usize {
+    let secs = if duration_s.is_finite() && duration_s > 0.0 {
+        duration_s.round() as u64
+    } else {
+        0
+    };
+    let digits = if secs < 10 {
+        1
+    } else if secs < 100 {
+        2
+    } else if secs < 1000 {
+        3
+    } else if secs < 10_000 {
+        4
+    } else {
+        5
+    };
+    (digits + 1).max(4)
+}
+
+/// Strips a redundant trailing `" (24s)"` / `" (45.0 s)"` duration suffix from `title` when it
+/// matches `duration_s` within `1.0 s`, preventing rows with a dedicated right-aligned duration
+/// column from displaying `"Street Navigation (24s) 24s"`.
+fn strip_trailing_duration_tag(title: &str, duration_s: f64) -> &str {
+    let trimmed = title.trim_end();
+    if !duration_s.is_finite() || duration_s <= 0.0 {
+        return trimmed;
+    }
+    let Some(no_close) = trimmed.strip_suffix(')') else {
+        return trimmed;
+    };
+    let Some(open_idx) = no_close.rfind('(') else {
+        return trimmed;
+    };
+    let inner = no_close[open_idx + 1..].trim();
+    let Some(num_str) = inner
+        .strip_suffix('s')
+        .or_else(|| inner.strip_suffix('S'))
+        .map(str::trim)
+    else {
+        return trimmed;
+    };
+    let Ok(parsed) = num_str.parse::<f64>() else {
+        return trimmed;
+    };
+    if (parsed - duration_s).abs() <= 1.0 {
+        let prefix = trimmed[..open_idx].trim_end();
+        if !prefix.is_empty() {
+            return prefix;
+        }
+    }
+    trimmed
 }
 
 /// Compact theme-aware amber stale-track warning pill using [`hdr_amber_tint`].
@@ -2167,7 +2387,7 @@ fn stale_badge(ui: &mut Ui, tooltip: &str) {
         .show(ui, |ui| {
             ui.label(
                 RichText::new(ic::WARNING)
-                    .size(10.0)
+                    .size(MONO_META_FONT)
                     .color(ui.visuals().warn_fg_color),
             )
         })
@@ -2183,9 +2403,9 @@ fn status_footer(ui: &mut Ui, msg: &str) {
     ui.add_space(2.0);
     ui.separator();
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(RichText::new(ic::INFO).size(11.0).weak());
-        ui.add(egui::Label::new(RichText::new(msg).size(10.5).weak()).truncate())
+        ui.spacing_mut().item_spacing.x = GAP_SM;
+        ui.label(RichText::new(ic::INFO).size(TITLE_FONT).weak());
+        ui.add(egui::Label::new(RichText::new(msg).size(SHOT_FONT).weak()).truncate())
             .on_hover_text(msg);
     });
 }
@@ -2226,14 +2446,16 @@ fn paint_series(
 ) {
     let (x_max, y_max) = bounds;
     let n = xs.len().min(ys.len());
-    if n < 2 || x_max <= 0.0 || y_max <= 0.0 {
+    if n < 2 || !x_max.is_finite() || !y_max.is_finite() || x_max <= 0.0 || y_max <= 0.0 {
         return;
     }
     let stride = (n as f32 / rect.width().max(1.0)).ceil().max(1.0) as usize;
     let map = |i: usize| {
-        let yv = if style.abs_y { ys[i].abs() } else { ys[i] };
+        let xv = if xs[i].is_finite() { xs[i] } else { 0.0 };
+        let y_raw = if ys[i].is_finite() { ys[i] } else { 0.0 };
+        let yv = if style.abs_y { y_raw.abs() } else { y_raw };
         Pos2::new(
-            rect.left() + rect.width() * (xs[i] / x_max).clamp(0.0, 1.0),
+            rect.left() + rect.width() * (xv / x_max).clamp(0.0, 1.0),
             rect.bottom() - 2.0 - (rect.height() - 4.0) * (yv / y_max).clamp(0.0, 1.0),
         )
     };
@@ -2264,14 +2486,16 @@ fn paint_loop_curve(
     y_max: f32,
     color: Color32,
 ) {
-    if pts.len() < 2 || x_max <= 0.0 || y_max <= 0.0 {
+    if pts.len() < 2 || !x_max.is_finite() || !y_max.is_finite() || x_max <= 0.0 || y_max <= 0.0 {
         return;
     }
     let stride = (pts.len() as f32 / rect.width().max(1.0)).ceil().max(1.0) as usize;
     let to_screen = |p: &LoopPoint| {
+        let t = if p.rail_t.is_finite() { p.rail_t } else { 0.0 };
+        let ms = if p.rt_ms.is_finite() { p.rt_ms } else { 0.0 };
         Pos2::new(
-            rect.left() + rect.width() * (p.rail_t / x_max).clamp(0.0, 1.0),
-            rect.bottom() - 1.0 - (rect.height() - 2.0) * (p.rt_ms / y_max).clamp(0.0, 1.0),
+            rect.left() + rect.width() * (t / x_max).clamp(0.0, 1.0),
+            rect.bottom() - 1.0 - (rect.height() - 2.0) * (ms / y_max).clamp(0.0, 1.0),
         )
     };
     let stroke = Stroke::new(1.25, color);
@@ -2280,5 +2504,264 @@ fn paint_loop_curve(
         let cur = to_screen(p);
         painter.line_segment([prev, cur], stroke);
         prev = cur;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flight::player::{CuratedTrackEntry, PlaylistSlot};
+    use crate::ui::{UiTheme, install_fonts};
+    use flight_navigator::fnav_core::{
+        Aim, CameraState, Cut, CutEvidence, CutKind, Kinematic, Lens, Transition,
+    };
+    use glam::Vec3;
+
+    fn sample_track(segment_count: usize, seg_dur_s: f64) -> Track {
+        let mut segments = Vec::with_capacity(segment_count);
+        for i in 0..segment_count {
+            let x0 = (i as f32) * 10.0;
+            let k0 = Kinematic {
+                state: CameraState::from_look_at(
+                    Vec3::new(x0, 5.0, 20.0),
+                    Vec3::new(x0 + 5.0, 2.0, 0.0),
+                    Vec3::Y,
+                    Lens::pinhole(35.0),
+                ),
+                ..Kinematic::default()
+            };
+            let k1 = Kinematic {
+                state: CameraState::from_look_at(
+                    Vec3::new(x0 + 10.0, 6.0, 20.0),
+                    Vec3::new(x0 + 15.0, 2.0, 0.0),
+                    Vec3::Y,
+                    Lens::pinhole(50.0),
+                ),
+                ..Kinematic::default()
+            };
+            if i > 0 && i.is_multiple_of(4) {
+                segments.push(Segment::Cut(Cut {
+                    kind: CutKind::Contrast,
+                    score: 0.9,
+                    evidence: CutEvidence {
+                        metric_a: 45.0,
+                        metric_b: 2.0,
+                        note: "test cut".to_string(),
+                    },
+                }));
+            }
+            segments.push(Segment::Transition(Transition::direct(
+                k0,
+                k1,
+                seg_dur_s,
+                Aim::Squad,
+            )));
+        }
+        Track {
+            segments,
+            looping: false,
+        }
+    }
+
+    #[test]
+    fn strip_trailing_duration_tag_removes_matching_suffix_only() {
+        assert_eq!(
+            strip_trailing_duration_tag("Street Navigation (24s)", 24.0),
+            "Street Navigation"
+        );
+        assert_eq!(
+            strip_trailing_duration_tag("Street Navigation (24s)", 24.4),
+            "Street Navigation"
+        );
+        assert_eq!(
+            strip_trailing_duration_tag("El Segundo Orbit (45.0 s)", 45.0),
+            "El Segundo Orbit"
+        );
+        assert_eq!(
+            strip_trailing_duration_tag("Street Navigation (24s)", 60.0),
+            "Street Navigation (24s)"
+        );
+        assert_eq!(
+            strip_trailing_duration_tag("gundo_auto_42", 45.0),
+            "gundo_auto_42"
+        );
+        assert_eq!(strip_trailing_duration_tag("(24s)", 24.0), "(24s)");
+        assert_eq!(
+            strip_trailing_duration_tag("Track (v2)", 24.0),
+            "Track (v2)"
+        );
+    }
+
+    #[test]
+    fn contact_sheet_expands_naturally_without_scroll_jail_or_overflow() {
+        let mut ws = FlightWorkspace::default();
+        ws.lab.preview_track = Some(sample_track(14, 3.0));
+        let mut stats = FlightStats::new();
+        let csg_stats = CsgStats::default();
+        let mut is_counters = false;
+        let mut time_scale = 1.0_f32;
+        let mut cam_smooth_tau = 0.08_f32;
+        let mut label_buf = String::with_capacity(96);
+
+        for panel_w in [260.0_f32, 300.0, 340.0] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock = UiTheme::Obsidian.apply(&ctx);
+            let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(
+                &ctx,
+                egui::Id::new("sec_flab_contact"),
+                true,
+            );
+            st.set_open(true);
+            st.store(&ctx);
+            let mut contact_height = 0.0_f32;
+            let mut content_right = 0.0_f32;
+
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(panel_w, 2000.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    ui.set_max_width(panel_w);
+                    ui.set_width(panel_w);
+                    let mut on_cmd = |_cmd: FlightCommand| {};
+                    let mut on_csv = || {};
+                    let mut on_seek = |_pose: CameraPose| {};
+                    let mut args = FlightUiArgs {
+                        workspace: &mut ws,
+                        flight_stats: &mut stats,
+                        csg_stats: &csg_stats,
+                        is_csg_scene: true,
+                        csg_lod_bias: 1.0,
+                        crowd_actor_count: 12,
+                        rt_ms: 8.5,
+                        is_counters: &mut is_counters,
+                        last_is_counts: None,
+                        active_scene_label: "Gundo",
+                        cur_pose: CameraPose::default(),
+                        is_recording: false,
+                        time_scale: &mut time_scale,
+                        cam_smooth_tau: &mut cam_smooth_tau,
+                        label_buf: &mut label_buf,
+                        on_command: &mut on_cmd,
+                        on_export_flight_csv: &mut on_csv,
+                        on_seek_pose: &mut on_seek,
+                    };
+                    let y0 = ui.cursor().top();
+                    ui_lab_contact_sheet(ui, &mut args);
+                    contact_height = ui.cursor().top() - y0;
+                    content_right = ui.min_rect().right();
+                });
+                out.drop_without_applying_deltas();
+            }
+
+            // 14 segments + 3 cut markers + summary header must flow well beyond the old 132 px cap.
+            assert!(
+                contact_height > 240.0,
+                "panel_w={panel_w}: Contact Sheet stayed cramped at {contact_height:.1} px (expected > 240 px)"
+            );
+            assert!(
+                content_right <= panel_w + 1.0,
+                "panel_w={panel_w}: Contact Sheet overflowed right edge ({content_right:.1} > {panel_w:.1})"
+            );
+        }
+    }
+
+    #[test]
+    fn flight_player_queue_and_library_never_overflow_or_overlap_at_standard_widths() {
+        let mut ws = FlightWorkspace::default();
+        ws.player.curated.clear();
+        ws.player.curated.push(CuratedTrackEntry {
+            id: "curated_street".to_string(),
+            label: "Street Navigation (24s)".to_string(),
+            description: "Street-level tour through Gundo".to_string(),
+            scene_id: "gundo".to_string(),
+            track: sample_track(4, 6.0),
+            duration_s: 24.0,
+        });
+        ws.player.queue.clear();
+        ws.player.queue.push(PlaylistSlot {
+            title: "Street Navigation (24s)".to_string(),
+            description: "Street-level tour through Gundo".to_string(),
+            scene_id: "gundo".to_string(),
+            track_id: "curated_street".to_string(),
+            file_path: None,
+            track: sample_track(4, 6.0),
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::Curated,
+        });
+        ws.player.queue.push(PlaylistSlot {
+            title: "Very Long Cinematic Aerial Flythrough Over El Segundo Refinery (90s)".to_string(),
+            description: "Extended aerial overview".to_string(),
+            scene_id: "gundo".to_string(),
+            track_id: "curated_aerial".to_string(),
+            file_path: None,
+            track: sample_track(5, 18.0),
+            plan: None,
+            transition_in: PlaylistTransition::FlyThrough,
+            hold_s: 1.5,
+            stale: true,
+            origin: TrackOrigin::RepoLibrary,
+        });
+
+        let mut stats = FlightStats::new();
+        let csg_stats = CsgStats::default();
+        let mut is_counters = false;
+        let mut time_scale = 1.0_f32;
+        let mut cam_smooth_tau = 0.08_f32;
+        let mut label_buf = String::with_capacity(96);
+
+        for panel_w in [240.0_f32, 280.0, 340.0] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock = UiTheme::Obsidian.apply(&ctx);
+            let mut content_right = 0.0_f32;
+
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(panel_w, 2000.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    ui.set_max_width(panel_w);
+                    ui.set_width(panel_w);
+                    let mut on_cmd = |_cmd: FlightCommand| {};
+                    let mut on_csv = || {};
+                    let mut on_seek = |_pose: CameraPose| {};
+                    let mut args = FlightUiArgs {
+                        workspace: &mut ws,
+                        flight_stats: &mut stats,
+                        csg_stats: &csg_stats,
+                        is_csg_scene: true,
+                        csg_lod_bias: 1.0,
+                        crowd_actor_count: 12,
+                        rt_ms: 8.5,
+                        is_counters: &mut is_counters,
+                        last_is_counts: None,
+                        active_scene_label: "Gundo",
+                        cur_pose: CameraPose::default(),
+                        is_recording: false,
+                        time_scale: &mut time_scale,
+                        cam_smooth_tau: &mut cam_smooth_tau,
+                        label_buf: &mut label_buf,
+                        on_command: &mut on_cmd,
+                        on_export_flight_csv: &mut on_csv,
+                        on_seek_pose: &mut on_seek,
+                    };
+                    ui_flight_player(ui, &mut args);
+                    content_right = ui.min_rect().right();
+                });
+                out.drop_without_applying_deltas();
+            }
+
+            assert!(
+                content_right <= panel_w + 1.0,
+                "panel_w={panel_w}: Flight Player overflowed right edge ({content_right:.1} > {panel_w:.1})"
+            );
+        }
     }
 }

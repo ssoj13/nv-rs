@@ -1,7 +1,22 @@
-//! Interactive RTX OptiX 3D Fractal Path Tracer + AI Denoiser + Zero-Copy `nv-wgpu` + `egui_dock` Demo.
+//! Interactive RTX OptiX 9 Path Tracer, pure-CSG world viewer, DLSS SR/RR, Flight Lab/Player,
+//! and zero-copy `nv-wgpu` + `egui_dock` studio application (`nv-demo`).
 //!
-//! Run with:
-//! `cargo run -p nv-demo --release`
+//! What: hosts the 60 Hz paced `winit` event loop (`PresentMode::Fifo` + `ControlFlow::WaitUntil`),
+//! Vulkan/CUDA `nv-wgpu` interop swapchain (SDR + native scRGB HDR), DLSS SR/RR post-passes,
+//! background MP4/PNG/JPEG and atomic config persistence workers, [`crate::fractal_presets`],
+//! [`crate::flight`] workspace + background R0/R1 auto-planner, and live `AppBus` coordination
+//! with the async OptiX render thread (including `SceneBuildProgress` HUD polling and repaint
+//! scheduling).
+//! Why: keeps windowing, camera input (`camera-rs`), UI layout, and capture/persistence responsive
+//! at 60 Hz without blocking on multi-second CSG scene generation, OptiX shader compilation, or
+//! heavy path-traced frames.
+//! How: polls non-blocking `RenderEvent`s and lock-free `build_progress`, runs `egui` via
+//! [`crate::ui::UiContext`], dispatches `UiCommand`s and coalesced `RenderStateSnapshot`s across
+//! [`crate::app_events::AppBus`], composites post-DLSS overlays, and presents via `wgpu`.
+//! Uses: `winit`, `wgpu`, `egui`, `egui_wgpu`, `egui_winit`, `egui_dock`, `nv_wgpu`, `ngx`,
+//! `nvml`, `camera`, `csg_scene`, `csg_scenes`, `flight_navigator`, `appbus`, and all internal
+//! `nv-demo` modules.
+//! Used by: standalone binary entry point (`cargo run -p nv-demo --release`).
 
 mod app_events;
 mod bench;
@@ -12,6 +27,7 @@ mod demo_anim;
 mod fft_bloom;
 mod flight;
 mod flight_stats;
+mod fractal_presets;
 mod frame_plan_runner;
 mod gpu_export;
 mod is_counters;
@@ -2976,9 +2992,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bench: Option<crate::bench::BenchRun>,
         ser_supported: bool,
         csg_stats: crate::csg_scene_host::CsgStats,
-        crowd_step_ms: f32,
-        crowd_active_backend: crate::sdg_export::ActiveCrowdBackend,
-        crowd_actor_count: u32,
+        sim_telemetry: crate::app_events::SimTelemetry,
         last_rendered_camera: CameraFrame,
         scene_descriptors: Vec<csg_scene::SceneDescriptor>,
         scene_viewpoints: Vec<csg_scene::SceneViewpoint>,
@@ -3011,6 +3025,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
+        fractal_presets: crate::fractal_presets::FractalPresetManager,
         flight_workspace: crate::flight::FlightWorkspace,
         flight_overlay_key: Option<FlightOverlayKey>,
         flight_overlay_cache: Option<Arc<crate::overlay::FlightPathOverlayData>>,
@@ -3115,6 +3130,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             self.record_frames = 0;
             self.shutter_in_flight = false;
             self.interacting_until = None;
+            self.bus.publish_build_progress(None);
+            self.engine_phase = crate::app_events::EnginePhase::Rendering;
             self.render_fatal = Some(format!("Render worker stopped: {reason}"));
         }
 
@@ -3700,9 +3717,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 bench,
                 ser_supported: false,
                 csg_stats: crate::csg_scene_host::CsgStats::default(),
-                crowd_step_ms: 0.0,
-                crowd_active_backend: crate::sdg_export::ActiveCrowdBackend::None,
-                crowd_actor_count: 0,
+                sim_telemetry: crate::app_events::SimTelemetry::default(),
                 last_rendered_camera: initial_camera,
                 scene_descriptors,
                 scene_viewpoints: Vec::new(),
@@ -3742,6 +3757,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 settings,
                 last_sent_settings: settings,
                 demo_anim: persisted.demo_anim.clone(),
+                fractal_presets: crate::fractal_presets::FractalPresetManager::load_default(),
                 flight_workspace: {
                     let mut fw = crate::flight::FlightWorkspace::new(
                         crate::flight::default_repo_flights_dir(),
@@ -4382,9 +4398,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
-                        self.crowd_step_ms = msg.crowd_step_ms;
-                        self.crowd_active_backend = msg.crowd_active_backend;
-                        self.crowd_actor_count = msg.crowd_actor_count;
+                        self.sim_telemetry = msg.sim_telemetry;
                         self.fast_preview = msg.fast_preview;
                         let is_counts = frame_is_counts.take();
                         if is_counts.is_some() {
@@ -4623,10 +4637,24 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 .checked_sub(1)
                 .and_then(|idx| self.scene_descriptors.get(idx as usize))
                 .map_or("Classic", |d| d.name);
+            let build_progress_slot = if self.render_fatal.is_some() {
+                None
+            } else {
+                Some(self.bus.load_build_progress())
+            };
+            let build_progress = build_progress_slot
+                .as_deref()
+                .and_then(Option::as_ref);
+            let effective_phase = if self.render_fatal.is_some() {
+                crate::app_events::EnginePhase::Rendering
+            } else {
+                build_progress.map_or(self.engine_phase, |p| p.phase)
+            };
             let mut ui_ctx = UiContext {
                 bus: &self.bus,
                 settings: &mut self.settings,
                 demo_anim: &mut self.demo_anim,
+                fractal_presets: &mut self.fractal_presets,
                 display_tex_id: self.display_tex_id,
                 render_w: self.render_w,
                 render_h: self.render_h,
@@ -4655,7 +4683,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 tonemap_ms: self.tonemap_ms,
                 tensor_cores_ms: self.denoise_ms + self.dlss_ms,
                 cuda_compute_ms: self.cuda_compute_ms,
-                engine_phase: self.engine_phase,
+                engine_phase: effective_phase,
+                build_progress,
                 ui_fps: self.ui_fps,
                 rt_fps: self.rt_fps,
                 fast_preview: self.fast_preview,
@@ -4663,9 +4692,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 record_frames: self.record_frames,
                 ser_supported: self.ser_supported,
                 csg_stats: self.csg_stats,
-                crowd_step_ms: self.crowd_step_ms,
-                crowd_active_backend: self.crowd_active_backend,
-                crowd_actor_count: self.crowd_actor_count,
+                sim_telemetry: self.sim_telemetry,
                 scene_descriptors: &self.scene_descriptors,
                 scene_viewpoints: &self.scene_viewpoints,
                 dlss_rr_available: self.dlss_rr_available,
@@ -4691,6 +4718,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                 if auto_plan_busy {
                     ui.ctx().request_repaint();
+                } else if effective_phase != crate::app_events::EnginePhase::Rendering {
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
                 }
                 egui::Panel::top("top_toolbar").show(ui, |ui| {
                     ui_ctx.ui_toolbar(ui);

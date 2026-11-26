@@ -422,6 +422,11 @@ impl<T: Pod> GrowCudaBuf<T> {
         self.len_elems
     }
 
+    #[inline]
+    fn cap_bytes(&self) -> usize {
+        self.cap_bytes
+    }
+
     fn ensure_len(&mut self, stream: &Stream, count: usize) -> Result<(), String> {
         let bytes = count.saturating_mul(std::mem::size_of::<T>());
         if bytes > self.cap_bytes {
@@ -590,6 +595,8 @@ pub struct CudaCrowdBackend {
     cpu_bones_stale: bool,
     uploaded_actor_count: usize,
     uploaded_bone_count: usize,
+    last_fault: u32,
+    ias_rebuild_count: u32,
 }
 
 impl Drop for CudaCrowdBackend {
@@ -686,6 +693,8 @@ impl CudaCrowdBackend {
             cpu_bones_stale: false,
             uploaded_actor_count: 0,
             uploaded_bone_count: 0,
+            last_fault: CROWD_FAULT_NONE,
+            ias_rebuild_count: 0,
         })
     }
 
@@ -700,6 +709,8 @@ impl CudaCrowdBackend {
         self.pending_ias_rebuild = false;
         self.steer_scene = None;
         self.pending_events.clear();
+        self.last_fault = CROWD_FAULT_NONE;
+        self.ias_rebuild_count = 0;
     }
 
     /// Marks `IntentPod` buffer dirty (call after `poke_crowd` or `freeze_pose` toggle).
@@ -783,6 +794,57 @@ impl CudaCrowdBackend {
         self.topology_dirty
     }
 
+    /// Total allocated VRAM bytes across `PlanKind::Crowd` buffers and the scatter/displacement
+    /// bridge arrays.
+    #[inline]
+    pub fn gpu_bytes(&self) -> u64 {
+        let bridge = self.d_bone_slot_map.cap_bytes()
+            + self.d_gas_handles.cap_bytes()
+            + self.d_sbt_offsets.cap_bytes()
+            + self.d_rebuild_pos.cap_bytes()
+            + self.d_disp_flag.cap_bytes()
+            + self.d_skeleton_edges.cap_bytes();
+        self.plan.gpu_bytes().saturating_add(bridge as u64)
+    }
+
+    /// Declarative `PlanKind::Crowd` version executed by this backend.
+    #[inline]
+    pub fn plan_version(&self) -> u32 {
+        self.plan.plan().version
+    }
+
+    /// Total CUDA kernels launched per steady-state crowd step (`plan.frame` + 2 bridge kernels).
+    #[inline]
+    pub fn kernel_count(&self) -> u32 {
+        (self.plan.plan().frame.len() + 2) as u32
+    }
+
+    /// NVRTC math compilation mode (`Fast` vs `StrictF32`) of the active crowd plan.
+    #[inline]
+    pub fn math_mode(&self) -> nvrtc::MathMode {
+        self.plan.math_mode()
+    }
+
+    /// Number of static steering obstacles uploaded in `CrowdSteerScene`.
+    #[inline]
+    pub fn obstacle_count(&self) -> u32 {
+        self.steer_scene
+            .as_ref()
+            .map_or(0, |s| s.obstacles.len() as u32)
+    }
+
+    /// Latest fault code observed from the 12-byte async pinned `CrowdGpuStatus` readback.
+    #[inline]
+    pub fn last_fault(&self) -> u32 {
+        self.last_fault
+    }
+
+    /// Cumulative count of amortized full OptiX IAS rebuilds triggered by `CUDA_IAS_REBUILD_DISP_M`.
+    #[inline]
+    pub fn ias_rebuild_count(&self) -> u32 {
+        self.ias_rebuild_count
+    }
+
     /// Drains the previously queued 12-byte page-locked status/displacement DMA (whose stream
     /// already completed at the end-of-frame fence or an explicit sync) into `scene` and returns
     /// whether cumulative actor displacement requested a full IAS rebuild.
@@ -792,6 +854,10 @@ impl CudaCrowdBackend {
             let fault = self.pinned_status.read(STATUS_FAULT_IDX)?;
             let ground_misses = self.pinned_status.read(STATUS_GROUND_MISSES_IDX)?;
             let disp = self.pinned_status.read(STATUS_DISP_FLAG_IDX)?;
+            self.last_fault = fault;
+            if disp != 0 {
+                self.ias_rebuild_count = self.ias_rebuild_count.saturating_add(1);
+            }
             scene.apply_gpu_status(&CrowdGpuStatus {
                 fault,
                 ground_misses,

@@ -10,11 +10,13 @@
 //! **How.** Auto-Plan builds sanitized [`flight_navigator::fnav_plan::PlanRequest`] values for
 //! [`crate::flight::oracle::CsgAutoPlanner`] (backed by `csg-scene` R0 `VoxelVolume` + R1
 //! `WorldRayQuery`) and installs validated [`flight_navigator::fnav_plan::RailPlan`] results into
-//! preview state; manual keyframes capture viewport [`camera::CameraPose`] values (storing focal
-//! length in mm on a 36x24 mm full-frame back), compile via
-//! [`crate::flight::convert::keyframes_to_track`], analyze/re-time tracks via
-//! [`crate::flight::convert::analyze_and_retime_track`], and persist verified `*.fnav.json` files
-//! atomically via [`flight_navigator::PlanTrackFile`].
+//! preview state (naming the preview from `plan.request.seed` and surfacing any
+//! `plan.report.gate_failures` in `status_msg`); manual keyframes capture viewport
+//! [`camera::CameraPose`] values (storing focal length in mm on a 36x24 mm full-frame back),
+//! compile via [`crate::flight::convert::keyframes_to_track`], analyze/re-time tracks via
+//! [`crate::flight::convert::analyze_and_retime_track`], persist user lab preferences
+//! ([`PersistedLabPrefs`], including `plan_mode`) in `nv-demo.json`, and persist verified
+//! `*.fnav.json` files atomically via [`flight_navigator::PlanTrackFile`].
 //! **Uses.** `camera`, `flight_navigator::{camera_guide, fnav_core, fnav_plan}`, `glam`, `serde`.
 //! **Used by.** `crate::flight`, `crate::flight::ui`, `crate::persist`.
 
@@ -132,6 +134,8 @@ pub struct PersistedLabPrefs {
     pub duration_s: f32,
     /// Deterministic planner RNG seed.
     pub seed: u64,
+    /// Planner mode (`Deterministic` or `Creative`).
+    pub plan_mode: Mode,
     /// Global cut-density multiplier (`0.0..=2.0`).
     pub cut_density: f32,
     /// Active `camera-guide-rs` kinematic and bank limits.
@@ -147,6 +151,7 @@ impl Default for PersistedLabPrefs {
         Self {
             duration_s: LAB_DURATION_DEFAULT_S,
             seed: 42,
+            plan_mode: Mode::Deterministic,
             cut_density: 1.0,
             limits: default_lab_limits(),
             manual_keyframes: Vec::new(),
@@ -244,8 +249,9 @@ impl FlightLabState {
         }
     }
 
-    /// Installs a completed automatic [`RailPlan`] into Flight Lab preview state and refreshes
-    /// [`Self::dynamics_plot`] without mutating the validated plan track.
+    /// Installs a completed automatic [`RailPlan`] into Flight Lab preview state, derives
+    /// `track_name` from `plan.request.seed`, surfaces any `plan.report.gate_failures` in
+    /// `status_msg`, and refreshes [`Self::dynamics_plot`] without mutating the validated track.
     ///
     /// Why: `fnav-plan` already verified clearance, handovers, and section 7.4 metric gates on
     /// `plan.track`, so preserving `plan.track` verbatim as [`Self::preview_track`] keeps all
@@ -253,19 +259,36 @@ impl FlightLabState {
     pub fn apply_auto_plan(&mut self, scene_id: String, plan: RailPlan, elapsed_ms: f32) {
         let shot_count = plan.shots.len();
         let dur_s = plan.track.duration_s();
+        let plan_seed = plan.request.seed;
+        let gate_warn = if !plan.report.all_gates_passed {
+            plan.report.gate_failures.first().map(|first| {
+                if plan.report.gate_failures.len() > 1 {
+                    format!(
+                        " [WARN {} gates: {}; ...]",
+                        plan.report.gate_failures.len(),
+                        first
+                    )
+                } else {
+                    format!(" [WARN: {first}]")
+                }
+            })
+        } else {
+            None
+        };
         self.dynamics_plot = analyze_and_retime_track(&plan.track, &self.limits)
             .ok()
             .map(|(_, plot)| plot);
         self.preview_track = Some(plan.track.clone());
         self.preview_plan = Some(plan);
         let stem = sanitize_file_stem(&scene_id);
-        self.track_name = format!("{stem}_auto_{}", self.seed);
+        self.track_name = format!("{stem}_auto_{plan_seed}");
         self.auto_plan_stage = AutoPlanStage::Idle;
         self.status_msg = format!(
-            "Planned {} shots ({:.1} s) in {:.0} ms",
+            "Planned {} shots ({:.1} s) in {:.0} ms{}",
             shot_count,
             dur_s,
-            elapsed_ms.max(0.0)
+            elapsed_ms.max(0.0),
+            gate_warn.as_deref().unwrap_or("")
         );
     }
 
@@ -396,6 +419,7 @@ impl FlightLabState {
         PersistedLabPrefs {
             duration_s: self.duration_s,
             seed: self.seed,
+            plan_mode: self.plan_mode,
             cut_density: self.cut_density,
             limits: self.limits,
             manual_keyframes: self.manual_keyframes.clone(),
@@ -413,6 +437,7 @@ impl FlightLabState {
             LAB_DURATION_DEFAULT_S
         };
         self.seed = prefs.seed;
+        self.plan_mode = prefs.plan_mode;
         self.cut_density = if prefs.cut_density.is_finite() {
             prefs.cut_density.clamp(0.0, 2.0)
         } else {
@@ -480,5 +505,32 @@ mod tests {
         let req2 = lab.build_plan_request();
         assert_eq!(req2.duration_s, LAB_DURATION_DEFAULT_S);
         assert_eq!(req2.cut_density, 1.0);
+    }
+
+    #[test]
+    fn persisted_lab_prefs_roundtrip_plan_mode_and_default_missing() {
+        let mut lab = FlightLabState::new();
+        lab.plan_mode = Mode::Creative;
+        lab.seed = 10;
+        lab.cut_density = 1.4;
+
+        let prefs = lab.to_persisted();
+        assert_eq!(prefs.plan_mode, Mode::Creative);
+
+        let json = serde_json::to_string(&prefs).expect("serialize PersistedLabPrefs");
+        let parsed: PersistedLabPrefs =
+            serde_json::from_str(&json).expect("deserialize PersistedLabPrefs");
+        assert_eq!(parsed.plan_mode, Mode::Creative);
+
+        let mut restored = FlightLabState::new();
+        restored.apply_persisted(&parsed);
+        assert_eq!(restored.plan_mode, Mode::Creative);
+        assert_eq!(restored.seed, 10);
+
+        // Legacy JSON missing `plan_mode` must default cleanly to Mode::Deterministic.
+        let legacy: PersistedLabPrefs =
+            serde_json::from_str(r#"{"duration_s":30.0,"seed":7}"#).expect("legacy json");
+        assert_eq!(legacy.plan_mode, Mode::Deterministic);
+        assert_eq!(legacy.seed, 7);
     }
 }

@@ -253,6 +253,7 @@ struct ArgCell {
 pub struct GpuFramePlan {
     cuda: Arc<CudaContext>,
     plan: FramePlan,
+    math_mode: nvrtc::MathMode,
     module: cu::CUmodule,
     kernels: BTreeMap<&'static str, cu::CUfunction>,
     slots: BTreeMap<BufId, DeviceSlot>,
@@ -402,6 +403,7 @@ impl GpuFramePlan {
         Ok(Self {
             cuda: cuda.clone(),
             plan,
+            math_mode,
             module,
             kernels,
             slots,
@@ -555,6 +557,18 @@ impl GpuFramePlan {
     #[inline]
     pub fn plan(&self) -> &FramePlan {
         &self.plan
+    }
+
+    /// Returns the [`nvrtc::MathMode`] (`Fast` or `StrictF32`) used to compile this plan's PTX.
+    #[inline]
+    pub fn math_mode(&self) -> nvrtc::MathMode {
+        self.math_mode
+    }
+
+    /// Returns the total allocated VRAM footprint in bytes across all owned plan buffers.
+    #[inline]
+    pub fn gpu_bytes(&self) -> u64 {
+        self.slots.values().map(|s| s.cap_bytes as u64).sum()
     }
 
     /// Executes each raised `EventId`'s launch list in order, then `plan.frame` in exact order on

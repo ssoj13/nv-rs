@@ -1,4 +1,23 @@
-//! Docked egui UI with Phosphor icons and uniformly aligned property grids.
+//! Docked studio `egui` UI with Phosphor icons, width-clamped property grids, fractal presets,
+//! viewport HUD overlays, and theme SSOT.
+//!
+//! What: renders the top toolbar, `egui_dock` panels (`Viewport`, `Fractal`, `Render & Floor`,
+//! `Camera & Stats`, `Flight Lab`, `Flight Player`), centered [`SceneBuildProgress`] compile/build
+//! HUD overlay, clickable Apple Maps WGS84 coordinate pill, and shared property-row primitives
+//! (`dock_scroll`, `collapsing_section`, `equal_grid`, `prop_row`, `allocate_clamped_ui`,
+//! `prop_slider_f32`, `anim_slider_f32`, `stat_row`).
+//! Why: provides one Single Source of Truth for control alignment (`LABEL_W`, `VAL_W = 68.0`,
+//! `ANIM_BTN_W`, `allocate_clamped_ui`), hover-jitter-free button geometry across all five
+//! [`UiTheme`] palettes (`bg_stroke.width = 1.0`, `expansion = 0.0`, `corner_radius = 2`), and
+//! live non-blocking status feedback during heavy CSG builds or OptiX compiles.
+//! How: draws the 60 Hz UI pass over borrowed [`UiContext`] state, emits typed [`UiCommand`]s
+//! into [`AppBus`], delegates fractal preset persistence/bar UI to [`crate::fractal_presets`]
+//! (`sl-controls::preset`) and Flight Lab/Player tabs to [`crate::flight::ui`], and formats HUD
+//! lines into reusable [`UiScratch`] buffers.
+//! Uses: `egui`, `egui_dock`, `egui_phosphor`, `camera`, `csg_scene`, `crate::app_events`,
+//! `crate::demo_anim`, `crate::fractal_presets`, `crate::flight`, `crate::overlay`,
+//! `crate::profiler`, `crate::renderer`, `crate::viewport_toolbar`, `crate::wireframe`.
+//! Used by: `crate::main` (`DemoApp::render`), `crate::flight::ui`, `crate::fractal_presets`.
 
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
@@ -11,7 +30,8 @@ use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessInfo, SmartViewResult, StillFormat, UiCommand,
+    AppBus, EnginePhase, PossessInfo, SceneBuildProgress, SimTelemetry, SmartViewResult,
+    StillFormat, UiCommand,
 };
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
@@ -87,7 +107,9 @@ const SKY_COASTAL_NIGHT: u32 = 8;
 const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
 
 const LABEL_W: f32 = 84.0;
-const VAL_W: f32 = 56.0;
+/// Width of numeric `DragValue` boxes in slider rows; sized for 9-character `11.0 pt` monospace
+/// readouts with units (e.g. `"12.0 m/s2"`, `"20.0 m/s3"`) plus `2.0 px` horizontal padding.
+const VAL_W: f32 = 68.0;
 pub(crate) const ANIM_BTN_W: f32 = 16.0;
 pub(crate) const ROW_H: f32 = 14.0;
 
@@ -184,6 +206,8 @@ pub struct UiScratch {
     pub status_buf: String,
     /// Reusable buffer for short telemetry/badge/toolbar formatted strings.
     pub label_buf: String,
+    /// Reusable buffer for lazily formatted hover tooltips (formatted only while hovered).
+    pub tip_buf: String,
 }
 
 impl Default for UiScratch {
@@ -191,6 +215,7 @@ impl Default for UiScratch {
         Self {
             status_buf: String::with_capacity(192),
             label_buf: String::with_capacity(96),
+            tip_buf: String::with_capacity(256),
         }
     }
 }
@@ -310,6 +335,183 @@ pub fn format_engine_phase_label(
         None => write_engine_phase_label(&mut out, phase, accum_count, max_accum, &[]),
     }
     out
+}
+
+/// Draws a compact centered studio progress card inside `viewport_rect` while the render worker
+/// compiles OptiX pipelines, generates a CSG world, builds per-compound GASes, or updates the IAS.
+fn draw_scene_build_progress_overlay(
+    ui: &mut Ui,
+    viewport_rect: egui::Rect,
+    theme: UiTheme,
+    phase: EnginePhase,
+    progress: Option<&SceneBuildProgress>,
+    now: std::time::Instant,
+) -> egui::Rect {
+    if viewport_rect.width() < 40.0 || viewport_rect.height() < 40.0 {
+        return viewport_rect;
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(50));
+
+    let max_w = (viewport_rect.width() - 24.0).max(1.0);
+    let card_w = max_w.clamp(180.0_f32.min(viewport_rect.width()), 340.0);
+    let card_h = 74.0_f32.min(viewport_rect.height());
+    let card_rect =
+        egui::Rect::from_center_size(viewport_rect.center(), egui::vec2(card_w, card_h));
+
+    let is_light = matches!(theme, UiTheme::Light);
+    let (card_bg, border_col, title_col, sub_col, accent_col, track_bg) = if is_light {
+        (
+            Color32::from_rgba_unmultiplied(246, 248, 252, 242),
+            Color32::from_rgba_unmultiplied(37, 99, 235, 150),
+            Color32::from_rgb(24, 29, 38),
+            Color32::from_rgb(82, 94, 112),
+            Color32::from_rgb(37, 99, 235),
+            Color32::from_rgba_unmultiplied(15, 23, 42, 22),
+        )
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(15, 18, 24, 232),
+            Color32::from_rgba_unmultiplied(88, 142, 235, 165),
+            Color32::from_rgb(232, 238, 248),
+            Color32::from_rgb(168, 182, 204),
+            Color32::from_rgb(92, 152, 255),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+        )
+    };
+
+    let painter = ui.painter().with_clip_rect(viewport_rect);
+    painter.rect_filled(card_rect, 6.0, card_bg);
+    painter.rect_stroke(
+        card_rect,
+        6.0,
+        egui::Stroke::new(1.0, border_col),
+        egui::StrokeKind::Inside,
+    );
+
+    let phase_icon = match phase {
+        EnginePhase::CompilingOptix => ic::CPU,
+        EnginePhase::BuildingCsgScene => ic::BUILDINGS,
+        EnginePhase::UpdatingIas => ic::STACK,
+        EnginePhase::Rendering => ic::CHECK_CIRCLE,
+    };
+    let title = progress
+        .filter(|bp| !bp.scene_name.is_empty())
+        .map_or_else(
+            || phase.transient_label().unwrap_or("Working..."),
+            |bp| bp.scene_name.as_str(),
+        );
+    let stage_text = progress.map_or_else(
+        || phase.transient_label().unwrap_or("Working...").to_owned(),
+        SceneBuildProgress::format_stage_line,
+    );
+    let elapsed_text = progress
+        .map(|bp| SceneBuildProgress::format_elapsed(bp.elapsed_secs(now)))
+        .unwrap_or_default();
+    let frac = progress.and_then(SceneBuildProgress::fraction);
+    let pct_text = match frac {
+        Some(f) => format!("{}%", (f * 100.0).round() as u32),
+        None => "Working".to_owned(),
+    };
+
+    let inner = card_rect.shrink2(egui::vec2(12.0, 9.0));
+    if inner.width() <= 8.0 || inner.height() <= 16.0 {
+        return card_rect;
+    }
+
+    let row1_rect = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(inner.right(), (inner.top() + 18.0).min(inner.bottom())),
+    );
+    let mut row1 = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row1_rect)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    row1.shrink_clip_rect(row1_rect);
+    row1.spacing_mut().item_spacing.x = 6.0;
+    if !elapsed_text.is_empty() {
+        row1.label(
+            RichText::new(&elapsed_text)
+                .monospace()
+                .size(11.0)
+                .color(sub_col),
+        );
+    }
+    row1.with_layout(Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add(egui::Spinner::new().size(12.0).color(accent_col));
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{phase_icon}  {title}"))
+                    .strong()
+                    .size(12.0)
+                    .color(title_col),
+            )
+            .truncate(),
+        );
+    });
+
+    let row2_top = (inner.top() + 22.0).min(inner.bottom());
+    let row2_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), row2_top),
+        egui::pos2(inner.right(), (row2_top + 16.0).min(inner.bottom())),
+    );
+    if row2_rect.height() >= 8.0 {
+        let mut row2 = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row2_rect)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        row2.shrink_clip_rect(row2_rect);
+        row2.spacing_mut().item_spacing.x = 6.0;
+        row2.label(
+            RichText::new(&pct_text)
+                .monospace()
+                .size(10.5)
+                .color(accent_col),
+        );
+        row2.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(&stage_text).size(11.0).color(sub_col)).truncate(),
+            );
+        });
+    }
+
+    let bar_h = 6.0;
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(inner.left(), (inner.bottom() - bar_h).max(inner.top())),
+        inner.max,
+    );
+    if bar_rect.height() >= 2.0 && bar_rect.width() >= 8.0 {
+        let bar_painter = ui.painter().with_clip_rect(card_rect);
+        bar_painter.rect_filled(bar_rect, 3.0, track_bg);
+        if let Some(f) = frac {
+            let fill_w = (bar_rect.width() * f).clamp(if f > 0.0 { 4.0 } else { 0.0 }, bar_rect.width());
+            if fill_w > 0.0 {
+                let fill_rect =
+                    egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_rect.height()));
+                bar_painter.rect_filled(fill_rect, 3.0, accent_col);
+            }
+        } else {
+            let t = ui.input(|i| i.time);
+            let cycle = (t * 0.75).rem_euclid(1.0) as f32;
+            let seg_min = 24.0_f32.min(bar_rect.width());
+            let seg_w = (bar_rect.width() * 0.32).clamp(seg_min, bar_rect.width());
+            let travel = bar_rect.width() + seg_w;
+            let seg_left = (bar_rect.left() - seg_w + cycle * travel).max(bar_rect.left());
+            let seg_right = (bar_rect.left() + cycle * travel).min(bar_rect.right());
+            if seg_right > seg_left {
+                let seg_rect = egui::Rect::from_min_max(
+                    egui::pos2(seg_left, bar_rect.top()),
+                    egui::pos2(seg_right, bar_rect.bottom()),
+                );
+                bar_painter.rect_filled(seg_rect, 3.0, accent_col);
+            }
+        }
+    }
+
+    card_rect
 }
 
 /// Converts a right-handed world position `[x, y, z]` (`+X = East`, `+Y = Up` orthometric
@@ -516,6 +718,21 @@ impl UiTheme {
             Color32::from_rgb(50, 55, 66)
         };
         visuals.widgets.active.bg_fill = accent.linear_multiply(0.55);
+        // Unify stroke width, expansion, and corner radius across all widget states so buttons
+        // with explicit 1px `.stroke(...)` never change `inner_margin` or height on hover
+        // (`Style::button_style` computes `button_padding + expansion - bg_stroke.width`).
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Color32::TRANSPARENT);
+        for w in [
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.open,
+        ] {
+            w.bg_stroke.width = 1.0;
+            w.expansion = 0.0;
+            w.corner_radius = egui::CornerRadius::same(2);
+        }
         let egui_theme = if is_light {
             egui::Theme::Light
         } else {
@@ -558,6 +775,7 @@ pub struct UiContext<'a> {
     pub bus: &'a AppBus,
     pub settings: &'a mut DemoSettings,
     pub demo_anim: &'a mut DemoAnimator,
+    pub fractal_presets: &'a mut crate::fractal_presets::FractalPresetManager,
     pub display_tex_id: egui::TextureId,
     pub render_w: u32,
     pub render_h: u32,
@@ -591,6 +809,8 @@ pub struct UiContext<'a> {
     pub cuda_compute_ms: f32,
     /// Active engine execution phase (`CompilingOptix`, `BuildingCsgScene`, `UpdatingIas`, `Rendering`).
     pub engine_phase: EnginePhase,
+    /// Live render-worker compile/build progress snapshot (`None` when steady-state rendering).
+    pub build_progress: Option<&'a SceneBuildProgress>,
     pub ui_fps: f32,
     pub rt_fps: f32,
     pub fast_preview: bool,
@@ -598,9 +818,7 @@ pub struct UiContext<'a> {
     pub record_frames: u64,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
-    pub crowd_step_ms: f32,
-    pub crowd_active_backend: ActiveCrowdBackend,
-    pub crowd_actor_count: u32,
+    pub sim_telemetry: SimTelemetry,
     pub scene_descriptors: &'a [SceneDescriptor],
     pub scene_viewpoints: &'a [SceneViewpoint],
     pub dlss_rr_available: bool,
@@ -657,9 +875,15 @@ fn dock_scroll(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.set_max_width(inner_w);
-            ui.set_width(inner_w);
-            add_contents(ui);
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(inner_w, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(inner_w);
+                    add_contents(ui);
+                },
+            );
         });
 }
 
@@ -1579,17 +1803,24 @@ impl UiContext<'_> {
             ic::STACK
         };
 
+        let now = std::time::Instant::now();
         let status_buf = &mut self.scratch.status_buf;
         status_buf.clear();
         status_buf.push_str(phase_icon);
         status_buf.push(' ');
-        write_engine_phase_label(
-            status_buf,
-            self.engine_phase,
-            self.accum_count,
-            self.settings.max_accum,
-            anim_slice,
-        );
+        if self.engine_phase != EnginePhase::Rendering
+            && let Some(bp) = self.build_progress
+        {
+            bp.write_status_summary(status_buf, bp.elapsed_secs(now));
+        } else {
+            write_engine_phase_label(
+                status_buf,
+                self.engine_phase,
+                self.accum_count,
+                self.settings.max_accum,
+                anim_slice,
+            );
+        }
         let Ok(()) = write!(
             status_buf,
             "  |  {}x{}  |  {}",
@@ -1711,6 +1942,18 @@ impl UiContext<'_> {
                 Color32::WHITE,
             );
         }
+
+        // Centered studio progress card while compiling pipelines or building a CSG scene / IAS.
+        if self.engine_phase != EnginePhase::Rendering {
+            draw_scene_build_progress_overlay(
+                ui,
+                rect,
+                *self.theme,
+                self.engine_phase,
+                self.build_progress,
+                now,
+            );
+        }
     }
 
     fn ui_fractal(&mut self, ui: &mut Ui) {
@@ -1729,73 +1972,91 @@ impl UiContext<'_> {
             }
         });
         ui.add_space(2.0);
+        let presets = &mut *self.fractal_presets;
         collapsing_section(ui, "sec_presets", ic::SPARKLE, "Presets", |ui| {
-            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
-                0 => {
-                    if ui
-                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Gold Bulb"))
-                        .on_hover_text("Load a classic 3D Mandelbulb preset with warm metallic gold shading.")
-                        .clicked()
-                    {
-                        s.fractal_kind = 0;
-                        s.bulb_power = 8.0;
-                        s.bulb_julia = false;
-                        s.metallic = 0.78;
-                        s.roughness = 0.14;
-                        s.palette_shift = 0.08;
-                        s.sun_azimuth = 36.0;
-                        s.sun_elevation = 42.0;
-                    }
-                }
-                1 => {
-                    if ui
-                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Chrome Box"))
-                        .on_hover_text("Load an architectural Mandelbox preset with polished chrome reflections.")
-                        .clicked()
-                    {
-                        s.fractal_kind = 1;
-                        s.box_scale = -2.0;
-                        s.box_fold = 1.0;
-                        s.metallic = 0.92;
-                        s.roughness = 0.10;
-                        s.palette_shift = 0.45;
-                        s.sun_azimuth = -45.0;
-                        s.sun_elevation = 35.0;
-                    }
-                }
-                2 => {
-                    if ui
-                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Obsidian KIFS"))
-                        .on_hover_text("Load a geometric KIFS/Menger folding fractal with dark glossy material.")
-                        .clicked()
-                    {
-                        s.fractal_kind = 2;
-                        s.kifs_scale = 2.0;
-                        s.kifs_rot1 = 18.0;
-                        s.kifs_rot2 = -12.0;
-                        s.metallic = 0.65;
-                        s.roughness = 0.22;
-                        s.palette_shift = 0.72;
-                        s.sun_azimuth = 55.0;
-                        s.sun_elevation = 28.0;
-                    }
-                }
-                _ => {
-                    if ui
-                        .add_sized([w, ROW_H + 2.0], egui::Button::new("Julia Coral"))
-                        .on_hover_text("Load an organic Julia-set Mandelbulb preset with soft coral tones.")
-                        .clicked()
-                    {
-                        s.fractal_kind = 0;
-                        s.bulb_power = 7.0;
-                        s.bulb_julia = true;
-                        s.bulb_c = [-0.22, 0.62, 0.18];
-                        s.metallic = 0.30;
-                        s.roughness = 0.26;
-                        s.palette_shift = 0.22;
-                    }
+            presets.draw_preset_bar(ui, s);
+            ui.add_space(4.0);
+
+            let builtins = crate::fractal_presets::builtin_presets();
+            let modified = presets.is_selected_modified(s);
+            let mut load_builtin: Option<&'static str> = None;
+            equal_grid(ui, 2, builtins.len(), |ui, idx, w| {
+                let Some(spec) = builtins.get(idx) else {
+                    return;
+                };
+                let selected = presets.is_selected(spec.name);
+                let btn = if selected && modified {
+                    egui::Button::selectable(true, format!("{} *", spec.name)).truncate()
+                } else {
+                    egui::Button::selectable(selected, spec.name).truncate()
+                };
+                if ui
+                    .add_sized([w, ROW_H + 2.0], btn)
+                    .on_hover_text(spec.tooltip)
+                    .clicked()
+                {
+                    load_builtin = Some(spec.name);
                 }
             });
+            if let Some(name) = load_builtin {
+                presets.apply_preset(name, s);
+            }
+
+            let user_count = presets.user_presets().count();
+            if user_count > 0 {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("User Presets")
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(2.0);
+                let mut load_user: Option<String> = None;
+                equal_grid(ui, 2, user_count, |ui, idx, w| {
+                    let Some(preset) = presets.user_presets().nth(idx) else {
+                        return;
+                    };
+                    let name = preset.name.as_str();
+                    let selected = presets.is_selected(name);
+                    let btn = if selected && modified {
+                        egui::Button::selectable(true, format!("{name} *")).truncate()
+                    } else {
+                        egui::Button::selectable(selected, name).truncate()
+                    };
+                    if ui
+                        .add_sized([w, ROW_H + 2.0], btn)
+                        .on_hover_ui(|ui| {
+                            ui.label(format!("Load user preset '{name}'"));
+                        })
+                        .clicked()
+                    {
+                        load_user = Some(name.to_string());
+                    }
+                });
+                if let Some(name) = load_user {
+                    presets.apply_preset(&name, s);
+                }
+            }
+
+            if let Some(status) = &presets.status {
+                ui.add_space(3.0);
+                let (icon, msg, color) = match status {
+                    crate::fractal_presets::PresetStatus::Info(m) => {
+                        (ic::CHECK_CIRCLE, m.as_str(), ui.visuals().weak_text_color())
+                    }
+                    crate::fractal_presets::PresetStatus::Warning(m) => {
+                        (ic::WARNING, m.as_str(), ui.visuals().warn_fg_color)
+                    }
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{icon}  {msg}"))
+                            .size(11.0)
+                            .color(color),
+                    )
+                    .wrap(),
+                );
+            }
         });
 
         collapsing_section(ui, "sec_formula", ic::CUBE, "Formula", |ui| {
@@ -2417,14 +2678,14 @@ impl UiContext<'_> {
                         self.bus.emit_ui(UiCommand::ToggleFreezePose);
                     }
                     ui.add_space(2.0);
-                    let crowd_badge = if self.crowd_actor_count > 0 {
+                    let crowd_badge = if self.sim_telemetry.crowd_actors > 0 {
                         fmt_into(
                             &mut self.scratch.label_buf,
                             format_args!(
                                 "Crowd Backend ({} {:.2} ms, {}a)",
-                                self.crowd_active_backend.label(),
-                                self.crowd_step_ms,
-                                self.crowd_actor_count
+                                self.sim_telemetry.crowd_backend.label(),
+                                self.sim_telemetry.crowd_step_ms,
+                                self.sim_telemetry.crowd_actors
                             ),
                         )
                     } else {
@@ -3569,7 +3830,7 @@ impl UiContext<'_> {
                 csg_stats: &self.csg_stats,
                 is_csg_scene,
                 csg_lod_bias,
-                crowd_actor_count: self.crowd_actor_count,
+                crowd_actor_count: self.sim_telemetry.crowd_actors,
                 rt_ms: self.rt_ms,
                 is_counters: &mut s.is_counters,
                 last_is_counts: self.is_counts.as_ref(),
@@ -3706,7 +3967,11 @@ impl UiContext<'_> {
         }
 
         collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", |ui| {
-            let buf = &mut self.scratch.label_buf;
+            let UiScratch {
+                label_buf: buf,
+                tip_buf,
+                ..
+            } = &mut *self.scratch;
             stat_row(ui, "GPU", &self.telemetry.gpu_name);
             stat_row(
                 ui,
@@ -3852,20 +4117,8 @@ impl UiContext<'_> {
                         format_args!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
                     ),
                 );
-                if self.crowd_actor_count > 0 {
-                    stat_row(
-                        ui,
-                        "Crowd Sim",
-                        fmt_into(
-                            buf,
-                            format_args!(
-                                "{} {:.2} ms ({})",
-                                self.crowd_active_backend.label(),
-                                self.crowd_step_ms,
-                                self.crowd_actor_count
-                            ),
-                        ),
-                    );
+                if self.sim_telemetry.has_any() {
+                    render_sim_telemetry(ui, &self.sim_telemetry, self.rt_fps, buf, tip_buf);
                 }
             }
         });
@@ -4300,10 +4553,20 @@ pub(crate) fn collapsing_section(
         egui::FontId::proportional(12.0),
         text_col,
     );
+    let indent_w = (total_w - ui.spacing().indent).max(60.0);
     state.show_body_indented(&title_resp, ui, |ui| {
-        ui.add_space(2.0);
-        add_body(ui);
-        ui.add_space(2.0);
+        let body_w = ui.available_width().min(indent_w).max(60.0);
+        allocate_clamped_ui(
+            ui,
+            egui::vec2(body_w, 0.0),
+            Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_min_width(body_w);
+                ui.add_space(2.0);
+                add_body(ui);
+                ui.add_space(2.0);
+            },
+        );
     });
 }
 
@@ -4352,6 +4615,68 @@ pub(crate) fn cycle_toggle_btn(
     step
 }
 
+/// Allocates a child `Ui` of `desired_size` with `layout` whose reported horizontal extent is
+/// hard-clamped to `desired_size.x` and clipped horizontally so no overflowing child widget
+/// (such as a `DragValue` using `TextWrapMode::Extend`) can expand the parent `Ui`'s
+/// `max_rect.max.x` (`available_width()`).
+pub(crate) fn allocate_clamped_ui<R>(
+    ui: &mut Ui,
+    desired_size: egui::Vec2,
+    layout: Layout,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let avail = ui.available_rect_before_wrap();
+    let h = if ui.layout().is_horizontal() {
+        avail.height().max(desired_size.y)
+    } else {
+        desired_size.y
+    };
+    let child_rect = egui::Rect::from_min_size(avail.min, egui::vec2(desired_size.x, h));
+    let mut child_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(child_rect)
+            .layout(layout),
+    );
+    child_ui.set_max_width(desired_size.x);
+    let cur_clip = child_ui.clip_rect();
+    let horiz_clip = egui::Rect::from_min_max(
+        egui::pos2(child_rect.min.x, cur_clip.min.y),
+        egui::pos2(child_rect.max.x, cur_clip.max.y),
+    );
+    child_ui.shrink_clip_rect(horiz_clip);
+    let ret = add_contents(&mut child_ui);
+    let mut used = child_ui.min_rect();
+    used.min.x = child_rect.min.x;
+    used.max.x = child_rect.max.x;
+    used.min.y = used.min.y.min(child_rect.min.y);
+    used.max.y = used.max.y.max(child_rect.min.y + desired_size.y);
+    drop(child_ui);
+    ui.advance_cursor_after_rect(used);
+    ret
+}
+
+/// Renders a compact `11.0 pt` monospace `DragValue` inside a hard-clamped `val_w` column with
+/// `2.0 px` horizontal padding so values with unit suffixes (`"35.0 deg"`, `"12.0 m/s2"`,
+/// `"20.0 m/s3"`) fit cleanly and every slider value box shares one exact columnar width.
+fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) {
+    allocate_clamped_ui(
+        ui,
+        egui::vec2(val_w, ROW_H),
+        Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            let font = egui::FontId::monospace(11.0);
+            let style = ui.style_mut();
+            style.drag_value_text_style = egui::TextStyle::Monospace;
+            style.override_text_style = Some(egui::TextStyle::Monospace);
+            style.override_font_id = Some(font.clone());
+            style.text_styles.insert(egui::TextStyle::Monospace, font);
+            style.spacing.button_padding.x = 2.0;
+            style.spacing.interact_size.x = val_w;
+            ui.add(drag);
+        },
+    );
+}
+
 /// Computes adaptive `(label_w, rem_w)` column widths for a property row so labels shrink
 /// gracefully on narrow dock panes without clipping control columns.
 pub(crate) fn prop_row_widths(total_w: f32) -> (f32, f32) {
@@ -4361,7 +4686,7 @@ pub(crate) fn prop_row_widths(total_w: f32) -> (f32, f32) {
     } else {
         240.0
     };
-    let label_w = LABEL_W.min((safe_w * 0.34).max(46.0));
+    let label_w = LABEL_W.min((safe_w * 0.34).max(46.0)).floor();
     let rem_w = (safe_w - label_w - row_gap).max(76.0);
     (label_w, rem_w)
 }
@@ -4384,40 +4709,45 @@ pub(crate) fn equal_grid(
 ) {
     let gap = 4.0;
     let cols = cols.max(1);
-    let total_w = ui.available_width().max(48.0);
-    let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(20.0);
+    let total_w = ui.available_width().max(1.0);
+    let cell_w = ((total_w - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).max(1.0);
     let mut idx = 0;
     while idx < count {
-        ui.horizontal(|ui| {
-            ui.set_max_width(total_w);
-            ui.spacing_mut().item_spacing.x = gap;
-            for _ in 0..cols {
-                if idx < count {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(cell_w, ROW_H + 2.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.set_max_width(cell_w);
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                            item_ui(ui, idx, cell_w);
-                        },
-                    );
-                    idx += 1;
+        allocate_clamped_ui(
+            ui,
+            egui::vec2(total_w, ROW_H + 2.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for _ in 0..cols {
+                    if idx < count {
+                        allocate_clamped_ui(
+                            ui,
+                            egui::vec2(cell_w, ROW_H + 2.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                item_ui(ui, idx, cell_w);
+                            },
+                        );
+                        idx += 1;
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 }
 
 pub(crate) fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
-    let total_w = ui.available_width().max(130.0);
+    let row_w = ui.available_width().max(1.0);
     let gap = 6.0;
-    let (label_w, rem_w) = prop_row_widths(total_w);
-    ui.allocate_ui_with_layout(
-        egui::vec2(total_w, ROW_H),
+    let (label_w, rem_w) = prop_row_widths(row_w);
+    let rem_w = rem_w.min((row_w - label_w - gap).max(1.0));
+    allocate_clamped_ui(
+        ui,
+        egui::vec2(row_w, ROW_H),
         Layout::left_to_right(Align::Center),
         |ui| {
-            ui.set_max_width(total_w);
             ui.spacing_mut().item_spacing.x = gap;
             let (label_rect, label_resp) =
                 ui.allocate_exact_size(egui::vec2(label_w, ROW_H), Sense::hover());
@@ -4440,11 +4770,12 @@ pub(crate) fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut 
             if clipped && label_resp.hovered() {
                 label_resp.on_hover_text(label);
             }
-            ui.allocate_ui_with_layout(
-                egui::vec2(rem_w, ROW_H),
+            let ctrl_w = ui.available_width().min(rem_w).max(1.0);
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(ctrl_w, ROW_H),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    ui.set_max_width(rem_w);
                     add_contents(ui);
                 },
             );
@@ -4539,16 +4870,14 @@ fn anim_slider_f32(
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-        ui.add_sized(
-            [val_w, ROW_H],
+        slider_drag_value(
+            ui,
+            val_w,
             egui::DragValue::new(val)
                 .range(range)
                 .fixed_decimals(decimals)
                 .speed(0.005),
         );
-        ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn(ui, anim, key);
     });
 }
@@ -4574,8 +4903,6 @@ pub(crate) fn prop_slider_f32(
         };
         let slider = egui::Slider::new(val, range.clone()).show_value(false);
         ui.add_sized([track_w, ROW_H], slider);
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         let mut drag = egui::DragValue::new(val)
             .range(range)
             .fixed_decimals(decimals)
@@ -4583,8 +4910,7 @@ pub(crate) fn prop_slider_f32(
         if !suffix.is_empty() {
             drag = drag.suffix(suffix);
         }
-        ui.add_sized([val_w, ROW_H], drag);
-        ui.style_mut().override_text_style = prev_style;
+        slider_drag_value(ui, val_w, drag);
         anim_toggle_btn_disabled(ui);
     });
 }
@@ -4599,13 +4925,7 @@ pub(crate) fn prop_slider_u32(ui: &mut Ui, label: &str, val: &mut u32, range: Ra
             .show_value(false)
             .logarithmic(log);
         ui.add_sized([track_w, ROW_H], slider);
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-        ui.add_sized(
-            [val_w, ROW_H],
-            egui::DragValue::new(val).range(range).speed(1.0),
-        );
-        ui.style_mut().override_text_style = prev_style;
+        slider_drag_value(ui, val_w, egui::DragValue::new(val).range(range).speed(1.0));
         anim_toggle_btn_disabled(ui);
     });
 }
@@ -4626,18 +4946,16 @@ fn anim_vec3(
         let gap = 4.0;
         let w = ((ui.available_width() - ANIM_BTN_W - gap * 3.0) / 3.0).max(18.0);
         ui.spacing_mut().item_spacing.x = gap;
-        let prev_style = ui.style().override_text_style.clone();
-        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
         for item in v.iter_mut() {
-            ui.add_sized(
-                [w, ROW_H],
+            slider_drag_value(
+                ui,
+                w,
                 egui::DragValue::new(item)
                     .range(range.clone())
                     .speed(speed)
                     .fixed_decimals(2),
             );
         }
-        ui.style_mut().override_text_style = prev_style;
         anim_toggle_btn(ui, anim, key);
     });
 }
@@ -4647,11 +4965,11 @@ pub(crate) fn prop_toggle(ui: &mut Ui, label: &str, val: &mut bool, text: &str) 
         let gap = 4.0;
         let check_w = (ui.available_width() - ANIM_BTN_W - gap).max(24.0);
         ui.spacing_mut().item_spacing.x = gap;
-        ui.allocate_ui_with_layout(
+        allocate_clamped_ui(
+            ui,
             egui::vec2(check_w, ROW_H),
             Layout::left_to_right(Align::Center),
             |ui| {
-                ui.set_max_width(check_w);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 ui.checkbox(val, text);
             },
@@ -4676,6 +4994,255 @@ pub(crate) fn stat_row(ui: &mut Ui, label: &str, value: &str) {
             }
         });
     });
+}
+
+/// Like [`stat_row`] with a lazily formatted hover tooltip (runs `format_tip` only while hovered
+/// so steady-state 60 Hz frames spend zero CPU and zero allocations on tooltip text).
+fn stat_row_tip(
+    ui: &mut Ui,
+    label: &str,
+    value: &str,
+    tip_buf: &mut String,
+    format_tip: impl FnOnce(&mut String),
+) {
+    prop_row(ui, label, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let resp = ui.add(
+                egui::Label::new(
+                    RichText::new(value)
+                        .size(11.5)
+                        .color(ui.visuals().text_color()),
+                )
+                .truncate(),
+            );
+            if resp.hovered() {
+                tip_buf.clear();
+                format_tip(tip_buf);
+                resp.on_hover_text(tip_buf.as_str());
+            }
+        });
+    });
+}
+
+/// Renders structured Crowd, Locomotion, and Traffic simulation telemetry rows inside the
+/// `Telemetry` panel using SSOT [`stat_row_tip`] alignment and reusable scratch buffers.
+pub(crate) fn render_sim_telemetry(
+    ui: &mut Ui,
+    sim: &SimTelemetry,
+    rt_fps: f32,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    if sim.has_crowd() {
+        ui.add_space(3.0);
+        let hdr = fmt_into(
+            label_buf,
+            format_args!("{}  Crowd & Locomotion", ic::USERS_THREE),
+        );
+        ui.label(
+            RichText::new(hdr)
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+
+        let crowd_sim_val = match sim.crowd_backend {
+            ActiveCrowdBackend::Cuda => fmt_into(
+                label_buf,
+                format_args!(
+                    "CUDA v{} {:.2} ms",
+                    sim.crowd_plan_version.max(2),
+                    sim.crowd_step_ms
+                ),
+            ),
+            ActiveCrowdBackend::Cpu => {
+                fmt_into(label_buf, format_args!("CPU {:.2} ms", sim.crowd_step_ms))
+            }
+            ActiveCrowdBackend::None => {
+                if sim.pose_frozen {
+                    "Frozen"
+                } else {
+                    "Idle"
+                }
+            }
+        };
+        stat_row_tip(ui, "Crowd Sim", crowd_sim_val, tip_buf, |t| {
+            let math = if sim.crowd_strict_f32 {
+                "StrictF32"
+            } else {
+                "Fast"
+            };
+            let _ = write!(
+                t,
+                "Backend: {} | Step: {:.2} ms",
+                sim.crowd_backend.label(),
+                sim.crowd_step_ms
+            );
+            if sim.crowd_backend == ActiveCrowdBackend::Cuda {
+                let _ = write!(
+                    t,
+                    "\nPlanKind::Crowd v{} ({} kernels + scatter bridge, NVRTC {math})",
+                    sim.crowd_plan_version.max(2),
+                    sim.crowd_kernel_count
+                );
+                if sim.crowd_gpu_fault == 0 {
+                    t.push_str("\nGPU Fault: None (OK)");
+                } else {
+                    let _ = write!(t, "\nGPU Fault: 0x{:08x}", sim.crowd_gpu_fault);
+                }
+            }
+        });
+
+        sim.write_archetypes_compact(label_buf);
+        stat_row_tip(ui, "Actors", label_buf.as_str(), tip_buf, |t| {
+            let [hero, ped, sign, pet] = sim.crowd_archetypes;
+            let _ = write!(
+                t,
+                "Total: {} actors\nHumanHero: {hero} | HumanCrowd: {ped}\nRoadSign: {sign} | Quadruped: {pet}\nWalkways: {} | Obstacles: {}",
+                sim.crowd_actors, sim.crowd_walkways, sim.crowd_obstacles
+            );
+        });
+
+        let rig_val = fmt_into(
+            label_buf,
+            format_args!("{} b / {} DOF", sim.crowd_bones, sim.crowd_dofs),
+        );
+        stat_row_tip(ui, "Rig / Bones", rig_val, tip_buf, |t| {
+            let bps = sim.bones_per_sec(rt_fps);
+            let _ = write!(
+                t,
+                "Bones: {} | World Joints: {}\nSkeleton Edges: {} | Total DOFs: {}",
+                sim.crowd_bones, sim.crowd_joints, sim.crowd_skeleton_edges, sim.crowd_dofs
+            );
+            if bps >= 1000.0 {
+                let _ = write!(t, "\nThroughput: {:.1}k bones/s", bps / 1000.0);
+            } else if bps > 0.0 {
+                let _ = write!(t, "\nThroughput: {:.0} bones/s", bps);
+            } else {
+                t.push_str("\nThroughput: 0 bones/s (paused/frozen)");
+            }
+        });
+
+        let loco_val = if sim.pose_frozen {
+            fmt_into(
+                label_buf,
+                format_args!("Frozen | {} miss", sim.crowd_ground_misses),
+            )
+        } else if sim.gpu_camera_active {
+            fmt_into(
+                label_buf,
+                format_args!("{:.2}x | GPU Cam", sim.sim_rate),
+            )
+        } else {
+            fmt_into(
+                label_buf,
+                format_args!("{:.2}x | {} miss", sim.sim_rate, sim.crowd_ground_misses),
+            )
+        };
+        stat_row_tip(ui, "Locomotion", loco_val, tip_buf, |t| {
+            let _ = write!(
+                t,
+                "State: {} (rate {:.2}x)\nCrowd LOD: ",
+                if sim.pose_frozen { "Frozen" } else { "Active" },
+                sim.sim_rate
+            );
+            sim.append_lod_summary(t);
+            let _ = write!(
+                t,
+                "\nGround Probe Misses (12 B async DMA): {}\nGPU Camera Rig (PlanKind::Camera v1): {}",
+                sim.crowd_ground_misses,
+                if sim.gpu_camera_active {
+                    "Active (VRAM zero-copy)"
+                } else {
+                    "Idle"
+                }
+            );
+        });
+
+        if sim.crowd_backend == ActiveCrowdBackend::Cuda && sim.crowd_gpu_bytes > 0 {
+            SimTelemetry::write_bytes_compact(sim.crowd_gpu_bytes, label_buf);
+            let _ = write!(label_buf, " ({} rbld)", sim.crowd_ias_rebuilds);
+            stat_row_tip(ui, "Crowd VRAM", label_buf.as_str(), tip_buf, |t| {
+                t.push_str("Plan + Scatter Bridge VRAM: ");
+                SimTelemetry::append_bytes_compact(sim.crowd_gpu_bytes, t);
+                let _ = write!(
+                    t,
+                    "\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                    sim.crowd_ias_rebuilds
+                );
+            });
+        }
+    }
+
+    if sim.has_traffic() {
+        ui.add_space(3.0);
+        let hdr = fmt_into(label_buf, format_args!("{}  Vehicles & Traffic", ic::CAR));
+        ui.label(
+            RichText::new(hdr)
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+
+        let traffic_sim_val = if sim.traffic_stepping {
+            fmt_into(
+                label_buf,
+                format_args!("CPU SoA {:.2} ms", sim.traffic_step_ms),
+            )
+        } else if sim.pose_frozen {
+            "CPU SoA Frozen"
+        } else {
+            "CPU SoA Paused"
+        };
+        stat_row_tip(ui, "Traffic Sim", traffic_sim_val, tip_buf, |t| {
+            let _ = write!(
+                t,
+                "Backend: CPU SoA lane-graph + async pinned DMA prefix + GPU OptiX IAS refit\nStep: {:.2} ms | Lane Graph: {}\nDynamic Instances (bodies + wheels): {}",
+                sim.traffic_step_ms,
+                if sim.traffic_has_lane_graph {
+                    "Active"
+                } else {
+                    "None"
+                },
+                sim.traffic_dyn_instances
+            );
+        });
+
+        let stopped = sim.traffic_stopped();
+        let veh_val = fmt_into(
+            label_buf,
+            format_args!(
+                "{} ({} mov / {} stop)",
+                sim.traffic_vehicles, sim.traffic_moving, stopped
+            ),
+        );
+        stat_row_tip(ui, "Vehicles", veh_val, tip_buf, |t| {
+            let _ = write!(
+                t,
+                "Total: {} vehicles\nMoving (>0.25 m/s): {} | Stopped/Queued: {}\nDynamic CSG Instances: {}",
+                sim.traffic_vehicles, sim.traffic_moving, stopped, sim.traffic_dyn_instances
+            );
+        });
+
+        let flow_val = fmt_into(
+            label_buf,
+            format_args!(
+                "{:.1} km/h (max {:.0})",
+                sim.traffic_avg_kmh(),
+                sim.traffic_max_kmh()
+            ),
+        );
+        stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
+            let _ = write!(
+                t,
+                "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Junction Releases: {}",
+                sim.traffic_avg_kmh(),
+                sim.traffic_avg_speed_mps,
+                sim.traffic_max_kmh(),
+                sim.traffic_max_speed_mps,
+                sim.traffic_respawns,
+                sim.traffic_stale_releases
+            );
+        });
+    }
 }
 
 /// Partition predicate for the eye-dropdown OSM provenance section: returns `true` for OSM /
@@ -5051,7 +5618,8 @@ mod tests {
         let (track_w, val_w) = slider_control_widths(rem_w);
         assert_eq!(label_w, LABEL_W);
         assert_eq!(val_w, VAL_W);
-        assert!((track_w - 150.0).abs() < 1e-4);
+        let expected_track_w = 320.0 - LABEL_W - 6.0 - ANIM_BTN_W - 8.0 - VAL_W;
+        assert!((track_w - expected_track_w).abs() < 1e-4);
     }
 
     #[test]
@@ -5290,6 +5858,391 @@ mod tests {
             let count = osm.iter().filter(|&&c| c == cls).count()
                 + generated.iter().filter(|&&c| c == cls).count();
             assert_eq!(count, 1, "OsmFeatureClass::{cls:?} must appear exactly once");
+        }
+    }
+
+    #[test]
+    fn stroked_and_unstroked_buttons_have_zero_hover_height_jitter_all_themes() {
+        for theme in UiTheme::ALL {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = theme.apply(&ctx);
+
+            let run_pass = |pointer: Option<egui::Pos2>| -> (egui::Rect, egui::Rect, bool, bool) {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 240.0),
+                    )),
+                    ..Default::default()
+                };
+                if let Some(pos) = pointer {
+                    raw.events.push(egui::Event::PointerMoved(pos));
+                }
+                let mut auto_rect = egui::Rect::NOTHING;
+                let mut manual_rect = egui::Rect::NOTHING;
+                let mut auto_hov = false;
+                let mut manual_hov = false;
+                let out = ctx.run_ui(raw, |ui| {
+                    dock_scroll(ui, |ui| {
+                        collapsing_section(
+                            ui,
+                            "sec_flab_author",
+                            ic::PAPER_PLANE_TILT,
+                            "Flight Authoring",
+                            |ui| {
+                                equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                                    0 => {
+                                        let btn = egui::Button::new(format!(
+                                            "{}  Auto Plan",
+                                            ic::SPARKLE
+                                        ))
+                                        .truncate()
+                                        .fill(active_accent_tint(ui))
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            ui.visuals().selection.stroke.color,
+                                        ));
+                                        let resp = ui.add_sized([w, ROW_H + 2.0], btn);
+                                        auto_rect = resp.rect;
+                                        auto_hov = resp.hovered();
+                                    }
+                                    _ => {
+                                        let btn =
+                                            egui::Button::new(format!("{}  Manual", ic::PATH))
+                                                .truncate();
+                                        let resp = ui.add_sized([w, ROW_H + 2.0], btn);
+                                        manual_rect = resp.rect;
+                                        manual_hov = resp.hovered();
+                                    }
+                                });
+                            },
+                        );
+                    });
+                });
+                out.drop_without_applying_deltas();
+                (auto_rect, manual_rect, auto_hov, manual_hov)
+            };
+
+            // Warm up layout, then capture unhovered baseline (`WidgetState::Inactive`).
+            let _ = run_pass(None);
+            let (auto_idle, manual_idle, _, _) = run_pass(None);
+            assert!(auto_idle.height() > 0.0 && manual_idle.height() > 0.0);
+            assert_eq!(
+                (auto_idle.height() - manual_idle.height()).abs(),
+                0.0,
+                "{theme:?}: active .stroke(1.0) vs inactive button height mismatch when unhovered ({} vs {})",
+                auto_idle.height(),
+                manual_idle.height()
+            );
+
+            // Move pointer over `Auto Plan`: two passes so `Button::atom_ui` reads the hovered
+            // response from the previous pass and evaluates `WidgetState::Hovered`.
+            let _ = run_pass(Some(auto_idle.center()));
+            let (auto_hov_rect, manual_while_auto_hov, auto_hov, _) =
+                run_pass(Some(auto_idle.center()));
+            assert!(auto_hov, "{theme:?}: Auto Plan button must register hover");
+            assert_eq!(
+                (auto_hov_rect.height() - auto_idle.height()).abs(),
+                0.0,
+                "{theme:?}: Auto Plan height jittered on hover ({} -> {})",
+                auto_idle.height(),
+                auto_hov_rect.height()
+            );
+            assert_eq!(
+                (auto_hov_rect.height() - manual_while_auto_hov.height()).abs(),
+                0.0,
+                "{theme:?}: hovered Auto Plan vs unhovered Manual height mismatch"
+            );
+
+            // Move pointer over `Manual`: verify zero height jitter on unstroked buttons too.
+            let _ = run_pass(Some(manual_idle.center()));
+            let (auto_while_manual_hov, manual_hov_rect, _, manual_hov) =
+                run_pass(Some(manual_idle.center()));
+            assert!(manual_hov, "{theme:?}: Manual button must register hover");
+            assert_eq!(
+                (manual_hov_rect.height() - manual_idle.height()).abs(),
+                0.0,
+                "{theme:?}: Manual height jittered on hover ({} -> {})",
+                manual_idle.height(),
+                manual_hov_rect.height()
+            );
+            assert_eq!(
+                (auto_while_manual_hov.height() - manual_hov_rect.height()).abs(),
+                0.0,
+                "{theme:?}: unhovered Auto Plan vs hovered Manual height mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_sliders_with_unit_suffixes_never_staircase_or_clip() {
+        for panel_w in [240.0_f32, 300.0, 360.0] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = UiTheme::Obsidian.apply(&ctx);
+
+            let sc = ctx.global_style().spacing.scroll;
+            let bar_reserve = sc.bar_outer_margin + sc.bar_width + sc.bar_inner_margin + 2.0;
+            let inner_w = (panel_w - bar_reserve).max(120.0);
+
+            let mut max_bank = 35.0_f32;
+            let mut bank_gain = 0.55_f32;
+            let mut bank_rate = 120.0_f32;
+            let mut long_accel = 12.0_f32;
+            let mut jerk = 20.0_f32;
+
+            let mut avail_widths = Vec::new();
+            let mut row_rights = Vec::new();
+            let mut sibling_avail_w = 0.0_f32;
+            let mut worst_text_w = 0.0_f32;
+
+            for _pass in 0..2 {
+                avail_widths.clear();
+                row_rights.clear();
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(panel_w, 800.0),
+                    )),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    let galley = ui.painter().layout_no_wrap(
+                        "20.0 m/s3".to_owned(),
+                        egui::FontId::monospace(11.0),
+                        Color32::WHITE,
+                    );
+                    worst_text_w = galley.size().x;
+
+                    dock_scroll(ui, |ui| {
+                        collapsing_section(
+                            ui,
+                            "sec_flab_dynamics",
+                            ic::SLIDERS_HORIZONTAL,
+                            "Camera Dynamics",
+                            |ui| {
+                                avail_widths.push(ui.available_width());
+                                prop_slider_f32(
+                                    ui,
+                                    "Max Bank",
+                                    &mut max_bank,
+                                    0.0..=60.0,
+                                    1,
+                                    " deg",
+                                );
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                prop_slider_f32(ui, "Bank Gain", &mut bank_gain, 0.0..=1.0, 2, "");
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                prop_slider_f32(
+                                    ui,
+                                    "Bank Rate",
+                                    &mut bank_rate,
+                                    10.0..=180.0,
+                                    0,
+                                    " d/s",
+                                );
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                prop_slider_f32(
+                                    ui,
+                                    "Long Accel",
+                                    &mut long_accel,
+                                    1.0..=12.0,
+                                    1,
+                                    " m/s2",
+                                );
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                prop_slider_f32(ui, "Jerk", &mut jerk, 1.0..=20.0, 1, " m/s3");
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                stat_row(ui, "Ratio", "0.94 | 14.2 m/s | 35.0 deg");
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                                stat_row(ui, "Limit", "Lateral Accel");
+                                row_rights.push(ui.min_rect().right());
+
+                                avail_widths.push(ui.available_width());
+                            },
+                        );
+                        sibling_avail_w = ui.available_width();
+                    });
+                });
+                out.drop_without_applying_deltas();
+            }
+
+            assert!(
+                worst_text_w + 4.0 <= VAL_W,
+                "9-char monospace unit readout ({worst_text_w:.1} + 4.0 px pad) must fit inside VAL_W={VAL_W}"
+            );
+            assert_eq!(avail_widths.len(), 8);
+            assert_eq!(row_rights.len(), 7);
+            let first_w = avail_widths[0];
+            for (idx, &w) in avail_widths.iter().enumerate() {
+                assert!(
+                    (w - first_w).abs() <= 1e-3,
+                    "panel_w={panel_w}: available_width() drifted at row {idx}: {first_w} -> {w}"
+                );
+            }
+            for (idx, &right) in row_rights.iter().enumerate() {
+                assert!(
+                    right <= inner_w + 0.5,
+                    "panel_w={panel_w}: row {idx} rect.right()={right} exceeded inner_w={inner_w}"
+                );
+            }
+            assert!(
+                sibling_avail_w <= inner_w + 0.5,
+                "panel_w={panel_w}: sibling section available_width()={sibling_avail_w} exceeded inner_w={inner_w}"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_build_progress_overlay_renders_within_viewport_all_themes() {
+        let now = std::time::Instant::now();
+        let indeterminate = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "Gundo OSM",
+            "Generating CSG scene...",
+            0,
+            0,
+            now,
+        );
+        let determinate = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "Gundo OSM",
+            "Building OptiX GAS",
+            112,
+            246,
+            now,
+        );
+
+        for theme in UiTheme::ALL {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = theme.apply(&ctx);
+
+            for (vp_w, vp_h) in [(48.0_f32, 48.0_f32), (220.0, 160.0), (1280.0, 720.0)] {
+                let vp_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(vp_w, vp_h));
+                for (phase, progress, time) in [
+                    (EnginePhase::CompilingOptix, None, 0.25_f64),
+                    (EnginePhase::BuildingCsgScene, Some(&indeterminate), 0.75_f64),
+                    (EnginePhase::BuildingCsgScene, Some(&determinate), 1.25_f64),
+                ] {
+                    let mut card_rect = egui::Rect::NOTHING;
+                    let raw = egui::RawInput {
+                        screen_rect: Some(vp_rect),
+                        time: Some(time),
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        card_rect = draw_scene_build_progress_overlay(
+                            ui,
+                            vp_rect,
+                            theme,
+                            phase,
+                            progress,
+                            now,
+                        );
+                    });
+                    out.drop_without_applying_deltas();
+                    assert!(
+                        vp_rect.contains_rect(card_rect),
+                        "{theme:?} {vp_w}x{vp_h} {phase:?}: card {card_rect:?} must stay within {vp_rect:?}"
+                    );
+                    if vp_w >= 220.0 && vp_h >= 160.0 {
+                        assert!(card_rect.width() >= 180.0 && card_rect.height() >= 70.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sim_telemetry_rows_fit_narrow_docks_without_staircase_or_overflow() {
+        let sim = SimTelemetry {
+            crowd_backend: ActiveCrowdBackend::Cuda,
+            crowd_plan_version: 2,
+            crowd_kernel_count: 11,
+            crowd_actors: 184,
+            crowd_archetypes: [2, 166, 4, 12],
+            crowd_bones: 2944,
+            crowd_joints: 2944,
+            crowd_skeleton_edges: 2760,
+            crowd_dofs: 4416,
+            crowd_walkways: 32,
+            crowd_obstacles: 140,
+            crowd_step_ms: 0.24,
+            crowd_gpu_bytes: 4 * 1024 * 1024 + 262_144,
+            pose_frozen: false,
+            sim_rate: 1.0,
+            crowd_lod_dists_m: [22.0, 75.0, 180.0],
+            crowd_lod_mode: 0,
+            crowd_ground_misses: 0,
+            crowd_gpu_fault: 0,
+            crowd_ias_rebuilds: 2,
+            gpu_camera_active: true,
+            traffic_has_lane_graph: true,
+            traffic_stepping: true,
+            traffic_vehicles: 48,
+            traffic_moving: 36,
+            traffic_avg_speed_mps: 9.2,
+            traffic_max_speed_mps: 15.8,
+            traffic_dyn_instances: 240,
+            traffic_step_ms: 0.14,
+            traffic_respawns: 12,
+            traffic_stale_releases: 0,
+            crowd_strict_f32: false,
+        };
+
+        for panel_w in [240.0_f32, 280.0, 340.0] {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = UiTheme::Obsidian.apply(&ctx);
+            let mut label_buf = String::with_capacity(96);
+            let mut tip_buf = String::with_capacity(256);
+            let mut avail_before = 0.0_f32;
+            let mut avail_after = 0.0_f32;
+            let mut max_right = 0.0_f32;
+
+            for _pass in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(panel_w, 800.0),
+                    )),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(raw, |ui| {
+                    dock_scroll(ui, |ui| {
+                        collapsing_section(ui, "sec_tel_sim", ic::GAUGE, "Telemetry", |ui| {
+                            avail_before = ui.available_width();
+                            render_sim_telemetry(ui, &sim, 60.0, &mut label_buf, &mut tip_buf);
+                            avail_after = ui.available_width();
+                            max_right = ui.min_rect().right();
+                        });
+                    });
+                });
+                out.drop_without_applying_deltas();
+            }
+
+            assert!(
+                avail_after <= avail_before + 0.5,
+                "width {panel_w}: render_sim_telemetry expanded available_width ({avail_before} -> {avail_after})"
+            );
+            assert!(
+                max_right <= panel_w + 0.5,
+                "width {panel_w}: render_sim_telemetry overflowed panel right edge ({max_right} > {panel_w})"
+            );
         }
     }
 }

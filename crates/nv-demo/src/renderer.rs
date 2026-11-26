@@ -1,4 +1,22 @@
-//! Asynchronous OptiX path-tracing worker thread communicating with the 60+ FPS GUI via `appbus`.
+//! Asynchronous OptiX 9 path-tracing worker thread communicating with the 60 Hz UI via `appbus`.
+//!
+//! What: compiles and hot-reloads `raytracer.cu` + `tonemap.cu`, owns the [`OptixRig`] GPU state
+//! (uncompacted persistent IAS, `CsgGpuHost`, `GpuFramePlan` crowd/camera backends, OptiX AI
+//! denoiser, cuFFT bloom, GPU overlays, 32 B GPU pick rig, IS counters, SDG burst/JSON export),
+//! and publishes live [`SceneBuildProgress`] snapshots during startup compile, shader reload,
+//! CSG scene rebuilds, and IAS builds.
+//! Why: isolates all CUDA/OptiX compilation, scene construction, and ray-tracing work from the
+//! winit/`egui` presentation thread so UI interaction and progress animation stay responsive at
+//! 60 Hz with a single end-of-frame stream fence per rendered frame.
+//! How: waits on [`AppBus::render_wake`], consumes coalesced [`crate::app_events::RenderStateSnapshot`] + discrete
+//! [`RenderControl`] commands, executes one uninterrupted GPU stream burst per frame
+//! (`IAS/Crowd/Camera -> OptiX RT (680 B LaunchParams) -> Denoiser -> Bloom -> Tonemap/Overlay`),
+//! and emits [`RenderEvent`]s (`FrameReady`, `PhaseChanged`, `SceneMetaUpdated`, `Fatal`, etc.).
+//! Uses: `optix`, `cuda_core`, `cuda_bindings`, `appbus`, `csg_scene`, `crate::app_events`,
+//! `crate::csg_scene_host`, `crate::cuda_crowd`, `crate::cuda_camera`, `crate::fft_bloom`,
+//! `crate::gpu_export`, `crate::overlay`, `crate::pick`, `crate::profiler`,
+//! `crate::semantic_filter`, `crate::wireframe`.
+//! Used by: `crate::main`, `crate::ui`, `crate::persist`, `crate::bench`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_void};
@@ -21,8 +39,8 @@ use optix::{
 };
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessInfo, RenderControl, RenderEvent, SmartViewResult,
-    fast_preview_budget,
+    AppBus, EnginePhase, PossessInfo, RenderControl, RenderEvent, SceneBuildProgress,
+    SimTelemetry, SmartViewResult, fast_preview_budget,
 };
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
@@ -1197,12 +1215,8 @@ pub struct FrameReady {
     pub possess_camera: Option<CameraFrame>,
     /// Exact world camera basis that rendered this frame (consumed by DLSS-RR `WorldToView` / `ViewToClip`).
     pub rendered_camera: CameraFrame,
-    /// Articulated crowd step wall/GPU duration in milliseconds for the latest frame.
-    pub crowd_step_ms: f32,
-    /// Concrete backend that executed the latest crowd step (`None`, `Cpu`, `Cuda`).
-    pub crowd_active_backend: ActiveCrowdBackend,
-    /// Number of articulated crowd actors currently simulated.
-    pub crowd_actor_count: u32,
+    /// Live zero-allocation snapshot of Crowd, Locomotion, and Traffic simulation telemetry.
+    pub sim_telemetry: SimTelemetry,
     /// The frame's timings and launch state, the same sample the perf CSV records.
     pub perf: crate::perf_log::PerfSample,
 }
@@ -2640,6 +2654,7 @@ fn initial_pipeline(
 fn init_optix(
     cuda: &Arc<CudaContext>,
     initial_settings: &DemoSettings,
+    bus: &AppBus,
 ) -> Result<OptixRig, String> {
     cuda.bind_to_thread()
         .map_err(|e| format!("CUDA bind_to_thread before OptiX init failed: {e}"))?;
@@ -2838,7 +2853,20 @@ fn init_optix(
     let initial_gpu_crowd = initial_settings.csg_mode > 0
         && !initial_settings.csg_freeze_pose
         && initial_settings.crowd_backend != CrowdBackend::Cpu;
-    if let Err(err) = csg_host.sync(
+    let init_csg_started = Instant::now();
+    let init_scene_name = csg_host.scene_display_name(initial_csg_key.scene_idx);
+    if initial_csg_key.scene_idx != 0 {
+        bus.publish_build_progress(Some(SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            init_scene_name,
+            "Generating CSG scene...",
+            0,
+            0,
+            init_csg_started,
+        )));
+        bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::BuildingCsgScene));
+    }
+    if let Err(err) = csg_host.sync_with_progress(
         &optix_ctx,
         &stream,
         &mut scratch,
@@ -2856,6 +2884,16 @@ fn init_optix(
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
         initial_gpu_crowd,
+        &mut |sname, stage, done, total| {
+            bus.publish_build_progress(Some(SceneBuildProgress::new(
+                EnginePhase::BuildingCsgScene,
+                sname,
+                stage,
+                done,
+                total,
+                init_csg_started,
+            )));
+        },
     ) {
         init_warnings.push(format!("Initial CSG scene sync failed: {err}"));
     }
@@ -2865,6 +2903,17 @@ fn init_optix(
     let mut ias: Option<Arc<Accel>> = None;
     let initial_classic = compute_ias_classic_state(initial_settings, 0.0, 0.0);
 
+    if initial_csg_key.scene_idx != 0 {
+        bus.publish_build_progress(Some(SceneBuildProgress::new(
+            EnginePhase::UpdatingIas,
+            init_scene_name,
+            "Building OptiX IAS...",
+            0,
+            0,
+            init_csg_started,
+        )));
+        bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::UpdatingIas));
+    }
     let classic_xforms = build_ias_into(
         &optix_ctx,
         &stream,
@@ -4944,14 +4993,25 @@ pub fn spawn_render_thread(
             let mut possess_blend_rem: f32 = 0.0;
             let mut last_rendered_camera = camera;
             let mut was_possessing = false;
+            let compile_started = Instant::now();
+            bus.publish_build_progress(Some(SceneBuildProgress::new(
+                EnginePhase::CompilingOptix,
+                "OptiX 9 Pipeline",
+                "Compiling shaders & pipelines...",
+                0,
+                0,
+                compile_started,
+            )));
             bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::CompilingOptix));
-            let mut rig = match init_optix(&cuda, &settings) {
+            let mut rig = match init_optix(&cuda, &settings, &bus) {
                 Ok(rig) => rig,
                 Err(e) => {
+                    bus.publish_build_progress(None);
                     bus.emit_render_event(RenderEvent::Fatal(format!("OptiX init failed: {e}")));
                     return;
                 }
             };
+            bus.publish_build_progress(None);
             bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
             for warning in rig.init_warnings.drain(..) {
                 bus.emit_render_event(RenderEvent::StatusMessage(warning));
@@ -5391,6 +5451,18 @@ pub fn spawn_render_thread(
                             frame_index = 0;
                         }
                         RenderControl::ReloadShader => {
+                            let reload_started = Instant::now();
+                            bus.publish_build_progress(Some(SceneBuildProgress::new(
+                                EnginePhase::CompilingOptix,
+                                "OptiX 9 Pipeline",
+                                "Hot-reloading raytracer.cu...",
+                                0,
+                                0,
+                                reload_started,
+                            )));
+                            bus.emit_render_event(RenderEvent::PhaseChanged(
+                                EnginePhase::CompilingOptix,
+                            ));
                             let disk_path = PathBuf::from(RAYTRACER_CU_PATH);
                             let res = std::fs::read_to_string(&disk_path)
                                 .map_err(|e| format!("Read {}: {e}", disk_path.display()))
@@ -5424,6 +5496,8 @@ pub fn spawn_render_thread(
                                     )));
                                 }
                             }
+                            bus.publish_build_progress(None);
+                            bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
                         }
                         RenderControl::Shutdown => {
                             should_exit = true;
@@ -5968,10 +6042,25 @@ pub fn spawn_render_thread(
                         bus.emit_render_event(RenderEvent::SelectionChanged(Box::default()));
                     }
                 }
+                let scene_build_started = Instant::now();
+                let target_scene_name = rig.csg_host.scene_display_name(csg_key.scene_idx);
                 if building_scene {
                     if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
                         cc.mark_scene_dirty();
                     }
+                    let initial_stage = if csg_key.scene_idx == 0 {
+                        "Switching to Classic stage..."
+                    } else {
+                        "Generating CSG scene..."
+                    };
+                    bus.publish_build_progress(Some(SceneBuildProgress::new(
+                        EnginePhase::BuildingCsgScene,
+                        target_scene_name,
+                        initial_stage,
+                        0,
+                        0,
+                        scene_build_started,
+                    )));
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::BuildingCsgScene));
                 }
                 let vfov_rad = 2.0 * active_camera.tan_half_fov.max(0.05).atan();
@@ -6010,7 +6099,7 @@ pub fn spawn_render_thread(
                         "CUDA crowd sync before CSG upload failed: {e}"
                     )));
                 }
-                let csg_sync = match rig.csg_host.sync(
+                let csg_sync = match rig.csg_host.sync_with_progress(
                     &rig._optix_ctx,
                     &rig.stream,
                     &mut rig._scratch,
@@ -6019,6 +6108,16 @@ pub fn spawn_render_thread(
                     settings.csg_time_of_day,
                     csg_cam_params,
                     sync_gpu_crowd,
+                    &mut |sname, stage, done, total| {
+                        bus.publish_build_progress(Some(SceneBuildProgress::new(
+                            EnginePhase::BuildingCsgScene,
+                            sname,
+                            stage,
+                            done,
+                            total,
+                            scene_build_started,
+                        )));
+                    },
                 ) {
                     Ok(sync_res) => {
                         last_csg_sync_err = None;
@@ -6152,6 +6251,14 @@ pub fn spawn_render_thread(
                     }
                     _ => {
                         if building_scene {
+                            bus.publish_build_progress(Some(SceneBuildProgress::new(
+                                EnginePhase::UpdatingIas,
+                                target_scene_name,
+                                "Building OptiX IAS...",
+                                0,
+                                0,
+                                scene_build_started,
+                            )));
                             bus.emit_render_event(RenderEvent::PhaseChanged(
                                 EnginePhase::UpdatingIas,
                             ));
@@ -6187,6 +6294,7 @@ pub fn spawn_render_thread(
                                 rig.classic_xforms = classic;
                             }
                             Err(e) => {
+                                bus.publish_build_progress(None);
                                 bus.emit_render_event(RenderEvent::Fatal(e));
                                 break 'render;
                             }
@@ -6451,6 +6559,7 @@ pub fn spawn_render_thread(
                     }
                 }
                 if building_scene {
+                    bus.publish_build_progress(None);
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
                 }
 
@@ -7452,6 +7561,16 @@ pub fn spawn_render_thread(
                 if let Some(counts) = fresh_is_counts.take() {
                     bus.emit_render_event(RenderEvent::IsCounts(counts));
                 }
+                let sim_telemetry = rig.csg_host.sample_sim_telemetry(
+                    last_crowd_backend,
+                    last_crowd_step_ms,
+                    crowd_lod,
+                    rig.cuda_crowd.as_ref().and_then(|r| r.as_ref().ok()),
+                    gpu_camera_composed_this_frame,
+                    settings.csg_freeze_pose,
+                    step_traffic_now,
+                    settings.time_scale * settings.csg_traffic_speed,
+                );
                 bus.emit_render_event(RenderEvent::FrameReady(Box::new(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
@@ -7468,9 +7587,7 @@ pub fn spawn_render_thread(
                     fast_preview: frame_is_fast_preview,
                     possess_camera: possess_cam_out,
                     rendered_camera: active_camera,
-                    crowd_step_ms: last_crowd_step_ms,
-                    crowd_active_backend: last_crowd_backend,
-                    crowd_actor_count: rig.csg_host.crowd_actor_count() as u32,
+                    sim_telemetry,
                     perf: perf_sample,
                 })));
             }

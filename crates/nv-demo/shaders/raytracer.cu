@@ -2330,7 +2330,12 @@ extern "C" __global__ void __raygen__render() {
         float3 sample_col = make_float3(0.0f, 0.0f, 0.0f);
 
         int max_bounces = aov_aa ? 1 : (int)params.bounces;
-        for (int bounce = 0; bounce < 16; ++bounce) {
+        // Separate non-glass `bounce` budget from primary `step == 0` so thin dielectric panes
+        // (balcony rail + sliding glazing = 4 interfaces + interior hit) never terminate black
+        // under PREVIEW (`max_bounces == 2`) or default `bounces == 3` while staying strictly bounded.
+        int bounce = 0;
+        int glass_passes = 0;
+        for (int step = 0; step < 22; ++step) {
             if (bounce >= max_bounces) break;
             if (bounce >= 2) {
                 float p_survive = fmaxf(
@@ -2341,16 +2346,16 @@ extern "C" __global__ void __raygen__render() {
                 throughput = f3_mul(throughput, 1.0f / p_survive);
             }
             unsigned int p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
-            trace_primary(origin, dir, (bounce == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
+            trace_primary(origin, dir, (step == 0) ? 1.0e-4f : 1.0e-5f, p0, p1, p2, p3, p4, p5, p6, p7);
 
             if (p0 == 0u) {
-                if (bounce == 0 && s == pick_tap && nv_pick_here(idx)) {
+                if (step == 0 && s == pick_tap && nv_pick_here(idx)) {
                     nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
                 }
                 if (!aov_geom_only) {
-                    float3 sky = sky_color(dir, sun_dir, bounce == 0);
+                    float3 sky = sky_color(dir, sun_dir, step == 0);
                     sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
-                    if (bounce == 0 && (s == 0u || aov_aa)) {
+                    if (step == 0 && (s == 0u || aov_aa)) {
                         first_albedo = make_float3(
                             fmaxf(0.0f, fminf(1.0f, sky.x)),
                             fmaxf(0.0f, fminf(1.0f, sky.y)),
@@ -2358,7 +2363,7 @@ extern "C" __global__ void __raygen__render() {
                         );
                     }
                 }
-                if (bounce == 0 && (s == 0u || aov_aa)) {
+                if (step == 0 && (s == 0u || aov_aa)) {
                     if (params.out_diffuse_albedo_f32 != 0ull && params.aov_mode == 0u) {
                         // DLSS-RR Integration Guide §§3.4.1/3.4.3/3.4.4 sky defaults
                         first_diffuse = make_float3(0.5f, 0.5f, 0.5f);
@@ -2397,7 +2402,7 @@ extern "C" __global__ void __raygen__render() {
             unsigned int inst_id = is_csg ? 0xFFFFu : (p6 & 0xFFu);
             float3 hit_pos = f3_add(origin, f3_mul(dir, hit_t));
 
-            if (bounce == 0 && (s == 0u || aov_aa)) {
+            if (step == 0 && (s == 0u || aov_aa)) {
                 first_has_hit = true;
                 first_world_pos = hit_pos;
                 first_range = f3_len(f3_sub(hit_pos, cam_pos));
@@ -2481,7 +2486,7 @@ extern "C" __global__ void __raygen__render() {
                 if (max_em > 1e-4f) {
                     sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
                     if (max_em > 1.5f) {
-                        if (bounce == 0 && (s == 0u || aov_aa)) {
+                        if (step == 0 && (s == 0u || aov_aa)) {
                             first_albedo = make_float3(
                                 fminf(1.0f, emission.x * 0.35f),
                                 fminf(1.0f, emission.y * 0.35f),
@@ -2503,7 +2508,7 @@ extern "C" __global__ void __raygen__render() {
                     float g_rough = fmaxf(0.0f, fminf(0.45f, rough));
                     float r0 = (1.0f - ior) / (1.0f + ior);
                     r0 = r0 * r0;
-                    if (bounce == 0 && (s == 0u || aov_aa)) {
+                    if (step == 0 && (s == 0u || aov_aa)) {
                         first_albedo = base_col;
                         first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
                         first_specular = make_float3(r0, r0, r0);
@@ -2526,32 +2531,41 @@ extern "C" __global__ void __raygen__render() {
                     float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
                     float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
                     bool tir = sin2_t > 1.0f;
-                    float g_bias = fmaxf(0.001f, hit_t * 0.0004f);
                     if (tir || rand01(seed) < fresnel) {
+                        float g_bias_refl = fmaxf(0.001f, hit_t * 0.0004f);
                         float3 refl = f3_reflect(dir, n);
                         if (g_rough > 1e-4f) {
                             refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), g_rough)));
                         }
                         dir = refl;
-                        origin = f3_add(hit_pos, f3_mul(n, g_bias));
+                        origin = f3_add(hit_pos, f3_mul(n, g_bias_refl));
+                        ++bounce;
                     } else {
+                        // Cap inward transmission bias at 2 mm so rays never tunnel across thin
+                        // architectural glazing (e.g. 24 mm Marina panes at hit_t >= 60 m).
+                        float g_bias_trans = fminf(0.002f, fmaxf(0.0005f, hit_t * 2.0e-5f));
                         float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
                         float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
                         if (g_rough > 1e-4f) {
                             refr = f3_norm(f3_add(refr, f3_mul(sample_cosine_hemisphere(refr, seed), g_rough)));
                         }
                         dir = refr;
-                        origin = f3_sub(hit_pos, f3_mul(n, g_bias));
+                        origin = f3_sub(hit_pos, f3_mul(n, g_bias_trans));
                         throughput = f3_mul3(throughput, make_float3(
                             0.65f + 0.35f * base_col.x,
                             0.65f + 0.35f * base_col.y,
                             0.65f + 0.35f * base_col.z
                         ));
+                        if (glass_passes < 6) {
+                            ++glass_passes;
+                        } else {
+                            ++bounce;
+                        }
                     }
                     continue;
                 }
 
-                if (bounce == 0 && (s == 0u || aov_aa)) {
+                if (step == 0 && (s == 0u || aov_aa)) {
                     float inv_m = 1.0f - metallic;
                     first_albedo = base_col;
                     first_diffuse = f3_mul(base_col, inv_m);
@@ -2629,6 +2643,7 @@ extern "C" __global__ void __raygen__render() {
                     origin = biased_origin;
                     throughput = f3_mul3(throughput, base_col);
                 }
+                ++bounce;
                 continue;
             }
 
@@ -2639,7 +2654,7 @@ extern "C" __global__ void __raygen__render() {
                 float g_rough = fmaxf(0.0f, fminf(0.5f, params.glass_params[2]));
                 float r0 = (1.0f - ior) / (1.0f + ior);
                 r0 = r0 * r0;
-                if (bounce == 0 && (s == 0u || aov_aa)) {
+                if (step == 0 && (s == 0u || aov_aa)) {
                     first_albedo = make_float3(0.92f, 0.97f, 1.0f);
                     first_diffuse = make_float3(0.0f, 0.0f, 0.0f);
                     first_specular = make_float3(r0, r0, r0);
@@ -2680,6 +2695,7 @@ extern "C" __global__ void __raygen__render() {
                     }
                     dir = refl;
                     origin = f3_add(hit_pos, f3_mul(n, 0.002f));
+                    ++bounce;
                 } else {
                     float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
                     float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
@@ -2688,6 +2704,11 @@ extern "C" __global__ void __raygen__render() {
                     }
                     dir = refr;
                     origin = f3_sub(hit_pos, f3_mul(n, 0.002f));
+                    if (glass_passes < 6) {
+                        ++glass_passes;
+                    } else {
+                        ++bounce;
+                    }
                 }
                 continue;
             }
@@ -2701,7 +2722,7 @@ extern "C" __global__ void __raygen__render() {
                 float3 neon_b = make_float3(1.65f, 0.35f, 1.85f);
                 float3 emission = f3_mul(f3_add(f3_mul(neon_a, 1.0f - mix_t), f3_mul(neon_b, mix_t)), pulse * 2.2f);
                 sample_col = f3_add(sample_col, f3_mul3(throughput, emission));
-                if (bounce == 0 && (s == 0u || aov_aa)) {
+                if (step == 0 && (s == 0u || aov_aa)) {
                     first_albedo = make_float3(
                         fminf(1.0f, emission.x * 0.45f),
                         fminf(1.0f, emission.y * 0.45f),
@@ -2763,7 +2784,7 @@ extern "C" __global__ void __raygen__render() {
                 metallic = params.fractal_r1[0];
             }
 
-            if (bounce == 0 && (s == 0u || aov_aa)) {
+            if (step == 0 && (s == 0u || aov_aa)) {
                 float inv_m = 1.0f - metallic;
                 first_albedo = base_col;
                 first_diffuse = f3_mul(base_col, inv_m);
@@ -2775,7 +2796,7 @@ extern "C" __global__ void __raygen__render() {
                 first_roughness = fmaxf(0.0f, fminf(1.0f, rough));
                 first_mat_pbr = make_float3(first_roughness, fmaxf(0.0f, fminf(1.0f, metallic)), 0.0f);
             }
-            if (aov_wire && bounce == 0) {
+            if (aov_wire && step == 0) {
                 // Slight ambient occlusion so faces read: a few short rays whose seed depends only
                 // on pixel and accumulation index (stable while moving, converging when still).
                 unsigned int ao_seed = pcg_hash(idx.x ^ pcg_hash(idx.y ^ pcg_hash(params.accum_count + 0x9E37u)));
@@ -2851,6 +2872,7 @@ extern "C" __global__ void __raygen__render() {
             dir = do_spec ? spec_dir : diff_dir;
             origin = biased_origin;
             throughput = f3_mul3(throughput, base_col);
+            ++bounce;
         }
 
         if (aov_aa) {

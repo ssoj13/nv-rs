@@ -6,7 +6,7 @@ Item IDs are stable. `<PREFIX>:<id>` points into the per-slice ledgers `audit/20
 
 ## 1. Status
 
-State as of 2026-11-26 (`csg-rs` `bd5f73b`, `flight-navigator-rs` `92d30bd`, `nv-rs` through P42 `39c71d4` + Wave 2 pending final gate). Hardware: RTX 3080 Ti (sm_86), CUDA 13.3, OptiX 9.1, Windows 11.
+State as of 2026-11-26 (`csg-rs` `99dc630`, `flight-navigator-rs` `c5ad038`, `nv-rs` Wave A verified & built: `nv-demo` clippy 0 warnings, `230/0/9` release tests + `1/1` OptiX 9 pipeline compile/link + `1/1` real-Gundo Auto-Plan + `target/release/nv-demo.exe`). Hardware: RTX 3080 Ti (sm_86), CUDA 13.3, OptiX 9.1, Windows 11.
 
 ### Done (by wave; details in section 4)
 
@@ -30,7 +30,8 @@ State as of 2026-11-26 (`csg-rs` `bd5f73b`, `flight-navigator-rs` `92d30bd`, `nv
 | 2026-11-26 Wave B (`GpuFramePlan`) | Generic `GpuFramePlan` runner (`frame_plan_runner.rs`), `CrowdFramePlan` v2 (`cuda_crowd.rs`), `CameraFramePlan` v1 (`cuda_camera.rs`); private `prepare_crowd_steering_and_grounds` deleted | `5324699` |
 | 2026-11-26 NVRTC `StrictF32` | `nvrtc::MathMode::StrictF32` (`--ftz=false`, `--prec-div=true`, `--prec-sqrt=true`, `--fmad=false`) + PTX disk-cache keying on `MathMode` for deterministic IEEE-754 single-precision NVRTC kernels | `d70250e` |
 | 2026-11-26 P42 Provenance & Object Axes | `csg-rs` `bd5f73b` adopted: per-instance OSM provenance (`OsmFeatureClass`/kind/`osm_id`) in pick & category filter (`hidden_osm_classes`), `OBJECT_KEY_BIT` logical object selection, `ovl_axes` object-root pivot triads & whole-object selection bounds | `39c71d4` |
-| 2026-11-26 Wave 2 (GPU Voxel Bake & Overlays) | GPU `voxel_bake.cuh` (`GpuVoxelBaker` in `flight/voxel_gpu.rs`, wired into `flight::oracle`), `OverlayKind::Skeletons` (zero-readback GPU `ovl_skeletons` on `CrowdWorldJoints` + static `[u32; 4]` `d_skeleton_edges`), `OverlayKind::FlightPath` (cached `FlightPathOverlayData` spline + cut/C2 handover markers) | Wave 2 (pending final gate) |
+| 2026-11-26 Wave 2 (GPU Voxel Bake & Overlays) | GPU `voxel_bake.cuh` (`GpuVoxelBaker` in `flight/voxel_gpu.rs`, wired into `flight::oracle`), `OverlayKind::Skeletons` (zero-readback GPU `ovl_skeletons` on `CrowdWorldJoints` + static `[u32; 4]` `d_skeleton_edges`), `OverlayKind::FlightPath` (cached `FlightPathOverlayData` spline + cut/C2 handover markers) | Included in Wave A gate (PASS) |
+| 2026-11-26 Wave A (UI SSOT, Presets, Progress HUD, `SimTelemetry`, B2 Glass, Auto-Plan & `csg-rs` `99dc630`) | `UiTheme::apply` zero hover-height jitter (`bg_stroke.width = 1.0`, `expansion = 0.0`), `VAL_W = 68.0` + `slider_drag_value` + `allocate_clamped_ui` zero-staircase SSOT, Contact Sheet dedup + Playlist Queue overlap fix, `FractalPresetManager` (`sl-controls::preset`, atomic `~/.nv-rs/fractal_presets.json`), live `SceneBuildProgress` HUD overlay + status bar (`AppBus::build_progress`), zero-readback `SimTelemetry` (Crowd/Locomotion/Traffic), `raytracer.cu` B2 thin-glass `glass_passes` (`0..6`) + `2 mm`-capped transmitted bias, `flight-navigator-rs` `c5ad038`, and `csg-rs` `99dc630` (`RoadTerrainTile` v2 `u16` CSR + `smin` height blend + zero embankment sawtooth) | `csg-rs` `99dc630`, `flight-navigator-rs` `c5ad038`; Wave A gate PASS: `nv-demo` clippy 0 warnings, `230/0/9` release tests + `1/1` OptiX 9 pipeline compile/link + `1/1` real-Gundo Auto-Plan + `target/release/nv-demo.exe` built |
 
 Final wave GPU tests (`-- --ignored --test-threads=1`, passed / failed): cuda-core-ext 12/0, nv-wgpu 13/0, optix 68/0, cublas 9/0, cudnn 5/0, cusolver 9/0, cusparse 11/0, nvenc 4/0, nvdec 2/0, nvofa 4/0, nvjpeg 7/0, nvenc-sys 1/0, nvapi-sys 1/0, nv-demo 5/0. `python/nv-py`: clippy clean, `cargo test --lib` 19 / 0 / 5 ignored (+ 5 ignored passed), **pytest 118 passed / 2 skipped**. `device/`: **15/15** cases. Linux cross: `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings` clean except `nvcomp-sys` / `nvcomp` (compile only, nothing ran on Linux). `cargo deny check`: advisories, bans, sources ok; licenses FAILED (`DENY:LIC`).
 
@@ -38,8 +39,8 @@ Final wave performance (release, persisted default scene, 4 spp, 6 bounces, 150 
 
 ### In flight
 
-- Wave 2 (GPU `voxel_bake.cuh` `GpuVoxelBaker` + `Skeletons` & `FlightPath` overlays + Wave 3 docs sync): awaiting final gate.
-- **csg-rs session** (chat name `Mullis-16-3934`): `CSG:R00b` GPU `TrafficFramePlan`, P36 `OverlayCurvePod`, P37 sweeps.
+- Wave B+C Stage 1 in `csg-rs` (base `99dc630`): `B3+` (`crates/csg-traffic` + 4 deadlock fixes + `PlanKind::Traffic` v1 + VRAM Pedestrian AEB/Yield), `B1` (Smart Yacht/Thin-Mast LOD + auto-proxy guard), `C1/C2` (water basin carving, holes, Oxford Basin, `WaterMask`, recessed `+0.5 m` bank-tucked water), followed by `D1` (real OSM street names on procedural signs).
+- **csg-rs session** (chat name `Mullis-16-3934`): P36 `OverlayCurvePod`, P37 sweeps.
 
 ### Open
 

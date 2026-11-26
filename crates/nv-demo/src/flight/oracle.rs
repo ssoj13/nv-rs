@@ -18,7 +18,9 @@
 //! to accelerate R0 `VoxelVolume` column baking on CUDA (falling back cleanly to exact CPU
 //! `VoxelVolume::build` if CUDA is unavailable or overflows), caches the most recent
 //! `(scene_idx, road_mode, inspector_variant)` oracle and
-//! [`flight_navigator::fnav_plan::PlanCache`], and reports typed [`AutoPlanEvent`] stage
+//! [`flight_navigator::fnav_plan::PlanCache`] (selectively invalidating `cache.catalog` on
+//! `sun_dir` changes and both `cache.catalog` + `cache.handover_costs` on `req.limits` changes
+//! while keeping the baked volume and `space_map` warm), and reports typed [`AutoPlanEvent`] stage
 //! progress, ready [`flight_navigator::fnav_plan::RailPlan`]s, or errors back to `FlightWorkspace`.
 //! **Uses.** `csg_core`, `csg_scene`, `csg_scenes`, `flight_navigator`, `glam`, `std::sync::mpsc`,
 //! `crate::flight::voxel_gpu`.
@@ -36,6 +38,7 @@ use csg_scene::voxel_volume::{
 };
 use csg_scene::world_ray::WorldRayQuery;
 use csg_scene::{RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, WorldScene, inst_flags};
+use flight_navigator::camera_guide::GuideLimits;
 use flight_navigator::fnav_interest::{ObjectInfo, ObjectTable, SimpleObjectTable};
 use flight_navigator::fnav_plan::{self, CpuRayProber, PlanCache, PlanRequest, RailPlan};
 use flight_navigator::fnav_space::{
@@ -463,8 +466,9 @@ impl CsgSceneOracle {
 
     /// Updates the sun direction used by subject-lighting probes on a cached oracle.
     ///
-    /// Why: lets [`CsgAutoPlanner`] reuse a baked volume and `PlanCache` across time-of-day or
-    /// lighting tweaks without rebuilding the CSG scene or rebaking `VoxelVolume`.
+    /// Why: lets [`CsgAutoPlanner`] keep the baked `VoxelVolume` and `space_map` warm across
+    /// time-of-day or lighting tweaks while clearing only `cache.catalog` so lighting scores are
+    /// recomputed against the new sun vector.
     pub fn set_sun_dir(&mut self, sun_dir: Option<Vec3>) {
         self.sun_dir = sun_dir.and_then(|d| {
             (d.is_finite() && d.length_squared() > 1.0e-6).then(|| d.normalize())
@@ -517,11 +521,26 @@ impl SceneOracle for CsgSceneOracle {
 }
 
 /// Cached scene oracle, object catalog, and `PlanCache` held inside the worker thread.
+///
+/// Tracks `sun_dir` and `limits` alongside the scene geometry `key` so lighting or dynamics-limit
+/// changes invalidate only the affected `PlanCache` tables without rebuilding the scene or volume.
 struct CachedOracle {
     key: (u32, RoadMode, u32),
+    sun_dir: Option<Vec3>,
+    limits: GuideLimits,
     oracle: CsgSceneOracle,
     objects: CsgObjectTable,
     cache: PlanCache,
+}
+
+/// Returns `true` when two optional unit sun directions differ enough to invalidate lighting scores.
+#[inline]
+fn sun_dir_changed(a: Option<Vec3>, b: Option<Vec3>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => (x - y).length_squared() > 1.0e-6,
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 /// Asynchronous background flight-planning coordinator for `nv-demo`.
@@ -529,7 +548,8 @@ struct CachedOracle {
 /// Why: building a CSG scene, baking its `VoxelVolume`, and running `fnav_plan::plan` can take
 /// seconds; isolating that work on one dedicated `mpsc`-driven worker thread keeps the 60 Hz UI
 /// and OptiX viewport completely responsive while reusing the baked scene and `PlanCache` across
-/// repeated seed, duration, and cut-density iterations.
+/// repeated seed, plan-mode, duration, and cut-density iterations (and selectively invalidating
+/// cached catalog/handover tables on `sun_dir` or `GuideLimits` changes).
 pub struct CsgAutoPlanner {
     stage: AutoPlanStage,
     job_tx: Option<Sender<AutoPlanJob>>,
@@ -678,7 +698,9 @@ fn planner_worker_loop(job_rx: Receiver<AutoPlanJob>, ev_tx: Sender<AutoPlanEven
     }
 }
 
-/// Executes one [`AutoPlanJob`], reusing `cached` whenever `(scene_idx, road_mode, variant)` match.
+/// Executes one [`AutoPlanJob`], reusing the baked scene, volume, and `space_map` in `cached`
+/// whenever `(scene_idx, road_mode, variant)` match, while clearing `cache.catalog` on `sun_dir`
+/// changes and both `cache.catalog` + `cache.handover_costs` on `req.limits` changes.
 fn execute_auto_plan_job(
     registry: &csg_scene::SceneRegistry,
     cached: &mut Option<CachedOracle>,
@@ -726,12 +748,25 @@ fn execute_auto_plan_job(
         let (oracle, objects) = CsgSceneOracle::build_with_baker(built, sun_dir, baker)?;
         *cached = Some(CachedOracle {
             key,
+            sun_dir,
+            limits: job.req.limits,
             oracle,
             objects,
             cache: PlanCache::default(),
         });
     } else if let Some(entry) = cached.as_mut() {
-        entry.oracle.set_sun_dir(sun_dir);
+        let sun_changed = sun_dir_changed(entry.sun_dir, sun_dir);
+        let limits_changed = entry.limits != job.req.limits;
+        if sun_changed {
+            entry.oracle.set_sun_dir(sun_dir);
+            entry.sun_dir = sun_dir;
+            entry.cache.catalog.clear();
+        }
+        if limits_changed {
+            entry.limits = job.req.limits;
+            entry.cache.catalog.clear();
+            entry.cache.handover_costs.clear();
+        }
     }
 
     ev_tx
@@ -1396,6 +1431,13 @@ mod tests {
         assert!(!planner.is_busy());
         assert_eq!(planner.stage(), AutoPlanStage::Idle);
         assert!(planner.poll().is_empty());
+
+        let sun_a = Some(Vec3::new(0.4, 0.8, 0.4).normalize());
+        let sun_b = Some(Vec3::new(-0.4, 0.8, 0.4).normalize());
+        assert!(!sun_dir_changed(None, None));
+        assert!(!sun_dir_changed(sun_a, sun_a));
+        assert!(sun_dir_changed(sun_a, sun_b));
+        assert!(sun_dir_changed(sun_a, None));
     }
 
     #[test]

@@ -1,25 +1,31 @@
-//! 100% scene-agnostic `csg-rs` host lifecycle, batched per-compound OptiX GAS cache, and
-//! zero-churn GPU uploads.
+//! 100% scene-agnostic `csg-rs` host lifecycle, per-compound OptiX GAS cache, progress reporting,
+//! and zero-churn GPU instance/material uploads.
 //!
 //! What: loads any registered [`csg_scene::SceneModule`] from [`csg_scenes::default_scene_registry`]
-//! (`Gundo`, `Marina del Rey`, `SF House of AI`, `Studio Asset Inspector`, or future scenes),
-//! batches all compound `OptixAabb`s in a single H2D upload while caching one custom-primitive GAS
-//! per unique `GpuCompound`, and refreshes material palettes and 3D Frenet traffic in-place with
-//! zero steady-state GPU buffer reallocations.
-//! Why: keeps `nv-demo` completely decoupled from scene-specific coordinates, presets, or rails
-//! while delivering smooth frame times across 10k-100k+ CSG instances.
-//! Category filter & P42 provenance: the host owns the per-instance filter state of the viewport
-//! eye dropdown (`apply_semantic_filter`: IAS visibility masks for both semantic classes and P42
-//! OSM feature classes, plus the device partial bitset, see `crate::semantic_filter`), the
-//! parallel `instance_obj_keys` device buffer driving single-triad-per-object axes & multi-part
-//! selection highlights (`ovl_axes`), and O(1) GPU pick resolution (`resolve_picked_csg`).
-//! Used by: `crate::renderer`, `crate::ui`, `crate::main`.
+//! (`Gundo`, `GundoOSM`, `Marina del Rey`, `SF House of AI`, `Studio Asset Inspector`, or future
+//! scenes), caches one non-compacted custom-primitive GAS per unique `GpuCompound` across split
+//! SBT offsets (`8` RPN / `10` single-prim & `PURE_UNION` / `12` exact `FIRST_HIT_UNION`),
+//! streams live build/upload/GAS milestones through [`CsgGpuHost::sync_with_progress`], and
+//! refreshes material palettes, articulated crowds, and Frenet traffic in-place with zero
+//! steady-state GPU buffer reallocations.
+//! Why: keeps `nv-demo` decoupled from scene-specific geometry, coordinates, or rails while
+//! delivering smooth frame times across 10k-100k+ CSG instances and visible UI feedback during
+//! heavy OSM/procedural scene builds.
+//! How: maintains a bounded CPU `SceneBuilt` LRU cache, persistent grow-only VRAM pools
+//! (`GrowDeviceBuffer`), dual pinned DMA staging buffers for `TrafficOnly` prefix streaming,
+//! P41/P42 category filtering (`apply_semantic_filter`: hardware IAS visibility masks for semantic
+//! and OSM classes + device partial bitset), `instance_obj_keys` for P42 logical object axes and
+//! multi-part selection, and O(1) GPU pick resolution (`resolve_picked_csg`).
+//! Uses: `csg_core`, `csg_actors`, `csg_scene`, `csg_scenes`, `cuda_core`, `cuda_bindings`,
+//! `optix`, `crate::app_events`, `crate::pick`, `crate::sdg_export`, `crate::semantic_filter`.
+//! Used by: `crate::renderer`, `crate::cuda_crowd`, `crate::ui`, `crate::main`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytemuck::Pod;
 use cuda_bindings as cu;
@@ -47,9 +53,10 @@ use csg_scene::{
     resolve_possess_attach, resolve_possess_pose_with_crowd,
 };
 
-use crate::app_events::PossessInfo;
-use crate::cuda_crowd::CrowdLodParams;
+use crate::app_events::{PossessInfo, SimTelemetry};
+use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend};
 use crate::renderer::{CameraFrame, CameraProjection};
+use crate::sdg_export::ActiveCrowdBackend;
 use crate::semantic_filter as sf;
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
@@ -1403,9 +1410,65 @@ pub struct CsgGpuHost {
     last_traffic_bits: u32,
     ias_dirty: bool,
     traffic_dirty: bool,
+    /// Active CSG scene telemetry reported back to the UI each frame.
     stats: CsgStats,
+    /// Cached per-scene crowd/traffic topology summary (refreshed only on scene build or stress spawn).
+    sim_summary: SceneSimSummary,
+    /// Host wall duration (ms) of the latest CPU `SoaTrafficDriver::step` (`0.0` when paused).
+    last_traffic_step_ms: f32,
     active_possess: Option<PossessInfo>,
     next_vehicle_cursor: usize,
+}
+
+/// Cached per-scene simulation counts computed once when a scene builds or spawns stress actors
+/// so steady-state telemetry sampling stays O(traffic_vehicles) with zero heap allocations.
+#[derive(Clone, Copy, Debug, Default)]
+struct SceneSimSummary {
+    crowd_archetypes: [u32; 4],
+    crowd_dofs: u32,
+    crowd_walkways: u32,
+    crowd_skeleton_edges: u32,
+    traffic_dyn_instances: u32,
+}
+
+fn compute_scene_sim_summary(scene: &SceneBuilt) -> SceneSimSummary {
+    let mut crowd_archetypes = [0u32; 4];
+    let mut crowd_dofs = 0u32;
+    let mut crowd_skeleton_edges = 0u32;
+    for desc in &scene.crowd.descs {
+        if let Some(topo) = scene.crowd.topologies.get(desc.archetype_id as usize) {
+            let slot = match topo.plan.archetype {
+                ArchetypeKind::HumanHero => 0,
+                ArchetypeKind::HumanCrowd => 1,
+                ArchetypeKind::RoadSignStickman => 2,
+                ArchetypeKind::Quadruped => 3,
+            };
+            crowd_archetypes[slot] = crowd_archetypes[slot].saturating_add(1);
+            crowd_dofs = crowd_dofs.saturating_add(topo.nv as u32);
+        }
+        if let Some(skel) = scene.crowd.archetype_skeleton(desc.archetype_id as usize) {
+            let edges = skel
+                .joints
+                .iter()
+                .enumerate()
+                .filter(|&(k, j)| j.parent.is_some_and(|p| usize::from(p) < k))
+                .count() as u32;
+            crowd_skeleton_edges = crowd_skeleton_edges.saturating_add(edges);
+        }
+    }
+    let crowd_walkways = scene.hints.walkways.len() as u32;
+    let traffic_dyn_instances = scene
+        .world
+        .dynamic_instances()
+        .len()
+        .saturating_sub(scene.crowd_inst_ids.len()) as u32;
+    SceneSimSummary {
+        crowd_archetypes,
+        crowd_dofs,
+        crowd_walkways,
+        crowd_skeleton_edges,
+        traffic_dyn_instances,
+    }
 }
 
 impl Default for CsgGpuHost {
@@ -1473,6 +1536,8 @@ impl CsgGpuHost {
             ias_dirty: false,
             traffic_dirty: false,
             stats: CsgStats::default(),
+            sim_summary: SceneSimSummary::default(),
+            last_traffic_step_ms: 0.0,
             active_possess: None,
             next_vehicle_cursor: 0,
         }
@@ -1486,6 +1551,14 @@ impl CsgGpuHost {
     /// Returns the currently loaded [`CsgSceneKey`].
     pub fn scene_key(&self) -> CsgSceneKey {
         self.scene_key
+    }
+
+    /// Returns the human-readable display name for 1-based `scene_idx` (`0` -> `"Classic"`).
+    pub fn scene_display_name(&self, scene_idx: u32) -> &'static str {
+        scene_idx
+            .checked_sub(1)
+            .and_then(|i| self.registry.get_by_index(i as usize))
+            .map_or("Classic", |m| m.descriptor().name)
     }
 
     /// Returns `true` when the active scene has dynamic moving traffic actors (legacy or SoA).
@@ -1503,6 +1576,144 @@ impl CsgGpuHost {
     /// Returns the latest CSG telemetry for the UI.
     pub fn stats(&self) -> CsgStats {
         self.stats
+    }
+
+    /// Samples a zero-allocation, `Copy` [`SimTelemetry`] snapshot of the active scene's Crowd,
+    /// Locomotion, and Traffic state without triggering any blocking GPU readbacks.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "aggregates live crowd backend, LOD policy, GPU camera flag, and traffic stepping state in one pass"
+    )]
+    pub fn sample_sim_telemetry(
+        &self,
+        crowd_backend: ActiveCrowdBackend,
+        crowd_step_ms: f32,
+        crowd_lod: CrowdLodParams,
+        cuda_crowd: Option<&CudaCrowdBackend>,
+        gpu_camera_active: bool,
+        pose_frozen: bool,
+        traffic_stepping: bool,
+        sim_rate: f32,
+    ) -> SimTelemetry {
+        let Some(ref scene) = self.scene else {
+            return SimTelemetry::default();
+        };
+
+        let crowd_actors = scene.crowd.actor_count() as u32;
+        let crowd_bones = scene.crowd.bone_count() as u32;
+        let crowd_joints = scene.crowd.world_joints.len() as u32;
+        let (l1, l2, cull) = crowd_lod.resolve_dists();
+        let crowd_lod_mode = if !crowd_lod.enabled {
+            4u8
+        } else {
+            match crowd_lod.force_lod {
+                Some(0) => 1u8,
+                Some(1) => 2u8,
+                Some(2..) => 3u8,
+                None => 0u8,
+            }
+        };
+
+        let (
+            crowd_plan_version,
+            crowd_kernel_count,
+            crowd_strict_f32,
+            crowd_obstacles,
+            crowd_gpu_bytes,
+            crowd_gpu_fault,
+            crowd_ias_rebuilds,
+            crowd_skeleton_edges,
+        ) = if crowd_backend == ActiveCrowdBackend::Cuda
+            && let Some(cc) = cuda_crowd
+        {
+            let gpu_edges = cc.skeleton_edges_device_ptr().1;
+            (
+                cc.plan_version(),
+                cc.kernel_count(),
+                cc.math_mode() == nvrtc::MathMode::StrictF32,
+                cc.obstacle_count(),
+                cc.gpu_bytes(),
+                cc.last_fault(),
+                cc.ias_rebuild_count(),
+                if gpu_edges > 0 {
+                    gpu_edges
+                } else {
+                    self.sim_summary.crowd_skeleton_edges
+                },
+            )
+        } else {
+            (0, 0, false, 0, 0, 0, 0, self.sim_summary.crowd_skeleton_edges)
+        };
+
+        let traffic_has_lane_graph = scene.traffic.has_lane_graph();
+        let traffic_vehicles = scene.traffic.vehicle_count() as u32;
+        let mut traffic_moving = 0u32;
+        let mut speed_sum = 0.0_f32;
+        let mut speed_max = 0.0_f32;
+        let mut counted = 0u32;
+        if traffic_vehicles > 0 {
+            scene.traffic.for_each_vehicle_xz(&mut |_, _, speed_mps, _| {
+                if speed_mps.is_finite() && speed_mps >= 0.0 {
+                    counted = counted.saturating_add(1);
+                    speed_sum += speed_mps;
+                    if speed_mps > speed_max {
+                        speed_max = speed_mps;
+                    }
+                    if speed_mps > 0.25 {
+                        traffic_moving = traffic_moving.saturating_add(1);
+                    }
+                }
+            });
+        }
+        let traffic_avg_speed_mps = if counted > 0 {
+            speed_sum / counted as f32
+        } else {
+            0.0
+        };
+        let rt_stats = if traffic_vehicles > 0 {
+            scene.traffic.runtime_stats()
+        } else {
+            Default::default()
+        };
+
+        SimTelemetry {
+            crowd_backend,
+            crowd_plan_version,
+            crowd_kernel_count,
+            crowd_strict_f32,
+            crowd_actors,
+            crowd_archetypes: self.sim_summary.crowd_archetypes,
+            crowd_bones,
+            crowd_joints,
+            crowd_skeleton_edges,
+            crowd_dofs: self.sim_summary.crowd_dofs,
+            crowd_walkways: self.sim_summary.crowd_walkways,
+            crowd_obstacles,
+            crowd_step_ms,
+            crowd_gpu_bytes,
+            pose_frozen,
+            sim_rate: if pose_frozen { 0.0 } else { sim_rate.max(0.0) },
+            crowd_lod_dists_m: [l1, l2, cull],
+            crowd_lod_mode,
+            crowd_ground_misses: scene.world.crowd_nav.ground_misses(),
+            crowd_gpu_fault,
+            crowd_ias_rebuilds,
+            gpu_camera_active,
+            traffic_has_lane_graph,
+            traffic_stepping: traffic_stepping && !pose_frozen && traffic_vehicles > 0,
+            traffic_vehicles,
+            traffic_moving,
+            traffic_avg_speed_mps,
+            traffic_max_speed_mps: speed_max,
+            traffic_dyn_instances: self.sim_summary.traffic_dyn_instances,
+            traffic_step_ms: if traffic_stepping && !pose_frozen {
+                self.last_traffic_step_ms
+            } else {
+                0.0
+            },
+            traffic_respawns: rt_stats.respawns,
+            traffic_stale_releases: rt_stats.stale_reservation_releases,
+        }
     }
 
     /// Returns `true` if freshly built scene metadata is waiting to be sent to the UI thread.
@@ -1839,6 +2050,7 @@ impl CsgGpuHost {
 
         if added > 0 {
             self.scene_mutated_stress = true;
+            self.sim_summary = compute_scene_sim_summary(scene);
         }
         self.packed
             .reserve_instances(scene.world.total_instance_count().max(256));
@@ -2350,6 +2562,7 @@ impl CsgGpuHost {
             return false;
         };
         if freeze_pose {
+            self.last_traffic_step_ms = 0.0;
             return false;
         }
 
@@ -2361,10 +2574,14 @@ impl CsgGpuHost {
             && let Some(reg_idx) = self.active_reg_idx
             && let Some(module) = self.registry.get_by_index(reg_idx)
         {
+            let t_traffic = Instant::now();
             module.step_dynamic(&mut scene.world, &scene.traffic, time_s);
+            self.last_traffic_step_ms = t_traffic.elapsed().as_secs_f32() * 1000.0;
             self.last_traffic_bits = traffic_bits;
             self.traffic_dirty = true;
             moved = true;
+        } else if !step_traffic {
+            self.last_traffic_step_ms = 0.0;
         }
 
         if scene.crowd.actor_count() > 0 && dt > 0.0 && dt.is_finite() {
@@ -2506,15 +2723,9 @@ impl CsgGpuHost {
         }
     }
 
-    /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
-    /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes, and either
-    /// streams only `dynamic_instances[0..D]` (or just non-crowd traffic vehicles when
-    /// `gpu_crowd_active` is true) via the growable pinned staging buffers
-    /// (`CsgSyncResult::TrafficOnly`) or repacks visible instances with live frustum +
-    /// small-detail culling (`CsgSyncResult::FullRepack`).
-    ///
-    /// Traffic is not stepped here: [`Self::step_dynamic`] is the only traffic step, so the
-    /// Traffic toggle holds even while the crowd keeps the shared simulation clock moving.
+    /// Test convenience wrapper forwarding to [`Self::sync_with_progress`] with a no-op progress
+    /// sink.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, and OptiX resources cleanly"
@@ -2530,6 +2741,47 @@ impl CsgGpuHost {
         cam: CsgCameraParams,
         gpu_crowd_active: bool,
     ) -> Result<CsgSyncResult, String> {
+        self.sync_with_progress(
+            optix_ctx,
+            stream,
+            scratch,
+            key,
+            wetness,
+            time_of_day,
+            cam,
+            gpu_crowd_active,
+            &mut |_, _, _, _| {},
+        )
+    }
+
+    /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes,
+    /// refreshes GPU materials in-place when `wetness` or `time_of_day` changes, and either
+    /// streams only `dynamic_instances[0..D]` (or just non-crowd traffic vehicles when
+    /// `gpu_crowd_active` is true) via the growable pinned staging buffers
+    /// (`CsgSyncResult::TrafficOnly`) or repacks visible instances with live frustum +
+    /// small-detail culling (`CsgSyncResult::FullRepack`).
+    ///
+    /// Invokes `on_progress(scene_name, stage, done, total)` before CPU scene generation, GPU
+    /// buffer upload, and each OptiX GAS batch so the UI can animate live progress during heavy
+    /// scene switches. Traffic is not stepped here: [`Self::step_dynamic`] is the only traffic
+    /// step, so the Traffic toggle holds even while the crowd keeps the shared simulation clock
+    /// moving.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, OptiX resources, and progress sink"
+    )]
+    pub fn sync_with_progress(
+        &mut self,
+        optix_ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        key: CsgSceneKey,
+        wetness: f32,
+        time_of_day: u32,
+        cam: CsgCameraParams,
+        gpu_crowd_active: bool,
+        on_progress: &mut dyn FnMut(&str, &str, u32, u32),
+    ) -> Result<CsgSyncResult, String> {
         if self.pinned_staging.is_none() {
             self.pinned_staging =
                 PinnedStagingBuffer::try_new(optix_ctx.cuda(), CSG_PINNED_STAGING_BYTES);
@@ -2541,7 +2793,15 @@ impl CsgGpuHost {
 
         let mut rebuilt_scene = false;
         if key != self.scene_key {
-            self.rebuild_scene(optix_ctx, stream, scratch, key, wetness, time_of_day)?;
+            self.rebuild_scene(
+                optix_ctx,
+                stream,
+                scratch,
+                key,
+                wetness,
+                time_of_day,
+                on_progress,
+            )?;
             rebuilt_scene = true;
         }
 
@@ -2941,6 +3201,10 @@ impl CsgGpuHost {
         self.scene_cache.remove(pos).map(|(_, s)| s)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal scene rebuild pipeline with explicit OptiX resources and progress sink"
+    )]
     fn rebuild_scene(
         &mut self,
         optix_ctx: &Arc<DeviceContext>,
@@ -2949,6 +3213,7 @@ impl CsgGpuHost {
         key: CsgSceneKey,
         wetness: f32,
         time_of_day: u32,
+        on_progress: &mut dyn FnMut(&str, &str, u32, u32),
     ) -> Result<(), String> {
         // Synchronize before dropping old GASes / GPU buffers so no in-flight launch reads them.
         stream
@@ -2990,6 +3255,8 @@ impl CsgGpuHost {
         self.dyn_prev_lods.clear();
         self.static_gpu_bytes = 0;
         self.stats = CsgStats::default();
+        self.sim_summary = SceneSimSummary::default();
+        self.last_traffic_step_ms = 0.0;
         self.last_mat_state = (u32::MAX, u32::MAX);
         self.last_pack_cam = [f32::NAN; 3];
         self.last_pack_fwd = [f32::NAN; 3];
@@ -3039,19 +3306,26 @@ impl CsgGpuHost {
             .registry
             .get_by_index(reg_idx)
             .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
+        let scene_name = module.descriptor().name;
         let mut built = match cached_built {
             Some(mut cached) => {
+                on_progress(scene_name, "Restoring cached CSG scene...", 0, 0);
                 cached.set_crowd_frozen(false);
                 cached
             }
-            None => module.build(&build_cfg).map_err(|e| {
-                format!("CSG scene '{}' failed to build: {e}", module.descriptor().name)
-            })?,
+            None => {
+                on_progress(scene_name, "Generating CSG scene...", 0, 0);
+                module
+                    .build(&build_cfg)
+                    .map_err(|e| format!("CSG scene '{scene_name}' failed to build: {e}"))?
+            }
         };
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
-        if let Err(e) = self.upload_scene_gpu(optix_ctx, stream, scratch, &mut built) {
+        if let Err(e) =
+            self.upload_scene_gpu(optix_ctx, stream, scratch, &mut built, scene_name, on_progress)
+        {
             // Keep the CPU build for a cheap retry; `compound_gases` is still empty from above.
             self.cache_insert_scene(key, built);
             return Err(e);
@@ -3067,6 +3341,8 @@ impl CsgGpuHost {
             viewpoints: built.viewpoints.clone(),
             rails: built.rails.clone(),
         });
+        self.sim_summary = compute_scene_sim_summary(&built);
+        self.last_traffic_step_ms = 0.0;
         self.scene = Some(built);
         Ok(())
     }
@@ -3080,7 +3356,10 @@ impl CsgGpuHost {
         stream: &Arc<Stream>,
         scratch: &mut Scratch,
         built: &mut SceneBuilt,
+        scene_name: &str,
+        on_progress: &mut dyn FnMut(&str, &str, u32, u32),
     ) -> Result<(), String> {
+        on_progress(scene_name, "Uploading CSG buffers to GPU...", 0, 0);
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
         let lib = &built.world.library;
@@ -3124,7 +3403,9 @@ impl CsgGpuHost {
                 .aabb_staging_buf
                 .as_ref()
                 .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
-            for c in &lib.compounds {
+            let total_gases = lib.compounds.len() as u32;
+            on_progress(scene_name, "Building OptiX GAS", 0, total_gases);
+            for (idx, c) in lib.compounds.iter().enumerate() {
                 let (gas, sbt_off) = build_compound_gas(
                     optix_ctx,
                     stream,
@@ -3136,6 +3417,10 @@ impl CsgGpuHost {
                 )?;
                 gases.push(gas);
                 sbt_offsets.push(sbt_off);
+                let done = (idx + 1) as u32;
+                if done == total_gases || done.is_multiple_of(4) {
+                    on_progress(scene_name, "Building OptiX GAS", done, total_gases);
+                }
             }
             stream
                 .synchronize()

@@ -1,18 +1,18 @@
 //! Conversion, re-timing, and `camera-guide-rs` dynamics analysis for `nv-demo` flight tracks.
 //!
 //! **What.** Bridges legacy curated [`csg_scene::RailSpec`] cassettes and Flight Lab manual
-//! keyframes into unified [`fnav_core::Track`] trajectories, and runs [`camera_guide::plan`] on
-//! any track to produce jerk-limited speed/bank curves ([`DynamicsCurvePlot`]) and a re-timed
-//! [`fnav_core::Track`] preserving the track's aiming and optical framing.
-//! **Why.** Having one canonical [`fnav_core::Track`] format eliminates split playback engines
+//! keyframes into unified [`Track`] trajectories, and runs [`plan`] on any track to produce
+//! jerk-limited speed/bank curves ([`DynamicsCurvePlot`]) and a re-timed [`Track`] preserving the
+//! track's aiming and optical framing.
+//! **Why.** Having one canonical [`Track`] format eliminates split playback engines
 //! between curated rails, manual keyframes, and disk-stored `*.fnav.json` flights while keeping
 //! `camera-guide-rs` as the single authoritative trajectory dynamics solver.
 //! **How.** [`curated_rail_to_track`] compiles a [`csg_scene::RailSpec`] once, samples
 //! [`csg_scene::CompiledRail::eval_at_fraction`] densely along uniform arc length, aligns
-//! quaternion hemispheres, and constructs a C2 [`fnav_core::Track`] via
-//! [`fnav_core::Track::from_keyframe_poses`] (matching curated poses within 1 cm and 0.1 deg).
-//! [`analyze_and_retime_track`] extracts continuous spans between cuts, solves [`camera_guide::plan`]
-//! on each span's [`camera_guide::GuidePath`], and rebuilds variable-speed C2 [`fnav_core::Transition`]
+//! quaternion hemispheres, and constructs a C2 [`Track`] via
+//! [`Track::from_keyframe_poses`] (matching curated poses within 1 cm and 0.1 deg).
+//! [`analyze_and_retime_track`] extracts continuous spans between cuts, solves [`plan`]
+//! on each span's [`GuidePath`], and rebuilds variable-speed C2 [`Transition`]
 //! segments honoring the solved `s(t)` timing and coordinated bank `bank(t)`.
 //! **Uses.** `camera`, `csg_scene`, `flight_navigator::{camera_guide, fnav_core}`, `glam`.
 //! **Used by.** `crate::flight::lab`, `crate::flight::player`, and unit tests in `crate::flight`.
@@ -54,7 +54,7 @@ fn align_quat(prev: Quat, q: Quat) -> Quat {
     if prev.dot(u) < 0.0 { -u } else { u }
 }
 
-/// Converts a curated [`csg_scene::RailSpec`] into an immutable [`fnav_core::Track`].
+/// Converts a curated [`csg_scene::RailSpec`] into an immutable [`Track`].
 ///
 /// Compiles [`CompiledRail::compile`] once, samples [`CompiledRail::eval_at_fraction`] densely
 /// along normalized arc length (`max(64, ceil(duration_s * 4))` samples, capped at `512`), and
@@ -104,7 +104,7 @@ pub fn curated_rail_to_track(spec: &RailSpec) -> Result<Track, String> {
     ))
 }
 
-/// Builds a smooth [`fnav_core::Track`] from Flight Lab [`ManualKeyframe`]s, applying
+/// Builds a smooth [`Track`] from Flight Lab [`ManualKeyframe`]s, applying
 /// `camera-guide-rs` jerk-limited timing and coordinated bank when the path is long enough.
 ///
 /// # Errors
@@ -162,7 +162,7 @@ pub fn keyframes_to_track(
 ///
 /// # Errors
 /// Returns an error description if `track` is empty, has zero duration, is shorter than
-/// `4 * GRID_DS_M` (2.0 m), or if `camera_guide::plan` rejects `limits`.
+/// `4 * GRID_DS_M` (2.0 m), or if [`plan`] rejects `limits`.
 pub fn analyze_and_retime_track(
     track: &Track,
     limits: &GuideLimits,

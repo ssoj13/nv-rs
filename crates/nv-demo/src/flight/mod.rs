@@ -4,8 +4,8 @@
 //! **What.** Owns [`FlightWorkspace`] (one single source of truth pairing [`player::FlightPlayer`]
 //! and [`lab::FlightLabState`]), typed [`FlightCommand`] actions routed through `AppBus`,
 //! [`CameraDamper`], [`shutter_subframe_dt`], library directory resolvers
-//! ([`default_repo_flights_dir`], [`default_user_flights_dir`]), and the five submodules
-//! [`convert`], [`lab`], [`oracle`], [`player`], and [`ui`].
+//! ([`default_repo_flights_dir`], [`default_user_flights_dir`]), and the six submodules
+//! [`convert`], [`lab`], [`oracle`], [`player`], [`ui`], and [`voxel_gpu`].
 //! **Why.** Replaces the legacy `camera_rail.rs` playback path with one scene-agnostic
 //! [`flight_navigator::fnav_core::Track`] pipeline covering curated rails, live `csg-scene` R0+R1
 //! automatic flight planning, manual Flight Lab keyframes, `camera-guide-rs` dynamics tuning,
@@ -36,6 +36,8 @@ pub mod oracle;
 pub mod player;
 /// Native `egui` dock panels for Flight Lab and Flight Player.
 pub mod ui;
+/// CUDA GPU column-span baker accelerating `csg-scene` R0 `VoxelVolume` construction.
+pub mod voxel_gpu;
 
 /// Shortest-path quaternion slerp ensuring rotation always follows the `<= 180 deg` arc.
 #[inline]
@@ -461,6 +463,42 @@ impl FlightWorkspace {
                 false
             }
         }
+    }
+
+    /// Returns the active [`flight_navigator::fnav_core::Track`] and optional
+    /// [`flight_navigator::fnav_plan::RailPlan`] currently loaded in Flight Player or previewed in
+    /// Flight Lab, for rendering the 3D viewport `FlightPath` overlay.
+    ///
+    /// Why: provides one authoritative overlay source so actively playing, paused, or
+    /// transitioning tracks in Flight Player take precedence without leaking an unrelated Lab
+    /// plan, while idle sessions still visualize a freshly planned or authored Flight Lab track
+    /// before pressing Play.
+    #[must_use]
+    pub fn active_overlay_source(
+        &self,
+    ) -> Option<(
+        &flight_navigator::fnav_core::Track,
+        Option<&flight_navigator::fnav_plan::RailPlan>,
+    )> {
+        let active_slot = match self.player.state {
+            player::PlayerState::Playing { entry_idx }
+            | player::PlayerState::Paused { entry_idx } => self.player.queue.get(entry_idx),
+            player::PlayerState::Transition { to_idx, .. } => self.player.queue.get(to_idx),
+            player::PlayerState::Idle | player::PlayerState::Loading { .. } => None,
+        };
+        if let Some(slot) = active_slot {
+            let plan = slot.plan.as_ref().or_else(|| {
+                let lab_plan = self.lab.preview_plan.as_ref()?;
+                (slot.origin == player::TrackOrigin::LabPreview
+                    && lab_plan.track.canonical_hash() == slot.track.canonical_hash())
+                .then_some(lab_plan)
+            });
+            return Some((&slot.track, plan));
+        }
+        self.lab
+            .preview_track
+            .as_ref()
+            .map(|track| (track, self.lab.preview_plan.as_ref()))
     }
 }
 
@@ -989,6 +1027,59 @@ mod tests {
         )));
         assert_eq!(ws.lab.auto_plan_stage, oracle::AutoPlanStage::Idle);
         assert_eq!(ws.lab.status_msg, "Auto-plan failed: no valid land");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_overlay_source_prefers_active_player_then_lab_preview() {
+        let dir = temp_dir("overlay_source");
+        let mut ws = FlightWorkspace::new(dir.join("repo"), dir.join("user"));
+        assert!(
+            ws.active_overlay_source().is_none(),
+            "empty workspace must report no active overlay source"
+        );
+
+        let lab_track = sample_linear_track(0.0, 20.0, 6.0, false);
+        let player_track = sample_linear_track(-30.0, -5.0, 8.0, false);
+        ws.lab.preview_track = Some(lab_track.clone());
+
+        let (t_idle, plan_idle) = ws
+            .active_overlay_source()
+            .expect("idle workspace must fall back to lab preview track");
+        assert_eq!(t_idle.canonical_hash(), lab_track.canonical_hash());
+        assert!(plan_idle.is_none());
+
+        ws.player.queue.push(PlaylistSlot {
+            title: "Curated".to_string(),
+            description: String::new(),
+            scene_id: String::new(),
+            track_id: "curated_0".to_string(),
+            file_path: None,
+            track: player_track.clone(),
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::Curated,
+        });
+        assert!(ws.player.play());
+        let (t_play, plan_play) = ws
+            .active_overlay_source()
+            .expect("playing player track must take precedence");
+        assert_eq!(t_play.canonical_hash(), player_track.canonical_hash());
+        assert!(plan_play.is_none());
+
+        ws.player.pause();
+        let (t_pause, _) = ws
+            .active_overlay_source()
+            .expect("paused player track must remain active overlay source");
+        assert_eq!(t_pause.canonical_hash(), player_track.canonical_hash());
+
+        ws.player.stop();
+        let (t_stopped, _) = ws
+            .active_overlay_source()
+            .expect("stopped player must fall back to lab preview track");
+        assert_eq!(t_stopped.canonical_hash(), lab_track.canonical_hash());
         let _ = fs::remove_dir_all(&dir);
     }
 }

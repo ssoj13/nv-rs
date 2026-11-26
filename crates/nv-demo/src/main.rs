@@ -2825,6 +2825,66 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// Upper sample budget for the flight-path overlay spline (smooth curves well below the
+    /// `OVERLAY_CPU_SEG_MAX` 16k staging budget).
+    const FLIGHT_PATH_OVERLAY_MAX_SAMPLES: usize = 512;
+
+    /// Zero-allocation cache key for [`DemoApp::flight_overlay_cache`].
+    ///
+    /// Why: the UI loop runs at 60 Hz while the active flight track only changes on scene loads,
+    /// track switches, Flight Lab edits, or auto-plan completion. Keying on track/plan identity
+    /// plus boundary poses avoids resampling or allocating on steady-state frames while still
+    /// detecting in-place track replacements or re-timings.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FlightOverlayKey {
+        track_addr: usize,
+        segments_addr: usize,
+        duration_bits: u64,
+        segment_count: usize,
+        looping: bool,
+        start_eye_bits: [u32; 3],
+        mid_eye_bits: [u32; 3],
+        plan_sig: Option<(usize, usize, usize)>,
+    }
+
+    impl FlightOverlayKey {
+        fn from_source(
+            track: &flight_navigator::fnav_core::Track,
+            plan: Option<&flight_navigator::fnav_plan::RailPlan>,
+        ) -> Self {
+            let dur = track.duration_s();
+            let start_eye = if track.segments.is_empty() {
+                [0u32; 3]
+            } else {
+                let e = track.eval(0.0).state.eye;
+                [e.x.to_bits(), e.y.to_bits(), e.z.to_bits()]
+            };
+            let mid_eye = if track.segments.is_empty() || !dur.is_finite() || dur <= 0.0 {
+                start_eye
+            } else {
+                let e = track.eval(dur * 0.5).state.eye;
+                [e.x.to_bits(), e.y.to_bits(), e.z.to_bits()]
+            };
+            let plan_sig = plan.map(|p| {
+                (
+                    std::ptr::from_ref(p).addr(),
+                    p.shots.as_ptr().addr(),
+                    p.shots.len(),
+                )
+            });
+            Self {
+                track_addr: std::ptr::from_ref(track).addr(),
+                segments_addr: track.segments.as_ptr().addr(),
+                duration_bits: dur.to_bits(),
+                segment_count: track.segments.len(),
+                looping: track.looping,
+                start_eye_bits: start_eye,
+                mid_eye_bits: mid_eye,
+                plan_sig,
+            }
+        }
+    }
+
     pub struct DemoApp {
         window: Arc<Window>,
         surface: wgpu::Surface<'static>,
@@ -2952,6 +3012,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         last_sent_settings: DemoSettings,
         demo_anim: crate::demo_anim::DemoAnimator,
         flight_workspace: crate::flight::FlightWorkspace,
+        flight_overlay_key: Option<FlightOverlayKey>,
+        flight_overlay_cache: Option<Arc<crate::overlay::FlightPathOverlayData>>,
+        last_sent_flight_overlay_key: Option<FlightOverlayKey>,
         auto_planner: crate::flight::oracle::CsgAutoPlanner,
         cam_damper: crate::flight::CameraDamper,
         rail_blend_remaining: f32,
@@ -3002,6 +3065,37 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if self.render_fatal.is_none() {
                 self.bus.publish_render_state(snapshot);
             }
+        }
+
+        /// Resolves the cached [`crate::overlay::FlightPathOverlayData`] for the active flight
+        /// track when `OverlayKind::FlightPath` is enabled, resampling only when the track/plan
+        /// signature changes so steady-state 60 Hz UI frames do zero resampling and zero allocs.
+        fn resolve_flight_path_overlay(
+            &mut self,
+            settings: &DemoSettings,
+        ) -> (
+            Option<FlightOverlayKey>,
+            Option<Arc<crate::overlay::FlightPathOverlayData>>,
+        ) {
+            let want = settings.overlay.enabled
+                && settings.overlay.shows(crate::overlay::OverlayKind::FlightPath);
+            if !want {
+                return (None, None);
+            }
+            let Some((track, plan)) = self.flight_workspace.active_overlay_source() else {
+                return (None, None);
+            };
+            let key = FlightOverlayKey::from_source(track, plan);
+            if self.flight_overlay_key != Some(key) {
+                let sampled = crate::overlay::sample_flight_path_overlay(
+                    track,
+                    plan,
+                    FLIGHT_PATH_OVERLAY_MAX_SAMPLES,
+                );
+                self.flight_overlay_cache = Some(Arc::new(sampled));
+                self.flight_overlay_key = Some(key);
+            }
+            (Some(key), self.flight_overlay_cache.clone())
         }
 
         /// Enters the terminal render-failure state once: persistent status, recording finished
@@ -3463,6 +3557,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
                 possess_zoom_offset: 0.0,
+                flight_path_overlay: None,
             });
             let render_thread = spawn_render_thread(
                 Arc::clone(interop.cuda_context()),
@@ -3656,6 +3751,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     fw.player.apply_persisted(&persisted.flight_player);
                     fw
                 },
+                flight_overlay_key: None,
+                flight_overlay_cache: None,
+                last_sent_flight_overlay_key: None,
                 auto_planner: crate::flight::oracle::CsgAutoPlanner::new(),
                 cam_damper: {
                     let mut d = crate::flight::CameraDamper::default();
@@ -5692,10 +5790,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             possess_zoom_offset: self.possess_zoom_offset,
                         });
                     }
+                    let (flight_ovl_key, flight_path_overlay) =
+                        self.resolve_flight_path_overlay(&final_settings);
                     self.interacting_until = None;
                     self.last_sent_settings = final_settings;
                     self.last_sent_camera = final_cam;
                     self.last_sent_possess_look = possess_look;
+                    self.last_sent_flight_overlay_key = flight_ovl_key;
                     self.publish_state(RenderStateSnapshot {
                         settings: final_settings,
                         camera: final_cam,
@@ -5705,6 +5806,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         possess_free_pitch: self.possess_free_pitch,
                         possess_auto_level: self.possess_auto_level,
                         possess_zoom_offset: self.possess_zoom_offset,
+                        flight_path_overlay,
                     });
                     self.shutter_in_flight = true;
                     if stop_playlist_record
@@ -5723,13 +5825,18 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         effective_settings.auto_rotate = false;
                         effective_settings.sat_orbit = false;
                     }
+                    let (flight_ovl_key, flight_path_overlay) =
+                        self.resolve_flight_path_overlay(&effective_settings);
+                    let flight_overlay_changed = flight_ovl_key != self.last_sent_flight_overlay_key;
                     if reset_accum_requested
                         || effective_settings != self.last_sent_settings
                         || possess_look != self.last_sent_possess_look
+                        || flight_overlay_changed
                     {
                         self.interacting_until = None;
                         self.last_sent_settings = effective_settings;
                         self.last_sent_possess_look = possess_look;
+                        self.last_sent_flight_overlay_key = flight_ovl_key;
                         self.publish_state(RenderStateSnapshot {
                             settings: effective_settings,
                             camera: self.last_sent_camera,
@@ -5739,6 +5846,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             possess_free_pitch: self.possess_free_pitch,
                             possess_auto_level: self.possess_auto_level,
                             possess_zoom_offset: self.possess_zoom_offset,
+                            flight_path_overlay,
                         });
                     }
                 }
@@ -5798,11 +5906,15 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     effective_settings.sat_orbit = false;
                 }
                 let cam_frame = pose_to_frame(render_pose);
+                let (flight_ovl_key, flight_path_overlay) =
+                    self.resolve_flight_path_overlay(&effective_settings);
+                let flight_overlay_changed = flight_ovl_key != self.last_sent_flight_overlay_key;
                 if reset_accum_requested
                     || cut_reset
                     || effective_settings != self.last_sent_settings
                     || cam_frame != self.last_sent_camera
                     || possess_look != self.last_sent_possess_look
+                    || flight_overlay_changed
                 {
                     let automated_motion = self.is_recording
                         || self.demo_anim.is_running()
@@ -5816,6 +5928,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.last_sent_settings = effective_settings;
                     self.last_sent_camera = cam_frame;
                     self.last_sent_possess_look = possess_look;
+                    self.last_sent_flight_overlay_key = flight_ovl_key;
                     self.publish_state(RenderStateSnapshot {
                         settings: effective_settings,
                         camera: cam_frame,
@@ -5825,6 +5938,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         possess_free_pitch: self.possess_free_pitch,
                         possess_auto_level: self.possess_auto_level,
                         possess_zoom_offset: self.possess_zoom_offset,
+                        flight_path_overlay,
                     });
                 }
             }

@@ -1,8 +1,8 @@
 //! Generic overlay line renderer for nv-demo: one device-resident primitive list, one GPU
 //! antialiased raster pass, one shared filter, many providers.
 //!
-//! - **What**: overlays (wireframe contours and object axes with the selection's bounds today;
-//!   actor skeletons, rail path and camera frustum in later waves) are line segments and point markers with a
+//! - **What**: overlays (wireframe contours, object axes with the selection's bounds, articulated
+//!   actor skeletons, and active flight track paths; camera frustums in later waves) are line segments and point markers with a
 //!   constant screen-space width, colour, dash pattern and depth mode, drawn over the finished
 //!   frame. Every frame the segment list is rebuilt on the device; nothing is read back.
 //! - **Why**: one renderer and one filter instead of one-off drawing code per feature, and no
@@ -236,11 +236,15 @@ pub enum OverlayKind {
     /// primary root pivot (or per ungrouped CSG instance), plus whole-object selection bounds on
     /// all parts of selected objects.
     Axes,
+    /// Articulated crowd actor skeletons from device-resident `CrowdWorldJoints` (`ovl_skeletons`).
+    Skeletons,
+    /// Active flight track 3D trajectory polyline and shot-handover markers.
+    FlightPath,
 }
 
 impl OverlayKind {
     /// Every kind, in toolbar order (one toggle each).
-    pub const ALL: [Self; 2] = [Self::Contours, Self::Axes];
+    pub const ALL: [Self; 4] = [Self::Contours, Self::Axes, Self::Skeletons, Self::FlightPath];
 
     /// Bit of this kind in [`OverlayFilter::kinds`] (a mask persists compactly and new kinds
     /// default to off in old configs).
@@ -248,6 +252,8 @@ impl OverlayKind {
         match self {
             Self::Contours => 1,
             Self::Axes => 2,
+            Self::Skeletons => 1 << 2,
+            Self::FlightPath => 1 << 3,
         }
     }
 
@@ -256,6 +262,8 @@ impl OverlayKind {
         match self {
             Self::Contours => "Contours",
             Self::Axes => "Object axes (X red, Y green, Z blue; the selection also shows its bounds)",
+            Self::Skeletons => "Skeletons",
+            Self::FlightPath => "Flight Path",
         }
     }
 }
@@ -347,7 +355,6 @@ pub enum DepthMode {
     #[default]
     Always = 0,
     /// Hidden parts are not drawn.
-    #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
     SkipHidden = 1,
     /// Hidden parts are drawn faded and dashed (object axes).
     FadeHidden = 2,
@@ -401,6 +408,13 @@ pub enum GpuSource {
     /// selected object, one style per axis plus the selection's bounding-box style, and the axis
     /// length in pixels.
     Axes { x: StyleId, y: StyleId, z: StyleId, bounds: StyleId, axis_px: f32 },
+    /// Articulated actor skeletons from device-resident `BufId::CrowdWorldJoints` (`ovl_skeletons`).
+    Skeletons {
+        /// Style index for bone segments.
+        style_bone: StyleId,
+        /// Style index for joint/root accent ticks.
+        style_joint: StyleId,
+    },
 }
 
 /// Per-frame camera, viewport and filter handed to providers.
@@ -505,7 +519,6 @@ impl OverlayList {
     }
 
     /// Adds a polyline; `object` ties it to an object id for the Selected scope.
-    #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
     pub fn polyline(
         &mut self,
         class: SegmentClass,
@@ -532,7 +545,6 @@ impl OverlayList {
     }
 
     /// Adds a point marker (a round dot of the style's width).
-    #[cfg_attr(not(test), expect(dead_code, reason = "CPU-provider API of the overlay renderer; its first CPU providers (rail path, gizmos) land in the next wave, the tests exercise it now"))]
     pub fn point(&mut self, class: SegmentClass, space: Space, p: [f32; 3], style: StyleId, object: Option<u32>) {
         let first = self.verts.len() as u32;
         self.verts.push(p);
@@ -693,6 +705,171 @@ impl OverlayProvider for AxesProvider {
         if let (Some(x), Some(y), Some(z), Some(bounds)) = (x, y, z, bounds) {
             let axis_px = ctx.filter.axis_px.clamp(*AXIS_PX_RANGE.start(), *AXIS_PX_RANGE.end());
             out.gpu_source(GpuSource::Axes { x, y, z, bounds, axis_px });
+        }
+    }
+}
+
+/// Articulated crowd skeleton provider: requests the GPU skeleton source (`ovl_skeletons` reads
+/// device-resident `BufId::CrowdWorldJoints` and the static parent-to-child bone edge table) with
+/// crisp lime/cyan bone strokes and warm-yellow joint accent dots.
+///
+/// Why GPU: crowd joint positions live in device-resident `CrowdWorldJoints` updated in place
+/// every frame by `PlanKind::Crowd`; emitting bone segments on the device avoids any per-frame
+/// host readback of articulated crowds.
+#[derive(Debug, Default)]
+pub struct SkeletonProvider;
+
+impl OverlayProvider for SkeletonProvider {
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList) {
+        if !ctx.filter.shows(OverlayKind::Skeletons) {
+            return;
+        }
+        // Depth-tested with occluded bones faded and dashed: skeletons sit inside actor bodies,
+        // so `FadeHidden` keeps interior bones readable while clearly separating front/back limbs.
+        let depth = DepthMode::FadeHidden;
+        let bone = out.style([0.15, 0.92, 0.72, 0.95], 1.6, [0.0, 0.0], depth);
+        let joint = out.style([1.00, 0.85, 0.15, 1.00], 2.8, [0.0, 0.0], depth);
+        if let (Some(style_bone), Some(style_joint)) = (bone, joint) {
+            out.gpu_source(GpuSource::Skeletons { style_bone, style_joint });
+        }
+    }
+}
+
+/// Pre-sampled 3D trajectory and shot-handover markers of the active flight track for the
+/// viewport `FlightPath` overlay (recomputed only when the active track/plan changes).
+///
+/// Why pre-sampled: flight tracks are small and immutable between edits, so sampling once on
+/// track/plan change keeps per-frame overlay emission allocation-free and independent of spline
+/// evaluation cost.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FlightPathOverlayData {
+    /// World-space camera eye samples along the track (metres).
+    pub points: Vec<[f32; 3]>,
+    /// World-space positions where a hard `Cut` handover occurs.
+    pub cut_markers: Vec<[f32; 3]>,
+    /// World-space positions where a continuous `C2` handover begins.
+    pub transition_markers: Vec<[f32; 3]>,
+}
+
+/// Samples `track` (and optional `plan` handovers) into [`FlightPathOverlayData`].
+///
+/// Why: separates one-time track sampling from per-frame `OverlayProvider::emit` so the viewport
+/// draws the active flight rail and its cut/transition handovers with zero steady-state heap work.
+pub fn sample_flight_path_overlay(
+    track: &flight_navigator::fnav_core::Track,
+    plan: Option<&flight_navigator::fnav_plan::RailPlan>,
+    max_samples: usize,
+) -> FlightPathOverlayData {
+    let dur = track.duration_s();
+    if track.segments.is_empty() || !dur.is_finite() || dur <= 0.0 || max_samples < 2 {
+        return FlightPathOverlayData::default();
+    }
+
+    let mut points = Vec::with_capacity(max_samples);
+    let denom = (max_samples - 1) as f64;
+    for i in 0..max_samples {
+        let t = (i as f64 / denom) * dur;
+        let eye = track.eval(t).state.eye;
+        if eye.is_finite() {
+            points.push([eye.x, eye.y, eye.z]);
+        }
+    }
+
+    let mut cut_markers = Vec::new();
+    let mut transition_markers = Vec::new();
+    if let Some(plan) = plan {
+        for handover in &plan.handovers {
+            let Some(from_shot) = plan.shots.get(handover.from_shot) else {
+                continue;
+            };
+            let t_raw = from_shot.start_s + from_shot.duration_s;
+            if !t_raw.is_finite() {
+                continue;
+            }
+            let t_handover = t_raw.clamp(0.0, dur);
+            let eye = track.eval(t_handover).state.eye;
+            if !eye.is_finite() {
+                continue;
+            }
+            let p = [eye.x, eye.y, eye.z];
+            match handover.kind {
+                flight_navigator::fnav_plan::HandoverKind::Cut(_) => cut_markers.push(p),
+                flight_navigator::fnav_plan::HandoverKind::Continuous { .. } => {
+                    transition_markers.push(p);
+                }
+            }
+        }
+    } else {
+        // Standalone tracks without a `RailPlan` still carry explicit `Cut` and `Transition`
+        // segments; extract their timestamps directly so loaded `.track` files show markers too.
+        let mut t_acc = 0.0_f64;
+        for seg in &track.segments {
+            match seg {
+                flight_navigator::fnav_core::Segment::Cut(_) => {
+                    let eye = track.eval(t_acc).state.eye;
+                    if eye.is_finite() {
+                        cut_markers.push([eye.x, eye.y, eye.z]);
+                    }
+                }
+                flight_navigator::fnav_core::Segment::Transition(tr) => {
+                    let eye = track.eval(t_acc).state.eye;
+                    if eye.is_finite() {
+                        transition_markers.push([eye.x, eye.y, eye.z]);
+                    }
+                    t_acc += tr.duration_s.max(0.0);
+                }
+                flight_navigator::fnav_core::Segment::Shot(s) => {
+                    t_acc += s.duration_s.max(0.0);
+                }
+            }
+        }
+    }
+
+    FlightPathOverlayData {
+        points,
+        cut_markers,
+        transition_markers,
+    }
+}
+
+/// Emits the active flight track's 3D trajectory polyline and handover markers into `OverlayList`.
+#[derive(Clone, Copy, Debug)]
+pub struct FlightPathProvider<'a> {
+    /// Pre-sampled trajectory points and handover markers for the active flight track.
+    pub data: &'a FlightPathOverlayData,
+}
+
+impl OverlayProvider for FlightPathProvider<'_> {
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList) {
+        if !ctx.filter.shows(OverlayKind::FlightPath) || self.data.points.len() < 2 {
+            return;
+        }
+        // Depth-tested (`SkipHidden`) so trajectory segments occluded behind buildings do not
+        // visually float over foreground architecture.
+        let depth = DepthMode::SkipHidden;
+        if let Some(path_style) = out.style([0.06, 0.85, 1.00, 0.95], 1.8, [0.0, 0.0], depth) {
+            out.polyline(
+                SegmentClass::Path,
+                Space::World,
+                &self.data.points,
+                false,
+                path_style,
+                None,
+            );
+        }
+        if !self.data.cut_markers.is_empty()
+            && let Some(cut_style) = out.style([1.00, 0.62, 0.06, 1.00], 6.0, [0.0, 0.0], depth)
+        {
+            for &p in &self.data.cut_markers {
+                out.point(SegmentClass::Path, Space::World, p, cut_style, None);
+            }
+        }
+        if !self.data.transition_markers.is_empty()
+            && let Some(trans_style) = out.style([0.12, 0.90, 0.28, 1.00], 5.0, [0.0, 0.0], depth)
+        {
+            for &p in &self.data.transition_markers {
+                out.point(SegmentClass::Path, Space::World, p, trans_style, None);
+            }
         }
     }
 }
@@ -1082,5 +1259,149 @@ mod tests {
             assert!(tm.contains(&format!("#define {name} {v}u")), "{name} != {v}");
         }
         assert!(tm.contains(&format!("#define OVL_AXES_NEAR {AXES_NEAR_M:.2}f")));
+        assert!(tm.contains("void ovl_skeletons("));
+    }
+
+    #[test]
+    fn overlay_kinds_have_four_distinct_bits_and_labels() {
+        assert_eq!(OverlayKind::ALL.len(), 4);
+        let mut mask = 0u32;
+        for kind in OverlayKind::ALL {
+            let bit = kind.bit();
+            assert_eq!(bit.count_ones(), 1, "{kind:?} bit must be single-bit");
+            assert_eq!(mask & bit, 0, "{kind:?} bit must be distinct");
+            mask |= bit;
+            assert!(!kind.label().is_empty(), "{kind:?} must have a non-empty label");
+        }
+        assert_eq!(OverlayKind::Skeletons.bit(), 1 << 2);
+        assert_eq!(OverlayKind::Skeletons.label(), "Skeletons");
+        assert_eq!(OverlayKind::FlightPath.bit(), 1 << 3);
+        assert_eq!(OverlayKind::FlightPath.label(), "Flight Path");
+    }
+
+    #[test]
+    fn skeleton_provider_requests_gpu_source_only_when_enabled() {
+        let mut c = ctx(CameraProjection::Pinhole);
+        let mut l = OverlayList::default();
+        SkeletonProvider.emit(&c, &mut l);
+        assert!(l.gpu_sources().is_empty(), "skeletons are off by default");
+
+        c.filter.kinds |= OverlayKind::Skeletons.bit();
+        SkeletonProvider.emit(&c, &mut l);
+        match l.gpu_sources() {
+            [GpuSource::Skeletons { style_bone, style_joint }] => {
+                assert_ne!(style_bone, style_joint);
+                assert_eq!(l.styles()[style_bone.0 as usize].width_px, 1.6);
+                assert_eq!(
+                    l.styles()[style_bone.0 as usize].depth_mode,
+                    DepthMode::FadeHidden as u32
+                );
+                assert_eq!(
+                    l.styles()[style_joint.0 as usize].depth_mode,
+                    DepthMode::FadeHidden as u32
+                );
+            }
+            other => panic!("expected one skeletons source, got {other:?}"),
+        }
+        assert_eq!(l.styles().len(), 2);
+    }
+
+    #[test]
+    fn flight_path_provider_emits_polyline_and_handover_markers_when_enabled() {
+        let data = FlightPathOverlayData {
+            points: vec![[0.0, 0.0, 5.0], [1.0, 0.0, 6.0], [2.0, 0.5, 7.0]],
+            cut_markers: vec![[1.0, 0.0, 6.0]],
+            transition_markers: vec![[2.0, 0.5, 7.0]],
+        };
+        let mut c = ctx(CameraProjection::Pinhole);
+        let mut l = OverlayList::default();
+        FlightPathProvider { data: &data }.emit(&c, &mut l);
+        assert!(l.flatten(&c).is_empty(), "flight path is off by default");
+
+        c.filter.kinds |= OverlayKind::FlightPath.bit();
+        FlightPathProvider { data: &data }.emit(&c, &mut l);
+        assert_eq!(l.styles().len(), 3, "path + cut + transition styles");
+        assert_eq!(l.styles()[0].width_px, 1.8);
+        assert_eq!(l.styles()[0].depth_mode, DepthMode::SkipHidden as u32);
+        let segs = l.flatten(&c);
+        // 3 polyline points -> 2 line segments + 1 cut dot + 1 transition dot = 4 segments.
+        assert_eq!(segs.len(), 4);
+        for seg in segs {
+            assert_eq!(seg.cls, SegmentClass::Path as u32);
+        }
+    }
+
+    #[test]
+    fn sample_flight_path_overlay_samples_points_and_handover_markers() {
+        use flight_navigator::fnav_core::{
+            Aim, CameraState, Cut, CutEvidence, CutKind, Kinematic, Lens, Segment, Track,
+            Transition,
+        };
+        use glam::Vec3;
+
+        let empty = Track { segments: Vec::new(), looping: false };
+        assert_eq!(sample_flight_path_overlay(&empty, None, 64), FlightPathOverlayData::default());
+
+        let k0 = Kinematic {
+            state: CameraState::from_look_at(
+                Vec3::new(0.0, 4.0, 10.0),
+                Vec3::ZERO,
+                Vec3::Y,
+                Lens::pinhole(35.0),
+            ),
+            ..Kinematic::default()
+        };
+        let k1 = Kinematic {
+            state: CameraState::from_look_at(
+                Vec3::new(10.0, 4.0, 10.0),
+                Vec3::ZERO,
+                Vec3::Y,
+                Lens::pinhole(35.0),
+            ),
+            ..Kinematic::default()
+        };
+        let k2 = Kinematic {
+            state: CameraState::from_look_at(
+                Vec3::new(-12.0, 8.0, 15.0),
+                Vec3::ZERO,
+                Vec3::Y,
+                Lens::pinhole(50.0),
+            ),
+            ..Kinematic::default()
+        };
+        let k3 = Kinematic {
+            state: CameraState::from_look_at(
+                Vec3::new(-4.0, 8.0, 15.0),
+                Vec3::ZERO,
+                Vec3::Y,
+                Lens::pinhole(50.0),
+            ),
+            ..Kinematic::default()
+        };
+        let track = Track {
+            segments: vec![
+                Segment::Transition(Transition::direct(k0, k1, 2.0, Aim::Squad)),
+                Segment::Cut(Cut {
+                    kind: CutKind::Contrast,
+                    score: 0.9,
+                    evidence: CutEvidence {
+                        metric_a: 45.0,
+                        metric_b: 2.0,
+                        note: "test cut".to_string(),
+                    },
+                }),
+                Segment::Transition(Transition::direct(k2, k3, 2.0, Aim::Squad)),
+            ],
+            looping: false,
+        };
+
+        assert_eq!(sample_flight_path_overlay(&track, None, 1), FlightPathOverlayData::default());
+
+        let sampled = sample_flight_path_overlay(&track, None, 17);
+        assert_eq!(sampled.points.len(), 17);
+        assert_eq!(sampled.cut_markers.len(), 1);
+        assert_eq!(sampled.transition_markers.len(), 2);
+        assert!((sampled.points[0][0] - 0.0).abs() < 1e-3);
+        assert!((sampled.points[16][0] - (-4.0)).abs() < 1e-3);
     }
 }

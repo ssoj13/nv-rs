@@ -1052,6 +1052,8 @@ impl UiContext<'_> {
                         let icon = match kind {
                             OverlayKind::Contours => ic::POLYGON,
                             OverlayKind::Axes => ic::ARROWS_OUT_CARDINAL,
+                            OverlayKind::Skeletons => ic::USERS_THREE,
+                            OverlayKind::FlightPath => ic::PATH,
                         };
                         if tb_icon_button(ui, icon, ov.kinds & kind.bit() != 0, TbTone::Normal, kind.label())
                             .clicked()

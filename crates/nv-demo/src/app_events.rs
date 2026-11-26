@@ -271,7 +271,7 @@ pub enum RenderEvent {
 /// Storing `DemoSettings` and `CameraFrame` in an `appbus::StateSlot` guarantees that rapid
 /// slider drags or mouse orbits never build up a backlog of stale frames — the render thread
 /// always consumes only the latest snapshot.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderStateSnapshot {
     /// Latest effective render settings (after `DemoAnimator` evaluation).
     pub settings: DemoSettings,
@@ -289,6 +289,9 @@ pub struct RenderStateSnapshot {
     pub possess_auto_level: bool,
     /// User scroll/pinch zoom offset (meters along `-forward`) while possessing a vehicle or actor.
     pub possess_zoom_offset: f32,
+    /// Cached sampled flight path overlay data (`None` when the `FlightPath` overlay is off or no
+    /// track is active), shared via `Arc` so 60 Hz UI snapshot publishes never resample or allocate.
+    pub flight_path_overlay: Option<Arc<crate::overlay::FlightPathOverlayData>>,
 }
 
 /// Lost-wakeup-immune condvar waking the OptiX worker whenever a command or state snapshot arrives.
@@ -450,6 +453,7 @@ mod tests {
             possess_free_pitch: 0.0,
             possess_auto_level: true,
             possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
         };
         let bus = AppBus::new(initial);
 
@@ -467,6 +471,7 @@ mod tests {
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
                 possess_zoom_offset: 0.0,
+                flight_path_overlay: None,
             });
         }
 
@@ -489,6 +494,7 @@ mod tests {
             possess_free_pitch: 0.0,
             possess_auto_level: true,
             possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
         };
         let bus = AppBus::new(initial);
         let mut scratch = Vec::with_capacity(16);
@@ -572,6 +578,7 @@ mod tests {
             possess_free_pitch: 0.0,
             possess_auto_level: true,
             possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
         });
         let mut scratch = Vec::with_capacity(4);
 

@@ -18,7 +18,10 @@
 //! `BufClass::DeviceState`, and queues [`EventId::CrowdNavRelink`] when needed. Each frame uploads
 //! uniforms + traffic vehicles, clears `CrowdGroundMisses`, executes the plan with null OptiX
 //! externals (so `CrowdBoneOuts` remains compactly bone-indexed for downstream zero-copy
-//! `PlanKind::Camera` binding via [`CudaCrowdBackend::bone_outs_device_ptr`]), runs the two tiny
+//! `PlanKind::Camera` binding via [`CudaCrowdBackend::bone_outs_device_ptr`], and `CrowdWorldJoints`
+//! plus a static parent-to-child bone-edge table remain device-resident for zero-copy skeleton
+//! overlays via [`CudaCrowdBackend::world_joints_device_ptr`] and
+//! [`CudaCrowdBackend::skeleton_edges_device_ptr`]), runs the two tiny
 //! bridge kernels, and copies 12 bytes of status/displacement words into page-locked host memory.
 //!
 //! Uses: `crate::frame_plan_runner`, `csg_scene::crowd_gpu`, `csg_scene::frame_plan`,
@@ -483,6 +486,54 @@ fn check_scatter_topology(
     Ok(())
 }
 
+/// Builds the static per-scene skeleton bone-edge table `[parent_gidx, child_gidx, obj_key, 0]`
+/// for every actor in `scene.crowd` so `ovl_skeletons` can draw articulated skeletons directly
+/// from device-resident `BufId::CrowdWorldJoints` with zero per-frame host work.
+fn build_skeleton_edges(scene: &SceneBuilt, out: &mut Vec<[u32; 4]>) {
+    out.clear();
+    let n_joints = scene.crowd.world_joints.len();
+    if n_joints == 0 {
+        return;
+    }
+    out.reserve(n_joints);
+
+    for desc in &scene.crowd.descs {
+        let Some(skel) = scene.crowd.archetype_skeleton(desc.archetype_id as usize) else {
+            continue;
+        };
+        // Resolve the actor's P42 logical `object_id` from its root bone's dynamic provenance
+        // so `Selected` overlay scope and highlight match viewport picking (`pick::csg_selection_key`).
+        let obj_id = scene
+            .crowd_inst_ids
+            .get(desc.bone_offset as usize)
+            .and_then(|&inst_id| scene.world.dynamic_index(inst_id))
+            .and_then(|dyn_idx| scene.world.dynamic_provenance_at(dyn_idx))
+            .map_or(csg_scene::provenance::OBJECT_ID_NONE, |prov| prov.object_id);
+        let obj_key = crate::pick::csg_selection_key(obj_id, desc.user_id);
+
+        for (k, joint) in skel.joints.iter().enumerate() {
+            let Some(parent_u16) = joint.parent else {
+                continue;
+            };
+            let parent = usize::from(parent_u16);
+            if parent >= k {
+                continue;
+            }
+            let (Some(&p_slot), Some(&c_slot)) = (
+                skel.world_joint_index.get(parent),
+                skel.world_joint_index.get(k),
+            ) else {
+                continue;
+            };
+            let p_gidx = desc.bone_offset.saturating_add(p_slot);
+            let c_gidx = desc.bone_offset.saturating_add(c_slot);
+            if (p_gidx as usize) < n_joints && (c_gidx as usize) < n_joints {
+                out.push([p_gidx, c_gidx, obj_key, 0]);
+            }
+        }
+    }
+}
+
 /// Uploads a `BufClass::Table` buffer only when its generation changed or its slot reallocated.
 fn upload_table_if_needed<T: Pod>(
     plan: &mut GpuFramePlan,
@@ -516,6 +567,9 @@ pub struct CudaCrowdBackend {
     d_sbt_offsets: GrowCudaBuf<u32>,
     d_rebuild_pos: GrowCudaBuf<[f32; 4]>,
     d_disp_flag: GrowCudaBuf<u32>,
+    /// Static `(parent_gidx, child_gidx, obj_key, 0)` bone-edge table uploaded once per scene for
+    /// zero-copy GPU skeleton overlay rendering (`ovl_skeletons`).
+    d_skeleton_edges: GrowCudaBuf<[u32; 4]>,
     // 12 B page-locked host status: [CrowdFault, CrowdGroundMisses, disp_flag].
     pinned_status: PinnedHostBuf<u32>,
     has_pending_readback: bool,
@@ -524,6 +578,7 @@ pub struct CudaCrowdBackend {
     host_archetypes: Vec<ArchetypeMetaPod>,
     host_vehicles: Vec<CrowdVehiclePod>,
     host_rebuild_pos: Vec<[f32; 4]>,
+    host_skeleton_edges: Vec<[u32; 4]>,
     staging_states: Vec<ActorStatePod>,
     staging_bone_outs: Vec<BoneOutPod>,
     staging_prev_xforms: Vec<[f32; 12]>,
@@ -612,12 +667,14 @@ impl CudaCrowdBackend {
             d_sbt_offsets: GrowCudaBuf::default(),
             d_rebuild_pos: GrowCudaBuf::default(),
             d_disp_flag: GrowCudaBuf::default(),
+            d_skeleton_edges: GrowCudaBuf::default(),
             pinned_status,
             has_pending_readback: false,
             pending_ias_rebuild: false,
             host_archetypes: Vec::with_capacity(8),
             host_vehicles: Vec::with_capacity(64),
             host_rebuild_pos: Vec::with_capacity(64),
+            host_skeleton_edges: Vec::new(),
             staging_states: Vec::new(),
             staging_bone_outs: Vec::new(),
             staging_prev_xforms: Vec::new(),
@@ -670,6 +727,38 @@ impl CudaCrowdBackend {
         (
             self.plan.device_ptr(BufId::CrowdBoneOuts).unwrap_or(0),
             self.plan.elem_count(BufId::CrowdBoneOuts),
+        )
+    }
+
+    /// Returns `(cu_deviceptr, bone_count)` of device-resident `BufId::CrowdWorldJoints`
+    /// (`float4[N]`, `[x, y, z, radius]`) for zero-copy GPU skeleton overlay rendering.
+    ///
+    /// Why: returns `(0, 0)` while `scene_dirty` is set so a scene switch to a crowdless world
+    /// never exposes stale world-joint buffers from the previous scene.
+    #[inline]
+    pub fn world_joints_device_ptr(&self) -> (u64, u32) {
+        if self.scene_dirty {
+            return (0, 0);
+        }
+        (
+            self.plan.device_ptr(BufId::CrowdWorldJoints).unwrap_or(0),
+            self.plan.elem_count(BufId::CrowdWorldJoints),
+        )
+    }
+
+    /// Returns `(cu_deviceptr, edge_count)` of the static `(parent_gidx, child_gidx, obj_key, 0)`
+    /// bone-edge table for `ovl_skeletons`.
+    ///
+    /// Why: returns `(0, 0)` while `scene_dirty` is set so `ovl_skeletons` never indexes an edge
+    /// table built for a superseded scene.
+    #[inline]
+    pub fn skeleton_edges_device_ptr(&self) -> (u64, u32) {
+        if self.scene_dirty {
+            return (0, 0);
+        }
+        (
+            self.d_skeleton_edges.device_ptr(),
+            u32::try_from(self.d_skeleton_edges.len()).unwrap_or(0),
         )
     }
 
@@ -927,7 +1016,7 @@ impl CudaCrowdBackend {
             self.pending_events.push(EventId::CrowdNavRelink);
         }
 
-        // Seed amortized IAS rebuild anchor positions and status words.
+        // Seed amortized IAS rebuild anchor positions, static skeleton bone edges, and status words.
         self.host_rebuild_pos.clear();
         self.host_rebuild_pos.reserve(n_actors);
         for st in &scene.crowd.states {
@@ -935,6 +1024,9 @@ impl CudaCrowdBackend {
                 .push([st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2], 0.0]);
         }
         self.d_rebuild_pos.upload(stream, &self.host_rebuild_pos)?;
+        build_skeleton_edges(scene, &mut self.host_skeleton_edges);
+        self.d_skeleton_edges
+            .upload(stream, &self.host_skeleton_edges)?;
         self.d_disp_flag.ensure_len(stream, 1)?;
         self.pinned_status.write(STATUS_FAULT_IDX, CROWD_FAULT_NONE)?;
         self.pinned_status.write(STATUS_GROUND_MISSES_IDX, 0)?;
@@ -1355,6 +1447,41 @@ mod tests {
             ..CrowdLodParams::default()
         };
         assert_eq!(a.signature_key(), b.signature_key());
+    }
+
+    #[test]
+    fn build_skeleton_edges_emits_valid_parent_child_pairs_with_selection_keys() {
+        let reg = csg_scenes::default_scene_registry();
+        let module = reg.get("marina").expect("marina registered");
+        let scene = module
+            .build(&csg_scene::SceneBuildConfig::default())
+            .expect("build marina scene");
+        assert!(scene.crowd.actor_count() > 0 && scene.crowd.bone_count() > 0);
+
+        let mut edges = Vec::new();
+        build_skeleton_edges(&scene, &mut edges);
+        let expected_edges: usize = scene
+            .crowd
+            .descs
+            .iter()
+            .filter_map(|d| scene.crowd.archetype_skeleton(d.archetype_id as usize))
+            .map(|skel| skel.joints.iter().filter(|j| j.parent.is_some()).count())
+            .sum();
+        assert_eq!(
+            edges.len(),
+            expected_edges,
+            "every non-root crowd joint must produce one skeleton edge"
+        );
+        let n_joints = scene.crowd.world_joints.len() as u32;
+        for &[p_gidx, c_gidx, _obj_key, pad] in &edges {
+            assert!(p_gidx < c_gidx, "parent joint must precede child joint");
+            assert!(c_gidx < n_joints, "child joint index out of bounds");
+            assert_eq!(pad, 0);
+        }
+        // Re-running into the same buffer must clear and reproduce identical edges.
+        let snapshot = edges.clone();
+        build_skeleton_edges(&scene, &mut edges);
+        assert_eq!(edges, snapshot);
     }
 
     #[test]

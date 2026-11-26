@@ -1222,6 +1222,8 @@ struct TonemapKernel {
     ovl_splat: cu::CUfunction,
     /// Object axes provider: device CSG instances -> axis (and selection bounds) segments.
     ovl_axes: cu::CUfunction,
+    /// Actor skeleton provider: device `WorldJoints` + skeleton edge table -> bone / joint segments.
+    ovl_skeletons: cu::CUfunction,
     /// Overlay composite: coverage -> tonemapped RGBA8 / scRGB outputs.
     ovl_composite: cu::CUfunction,
     pack_rr_func: cu::CUfunction,
@@ -2714,6 +2716,7 @@ fn init_optix(
         wire_emit: std::ptr::null_mut(),
         ovl_splat: std::ptr::null_mut(),
         ovl_axes: std::ptr::null_mut(),
+        ovl_skeletons: std::ptr::null_mut(),
         ovl_composite: std::ptr::null_mut(),
         pack_rr_func: std::ptr::null_mut(),
     };
@@ -2725,6 +2728,7 @@ fn init_optix(
     tonemap.wire_emit = cu_module_function(tonemap.module, c"wire_emit")?;
     tonemap.ovl_splat = cu_module_function(tonemap.module, c"ovl_splat")?;
     tonemap.ovl_axes = cu_module_function(tonemap.module, c"ovl_axes")?;
+    tonemap.ovl_skeletons = cu_module_function(tonemap.module, c"ovl_skeletons")?;
     tonemap.ovl_composite = cu_module_function(tonemap.module, c"ovl_composite")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
@@ -3462,6 +3466,8 @@ struct OverlayFrame<'a> {
     wire: bool,
     /// Contour silhouette width (`DemoSettings::wire_line_px`).
     wire_line_px: f32,
+    /// Cached sampled flight path overlay data (`None` when disabled or no track is active).
+    flight_path: Option<&'a crate::overlay::FlightPathOverlayData>,
 }
 
 /// The overlay pass (`overlay.rs`): providers fill `list`, CPU primitives, styles and the camera
@@ -3493,6 +3499,14 @@ fn run_overlay(
     contours.line_px = f.wire_line_px;
     contours.emit(&ctx, list);
     axes.emit(&ctx, list);
+    if rig.csg_host.has_crowd() {
+        let mut skeletons = ov::SkeletonProvider;
+        skeletons.emit(&ctx, list);
+    }
+    if let Some(data) = f.flight_path {
+        let mut flight = ov::FlightPathProvider { data };
+        flight.emit(&ctx, list);
+    }
     let n_cpu = list.flatten(&ctx).len().min(OVERLAY_CPU_SEG_MAX);
     if n_cpu == 0 && list.gpu_sources().is_empty() {
         if let Some(o) = rig.overlay.as_mut() {
@@ -3727,6 +3741,60 @@ fn run_overlay(
                 };
                 if rc != cu::cudaError_enum_CUDA_SUCCESS {
                     return Err(format!("ovl_axes cuLaunchKernel failed ({rc:?})"));
+                }
+            }
+            ov::GpuSource::Skeletons {
+                style_bone,
+                style_joint,
+            } => {
+                // Skip cleanly when the GPU crowd backend has not been initialized yet (e.g.
+                // paused on startup) or has no device-resident joints/edges yet.
+                let Some(Ok(cc)) = rig.cuda_crowd.as_ref() else {
+                    continue;
+                };
+                let (mut world_joints, mut joint_count) = cc.world_joints_device_ptr();
+                let (mut edges, mut edge_count) = cc.skeleton_edges_device_ptr();
+                if world_joints == 0 || edges == 0 || joint_count == 0 || edge_count == 0 {
+                    continue;
+                }
+                let mut cam_dev = cam_ptr;
+                let mut sel_dev = sel_ptr;
+                let (mut sb, mut sj) = (style_bone.0, style_joint.0);
+                let mut args: [*mut c_void; 11] = [
+                    (&raw mut world_joints).cast(),
+                    (&raw mut joint_count).cast(),
+                    (&raw mut edges).cast(),
+                    (&raw mut edge_count).cast(),
+                    (&raw mut cam_dev).cast(),
+                    (&raw mut sel_dev).cast(),
+                    (&raw mut segs).cast(),
+                    (&raw mut counter).cast(),
+                    (&raw mut cap).cast(),
+                    (&raw mut sb).cast(),
+                    (&raw mut sj).cast(),
+                ];
+                // SAFETY: `ovl_skeletons(const float4*, u32, const NvSkeletonEdge*, u32,
+                // const OvlCamera*, const unsigned*, NvOverlaySegment*, unsigned*, u32, u32, u32)`;
+                // `world_joints` (`joint_count` float4s) and `edges` (`edge_count` edge records)
+                // stay alive inside `rig.cuda_crowd` on `rig.stream` until the end-of-frame fence;
+                // writes into `segs` are bounded by `cap` via `nv_overlay_push`.
+                let rc = unsafe {
+                    cu::cuLaunchKernel(
+                        rig.tonemap.ovl_skeletons,
+                        edge_count.div_ceil(128),
+                        1,
+                        1,
+                        128,
+                        1,
+                        1,
+                        0,
+                        cs,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                    return Err(format!("ovl_skeletons cuLaunchKernel failed ({rc:?})"));
                 }
             }
         }
@@ -4870,6 +4938,7 @@ pub fn spawn_render_thread(
             let mut possess_free_pitch = init_snap.possess_free_pitch;
             let mut possess_auto_level = init_snap.possess_auto_level;
             let mut possess_zoom_offset = init_snap.possess_zoom_offset;
+            let mut flight_path_overlay = init_snap.flight_path_overlay.clone();
             let mut possess_damper = crate::flight::CameraDamper::default();
             possess_damper.snap(camera_frame_to_core_pose(camera));
             let mut possess_blend_rem: f32 = 0.0;
@@ -5427,6 +5496,7 @@ pub fn spawn_render_thread(
                     possess_free_pitch = snap.possess_free_pitch;
                     possess_auto_level = snap.possess_auto_level;
                     possess_zoom_offset = snap.possess_zoom_offset;
+                    flight_path_overlay = snap.flight_path_overlay.clone();
                 }
 
                 // Intersection counters of the previous counted launch (non-blocking event query).
@@ -7050,6 +7120,7 @@ pub fn spawn_render_thread(
                             history_cut: overlay_history_cut,
                             wire: wireframe && rig.wire_cls_u32.is_some(),
                             wire_line_px: settings.wire_line_px,
+                            flight_path: flight_path_overlay.as_deref(),
                         };
                         overlay_history_cut = false;
                         match run_overlay(

@@ -751,6 +751,122 @@ extern "C" __global__ void ovl_axes(
     }
 }
 
+// Articulated crowd skeleton overlay (`overlay::GpuSource::Skeletons`): reads device-resident
+// `world_joints` (`float4[N]`, `[x, y, z, radius]`, updated in place by `PlanKind::Crowd`) and the
+// static `(parent_gidx, child_gidx, obj_key, 0)` edge table uploaded once per scene. Why: emits
+// near-clipped world-space `NvOverlaySegment`s directly on the device for `ovl_splat` to project
+// and depth-test, with zero per-frame host readbacks.
+#define OVL_SKEL_NEAR 0.05f
+#define OVL_SKEL_JOINT_DOT_DIST 25.0f
+
+extern "C" __global__ void ovl_skeletons(
+    const float4* __restrict__ world_joints,
+    unsigned int joint_count,
+    const uint4* __restrict__ edges,
+    unsigned int edge_count,
+    const OvlCamera* __restrict__ cam,
+    const unsigned int* __restrict__ sel,
+    NvOverlaySegment* __restrict__ segs,
+    unsigned int* __restrict__ counter,
+    unsigned int cap,
+    unsigned int style_bone,
+    unsigned int style_joint
+) {
+    if (world_joints == nullptr || edges == nullptr || cam == nullptr
+        || segs == nullptr || counter == nullptr) {
+        return;
+    }
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= edge_count) return;
+    const OvlCamera c = *cam;
+    if (c.pinhole == 0u) {
+        if (i == 0u) atomicAdd(&counter[2], 1u);
+        return;
+    }
+
+    const uint4 e = __ldg(edges + i);
+    if (e.x >= joint_count || e.y >= joint_count) return;
+
+    const unsigned int sel_n = (sel != nullptr) ? c.sel_count : 0u;
+    const bool selected = ovl_is_selected(sel, sel_n, e.z);
+    if (c.scope_selected != 0u && !selected) return;
+
+    const float4 j0 = __ldg(world_joints + e.x);
+    const float4 j1 = __ldg(world_joints + e.y);
+    // Culled or unposed actors carry non-positive radius (`w <= 0`); guard non-finite coordinates.
+    if (!isfinite(j0.x) || !isfinite(j0.y) || !isfinite(j0.z) || !isfinite(j0.w)
+        || !isfinite(j1.x) || !isfinite(j1.y) || !isfinite(j1.z) || !isfinite(j1.w)
+        || j0.w <= 0.0f || j1.w <= 0.0f) {
+        return;
+    }
+
+    const float3 orig0 = make_float3(j0.x, j0.y, j0.z);
+    const float3 orig1 = make_float3(j1.x, j1.y, j1.z);
+    const float bx = orig1.x - orig0.x;
+    const float by = orig1.y - orig0.y;
+    const float bz = orig1.z - orig0.z;
+    if (bx * bx + by * by + bz * bz < 1e-8f) return; // length < 1e-4 m
+
+    const float3 eye = make_float3(c.eye[0], c.eye[1], c.eye[2]);
+    const float3 fwd = make_float3(c.fwd[0], c.fwd[1], c.fwd[2]);
+    const float z0_raw = (orig0.x - eye.x) * fwd.x + (orig0.y - eye.y) * fwd.y + (orig0.z - eye.z) * fwd.z;
+    const float z1_raw = (orig1.x - eye.x) * fwd.x + (orig1.y - eye.y) * fwd.y + (orig1.z - eye.z) * fwd.z;
+    if (z0_raw <= OVL_SKEL_NEAR && z1_raw <= OVL_SKEL_NEAR) return;
+
+    // Clip segments that straddle the near plane so `ovl_splat`'s `ovl_project` never drops a bone
+    // whose parent or child sits just behind the camera.
+    float3 p0 = orig0;
+    float3 p1 = orig1;
+    if (z0_raw <= OVL_SKEL_NEAR) {
+        const float t = fminf(1.0f, fmaxf(0.0f, (OVL_SKEL_NEAR - z0_raw) / (z1_raw - z0_raw)));
+        p0 = make_float3(orig0.x + t * bx, orig0.y + t * by, orig0.z + t * bz);
+    } else if (z1_raw <= OVL_SKEL_NEAR) {
+        const float t = fminf(1.0f, fmaxf(0.0f, (OVL_SKEL_NEAR - z0_raw) / (z1_raw - z0_raw)));
+        p1 = make_float3(orig0.x + t * bx, orig0.y + t * by, orig0.z + t * bz);
+    }
+
+    const float3 v0 = make_float3(p0.x - eye.x, p0.y - eye.y, p0.z - eye.z);
+    const float3 v1 = make_float3(p1.x - eye.x, p1.y - eye.y, p1.z - eye.z);
+    if (c.radius > 0.0f) {
+        const float d0sq = v0.x * v0.x + v0.y * v0.y + v0.z * v0.z;
+        const float d1sq = v1.x * v1.x + v1.y * v1.y + v1.z * v1.z;
+        if (fminf(d0sq, d1sq) > c.radius * c.radius) return;
+    }
+
+    // Frustum side-plane cull on the clipped segment's bounding sphere so offscreen crowds do not
+    // consume overlay segment capacity.
+    const float3 rgt = make_float3(c.right[0], c.right[1], c.right[2]);
+    const float3 up = make_float3(c.up[0], c.up[1], c.up[2]);
+    const float3 mid = make_float3(0.5f * (v0.x + v1.x), 0.5f * (v0.y + v1.y), 0.5f * (v0.z + v1.z));
+    const float cdx = p1.x - p0.x, cdy = p1.y - p0.y, cdz = p1.z - p0.z;
+    const float rad = 0.5f * sqrtf(cdx * cdx + cdy * cdy + cdz * cdz);
+    const float mx = mid.x * rgt.x + mid.y * rgt.y + mid.z * rgt.z;
+    const float my = mid.x * up.x + mid.y * up.y + mid.z * up.z;
+    const float mz = mid.x * fwd.x + mid.y * fwd.y + mid.z * fwd.z;
+    const float tx = c.tan_half_fov * c.aspect;
+    const float ty = c.tan_half_fov;
+    const float nx = sqrtf(1.0f + tx * tx);
+    const float ny = sqrtf(1.0f + ty * ty);
+    if ((mx - mz * tx) / nx > rad || (-mx - mz * tx) / nx > rad
+        || (my - mz * ty) / ny > rad || (-my - mz * ty) / ny > rad) {
+        return;
+    }
+
+    // Depth-tested world segment (omitting `NV_OVERLAY_FLAG_NO_DEPTH_TEST` enables `st.depth_mode`).
+    const unsigned int sflags = NV_OVERLAY_FLAG_WORLD | NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH
+        | (selected ? NV_OVERLAY_FLAG_SELECTED : 0u);
+    ovl_push_world(
+        segs, counter, cap, p0, p1, sflags, NV_OVERLAY_CLASS_BONE, e.z, style_bone, 0.0f
+    );
+
+    // Optional joint accent dot at child joint `j1` when selected or close enough to inspect joints.
+    if (z1_raw > OVL_SKEL_NEAR && (selected || z1_raw < OVL_SKEL_JOINT_DOT_DIST)) {
+        ovl_push_world(
+            segs, counter, cap, orig1, orig1, sflags, NV_OVERLAY_CLASS_BONE, e.z, style_joint, 0.0f
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Hidden-line wireframe (`DisplayMode::Wireframe`, wireframe.rs): vector contour lines at native
 // resolution. Input is this frame's visible-hit G-buffer (raytracer.cu, `aov_mode` 11):

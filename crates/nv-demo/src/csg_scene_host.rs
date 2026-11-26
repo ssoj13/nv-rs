@@ -36,13 +36,13 @@ use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat};
 use csg_scene::{
-    CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
+    AssemblyPart, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
     GpuMaterial, LodConfig, MAT_OVERRIDE_NONE, PackedGpuScene, RailSpec,
     SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
     SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, find_crowd_actor_for_inst,
     inst_flags, is_dynamic_inst_id, list_possess_targets_with_crowd,
     crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id, encode_static_inst_id,
-    lookup_instance_and_assembly,
+    lookup_instance_and_assembly, resolve_possess_attach,
     resolve_possess_pose_with_crowd,
 };
 
@@ -143,15 +143,19 @@ impl CompoundGasPlan {
 
 /// Inspects a compiled compound in `lib` and selects the fastest valid OptiX GAS strategy.
 ///
-/// Eligible union compounds (`PURE_UNION` = separated parts, or `FIRST_HIT_UNION` = overlapping /
-/// touching parts) with `M >= 2` contiguous `PUSH_PRIM`s (no `FINITE_REPEAT`, bounded finite
-/// primitive AABBs) build an `M`-AABB custom-primitive GAS with `primitive_offset = first_prim`
-/// so hardware RT Cores traverse the compound's internal BVH with
-/// `optixGetPrimitiveIndex() == prim_idx`. `PURE_UNION` parts are disjoint, so the per-part hit is
-/// the union's (`__intersection__csg_prim`, SBT 10); `FIRST_HIT_UNION` parts go to SBT 12
-/// (`__intersection__csg_union_part`), whose `csg_union_part_hit` / `_shadow` (csg-rs `6e84ff6`)
-/// report a part's hit only where no other part covers it, so internal faces of overlapping parts
-/// never surface, also for rays starting inside a part.
+/// - Standalone `SINGLE_PRIM` compounds — including P37 W1 sweep primitives (`SWEEP_SEG = 13` and
+///   `SWEEP_TILE = 14`, the latter flagged `SINGLE_PRIM | DISJOINT_PARTS`) — route directly to
+///   [`CompoundGasPlan::SinglePrim`] -> `CSG_SBT_PRIM_OFFSET` (10) -> `__intersection__csg_prim`
+///   -> `csg_intersect_prim_idx`.
+/// - Eligible union compounds (`PURE_UNION` = separated parts, or `FIRST_HIT_UNION` = overlapping /
+///   touching parts) with `M >= 2` contiguous `PUSH_PRIM`s (no `FINITE_REPEAT`, bounded finite
+///   primitive AABBs) build an `M`-AABB custom-primitive GAS with `primitive_offset = first_prim`
+///   so hardware RT Cores traverse the compound's internal BVH with
+///   `optixGetPrimitiveIndex() == prim_idx`. `PURE_UNION` parts are disjoint, so the per-part hit is
+///   the union's (`__intersection__csg_prim`, SBT 10); `FIRST_HIT_UNION` parts go to SBT 12
+///   (`__intersection__csg_union_part`), whose `csg_union_part_hit` / `_shadow` (csg-rs `6e84ff6`)
+///   report a part's hit only where no other part covers it, so internal faces of overlapping parts
+///   never surface, also for rays starting inside a part.
 fn compound_gas_plan(lib: &CompiledLibrary, comp: &GpuCompound) -> CompoundGasPlan {
     let op_start = comp.op_offset as usize;
     let op_end = op_start.saturating_add(comp.op_count as usize);
@@ -1016,6 +1020,176 @@ fn pack_dynamic_prefix_only(
     }
 }
 
+/// Checks whether `packed` begins with the exact `GpuInstance` entries that `part` emits at `lod`
+/// for `inst`, returning the consumed slot count on a match.
+fn matches_packed_lod(
+    part: &AssemblyPart,
+    lod: usize,
+    inst: &csg_scene::Instance,
+    packed: &[GpuInstance],
+) -> Option<usize> {
+    if let Some(proxy) = part.active_proxy(lod) {
+        let first = packed.first()?;
+        let part_world = inst.xform * proxy.box_local_xform;
+        return (first.compound_id == proxy.compound_id.0
+            && first.user_id == inst.user_id
+            && xform_to_bits(first.xform) == xform_to_bits(part_world.0))
+        .then_some(1);
+    }
+    let compounds = part.lods.compounds_for_lod(lod);
+    if compounds.is_empty() {
+        return Some(0);
+    }
+    if packed.len() < compounds.len() {
+        return None;
+    }
+    let expected_xf = xform_to_bits((inst.xform * part.local_xform).0);
+    packed[..compounds.len()]
+        .iter()
+        .zip(compounds)
+        .all(|(g, &cid)| {
+            g.compound_id == cid.0
+                && g.user_id == inst.user_id
+                && xform_to_bits(g.xform) == expected_xf
+        })
+        .then_some(compounds.len())
+}
+
+/// Synchronizes `dyn_prev_lods` with the LODs that `WorldScene::pack_visible` just emitted into
+/// `packed_dyn`, preserving LOD hysteresis across `FullRepack` -> `TrafficOnly` transitions.
+///
+/// Why: `WorldScene::dynamic_prev_lods` is private, while [`pack_dynamic_prefix_only`] maintains
+/// its own hysteresis mirror (`self.dyn_prev_lods`). Wiping `dyn_prev_lods` to `PREV_LOD_NONE`
+/// after `FullRepack` destroys hysteresis, so any dynamic vehicle inside a LOD deadband picks a
+/// different LOD on the next `TrafficOnly` tick than `pack_visible` kept, failing
+/// `same_dyn_topology` and causing endless `FullRepack` churn even on a stationary camera.
+fn record_packed_dynamic_lods(
+    world: &WorldScene,
+    view: &CameraView,
+    packed_dyn: &[GpuInstance],
+    dyn_prev_lods: &mut Vec<u8>,
+) {
+    let dyn_slice = world.dynamic_instances();
+    dyn_prev_lods.resize(dyn_slice.len(), PREV_LOD_NONE);
+    let lod_cfg = view.effective_lod_config();
+    if !lod_cfg.enabled || lod_cfg.force_lod.is_some() {
+        dyn_prev_lods.fill(PREV_LOD_NONE);
+        return;
+    }
+
+    let max_radius = if view.max_radius.is_nan() {
+        0.0
+    } else {
+        view.max_radius.max(0.0)
+    };
+    let max_radius_sq = if max_radius.is_finite() {
+        max_radius * max_radius
+    } else {
+        f32::INFINITY
+    };
+    let shadow_radius = if view.shadow_guard_radius.is_finite() {
+        view.shadow_guard_radius.max(0.0).min(max_radius)
+    } else {
+        0.0
+    };
+    let shadow_radius_sq = shadow_radius * shadow_radius;
+    let min_px = if view.small_detail_cull_factor.is_finite() && view.small_detail_cull_factor > 0.0
+    {
+        lod_cfg.sanitized_min_screen_px()
+    } else {
+        0.0
+    };
+
+    let mut cursor = 0usize;
+    for (dyn_idx, (inst, prev_lod_slot)) in
+        dyn_slice.iter().zip(dyn_prev_lods.iter_mut()).enumerate()
+    {
+        if !inst.is_visible() {
+            continue;
+        }
+        let Some(assembly) = world.assembly(inst.assembly_id) else {
+            continue;
+        };
+        let crowd_actor = world.crowd_actor_of_dynamic(dyn_idx);
+        let is_crowd_bone = crowd_actor.is_some();
+        if crowd_actor.is_some_and(|actor| !world.crowd_actor_visible(actor, view)) {
+            continue;
+        }
+        let world_aabb = inst.xform.xform_aabb(assembly.local_aabb);
+        let dist_sq = csg_aabb_distance_sq(world_aabb, view.position);
+        if !is_crowd_bone && max_radius_sq.is_finite() && dist_sq > max_radius_sq {
+            continue;
+        }
+        let world_diam = world_aabb.diameter();
+        let in_frustum = is_crowd_bone
+            || view
+                .frustum
+                .is_none_or(|frustum| frustum.intersects_aabb(world_aabb));
+        if !in_frustum {
+            let keep_shadow = (inst.flags & inst_flags::CAST_SHADOW) != 0
+                && shadow_radius_sq > 0.0
+                && dist_sq <= shadow_radius_sq
+                && (!world_diam.is_finite() || world_diam >= SHADOW_GUARD_MIN_DIAMETER);
+            if !keep_shadow {
+                continue;
+            }
+        }
+        let center = if assembly.local_aabb.is_empty() || !assembly.local_aabb.is_finite() {
+            inst.position()
+        } else {
+            inst.xform.xform_pt(assembly.local_aabb.center())
+        };
+        let dist = (center - view.position).len();
+        let part_end = if is_crowd_bone {
+            assembly.parts.len()
+        } else {
+            assembly.visible_part_end_with_config(dist, view.small_detail_cull_factor, &lod_cfg)
+        };
+        if part_end == 0 {
+            continue;
+        }
+        let scale_max = xform_max_scale(inst.xform);
+        let prev_lod = if *prev_lod_slot == PREV_LOD_NONE {
+            None
+        } else {
+            Some(*prev_lod_slot as usize)
+        };
+        let part_min_px = if is_crowd_bone { 0.0 } else { min_px };
+        let mut recorded_lod: Option<usize> = None;
+        let visible_parts = assembly.parts.get(..part_end).unwrap_or(&assembly.parts);
+        for part in visible_parts {
+            let part_diam = if part.local_aabb.is_finite() && !part.local_aabb.is_empty() {
+                part.local_aabb.diameter() * scale_max * xform_max_scale(part.local_xform)
+            } else {
+                assembly.local_aabb.diameter() * scale_max
+            };
+            let proj_px = view.project_diameter_px(part_diam, dist);
+            if part_min_px > 0.0 && part.tier != DetailTier::Macro && proj_px < part_min_px {
+                continue;
+            }
+            let preferred = part
+                .lods
+                .select_lod_with_config(dist, proj_px, prev_lod, &lod_cfg);
+            let rem = packed_dyn.get(cursor..).unwrap_or(&[]);
+            // Longest matching tier wins (disambiguates when a coarser LOD is a compound prefix of
+            // a finer LOD), breaking equal-length ties in favor of `preferred`.
+            let (chosen_lod, consumed) = (0..part.lods.num_levels())
+                .filter_map(|tier| {
+                    matches_packed_lod(part, tier, inst, rem).map(|n| (tier, n))
+                })
+                .max_by_key(|&(tier, n)| (n, tier == preferred))
+                .unwrap_or((preferred, 0));
+            cursor = cursor.saturating_add(consumed).min(packed_dyn.len());
+            if recorded_lod.is_none() && part.lods.num_levels() > 1 {
+                recorded_lod = Some(chosen_lod);
+            }
+        }
+        if let Some(lod) = recorded_lod {
+            *prev_lod_slot = u8::try_from(lod).unwrap_or(PREV_LOD_NONE - 1);
+        }
+    }
+}
+
 /// Builds a single cached OptiX custom-primitive GAS for `comp`, selecting Multi-AABB hardware BVH
 /// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible union
 /// compounds, `primitive_offset = prim_idx` for `SINGLE_PRIM` compounds, and a 1-AABB GAS for
@@ -1167,6 +1341,9 @@ pub struct CsgGpuHost {
     compound_gases: Vec<Arc<Accel>>,
     /// Per-compound SBT hit-group offset (`CSG_SBT_PRIM_OFFSET` = 10 or `CSG_SBT_OFFSET` = 8).
     compound_sbt_offsets: Vec<u32>,
+    /// Per-compound semantic class masks (`WorldScene::semantic_masks`, csg-rs P41; indexed by
+    /// `compound_id`).
+    compound_semantic_masks: Vec<u64>,
     compounds_buf: GrowDeviceBuffer<GpuCompound>,
     ops_buf: GrowDeviceBuffer<GpuOp>,
     prims_buf: GrowDeviceBuffer<GpuPrim>,
@@ -1237,6 +1414,7 @@ impl CsgGpuHost {
             packed: PackedGpuScene::new(),
             compound_gases: Vec::new(),
             compound_sbt_offsets: Vec::new(),
+            compound_semantic_masks: Vec::new(),
             compounds_buf: GrowDeviceBuffer::default(),
             ops_buf: GrowDeviceBuffer::default(),
             prims_buf: GrowDeviceBuffer::default(),
@@ -1346,6 +1524,16 @@ impl CsgGpuHost {
     /// = 8) for every compound that has a GAS.
     pub fn compound_sbt_offsets(&self) -> &[u32] {
         &self.compound_sbt_offsets
+    }
+
+    /// Returns the per-compound semantic class masks (`WorldScene::semantic_masks`, csg-rs P41)
+    /// for every compound in the active scene library, indexed by `compound_id`.
+    #[expect(
+        dead_code,
+        reason = "accessor reserved for Wave B GPU semantic-mask consumers"
+    )]
+    pub fn compound_semantic_masks(&self) -> &[u64] {
+        &self.compound_semantic_masks
     }
 
     /// Computes the exact 1:1 mapping `bone_slot_map[gidx] -> packed_instance_slot` (or `u32::MAX`
@@ -1626,6 +1814,7 @@ impl CsgGpuHost {
                 .map_err(|e| format!("CSG stress GAS sync failed: {e}"))?;
             self.compound_gases.extend(new_gases);
             self.compound_sbt_offsets.extend(new_sbt_offsets);
+            self.compound_semantic_masks = scene.world.semantic_masks().to_vec();
             Ok(())
         })();
 
@@ -1929,6 +2118,28 @@ impl CsgGpuHost {
         )
     }
 
+    /// Builds a GPU [`csg_scene::camera_gpu::PossessAttachPod`] and vertical FOV (degrees)
+    /// when the currently possessed body is a crowd actor whose mount bone exists in
+    /// `CrowdSim::bone_outs`, so `PlanKind::Camera` can compose the camera directly from
+    /// `BufId::CrowdBoneOuts` on the GPU with zero host readback.
+    pub fn active_possess_attach(
+        &self,
+        free_yaw: f32,
+        free_pitch: f32,
+        auto_level: bool,
+    ) -> Option<(csg_scene::camera_gpu::PossessAttachPod, f32)> {
+        let scene = self.scene.as_ref()?;
+        let info = self.active_possess.as_ref()?;
+        let attach =
+            resolve_possess_attach(&scene.world, &scene.crowd, info.inst_id, info.mount_idx)?;
+        if (attach.index as usize) >= scene.crowd.bone_outs.len() {
+            return None;
+        }
+        let pod = attach.to_pod([0.0; 3], [free_yaw, free_pitch], auto_level)?;
+        let vfov_deg = if info.mount_idx.min(1) == 0 { 78.0 } else { 60.0 };
+        Some((pod, vfov_deg))
+    }
+
     /// Returns the flat device pointers for `LaunchParams`.
     pub fn device_pointers(&self) -> CsgDevicePointers {
         if !self.is_active() {
@@ -1981,7 +2192,8 @@ impl CsgGpuHost {
             let uploaded = self.packed.len().min(self.instances_buf.len_elems);
             let slots = &self.packed.instances_slice()[..uploaded];
             let partial = crate::semantic_filter::fill_partial_bits(
-                slots.iter().map(|i| i.flags),
+                slots,
+                &self.compound_semantic_masks,
                 hidden,
                 &mut self.sem_partial_host,
             );
@@ -2383,9 +2595,12 @@ impl CsgGpuHost {
                 }
                 self.prev_non_crowd_dyn_count = first_crowd;
                 self.crowd_at_dyn_tail = saw_crowd && crowd_tail_contiguous;
-                self.dyn_prev_lods
-                    .resize(scene.world.dynamic_instance_count(), PREV_LOD_NONE);
-                self.dyn_prev_lods.fill(PREV_LOD_NONE);
+                record_packed_dynamic_lods(
+                    &scene.world,
+                    &cam_view,
+                    &slice[..dyn_count],
+                    &mut self.dyn_prev_lods,
+                );
                 self.sem_partial_stale = true;
                 self.last_pack_gpu_crowd = gpu_crowd_active;
                 CsgSyncResult::FullRepack
@@ -2459,8 +2674,16 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
+            let cm = self
+                .compound_semantic_masks
+                .get(cid)
+                .copied()
+                .unwrap_or(u64::MAX);
             inst.mask = if visible {
-                sf::visibility_mask(inst.mask, sf::classify(sf::instance_semantic_mask(gpu_inst.flags), hidden))
+                sf::visibility_mask(
+                    inst.mask,
+                    sf::classify(sf::instance_semantic_mask(gpu_inst.flags, cm), hidden),
+                )
             } else {
                 0
             };
@@ -2504,8 +2727,16 @@ impl CsgGpuHost {
                 break;
             };
             let mut inst = Instance::new(&self.compound_gases[gas_idx]);
+            let cm = self
+                .compound_semantic_masks
+                .get(cid)
+                .copied()
+                .unwrap_or(u64::MAX);
             inst.mask = if visible {
-                sf::visibility_mask(inst.mask, sf::classify(sf::instance_semantic_mask(gpu_inst.flags), hidden))
+                sf::visibility_mask(
+                    inst.mask,
+                    sf::classify(sf::instance_semantic_mask(gpu_inst.flags, cm), hidden),
+                )
             } else {
                 0
             };
@@ -2579,6 +2810,7 @@ impl CsgGpuHost {
         self.crowd_frozen = false;
         self.compound_gases.clear();
         self.compound_sbt_offsets.clear();
+        self.compound_semantic_masks.clear();
         self.compounds_buf.clear();
         self.ops_buf.clear();
         self.prims_buf.clear();
@@ -2657,7 +2889,7 @@ impl CsgGpuHost {
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
-        if let Err(e) = self.upload_scene_gpu(optix_ctx, stream, scratch, &built) {
+        if let Err(e) = self.upload_scene_gpu(optix_ctx, stream, scratch, &mut built) {
             // Keep the CPU build for a cheap retry; `compound_gases` is still empty from above.
             self.cache_insert_scene(key, built);
             return Err(e);
@@ -2678,13 +2910,14 @@ impl CsgGpuHost {
     }
 
     /// Uploads `built`'s compiled library and materials and builds its per-compound GASes,
-    /// committing `compound_gases` / `compound_sbt_offsets` only when every build succeeded.
+    /// committing `compound_gases` / `compound_sbt_offsets` / `compound_semantic_masks` only when
+    /// every build succeeded.
     fn upload_scene_gpu(
         &mut self,
         optix_ctx: &Arc<DeviceContext>,
         stream: &Arc<Stream>,
         scratch: &mut Scratch,
-        built: &SceneBuilt,
+        built: &mut SceneBuilt,
     ) -> Result<(), String> {
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
@@ -2749,6 +2982,7 @@ impl CsgGpuHost {
 
         self.compound_gases = gases;
         self.compound_sbt_offsets = sbt_offsets;
+        self.compound_semantic_masks = built.world.semantic_masks().to_vec();
         Ok(())
     }
 }
@@ -4186,5 +4420,158 @@ mod tests {
             }
             built.viewpoints.clear();
         }
+    }
+
+    #[test]
+    fn record_packed_dynamic_lods_preserves_hysteresis_in_deadband() {
+        let mut world = WorldScene::new(64.0);
+        let box_a = csg_core::CsgNode::box3([2.0, 1.5, 4.0], csg_core::MaterialId(0), csg_core::ast::semantic::VEHICLE);
+        let box_b = csg_core::CsgNode::box3([1.8, 0.8, 2.0], csg_core::MaterialId(0), csg_core::ast::semantic::VEHICLE);
+        let cid_a = world
+            .library
+            .compile_single(&box_a, csg_core::OptimizeConfig::default(), 0)
+            .expect("cid_a");
+        let cid_b = world
+            .library
+            .compile_single(&box_b, csg_core::OptimizeConfig::default(), 0)
+            .expect("cid_b");
+        // LOD0 emits 2 compounds, LOD1 emits 1 compound so topology differs across tiers.
+        let lods = csg_scene::LodSet::from_compiled(vec![vec![cid_a, cid_b], vec![cid_a]]);
+        let asm_id = world.register_assembly(csg_scene::Assembly::from_lods(
+            "veh_hyst",
+            lods,
+            &world.library,
+        ));
+        let inst_id = world.add_dynamic(
+            csg_scene::Instance::dynamic(asm_id, Mat3x4::translate(Vec3::new(0.0, 0.0, 45.0)))
+                .with_user_id(77),
+        );
+
+        let lod_cfg = LodConfig {
+            enabled: true,
+            force_lod: None,
+            lod1_dist_m: 50.0,
+            lod2_dist_m: 120.0,
+            lod_bias: 1.0,
+            hysteresis: 0.15,
+            min_screen_px: 0.0,
+            ..LodConfig::default()
+        };
+        let view = CameraView::omnidirectional(Vec3::ZERO, 500.0, 1.0, 720.0)
+            .with_lod_config(lod_cfg);
+
+        // Frame 0: vehicle at 45 m -> LOD0 (2 compounds).
+        let mut packed = PackedGpuScene::new();
+        world.pack_visible(&view, &mut packed);
+        assert_eq!(packed.instances_slice().len(), 2);
+        let mut dyn_prev_lods = Vec::new();
+        record_packed_dynamic_lods(&world, &view, packed.instances_slice(), &mut dyn_prev_lods);
+        assert_eq!(dyn_prev_lods, vec![0]);
+
+        // Frame 1: move vehicle into the hysteresis deadband (50 < 53 < 50 * 1.15 = 57.5).
+        // `pack_visible` keeps LOD0 (2 compounds) via hysteresis; `pack_dynamic_prefix_only` must
+        // agree instead of dropping to LOD1 (1 compound) and forcing endless `FullRepack` churn.
+        assert!(world.update_dynamic_xform(inst_id, Mat3x4::translate(Vec3::new(0.0, 0.0, 53.0))));
+        world.pack_visible(&view, &mut packed);
+        assert_eq!(packed.instances_slice().len(), 2, "pack_visible must keep LOD0 in deadband");
+
+        // Even starting from a wiped mirror (e.g. LRU-cached scene), `record_packed_dynamic_lods`
+        // recovers LOD0 from `packed` so the next `pack_dynamic_prefix_only` matches 1:1.
+        dyn_prev_lods.clear();
+        record_packed_dynamic_lods(&world, &view, packed.instances_slice(), &mut dyn_prev_lods);
+        assert_eq!(dyn_prev_lods, vec![0]);
+
+        let mut dyn_out = Vec::new();
+        let mut dyn_prev = Vec::new();
+        pack_dynamic_prefix_only(&world, &view, false, &mut dyn_prev_lods, &mut dyn_out, &mut dyn_prev);
+        assert_eq!(dyn_out.len(), 2, "preserved hysteresis keeps LOD0 topology on TrafficOnly");
+        assert_eq!(dyn_out[0].compound_id, cid_a.0);
+        assert_eq!(dyn_out[1].compound_id, cid_b.0);
+
+        // Contrast: wiping `dyn_prev_lods` to PREV_LOD_NONE reproduces the old mismatch (LOD1).
+        let mut wiped = vec![PREV_LOD_NONE];
+        pack_dynamic_prefix_only(&world, &view, false, &mut wiped, &mut dyn_out, &mut dyn_prev);
+        assert_eq!(dyn_out.len(), 1, "wiped hysteresis drops to LOD1 inside the deadband");
+    }
+
+    #[test]
+    fn active_possess_attach_matches_cpu_pose_and_skips_non_crowd() {
+        let mut host = CsgGpuHost::new();
+        let inspector_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "inspector")
+            .expect("inspector registered");
+        let module = host
+            .registry
+            .get_by_index(inspector_idx)
+            .expect("inspector module");
+        let cfg = SceneBuildConfig {
+            variant_idx: csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32,
+            ..SceneBuildConfig::default()
+        };
+        let mut built = module.build(&cfg).expect("showcase builds");
+        built.reset_crowd_motion_history();
+        host.scene_key = CsgSceneKey {
+            scene_idx: (inspector_idx + 1) as u32,
+            variant_idx: csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32,
+            seed: 1,
+            road_mode: 2,
+        };
+        host.active_reg_idx = Some(inspector_idx);
+        host.scene = Some(built);
+
+        assert!(
+            host.active_possess_attach(0.0, 0.0, true).is_none(),
+            "not possessing must return None"
+        );
+        let _info = host.possess_next_vehicle().expect("possess crowd actor");
+        assert!(host.is_possessing_crowd());
+
+        for mount_idx in 0..2 {
+            let _ = host.set_possess_mount(mount_idx);
+            let scene = host.scene.as_ref().expect("scene");
+            let src = csg_scene::camera_gpu::CrowdBoneSource(&scene.crowd.bone_outs);
+            for &auto_level in &[false, true] {
+                for &(fyaw, fpitch) in &[(0.0f32, 0.0f32), (0.35, -0.2), (-0.8, 0.4)] {
+                    let (pod, vfov_deg) = host
+                        .active_possess_attach(fyaw, fpitch, auto_level)
+                        .expect("crowd attach pod");
+                    assert_eq!(pod.source, csg_scene::camera_gpu::ATTACH_CROWD_BONE);
+                    let mode = csg_scene::camera_gpu::CameraModePod::possess(
+                        vfov_deg,
+                        csg_scene::camera_gpu::CAM_FLAG_RESET_HISTORY,
+                    );
+                    let rec = csg_scene::camera_gpu::compose_one(&mode, &pod, &src, None);
+                    assert_eq!(rec.fault, csg_scene::camera_gpu::CAM_FAULT_NONE);
+                    let cpu = host
+                        .resolve_active_possess(fyaw, fpitch, auto_level)
+                        .expect("cpu possess pose");
+                    let (fwd, up) = csg_scene::camera_gpu::quat_forward_up(rec.q);
+                    let rec_eye = Vec3::new(rec.eye[0], rec.eye[1], rec.eye[2]);
+                    assert!((rec_eye - cpu.eye).len() < 1e-5, "eye mismatch: {rec_eye:?} vs {:?}", cpu.eye);
+                    assert!((fwd - cpu.forward).len() < 1e-5, "fwd mismatch: {fwd:?} vs {:?}", cpu.forward);
+                    assert!((up - cpu.up).len() < 1e-5, "up mismatch: {up:?} vs {:?}", cpu.up);
+                    assert!((rec.vfov_deg - cpu.vfov_deg).abs() < 1e-5);
+                }
+            }
+        }
+        assert!(host.eject_possess());
+        assert!(host.active_possess_attach(0.0, 0.0, true).is_none());
+
+        // Non-crowd instance (static stage / non-actor body) must return None so CPU fallback runs.
+        host.active_possess = Some(PossessInfo {
+            inst_id: encode_static_inst_id(0),
+            assembly_name: "static_stage".to_string(),
+            mounts: Vec::new(),
+            mount_idx: 0,
+            is_dynamic: false,
+        });
+        assert!(!host.is_possessing_crowd());
+        assert!(
+            host.active_possess_attach(0.0, 0.0, true).is_none(),
+            "non-crowd possessed body must return None from active_possess_attach"
+        );
     }
 }

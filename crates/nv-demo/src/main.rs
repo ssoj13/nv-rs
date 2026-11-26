@@ -6,11 +6,13 @@
 mod app_events;
 mod bench;
 mod csg_scene_host;
+mod cuda_camera;
 mod cuda_crowd;
 mod demo_anim;
 mod fft_bloom;
 mod flight;
 mod flight_stats;
+mod frame_plan_runner;
 mod gpu_export;
 mod is_counters;
 mod mp4_muxer;

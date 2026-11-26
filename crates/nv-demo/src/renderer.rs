@@ -27,6 +27,7 @@ use crate::app_events::{
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
 };
+use crate::cuda_camera::GpuCameraComposer;
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
@@ -37,6 +38,9 @@ use crate::sdg_export::{
     SdgExrFrame, SdgOccluderBackend, write_sdg_exr_atomic, write_sdg_manifest_atomic,
 };
 use csg_actors::{KeypointVis, RayOccluder, SdgCamera, Vec3 as ActorVec3};
+use csg_scene::camera_gpu::{
+    CAM_FAULT_NONE, CAM_FLAG_RESET_HISTORY, CameraModePod, CameraRecordPod, quat_forward_up,
+};
 use csg_scene::{
     CpuViewProber, PackedGpuScene, ProbeBackendKind, ProbeSample, SmartViewSelector,
     ViewCandidate, ViewProbeBackend, ViewScore, WgpuViewProber, WorldScene, score_probe_grid,
@@ -1305,6 +1309,7 @@ struct OptixRig {
     cpu_prober: CpuViewProber,
     wgpu_prober: Option<WgpuViewProber>,
     cuda_crowd: Option<Result<CudaCrowdBackend, String>>,
+    cuda_camera: Option<Result<GpuCameraComposer, String>>,
     crowd_slot_map_host: Vec<u32>,
     crowd_gas_handles_host: Vec<u64>,
 }
@@ -2561,7 +2566,7 @@ fn build_ias_into(
     // through the same category-filter rule as CSG instances (`semantic_filter::classify` on
     // their override flags); their class is exact, so they are hidden or unaffected, never partial.
     for (slot, inst) in instances.iter_mut().enumerate() {
-        let m = sf::instance_semantic_mask(classic_instance_flags(inst.id & 0xFF));
+        let m = sf::instance_semantic_mask(classic_instance_flags(inst.id & 0xFF), u64::MAX);
         inst.mask = sf::visibility_mask(inst.mask, sf::classify(m, hidden));
         inst.id |= (slot as u32) << CLASSIC_SLOT_SHIFT;
     }
@@ -2960,6 +2965,7 @@ fn init_optix(
         cpu_prober: CpuViewProber::new(),
         wgpu_prober: None,
         cuda_crowd: None,
+        cuda_camera: None,
         crowd_slot_map_host: Vec::with_capacity(1024),
         crowd_gas_handles_host: Vec::with_capacity(256),
     })
@@ -2981,6 +2987,25 @@ fn ensure_cuda_crowd<'a>(
         Some(Ok(cc)) => Ok(cc),
         Some(Err(e)) => Err(e.as_str()),
         None => Err("CUDA crowd backend uninitialized"),
+    }
+}
+
+/// Lazily initializes `rig.cuda_camera` (`PlanKind::Camera` v1, single camera slot) once on first
+/// use, caching either the compiled NVRTC composer or the diagnostic failure string so failed
+/// builds are not retried every frame.
+///
+/// The error borrows the cached string so fallback frames do not allocate per frame.
+fn ensure_cuda_camera<'a>(
+    rig: &'a mut OptixRig,
+    cuda: &Arc<CudaContext>,
+) -> Result<&'a mut GpuCameraComposer, &'a str> {
+    if rig.cuda_camera.is_none() {
+        rig.cuda_camera = Some(GpuCameraComposer::new(cuda, 1));
+    }
+    match rig.cuda_camera.as_mut() {
+        Some(Ok(cam)) => Ok(cam),
+        Some(Err(e)) => Err(e.as_str()),
+        None => Err("CUDA camera composer uninitialized"),
     }
 }
 
@@ -4672,6 +4697,45 @@ fn csg_pose_to_camera_frame(pose: csg_scene::CameraPose) -> CameraFrame {
     }
 }
 
+/// Converts a GPU-composed [`CameraRecordPod`] into the host [`CameraFrame`] basis, routing
+/// through [`csg_pose_to_camera_frame`] so orthonormalization and FOV clamping stay single-source.
+fn camera_record_to_camera_frame(rec: &CameraRecordPod) -> CameraFrame {
+    let (forward, up) = quat_forward_up(rec.q);
+    csg_pose_to_camera_frame(csg_scene::CameraPose {
+        eye: csg_core::Vec3::new(rec.eye[0], rec.eye[1], rec.eye[2]),
+        forward,
+        up,
+        vfov_deg: rec.vfov_deg,
+    })
+}
+
+/// Applies possess zoom dolly and entry/mount transition damping to a resolved target camera frame.
+/// Returns `(final_frame, blended)` where `blended` is `true` while the damper is still converging.
+fn apply_possess_target(
+    mut target_frame: CameraFrame,
+    possess_zoom_offset: f32,
+    possess_blend_rem: &mut f32,
+    possess_damper: &mut crate::flight::CameraDamper,
+    dt: f32,
+) -> (CameraFrame, bool) {
+    if possess_zoom_offset.abs() > 1e-4 {
+        target_frame.eye[0] -= target_frame.fwd[0] * possess_zoom_offset;
+        target_frame.eye[1] -= target_frame.fwd[1] * possess_zoom_offset;
+        target_frame.eye[2] -= target_frame.fwd[2] * possess_zoom_offset;
+    }
+    if *possess_blend_rem > 0.0 {
+        let frac = (*possess_blend_rem / 0.9).clamp(0.0, 1.0);
+        *possess_blend_rem = (*possess_blend_rem - dt.max(1.0 / 120.0)).max(0.0);
+        let tau = 0.24 * frac;
+        let target_core = camera_frame_to_core_pose(target_frame);
+        let blended = possess_damper.step(target_core, dt.max(1.0 / 120.0), tau);
+        (core_pose_to_camera_frame(blended), true)
+    } else {
+        possess_damper.snap(camera_frame_to_core_pose(target_frame));
+        (target_frame, false)
+    }
+}
+
 fn camera_frame_to_core_pose(cam: CameraFrame) -> camera::CameraPose {
     let fov_y = (2.0 * cam.tan_half_fov.max(0.05).atan()).clamp(0.2, 2.2);
     camera::CameraPose::from_eye_forward_up(
@@ -4839,6 +4903,8 @@ pub fn spawn_render_thread(
             let mut last_crowd_step_ms: f32 = 0.0;
             let mut last_crowd_backend = ActiveCrowdBackend::None;
             let mut last_cuda_crowd_err: Option<String> = None;
+            let mut last_cuda_camera_err: Option<String> = None;
+            let mut gpu_camera_history_valid = false;
             let mut last_crowd_lod_sig = settings.crowd_lod_params().signature_key();
             let mut rec_active = false;
             let mut rec_fixed_fps: u32 = 0;
@@ -5746,32 +5812,38 @@ pub fn spawn_render_thread(
 
                 // Resolve live possessed camera mount AFTER dynamic traffic advances so the
                 // camera stays mathematically locked to moving vehicles with zero 1-frame lag.
+                // When CUDA crowd will step this frame and a crowd actor is possessed, hold the
+                // previous frame's exact composed pose for pre-step culling/LOD and let
+                // `GpuCameraComposer` resolve this frame's bone directly in VRAM after the step.
+                let defer_crowd_possess =
+                    run_cuda_crowd_after_sync && rig.csg_host.is_possessing_crowd();
+                if !defer_crowd_possess
+                    && rig.csg_host.is_possessing_crowd()
+                    && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
+                {
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "CUDA crowd sync before possess resolve failed: {e}"
+                    )));
+                }
                 let mut possess_cam_out: Option<CameraFrame> = None;
-                let mut active_camera = if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                let mut active_camera = if defer_crowd_possess {
+                    possess_cam_out = Some(last_rendered_camera);
+                    last_rendered_camera
+                } else if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
                     possess_free_yaw,
                     possess_free_pitch,
                     possess_auto_level,
                 ) {
-                    let mut target_frame = csg_pose_to_camera_frame(csg_pose);
-                    if possess_zoom_offset.abs() > 1e-4 {
-                        target_frame.eye[0] -= target_frame.fwd[0] * possess_zoom_offset;
-                        target_frame.eye[1] -= target_frame.fwd[1] * possess_zoom_offset;
-                        target_frame.eye[2] -= target_frame.fwd[2] * possess_zoom_offset;
+                    let (final_frame, blended) = apply_possess_target(
+                        csg_pose_to_camera_frame(csg_pose),
+                        possess_zoom_offset,
+                        &mut possess_blend_rem,
+                        &mut possess_damper,
+                        dt,
+                    );
+                    if blended && !preserve_shutter_accum {
+                        accum_count = 0;
                     }
-                    let final_frame = if possess_blend_rem > 0.0 {
-                        let frac = (possess_blend_rem / 0.9).clamp(0.0, 1.0);
-                        possess_blend_rem = (possess_blend_rem - dt.max(1.0 / 120.0)).max(0.0);
-                        let tau = 0.24 * frac;
-                        let target_core = camera_frame_to_core_pose(target_frame);
-                        let blended = possess_damper.step(target_core, dt.max(1.0 / 120.0), tau);
-                        if !preserve_shutter_accum {
-                            accum_count = 0;
-                        }
-                        core_pose_to_camera_frame(blended)
-                    } else {
-                        possess_damper.snap(camera_frame_to_core_pose(target_frame));
-                        target_frame
-                    };
                     possess_cam_out = Some(final_frame);
                     final_frame
                 } else {
@@ -5876,6 +5948,10 @@ pub fn spawn_render_thread(
                 }
                 let is_possessing_now = rig.csg_host.is_possessing();
                 if was_possessing && !is_possessing_now {
+                    possess_blend_rem = 0.0;
+                    possess_cam_out = None;
+                    active_camera = camera;
+                    last_rendered_camera = camera;
                     bus.emit_render_event(RenderEvent::PossessChanged(None));
                 }
                 was_possessing = is_possessing_now;
@@ -6021,11 +6097,37 @@ pub fn spawn_render_thread(
                     }
                 }
 
+                let mut gpu_camera_composed_this_frame = false;
                 // GPU-direct CUDA articulated crowd step -> scatter into VRAM (`csg_instances`,
                 // `csg_prev_xforms`, `d_optix_instances`) -> single OptiX IAS refit/rebuild.
                 if run_cuda_crowd_after_sync && rig.csg_host.has_crowd() && rig.ias.is_some() {
                     let csg_ptrs_scatter = rig.csg_host.device_pointers();
                     let possessing_crowd = rig.csg_host.is_possessing_crowd();
+                    let gpu_possess_attach = if possessing_crowd {
+                        rig.csg_host.active_possess_attach(
+                            possess_free_yaw,
+                            possess_free_pitch,
+                            possess_auto_level,
+                        )
+                    } else {
+                        None
+                    };
+                    let use_gpu_camera = if gpu_possess_attach.is_some() {
+                        match ensure_cuda_camera(&mut rig, &cuda) {
+                            Ok(_) => true,
+                            Err(err) => {
+                                if last_cuda_camera_err.as_deref() != Some(err) {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "CUDA camera composer unavailable: {err}"
+                                    )));
+                                    last_cuda_camera_err = Some(err.to_string());
+                                }
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     let optix_ptr = if rig.d_optix_instances.len()
                         >= rig.ias_classic_count + csg_ptrs_scatter.instance_count as usize
                     {
@@ -6040,6 +6142,7 @@ pub fn spawn_render_thread(
                         optix_instances_ptr: optix_ptr,
                         optix_slot_offset: rig.ias_classic_count as u32,
                         max_optix_instances: rig.d_optix_instances.len() as u32,
+                        hidden_semantics: rig.csg_host.semantic_hidden(),
                     };
 
                     let need_topo = rig
@@ -6066,6 +6169,9 @@ pub fn spawn_render_thread(
                         }
                     }
 
+                    // Skip full-crowd CPU readback whenever GPU camera composition can resolve
+                    // the possessed bone directly from `BufId::CrowdBoneOuts` in VRAM.
+                    let readback_poses_for_cpu = possessing_crowd && !use_gpu_camera;
                     let cuda_step_res = match (
                         rig.cuda_crowd.as_mut(),
                         rig.csg_host.active_scene_mut(),
@@ -6078,7 +6184,7 @@ pub fn spawn_render_thread(
                             active_camera.eye,
                             crowd_lod,
                             Some(scatter),
-                            possessing_crowd,
+                            readback_poses_for_cpu,
                         ),
                         _ => Err("CUDA crowd backend unavailable".to_string()),
                     };
@@ -6112,24 +6218,97 @@ pub fn spawn_render_thread(
                                 }
                                 ias_refit_pending = false;
                             }
-                            if possessing_crowd
-                                && let Some(csg_pose) = rig.csg_host.resolve_active_possess(
-                                    possess_free_yaw,
-                                    possess_free_pitch,
-                                    possess_auto_level,
-                                )
-                            {
-                                let mut updated = csg_pose_to_camera_frame(csg_pose);
-                                if possess_zoom_offset.abs() > 1e-4 {
-                                    updated.eye[0] -= updated.fwd[0] * possess_zoom_offset;
-                                    updated.eye[1] -= updated.fwd[1] * possess_zoom_offset;
-                                    updated.eye[2] -= updated.fwd[2] * possess_zoom_offset;
+                            if possessing_crowd {
+                                let mut target_frame: Option<CameraFrame> = None;
+                                if use_gpu_camera
+                                    && let Some((attach, vfov_deg)) = gpu_possess_attach
+                                {
+                                    let bone_outs = rig
+                                        .cuda_crowd
+                                        .as_ref()
+                                        .and_then(|r| r.as_ref().ok())
+                                        .map(CudaCrowdBackend::bone_outs_device_ptr);
+                                    let cam_flags =
+                                        if temporal_history_cut || !gpu_camera_history_valid {
+                                            CAM_FLAG_RESET_HISTORY
+                                        } else {
+                                            0
+                                        };
+                                    if let (Some(Ok(cam_gpu)), Some(bones)) =
+                                        (rig.cuda_camera.as_mut(), bone_outs)
+                                    {
+                                        match cam_gpu.compose_one(
+                                            &rig.stream,
+                                            CameraModePod::possess(vfov_deg, cam_flags),
+                                            attach,
+                                            Some(bones),
+                                            None,
+                                        ) {
+                                            Ok(rec) if rec.fault == CAM_FAULT_NONE => {
+                                                target_frame =
+                                                    Some(camera_record_to_camera_frame(&rec));
+                                                gpu_camera_composed_this_frame = true;
+                                                last_cuda_camera_err = None;
+                                            }
+                                            Ok(rec) => {
+                                                let msg = format!(
+                                                    "CUDA camera compose fault (0x{:x}); falling back to CPU possess",
+                                                    rec.fault
+                                                );
+                                                if last_cuda_camera_err.as_deref()
+                                                    != Some(msg.as_str())
+                                                {
+                                                    bus.emit_render_event(
+                                                        RenderEvent::StatusMessage(msg.clone()),
+                                                    );
+                                                    last_cuda_camera_err = Some(msg);
+                                                }
+                                            }
+                                            Err(err) => {
+                                                if last_cuda_camera_err.as_deref()
+                                                    != Some(err.as_str())
+                                                {
+                                                    bus.emit_render_event(
+                                                        RenderEvent::StatusMessage(format!(
+                                                            "CUDA camera compose failed: {err}"
+                                                        )),
+                                                    );
+                                                    last_cuda_camera_err = Some(err);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                if possess_blend_rem <= 0.0 {
-                                    possess_damper.snap(camera_frame_to_core_pose(updated));
-                                    active_camera = updated;
-                                    last_rendered_camera = updated;
-                                    possess_cam_out = Some(updated);
+                                if target_frame.is_none() {
+                                    if !readback_poses_for_cpu
+                                        && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
+                                    {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                            "CUDA crowd sync for possess fallback failed: {e}"
+                                        )));
+                                    }
+                                    if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                                        possess_free_yaw,
+                                        possess_free_pitch,
+                                        possess_auto_level,
+                                    ) {
+                                        target_frame = Some(csg_pose_to_camera_frame(csg_pose));
+                                    }
+                                }
+                                if let Some(frame) = target_frame {
+                                    let (final_frame, blended) = apply_possess_target(
+                                        frame,
+                                        possess_zoom_offset,
+                                        &mut possess_blend_rem,
+                                        &mut possess_damper,
+                                        dt,
+                                    );
+                                    if blended && !preserve_shutter_accum {
+                                        accum_count = 0;
+                                    }
+                                    active_camera = final_frame;
+                                    last_rendered_camera = final_frame;
+                                    possess_cam_out = Some(final_frame);
                                 }
                             }
                         }
@@ -6145,6 +6324,7 @@ pub fn spawn_render_thread(
                         }
                     }
                 }
+                gpu_camera_history_valid = gpu_camera_composed_this_frame;
                 if ias_refit_pending {
                     // The CUDA crowd step failed or had no OptiX scatter target, so nothing refit
                     // the BVH over the traffic prefix uploaded above.
@@ -7729,5 +7909,37 @@ mod tests {
         assert!(!should_skip_cuda_tonemap(true, true, 1, false, false));
         assert!(!should_skip_cuda_tonemap(true, true, 0, true, false));
         assert!(!should_skip_cuda_tonemap(true, true, 0, false, true));
+    }
+
+    #[test]
+    fn camera_record_roundtrips_with_csg_pose_basis() {
+        let eye = csg_core::Vec3::new(12.5, 1.75, -8.25);
+        let forward = csg_core::Vec3::new(0.4, -0.2, 0.9).norm();
+        let up = csg_core::Vec3::new(0.1, 0.98, 0.15).norm();
+        let vfov_deg = 68.0;
+        let pose = csg_scene::CameraPose {
+            eye,
+            forward,
+            up,
+            vfov_deg,
+        };
+        let expected = csg_pose_to_camera_frame(pose);
+        let q = csg_scene::camera_gpu::basis_quat(forward, up);
+        let rec = CameraRecordPod {
+            eye: [eye.x, eye.y, eye.z],
+            vfov_deg,
+            q,
+            prev_eye: [eye.x, eye.y, eye.z],
+            fault: CAM_FAULT_NONE,
+            prev_q: q,
+        };
+        let actual = camera_record_to_camera_frame(&rec);
+        for i in 0..3 {
+            assert!((actual.eye[i] - expected.eye[i]).abs() < 1e-5);
+            assert!((actual.fwd[i] - expected.fwd[i]).abs() < 1e-5);
+            assert!((actual.right[i] - expected.right[i]).abs() < 1e-5);
+            assert!((actual.up[i] - expected.up[i]).abs() < 1e-5);
+        }
+        assert!((actual.tan_half_fov - expected.tan_half_fov).abs() < 1e-5);
     }
 }

@@ -31,7 +31,7 @@ pub enum CrowdBackend {
     Auto,
     /// Run CPU `SceneBuilt::step_crowd` exclusively.
     Cpu,
-    /// Run GPU-direct CUDA `step_and_emit_actors_cuda` exclusively (returns error if unavailable).
+    /// Run GPU-direct CUDA `crowd_frame_plan` (v2) exclusively (returns error if unavailable).
     Cuda,
 }
 
@@ -60,7 +60,7 @@ pub enum ActiveCrowdBackend {
     None,
     /// CPU `CrowdSim::step_analytical` executed.
     Cpu,
-    /// GPU-direct CUDA `step_and_emit_actors_cuda` executed.
+    /// GPU-direct CUDA `crowd_frame_plan` (v2) executed.
     Cuda,
 }
 

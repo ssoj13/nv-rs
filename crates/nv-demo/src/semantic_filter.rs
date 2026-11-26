@@ -1,10 +1,10 @@
 //! Viewport category filter: which semantic classes are rendered (the toolbar "eye" dropdown).
 //!
 //! - **What**: a `u64` mask of hidden semantic ids (`DemoSettings::hidden_semantics`, persisted)
-//!   and the one table that groups csg-core's semantic ids for the UI ([`GROUPS`]: Humans,
+//!   and the one table that groups csg-core's 22 semantic ids for the UI ([`GROUPS`]: Humans,
 //!   Animals, Vehicles, Buildings, Roads, Street furniture, Industrial, Water, Ground, Unknown,
-//!   plus Vegetation / Terrain features that wait for csg-rs P41). The OSM class section of the
-//!   dropdown waits for per-instance provenance (csg-rs P42) and says so ([`OSM_SECTION_STATUS`]).
+//!   Vegetation, and Terrain features). The OSM class section of the dropdown waits for
+//!   per-instance provenance (csg-rs P42) and says so ([`OSM_SECTION_STATUS`]).
 //! - **Why**: hiding a class must be exact and complete (gone from camera rays, shadows and
 //!   reflections, per part, so Buildings > Windows works) and must not cost the frame when
 //!   nothing is hidden; a host-side instance filter could do neither.
@@ -18,24 +18,24 @@
 //! - **Fast path (per instance, per filter change)**: hiding classes used to cost about +67 % RT
 //!   because every intersection program rejected per hit, shadows took the radiance intersector
 //!   and RPN compounds re-traced, for every instance. Now each instance gets an effective
-//!   semantic mask M ([`instance_semantic_mask`], a conservative superset of the classes its hits
-//!   can carry) and [`classify`] sorts it against the hidden mask H into three classes:
-//!   [`InstanceFilter::Hidden`] (`M & !H == 0`: visibility mask without the render bits, zero
-//!   traversal cost), [`InstanceFilter::Unaffected`] (`M & H == 0`: its intersection program
-//!   skips the reject test), [`InstanceFilter::Partial`] (per-hit reject as before). The partial
-//!   set reaches the device as a bitset over the packed instance slots ([`fill_partial_bits`],
-//!   `LaunchParams::csg_sem_partial`); it is the renderer's filter state, not csg-rs scene data,
-//!   and is recomputed only when H or the packed instances change.
+//!   semantic mask M ([`instance_semantic_mask`], delegating to csg-rs P41 per-compound
+//!   `semantic_masks` plus instance overrides) and [`classify`] sorts it against the hidden mask H
+//!   into three classes: [`InstanceFilter::Hidden`] (`M & !H == 0`: visibility mask without the
+//!   render bits, zero traversal cost), [`InstanceFilter::Unaffected`] (`M & H == 0`: its
+//!   intersection program skips the reject test), [`InstanceFilter::Partial`] (per-hit reject as
+//!   before). The partial set reaches the device as a bitset over the packed instance slots
+//!   ([`fill_partial_bits`], `LaunchParams::csg_sem_partial`); it is the renderer's filter state,
+//!   not csg-rs scene data, and is recomputed only when H or the packed instances change.
 //! - **Used by**: `ui.rs` (dropdown), `renderer.rs` (launch parameter, classic IAS mask),
 //!   `csg_scene_host.rs` (per-instance classification, partial bitset).
 
 use csg_core::ast::semantic;
 use csg_scene::inst_flags;
 
-/// Semantic ids the pinned csg-core defines (`0..=ANIMAL`); a new id must be added to a group
-/// (the coverage test fails otherwise).
+/// Semantic ids the pinned csg-core defines (`0..semantic::COUNT`); a new id must be added to a
+/// group (the coverage test fails otherwise).
 #[cfg(test)]
-pub const SEMANTIC_COUNT: u16 = semantic::ANIMAL.0 + 1;
+pub const SEMANTIC_COUNT: u16 = semantic::COUNT;
 
 /// Display name of a semantic id (sub-rows of the dropdown).
 pub const fn semantic_name(id: u16) -> &'static str {
@@ -60,6 +60,8 @@ pub const fn semantic_name(id: u16) -> &'static str {
         17 => "Barrier",
         18 => "Pedestrian",
         19 => "Animal",
+        20 => "Vegetation",
+        21 => "Terrain feature",
         _ => "?",
     }
 }
@@ -105,10 +107,8 @@ pub const GROUPS: &[SemanticGroup] = &[
     SemanticGroup { label: "Water", ids: &[semantic::WATER.0], pending: None },
     SemanticGroup { label: "Ground", ids: &[semantic::GROUND.0], pending: None },
     SemanticGroup { label: "Unknown", ids: &[semantic::UNKNOWN.0], pending: None },
-    // csg-rs P41 adds VEGETATION = 20 and TERRAIN_FEATURE = 21 (trees and scrub are tagged
-    // FURNITURE until then); the rows activate when the pinned csg-core defines the ids.
-    SemanticGroup { label: "Vegetation", ids: &[], pending: Some("needs csg-rs P41") },
-    SemanticGroup { label: "Terrain features", ids: &[], pending: Some("needs csg-rs P41") },
+    SemanticGroup { label: "Vegetation", ids: &[semantic::VEGETATION.0], pending: None },
+    SemanticGroup { label: "Terrain features", ids: &[semantic::TERRAIN_FEATURE.0], pending: None },
 ];
 
 /// Status of the OSM class section: csg-scene instances carry no OSM class / kind / id yet.
@@ -168,23 +168,12 @@ pub const LINES_OCCLUDER_MASK: u8 = 0x80;
 /// Effective semantic mask M of an instance: bit `s` set when a hit on it may carry semantic `s`
 /// (a superset is correct, only slower). The single source of M.
 ///
-/// Why this shape: the pinned csg-rs (`0fb1087`) has no per-compound semantic mask yet, so only
-/// an instance's semantic override (flags bits 16..24 = id + 1) gives an exact answer; every
-/// other instance is unknown (all bits: always [`InstanceFilter::Partial`], the per-hit reject of
-/// before). Crowd bones are unknown too: the GPU crowd scatter (`cuda_crowd.rs`) rewrites their
-/// device records every frame without the host override, so their device class is the
-/// primitive's. csg-rs P41 replaces the body with
-/// `csg_scene::instance_semantic_mask(flags, library.semantic_masks[compound_id])`.
-pub const fn instance_semantic_mask(flags: u32) -> u64 {
-    if flags & inst_flags::CROWD_BONE != 0 {
-        return u64::MAX;
-    }
-    match inst_flags::semantic(flags) {
-        // Ids >= 64 are outside the hidden mask (csg-rs ABI): such a class is never hidden.
-        Some(s) if s.0 < 64 => bit(s.0),
-        Some(_) => 0,
-        None => u64::MAX,
-    }
+/// Why: delegates directly to [`inst_flags::instance_semantic_mask`] (csg-rs P41), preferring the
+/// instance's semantic override (including GPU crowd bones, whose override + `CROWD_BONE` bits are
+/// written directly by `emit_actors_cuda`) and otherwise using `compound_mask` from
+/// `WorldScene::semantic_masks`.
+pub const fn instance_semantic_mask(flags: u32, compound_mask: u64) -> u64 {
+    inst_flags::instance_semantic_mask(flags, compound_mask)
 }
 
 /// What the category filter does with one instance this frame.
@@ -201,11 +190,15 @@ pub enum InstanceFilter {
 /// Three-way classification of an instance with effective mask `m` under hidden mask `hidden`.
 ///
 /// Unaffected is tested first, so an instance with no classes (`m == 0`) and every instance
-/// while nothing is hidden is unaffected, never hidden.
+/// while nothing is hidden is unaffected, never hidden. The conservative all-bits sentinel
+/// `u64::MAX` (produced by `csg_core::semantic::mask_bit` for semantic ids `>= 64` or when a
+/// compound id is out of range) is never classified [`InstanceFilter::Hidden`] even when
+/// `hidden == u64::MAX`, so ids outside the 64-bit mask fall through to device per-hit checks and
+/// are never hidden.
 pub const fn classify(m: u64, hidden: u64) -> InstanceFilter {
     if m & hidden == 0 {
         InstanceFilter::Unaffected
-    } else if m & !hidden == 0 {
+    } else if m != u64::MAX && m & !hidden == 0 {
         InstanceFilter::Hidden
     } else {
         InstanceFilter::Partial
@@ -222,17 +215,26 @@ pub const fn visibility_mask(base: u8, f: InstanceFilter) -> u8 {
 }
 
 /// Fills `out` with the device partial bitset (bit `i` of word `i / 32` = instance slot `i` is
-/// [`InstanceFilter::Partial`]) for the instances whose flags `flags` yields in slot order, and
-/// returns the number of partial slots.
+/// [`InstanceFilter::Partial`]) for `instances` using per-compound `semantic_masks`, and returns
+/// the number of partial slots.
 ///
 /// Why a bitset: the intersection programs read one bit per invocation, 32 slots per cached word
 /// (6 KiB for 50k instances). `out` is reused; it grows only with the instance count.
-pub fn fill_partial_bits(flags: impl ExactSizeIterator<Item = u32>, hidden: u64, out: &mut Vec<u32>) -> usize {
+pub fn fill_partial_bits(
+    instances: &[csg_scene::GpuInstance],
+    semantic_masks: &[u64],
+    hidden: u64,
+    out: &mut Vec<u32>,
+) -> usize {
     out.clear();
-    out.resize(flags.len().div_ceil(32), 0);
+    out.resize(instances.len().div_ceil(32), 0);
     let mut partial = 0;
-    for (i, f) in flags.enumerate() {
-        if classify(instance_semantic_mask(f), hidden) == InstanceFilter::Partial
+    for (i, inst) in instances.iter().enumerate() {
+        let cm = semantic_masks
+            .get(inst.compound_id as usize)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if classify(instance_semantic_mask(inst.flags, cm), hidden) == InstanceFilter::Partial
             && let Some(w) = out.get_mut(i / 32)
         {
             *w |= 1 << (i % 32);
@@ -260,6 +262,9 @@ mod tests {
             assert_eq!(seen[id as usize], 1, "semantic {id} ({}) must be in exactly one group", semantic_name(id));
             assert_ne!(semantic_name(id), "?");
         }
+        assert_eq!(SEMANTIC_COUNT, 22);
+        assert_eq!(semantic_name(semantic::VEGETATION.0), "Vegetation");
+        assert_eq!(semantic_name(semantic::TERRAIN_FEATURE.0), "Terrain feature");
         assert!(seen[SEMANTIC_COUNT as usize..].iter().all(|&n| n == 0), "no ids beyond csg-core's");
         assert_eq!(all_mask(), (1u64 << SEMANTIC_COUNT) - 1);
     }
@@ -298,6 +303,16 @@ mod tests {
         inst_flags::with_semantic(inst_flags::VISIBLE, Some(csg_core::SemanticId(id))).expect("fits")
     }
 
+    fn gpu_inst(compound_id: u32, flags: u32) -> csg_scene::GpuInstance {
+        csg_scene::GpuInstance {
+            xform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            compound_id,
+            user_id: 0,
+            mat_override: u32::MAX,
+            flags,
+        }
+    }
+
     #[test]
     fn classify_all_none_partial() {
         let m = bit(semantic::VEHICLE.0) | bit(semantic::WHEEL.0);
@@ -307,23 +322,60 @@ mod tests {
         assert_eq!(classify(m, m | bit(semantic::ROAD.0)), InstanceFilter::Hidden, "superset hidden");
         assert_eq!(classify(m, bit(semantic::WHEEL.0)), InstanceFilter::Partial, "some hidden");
         assert_eq!(classify(0, u64::MAX), InstanceFilter::Unaffected, "no classes is never hidden");
+        assert_eq!(classify(u64::MAX, 0), InstanceFilter::Unaffected, "sentinel unaffected when nothing hidden");
+        assert_eq!(classify(u64::MAX, u64::MAX), InstanceFilter::Partial, "sentinel is never Hidden");
     }
 
     #[test]
-    fn mask_source_override_unknown_crowd() {
-        // Override: exactly its class.
+    fn mask_source_override_compound_and_crowd() {
+        let bldg_win = bit(semantic::BUILDING.0) | bit(semantic::WINDOW.0);
+        let veg = bit(semantic::VEGETATION.0);
+        // Single-class compound: Hidden or Unaffected with no override.
+        assert_eq!(instance_semantic_mask(inst_flags::VISIBLE, veg), veg);
+        assert_eq!(classify(instance_semantic_mask(inst_flags::VISIBLE, veg), veg), InstanceFilter::Hidden);
+        assert_eq!(
+            classify(instance_semantic_mask(inst_flags::VISIBLE, veg), bit(semantic::VEHICLE.0)),
+            InstanceFilter::Unaffected
+        );
+        // Multi-class compound: Partial when one sub-class is hidden, Hidden when all are.
+        assert_eq!(instance_semantic_mask(inst_flags::VISIBLE, bldg_win), bldg_win);
+        assert_eq!(
+            classify(instance_semantic_mask(inst_flags::VISIBLE, bldg_win), bit(semantic::WINDOW.0)),
+            InstanceFilter::Partial
+        );
+        assert_eq!(
+            classify(instance_semantic_mask(inst_flags::VISIBLE, bldg_win), bldg_win),
+            InstanceFilter::Hidden
+        );
+        // Override beats the compound mask.
         let ped = with_sem(semantic::PEDESTRIAN.0);
-        assert_eq!(instance_semantic_mask(ped), bit(semantic::PEDESTRIAN.0));
-        assert_eq!(classify(instance_semantic_mask(ped), bit(semantic::PEDESTRIAN.0)), InstanceFilter::Hidden);
-        assert_eq!(classify(instance_semantic_mask(ped), bit(semantic::VEHICLE.0)), InstanceFilter::Unaffected);
-        // Unknown (no override, csg-rs P41 pending): always partial while anything is hidden.
-        assert_eq!(instance_semantic_mask(inst_flags::VISIBLE), u64::MAX);
-        assert_eq!(classify(u64::MAX, bit(semantic::VEHICLE.0)), InstanceFilter::Partial);
-        assert_eq!(classify(u64::MAX, 0), InstanceFilter::Unaffected);
-        // Crowd bones: the GPU scatter drops the override, so they stay unknown.
-        assert_eq!(instance_semantic_mask(ped | inst_flags::CROWD_BONE), u64::MAX);
-        // An override id outside the 64-bit mask can never be hidden.
-        assert_eq!(classify(instance_semantic_mask(with_sem(70)), u64::MAX), InstanceFilter::Unaffected);
+        assert_eq!(instance_semantic_mask(ped, bldg_win), bit(semantic::PEDESTRIAN.0));
+        assert_eq!(
+            classify(instance_semantic_mask(ped, bldg_win), bit(semantic::PEDESTRIAN.0)),
+            InstanceFilter::Hidden
+        );
+        assert_eq!(
+            classify(instance_semantic_mask(ped, bldg_win), bit(semantic::BUILDING.0)),
+            InstanceFilter::Unaffected
+        );
+        // Crowd bones carry semantic override directly from `emit_actors_cuda` (no u64::MAX shim).
+        let dog_bone = with_sem(semantic::ANIMAL.0) | inst_flags::CROWD_BONE;
+        assert_eq!(instance_semantic_mask(dog_bone, bit(semantic::PEDESTRIAN.0)), bit(semantic::ANIMAL.0));
+        assert_eq!(
+            classify(instance_semantic_mask(dog_bone, bit(semantic::PEDESTRIAN.0)), bit(semantic::ANIMAL.0)),
+            InstanceFilter::Hidden
+        );
+        assert_eq!(
+            classify(instance_semantic_mask(dog_bone, bit(semantic::PEDESTRIAN.0)), bit(semantic::PEDESTRIAN.0)),
+            InstanceFilter::Unaffected
+        );
+        // Override id >= 64 yields conservative `u64::MAX` from `csg_core::semantic::mask_bit`,
+        // which `classify` keeps out of `Hidden` so ids outside the 64-bit mask are never hidden.
+        let high = instance_semantic_mask(with_sem(70), veg);
+        assert_eq!(high, u64::MAX);
+        assert_eq!(classify(high, 0), InstanceFilter::Unaffected);
+        assert_eq!(classify(high, all_mask()), InstanceFilter::Partial);
+        assert_eq!(classify(high, u64::MAX), InstanceFilter::Partial);
     }
 
     #[test]
@@ -340,21 +392,30 @@ mod tests {
     #[test]
     fn partial_bitset_marks_only_partial_slots() {
         let hidden = bit(semantic::VEHICLE.0);
-        let flags = [
-            with_sem(semantic::VEHICLE.0),    // 0 hidden
-            inst_flags::VISIBLE,              // 1 unknown -> partial
-            with_sem(semantic::ROAD.0),       // 2 unaffected
+        // Compound masks: 0 = single VEHICLE, 1 = multi VEHICLE|WHEEL, 2 = single ROAD.
+        let masks = [
+            bit(semantic::VEHICLE.0),
+            bit(semantic::VEHICLE.0) | bit(semantic::WHEEL.0),
+            bit(semantic::ROAD.0),
         ];
-        let mut many: Vec<u32> = flags.iter().copied().cycle().take(40).collect();
-        many[39] = inst_flags::VISIBLE; // slot 39 (word 1, bit 7) partial
+        let base = [
+            gpu_inst(0, inst_flags::VISIBLE), // 0 single-class -> hidden (not partial)
+            gpu_inst(1, inst_flags::VISIBLE), // 1 multi-class -> partial
+            gpu_inst(2, inst_flags::VISIBLE), // 2 unaffected (not partial)
+        ];
+        let mut many: Vec<csg_scene::GpuInstance> = base.iter().copied().cycle().take(40).collect();
+        // Slot 38: multi-class compound overridden to ROAD -> unaffected (not partial).
+        many[38] = gpu_inst(1, with_sem(semantic::ROAD.0));
+        // Slot 39 (word 1, bit 7): out-of-range compound_id -> conservative u64::MAX -> partial.
+        many[39] = gpu_inst(99, inst_flags::VISIBLE);
         let mut out = vec![0xDEAD_BEEF; 7];
-        let n = fill_partial_bits(many.iter().copied(), hidden, &mut out);
+        let n = fill_partial_bits(&many, &masks, hidden, &mut out);
         assert_eq!(out.len(), 2);
         let expect: u32 = (0..32).filter(|i| i % 3 == 1).fold(0, |m, i| m | 1 << i);
         assert_eq!(out[0], expect);
         assert_eq!(out[1], (1 << (34 - 32)) | (1 << (37 - 32)) | (1 << 7));
         assert_eq!(n, expect.count_ones() as usize + 3);
-        assert_eq!(fill_partial_bits(std::iter::empty(), hidden, &mut out), 0);
+        assert_eq!(fill_partial_bits(&[], &masks, hidden, &mut out), 0);
         assert!(out.is_empty());
     }
 }

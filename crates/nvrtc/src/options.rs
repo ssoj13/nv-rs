@@ -8,6 +8,22 @@
 use crate::{Error, Result};
 use std::ffi::CString;
 
+/// Floating-point math precision mode for NVRTC compilation.
+///
+/// Why: interactive rendering and simulation benefit from `--use_fast_math`, whereas certified
+/// hard-Boolean verification and polynomial root-finding (e.g. quartic `Torus` / cubic
+/// `LatheCurve` intersections, `gracefold-rs/crates/csg-fit`) require IEEE-754 subnormal
+/// preservation and exact division/square-root rounding without FMA contraction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MathMode {
+    /// Enables `--use_fast_math` (flush-to-zero, approximate div/sqrt, FMA enabled).
+    #[default]
+    Fast,
+    /// Strict IEEE-754 single-precision math (`--ftz=false`, `--prec-div=true`,
+    /// `--prec-sqrt=true`, `--fmad=false`; never passes `--use_fast_math`).
+    StrictF32,
+}
+
 /// Compiler options passed to [`crate::Program::compile`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompileOptions {
@@ -53,10 +69,44 @@ impl CompileOptions {
         self
     }
 
+    /// Sets `--ftz=true` or `--ftz=false` (flush denormal/subnormal floats to zero).
+    pub fn ftz(mut self, enabled: bool) -> Self {
+        self.args.push(format!("--ftz={enabled}"));
+        self
+    }
+
+    /// Sets `--prec-div=true` or `--prec-div=false` (IEEE-754 single-precision division).
+    pub fn prec_div(mut self, enabled: bool) -> Self {
+        self.args.push(format!("--prec-div={enabled}"));
+        self
+    }
+
+    /// Sets `--prec-sqrt=true` or `--prec-sqrt=false` (IEEE-754 single-precision square root).
+    pub fn prec_sqrt(mut self, enabled: bool) -> Self {
+        self.args.push(format!("--prec-sqrt={enabled}"));
+        self
+    }
+
     /// Sets `--fmad=true` or `--fmad=false`.
     pub fn fmad(mut self, enabled: bool) -> Self {
         self.args.push(format!("--fmad={enabled}"));
         self
+    }
+
+    /// Configures strict IEEE-754 single-precision math (`--ftz=false`, `--prec-div=true`,
+    /// `--prec-sqrt=true`, `--fmad=false`) for deterministic root-finding and verification
+    /// kernels without `--use_fast_math`.
+    pub fn strict_f32(self) -> Self {
+        self.ftz(false).prec_div(true).prec_sqrt(true).fmad(false)
+    }
+
+    /// Applies [`MathMode::Fast`] ([`Self::fast_math`]) or [`MathMode::StrictF32`]
+    /// ([`Self::strict_f32`]).
+    pub fn math_mode(self, mode: MathMode) -> Self {
+        match mode {
+            MathMode::Fast => self.fast_math(),
+            MathMode::StrictF32 => self.strict_f32(),
+        }
     }
 
     /// Enables `--device-debug` (`-G`).
@@ -143,6 +193,30 @@ mod tests {
             ]
         );
         assert_eq!(opts.to_cstrings().expect("valid cstrings").len(), 11);
+    }
+
+    #[test]
+    fn strict_f32_and_math_mode_emit_ieee754_flags_without_fast_math() {
+        let strict = CompileOptions::new()
+            .arch("compute_75")
+            .std("c++17")
+            .math_mode(MathMode::StrictF32);
+        assert_eq!(
+            strict.args(),
+            &[
+                "--gpu-architecture=compute_75",
+                "--std=c++17",
+                "--ftz=false",
+                "--prec-div=true",
+                "--prec-sqrt=true",
+                "--fmad=false",
+            ]
+        );
+        assert!(!strict.args().iter().any(|a| a.contains("fast_math")));
+
+        let fast = CompileOptions::new().math_mode(MathMode::Fast);
+        assert_eq!(fast.args(), &["--use_fast_math"]);
+        assert_eq!(MathMode::default(), MathMode::Fast);
     }
 
     #[test]

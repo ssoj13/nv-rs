@@ -17,7 +17,7 @@
 pub mod options;
 pub mod program;
 
-pub use options::CompileOptions;
+pub use options::{CompileOptions, MathMode};
 pub use program::Program;
 
 pub use nvrtc_sys as sys;

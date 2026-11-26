@@ -614,11 +614,12 @@ fn ptx_cache_entry(
     arch: &str,
     include_dirs: &[String],
     extra_hash_blobs: &[&[u8]],
+    math_mode: nvrtc::MathMode,
 ) -> Result<PtxCacheEntry, String> {
     let mut opts = nvrtc::CompileOptions::new()
         .arch(arch)
         .std("c++17")
-        .fast_math();
+        .math_mode(math_mode);
     for dir in include_dirs {
         opts = opts.include_dir(dir);
     }
@@ -712,25 +713,65 @@ pub(crate) fn compile_ptx_cached(
     include_dirs: &[String],
     extra_hash_blobs: &[&[u8]],
 ) -> Result<Vec<u8>, String> {
-    let entry = ptx_cache_entry(src, unit_name, arch, include_dirs, extra_hash_blobs)?;
+    let math_mode = if std::env::var("NV_DEMO_STRICT_F32").is_ok_and(|v| v == "1") {
+        nvrtc::MathMode::StrictF32
+    } else {
+        nvrtc::MathMode::Fast
+    };
+    let entry = ptx_cache_entry(
+        src,
+        unit_name,
+        arch,
+        include_dirs,
+        extra_hash_blobs,
+        math_mode,
+    )?;
     if let Some(cached) = read_cached_ptx(&entry) {
         return Ok(cached);
     }
     compile_and_store_ptx(src, unit_name, &entry)
 }
 
-/// Like `compile_ptx_cached`, then hands the PTX to `load`. When a *cached* image fails to load
-/// (truncated or corrupt file, or PTX the current driver rejects), the entry is deleted, the source
-/// is recompiled and loaded once more; a freshly compiled image that fails returns `load`'s error.
+/// Like [`load_ptx_cached_with_math`] using [`nvrtc::MathMode::Fast`].
 pub(crate) fn load_ptx_cached<T>(
     src: &str,
     unit_name: &str,
     arch: &str,
     include_dirs: &[String],
     extra_hash_blobs: &[&[u8]],
+    load: impl FnMut(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    load_ptx_cached_with_math(
+        src,
+        unit_name,
+        arch,
+        include_dirs,
+        extra_hash_blobs,
+        nvrtc::MathMode::Fast,
+        load,
+    )
+}
+
+/// Like `compile_ptx_cached`, then hands the PTX to `load` under `math_mode` (distinct cache
+/// entries for [`nvrtc::MathMode::Fast`] vs [`nvrtc::MathMode::StrictF32`]). When a *cached*
+/// image fails to load, the entry is deleted, the source is recompiled, and loaded once more.
+pub(crate) fn load_ptx_cached_with_math<T>(
+    src: &str,
+    unit_name: &str,
+    arch: &str,
+    include_dirs: &[String],
+    extra_hash_blobs: &[&[u8]],
+    math_mode: nvrtc::MathMode,
     mut load: impl FnMut(&[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
-    let entry = ptx_cache_entry(src, unit_name, arch, include_dirs, extra_hash_blobs)?;
+    let entry = ptx_cache_entry(
+        src,
+        unit_name,
+        arch,
+        include_dirs,
+        extra_hash_blobs,
+        math_mode,
+    )?;
     if let Some(cached) = read_cached_ptx(&entry) {
         match load(&cached) {
             Ok(loaded) => return Ok(loaded),
@@ -1492,7 +1533,9 @@ mod tests {
     fn load_ptx_cached_evicts_and_recompiles_a_rejected_cache_entry() {
         let src = "extern \"C\" __global__ void nv_demo_evict_probe() {}";
         let unit = "nv_demo_evict_probe.cu";
-        let entry = ptx_cache_entry(src, unit, "compute_75", &[], &[]).expect("cache entry");
+        let entry =
+            ptx_cache_entry(src, unit, "compute_75", &[], &[], nvrtc::MathMode::Fast)
+                .expect("cache entry");
         std::fs::create_dir_all(&entry.dir).expect("cache dir");
         std::fs::write(&entry.path, b"corrupt").expect("seed a corrupt cache entry");
 

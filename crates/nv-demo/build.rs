@@ -33,12 +33,20 @@ fn compile_ptx(
     src: &Path,
     out: &Path,
     extra_incs: &[&Path],
+    strict_f32: bool,
 ) -> Result<(), String> {
     let mut cmd = Command::new(nvcc);
-    cmd.arg("--ptx")
-        .arg("-arch=compute_75")
-        .arg("-std=c++17")
-        .arg("--use_fast_math");
+    cmd.arg("--ptx").arg("-arch=compute_75").arg("-std=c++17");
+    if strict_f32 {
+        // Strict IEEE-754 single-precision math for certified hard-Boolean verification and
+        // grazing-angle quartic/cubic root-finding (preserves subnormals and exact div/sqrt).
+        cmd.arg("--ftz=false")
+            .arg("--prec-div=true")
+            .arg("--prec-sqrt=true")
+            .arg("--fmad=false");
+    } else {
+        cmd.arg("--use_fast_math");
+    }
     for inc in extra_incs {
         cmd.arg("-I").arg(inc);
     }
@@ -179,6 +187,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OPTIX_ROOT");
     println!("cargo:rerun-if-env-changed=ProgramData");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=NV_DEMO_STRICT_F32");
+    let strict_f32 = env::var("NV_DEMO_STRICT_F32").is_ok_and(|v| v == "1");
 
     // `csg_eval.cuh` is an umbrella over its parts; an edit inside a part must rebuild the PTX.
     let csg_inc = PathBuf::from(csg_device::csg_eval_cuh_dir());
@@ -216,11 +226,18 @@ fn main() {
         Path::new("shaders/raytracer.cu"),
         &rt_out,
         &[optix_inc.as_path(), csg_inc.as_path()],
+        strict_f32,
     ) {
         println!("cargo:warning={err}");
         return;
     }
-    if let Err(err) = compile_ptx(&nvcc, Path::new("shaders/tonemap.cu"), &tm_out, &[]) {
+    if let Err(err) = compile_ptx(
+        &nvcc,
+        Path::new("shaders/tonemap.cu"),
+        &tm_out,
+        &[],
+        false,
+    ) {
         println!("cargo:warning={err}");
         return;
     }

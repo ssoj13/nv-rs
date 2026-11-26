@@ -41,16 +41,21 @@ use cuda_core::{Context as CudaContext, DeviceBuffer, Stream};
 /// allocations per launch; largest current plan kernel takes 23 parameters).
 const MAX_STACK_KERNEL_ARGS: usize = 64;
 
-/// Compiles CUDA C++ `source` via NVRTC (`compute_75`, C++17, `--use_fast_math`) and returns a
+/// Compiles CUDA C++ `source` via NVRTC (`compute_75`, C++17) under `math_mode` and returns a
 /// NUL-terminated PTX byte buffer ready for `cuModuleLoadData`.
 ///
-/// Shared helper for standalone host bridge kernels (such as `cuda_crowd`'s scatter bridge) that
-/// compile a small CUDA unit without going through a `FramePlan`.
-pub fn compile_nvrtc_ptx(source: &str, name: &str) -> Result<Vec<u8>, String> {
+/// Use [`nvrtc::MathMode::StrictF32`] for verification or polynomial root-finding kernels that
+/// must preserve IEEE-754 subnormals and exact division/square-root rounding without
+/// `--use_fast_math`.
+pub fn compile_nvrtc_ptx_with_math(
+    source: &str,
+    name: &str,
+    math_mode: nvrtc::MathMode,
+) -> Result<Vec<u8>, String> {
     let opts = nvrtc::CompileOptions::new()
         .arch("compute_75")
         .std("c++17")
-        .fast_math();
+        .math_mode(math_mode);
     let mut prog = nvrtc::Program::new(source, Some(name), &[])
         .map_err(|e| format!("NVRTC program creation failed for {name}: {e}"))?;
     prog.compile(&opts)
@@ -62,6 +67,15 @@ pub fn compile_nvrtc_ptx(source: &str, name: &str) -> Result<Vec<u8>, String> {
         ptx.push(0);
     }
     Ok(ptx)
+}
+
+/// Compiles CUDA C++ `source` via NVRTC (`compute_75`, C++17, [`nvrtc::MathMode::Fast`]) and
+/// returns a NUL-terminated PTX byte buffer ready for `cuModuleLoadData`.
+///
+/// Shared helper for standalone host bridge kernels (such as `cuda_crowd`'s scatter bridge) that
+/// compile a small CUDA unit without going through a `FramePlan`.
+pub fn compile_nvrtc_ptx(source: &str, name: &str) -> Result<Vec<u8>, String> {
+    compile_nvrtc_ptx_with_math(source, name, nvrtc::MathMode::Fast)
 }
 
 /// Resolves an `extern "C"` kernel symbol `name` inside a loaded `CUmodule`.
@@ -250,14 +264,27 @@ unsafe impl Send for GpuFramePlan {}
 
 impl GpuFramePlan {
     /// Validates `plan` against `expected_version`, its own FNV-1a source hash, and the parsed
-    /// `extern "C"` kernel signatures in `plan.source`, compiles/loads its PTX module (via the
-    /// disk PTX cache), caches all referenced `CUfunction`s, and initializes grow-only device
-    /// slots for every owned buffer.
+    /// `extern "C"` kernel signatures in `plan.source`, compiles/loads its PTX module with
+    /// [`nvrtc::MathMode::Fast`], caches all referenced `CUfunction`s, and initializes grow-only
+    /// device slots for every owned buffer.
     pub fn new(
         cuda: &Arc<CudaContext>,
         plan: FramePlan,
         expected_version: u32,
         unit_name: &str,
+    ) -> Result<Self, String> {
+        Self::new_with_math(cuda, plan, expected_version, unit_name, nvrtc::MathMode::Fast)
+    }
+
+    /// Like [`Self::new`] with explicit [`nvrtc::MathMode`] (`Fast` vs `StrictF32`) so
+    /// verification and root-finding plans compile with IEEE-754 precision into their own PTX
+    /// cache slot.
+    pub fn new_with_math(
+        cuda: &Arc<CudaContext>,
+        plan: FramePlan,
+        expected_version: u32,
+        unit_name: &str,
+        math_mode: nvrtc::MathMode,
     ) -> Result<Self, String> {
         if plan.version != expected_version {
             return Err(format!(
@@ -324,12 +351,13 @@ impl GpuFramePlan {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed for FramePlan {:?} ({unit_name}): {e}", plan.kind))?;
 
-        let module = crate::gpu_export::load_ptx_cached(
+        let module = crate::gpu_export::load_ptx_cached_with_math(
             &plan.source,
             unit_name,
             "compute_75",
             &[],
             &[],
+            math_mode,
             |ptx| {
                 let mut m: cu::CUmodule = std::ptr::null_mut();
                 // SAFETY: `ptx` is a NUL-terminated PTX buffer and `cuda` is current on this thread.
@@ -844,5 +872,45 @@ impl Drop for GpuFramePlan {
             }
             self.module = std::ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA/NVRTC runtime"]
+    fn strict_f32_ptx_emits_ieee754_div_and_sqrt_without_ftz() {
+        let src = r#"
+extern "C" __global__ void strict_probe(const float* a, const float* b, float* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = sqrtf(a[i] / b[i]);
+}
+"#;
+        let strict_ptx =
+            compile_nvrtc_ptx_with_math(src, "strict_probe.cu", nvrtc::MathMode::StrictF32)
+                .expect("NVRTC strict_f32 compile");
+        let strict_text = String::from_utf8_lossy(&strict_ptx);
+        assert!(
+            strict_text.contains("div.rn.f32"),
+            "StrictF32 PTX must use IEEE-754 div.rn.f32:\n{strict_text}"
+        );
+        assert!(
+            strict_text.contains("sqrt.rn.f32"),
+            "StrictF32 PTX must use IEEE-754 sqrt.rn.f32:\n{strict_text}"
+        );
+        assert!(
+            !strict_text.contains(".ftz."),
+            "StrictF32 PTX must not flush subnormals (.ftz):\n{strict_text}"
+        );
+
+        let fast_ptx = compile_nvrtc_ptx_with_math(src, "fast_probe.cu", nvrtc::MathMode::Fast)
+            .expect("NVRTC fast_math compile");
+        let fast_text = String::from_utf8_lossy(&fast_ptx);
+        assert!(
+            fast_text.contains(".ftz."),
+            "Fast PTX should emit flush-to-zero instructions:\n{fast_text}"
+        );
     }
 }

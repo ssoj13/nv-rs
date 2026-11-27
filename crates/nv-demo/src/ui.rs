@@ -4008,13 +4008,8 @@ impl UiContext<'_> {
             );
         }
 
-        collapsing_section(ui, "sec_telemetry", ic::GAUGE, "Telemetry", |ui| {
-            let UiScratch {
-                label_buf: buf,
-                tip_buf,
-                ..
-            } = &mut *self.scratch;
-            stat_row(ui, "GPU", &self.telemetry.gpu_name);
+        collapsing_section(ui, "sec_render_stats", ic::MONITOR_PLAY, "Render & Frame", |ui| {
+            let buf = &mut self.scratch.label_buf;
             stat_row(
                 ui,
                 "Resolution",
@@ -4036,11 +4031,6 @@ impl UiContext<'_> {
             );
             stat_row(
                 ui,
-                "Bloom / TM",
-                fmt_into(buf, format_args!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms)),
-            );
-            stat_row(
-                ui,
                 "Accum",
                 fmt_into(
                     buf,
@@ -4050,53 +4040,12 @@ impl UiContext<'_> {
                     ),
                 ),
             );
+            stat_row(
+                ui,
+                "Bloom / TM",
+                fmt_into(buf, format_args!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms)),
+            );
             stat_row(ui, "Denoiser", fmt_into(buf, format_args!("{:.1} ms", self.denoise_ms)));
-            stat_row(
-                ui,
-                "OptiX SER",
-                match (self.ser_supported, self.settings.ser_on) {
-                    (true, true) => "HW Active",
-                    (true, false) => "HW Off",
-                    (false, _) => "Unsupported",
-                },
-            );
-            stat_row(
-                ui,
-                "VRAM",
-                fmt_into(
-                    buf,
-                    format_args!(
-                        "{} / {} MiB",
-                        self.telemetry.vram_used_mib, self.telemetry.vram_total_mib
-                    ),
-                ),
-            );
-            stat_row(
-                ui,
-                "Clocks",
-                fmt_into(
-                    buf,
-                    format_args!(
-                        "{} / {} MHz",
-                        self.telemetry.gpu_clock_mhz, self.telemetry.mem_clock_mhz
-                    ),
-                ),
-            );
-            stat_row(
-                ui,
-                "Temp / Load",
-                fmt_into(
-                    buf,
-                    format_args!("{} C / {} %", self.telemetry.temp_c, self.telemetry.util_gpu),
-                ),
-            );
-            stat_row(
-                ui,
-                "Power",
-                fmt_into(buf, format_args!("{:.0} W", self.telemetry.power_w)),
-            );
-            stat_row(ui, "CUPTI", &self.telemetry.cupti_status);
-            stat_row(ui, "NGX", &self.telemetry.ngx_status);
             stat_row(
                 ui,
                 "DLSS RR",
@@ -4106,67 +4055,86 @@ impl UiContext<'_> {
                     (false, _) => "Unavailable",
                 },
             );
-            if self.settings.csg_mode != 0 {
-                stat_row(
-                    ui,
-                    "CSG Inst",
-                    fmt_into(
-                        buf,
-                        format_args!(
-                            "{} / {}",
-                            self.csg_stats.visible_instances, self.csg_stats.total_instances
-                        ),
-                    ),
-                );
-                stat_row(
-                    ui,
-                    "CSG LOD",
-                    fmt_into(
-                        buf,
-                        format_args!(
-                            "L0:{} L1:{} L2:{} C:{}",
-                            self.csg_stats.lod0_count,
-                            self.csg_stats.lod1_count,
-                            self.csg_stats.lod2_count,
-                            self.csg_stats.culled_count
-                        ),
-                    ),
-                );
-                stat_row(
-                    ui,
-                    "CSG DAG",
-                    fmt_into(
-                        buf,
-                        format_args!(
-                            "{} GAS / {} prm",
-                            self.csg_stats.compounds, self.csg_stats.primitives
-                        ),
-                    ),
-                );
-                stat_row(
-                    ui,
-                    "CSG Aux",
-                    fmt_into(
-                        buf,
-                        format_args!("{:.1} KiB", self.csg_stats.aux_planes_bytes as f64 / 1024.0),
-                    ),
-                );
-                stat_row(
-                    ui,
-                    "CSG VRAM",
-                    fmt_into(
-                        buf,
-                        format_args!("{:.1} KiB", self.csg_stats.gpu_bytes as f64 / 1024.0),
-                    ),
-                );
-                if self.sim_telemetry.has_any() {
-                    render_sim_telemetry(ui, &self.sim_telemetry, self.rt_fps, buf, tip_buf);
-                }
-            }
+            stat_row(
+                ui,
+                "OptiX SER",
+                match (self.ser_supported, self.settings.ser_on) {
+                    (true, true) => "HW Active",
+                    (true, false) => "HW Off",
+                    (false, _) => "Unsupported",
+                },
+            );
         });
 
+        collapsing_section(ui, "sec_gpu_hw", ic::CPU, "GPU & Hardware", |ui| {
+            let UiScratch {
+                label_buf: buf,
+                tip_buf,
+                ..
+            } = &mut *self.scratch;
+            render_gpu_hw_body(ui, self.telemetry, buf, tip_buf);
+        });
+
+        if self.settings.csg_mode != 0 {
+            collapsing_section(ui, "sec_csg_stats", ic::CUBE, "CSG Scene & LOD", |ui| {
+                let UiScratch {
+                    label_buf: buf,
+                    tip_buf,
+                    ..
+                } = &mut *self.scratch;
+                render_csg_stats_body(ui, &self.csg_stats, buf, tip_buf);
+            });
+
+            if self.sim_telemetry.has_any() {
+                if self.sim_telemetry.has_crowd() {
+                    collapsing_section(
+                        ui,
+                        "sec_crowd_stats",
+                        ic::USERS_THREE,
+                        "Crowd & Locomotion",
+                        |ui| {
+                            let UiScratch {
+                                label_buf: buf,
+                                tip_buf,
+                                ..
+                            } = &mut *self.scratch;
+                            render_crowd_stats_body(
+                                ui,
+                                &self.sim_telemetry,
+                                self.timings,
+                                self.rt_fps,
+                                buf,
+                                tip_buf,
+                            );
+                        },
+                    );
+                }
+
+                if self.sim_telemetry.has_traffic() {
+                    collapsing_section(ui, "sec_traffic_stats", ic::CAR, "Traffic & ADAS", |ui| {
+                        let UiScratch {
+                            label_buf: buf,
+                            tip_buf,
+                            ..
+                        } = &mut *self.scratch;
+                        render_traffic_stats_body(
+                            ui,
+                            &self.sim_telemetry,
+                            self.timings,
+                            buf,
+                            tip_buf,
+                        );
+                    });
+                }
+            }
+        }
+
         collapsing_section(ui, "sec_perf", ic::CHART_LINE, "Performance", |ui| {
-            let buf = &mut self.scratch.label_buf;
+            let UiScratch {
+                label_buf: buf,
+                tip_buf,
+                ..
+            } = &mut *self.scratch;
             stat_row(
                 ui,
                 "RT Cores",
@@ -4186,6 +4154,7 @@ impl UiContext<'_> {
             sparkline_row(
                 ui,
                 buf,
+                tip_buf,
                 "RT Cores",
                 &self.timings.rt_cores_ms,
                 Color32::from_rgb(138, 173, 244),
@@ -4194,6 +4163,7 @@ impl UiContext<'_> {
             sparkline_row(
                 ui,
                 buf,
+                tip_buf,
                 "Tensor",
                 &self.timings.tensor_cores_ms,
                 Color32::from_rgb(166, 209, 137),
@@ -4202,6 +4172,7 @@ impl UiContext<'_> {
             sparkline_row(
                 ui,
                 buf,
+                tip_buf,
                 "CUDA SM",
                 &self.timings.cuda_compute_ms,
                 Color32::from_rgb(238, 212, 159),
@@ -4210,6 +4181,7 @@ impl UiContext<'_> {
             sparkline_row(
                 ui,
                 buf,
+                tip_buf,
                 "FPS",
                 &self.timings.fps,
                 Color32::from_rgb(198, 160, 246),
@@ -4421,8 +4393,12 @@ fn section_accent(id_salt: &str) -> Color32 {
         "sec_formula" => Color32::from_rgb(92, 188, 168),
         "sec_transform" => Color32::from_rgb(138, 164, 212),
         "sec_detail" => Color32::from_rgb(166, 209, 137),
-        "sec_cinema" => Color32::from_rgb(232, 148, 112),
-        "sec_telemetry" => Color32::from_rgb(112, 172, 216),
+        "sec_view_possess" | "sec_cinema" => Color32::from_rgb(232, 148, 112),
+        "sec_render_stats" => Color32::from_rgb(112, 172, 216),
+        "sec_gpu_hw" => Color32::from_rgb(154, 144, 216),
+        "sec_csg_stats" => Color32::from_rgb(92, 184, 224),
+        "sec_crowd_stats" => Color32::from_rgb(166, 209, 137),
+        "sec_traffic_stats" => Color32::from_rgb(232, 178, 84),
         "sec_perf" => Color32::from_rgb(112, 184, 156),
         "sec_flab_author" => Color32::from_rgb(92, 184, 224),
         "sec_flab_dynamics" => Color32::from_rgb(104, 192, 186),
@@ -4451,7 +4427,15 @@ const SECTION_GROUPS: &[&[&str]] = &[
         "sec_pt",
     ],
     // Camera & Stats panel
-    &["sec_cinema", "sec_telemetry", "sec_perf"],
+    &[
+        "sec_view_possess",
+        "sec_render_stats",
+        "sec_gpu_hw",
+        "sec_csg_stats",
+        "sec_crowd_stats",
+        "sec_traffic_stats",
+        "sec_perf",
+    ],
     // Flight Lab panel
     &[
         "sec_flab_author",
@@ -4474,8 +4458,12 @@ fn section_group_for(id_salt: &str) -> &'static [&'static str] {
 fn section_default_open(id_salt: &str) -> bool {
     matches!(
         id_salt,
-        "sec_cinema"
-            | "sec_telemetry"
+        "sec_view_possess"
+            | "sec_cinema"
+            | "sec_render_stats"
+            | "sec_csg_stats"
+            | "sec_crowd_stats"
+            | "sec_traffic_stats"
             | "sec_perf"
             | "sec_presets"
             | "sec_formula"
@@ -5066,48 +5054,463 @@ fn stat_row_tip(
     });
 }
 
-/// Renders structured Crowd, Locomotion, and Traffic simulation telemetry rows inside the
-/// `Telemetry` panel using SSOT [`stat_row_tip`] alignment and reusable scratch buffers.
-pub(crate) fn render_sim_telemetry(
+/// One weighted segment inside a [`stacked_bar_row`] horizontal proportion bar.
+#[derive(Clone, Copy)]
+struct BarSegment {
+    count: u64,
+    color: Color32,
+}
+
+/// Visual tone for a compact backend / simulation status pill in [`stat_badge_row_tip`].
+#[derive(Clone, Copy)]
+enum PillTone {
+    Green,
+    Amber,
+    Muted,
+}
+
+/// Compact color-coded status badge rendered at the left of a telemetry value row.
+#[derive(Clone, Copy)]
+struct StatusPill<'a> {
+    text: &'a str,
+    tone: PillTone,
+}
+
+fn pill_colors(ui: &Ui, tone: PillTone) -> (Color32, Color32) {
+    let dark = ui.visuals().dark_mode;
+    match (tone, dark) {
+        (PillTone::Green, true) => (
+            Color32::from_rgb(176, 242, 198),
+            Color32::from_rgb(24, 76, 50),
+        ),
+        (PillTone::Green, false) => (
+            Color32::from_rgb(18, 92, 52),
+            Color32::from_rgb(208, 242, 220),
+        ),
+        (PillTone::Amber, true) => (
+            Color32::from_rgb(252, 224, 162),
+            Color32::from_rgb(96, 66, 20),
+        ),
+        (PillTone::Amber, false) => (
+            Color32::from_rgb(126, 76, 8),
+            Color32::from_rgb(252, 232, 186),
+        ),
+        (PillTone::Muted, true) => (
+            Color32::from_rgb(186, 196, 212),
+            Color32::from_rgb(54, 60, 72),
+        ),
+        (PillTone::Muted, false) => (
+            Color32::from_rgb(66, 74, 88),
+            Color32::from_rgb(220, 224, 232),
+        ),
+    }
+}
+
+/// Renders a [`prop_row`] with a compact color-coded status pill (e.g. `CUDA v2`, `CPU SoA`) and
+/// an optional right-aligned trailing metric readout, with a lazily formatted hover tooltip.
+fn stat_badge_row_tip(
+    ui: &mut Ui,
+    label: &str,
+    pill: StatusPill<'_>,
+    trailing_text: &str,
+    tip_buf: &mut String,
+    format_tip: impl FnOnce(&mut String),
+) {
+    let (pill_fg, pill_bg) = pill_colors(ui, pill.tone);
+    prop_row(ui, label, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let mut hovered_resp = None;
+            if !trailing_text.is_empty() {
+                let resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(trailing_text)
+                            .monospace()
+                            .size(11.0)
+                            .color(ui.visuals().text_color()),
+                    )
+                    .truncate(),
+                );
+                if resp.hovered() {
+                    hovered_resp = Some(resp);
+                }
+            }
+
+            let font = egui::FontId::proportional(10.0);
+            let galley = ui
+                .painter()
+                .layout_no_wrap(pill.text.to_owned(), font, pill_fg);
+            let max_pill_w = ui.available_width().max(20.0);
+            let pill_w = (galley.size().x + 10.0).min(max_pill_w);
+            let pill_h = 15.0;
+            let (rect, pill_resp) =
+                ui.allocate_exact_size(egui::vec2(pill_w, pill_h), Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let p = ui.painter();
+                p.rect_filled(rect, 3.0, pill_bg);
+                p.rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.0, pill_fg.gamma_multiply(0.35)),
+                    egui::StrokeKind::Inside,
+                );
+                let text_pos = egui::pos2(
+                    (rect.center().x - galley.size().x * 0.5).max(rect.left() + 3.0),
+                    rect.center().y - galley.size().y * 0.5,
+                );
+                p.with_clip_rect(rect.intersect(ui.clip_rect()))
+                    .galley(text_pos, galley, Color32::WHITE);
+            }
+            if pill_resp.hovered() {
+                hovered_resp = Some(pill_resp);
+            }
+            if let Some(resp) = hovered_resp {
+                tip_buf.clear();
+                format_tip(tip_buf);
+                resp.on_hover_text(tip_buf.as_str());
+            }
+        });
+    });
+}
+
+/// Renders a compact (`12 px` tall), width-clamped horizontal stacked proportion bar inside a
+/// standard [`prop_row`] with an optional right-aligned compact readout and a lazy hover tooltip.
+fn stacked_bar_row(
+    ui: &mut Ui,
+    label: &str,
+    segments: &[BarSegment],
+    right_text: Option<&str>,
+    tip_buf: &mut String,
+    format_tip: impl FnOnce(&mut String),
+) {
+    prop_row(ui, label, |ui| {
+        let avail_w = ui.available_width().max(1.0);
+        let gap = 5.0;
+        let (bar_w, val_w) = if let Some(txt) = right_text {
+            let desired_val_w: f32 = if txt.len() <= 5 { 40.0 } else { 52.0 };
+            let vw = desired_val_w.min((avail_w * 0.44).max(30.0));
+            let bw = (avail_w - vw - gap).max(24.0);
+            (bw, vw)
+        } else {
+            (avail_w, 0.0)
+        };
+        ui.spacing_mut().item_spacing.x = gap;
+
+        let bar_h = 12.0;
+        let (bar_rect, bar_resp) =
+            ui.allocate_exact_size(egui::vec2(bar_w, bar_h), Sense::hover());
+        if ui.is_rect_visible(bar_rect) {
+            let p = ui.painter();
+            let track_bg = ui.visuals().extreme_bg_color;
+            let border_col = ui
+                .visuals()
+                .widgets
+                .noninteractive
+                .bg_stroke
+                .color
+                .gamma_multiply(0.55);
+            p.rect_filled(bar_rect, 3.0, track_bg);
+
+            let total: u64 = segments.iter().map(|s| s.count).sum();
+            let inner = bar_rect.shrink(1.0);
+            if total > 0 && inner.width() > 2.0 {
+                let total_f = total as f32;
+                let nonzero_total = segments.iter().filter(|s| s.count > 0).count();
+                let min_seg = 2.5_f32.min(inner.width() / (nonzero_total.max(1) as f32));
+                let mut cursor_x = inner.left();
+                let mut seen_nonzero = 0usize;
+
+                for seg in segments {
+                    if seg.count == 0 {
+                        continue;
+                    }
+                    seen_nonzero += 1;
+                    let is_first = seen_nonzero == 1;
+                    let is_last = seen_nonzero == nonzero_total;
+                    let rem_after = nonzero_total.saturating_sub(seen_nonzero);
+                    let remaining_w = (inner.right() - cursor_x).max(0.0);
+                    let seg_w = if is_last {
+                        remaining_w
+                    } else {
+                        let reserve = min_seg * (rem_after as f32);
+                        let max_w = (remaining_w - reserve).max(0.0);
+                        ((seg.count as f32 / total_f) * inner.width())
+                            .max(min_seg)
+                            .min(max_w)
+                    };
+                    if seg_w > 0.25 {
+                        if seg.color.a() > 0 {
+                            let seg_rect = egui::Rect::from_min_max(
+                                egui::pos2(cursor_x, inner.top()),
+                                egui::pos2((cursor_x + seg_w).min(inner.right()), inner.bottom()),
+                            );
+                            let cr = egui::CornerRadius {
+                                nw: if is_first { 2 } else { 0 },
+                                sw: if is_first { 2 } else { 0 },
+                                ne: if is_last { 2 } else { 0 },
+                                se: if is_last { 2 } else { 0 },
+                            };
+                            p.rect_filled(seg_rect, cr, seg.color);
+                            if !is_first {
+                                p.line_segment(
+                                    [
+                                        egui::pos2(cursor_x, inner.top()),
+                                        egui::pos2(cursor_x, inner.bottom()),
+                                    ],
+                                    egui::Stroke::new(1.0, track_bg.gamma_multiply(0.75)),
+                                );
+                            }
+                        }
+                        cursor_x = (cursor_x + seg_w).min(inner.right());
+                    }
+                }
+            }
+
+            p.rect_stroke(
+                bar_rect,
+                3.0,
+                egui::Stroke::new(0.75, border_col),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        let mut hovered_resp = if bar_resp.hovered() {
+            Some(bar_resp)
+        } else {
+            None
+        };
+        if let Some(txt) = right_text {
+            let txt_resp = allocate_clamped_ui(
+                ui,
+                egui::vec2(val_w, ROW_H),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(txt)
+                                .monospace()
+                                .size(10.5)
+                                .color(ui.visuals().text_color()),
+                        )
+                        .truncate(),
+                    )
+                },
+            );
+            if hovered_resp.is_none() && txt_resp.hovered() {
+                hovered_resp = Some(txt_resp);
+            }
+        }
+        if let Some(resp) = hovered_resp {
+            tip_buf.clear();
+            format_tip(tip_buf);
+            resp.on_hover_text(tip_buf.as_str());
+        }
+    });
+}
+
+/// Renders the `GPU & Hardware` section body (`GPU`, `VRAM`, live VRAM gauge bar, `Clocks`,
+/// `Temp / Load`, `Power`, `CUPTI`, `NGX`).
+fn render_gpu_hw_body(
+    ui: &mut Ui,
+    telemetry: &GpuTelemetry,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    stat_row(ui, "GPU", &telemetry.gpu_name);
+    stat_row(
+        ui,
+        "VRAM",
+        fmt_into(
+            label_buf,
+            format_args!("{} / {} MiB", telemetry.vram_used_mib, telemetry.vram_total_mib),
+        ),
+    );
+    if telemetry.vram_total_mib > 0 {
+        let used = telemetry.vram_used_mib.min(telemetry.vram_total_mib);
+        let free = telemetry.vram_total_mib.saturating_sub(used);
+        let pct = (used as f32 / telemetry.vram_total_mib as f32) * 100.0;
+        let gauge_col = if pct > 90.0 {
+            Color32::from_rgb(236, 78, 86)
+        } else if pct > 75.0 {
+            Color32::from_rgb(242, 184, 72)
+        } else {
+            Color32::from_rgb(122, 206, 138)
+        };
+        let segs = [
+            BarSegment {
+                count: used,
+                color: gauge_col,
+            },
+            BarSegment {
+                count: free,
+                color: Color32::TRANSPARENT,
+            },
+        ];
+        let pct_txt = fmt_into(label_buf, format_args!("{pct:.0}%"));
+        stacked_bar_row(ui, "VRAM Use", &segs, Some(pct_txt), tip_buf, |t| {
+            let _ = write!(
+                t,
+                "VRAM Used: {used} / {} MiB ({pct:.1}%)\nFree: {free} MiB",
+                telemetry.vram_total_mib
+            );
+        });
+    }
+    stat_row(
+        ui,
+        "Clocks",
+        fmt_into(
+            label_buf,
+            format_args!("{} / {} MHz", telemetry.gpu_clock_mhz, telemetry.mem_clock_mhz),
+        ),
+    );
+    stat_row(
+        ui,
+        "Temp / Load",
+        fmt_into(
+            label_buf,
+            format_args!("{} C / {} %", telemetry.temp_c, telemetry.util_gpu),
+        ),
+    );
+    stat_row(
+        ui,
+        "Power",
+        fmt_into(label_buf, format_args!("{:.0} W", telemetry.power_w)),
+    );
+    stat_row(ui, "CUPTI", &telemetry.cupti_status);
+    stat_row(ui, "NGX", &telemetry.ngx_status);
+}
+
+/// Renders the `CSG Scene & LOD` section body (`CSG Inst`, `CSG LOD`, live LOD stacked bar,
+/// `CSG DAG`, `CSG Aux`, `CSG VRAM`).
+fn render_csg_stats_body(
+    ui: &mut Ui,
+    stats: &CsgStats,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    stat_row(
+        ui,
+        "CSG Inst",
+        fmt_into(
+            label_buf,
+            format_args!("{} / {}", stats.visible_instances, stats.total_instances),
+        ),
+    );
+    stat_row(
+        ui,
+        "CSG LOD",
+        fmt_into(
+            label_buf,
+            format_args!(
+                "L0:{} L1:{} L2:{} C:{}",
+                stats.lod0_count, stats.lod1_count, stats.lod2_count, stats.culled_count
+            ),
+        ),
+    );
+    let lod_segs = [
+        BarSegment {
+            count: u64::from(stats.lod0_count),
+            color: Color32::from_rgb(122, 206, 138),
+        },
+        BarSegment {
+            count: u64::from(stats.lod1_count),
+            color: Color32::from_rgb(104, 182, 238),
+        },
+        BarSegment {
+            count: u64::from(stats.lod2_count),
+            color: Color32::from_rgb(236, 180, 86),
+        },
+        BarSegment {
+            count: u64::from(stats.culled_count),
+            color: Color32::from_rgb(108, 114, 128),
+        },
+    ];
+    let lod_total = u64::from(stats.lod0_count)
+        + u64::from(stats.lod1_count)
+        + u64::from(stats.lod2_count)
+        + u64::from(stats.culled_count);
+    let vis_pct = if lod_total > 0 {
+        let vis = u64::from(stats.lod0_count)
+            + u64::from(stats.lod1_count)
+            + u64::from(stats.lod2_count);
+        (vis as f32 / lod_total as f32) * 100.0
+    } else {
+        0.0
+    };
+    let vis_txt = fmt_into(label_buf, format_args!("{vis_pct:.0}%"));
+    stacked_bar_row(ui, "LOD Mix", &lod_segs, Some(vis_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "LOD0 (Full): {} | LOD1 (Mid): {}\nLOD2 (Coarse): {} | Culled: {}\nVisible: {vis_pct:.1}% of {lod_total} instances",
+            stats.lod0_count, stats.lod1_count, stats.lod2_count, stats.culled_count
+        );
+    });
+    stat_row(
+        ui,
+        "CSG DAG",
+        fmt_into(
+            label_buf,
+            format_args!("{} GAS / {} prm", stats.compounds, stats.primitives),
+        ),
+    );
+    stat_row(
+        ui,
+        "CSG Aux",
+        fmt_into(
+            label_buf,
+            format_args!("{:.1} KiB", stats.aux_planes_bytes as f64 / 1024.0),
+        ),
+    );
+    stat_row(
+        ui,
+        "CSG VRAM",
+        fmt_into(
+            label_buf,
+            format_args!("{:.1} KiB", stats.gpu_bytes as f64 / 1024.0),
+        ),
+    );
+}
+
+/// Renders the `Crowd & Locomotion` section body: backend status pill, actor counts, archetype
+/// stacked bar, rig/locomotion/VRAM stats, and live `Crowd ms` / `kBones/s` sparklines.
+fn render_crowd_stats_body(
     ui: &mut Ui,
     sim: &SimTelemetry,
+    timings: &FrameTimings,
     rt_fps: f32,
     label_buf: &mut String,
     tip_buf: &mut String,
 ) {
-    if sim.has_crowd() {
-        ui.add_space(3.0);
-        let hdr = fmt_into(
-            label_buf,
-            format_args!("{}  Crowd & Locomotion", ic::USERS_THREE),
-        );
-        ui.label(
-            RichText::new(hdr)
-                .size(11.0)
-                .color(ui.visuals().weak_text_color()),
-        );
-
-        let crowd_sim_val = match sim.crowd_backend {
-            ActiveCrowdBackend::Cuda => fmt_into(
-                label_buf,
-                format_args!(
-                    "CUDA v{} {:.2} ms",
-                    sim.crowd_plan_version.max(2),
-                    sim.crowd_step_ms
-                ),
-            ),
-            ActiveCrowdBackend::Cpu => {
-                fmt_into(label_buf, format_args!("CPU {:.2} ms", sim.crowd_step_ms))
+    let (pill_text, pill_tone, show_ms) = match sim.crowd_backend {
+        ActiveCrowdBackend::Cuda => {
+            let ver = sim.crowd_plan_version.max(2);
+            let tag = if ver == 2 { "CUDA v2" } else { "CUDA" };
+            (tag, PillTone::Green, true)
+        }
+        ActiveCrowdBackend::Cpu => ("CPU", PillTone::Amber, true),
+        ActiveCrowdBackend::None => {
+            if sim.pose_frozen {
+                ("Frozen", PillTone::Muted, false)
+            } else {
+                ("Idle", PillTone::Muted, false)
             }
-            ActiveCrowdBackend::None => {
-                if sim.pose_frozen {
-                    "Frozen"
-                } else {
-                    "Idle"
-                }
-            }
-        };
-        stat_row_tip(ui, "Crowd Sim", crowd_sim_val, tip_buf, |t| {
+        }
+    };
+    let trailing = if show_ms {
+        fmt_into(label_buf, format_args!("{:.2} ms", sim.crowd_step_ms))
+    } else {
+        ""
+    };
+    stat_badge_row_tip(
+        ui,
+        "Crowd Sim",
+        StatusPill {
+            text: pill_text,
+            tone: pill_tone,
+        },
+        trailing,
+        tip_buf,
+        |t| {
             let math = if sim.crowd_strict_f32 {
                 "StrictF32"
             } else {
@@ -5132,126 +5535,186 @@ pub(crate) fn render_sim_telemetry(
                     let _ = write!(t, "\nGPU Fault: 0x{:08x}", sim.crowd_gpu_fault);
                 }
             }
-        });
+        },
+    );
 
-        sim.write_archetypes_compact(label_buf);
-        stat_row_tip(ui, "Actors", label_buf.as_str(), tip_buf, |t| {
-            let [hero, ped, sign, pet] = sim.crowd_archetypes;
-            let _ = write!(
-                t,
-                "Total: {} actors\nHumanHero: {hero} | HumanCrowd: {ped}\nRoadSign: {sign} | Quadruped: {pet}\nWalkways: {} | Obstacles: {}",
-                sim.crowd_actors, sim.crowd_walkways, sim.crowd_obstacles
-            );
-        });
-
-        let rig_val = fmt_into(
-            label_buf,
-            format_args!("{} b / {} DOF", sim.crowd_bones, sim.crowd_dofs),
+    sim.write_archetypes_compact(label_buf);
+    stat_row_tip(ui, "Actors", label_buf.as_str(), tip_buf, |t| {
+        let [hero, ped, sign, pet] = sim.crowd_archetypes;
+        let _ = write!(
+            t,
+            "Total: {} actors\nHumanHero: {hero} | HumanCrowd: {ped}\nRoadSign: {sign} | Quadruped: {pet}\nWalkways: {} | Obstacles: {}",
+            sim.crowd_actors, sim.crowd_walkways, sim.crowd_obstacles
         );
-        stat_row_tip(ui, "Rig / Bones", rig_val, tip_buf, |t| {
-            let bps = sim.bones_per_sec(rt_fps);
-            let _ = write!(
-                t,
-                "Bones: {} | World Joints: {}\nSkeleton Edges: {} | Total DOFs: {}",
-                sim.crowd_bones, sim.crowd_joints, sim.crowd_skeleton_edges, sim.crowd_dofs
-            );
-            if bps >= 1000.0 {
-                let _ = write!(t, "\nThroughput: {:.1}k bones/s", bps / 1000.0);
-            } else if bps > 0.0 {
-                let _ = write!(t, "\nThroughput: {:.0} bones/s", bps);
-            } else {
-                t.push_str("\nThroughput: 0 bones/s (paused/frozen)");
-            }
-        });
+    });
 
-        let loco_val = if sim.pose_frozen {
-            fmt_into(
-                label_buf,
-                format_args!("Frozen | {} miss", sim.crowd_ground_misses),
-            )
-        } else if sim.gpu_camera_active {
-            fmt_into(
-                label_buf,
-                format_args!("{:.2}x | GPU Cam", sim.sim_rate),
-            )
+    let [hero, ped, sign, pet] = sim.crowd_archetypes;
+    let arch_segs = [
+        BarSegment {
+            count: u64::from(hero),
+            color: Color32::from_rgb(198, 148, 246),
+        },
+        BarSegment {
+            count: u64::from(ped),
+            color: Color32::from_rgb(112, 186, 238),
+        },
+        BarSegment {
+            count: u64::from(sign),
+            color: Color32::from_rgb(238, 192, 92),
+        },
+        BarSegment {
+            count: u64::from(pet),
+            color: Color32::from_rgb(138, 214, 148),
+        },
+    ];
+    let total_txt = fmt_into(label_buf, format_args!("{}", sim.crowd_actors));
+    stacked_bar_row(ui, "Archetypes", &arch_segs, Some(total_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Hero: {hero} | Pedestrian: {ped}\nStickman: {sign} | Pet: {pet}\nTotal: {} actors",
+            sim.crowd_actors
+        );
+    });
+
+    let rig_val = fmt_into(
+        label_buf,
+        format_args!("{} b / {} DOF", sim.crowd_bones, sim.crowd_dofs),
+    );
+    stat_row_tip(ui, "Rig / Bones", rig_val, tip_buf, |t| {
+        let bps = sim.bones_per_sec(rt_fps);
+        let _ = write!(
+            t,
+            "Bones: {} | World Joints: {}\nSkeleton Edges: {} | Total DOFs: {}",
+            sim.crowd_bones, sim.crowd_joints, sim.crowd_skeleton_edges, sim.crowd_dofs
+        );
+        if bps >= 1000.0 {
+            let _ = write!(t, "\nThroughput: {:.1}k bones/s", bps / 1000.0);
+        } else if bps > 0.0 {
+            let _ = write!(t, "\nThroughput: {:.0} bones/s", bps);
         } else {
-            fmt_into(
-                label_buf,
-                format_args!("{:.2}x | {} miss", sim.sim_rate, sim.crowd_ground_misses),
-            )
-        };
-        stat_row_tip(ui, "Locomotion", loco_val, tip_buf, |t| {
+            t.push_str("\nThroughput: 0 bones/s (paused/frozen)");
+        }
+    });
+
+    let loco_val = if sim.pose_frozen {
+        fmt_into(
+            label_buf,
+            format_args!("Frozen | {} miss", sim.crowd_ground_misses),
+        )
+    } else if sim.gpu_camera_active {
+        fmt_into(
+            label_buf,
+            format_args!("{:.2}x | GPU Cam", sim.sim_rate),
+        )
+    } else {
+        fmt_into(
+            label_buf,
+            format_args!("{:.2}x | {} miss", sim.sim_rate, sim.crowd_ground_misses),
+        )
+    };
+    stat_row_tip(ui, "Locomotion", loco_val, tip_buf, |t| {
+        let _ = write!(
+            t,
+            "State: {} (rate {:.2}x)\nCrowd LOD: ",
+            if sim.pose_frozen { "Frozen" } else { "Active" },
+            sim.sim_rate
+        );
+        sim.append_lod_summary(t);
+        let _ = write!(
+            t,
+            "\nGround Probe Misses (12 B async DMA): {}\nGPU Camera Rig (PlanKind::Camera v1): {}",
+            sim.crowd_ground_misses,
+            if sim.gpu_camera_active {
+                "Active (VRAM zero-copy)"
+            } else {
+                "Idle"
+            }
+        );
+    });
+
+    if sim.crowd_backend == ActiveCrowdBackend::Cuda && sim.crowd_gpu_bytes > 0 {
+        SimTelemetry::write_bytes_compact(sim.crowd_gpu_bytes, label_buf);
+        let _ = write!(label_buf, " ({} rbld)", sim.crowd_ias_rebuilds);
+        stat_row_tip(ui, "Crowd VRAM", label_buf.as_str(), tip_buf, |t| {
+            t.push_str("Plan + Scatter Bridge VRAM: ");
+            SimTelemetry::append_bytes_compact(sim.crowd_gpu_bytes, t);
             let _ = write!(
                 t,
-                "State: {} (rate {:.2}x)\nCrowd LOD: ",
-                if sim.pose_frozen { "Frozen" } else { "Active" },
-                sim.sim_rate
-            );
-            sim.append_lod_summary(t);
-            let _ = write!(
-                t,
-                "\nGround Probe Misses (12 B async DMA): {}\nGPU Camera Rig (PlanKind::Camera v1): {}",
-                sim.crowd_ground_misses,
-                if sim.gpu_camera_active {
-                    "Active (VRAM zero-copy)"
-                } else {
-                    "Idle"
-                }
+                "\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                sim.crowd_ias_rebuilds
             );
         });
-
-        if sim.crowd_backend == ActiveCrowdBackend::Cuda && sim.crowd_gpu_bytes > 0 {
-            SimTelemetry::write_bytes_compact(sim.crowd_gpu_bytes, label_buf);
-            let _ = write!(label_buf, " ({} rbld)", sim.crowd_ias_rebuilds);
-            stat_row_tip(ui, "Crowd VRAM", label_buf.as_str(), tip_buf, |t| {
-                t.push_str("Plan + Scatter Bridge VRAM: ");
-                SimTelemetry::append_bytes_compact(sim.crowd_gpu_bytes, t);
-                let _ = write!(
-                    t,
-                    "\nAmortized Full IAS Rebuilds (>8m disp): {}",
-                    sim.crowd_ias_rebuilds
-                );
-            });
-        }
     }
 
-    if sim.has_traffic() {
-        ui.add_space(3.0);
-        let hdr = fmt_into(label_buf, format_args!("{}  Vehicles & Traffic", ic::CAR));
-        ui.label(
-            RichText::new(hdr)
-                .size(11.0)
-                .color(ui.visuals().weak_text_color()),
-        );
+    ui.add_space(2.0);
+    sparkline_row(
+        ui,
+        label_buf,
+        tip_buf,
+        "Crowd ms",
+        &timings.crowd_step_ms,
+        Color32::from_rgb(166, 209, 137),
+        "ms",
+    );
+    sparkline_row(
+        ui,
+        label_buf,
+        tip_buf,
+        "kBones/s",
+        &timings.crowd_kbones_s,
+        Color32::from_rgb(112, 186, 238),
+        "k",
+    );
+}
 
-        let traffic_sim_val = if sim.traffic_stepping {
-            match sim.traffic_backend {
-                ActiveTrafficBackend::Cuda => fmt_into(
-                    label_buf,
-                    format_args!(
-                        "CUDA v{} {:.2} ms",
-                        sim.traffic_plan_version.max(1),
-                        sim.traffic_step_ms
-                    ),
-                ),
-                ActiveTrafficBackend::Cpu => fmt_into(
-                    label_buf,
-                    format_args!("CPU SoA {:.2} ms", sim.traffic_step_ms),
-                ),
-                ActiveTrafficBackend::None => "Idle",
+/// Renders the `Traffic & ADAS` section body: backend status pill, fleet counts, live Fleet State
+/// stacked bar (`Moving | Ped Yield | Ped AEB | Stopped`), flow, pedestrian safety summary, VRAM,
+/// and live `Traffic ms` / `Flow` / `AEB/Yld` sparklines.
+fn render_traffic_stats_body(
+    ui: &mut Ui,
+    sim: &SimTelemetry,
+    timings: &FrameTimings,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    let (pill_text, pill_tone, show_ms) = if sim.traffic_stepping {
+        match sim.traffic_backend {
+            ActiveTrafficBackend::Cuda => {
+                let ver = sim.traffic_plan_version.max(1);
+                let tag = if ver == 1 { "CUDA v1" } else { "CUDA" };
+                (tag, PillTone::Green, true)
             }
-        } else if sim.pose_frozen {
-            if sim.traffic_backend == ActiveTrafficBackend::Cuda {
-                "CUDA Frozen"
-            } else {
-                "CPU SoA Frozen"
-            }
-        } else if sim.traffic_backend == ActiveTrafficBackend::Cuda {
-            "CUDA Paused"
-        } else {
-            "CPU SoA Paused"
-        };
-        stat_row_tip(ui, "Traffic Sim", traffic_sim_val, tip_buf, |t| {
+            ActiveTrafficBackend::Cpu => ("CPU SoA", PillTone::Amber, true),
+            ActiveTrafficBackend::None => ("Idle", PillTone::Muted, false),
+        }
+    } else if sim.pose_frozen {
+        match sim.traffic_backend {
+            ActiveTrafficBackend::Cuda => ("CUDA Frozen", PillTone::Muted, false),
+            ActiveTrafficBackend::Cpu => ("CPU Frozen", PillTone::Muted, false),
+            ActiveTrafficBackend::None => ("Frozen", PillTone::Muted, false),
+        }
+    } else {
+        match sim.traffic_backend {
+            ActiveTrafficBackend::Cuda => ("CUDA Paused", PillTone::Muted, false),
+            ActiveTrafficBackend::Cpu => ("CPU Paused", PillTone::Muted, false),
+            ActiveTrafficBackend::None => ("Idle", PillTone::Muted, false),
+        }
+    };
+    let trailing = if show_ms {
+        fmt_into(label_buf, format_args!("{:.2} ms", sim.traffic_step_ms))
+    } else {
+        ""
+    };
+    stat_badge_row_tip(
+        ui,
+        "Traffic Sim",
+        StatusPill {
+            text: pill_text,
+            tone: pill_tone,
+        },
+        trailing,
+        tip_buf,
+        |t| {
             let _ = write!(
                 t,
                 "Backend: {} | Step: {:.2} ms | Lane Graph: {}\nDynamic Instances (bodies + wheels): {}",
@@ -5268,87 +5731,146 @@ pub(crate) fn render_sim_telemetry(
                 let _ = write!(
                     t,
                     "\nPlanKind::Traffic v{} ({} kernels, StrictF32)\nAmortized Full IAS Rebuilds (>8m disp): {}",
-                    sim.traffic_plan_version, sim.traffic_kernel_count, sim.traffic_ias_rebuilds
-                );
-            }
-        });
-
-        let stopped = sim.traffic_stopped();
-        let veh_val = fmt_into(
-            label_buf,
-            format_args!(
-                "{} ({} mov / {} stop)",
-                sim.traffic_vehicles, sim.traffic_moving, stopped
-            ),
-        );
-        stat_row_tip(ui, "Vehicles", veh_val, tip_buf, |t| {
-            let _ = write!(
-                t,
-                "Total: {} vehicles\nMoving (>0.25 m/s): {} | Stopped/Queued: {}\nDynamic CSG Instances: {}",
-                sim.traffic_vehicles, sim.traffic_moving, stopped, sim.traffic_dyn_instances
-            );
-        });
-
-        let flow_val = fmt_into(
-            label_buf,
-            format_args!(
-                "{:.1} km/h (max {:.0})",
-                sim.traffic_avg_kmh(),
-                sim.traffic_max_kmh()
-            ),
-        );
-        stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
-            let _ = write!(
-                t,
-                "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
-                sim.traffic_avg_kmh(),
-                sim.traffic_avg_speed_mps,
-                sim.traffic_max_kmh(),
-                sim.traffic_max_speed_mps,
-                sim.traffic_respawns,
-                sim.traffic_stale_releases,
-                sim.traffic_deadlock_relocations
-            );
-        });
-
-        if sim.traffic_backend == ActiveTrafficBackend::Cuda
-            || sim.traffic_aeb_active > 0
-            || sim.traffic_yield_active > 0
-            || sim.traffic_deadlock_relocations > 0
-        {
-            let adas_val = fmt_into(
-                label_buf,
-                format_args!(
-                    "AEB {} | Yld {} | Reloc {}",
-                    sim.traffic_aeb_active,
-                    sim.traffic_yield_active,
-                    sim.traffic_deadlock_relocations
-                ),
-            );
-            stat_row_tip(ui, "Traffic ADAS", adas_val, tip_buf, |t| {
-                let _ = write!(
-                    t,
-                    "Active Pedestrian AEB: {}\nActive Pedestrian Yield: {}\nCircular-Wait Deadlock Relocations: {}",
-                    sim.traffic_aeb_active,
-                    sim.traffic_yield_active,
-                    sim.traffic_deadlock_relocations
-                );
-            });
-        }
-
-        if sim.traffic_backend == ActiveTrafficBackend::Cuda && sim.traffic_gpu_bytes > 0 {
-            SimTelemetry::write_bytes_compact(sim.traffic_gpu_bytes, label_buf);
-            stat_row_tip(ui, "Traffic VRAM", label_buf, tip_buf, |t| {
-                t.push_str("PlanKind::Traffic + Scatter Bridge VRAM: ");
-                SimTelemetry::append_bytes_compact(sim.traffic_gpu_bytes, t);
-                let _ = write!(
-                    t,
-                    "\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                    sim.traffic_plan_version.max(1),
+                    sim.traffic_kernel_count,
                     sim.traffic_ias_rebuilds
                 );
-            });
-        }
+            }
+        },
+    );
+
+    let stopped = sim.traffic_stopped();
+    let veh_val = fmt_into(
+        label_buf,
+        format_args!(
+            "{} ({} mov / {} stop)",
+            sim.traffic_vehicles, sim.traffic_moving, stopped
+        ),
+    );
+    stat_row_tip(ui, "Vehicles", veh_val, tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Total: {} vehicles\nMoving (>0.25 m/s): {} | Stopped/Queued: {}\nDynamic CSG Instances: {}",
+            sim.traffic_vehicles, sim.traffic_moving, stopped, sim.traffic_dyn_instances
+        );
+    });
+
+    let total_v = sim.traffic_vehicles;
+    let aeb_v = sim.traffic_aeb_active.min(total_v);
+    let yld_v = sim.traffic_yield_active.min(total_v.saturating_sub(aeb_v));
+    let non_ped = total_v.saturating_sub(aeb_v + yld_v);
+    let moving_clear = sim.traffic_moving.min(non_ped);
+    let stopped_other = non_ped.saturating_sub(moving_clear);
+    let fleet_segs = [
+        BarSegment {
+            count: u64::from(moving_clear),
+            color: Color32::from_rgb(122, 206, 138),
+        },
+        BarSegment {
+            count: u64::from(yld_v),
+            color: Color32::from_rgb(242, 184, 72),
+        },
+        BarSegment {
+            count: u64::from(aeb_v),
+            color: Color32::from_rgb(236, 78, 86),
+        },
+        BarSegment {
+            count: u64::from(stopped_other),
+            color: Color32::from_rgb(104, 114, 132),
+        },
+    ];
+    let fleet_txt = fmt_into(label_buf, format_args!("{}/{total_v}", sim.traffic_moving));
+    stacked_bar_row(ui, "Fleet State", &fleet_segs, Some(fleet_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Moving (Clear): {moving_clear} | Ped Yield: {yld_v}\nPed AEB (Emergency Brake): {aeb_v} | Stopped/Queued: {stopped_other}\nTotal Fleet: {total_v} vehicles"
+        );
+    });
+
+    let flow_val = fmt_into(
+        label_buf,
+        format_args!(
+            "{:.1} km/h (max {:.0})",
+            sim.traffic_avg_kmh(),
+            sim.traffic_max_kmh()
+        ),
+    );
+    stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
+            sim.traffic_avg_kmh(),
+            sim.traffic_avg_speed_mps,
+            sim.traffic_max_kmh(),
+            sim.traffic_max_speed_mps,
+            sim.traffic_respawns,
+            sim.traffic_stale_releases,
+            sim.traffic_deadlock_relocations
+        );
+    });
+
+    let safety_val = fmt_into(
+        label_buf,
+        format_args!(
+            "AEB:{} Yld:{} Rel:{}",
+            sim.traffic_aeb_active,
+            sim.traffic_yield_active,
+            sim.traffic_deadlock_relocations
+        ),
+    );
+    stat_row_tip(ui, "Ped Safety", safety_val, tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Pedestrian AEB (Emergency Braking): {}\nPedestrian Yield (Crosswalk Slowdown): {}\nDeadlock Relocations: {}\nStale Junction Releases: {} | Network Respawns: {}",
+            sim.traffic_aeb_active,
+            sim.traffic_yield_active,
+            sim.traffic_deadlock_relocations,
+            sim.traffic_stale_releases,
+            sim.traffic_respawns
+        );
+    });
+
+    if sim.traffic_backend == ActiveTrafficBackend::Cuda && sim.traffic_gpu_bytes > 0 {
+        SimTelemetry::write_bytes_compact(sim.traffic_gpu_bytes, label_buf);
+        stat_row_tip(ui, "Traffic VRAM", label_buf.as_str(), tip_buf, |t| {
+            t.push_str("PlanKind::Traffic + Scatter Bridge VRAM: ");
+            SimTelemetry::append_bytes_compact(sim.traffic_gpu_bytes, t);
+            let _ = write!(
+                t,
+                "\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                sim.traffic_ias_rebuilds
+            );
+        });
     }
+
+    ui.add_space(2.0);
+    sparkline_row(
+        ui,
+        label_buf,
+        tip_buf,
+        "Traffic ms",
+        &timings.traffic_step_ms,
+        Color32::from_rgb(238, 212, 159),
+        "ms",
+    );
+    sparkline_row(
+        ui,
+        label_buf,
+        tip_buf,
+        "Flow",
+        &timings.traffic_avg_kmh,
+        Color32::from_rgb(122, 206, 138),
+        "km/h",
+    );
+    sparkline_row(
+        ui,
+        label_buf,
+        tip_buf,
+        "AEB/Yld",
+        &timings.traffic_ped_events,
+        Color32::from_rgb(238, 112, 92),
+        "",
+    );
 }
 
 /// Renders the compact ADAS driving-state badge, speed readout, and bipolar `THR/BRK` bar inside
@@ -5681,45 +6203,167 @@ fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64, osm_mask: &mut u32) {
     resp.on_hover_text(tip);
 }
 
+/// Renders a compact, width-clamped live telemetry sparkline inside a [`prop_row`] with a subtle
+/// mid-height guide line, translucent vertical-gradient area fill, bright latest-sample dot,
+/// monospace readout, and lazy min/max hover tooltip.
 fn sparkline_row(
     ui: &mut Ui,
     label_buf: &mut String,
+    tip_buf: &mut String,
     label: &str,
     ring: &RingBuffer<HISTORY_LEN>,
     color: Color32,
     unit: &str,
 ) {
     prop_row(ui, label, |ui| {
-        let val_w = 52.0;
-        let gap = 6.0;
-        let plot_w = (ui.available_width() - val_w - gap).max(40.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(plot_w, ROW_H - 2.0), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+        let avail_w = ui.available_width().max(1.0);
+        let gap = 5.0;
+        let desired_val_w: f32 = if unit.len() >= 3 {
+            58.0
+        } else if !unit.is_empty() {
+            48.0
+        } else {
+            34.0
+        };
+        let val_w = desired_val_w.min((avail_w * 0.48).max(30.0));
+        let plot_w = (avail_w - val_w - gap).max(24.0);
+        ui.spacing_mut().item_spacing.x = gap;
 
+        let (rect, plot_resp) =
+            ui.allocate_exact_size(egui::vec2(plot_w, ROW_H - 2.0), Sense::hover());
         let n = ring.len();
-        if n >= 2 {
-            let (min_v, max_v) = ring.min_max();
-            let span = (max_v - min_v).max(1e-3);
-            let mut pts = Vec::with_capacity(n);
-            let denom = (n - 1) as f32;
-            for (i, v) in ring.iter().enumerate() {
-                let x = rect.left() + 2.0 + (rect.width() - 4.0) * (i as f32 / denom);
-                let norm = ((v - min_v) / span).clamp(0.0, 1.0);
-                let y = rect.bottom() - 2.0 - (rect.height() - 4.0) * norm;
-                pts.push(egui::pos2(x, y));
+        let (min_v, max_v) = ring.min_max();
+
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            let border_col = ui
+                .visuals()
+                .widgets
+                .noninteractive
+                .bg_stroke
+                .color
+                .gamma_multiply(0.5);
+            painter.rect_filled(rect, 2.5, ui.visuals().extreme_bg_color);
+
+            let guide_col = ui.visuals().weak_text_color().gamma_multiply(0.22);
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 2.0, rect.center().y),
+                    egui::pos2(rect.right() - 2.0, rect.center().y),
+                ],
+                egui::Stroke::new(0.75, guide_col),
+            );
+
+            if n >= 2 && rect.width() > 6.0 {
+                let flat_nonzero = (max_v - min_v) < 1e-3 && max_v > 0.0;
+                let span = (max_v - min_v).max(1e-3);
+                let top_y = rect.top() + 2.0;
+                let bot_y = rect.bottom() - 2.0;
+                let base_y = rect.bottom() - 1.25;
+                let inner_h = (bot_y - top_y).max(1.0);
+                let inner_w = (rect.width() - 5.0).max(1.0);
+                let left_x = rect.left() + 2.0;
+                let denom = (n - 1) as f32;
+
+                let mut pts = Vec::with_capacity(n);
+                let mut fill = egui::epaint::Mesh::default();
+                fill.vertices.reserve(n * 2);
+                fill.indices.reserve((n - 1) * 6);
+                let top_fill = color.gamma_multiply(0.26);
+                let bot_fill = color.gamma_multiply(0.03);
+
+                for (i, raw_v) in ring.iter().enumerate() {
+                    let v = if raw_v.is_finite() { raw_v } else { min_v };
+                    let x = left_x + inner_w * (i as f32 / denom);
+                    let norm = if flat_nonzero {
+                        0.5
+                    } else {
+                        ((v - min_v) / span).clamp(0.0, 1.0)
+                    };
+                    let y = bot_y - inner_h * norm;
+                    let pt = egui::pos2(x, y);
+                    pts.push(pt);
+                    fill.vertices.push(egui::epaint::Vertex::untextured(pt, top_fill));
+                    fill.vertices.push(egui::epaint::Vertex::untextured(
+                        egui::pos2(x, base_y),
+                        bot_fill,
+                    ));
+                }
+                for i in 0..(n - 1) {
+                    let a = (2 * i) as u32;
+                    fill.add_triangle(a, a + 1, a + 2);
+                    fill.add_triangle(a + 1, a + 3, a + 2);
+                }
+
+                let last_pt = pts.last().copied();
+                painter.add(egui::Shape::mesh(fill));
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
+                if let Some(dot) = last_pt {
+                    painter.circle_filled(dot, 3.0, color.gamma_multiply(0.32));
+                    painter.circle_filled(dot, 1.7, color.lerp_to_gamma(Color32::WHITE, 0.35));
+                }
+            } else if n == 1 && rect.width() > 6.0 {
+                let dot = egui::pos2(rect.right() - 3.5, rect.center().y);
+                painter.circle_filled(dot, 3.0, color.gamma_multiply(0.32));
+                painter.circle_filled(dot, 1.7, color.lerp_to_gamma(Color32::WHITE, 0.35));
             }
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
+
+            painter.rect_stroke(
+                rect,
+                2.5,
+                egui::Stroke::new(0.75, border_col),
+                egui::StrokeKind::Inside,
+            );
         }
 
-        let txt = if unit.is_empty() {
-            fmt_into(label_buf, format_args!("{:.0}", ring.latest()))
+        let latest_raw = ring.latest();
+        let latest = if latest_raw.is_finite() {
+            latest_raw
         } else {
-            fmt_into(label_buf, format_args!("{:.1} {unit}", ring.latest()))
+            0.0
         };
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(egui::Label::new(RichText::new(txt).size(11.5).color(color)).truncate());
-        });
+        let txt = if unit.is_empty() {
+            fmt_into(label_buf, format_args!("{latest:.0}"))
+        } else if unit == "ms" && latest < 10.0 {
+            fmt_into(label_buf, format_args!("{latest:.2} {unit}"))
+        } else {
+            fmt_into(label_buf, format_args!("{latest:.1} {unit}"))
+        };
+        let val_resp = allocate_clamped_ui(
+            ui,
+            egui::vec2(val_w, ROW_H),
+            Layout::right_to_left(Align::Center),
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(txt).monospace().size(10.5).color(color),
+                    )
+                    .truncate(),
+                )
+            },
+        );
+
+        let hovered = if plot_resp.hovered() {
+            Some(plot_resp)
+        } else if val_resp.hovered() {
+            Some(val_resp)
+        } else {
+            None
+        };
+        if let Some(resp) = hovered {
+            tip_buf.clear();
+            let suffix = if unit.is_empty() { "" } else { unit };
+            let sep = if unit.is_empty() { "" } else { " " };
+            if n > 0 {
+                let _ = write!(
+                    tip_buf,
+                    "{label}: {latest:.2}{sep}{suffix}\nRange: {min_v:.2} .. {max_v:.2}{sep}{suffix} ({n} frames)"
+                );
+            } else {
+                let _ = write!(tip_buf, "{label}: no samples yet");
+            }
+            resp.on_hover_text(tip_buf.as_str());
+        }
     });
 }
 
@@ -6393,7 +7037,40 @@ mod tests {
     }
 
     #[test]
-    fn sim_telemetry_rows_fit_narrow_docks_without_staircase_or_overflow() {
+    fn camera_stats_section_registry_and_defaults_cover_all_seven_sections() {
+        let expected = [
+            "sec_view_possess",
+            "sec_render_stats",
+            "sec_gpu_hw",
+            "sec_csg_stats",
+            "sec_crowd_stats",
+            "sec_traffic_stats",
+            "sec_perf",
+        ];
+        let fallback_accent = section_accent("sec_unknown_fallback_sentinel");
+        for id in expected {
+            let group = section_group_for(id);
+            assert_eq!(
+                group,
+                &expected[..],
+                "section `{id}` must share the 7-section Camera & Stats collapse/expand group"
+            );
+            assert_ne!(
+                section_accent(id),
+                fallback_accent,
+                "section `{id}` must register a dedicated accent color"
+            );
+            let want_open = id != "sec_gpu_hw";
+            assert_eq!(
+                section_default_open(id),
+                want_open,
+                "section `{id}` default open state mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn sectioned_camera_stats_bars_and_sparklines_fit_narrow_docks() {
         let sim = SimTelemetry {
             crowd_backend: ActiveCrowdBackend::Cuda,
             crowd_plan_version: 2,
@@ -6431,51 +7108,264 @@ mod tests {
             traffic_respawns: 12,
             traffic_stale_releases: 0,
             traffic_deadlock_relocations: 1,
-            traffic_aeb_active: 2,
+            traffic_aeb_active: 1,
             traffic_yield_active: 3,
             traffic_ias_rebuilds: 4,
             crowd_strict_f32: false,
         };
+        let csg = CsgStats {
+            visible_instances: 1620,
+            total_instances: 2400,
+            compounds: 246,
+            primitives: 14_820,
+            gpu_bytes: 18_432_000,
+            aux_planes_bytes: 2_621_440,
+            lod0_count: 410,
+            lod1_count: 680,
+            lod2_count: 530,
+            culled_count: 780,
+            ..CsgStats::default()
+        };
+        let gpu_hw_cases = [
+            GpuTelemetry {
+                gpu_name: "NVIDIA GeForce RTX 3080 Ti".to_owned(),
+                temp_c: 64,
+                util_gpu: 88,
+                vram_used_mib: 5_200,
+                vram_total_mib: 12_288,
+                power_w: 285.0,
+                gpu_clock_mhz: 1920,
+                mem_clock_mhz: 9501,
+                cupti_status: "Active".to_owned(),
+                ngx_status: "DLSS 3.7 RR".to_owned(),
+                ..GpuTelemetry::default()
+            },
+            GpuTelemetry {
+                gpu_name: "RTX Amber".to_owned(),
+                vram_used_mib: 10_000,
+                vram_total_mib: 12_288,
+                ..GpuTelemetry::default()
+            },
+            GpuTelemetry {
+                gpu_name: "RTX Red".to_owned(),
+                vram_used_mib: 11_500,
+                vram_total_mib: 12_288,
+                ..GpuTelemetry::default()
+            },
+        ];
 
-        for panel_w in [240.0_f32, 280.0, 340.0] {
-            let ctx = egui::Context::default();
-            install_fonts(&ctx);
-            let _dock_style = UiTheme::Obsidian.apply(&ctx);
-            let mut label_buf = String::with_capacity(96);
-            let mut tip_buf = String::with_capacity(256);
-            let mut avail_before = 0.0_f32;
-            let mut avail_after = 0.0_f32;
-            let mut max_right = 0.0_f32;
+        let mut timings = FrameTimings::new();
+        for i in 0..40 {
+            let t = i as f32;
+            timings.record_with_engines(
+                8.5 + (t * 0.25).sin() * 1.2,
+                1.4,
+                0.45,
+                0.32,
+                8.5 + (t * 0.25).sin() * 1.2,
+                1.4,
+                0.9,
+                60.0 + (t * 0.2).cos() * 4.0,
+            );
+            let mut s = sim;
+            s.crowd_step_ms = 0.20 + (t * 0.3).sin().abs() * 0.15;
+            s.traffic_step_ms = 0.11 + (t * 0.2).cos().abs() * 0.08;
+            s.traffic_avg_speed_mps = 8.0 + (t * 0.15).sin() * 3.0;
+            s.traffic_aeb_active = u32::from(i % 7 == 0);
+            s.traffic_yield_active = (i % 4) as u32;
+            timings.record_sim(&s, 60.0);
+        }
 
-            for _pass in 0..2 {
-                let raw = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(panel_w, 800.0),
-                    )),
-                    ..Default::default()
-                };
-                let out = ctx.run_ui(raw, |ui| {
-                    dock_scroll(ui, |ui| {
-                        collapsing_section(ui, "sec_tel_sim", ic::GAUGE, "Telemetry", |ui| {
-                            avail_before = ui.available_width();
-                            render_sim_telemetry(ui, &sim, 60.0, &mut label_buf, &mut tip_buf);
-                            avail_after = ui.available_width();
-                            max_right = ui.min_rect().right();
+        let empty_ring: RingBuffer<HISTORY_LEN> = RingBuffer::new();
+        let mut single_ring: RingBuffer<HISTORY_LEN> = RingBuffer::new();
+        single_ring.push(12.5);
+        let mut flat_zero_ring: RingBuffer<HISTORY_LEN> = RingBuffer::new();
+        let mut flat_const_ring: RingBuffer<HISTORY_LEN> = RingBuffer::new();
+        for _ in 0..8 {
+            flat_zero_ring.push(0.0);
+            flat_const_ring.push(60.0);
+        }
+
+        for theme in [UiTheme::Obsidian, UiTheme::Light] {
+            for panel_w in [240.0_f32, 280.0, 340.0] {
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                let _dock_style = theme.apply(&ctx);
+                let mut label_buf = String::with_capacity(96);
+                let mut tip_buf = String::with_capacity(256);
+                let mut avail_samples = Vec::new();
+                let mut max_right = 0.0_f32;
+
+                for _pass in 0..2 {
+                    avail_samples.clear();
+                    max_right = 0.0;
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(panel_w, 1600.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        dock_scroll(ui, |ui| {
+                            collapsing_section(
+                                ui,
+                                "sec_gpu_hw_open_test",
+                                ic::CPU,
+                                "GPU & Hardware",
+                                |ui| {
+                                    // Force open in test so VRAM gauge bar runs across all thresholds.
+                                    let _ = ui.available_width();
+                                },
+                            );
+                            let start_w = ui.available_width();
+                            avail_samples.push(start_w);
+                            for hw in &gpu_hw_cases {
+                                render_gpu_hw_body(ui, hw, &mut label_buf, &mut tip_buf);
+                                avail_samples.push(ui.available_width());
+                                max_right = max_right.max(ui.min_rect().right());
+                            }
+                            collapsing_section(
+                                ui,
+                                "sec_csg_stats",
+                                ic::CUBE,
+                                "CSG Scene & LOD",
+                                |ui| {
+                                    let w0 = ui.available_width();
+                                    render_csg_stats_body(ui, &csg, &mut label_buf, &mut tip_buf);
+                                    avail_samples.push(ui.available_width() - w0 + start_w);
+                                    max_right = max_right.max(ui.min_rect().right());
+                                },
+                            );
+                            collapsing_section(
+                                ui,
+                                "sec_crowd_stats",
+                                ic::USERS_THREE,
+                                "Crowd & Locomotion",
+                                |ui| {
+                                    let w0 = ui.available_width();
+                                    render_crowd_stats_body(
+                                        ui,
+                                        &sim,
+                                        &timings,
+                                        60.0,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
+                                    avail_samples.push(ui.available_width() - w0 + start_w);
+                                    max_right = max_right.max(ui.min_rect().right());
+                                },
+                            );
+                            collapsing_section(
+                                ui,
+                                "sec_traffic_stats",
+                                ic::CAR,
+                                "Traffic & ADAS",
+                                |ui| {
+                                    let w0 = ui.available_width();
+                                    render_traffic_stats_body(
+                                        ui,
+                                        &sim,
+                                        &timings,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
+                                    avail_samples.push(ui.available_width() - w0 + start_w);
+                                    max_right = max_right.max(ui.min_rect().right());
+                                },
+                            );
+                            collapsing_section(
+                                ui,
+                                "sec_perf",
+                                ic::CHART_LINE,
+                                "Performance",
+                                |ui| {
+                                    let w0 = ui.available_width();
+                                    sparkline_row(
+                                        ui,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                        "Empty",
+                                        &empty_ring,
+                                        Color32::from_rgb(138, 173, 244),
+                                        "ms",
+                                    );
+                                    sparkline_row(
+                                        ui,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                        "Single",
+                                        &single_ring,
+                                        Color32::from_rgb(166, 209, 137),
+                                        "k",
+                                    );
+                                    sparkline_row(
+                                        ui,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                        "Zero",
+                                        &flat_zero_ring,
+                                        Color32::from_rgb(238, 112, 92),
+                                        "",
+                                    );
+                                    sparkline_row(
+                                        ui,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                        "Const",
+                                        &flat_const_ring,
+                                        Color32::from_rgb(122, 206, 138),
+                                        "km/h",
+                                    );
+                                    stacked_bar_row(
+                                        ui,
+                                        "Tiny Pulse",
+                                        &[
+                                            BarSegment {
+                                                count: 999,
+                                                color: Color32::from_rgb(122, 206, 138),
+                                            },
+                                            BarSegment {
+                                                count: 1,
+                                                color: Color32::from_rgb(236, 78, 86),
+                                            },
+                                        ],
+                                        Some("1/1000"),
+                                        &mut tip_buf,
+                                        |t| t.push_str("1 AEB event out of 1000"),
+                                    );
+                                    stacked_bar_row(
+                                        ui,
+                                        "Zero Bar",
+                                        &[BarSegment {
+                                            count: 0,
+                                            color: Color32::from_rgb(122, 206, 138),
+                                        }],
+                                        None,
+                                        &mut tip_buf,
+                                        |t| t.push_str("empty"),
+                                    );
+                                    avail_samples.push(ui.available_width() - w0 + start_w);
+                                    max_right = max_right.max(ui.min_rect().right());
+                                },
+                            );
                         });
                     });
-                });
-                out.drop_without_applying_deltas();
-            }
+                    out.drop_without_applying_deltas();
+                }
 
-            assert!(
-                avail_after <= avail_before + 0.5,
-                "width {panel_w}: render_sim_telemetry expanded available_width ({avail_before} -> {avail_after})"
-            );
-            assert!(
-                max_right <= panel_w + 0.5,
-                "width {panel_w}: render_sim_telemetry overflowed panel right edge ({max_right} > {panel_w})"
-            );
+                let baseline_w = avail_samples[0];
+                for (idx, &w) in avail_samples.iter().enumerate() {
+                    assert!(
+                        (w - baseline_w).abs() <= 0.5,
+                        "{theme:?} width {panel_w}: available_width drifted at stage {idx} ({baseline_w} -> {w})"
+                    );
+                }
+                assert!(
+                    max_right <= panel_w + 0.5,
+                    "{theme:?} width {panel_w}: sectioned Camera & Stats overflowed right edge ({max_right} > {panel_w})"
+                );
+            }
         }
     }
 

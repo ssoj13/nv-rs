@@ -447,6 +447,16 @@ pub struct FrameTimings {
     pub cuda_compute_ms: RingBuffer<HISTORY_LEN>,
     /// Instantaneous frames per second.
     pub fps: RingBuffer<HISTORY_LEN>,
+    /// Articulated crowd simulation step duration in milliseconds.
+    pub crowd_step_ms: RingBuffer<HISTORY_LEN>,
+    /// Articulated crowd bone synthesis throughput in thousands of bones per second (`kBones/s`).
+    pub crowd_kbones_s: RingBuffer<HISTORY_LEN>,
+    /// Lane-graph vehicle traffic simulation step duration in milliseconds.
+    pub traffic_step_ms: RingBuffer<HISTORY_LEN>,
+    /// Mean fleet traffic flow speed in km/h.
+    pub traffic_avg_kmh: RingBuffer<HISTORY_LEN>,
+    /// Combined active pedestrian safety events (`traffic_aeb_active + traffic_yield_active`).
+    pub traffic_ped_events: RingBuffer<HISTORY_LEN>,
 }
 
 impl FrameTimings {
@@ -461,6 +471,11 @@ impl FrameTimings {
             tensor_cores_ms: RingBuffer::new(),
             cuda_compute_ms: RingBuffer::new(),
             fps: RingBuffer::new(),
+            crowd_step_ms: RingBuffer::new(),
+            crowd_kbones_s: RingBuffer::new(),
+            traffic_step_ms: RingBuffer::new(),
+            traffic_avg_kmh: RingBuffer::new(),
+            traffic_ped_events: RingBuffer::new(),
         }
     }
 
@@ -489,6 +504,21 @@ impl FrameTimings {
         self.tensor_cores_ms.push(sanitize_ms(tensor_cores_ms));
         self.cuda_compute_ms.push(sanitize_ms(cuda_compute_ms));
         self.fps.push(sanitize_ms(fps));
+    }
+
+    /// Records one frame's sanitized Crowd & Traffic simulation sparkline histories with zero
+    /// heap allocations.
+    #[inline]
+    pub fn record_sim(&mut self, sim: &crate::app_events::SimTelemetry, rt_fps: f32) {
+        self.crowd_step_ms.push(sanitize_ms(sim.crowd_step_ms));
+        self.crowd_kbones_s
+            .push(sanitize_ms(sim.bones_per_sec(rt_fps) * 1e-3));
+        self.traffic_step_ms.push(sanitize_ms(sim.traffic_step_ms));
+        self.traffic_avg_kmh.push(sanitize_ms(sim.traffic_avg_kmh()));
+        self.traffic_ped_events.push(
+            sim.traffic_aeb_active
+                .saturating_add(sim.traffic_yield_active) as f32,
+        );
     }
 }
 
@@ -788,5 +818,46 @@ mod tests {
             tonemap_ms: -0.5,
         };
         assert!((bad.cuda_compute_ms() - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn frame_timings_record_sim_sanitizes_and_tracks_crowd_and_traffic() {
+        let mut ft = FrameTimings::new();
+        let sim = crate::app_events::SimTelemetry {
+            crowd_step_ms: 0.32,
+            crowd_bones: 2000,
+            sim_rate: 1.0,
+            pose_frozen: false,
+            traffic_step_ms: 0.18,
+            traffic_avg_speed_mps: 10.0,
+            traffic_aeb_active: 2,
+            traffic_yield_active: 3,
+            ..crate::app_events::SimTelemetry::default()
+        };
+        ft.record_sim(&sim, 60.0);
+        assert!((ft.crowd_step_ms.latest() - 0.32).abs() < 1e-6);
+        assert!((ft.crowd_kbones_s.latest() - 120.0).abs() < 1e-3);
+        assert!((ft.traffic_step_ms.latest() - 0.18).abs() < 1e-6);
+        assert!((ft.traffic_avg_kmh.latest() - 36.0).abs() < 1e-4);
+        assert!((ft.traffic_ped_events.latest() - 5.0).abs() < 1e-6);
+
+        let bad = crate::app_events::SimTelemetry {
+            crowd_step_ms: f32::NAN,
+            crowd_bones: 2000,
+            sim_rate: 1.0,
+            pose_frozen: true,
+            traffic_step_ms: -0.5,
+            traffic_avg_speed_mps: f32::INFINITY,
+            traffic_aeb_active: 0,
+            traffic_yield_active: 0,
+            ..crate::app_events::SimTelemetry::default()
+        };
+        ft.record_sim(&bad, f32::NAN);
+        assert_eq!(ft.crowd_step_ms.latest(), 0.0);
+        assert_eq!(ft.crowd_kbones_s.latest(), 0.0);
+        assert_eq!(ft.traffic_step_ms.latest(), 0.0);
+        assert_eq!(ft.traffic_avg_kmh.latest(), 0.0);
+        assert_eq!(ft.traffic_ped_events.latest(), 0.0);
+        assert_eq!(ft.crowd_step_ms.len(), 2);
     }
 }

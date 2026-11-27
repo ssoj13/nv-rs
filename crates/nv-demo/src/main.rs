@@ -4446,6 +4446,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             msg.cuda_compute_ms,
                             self.rt_fps,
                         );
+                        self.profiler
+                            .timings
+                            .record_sim(&self.sim_telemetry, self.rt_fps);
                         self.retired_buffers.retain(|(g, _)| *g >= msg.gen_id);
                         if rail_active {
                             let st = &msg.csg_stats;

@@ -4009,7 +4009,11 @@ impl UiContext<'_> {
         }
 
         collapsing_section(ui, "sec_render_stats", ic::MONITOR_PLAY, "Render & Frame", |ui| {
-            let buf = &mut self.scratch.label_buf;
+            let UiScratch {
+                label_buf: buf,
+                tip_buf,
+                ..
+            } = &mut *self.scratch;
             stat_row(
                 ui,
                 "Resolution",
@@ -4029,16 +4033,13 @@ impl UiContext<'_> {
                     ),
                 ),
             );
-            stat_row(
+            render_accum_bar(
                 ui,
-                "Accum",
-                fmt_into(
-                    buf,
-                    format_args!(
-                        "{} / {} ({} spp)",
-                        self.accum_count, self.settings.max_accum, self.total_samples
-                    ),
-                ),
+                self.accum_count,
+                self.settings.max_accum,
+                self.total_samples,
+                buf,
+                tip_buf,
             );
             stat_row(
                 ui,
@@ -4103,6 +4104,7 @@ impl UiContext<'_> {
                                 &self.sim_telemetry,
                                 self.timings,
                                 self.rt_fps,
+                                self.cuda_compute_ms,
                                 buf,
                                 tip_buf,
                             );
@@ -4149,6 +4151,14 @@ impl UiContext<'_> {
                 ui,
                 "CUDA Compute",
                 fmt_into(buf, format_args!("{:.2} ms (IAS/FFT/TM)", self.cuda_compute_ms)),
+            );
+            render_perf_frame_split_bar(
+                ui,
+                self.rt_ms,
+                self.tensor_cores_ms,
+                self.cuda_compute_ms,
+                buf,
+                tip_buf,
             );
             ui.add_space(2.0);
             sparkline_row(
@@ -5308,8 +5318,114 @@ fn stacked_bar_row(
     });
 }
 
-/// Renders the `GPU & Hardware` section body (`GPU`, `VRAM`, live VRAM gauge bar, `Clocks`,
-/// `Temp / Load`, `Power`, `CUPTI`, `NGX`).
+/// Renders the `Render & Frame -> Accum` progress bar (green when converged, blue while
+/// accumulating, muted full-idle when `max_accum == 0` continuous) with a lazy hover tooltip.
+fn render_accum_bar(
+    ui: &mut Ui,
+    accum_count: u32,
+    max_accum: u32,
+    total_samples: u32,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    if max_accum > 0 {
+        let cur = accum_count.min(max_accum);
+        let rem = max_accum.saturating_sub(cur);
+        let converged = accum_count >= max_accum;
+        let fill_col = if converged {
+            Color32::from_rgb(122, 206, 138)
+        } else {
+            Color32::from_rgb(112, 172, 216)
+        };
+        let segs = [
+            BarSegment {
+                count: u64::from(cur),
+                color: fill_col,
+            },
+            BarSegment {
+                count: u64::from(rem),
+                color: Color32::TRANSPARENT,
+            },
+        ];
+        let pct = (cur as f32 / max_accum as f32) * 100.0;
+        let txt = fmt_into(label_buf, format_args!("{accum_count}/{max_accum}"));
+        stacked_bar_row(ui, "Accum", &segs, Some(txt), tip_buf, |t| {
+            let status = if converged { "Converged" } else { "Accumulating" };
+            let _ = write!(
+                t,
+                "Accumulation: {accum_count} / {max_accum} ({pct:.0}%)\nTotal Samples: {total_samples} spp | Status: {status}"
+            );
+        });
+    } else {
+        let segs = [BarSegment {
+            count: 1,
+            color: Color32::from_rgb(104, 114, 132),
+        }];
+        let txt = fmt_into(label_buf, format_args!("{total_samples} spp"));
+        stacked_bar_row(ui, "Accum", &segs, Some(txt), tip_buf, |t| {
+            let _ = write!(
+                t,
+                "Continuous Accumulation (max_accum = 0)\nFrames: {accum_count} | Total Samples: {total_samples} spp"
+            );
+        });
+    }
+}
+
+/// Renders the `Performance -> Frame Split` stacked bar (`RT Cores | Tensor | CUDA`) with total ms
+/// readout and exact per-engine percentage + 60/30 FPS target budget tooltip.
+fn render_perf_frame_split_bar(
+    ui: &mut Ui,
+    rt_ms: f32,
+    tensor_cores_ms: f32,
+    cuda_compute_ms: f32,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) {
+    let rt = if rt_ms.is_finite() && rt_ms > 0.0 {
+        rt_ms
+    } else {
+        0.0
+    };
+    let tensor = if tensor_cores_ms.is_finite() && tensor_cores_ms > 0.0 {
+        tensor_cores_ms
+    } else {
+        0.0
+    };
+    let cuda = if cuda_compute_ms.is_finite() && cuda_compute_ms > 0.0 {
+        cuda_compute_ms
+    } else {
+        0.0
+    };
+    let tot = rt + tensor + cuda;
+    let segs = [
+        BarSegment {
+            count: (rt * 1000.0).round() as u64,
+            color: Color32::from_rgb(138, 173, 244),
+        },
+        BarSegment {
+            count: (tensor * 1000.0).round() as u64,
+            color: Color32::from_rgb(166, 209, 137),
+        },
+        BarSegment {
+            count: (cuda * 1000.0).round() as u64,
+            color: Color32::from_rgb(238, 212, 159),
+        },
+    ];
+    let txt = fmt_into(label_buf, format_args!("{tot:.1} ms"));
+    stacked_bar_row(ui, "Frame Split", &segs, Some(txt), tip_buf, |t| {
+        let denom = tot.max(1e-4);
+        let rt_pct = (rt / denom) * 100.0;
+        let tensor_pct = (tensor / denom) * 100.0;
+        let cuda_pct = (cuda / denom) * 100.0;
+        let _ = write!(
+            t,
+            "GPU Frame Total: {tot:.2} ms\nRT Cores: {rt:.2} ms ({rt_pct:.1}%) | Tensor: {tensor:.2} ms ({tensor_pct:.1}%)\nCUDA Compute: {cuda:.2} ms ({cuda_pct:.1}%)\nTargets: 60 FPS (16.7 ms) | 30 FPS (33.3 ms)"
+        );
+    });
+}
+
+/// Renders the `GPU & Hardware` section body (`GPU`, `VRAM` + gauge bar, `Clocks`, `GPU Load`,
+/// `GPU Temp`, `Power` live gauge bars, `CUPTI`, `NGX`).
 fn render_gpu_hw_body(
     ui: &mut Ui,
     telemetry: &GpuTelemetry,
@@ -5363,25 +5479,100 @@ fn render_gpu_hw_body(
             format_args!("{} / {} MHz", telemetry.gpu_clock_mhz, telemetry.mem_clock_mhz),
         ),
     );
-    stat_row(
-        ui,
-        "Temp / Load",
-        fmt_into(
-            label_buf,
-            format_args!("{} C / {} %", telemetry.temp_c, telemetry.util_gpu),
-        ),
-    );
-    stat_row(
-        ui,
-        "Power",
-        fmt_into(label_buf, format_args!("{:.0} W", telemetry.power_w)),
-    );
+
+    let util = telemetry.util_gpu.min(100);
+    let load_col = if util > 95 {
+        Color32::from_rgb(236, 78, 86)
+    } else if util > 80 {
+        Color32::from_rgb(242, 184, 72)
+    } else {
+        Color32::from_rgb(122, 206, 138)
+    };
+    let load_segs = [
+        BarSegment {
+            count: u64::from(util),
+            color: load_col,
+        },
+        BarSegment {
+            count: u64::from(100 - util),
+            color: Color32::TRANSPARENT,
+        },
+    ];
+    let load_txt = fmt_into(label_buf, format_args!("{util}%"));
+    stacked_bar_row(ui, "GPU Load", &load_segs, Some(load_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "GPU Core Utilization: {util}% (NVML)\nThresholds: <=80% nominal | >80% high | >95% saturated"
+        );
+    });
+
+    let temp = telemetry.temp_c;
+    let temp_filled = temp.saturating_sub(25).min(70);
+    let temp_col = if temp >= 85 {
+        Color32::from_rgb(236, 78, 86)
+    } else if temp >= 75 {
+        Color32::from_rgb(242, 184, 72)
+    } else {
+        Color32::from_rgb(112, 198, 168)
+    };
+    let temp_segs = [
+        BarSegment {
+            count: u64::from(temp_filled),
+            color: temp_col,
+        },
+        BarSegment {
+            count: u64::from(70 - temp_filled),
+            color: Color32::TRANSPARENT,
+        },
+    ];
+    let temp_txt = fmt_into(label_buf, format_args!("{temp} C"));
+    stacked_bar_row(ui, "GPU Temp", &temp_segs, Some(temp_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "GPU Die Temperature: {temp} C (bar scale 25..95 C)\nThresholds: <75 C cool | >=75 C warm | >=85 C hot"
+        );
+    });
+
+    let power_w = if telemetry.power_w.is_finite() && telemetry.power_w > 0.0 {
+        telemetry.power_w
+    } else {
+        0.0
+    };
+    let power_ceil = power_w.max(350.0);
+    let power_pct = (power_w / power_ceil) * 100.0;
+    let power_col = if power_pct > 90.0 {
+        Color32::from_rgb(236, 78, 86)
+    } else if power_pct > 75.0 {
+        Color32::from_rgb(242, 184, 72)
+    } else {
+        Color32::from_rgb(112, 182, 224)
+    };
+    let p_filled = (power_w * 10.0).round() as u64;
+    let p_total = (power_ceil * 10.0).round() as u64;
+    let power_segs = [
+        BarSegment {
+            count: p_filled,
+            color: power_col,
+        },
+        BarSegment {
+            count: p_total.saturating_sub(p_filled),
+            color: Color32::TRANSPARENT,
+        },
+    ];
+    let power_txt = fmt_into(label_buf, format_args!("{power_w:.0} W"));
+    stacked_bar_row(ui, "Power", &power_segs, Some(power_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Board Power Draw: {power_w:.1} W ({power_pct:.0}% of {power_ceil:.0} W reference scale)"
+        );
+    });
+
     stat_row(ui, "CUPTI", &telemetry.cupti_status);
     stat_row(ui, "NGX", &telemetry.ngx_status);
 }
 
-/// Renders the `CSG Scene & LOD` section body (`CSG Inst`, `CSG LOD`, live LOD stacked bar,
-/// `CSG DAG`, `CSG Aux`, `CSG VRAM`).
+/// Renders the `CSG Scene & LOD` section body (`CSG Inst`, `CSG LOD`, live LOD & SBT Path stacked
+/// bars, `CSG DAG`, `CSG Aux`, `CSG VRAM`).
 fn render_csg_stats_body(
     ui: &mut Ui,
     stats: &CsgStats,
@@ -5445,6 +5636,44 @@ fn render_csg_stats_body(
             stats.lod0_count, stats.lod1_count, stats.lod2_count, stats.culled_count
         );
     });
+
+    let [p_single, p_pure, p_first, p_rpn] = stats.path_instances;
+    let path_total =
+        u64::from(p_single) + u64::from(p_pure) + u64::from(p_first) + u64::from(p_rpn);
+    if path_total > 0 {
+        let fast_pct = ((u64::from(p_single) + u64::from(p_pure)) as f32 / path_total as f32) * 100.0;
+        let path_segs = [
+            BarSegment {
+                count: u64::from(p_single),
+                color: Color32::from_rgb(122, 206, 138),
+            },
+            BarSegment {
+                count: u64::from(p_pure),
+                color: Color32::from_rgb(104, 182, 238),
+            },
+            BarSegment {
+                count: u64::from(p_first),
+                color: Color32::from_rgb(236, 180, 86),
+            },
+            BarSegment {
+                count: u64::from(p_rpn),
+                color: Color32::from_rgb(224, 114, 126),
+            },
+        ];
+        let fast_txt = fmt_into(label_buf, format_args!("{fast_pct:.0}%"));
+        stacked_bar_row(ui, "SBT Paths", &path_segs, Some(fast_txt), tip_buf, |t| {
+            let denom = path_total as f32;
+            let _ = write!(
+                t,
+                "OptiX Evaluation Paths ({path_total} visible, {fast_pct:.1}% fast-path)\nSingle Prim (SBT 10): {p_single} ({:.1}%) | Pure Union (SBT 10): {p_pure} ({:.1}%)\nExact Union (SBT 12): {p_first} ({:.1}%) | General RPN (SBT 8): {p_rpn} ({:.1}%)",
+                (p_single as f32 / denom) * 100.0,
+                (p_pure as f32 / denom) * 100.0,
+                (p_first as f32 / denom) * 100.0,
+                (p_rpn as f32 / denom) * 100.0
+            );
+        });
+    }
+
     stat_row(
         ui,
         "CSG DAG",
@@ -5472,12 +5701,14 @@ fn render_csg_stats_body(
 }
 
 /// Renders the `Crowd & Locomotion` section body: backend status pill, actor counts, archetype
-/// stacked bar, rig/locomotion/VRAM stats, and live `Crowd ms` / `kBones/s` sparklines.
+/// stacked bar, rig/locomotion/VRAM stats, `Sim Share` CUDA Compute bar, and live `Crowd ms` /
+/// `kBones/s` sparklines.
 fn render_crowd_stats_body(
     ui: &mut Ui,
     sim: &SimTelemetry,
     timings: &FrameTimings,
     rt_fps: f32,
+    cuda_compute_ms: f32,
     label_buf: &mut String,
     tip_buf: &mut String,
 ) {
@@ -5646,6 +5877,49 @@ fn render_crowd_stats_body(
         });
     }
 
+    let crowd_ms = if sim.crowd_step_ms.is_finite() && sim.crowd_step_ms > 0.0 {
+        sim.crowd_step_ms
+    } else {
+        0.0
+    };
+    let traffic_ms = if sim.traffic_step_ms.is_finite() && sim.traffic_step_ms > 0.0 {
+        sim.traffic_step_ms
+    } else {
+        0.0
+    };
+    let cuda_ms = if cuda_compute_ms.is_finite() && cuda_compute_ms > 0.0 {
+        cuda_compute_ms
+    } else {
+        0.0
+    };
+    let denom_ms = cuda_ms.max(crowd_ms + traffic_ms).max(0.01);
+    let other_ms = (denom_ms - crowd_ms - traffic_ms).max(0.0);
+    let sim_pct = (((crowd_ms + traffic_ms) / denom_ms) * 100.0).clamp(0.0, 100.0);
+    let share_segs = [
+        BarSegment {
+            count: (crowd_ms * 1000.0).round() as u64,
+            color: Color32::from_rgb(166, 209, 137),
+        },
+        BarSegment {
+            count: (traffic_ms * 1000.0).round() as u64,
+            color: Color32::from_rgb(238, 212, 159),
+        },
+        BarSegment {
+            count: (other_ms * 1000.0).round() as u64,
+            color: Color32::from_rgb(98, 122, 156),
+        },
+    ];
+    let share_txt = fmt_into(label_buf, format_args!("{sim_pct:.0}%"));
+    stacked_bar_row(ui, "Sim Share", &share_segs, Some(share_txt), tip_buf, |t| {
+        let c_pct = (crowd_ms / denom_ms) * 100.0;
+        let t_pct = (traffic_ms / denom_ms) * 100.0;
+        let o_pct = (other_ms / denom_ms) * 100.0;
+        let _ = write!(
+            t,
+            "Simulation Share of CUDA Compute ({denom_ms:.2} ms)\nCrowd: {crowd_ms:.2} ms ({c_pct:.1}%) | Traffic: {traffic_ms:.2} ms ({t_pct:.1}%)\nOther CUDA (IAS/FFT/TM): {other_ms:.2} ms ({o_pct:.1}%)"
+        );
+    });
+
     ui.add_space(2.0);
     sparkline_row(
         ui,
@@ -5787,25 +6061,50 @@ fn render_traffic_stats_body(
         );
     });
 
+    let avg_kmh = sim.traffic_avg_kmh();
+    let max_kmh = sim.traffic_max_kmh();
     let flow_val = fmt_into(
         label_buf,
-        format_args!(
-            "{:.1} km/h (max {:.0})",
-            sim.traffic_avg_kmh(),
-            sim.traffic_max_kmh()
-        ),
+        format_args!("{avg_kmh:.1} km/h (max {max_kmh:.0})"),
     );
     stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
         let _ = write!(
             t,
-            "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
-            sim.traffic_avg_kmh(),
+            "Mean Speed: {avg_kmh:.1} km/h ({:.2} m/s)\nPeak Speed: {max_kmh:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
             sim.traffic_avg_speed_mps,
-            sim.traffic_max_kmh(),
             sim.traffic_max_speed_mps,
             sim.traffic_respawns,
             sim.traffic_stale_releases,
             sim.traffic_deadlock_relocations
+        );
+    });
+
+    let ceil_kmh = max_kmh.max(50.0);
+    let flow_col = if avg_kmh >= 20.0 {
+        Color32::from_rgb(122, 206, 138)
+    } else if avg_kmh >= 5.0 {
+        Color32::from_rgb(242, 184, 72)
+    } else {
+        Color32::from_rgb(104, 114, 132)
+    };
+    let f_filled = (avg_kmh * 100.0).round() as u64;
+    let f_total = (ceil_kmh * 100.0).round() as u64;
+    let flow_segs = [
+        BarSegment {
+            count: f_filled,
+            color: flow_col,
+        },
+        BarSegment {
+            count: f_total.saturating_sub(f_filled),
+            color: Color32::TRANSPARENT,
+        },
+    ];
+    let flow_bar_txt = fmt_into(label_buf, format_args!("{avg_kmh:.0} km/h"));
+    stacked_bar_row(ui, "Flow Speed", &flow_segs, Some(flow_bar_txt), tip_buf, |t| {
+        let _ = write!(
+            t,
+            "Mean Flow Speed: {avg_kmh:.1} km/h ({:.2} m/s)\nPeak Fleet Speed: {max_kmh:.1} km/h ({:.2} m/s) | Scale Ceiling: {ceil_kmh:.0} km/h",
+            sim.traffic_avg_speed_mps, sim.traffic_max_speed_mps
         );
     });
 
@@ -7124,16 +7423,20 @@ mod tests {
             lod1_count: 680,
             lod2_count: 530,
             culled_count: 780,
-            ..CsgStats::default()
+            path_instances: [820, 460, 210, 130],
+        };
+        let csg_empty_paths = CsgStats {
+            path_instances: [0; 4],
+            ..csg
         };
         let gpu_hw_cases = [
             GpuTelemetry {
                 gpu_name: "NVIDIA GeForce RTX 3080 Ti".to_owned(),
                 temp_c: 64,
-                util_gpu: 88,
+                util_gpu: 62,
                 vram_used_mib: 5_200,
                 vram_total_mib: 12_288,
-                power_w: 285.0,
+                power_w: 240.0,
                 gpu_clock_mhz: 1920,
                 mem_clock_mhz: 9501,
                 cupti_status: "Active".to_owned(),
@@ -7142,14 +7445,20 @@ mod tests {
             },
             GpuTelemetry {
                 gpu_name: "RTX Amber".to_owned(),
+                temp_c: 78,
+                util_gpu: 86,
                 vram_used_mib: 10_000,
                 vram_total_mib: 12_288,
+                power_w: 300.0,
                 ..GpuTelemetry::default()
             },
             GpuTelemetry {
                 gpu_name: "RTX Red".to_owned(),
+                temp_c: 88,
+                util_gpu: 98,
                 vram_used_mib: 11_500,
                 vram_total_mib: 12_288,
+                power_w: 420.0,
                 ..GpuTelemetry::default()
             },
         ];
@@ -7220,6 +7529,20 @@ mod tests {
                             );
                             let start_w = ui.available_width();
                             avail_samples.push(start_w);
+                            collapsing_section(
+                                ui,
+                                "sec_render_stats",
+                                ic::MONITOR_PLAY,
+                                "Render & Frame",
+                                |ui| {
+                                    let w0 = ui.available_width();
+                                    render_accum_bar(ui, 12, 64, 48, &mut label_buf, &mut tip_buf);
+                                    render_accum_bar(ui, 64, 64, 256, &mut label_buf, &mut tip_buf);
+                                    render_accum_bar(ui, 18, 0, 72, &mut label_buf, &mut tip_buf);
+                                    avail_samples.push(ui.available_width() - w0 + start_w);
+                                    max_right = max_right.max(ui.min_rect().right());
+                                },
+                            );
                             for hw in &gpu_hw_cases {
                                 render_gpu_hw_body(ui, hw, &mut label_buf, &mut tip_buf);
                                 avail_samples.push(ui.available_width());
@@ -7233,6 +7556,12 @@ mod tests {
                                 |ui| {
                                     let w0 = ui.available_width();
                                     render_csg_stats_body(ui, &csg, &mut label_buf, &mut tip_buf);
+                                    render_csg_stats_body(
+                                        ui,
+                                        &csg_empty_paths,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
                                     avail_samples.push(ui.available_width() - w0 + start_w);
                                     max_right = max_right.max(ui.min_rect().right());
                                 },
@@ -7249,6 +7578,7 @@ mod tests {
                                         &sim,
                                         &timings,
                                         60.0,
+                                        0.95,
                                         &mut label_buf,
                                         &mut tip_buf,
                                     );
@@ -7281,6 +7611,22 @@ mod tests {
                                 "Performance",
                                 |ui| {
                                     let w0 = ui.available_width();
+                                    render_perf_frame_split_bar(
+                                        ui,
+                                        8.5,
+                                        1.4,
+                                        0.9,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
+                                    render_perf_frame_split_bar(
+                                        ui,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
                                     sparkline_row(
                                         ui,
                                         &mut label_buf,

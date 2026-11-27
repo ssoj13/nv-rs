@@ -795,13 +795,14 @@ impl SceneBuildProgress {
     }
 
     /// Appends the current substage label (prefixed with `"Step k/N | "` when step metadata is
-    /// present, plus `" (done/total)"` when determinate) into `out`.
+    /// present, plus `" (done/total)"` when determinate and not already embedded in `self.stage`)
+    /// into `out`.
     pub fn write_stage_line(&self, out: &mut String) {
         if self.write_step_prefix(out) {
             out.push_str(" | ");
         }
         out.push_str(&self.stage);
-        if self.total > 0 {
+        if self.total > 0 && !stage_has_inline_counter(&self.stage) {
             let clamped = self.done.min(self.total);
             let Ok(()) = write!(out, " ({clamped}/{})", self.total) else {
                 unreachable!("writing to String cannot fail");
@@ -840,6 +841,25 @@ impl SceneBuildProgress {
         self.write_status_summary(&mut out, elapsed_s);
         out
     }
+}
+
+/// Returns `true` when `stage` already ends with a parenthesized `"(<digits>/<digits>)"`
+/// sub-phase counter (e.g. `"Grounding objects 1/2 (1240/3480)"`), avoiding duplicate counter
+/// suffixes when the outer weighted scale (`done/total`) is already shown in the bar and `%`.
+fn stage_has_inline_counter(stage: &str) -> bool {
+    let Some(inner) = stage
+        .strip_suffix(')')
+        .and_then(|s| s.rsplit_once('(').map(|(_, tail)| tail))
+    else {
+        return false;
+    };
+    let Some((lhs, rhs)) = inner.split_once('/') else {
+        return false;
+    };
+    !lhs.is_empty()
+        && !rhs.is_empty()
+        && lhs.bytes().all(|b| b.is_ascii_digit())
+        && rhs.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Typed UI commands emitted by `ui.rs` and consumed cleanly by the main application loop.
@@ -1775,5 +1795,37 @@ mod tests {
             downcast_event::<RenderEvent>(&scratch[0]),
             Some(RenderEvent::SceneCacheStats(s)) if *s == stats
         ));
+    }
+
+    #[test]
+    fn stage_line_skips_duplicate_counter_when_stage_has_inline_count() {
+        let now = Instant::now();
+        let inline = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "SF HoAI",
+            "Grounding objects 1/2 (1240/3480)",
+            6400,
+            10_000,
+            now,
+        )
+        .with_step(1, 3);
+        assert_eq!(
+            inline.format_stage_line(),
+            "Step 1/3 | Grounding objects 1/2 (1240/3480)"
+        );
+
+        let plain = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "SF HoAI",
+            "Building OptiX GAS",
+            40,
+            218,
+            now,
+        )
+        .with_step(3, 3);
+        assert_eq!(
+            plain.format_stage_line(),
+            "Step 3/3 | Building OptiX GAS (40/218)"
+        );
     }
 }

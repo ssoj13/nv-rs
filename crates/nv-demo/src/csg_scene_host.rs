@@ -2184,10 +2184,76 @@ impl CsgGpuHost {
             scene.poke_crowd_all(impulse);
             Ok(format!("Poked all {count} crowd actors ({mag:.1} m/s)"))
         } else {
-            let pos = Vec3::new(origin[0], origin[1], origin[2]);
-            match scene.poke_crowd_nearest(pos, impulse) {
-                Some(idx) => Ok(format!("Poked crowd actor #{idx} ({mag:.1} m/s)")),
-                None => Err("Failed to locate nearest crowd actor to poke".to_string()),
+            // Prefer the actor closest to the camera's forward look ray (`dot > 0.30`) so Poke
+            // always hits visible pedestrians in front of the user rather than an unseen actor
+            // behind the camera, then fall back to nearest-3D if nobody is ahead.
+            let cam_pos = Vec3::new(origin[0], origin[1], origin[2]);
+            let cam_fwd = {
+                let f = Vec3::new(forward[0], forward[1], forward[2]);
+                if f.len_sq() > 1e-6 { f.norm() } else { Vec3::Z }
+            };
+            let mut best_in_view: Option<(usize, f32, Vec3)> = None;
+            for (idx, st) in scene.crowd.states.iter().enumerate() {
+                let p = Vec3::new(st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2]);
+                let delta = p - cam_pos;
+                let d2 = delta.len_sq();
+                if !d2.is_finite() || d2 < 1e-6 {
+                    continue;
+                }
+                let dist = d2.sqrt();
+                let dot = delta.dot(cam_fwd) / dist;
+                if dot <= 0.30 {
+                    continue;
+                }
+                let score = dist * (1.6 - dot);
+                if best_in_view.is_none_or(|(_, best_s, _)| score < best_s) {
+                    best_in_view = Some((idx, score, p));
+                }
+            }
+
+            if let Some((target_idx, _, center)) = best_in_view {
+                let imp_a = csg_actors::Vec3::new(impulse.x, impulse.y, impulse.z);
+                scene.crowd.poke_actor(target_idx, imp_a);
+                // Apply an attenuated shockwave to immediate neighbors within 3.5 m (up to 8
+                // nearby actors) so dense crowds react visibly around the targeted pedestrian.
+                const SPLASH_RADIUS_M: f32 = 3.5;
+                let mut nearby: Vec<(usize, f32)> = scene
+                    .crowd
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|&(idx, _)| idx != target_idx)
+                    .filter_map(|(idx, st)| {
+                        let p = Vec3::new(st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2]);
+                        let d = (p - center).len_sq().sqrt();
+                        (d.is_finite() && d <= SPLASH_RADIUS_M).then_some((idx, d))
+                    })
+                    .collect();
+                nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
+                let mut extra = 0usize;
+                for &(idx, d) in nearby.iter().take(8) {
+                    let atten = (1.0 - 0.55 * (d / SPLASH_RADIUS_M)).clamp(0.45, 1.0);
+                    let sub_imp = csg_actors::Vec3::new(
+                        impulse.x * atten,
+                        impulse.y * atten,
+                        impulse.z * atten,
+                    );
+                    if scene.crowd.poke_actor(idx, sub_imp) {
+                        extra += 1;
+                    }
+                }
+                if extra > 0 {
+                    Ok(format!(
+                        "Poked crowd actor #{target_idx} (+{extra} nearby, {mag:.1} m/s)"
+                    ))
+                } else {
+                    Ok(format!("Poked crowd actor #{target_idx} ({mag:.1} m/s)"))
+                }
+            } else {
+                match scene.poke_crowd_nearest(cam_pos, impulse) {
+                    Some(idx) => Ok(format!("Poked crowd actor #{idx} ({mag:.1} m/s)")),
+                    None => Err("Failed to locate nearest crowd actor to poke".to_string()),
+                }
             }
         }
     }

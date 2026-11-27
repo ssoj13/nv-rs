@@ -589,6 +589,10 @@ pub struct CudaCrowdBackend {
     staging_prev_xforms: Vec<[f32; 12]>,
     staging_world_joints: Vec<[f32; 4]>,
     staging_intents: Vec<csg_actors::IntentPod>,
+    /// Dedicated host buffer kept immutable after `cuMemcpyHtoDAsync_v2` until the next
+    /// `intents_dirty` upload so clearing one-shot `MASK_IMPULSE` bits in `scene.crowd.intents`
+    /// never races with an in-flight async PCIe transfer (>64 KiB on 2,000-actor crowds).
+    upload_intents: Vec<csg_actors::IntentPod>,
     scene_dirty: bool,
     intents_dirty: bool,
     topology_dirty: bool,
@@ -687,6 +691,7 @@ impl CudaCrowdBackend {
             staging_prev_xforms: Vec::new(),
             staging_world_joints: Vec::new(),
             staging_intents: Vec::new(),
+            upload_intents: Vec::new(),
             scene_dirty: true,
             intents_dirty: true,
             topology_dirty: true,
@@ -1239,9 +1244,14 @@ impl CudaCrowdBackend {
         self.ensure_scene_uploaded(stream, scene)?;
 
         // 3. Upload `CrowdIntents` only when externally modified (init, PokeCrowd, FreezePose).
+        // Copy into `self.upload_intents` first so clearing one-shot `MASK_IMPULSE` bits on CPU
+        // never mutates the source slice while `cuMemcpyHtoDAsync_v2` is still reading it.
         if self.intents_dirty {
+            self.upload_intents.clear();
+            self.upload_intents
+                .extend_from_slice(&scene.crowd.intents);
             self.plan
-                .upload(stream, BufId::CrowdIntents, &scene.crowd.intents)?;
+                .upload(stream, BufId::CrowdIntents, &self.upload_intents)?;
             for intent in &mut scene.crowd.intents {
                 let frozen = (intent.flags & intent_flags::FREEZE_POSE) != 0;
                 if !frozen && (intent.flags & intent_flags::MASK_IMPULSE) != 0 {

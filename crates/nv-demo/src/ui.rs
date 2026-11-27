@@ -397,7 +397,7 @@ fn draw_scene_build_progress_overlay(
         .request_repaint_after(std::time::Duration::from_millis(50));
 
     let max_w = (viewport_rect.width() - 24.0).max(1.0);
-    let card_w = max_w.clamp(180.0_f32.min(viewport_rect.width()), 380.0);
+    let card_w = max_w.clamp(180.0_f32.min(viewport_rect.width()), 450.0);
     let card_h = 74.0_f32.min(viewport_rect.height());
     let card_rect =
         egui::Rect::from_center_size(viewport_rect.center(), egui::vec2(card_w, card_h));
@@ -1082,33 +1082,34 @@ impl UiContext<'_> {
 
             ui.label(RichText::new("AOV").small().weak())
                 .on_hover_text("Select which render output pass to display (final Beauty image, depth, normals, motion, semantic labels, etc.).");
-            egui::ComboBox::from_id_salt("toolbar_aov_mode")
-                .width(102.0)
-                .selected_text(aov_pass(self.settings.aov_mode).label)
-                .show_ui(ui, |ui| {
-                    for (idx, pass) in AOV_PASSES.iter().enumerate() {
-                        ui.selectable_value(&mut self.settings.aov_mode, idx as u32, pass.label);
-                    }
-                })
-                .response
-                .on_hover_text("Select which render output pass to display (final Beauty image, depth, normals, motion, semantic labels, etc.).");
+            let aov_label_items: Vec<(u32, &str)> = AOV_PASSES
+                .iter()
+                .enumerate()
+                .map(|(idx, pass)| (idx as u32, pass.label))
+                .collect();
+            vt::tb_stepper_combo(
+                ui,
+                "toolbar_aov_mode",
+                "",
+                96.0,
+                "Select which render output pass to display (final Beauty image, depth, normals, motion, semantic labels, etc.).",
+                &aov_label_items,
+                &mut self.settings.aov_mode,
+            );
 
             ui.label(RichText::new("Lens").small().weak())
                 .on_hover_text("Camera optical lens projection: standard Pinhole, 180-degree Fisheye, 360 Equirectangular, or SlitCam.");
-            egui::ComboBox::from_id_salt("toolbar_lens_proj")
-                .width(96.0)
-                .selected_text(self.settings.camera_projection.label())
-                .show_ui(ui, |ui| {
-                    for proj in CameraProjection::ALL {
-                        ui.selectable_value(
-                            &mut self.settings.camera_projection,
-                            proj,
-                            proj.label(),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text("Camera optical lens projection: standard Pinhole, 180-degree Fisheye, 360 Equirectangular, or SlitCam.");
+            let toolbar_lens_items: [(CameraProjection, &str); 4] =
+                CameraProjection::ALL.map(|p| (p, p.label()));
+            vt::tb_stepper_combo(
+                ui,
+                "toolbar_lens_proj",
+                "",
+                vt::TB_COMBO_WIDTH - 8.0,
+                "Camera optical lens projection: standard Pinhole, 180-degree Fisheye, 360 Equirectangular, or SlitCam.",
+                &toolbar_lens_items,
+                &mut self.settings.camera_projection,
+            );
 
             let pick_on = *self.pick_possess_mode;
             let pick_btn = if pick_on {
@@ -1287,20 +1288,20 @@ impl UiContext<'_> {
         let wire_mode = self.settings.display_mode == DisplayMode::Wireframe;
         let toolbar_resp = vt::ViewportToolbar::new("nv_demo_viewport_toolbar")
             .show(ui.ctx(), rect, self.viewport_toolbar, |ui| {
-                // 1. Display mode (DEMO:VIEWS), AOV / line width, lens
-                egui::ComboBox::from_id_salt("vt_display")
-                    .selected_text(format!("{} {}", ic::CUBE, self.settings.display_mode.label()))
-                    .width(vt::TB_COMBO_WIDTH)
-                    .show_ui(ui, |ui| {
-                        for mode in DisplayMode::ALL {
-                            ui.selectable_value(&mut self.settings.display_mode, mode, mode.label());
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "Display mode: CSG = shaded path-traced render; Wireframe = smooth \
-                         hidden-line contours (silhouettes, creases, instance borders).",
-                    );
+                // 1. Display mode (DEMO:VIEWS), AOV / line width, lens — systemic stepped combos
+                // with flush `<` / `>` quick-cycle arrows and hover-wheel stepping.
+                let display_items: [(DisplayMode, &str); 2] =
+                    DisplayMode::ALL.map(|m| (m, m.label()));
+                vt::tb_stepper_combo(
+                    ui,
+                    "vt_display",
+                    ic::CUBE,
+                    vt::TB_COMBO_WIDTH - 16.0,
+                    "Display mode: CSG = shaded path-traced render; Wireframe = smooth \
+                     hidden-line contours (silhouettes, creases, instance borders).",
+                    &display_items,
+                    &mut self.settings.display_mode,
+                );
                 if wire_mode {
                     ui.add_sized(
                         vt::TB_BUTTON_SIZE,
@@ -1317,36 +1318,32 @@ impl UiContext<'_> {
                     )
                     .on_hover_text("Silhouette stroke width in screen pixels (creases are 2/3 of it)");
                 } else {
-                    let aov_cur = aov_pass(self.settings.aov_mode).tag;
-                    egui::ComboBox::from_id_salt("vt_aov")
-                        .selected_text(format!("{} {aov_cur}", ic::STACK))
-                        .width(vt::TB_COMBO_WIDTH)
-                        .show_ui(ui, |ui| {
-                            for (idx, pass) in AOV_PASSES.iter().enumerate() {
-                                ui.selectable_value(&mut self.settings.aov_mode, idx as u32, pass.tag);
-                            }
-                        })
-                        .response
-                        .on_hover_text("Output pass (AOV)");
+                    let aov_items: Vec<(u32, &str)> = AOV_PASSES
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, pass)| (idx as u32, pass.tag))
+                        .collect();
+                    vt::tb_stepper_combo(
+                        ui,
+                        "vt_aov",
+                        ic::STACK,
+                        vt::TB_COMBO_WIDTH - 8.0,
+                        "Output pass (AOV)",
+                        &aov_items,
+                        &mut self.settings.aov_mode,
+                    );
                 }
-                egui::ComboBox::from_id_salt("vt_lens")
-                    .selected_text(format!(
-                        "{} {}",
-                        ic::APERTURE,
-                        self.settings.camera_projection.label()
-                    ))
-                    .width(vt::TB_COMBO_WIDTH)
-                    .show_ui(ui, |ui| {
-                        for proj in CameraProjection::ALL {
-                            ui.selectable_value(
-                                &mut self.settings.camera_projection,
-                                proj,
-                                proj.label(),
-                            );
-                        }
-                    })
-                    .response
-                    .on_hover_text("Lens / sensor projection");
+                let lens_items: [(CameraProjection, &str); 4] =
+                    CameraProjection::ALL.map(|p| (p, p.label()));
+                vt::tb_stepper_combo(
+                    ui,
+                    "vt_lens",
+                    ic::APERTURE,
+                    vt::TB_COMBO_WIDTH + 4.0,
+                    "Lens / sensor projection",
+                    &lens_items,
+                    &mut self.settings.camera_projection,
+                );
                 tb_separator(ui);
 
                 // 1b. Overlay (overlay.rs): master switch, kinds, scope, screen-size cull, captures
@@ -2675,36 +2672,51 @@ impl UiContext<'_> {
                         }
                     }
 
-                    equal_grid(ui, 3, 3, |ui, idx, w| {
-                        let (tod, label) = match idx {
-                            0 => (0u32, "Day"),
-                            1 => (1u32, "Sunset"),
-                            _ => (2u32, "Night"),
-                        };
-                        if ui
-                            .add_sized(
-                                [w, ROW_H + 2.0],
-                                egui::Button::selectable(s.csg_time_of_day == tod, label),
-                            )
-                            .clicked()
-                        {
-                            self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
-                        }
-                    });
-                    prop_row(ui, "Transition", |ui| {
-                        ui.checkbox(&mut s.tod_transition_enabled, "Smooth")
-                            .on_hover_text(
-                                "Smoothly animate sky and sun lighting across Day / Sunset / Night.",
-                            );
-                        ui.add_enabled(
-                            s.tod_transition_enabled,
-                            egui::DragValue::new(&mut s.tod_transition_secs)
-                                .range(0.1..=15.0)
-                                .speed(0.1)
-                                .suffix(" s"),
-                        )
-                        .on_hover_text("Transition duration in seconds.");
-                    });
+                    // Single-row Day / Sunset / Night + Smooth transition duration controls.
+                    let row_w = ui.available_width().max(1.0);
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(row_w, ROW_H + 2.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            let sp = 4.0_f32;
+                            ui.spacing_mut().item_spacing.x = sp;
+                            let avail = ui.available_width().max(120.0);
+                            let dur_w = 46.0_f32;
+                            let show_smooth_lbl = avail >= 285.0;
+                            let chk_w = if show_smooth_lbl { 62.0 } else { 18.0 };
+                            let right_w = chk_w + sp + dur_w + sp;
+                            let seg_total = (avail - right_w).max(90.0);
+                            let seg_w = ((seg_total - 2.0 * sp) / 3.0).max(26.0);
+                            for (tod, label) in [(0u32, "Day"), (1u32, "Sunset"), (2u32, "Night")] {
+                                if ui
+                                    .add_sized(
+                                        [seg_w, ROW_H + 2.0],
+                                        egui::Button::selectable(s.csg_time_of_day == tod, label),
+                                    )
+                                    .clicked()
+                                {
+                                    self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
+                                }
+                            }
+                            ui.spacing_mut().interact_size.x = 18.0;
+                            let chk_lbl = if show_smooth_lbl { "Smooth" } else { "" };
+                            ui.checkbox(&mut s.tod_transition_enabled, chk_lbl)
+                                .on_hover_text(
+                                    "Smoothly animate sky and sun lighting across Day / Sunset / Night.",
+                                );
+                            ui.add_enabled_ui(s.tod_transition_enabled, |ui| {
+                                ui.add_sized(
+                                    [dur_w, ROW_H],
+                                    egui::DragValue::new(&mut s.tod_transition_secs)
+                                        .range(0.1..=15.0)
+                                        .speed(0.1)
+                                        .suffix(" s"),
+                                )
+                                .on_hover_text("Transition duration in seconds.");
+                            });
+                        },
+                    );
                     // 4-way Road Mode selector (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`)
                     let prev_road_mode = s.csg_road_mode.min(3);
                     ui.label(RichText::new("Road Mode").small().weak());

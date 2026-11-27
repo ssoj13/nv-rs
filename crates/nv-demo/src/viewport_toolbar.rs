@@ -246,6 +246,89 @@ pub fn tb_separator(ui: &mut Ui) {
     ui.separator();
 }
 
+/// Width of each flush `<` / `>` stepper button flanking [`tb_stepper_combo`].
+pub const TB_STEPPER_BTN_W: f32 = 16.0;
+
+/// Systemic stepped ComboBox widget (`<` | `[icon label ▾]` | `>`): wraps an `egui::ComboBox`
+/// with flush compact `egui-phosphor` previous/next chevron buttons (`ic::CARET_LEFT` /
+/// `ic::CARET_RIGHT`) and hover-wheel stepping so discrete modes (Display, AOV, Lens, etc.) can
+/// be cycled in one click or opened as a dropdown. Returns `true` when `*current` changed.
+pub fn tb_stepper_combo<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    id_salt: &str,
+    icon: &str,
+    combo_width: f32,
+    tooltip: &str,
+    items: &[(T, &str)],
+    current: &mut T,
+) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    let cur_idx = items.iter().position(|(v, _)| *v == *current).unwrap_or(0);
+    let cur_label = items[cur_idx].1;
+    let selected_text = if icon.is_empty() {
+        cur_label.to_owned()
+    } else {
+        format!("{icon} {cur_label}")
+    };
+    let mut changed = false;
+    let len = items.len();
+
+    let group_resp = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        ui.spacing_mut().button_padding.x = 2.0;
+        ui.spacing_mut().interact_size.x = TB_STEPPER_BTN_W;
+
+        let prev_btn = egui::Button::new(egui::RichText::new(ic::CARET_LEFT).size(11.0));
+        if ui
+            .add_sized([TB_STEPPER_BTN_W, TB_BUTTON_SIZE.y], prev_btn)
+            .on_hover_text(format!("Previous — {tooltip}"))
+            .clicked()
+        {
+            let next_idx = (cur_idx + len - 1) % len;
+            *current = items[next_idx].0;
+            changed = true;
+        }
+
+        let combo_resp = egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(selected_text)
+            .width(combo_width)
+            .show_ui(ui, |ui| {
+                for &(val, label) in items {
+                    if ui.selectable_value(current, val, label).changed() {
+                        changed = true;
+                    }
+                }
+            });
+        combo_resp.response.on_hover_text(tooltip);
+
+        let next_btn = egui::Button::new(egui::RichText::new(ic::CARET_RIGHT).size(11.0));
+        if ui
+            .add_sized([TB_STEPPER_BTN_W, TB_BUTTON_SIZE.y], next_btn)
+            .on_hover_text(format!("Next — {tooltip}"))
+            .clicked()
+        {
+            let next_idx = (cur_idx + 1) % len;
+            *current = items[next_idx].0;
+            changed = true;
+        }
+    });
+
+    // Hover-wheel quick stepping when the pointer rests on the stepper group and the dropdown
+    // popup is closed.
+    let popup_open = egui::Popup::is_id_open(ui.ctx(), ui.make_persistent_id(id_salt));
+    if !popup_open && group_resp.response.hovered() {
+        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll_y.abs() >= 10.0 {
+            let delta = if scroll_y > 0.0 { len - 1 } else { 1 };
+            *current = items[(cur_idx + delta) % len].0;
+            changed = true;
+        }
+    }
+    changed
+}
+
 // ---- Possession toolbar expand / collapse rule ------------------------------------------------
 
 /// The user's persisted choices for the possession toolbar.

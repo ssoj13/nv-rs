@@ -39,7 +39,7 @@ use csg_scene::traffic::{TrafficPoseSink, VehicleHazardStatePod};
 use csg_scene::traffic_gpu::{
     TRAFFIC_FRAME_PLAN_VERSION, TRAFFIC_SLOTS_PER_VEHICLE, TrafficBlockerPod, TrafficFrameData,
     TrafficGlobalsPod, TrafficGpuScene, TrafficInstanceOutPod, TrafficTableGenerations,
-    encode_blockers, out_flags, traffic_frame_plan,
+    TrafficVehicleDescPod, encode_blockers, out_flags, traffic_frame_plan,
 };
 use csg_scene::SceneBuilt;
 use cuda_bindings as cu;
@@ -650,10 +650,11 @@ impl CudaTrafficBackend {
             return Ok(false);
         }
 
-        let gpu_scene = scene
+        let mut gpu_scene = scene
             .traffic
             .gpu_scene()
             .map_err(|e| format!("SceneTraffic::gpu_scene failed: {e}"))?;
+        sanitize_gpu_scene_wheel_ids(&mut gpu_scene.descs);
 
         self.generations.scene = self.generations.scene.wrapping_add(1).max(1);
         let frame_data = TrafficFrameData {
@@ -1167,6 +1168,16 @@ impl CudaTrafficBackend {
     }
 }
 
+/// Masks unused wheel-slot IDs (`wheel_count..MAX_VEHICLE_WHEELS`) to `u32::MAX` so stale
+/// `InstanceId(0)` defaults in unused slots can never alias Vehicle 0's body (`InstanceId(0)`)
+/// during scatter-binding construction in `CsgGpuHost::fill_traffic_scatter_bindings`.
+pub(crate) fn sanitize_gpu_scene_wheel_ids(descs: &mut [TrafficVehicleDescPod]) {
+    for desc in descs {
+        let active = ((desc.wheel_bits & 0xFF) as usize).min(desc.wheel_ids.len());
+        desc.wheel_ids[active..].fill(u32::MAX);
+    }
+}
+
 /// Computes `inv(parent) * child` for two row-major 3x4 affine matrices in `f64` precision so
 /// multi-part vehicle assembly children (`part.local_xform` or `proxy.box_local_xform`) are
 /// recovered exactly from `WorldScene` during topology binding.
@@ -1285,5 +1296,47 @@ mod tests {
         plan.validate().expect("traffic_frame_plan validates");
         assert_eq!(plan.version, TRAFFIC_FRAME_PLAN_VERSION);
         assert_eq!(plan.kind, PlanKind::Traffic);
+    }
+
+    #[test]
+    fn sanitize_gpu_scene_wheel_ids_protects_vehicle_zero_body_binding() {
+        use std::collections::HashMap;
+
+        let mut descs = [
+            TrafficVehicleDescPod {
+                wheel_bits: 4 | (0b0011 << 8),
+                body_id: 0,
+                wheel_ids: [1, 2, 3, 4, 0, 0],
+                ..TrafficVehicleDescPod::default()
+            },
+            TrafficVehicleDescPod {
+                wheel_bits: 4 | (0b0011 << 8),
+                body_id: 5,
+                wheel_ids: [6, 7, 8, 9, 0, 0],
+                ..TrafficVehicleDescPod::default()
+            },
+        ];
+        sanitize_gpu_scene_wheel_ids(&mut descs);
+
+        assert_eq!(descs[0].wheel_ids, [1, 2, 3, 4, u32::MAX, u32::MAX]);
+        assert_eq!(descs[1].wheel_ids, [6, 7, 8, 9, u32::MAX, u32::MAX]);
+
+        let mut inst_to_out = HashMap::new();
+        for (v_idx, desc) in descs.iter().enumerate() {
+            let base = (v_idx * TRAFFIC_SLOTS_PER_VEHICLE) as u32;
+            if desc.body_id != u32::MAX {
+                inst_to_out.insert(desc.body_id, base);
+            }
+            for (w_idx, &wid) in desc.wheel_ids.iter().enumerate() {
+                if wid != u32::MAX {
+                    inst_to_out.insert(wid, base + 1 + w_idx as u32);
+                }
+            }
+        }
+        assert_eq!(inst_to_out.get(&0), Some(&0));
+        assert_eq!(inst_to_out.get(&1), Some(&1));
+        assert_eq!(inst_to_out.get(&4), Some(&4));
+        assert_eq!(inst_to_out.get(&5), Some(&(TRAFFIC_SLOTS_PER_VEHICLE as u32)));
+        assert_eq!(inst_to_out.get(&9), Some(&(TRAFFIC_SLOTS_PER_VEHICLE as u32 + 4)));
     }
 }

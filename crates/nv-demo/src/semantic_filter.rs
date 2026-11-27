@@ -400,7 +400,7 @@ mod tests {
         assert_ne!(mask & bit(inst_flags::resolve_semantic(flags, semantic::PEDESTRIAN).0), 0);
         let cu = include_str!("../shaders/raytracer.cu");
         assert!(cu.contains("csg_instance_semantic(flags, hit.sem_id)"));
-        assert!(cu.contains("static_assert(sizeof(Params) == 704"));
+        assert!(cu.contains("static_assert(sizeof(Params) == 752"));
     }
 
     fn with_sem(id: u16) -> u32 {

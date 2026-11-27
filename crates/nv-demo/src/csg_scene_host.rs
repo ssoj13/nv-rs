@@ -5,7 +5,7 @@
 //! (`Gundo`, `GundoOSM`, `Marina del Rey`, `SF House of AI`, `Studio Asset Inspector`, or future
 //! scenes), caches one non-compacted custom-primitive GAS per unique `GpuCompound` across split
 //! SBT offsets (`8` RPN / `10` single-prim & `PURE_UNION` / `12` exact `FIRST_HIT_UNION`),
-//! streams live build/upload/GAS milestones through [`CsgGpuHost::sync_with_progress`], and
+//! streams live build/upload/GAS milestones through [`CsgGpuHost::sync_with_rich_progress`], and
 //! refreshes material palettes, articulated crowds, and Frenet traffic in-place with zero
 //! steady-state GPU buffer reallocations.
 //! Why: keeps `nv-demo` decoupled from scene-specific geometry, coordinates, or rails while
@@ -56,7 +56,9 @@ use csg_scene::{
     resolve_possess_pose_with_crowd,
 };
 
-use crate::app_events::{PossessAdas, PossessInfo, SimTelemetry};
+use crate::app_events::{
+    BuildEtaTracker, EnginePhase, PossessAdas, PossessInfo, SceneBuildProgress, SimTelemetry,
+};
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend};
 use crate::cuda_traffic::{
     CudaTrafficBackend, TRAFFIC_BIND_NON_IDENTITY, TrafficScatterBindingPod,
@@ -1976,7 +1978,8 @@ impl CsgGpuHost {
             if desc.body_id != u32::MAX {
                 inst_to_out.insert(desc.body_id, base);
             }
-            for (w_idx, &wid) in desc.wheel_ids.iter().enumerate() {
+            let active_wheels = ((desc.wheel_bits & 0xFF) as usize).min(desc.wheel_ids.len());
+            for (w_idx, &wid) in desc.wheel_ids.iter().take(active_wheels).enumerate() {
                 if wid != u32::MAX {
                     inst_to_out.insert(wid, base + 1 + w_idx as u32);
                 }
@@ -3018,6 +3021,7 @@ impl CsgGpuHost {
     /// scene switches. Traffic is not stepped here: [`Self::step_dynamic`] is the only traffic
     /// step, so the Traffic toggle holds even while the crowd keeps the shared simulation clock
     /// moving.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, OptiX resources, and progress sink"
@@ -3033,6 +3037,42 @@ impl CsgGpuHost {
         cam: CsgCameraParams,
         gpu_crowd_active: bool,
         on_progress: &mut dyn FnMut(&str, &str, u32, u32),
+    ) -> Result<CsgSyncResult, String> {
+        self.sync_with_rich_progress(
+            optix_ctx,
+            stream,
+            scratch,
+            key,
+            wetness,
+            time_of_day,
+            cam,
+            gpu_crowd_active,
+            Instant::now(),
+            &mut |progress| {
+                on_progress(&progress.scene_name, &progress.stage, progress.done, progress.total);
+            },
+        )
+    }
+
+    /// Rebuilds the CSG scene and per-compound GAS cache only when `key` changes, streaming
+    /// determinate [`SceneBuildProgress`] snapshots carrying macro step indices (`Step 1/3..3/3`),
+    /// blended overall fraction (`0.0..=1.0`), and a 10-step moving-average ETA (`eta_secs`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, OptiX resources, build clock, and rich progress sink"
+    )]
+    pub fn sync_with_rich_progress(
+        &mut self,
+        optix_ctx: &Arc<DeviceContext>,
+        stream: &Arc<Stream>,
+        scratch: &mut Scratch,
+        key: CsgSceneKey,
+        wetness: f32,
+        time_of_day: u32,
+        cam: CsgCameraParams,
+        gpu_crowd_active: bool,
+        started_at: Instant,
+        on_progress: &mut dyn FnMut(SceneBuildProgress),
     ) -> Result<CsgSyncResult, String> {
         if self.pinned_staging.is_none() {
             self.pinned_staging =
@@ -3052,6 +3092,7 @@ impl CsgGpuHost {
                 key,
                 wetness,
                 time_of_day,
+                started_at,
                 on_progress,
             )?;
             rebuilt_scene = true;
@@ -3460,7 +3501,7 @@ impl CsgGpuHost {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "internal scene rebuild pipeline with explicit OptiX resources and progress sink"
+        reason = "internal scene rebuild pipeline with explicit OptiX resources, build clock, and rich progress sink"
     )]
     fn rebuild_scene(
         &mut self,
@@ -3470,7 +3511,8 @@ impl CsgGpuHost {
         key: CsgSceneKey,
         wetness: f32,
         time_of_day: u32,
-        on_progress: &mut dyn FnMut(&str, &str, u32, u32),
+        started_at: Instant,
+        on_progress: &mut dyn FnMut(SceneBuildProgress),
     ) -> Result<(), String> {
         // Synchronize before dropping old GASes / GPU buffers so no in-flight launch reads them.
         stream
@@ -3566,24 +3608,33 @@ impl CsgGpuHost {
             .get_by_index(reg_idx)
             .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
         let scene_name = module.descriptor().name;
+        let is_cached = cached_built.is_some();
+        let mut reporter = CsgBuildReporter::new(scene_name, is_cached, started_at, on_progress);
         let mut built = match cached_built {
             Some(mut cached) => {
-                on_progress(scene_name, "Restoring cached CSG scene...", 0, 0);
+                reporter.emit(1, "Restoring cached CSG scene", 0, 1);
                 cached.set_crowd_frozen(false);
+                reporter.emit(1, "Restoring cached CSG scene", 1, 1);
                 cached
             }
             None => {
-                on_progress(scene_name, "Generating CSG scene...", 0, 0);
-                module
-                    .build(&build_cfg)
-                    .map_err(|e| format!("CSG scene '{scene_name}' failed to build: {e}"))?
+                reporter.emit(1, "Generating CSG scene", 0, 1);
+                let built = module
+                    .build_with_progress(&build_cfg, &mut |stage, done, total| {
+                        reporter.emit(1, stage, done, total);
+                    })
+                    .map_err(|e| format!("CSG scene '{scene_name}' failed to build: {e}"))?;
+                if reporter.max_overall() < csg_build_overall_fraction(false, 1, 1, 1) {
+                    reporter.emit(1, "CSG scene generated", 1, 1);
+                }
+                built
             }
         };
         module.refresh_materials(&mut built.world, wetness.clamp(0.0, 1.0), tod);
         self.last_mat_state = (wetness.clamp(0.0, 1.0).to_bits(), time_of_day);
 
         if let Err(e) =
-            self.upload_scene_gpu(optix_ctx, stream, scratch, &mut built, scene_name, on_progress)
+            self.upload_scene_gpu(optix_ctx, stream, scratch, &mut built, &mut reporter)
         {
             // Keep the CPU build for a cheap retry; `compound_gases` is still empty from above.
             self.cache_insert_scene(key, built);
@@ -3615,10 +3666,9 @@ impl CsgGpuHost {
         stream: &Arc<Stream>,
         scratch: &mut Scratch,
         built: &mut SceneBuilt,
-        scene_name: &str,
-        on_progress: &mut dyn FnMut(&str, &str, u32, u32),
+        reporter: &mut CsgBuildReporter<'_>,
     ) -> Result<(), String> {
-        on_progress(scene_name, "Uploading CSG buffers to GPU...", 0, 0);
+        reporter.emit(2, "Uploading CSG buffers to GPU", 0, 8);
         // Upload static compiled library buffers into persistent grow-only VRAM pools (zero
         // alloc/free churn across RoadMode toggles or scene rebuilds once warm).
         let lib = &built.world.library;
@@ -3634,12 +3684,14 @@ impl CsgGpuHost {
         self.ops_buf.upload(stream, &lib.ops)?;
         self.prims_buf.upload(stream, &lib.prims)?;
         self.aux_planes_buf.upload(stream, &lib.aux_planes)?;
+        reporter.emit(2, "Uploading CSG buffers to GPU", 4, 8);
         self.guard_aabbs_buf.upload(stream, &lib.guard_aabbs)?;
         self.repeats_buf.upload(stream, &lib.repeats)?;
         self.materials_buf
             .upload(stream, built.world.materials.as_slice())?;
         self.sign_text_bytes_buf
             .upload(stream, built.world.sign_text.bytes())?;
+        reporter.emit(2, "Uploading CSG buffers to GPU", 8, 8);
 
         self.static_gpu_bytes = self.compounds_buf.active_bytes()
             + self.ops_buf.active_bytes()
@@ -3666,7 +3718,8 @@ impl CsgGpuHost {
                 .as_ref()
                 .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
             let total_gases = lib.compounds.len() as u32;
-            on_progress(scene_name, "Building OptiX GAS", 0, total_gases);
+            let stride = if total_gases <= 64 { 4 } else { 8 };
+            reporter.emit(3, "Building OptiX GAS", 0, total_gases);
             for (idx, c) in lib.compounds.iter().enumerate() {
                 let (gas, sbt_off) = build_compound_gas(
                     optix_ctx,
@@ -3680,19 +3733,109 @@ impl CsgGpuHost {
                 gases.push(gas);
                 sbt_offsets.push(sbt_off);
                 let done = (idx + 1) as u32;
-                if done == total_gases || done.is_multiple_of(4) {
-                    on_progress(scene_name, "Building OptiX GAS", done, total_gases);
+                if done == total_gases || done.is_multiple_of(stride) {
+                    reporter.emit(3, "Building OptiX GAS", done, total_gases);
                 }
             }
             stream
                 .synchronize()
                 .map_err(|e| format!("CSG GAS sync failed: {e}"))?;
+        } else {
+            reporter.emit(3, "Building OptiX GAS", 1, 1);
         }
 
         self.compound_gases = gases;
         self.compound_sbt_offsets = sbt_offsets;
         self.compound_semantic_masks = built.world.semantic_masks().to_vec();
         Ok(())
+    }
+}
+
+/// Number of macro steps reported during a CSG scene rebuild:
+/// 1) CPU scene generation / cache restore, 2) GPU buffer upload, 3) OptiX GAS builds.
+const CSG_BUILD_STEP_COUNT: u32 = 3;
+
+/// Maps `(cached, step_idx, done, total)` into a monotonic overall `[0.0, 1.0]` build fraction.
+///
+/// Uncached builds weight CPU generation heavily (`0.00..=0.72`) because OSM/CSG compilation
+/// dominates wall-clock time; cached restores shift weight onto GPU upload (`0.05..=0.20`) and
+/// OptiX GAS builds (`0.20..=1.00`).
+pub(crate) fn csg_build_overall_fraction(
+    cached: bool,
+    step_idx: u32,
+    done: u32,
+    total: u32,
+) -> f32 {
+    let (lo, hi) = match (cached, step_idx) {
+        (false, 1) => (0.00_f32, 0.72_f32),
+        (false, 2) => (0.72_f32, 0.78_f32),
+        (false, _) => (0.78_f32, 1.00_f32),
+        (true, 1) => (0.00_f32, 0.05_f32),
+        (true, 2) => (0.05_f32, 0.20_f32),
+        (true, _) => (0.20_f32, 1.00_f32),
+    };
+    let local = if total > 0 {
+        (done.min(total) as f32) / (total as f32)
+    } else {
+        0.0
+    };
+    (lo + (hi - lo) * local).clamp(0.0, 1.0)
+}
+
+/// Streams determinate [`SceneBuildProgress`] snapshots across all 3 CSG rebuild steps while
+/// maintaining a rolling 10-step moving-average ETA (`BuildEtaTracker`).
+struct CsgBuildReporter<'a> {
+    scene_name: &'a str,
+    cached: bool,
+    started_at: Instant,
+    tracker: BuildEtaTracker,
+    max_overall: f32,
+    sink: &'a mut dyn FnMut(SceneBuildProgress),
+}
+
+impl<'a> CsgBuildReporter<'a> {
+    fn new(
+        scene_name: &'a str,
+        cached: bool,
+        started_at: Instant,
+        sink: &'a mut dyn FnMut(SceneBuildProgress),
+    ) -> Self {
+        Self {
+            scene_name,
+            cached,
+            started_at,
+            tracker: BuildEtaTracker::new(started_at),
+            max_overall: 0.0,
+            sink,
+        }
+    }
+
+    #[inline]
+    fn max_overall(&self) -> f32 {
+        self.max_overall
+    }
+
+    fn emit(&mut self, step_idx: u32, stage: &str, done: u32, total: u32) {
+        self.emit_at(step_idx, stage, done, total, Instant::now());
+    }
+
+    fn emit_at(&mut self, step_idx: u32, stage: &str, done: u32, total: u32, now: Instant) {
+        let raw = csg_build_overall_fraction(self.cached, step_idx, done, total);
+        self.max_overall = self.max_overall.max(raw);
+        let overall = self.max_overall;
+        let eta = self.tracker.record(overall, 1.0, now);
+        let progress = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            self.scene_name,
+            stage,
+            done,
+            total,
+            self.started_at,
+        )
+        .with_step(step_idx, CSG_BUILD_STEP_COUNT)
+        .with_overall(Some(overall))
+        .with_eta(eta);
+        (self.sink)(progress);
     }
 }
 
@@ -5655,6 +5798,45 @@ mod tests {
                 first.key,
                 crate::pick::OBJECT_KEY_BIT | (*grouped_obj & OBJ_KEY_ID_MASK)
             );
+        }
+    }
+
+    #[test]
+    fn csg_build_reporter_streams_monotonic_steps_and_sma10_eta() {
+        use std::time::Duration;
+
+        for cached in [false, true] {
+            let t0 = Instant::now();
+            let mut events: Vec<SceneBuildProgress> = Vec::new();
+            let mut sink = |p: SceneBuildProgress| events.push(p);
+            let mut reporter = CsgBuildReporter::new("Gundo", cached, t0, &mut sink);
+
+            reporter.emit_at(1, "Loading OSM", 0, 4, t0);
+            reporter.emit_at(1, "Road network", 1, 4, t0 + Duration::from_secs(2));
+            reporter.emit_at(1, "Buildings", 2, 4, t0 + Duration::from_secs(4));
+            reporter.emit_at(1, "Crowd", 4, 4, t0 + Duration::from_secs(8));
+            reporter.emit_at(2, "Uploading CSG buffers to GPU", 0, 8, t0 + Duration::from_secs(8));
+            reporter.emit_at(2, "Uploading CSG buffers to GPU", 8, 8, t0 + Duration::from_secs(9));
+            reporter.emit_at(3, "Building OptiX GAS", 0, 10, t0 + Duration::from_secs(9));
+            reporter.emit_at(3, "Building OptiX GAS", 10, 10, t0 + Duration::from_secs(11));
+
+            assert_eq!(events.len(), 8);
+            let mut prev = 0.0_f32;
+            for ev in &events {
+                assert_eq!(ev.step_count, 3);
+                assert!(ev.step_idx >= 1 && ev.step_idx <= 3);
+                let frac = ev.overall_fraction.expect("overall fraction present");
+                assert!(frac >= prev && frac <= 1.0, "non-monotonic frac {frac} < {prev}");
+                prev = frac;
+            }
+            assert!(events[0].eta_secs.is_none(), "warm-up before 2 intervals");
+            assert!(events[1].eta_secs.is_none(), "warm-up after 1 interval");
+            assert!(
+                events[2].eta_secs.is_some_and(|e| e > 0.0 && e.is_finite()),
+                "ETA must activate once 2 intervals complete"
+            );
+            assert_eq!(events.last().expect("final").overall_fraction, Some(1.0));
+            assert_eq!(events.last().expect("final").eta_secs, Some(0.0));
         }
     }
 }

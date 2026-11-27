@@ -111,9 +111,16 @@ struct Params {
     unsigned long long csg_sign_text_bytes; // device u8[csg_sign_text_len] flat deduplicated MUTCD ASCII sign text buffer (0 = empty)
     unsigned int csg_sign_text_len;         // byte length of csg_sign_text_bytes
     unsigned int _pad_sign_text;            // explicit 16-byte alignment padding
+    unsigned long long ocean_cascades_ptr;  // device float4[3 * 256 * 256] cuFFT ocean cascades (height, sx, sz, foam); 0 = Analytical
+    unsigned long long _pad_ocean;          // explicit 16-byte alignment padding before float4 ocean_params_a
+    float ocean_params_a[4];                // [wind_speed, wind_dir_rad, choppiness, swell]
+    float ocean_params_b[4];                // [foam, clarity, cascade_dim_f, mode_flags (1.0 = CuFft)]
 };
 
-static_assert(sizeof(Params) == 704, "Params size must match LaunchParams (704 B)");
+static_assert(sizeof(Params) == 752, "Params size must match LaunchParams (752 B)");
+static_assert(__builtin_offsetof(Params, ocean_params_b) == 736, "Params::ocean_params_b offset must be 736");
+static_assert(__builtin_offsetof(Params, ocean_params_a) == 720, "Params::ocean_params_a offset must be 720");
+static_assert(__builtin_offsetof(Params, ocean_cascades_ptr) == 704, "Params::ocean_cascades_ptr offset must be 704");
 static_assert(__builtin_offsetof(Params, csg_sign_text_len) == 696, "Params::csg_sign_text_len offset must be 696");
 static_assert(__builtin_offsetof(Params, csg_sign_text_bytes) == 688, "Params::csg_sign_text_bytes offset must be 688");
 static_assert(__builtin_offsetof(Params, csg_instance_text) == 680, "Params::csg_instance_text offset must be 680");
@@ -1430,6 +1437,8 @@ struct CsgProcResult {
     float clearcoat;
     float cc_rough;
     float ior;
+    float water_height;
+    float water_foam;
     unsigned int mat_flags;
     unsigned int proc_kind;
 };
@@ -1903,13 +1912,207 @@ static __noinline__ __device__ void shade_csg_sign_text(
     cc_rough = cc_rough * (1.0f - ink) + 0.10f * ink;
 }
 
+// ============================================================================
+// Procedural 3-Cascade cuFFT JONSWAP/TMA + 12-Octave Gerstner Ocean Evaluator
+// ============================================================================
+
+static __forceinline__ __device__ float4 sample_ocean_cascade_bilinear(
+    const float4* cascades,
+    unsigned int c,
+    float wx,
+    float wz,
+    float tile_m,
+    unsigned int dim
+) {
+    float u = wx / tile_m;
+    float v = wz / tile_m;
+    u -= floorf(u);
+    v -= floorf(v);
+    float fdim = (float)dim;
+    float fx = u * fdim;
+    float fz = v * fdim;
+    int ix0 = (int)floorf(fx);
+    int iz0 = (int)floorf(fz);
+    float tx = fx - (float)ix0;
+    float tz = fz - (float)iz0;
+    unsigned int mask = dim - 1u;
+    unsigned int x0 = (unsigned int)ix0 & mask;
+    unsigned int z0 = (unsigned int)iz0 & mask;
+    unsigned int x1 = (x0 + 1u) & mask;
+    unsigned int z1 = (z0 + 1u) & mask;
+    size_t plane_stride = (size_t)dim * (size_t)dim;
+    const float4* plane = cascades + (size_t)c * plane_stride;
+    size_t r0 = (size_t)z0 * (size_t)dim;
+    size_t r1 = (size_t)z1 * (size_t)dim;
+    float4 q00 = __ldg(&plane[r0 + (size_t)x0]);
+    float4 q10 = __ldg(&plane[r0 + (size_t)x1]);
+    float4 q01 = __ldg(&plane[r1 + (size_t)x0]);
+    float4 q11 = __ldg(&plane[r1 + (size_t)x1]);
+    float4 top = make_float4(
+        q00.x + (q10.x - q00.x) * tx,
+        q00.y + (q10.y - q00.y) * tx,
+        q00.z + (q10.z - q00.z) * tx,
+        q00.w + (q10.w - q00.w) * tx
+    );
+    float4 bot = make_float4(
+        q01.x + (q11.x - q01.x) * tx,
+        q01.y + (q11.y - q01.y) * tx,
+        q01.z + (q11.z - q01.z) * tx,
+        q01.w + (q11.w - q01.w) * tx
+    );
+    return make_float4(
+        top.x + (bot.x - top.x) * tz,
+        top.y + (bot.y - top.y) * tz,
+        top.z + (bot.z - top.z) * tz,
+        top.w + (bot.w - top.w) * tz
+    );
+}
+
+// Evaluates `(height_m, slope_x, slope_z, foam_raw)` and filtered sub-pixel `out_slope_var`
+// (for Toksvig/LEADR horizon anti-shimmer) using either 3-cascade cuFFT (`L0=220m, L1=48m, L2=9m`)
+// or a 12-octave directional Gerstner/dispersion wave sum (`Analytical`).
+static __noinline__ __device__ float4 eval_ocean_field(
+    float wx,
+    float wz,
+    float wt,
+    float cam_dist,
+    float& out_slope_var
+) {
+    float wind_speed = fminf(fmaxf(params.ocean_params_a[0], 1.0f), 25.0f);
+    float wind_dir = params.ocean_params_a[1];
+    float chop = fminf(fmaxf(params.ocean_params_a[2], 0.0f), 2.0f);
+    float swell = fminf(fmaxf(params.ocean_params_a[3], 0.0f), 1.0f);
+    bool use_cufft = (params.ocean_cascades_ptr != 0ull) && (params.ocean_params_b[3] > 0.5f);
+
+    if (use_cufft) {
+        const float4* cascades = reinterpret_cast<const float4*>(params.ocean_cascades_ptr);
+        unsigned int dim = (params.ocean_params_b[2] >= 64.0f) ? (unsigned int)params.ocean_params_b[2] : 256u;
+        // Distance-attenuated cascade weights convert sub-pixel ripples into Toksvig roughness.
+        float w0 = 1.0f - 0.30f * sky_smoothstep(450.0f, 1800.0f, cam_dist);
+        float w1 = 1.0f - sky_smoothstep(130.0f, 520.0f, cam_dist);
+        float w2 = 1.0f - sky_smoothstep(26.0f, 115.0f, cam_dist);
+
+        float4 s0 = sample_ocean_cascade_bilinear(cascades, 0u, wx, wz, 220.0f, dim);
+        float h = s0.x * w0;
+        float sx = s0.y * w0;
+        float sz = s0.z * w0;
+        float foam = s0.w * 0.72f * w0;
+
+        if (w1 > 0.005f) {
+            float4 s1 = sample_ocean_cascade_bilinear(cascades, 1u, wx, wz, 48.0f, dim);
+            h += s1.x * w1;
+            sx += s1.y * w1;
+            sz += s1.z * w1;
+            foam += s1.w * 0.85f * w1;
+        }
+        if (w2 > 0.005f) {
+            float4 s2 = sample_ocean_cascade_bilinear(cascades, 2u, wx, wz, 9.0f, dim);
+            h += s2.x * w2;
+            sx += s2.y * w2;
+            sz += s2.z * w2;
+            foam += s2.w * 0.45f * w2;
+        }
+        float wind_k = fminf(1.6f, wind_speed * 0.10f);
+        out_slope_var = ((1.0f - w2) * 0.048f + (1.0f - w1) * 0.088f + (1.0f - w0) * 0.060f) * wind_k;
+        return make_float4(h, sx, sz, fminf(1.0f, foam));
+    }
+
+    // Analytical 12-octave directional Gerstner / deep-water dispersion wave sum.
+    static const float WAVE_LEN[12] = {
+        76.0f, 52.0f, 36.0f, 24.5f, 16.5f, 11.2f, 7.6f, 5.1f, 3.4f, 2.25f, 1.55f, 1.05f
+    };
+    static const float WAVE_ANG[12] = {
+        0.04f, -0.18f, 0.28f, -0.42f, 0.56f, -0.68f, 0.82f, -0.95f, 1.12f, -1.28f, 1.48f, -1.72f
+    };
+    static const float WAVE_PHASE[12] = {
+        0.7f, 2.1f, 4.3f, 1.2f, 5.4f, 3.6f, 0.3f, 2.8f, 4.9f, 1.8f, 3.1f, 5.9f
+    };
+    float wind_amp = fminf(1.8f, 0.14f + 0.065f * wind_speed);
+    float ang_tight = 1.0f - 0.58f * swell;
+    float h = 0.0f;
+    float sx = 0.0f;
+    float sz = 0.0f;
+    float crest_acc = 0.0f;
+    float filtered_var = 0.0f;
+
+    for (int i = 0; i < 12; ++i) {
+        float lam = WAVE_LEN[i];
+        float k = 6.2831853f / lam;
+        float omega = sqrtf(9.81f * k);
+        float spread = WAVE_ANG[i] * ((i < 4) ? ang_tight : (0.75f + 0.25f * ang_tight));
+        float ang = wind_dir + spread;
+        float dx = cosf(ang);
+        float dz = sinf(ang);
+        float amp = wind_amp * (lam * 0.0092f) * ((i < 3) ? (0.75f + 0.65f * swell) : 1.0f);
+        // Distance fade prevents Nyquist shimmer on distant short octaves and moves energy into Toksvig variance.
+        float dist_w = 1.0f - sky_smoothstep(lam * 6.0f, lam * 18.0f, cam_dist);
+        float ka = k * amp;
+        if (dist_w <= 0.005f) {
+            filtered_var += 0.5f * ka * ka;
+            continue;
+        }
+        float ph = k * (wx * dx + wz * dz) - omega * wt + WAVE_PHASE[i];
+        float s = sinf(ph);
+        float c = cosf(ph);
+        // Gerstner crest sharpening via 2nd harmonic scaled by choppiness.
+        float q = fminf(0.45f, 0.18f * chop * (1.0f + 0.06f * (float)i));
+        float h_i = amp * (s + 0.35f * q * (c * c - s * s)) * dist_w;
+        float dh = ka * (c - 0.70f * q * s * c) * dist_w;
+        h += h_i;
+        sx += dh * dx;
+        sz += dh * dz;
+        crest_acc += fmaxf(0.0f, s - 0.45f) * ka * chop * dist_w;
+        filtered_var += 0.5f * ka * ka * (1.0f - dist_w);
+    }
+    out_slope_var = fminf(0.28f, filtered_var);
+    float foam = fminf(1.0f, fmaxf(0.0f, (crest_acc - 0.32f) * 1.45f));
+    return make_float4(h, sx, sz, foam);
+}
+
+// Animated dual-wave refractive caustics projected onto shallow seabed, sand, and pool floors.
+static __forceinline__ __device__ float eval_water_caustics(
+    float wx,
+    float wz,
+    float wt,
+    float depth_m,
+    bool is_pool
+) {
+    float max_d = is_pool ? 6.0f : 8.5f;
+    if (depth_m >= max_d) return 0.0f;
+    float sc = is_pool ? 2.4f : 1.15f;
+    float a = sinf(wx * sc * 1.7f + wz * sc * 0.9f + wt * 2.1f)
+            + sinf(wx * sc * 0.8f - wz * sc * 1.9f - wt * 1.7f);
+    float b = sinf(wx * sc * 2.5f - wz * sc * 1.3f + wt * 2.6f)
+            + cosf(wx * sc * 1.4f + wz * sc * 2.2f - wt * 1.9f);
+    float ridge = 1.0f - fminf(1.0f, fabsf(a * 0.5f));
+    float ridge2 = 1.0f - fminf(1.0f, fabsf(b * 0.5f));
+    float caust = powf(fmaxf(0.0f, ridge * 0.55f + ridge2 * 0.45f), 4.0f);
+    // Fade in right below surface (avoid flat contact glare) and attenuate smoothly with depth.
+    float depth_env = sky_smoothstep(0.05f, 0.35f, depth_m) * (1.0f - sky_smoothstep(max_d * 0.35f, max_d, depth_m));
+    return caust * depth_env * (is_pool ? 1.15f : 0.72f);
+}
+
+// Physically grounded pelagic water-column volume in-scatter (day/sunset/night responsive via sun elevation).
+static __forceinline__ __device__ float3 water_pelagic_scatter(float3 sun_dir, bool is_pool) {
+    float sun_elev = fmaxf(0.0f, sun_dir.y);
+    float sky_i = fmaxf(0.05f, params.sky_params[0]);
+    float day_k = (0.14f + 0.86f * powf(sun_elev, 0.55f)) * fminf(1.8f, sky_i);
+    if (is_pool) {
+        return f3_mul(make_float3(0.015f, 0.24f, 0.32f), day_k);
+    }
+    // Deep Southern California Pacific teal-navy marine volume scatter.
+    return f3_mul(make_float3(0.004f, 0.032f, 0.058f), day_k);
+}
+
 static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     unsigned int mat_id,
     unsigned int sem_id,
     unsigned int part_id,
     unsigned int inst_idx,
     float3 hit_pos,
-    float3 n
+    float3 n,
+    float3 ray_dir,
+    float hit_t
 ) {
     CsgGpuMaterial mat = load_csg_material(mat_id);
     float3 base_col = make_float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
@@ -1918,6 +2121,8 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     float clearcoat = fmaxf(0.0f, fminf(1.0f, mat.clearcoat));
     float cc_rough = fmaxf(0.02f, fminf(0.60f, mat.clearcoat_roughness));
     float3 emission = make_float3(mat.emission[0], mat.emission[1], mat.emission[2]);
+    float water_height = 0.0f;
+    float water_foam = 0.0f;
 
     float wet = fmaxf(0.0f, fminf(1.0f, params.csg_wetness));
     if ((mat.flags & CSG_MAT_FLAG_WET) != 0u) {
@@ -2184,28 +2389,66 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
             float wt = params.csg_traffic_time;
             // Distinguish bright turquoise swimming pools from deep Pacific ocean / marina basins.
             bool is_pool = (base_col.y > 0.25f && base_col.z > 0.30f);
-            float scale = is_pool ? 1.15f : 0.35f;
-            float wx = hit_pos.x * scale;
-            float wz = hit_pos.z * scale;
-            float eps = 0.08f;
-            float h0 = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
-                     + cosf(wz * 1.9f - wt * 1.1f) * 0.25f
-                     + fbm2(wx * 1.6f + wt * 0.25f, wz * 1.6f - wt * 0.18f) * 0.45f;
-            float hx = sinf((wx + eps) * 2.4f + wt * 1.4f) * 0.35f
-                     + cosf(wz * 1.9f - wt * 1.1f) * 0.25f
-                     + fbm2((wx + eps) * 1.6f + wt * 0.25f, wz * 1.6f - wt * 0.18f) * 0.45f;
-            float hz = sinf(wx * 2.4f + wt * 1.4f) * 0.35f
-                     + cosf((wz + eps) * 1.9f - wt * 1.1f) * 0.25f
-                     + fbm2(wx * 1.6f + wt * 0.25f, (wz + eps) * 1.6f - wt * 0.18f) * 0.45f;
-            float strength = is_pool ? 0.06f : 0.10f;
-            n = f3_norm(make_float3(n.x - (hx - h0) / eps * strength, n.y, n.z - (hz - h0) / eps * strength));
             if (is_pool) {
+                float wx = hit_pos.x * 1.15f;
+                float wz = hit_pos.z * 1.15f;
+                float eps = 0.06f;
+                float h0 = sinf(wx * 2.8f + wt * 1.7f) * 0.28f
+                         + cosf(wz * 2.3f - wt * 1.4f) * 0.22f
+                         + fbm2(wx * 2.1f + wt * 0.30f, wz * 2.1f - wt * 0.22f) * 0.35f;
+                float hx = sinf((wx + eps) * 2.8f + wt * 1.7f) * 0.28f
+                         + cosf(wz * 2.3f - wt * 1.4f) * 0.22f
+                         + fbm2((wx + eps) * 2.1f + wt * 0.30f, wz * 2.1f - wt * 0.22f) * 0.35f;
+                float hz = sinf(wx * 2.8f + wt * 1.7f) * 0.28f
+                         + cosf((wz + eps) * 2.3f - wt * 1.4f) * 0.22f
+                         + fbm2(wx * 2.1f + wt * 0.30f, (wz + eps) * 2.1f - wt * 0.22f) * 0.35f;
+                n = f3_norm(make_float3(n.x - (hx - h0) / eps * 0.055f, n.y, n.z - (hz - h0) / eps * 0.055f));
                 float caustic = fmaxf(0.0f, sinf(wx * 4.5f + wt * 1.8f) * cosf(wz * 4.2f - wt * 1.5f));
                 base_col = f3_mul(base_col, 0.90f + 0.28f * caustic * caustic);
+                rough = 0.022f;
+                clearcoat = 0.95f;
+                cc_rough = 0.020f;
+            } else {
+                float cam_dist = fmaxf(hit_t, f3_len(f3_sub(hit_pos, make_float3(params.cam_pos[0], params.cam_pos[1], params.cam_pos[2]))));
+                float px = hit_pos.x;
+                float pz = hit_pos.z;
+                float slope_var = 0.0f;
+                // Near-field 3D wave relief (0 triangle meshes!): 4-step parallax heightfield ray
+                // offset within < 60 m gives real crest relief and self-parallax on ocean waves.
+                if (cam_dist < 60.0f && fabsf(n.y) > 0.5f && fabsf(ray_dir.y) > 0.03f) {
+                    float relief_w = (1.0f - sky_smoothstep(38.0f, 60.0f, cam_dist))
+                                   * sky_smoothstep(0.03f, 0.20f, fabsf(ray_dir.y));
+                    float inv_dy = 1.0f / fmaxf(fabsf(ray_dir.y), 0.20f);
+                    for (int it = 0; it < 4; ++it) {
+                        float tmp_var = 0.0f;
+                        float4 wf = eval_ocean_field(px, pz, wt, cam_dist, tmp_var);
+                        float delta = fminf(2.2f, fmaxf(-2.2f, wf.x * relief_w * 0.65f * inv_dy));
+                        px = hit_pos.x + ray_dir.x * delta;
+                        pz = hit_pos.z + ray_dir.z * delta;
+                    }
+                }
+                float4 wf = eval_ocean_field(px, pz, wt, cam_dist, slope_var);
+                water_height = wf.x;
+                // Construct wave-perturbed normal from spectral slopes; keep upward-facing on slabs.
+                if (fabsf(n.y) > 0.5f) {
+                    float sign_y = (n.y >= 0.0f) ? 1.0f : -1.0f;
+                    n = f3_norm(make_float3(-wf.y * sign_y, sign_y, -wf.z * sign_y));
+                } else {
+                    n = f3_norm(make_float3(n.x - wf.y * 0.35f, n.y, n.z - wf.z * 0.35f));
+                }
+                // Toksvig / LEADR normal-variance roughness filtering eliminates distant horizon shimmer.
+                float base_r = 0.025f;
+                rough = fminf(0.42f, sqrtf(base_r * base_r + slope_var));
+                // Jacobian whitecaps with fine organic spindrift breakup modulated by user foam gain.
+                float foam_gain = fmaxf(0.0f, params.ocean_params_b[0]);
+                float lace = value_noise2(px * 3.8f + wt * 0.22f, pz * 3.8f - wt * 0.16f) * 0.65f
+                           + value_noise2(px * 11.5f - wt * 0.35f, pz * 11.5f + wt * 0.28f) * 0.35f;
+                float foam_raw = wf.w * foam_gain;
+                float foam_fade = 1.0f - 0.45f * sky_smoothstep(240.0f, 950.0f, cam_dist);
+                water_foam = fminf(1.0f, fmaxf(0.0f, (foam_raw * (0.45f + 1.05f * lace) - 0.14f) * 1.45f)) * foam_fade;
+                clearcoat = 0.0f;
+                cc_rough = rough;
             }
-            rough = is_pool ? 0.02f : 0.035f;
-            clearcoat = 0.95f;
-            cc_rough = 0.025f;
             break;
         }
         case CSG_PROC_METAL: {
@@ -2387,6 +2630,8 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     res.clearcoat = clearcoat;
     res.cc_rough = cc_rough;
     res.ior = mat.ior;
+    res.water_height = water_height;
+    res.water_foam = water_foam;
     res.mat_flags = mat.flags;
     res.proc_kind = mat.procedural_kind;
     return res;
@@ -2818,6 +3063,12 @@ extern "C" __global__ void __raygen__render() {
         // under PREVIEW (`max_bounces == 2`) or default `bounces == 3` while staying strictly bounded.
         int bounce = 0;
         int glass_passes = 0;
+        bool in_water = false;
+        bool water_is_pool = false;
+        float3 water_sigma = make_float3(0.52f, 0.16f, 0.095f);
+        float water_depth_accum = 0.0f;
+        float water_foam_gain = 1.0f;
+        float water_surface_y = 0.0f;
         for (int step = 0; step < 22; ++step) {
             if (bounce >= max_bounces) break;
             if (bounce >= 2) {
@@ -2836,14 +3087,21 @@ extern "C" __global__ void __raygen__render() {
                     nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
                 }
                 if (!aov_geom_only) {
-                    float3 sky = sky_color(dir, sun_dir, step == 0);
-                    sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
-                    if (step == 0 && (s == 0u || aov_aa)) {
-                        first_albedo = make_float3(
-                            fmaxf(0.0f, fminf(1.0f, sky.x)),
-                            fmaxf(0.0f, fminf(1.0f, sky.y)),
-                            fmaxf(0.0f, fminf(1.0f, sky.z))
-                        );
+                    if (in_water) {
+                        // Deep-ocean pelagic volume scatter when a refracted ray exits below a water slab
+                        // with no seabed geometry beneath (prevents sky-bleed under offshore Pacific water).
+                        float3 pelagic = water_pelagic_scatter(sun_dir, water_is_pool);
+                        sample_col = f3_add(sample_col, f3_mul3(throughput, pelagic));
+                    } else {
+                        float3 sky = sky_color(dir, sun_dir, step == 0);
+                        sample_col = f3_add(sample_col, f3_mul3(throughput, sky));
+                        if (step == 0 && (s == 0u || aov_aa)) {
+                            first_albedo = make_float3(
+                                fmaxf(0.0f, fminf(1.0f, sky.x)),
+                                fmaxf(0.0f, fminf(1.0f, sky.y)),
+                                fmaxf(0.0f, fminf(1.0f, sky.z))
+                            );
+                        }
                     }
                 }
                 if (step == 0 && (s == 0u || aov_aa)) {
@@ -2955,7 +3213,7 @@ extern "C" __global__ void __raygen__render() {
             if (is_csg) {
                 unsigned int mat_id = p5 & 0xFFFFu;
                 unsigned int sem_id = (p5 >> 16u) & 0xFFFFu;
-                CsgProcResult pr = eval_csg_procedural(mat_id, sem_id, p7, p6, hit_pos, n);
+                CsgProcResult pr = eval_csg_procedural(mat_id, sem_id, p7, p6, hit_pos, n, dir, hit_t);
                 n = pr.n;
                 base_col = pr.base_col;
                 float rough = pr.rough;
@@ -2963,6 +3221,195 @@ extern "C" __global__ void __raygen__render() {
                 float clearcoat = pr.clearcoat;
                 float cc_rough = pr.cc_rough;
                 float3 emission = pr.emission;
+
+                // True OptiX 9 dielectric reflection & underwater refraction (IOR = 1.333) for CSG_PROC_WATER.
+                if (pr.proc_kind == CSG_PROC_WATER) {
+                    // Bottom face of a thin CSG water slab while traveling underwater: pass straight
+                    // through toward the real seabed / pool floor without artificial bottom reflection.
+                    if (in_water && !entering) {
+                        water_depth_accum += hit_t;
+                        origin = f3_add(hit_pos, f3_mul(dir, 0.004f));
+                        if (glass_passes < 6) {
+                            ++glass_passes;
+                        } else {
+                            ++bounce;
+                        }
+                        continue;
+                    }
+
+                    bool is_pool = (base_col.y > 0.25f && base_col.z > 0.30f);
+                    float w_ior = (pr.ior > 1.05f) ? pr.ior : 1.333f;
+                    float r0 = (1.0f - w_ior) / (1.0f + w_ior);
+                    r0 = r0 * r0;
+                    float w_foam = is_pool ? 0.0f : pr.water_foam;
+                    float w_rough = fmaxf(0.015f, fminf(0.45f, rough));
+
+                    if (step == 0 && (s == 0u || aov_aa)) {
+                        float3 foam_alb = make_float3(0.88f, 0.91f, 0.93f);
+                        float3 alb = f3_add(f3_mul(base_col, 1.0f - w_foam), f3_mul(foam_alb, w_foam));
+                        first_albedo = alb;
+                        first_diffuse = f3_mul(foam_alb, w_foam);
+                        float spec_r0 = r0 * (1.0f - w_foam);
+                        first_specular = make_float3(spec_r0, spec_r0, spec_r0);
+                        first_normal = n;
+                        first_roughness = w_rough * (1.0f - w_foam) + 0.78f * w_foam;
+                        first_mat_pbr = make_float3(first_roughness, 0.0f, 1.0f - w_foam);
+                    }
+                    if (aov_aa) {
+                        break;
+                    }
+
+                    float3 sun_rad = sun_radiance(params.fractal_r1[3]);
+                    float ray_bias_w = fmaxf(0.002f, hit_t * 0.0004f);
+                    float3 biased_w = f3_add(hit_pos, f3_mul(geom_n, ray_bias_w));
+                    float ndotl_w = fmaxf(0.0f, f3_dot(n, sun_dir));
+                    bool w_occluded = false;
+                    if ((ndotl_w > 0.0f || (!is_pool && pr.water_height > 0.04f)) && params.enable_shadows != 0u) {
+                        float3 jitter = make_float3(rand01(seed) - 0.5f, rand01(seed) - 0.5f, rand01(seed) - 0.5f);
+                        float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.020f)));
+                        w_occluded = trace_shadow(biased_w, sdir, 1500.0f);
+                    }
+
+                    // 1. Direct sun specular glitter (Toksvig-filtered roughness prevents horizon shimmer)
+                    //    + sunlit wave-crest emerald/cyan Subsurface Scattering (SSS).
+                    if (!w_occluded) {
+                        if (ndotl_w > 0.0f && w_foam < 0.99f) {
+                            float3 half_v = f3_norm(f3_sub(sun_dir, dir));
+                            float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
+                            float spec_exp = fmaxf(8.0f, 2.0f / (w_rough * w_rough + 0.0008f) - 2.0f);
+                            float spec_norm = (spec_exp + 2.0f) * 0.125f * 0.318309886f;
+                            float spec_val = powf(ndoth, fminf(spec_exp, 2048.0f)) * fminf(spec_norm, 22.0f);
+                            float cos_vh = fminf(1.0f, fmaxf(0.0f, f3_dot(sun_dir, half_v)));
+                            float f_spec = r0 + (1.0f - r0) * powf(1.0f - cos_vh, 5.0f);
+                            float3 glitter = f3_mul(sun_rad, f_spec * spec_val * ndotl_w * (1.0f - w_foam));
+                            sample_col = f3_add(sample_col, f3_mul3(throughput, glitter));
+                        }
+                        // Wave-crest Subsurface Scattering (SSS): forward-scattered emerald-cyan glow
+                        // through tall sunlit wave crests when viewing toward low-to-mid sun.
+                        if (!is_pool && w_foam < 0.95f && sun_dir.y > 0.01f) {
+                            float crest = sky_smoothstep(0.05f, 0.85f, pr.water_height);
+                            float back_scatter = powf(fmaxf(0.0f, f3_dot(dir, f3_norm(make_float3(sun_dir.x, sun_dir.y - 0.15f, sun_dir.z)))), 4.0f);
+                            float grazing = powf(1.0f - fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n))), 2.0f);
+                            float sss_k = crest * (0.18f + 0.82f * back_scatter) * (0.35f + 0.65f * grazing) * (1.0f - w_foam);
+                            float3 sss_tint = make_float3(0.018f, 0.24f, 0.22f);
+                            sample_col = f3_add(sample_col, f3_mul3(throughput, f3_mul3(sss_tint, f3_mul(sun_rad, sss_k * 0.42f))));
+                        }
+                    }
+
+                    // 2. Aerated whitecap foam branch (high-roughness diffuse sea spray on breaking crests).
+                    if (w_foam > 0.01f && rand01(seed) < w_foam) {
+                        float3 foam_col = make_float3(0.86f, 0.90f, 0.93f);
+                        if (!w_occluded && ndotl_w > 0.0f) {
+                            float3 diff_f = f3_mul(f3_mul3(foam_col, sun_rad), ndotl_w * 0.318309886f);
+                            sample_col = f3_add(sample_col, f3_mul3(throughput, diff_f));
+                        }
+                        dir = sample_cosine_hemisphere(n, seed);
+                        origin = biased_w;
+                        throughput = f3_mul3(throughput, foam_col);
+                        ++bounce;
+                        continue;
+                    }
+
+                    // 3. Schlick Fresnel split: real mirror reflection vs Snell underwater refraction.
+                    float eta = entering ? (1.0f / w_ior) : w_ior;
+                    float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
+                    float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
+                    float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
+                    bool tir = sin2_t > 1.0f;
+
+                    if (tir || rand01(seed) < fresnel) {
+                        float3 refl = f3_reflect(dir, n);
+                        if (w_rough > 1e-4f) {
+                            refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), w_rough * 0.85f)));
+                        }
+                        // Prevent perturbed microfacet reflections from dipping below the geometric water plane.
+                        if (f3_dot(refl, geom_n) <= 0.005f) {
+                            refl = f3_norm(make_float3(refl.x, fabsf(refl.y) + 0.02f, refl.z));
+                        }
+                        dir = refl;
+                        origin = biased_w;
+                        ++bounce;
+                    } else {
+                        float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
+                        float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
+                        if (f3_dot(refr, geom_n) >= -0.02f) {
+                            refr = f3_norm(f3_sub(refr, f3_mul(geom_n, f3_dot(refr, geom_n) + 0.05f)));
+                        }
+                        dir = refr;
+                        origin = f3_sub(hit_pos, f3_mul(geom_n, 0.004f));
+                        in_water = true;
+                        water_is_pool = is_pool;
+                        water_depth_accum = 0.0f;
+                        water_surface_y = hit_pos.y;
+                        float clarity = fmaxf(0.25f, params.ocean_params_b[1]);
+                        water_sigma = is_pool
+                            ? make_float3(0.26f / clarity, 0.052f / clarity, 0.040f / clarity)
+                            : make_float3(0.54f / clarity, 0.165f / clarity, 0.095f / clarity);
+                        water_foam_gain = fmaxf(0.0f, params.ocean_params_b[0]);
+                        if (glass_passes < 6) {
+                            ++glass_passes;
+                        } else {
+                            ++bounce;
+                        }
+                    }
+                    continue;
+                }
+
+                // Apply underwater Beer-Lambert absorption, volume in-scatter, shoreline/piling contact foam,
+                // and shallow underwater caustics when a refracted ray strikes seabed / pilings / yacht hulls.
+                float water_caustic_boost = 0.0f;
+                bool hit_from_underwater = false;
+                float3 solar_water_atten = make_float3(1.0f, 1.0f, 1.0f);
+                if (in_water) {
+                    hit_from_underwater = true;
+                    float d_under = fmaxf(0.0f, water_depth_accum + hit_t);
+                    float3 beer = make_float3(
+                        expf(-water_sigma.x * d_under),
+                        expf(-water_sigma.y * d_under),
+                        expf(-water_sigma.z * d_under)
+                    );
+                    // Solar downwelling attenuation through the vertical water column above the seabed hit.
+                    float v_depth = fmaxf(0.0f, water_surface_y - hit_pos.y);
+                    float sun_path = v_depth / fmaxf(sun_dir.y, 0.18f);
+                    solar_water_atten = make_float3(
+                        expf(-water_sigma.x * sun_path),
+                        expf(-water_sigma.y * sun_path),
+                        expf(-water_sigma.z * sun_path)
+                    );
+                    float3 pelagic = water_pelagic_scatter(sun_dir, water_is_pool);
+
+                    // Shoreline / piling / yacht-hull contact foam where solid geometry meets water (< 0.95 m).
+                    if (!water_is_pool && d_under < 0.95f && water_foam_gain > 0.01f) {
+                        float wt = params.csg_traffic_time;
+                        float shore_band = 1.0f - sky_smoothstep(0.04f, 0.95f, d_under);
+                        float surf_n = fbm2(hit_pos.x * 2.1f + wt * 0.24f, hit_pos.z * 2.1f - wt * 0.18f);
+                        float froth = sky_smoothstep(0.30f, 0.72f, surf_n + shore_band * 0.48f);
+                        float contact_foam = fminf(0.88f, shore_band * froth * fminf(1.4f, water_foam_gain));
+                        if (contact_foam > 0.01f) {
+                            float3 sun_rad_f = sun_radiance(params.fractal_r1[3]);
+                            float3 sky_amb = f3_mul(make_float3(0.32f, 0.38f, 0.45f), fmaxf(0.08f, params.sky_params[0]));
+                            float3 foam_lit = f3_add(
+                                f3_mul(sun_rad_f, fmaxf(0.0f, sun_dir.y) * 0.30f),
+                                sky_amb
+                            );
+                            sample_col = f3_add(sample_col, f3_mul3(throughput, f3_mul(foam_lit, contact_foam * 0.85f)));
+                            throughput = f3_mul(throughput, 1.0f - contact_foam * 0.75f);
+                        }
+                    }
+
+                    // Pelagic volume in-scattering along the underwater ray segment: L_pelagic * (1 - T).
+                    sample_col = f3_add(sample_col, f3_mul3(throughput, make_float3(
+                        pelagic.x * (1.0f - beer.x),
+                        pelagic.y * (1.0f - beer.y),
+                        pelagic.z * (1.0f - beer.z)
+                    )));
+                    throughput = f3_mul3(throughput, beer);
+                    water_caustic_boost = eval_water_caustics(
+                        hit_pos.x, hit_pos.z, params.csg_traffic_time, d_under, water_is_pool
+                    );
+                    in_water = false;
+                    water_depth_accum = 0.0f;
+                }
 
                 // Emissive contribution (streetlights, vehicle headlights/taillights, signals, aviation beacons, lit windows)
                 float max_em = fmaxf(emission.x, fmaxf(emission.y, emission.z));
@@ -3077,11 +3524,20 @@ extern "C" __global__ void __raygen__render() {
                     if (params.enable_shadows != 0u) {
                         float3 jitter = make_float3(rand01(seed) - 0.5f, rand01(seed) - 0.5f, rand01(seed) - 0.5f);
                         float3 sdir = f3_norm(f3_add(sun_dir, f3_mul(jitter, 0.024f)));
-                        occluded = trace_shadow(biased_origin, sdir, 1500.0f);
+                        // For underwater seabed/piling hits, launch the solar shadow ray just above the
+                        // water plane so the CSG water sheet itself does not block sunlight & caustics
+                        // while yachts, piers, and buildings above still cast real shadows.
+                        float3 shadow_org = biased_origin;
+                        if (hit_from_underwater && sdir.y > 0.02f && hit_pos.y < water_surface_y) {
+                            float t_surf = (water_surface_y - hit_pos.y) / sdir.y + 0.06f;
+                            shadow_org = f3_add(hit_pos, f3_mul(sdir, t_surf));
+                        }
+                        occluded = trace_shadow(shadow_org, sdir, 1500.0f);
                     }
                     if (!occluded) {
-                        float3 sun_rad = sun_radiance(params.fractal_r1[3]);
-                        float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.85f));
+                        float3 sun_rad = f3_mul3(sun_radiance(params.fractal_r1[3]), solar_water_atten);
+                        float caustic_scale = 1.0f + water_caustic_boost * fmaxf(0.0f, n.y);
+                        float3 diff_term = f3_mul(f3_mul3(base_col, sun_rad), ndotl * 0.318309886f * (1.0f - metallic * 0.85f) * caustic_scale);
                         float3 half_v = f3_norm(f3_sub(sun_dir, dir));
                         float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
                         float spec_exp = fmaxf(4.0f, 2.0f / (rough * rough + 0.002f) - 2.0f);
@@ -3128,6 +3584,11 @@ extern "C" __global__ void __raygen__render() {
                 }
                 ++bounce;
                 continue;
+            }
+
+            if (in_water) {
+                in_water = false;
+                water_depth_accum = 0.0f;
             }
 
             if (inst_id == 2u) {

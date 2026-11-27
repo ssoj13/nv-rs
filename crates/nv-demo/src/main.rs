@@ -23,6 +23,7 @@ mod bench;
 mod csg_scene_host;
 mod cuda_camera;
 mod cuda_crowd;
+mod cuda_ocean;
 mod cuda_traffic;
 mod demo_anim;
 mod fft_bloom;
@@ -64,7 +65,7 @@ mod demo_app {
     use std::sync::{Mutex, mpsc};
 
     use crate::app_events::{
-        AppBus, INTERACTION_SETTLE_WINDOW, PossessInfo, RenderControl, RenderEvent,
+        AppBus, INTERACTION_SETTLE_WINDOW, OceanParams, PossessInfo, RenderControl, RenderEvent,
         RenderStateSnapshot, SmartViewResult, StillFormat, UiCommand,
     };
     use crate::profiler::{GpuTelemetry, Profiler};
@@ -2611,20 +2612,28 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 self.from_sky_intensity + (self.to_sky_intensity - self.from_sky_intensity) * u;
             s.exposure = self.from_exposure + (self.to_exposure - self.from_exposure) * u;
 
-            // Continuous shader sky crossfade across [0, 1] instead of a discrete 1-frame jump.
-            s.sky_mode_from = self.from_sky_mode;
-            s.sky_mode = self.to_sky_mode;
-            s.sky_blend = u;
-
+            if t >= 1.0 {
+                self.apply_target(s);
+                return true;
+            }
             if t >= 0.5 {
                 s.csg_time_of_day = self.to_tod;
             }
-            if t >= 1.0 {
-                self.apply_target(s);
-                true
+
+            // Continuous shader sky crossfade across (1e-4, 0.9999). `raytracer.cu` treats
+            // `sky_blend <= 1e-4` as "no crossfade -> render sky_mode" (required because
+            // `sky_mode_from` is `#[serde(skip)]`), so keep `sky_mode` on `from_sky_mode` while
+            // `u <= 1e-4` (including subframe 0 `dt == 0.0`) to eliminate 1-frame destination flashes.
+            if u <= 1e-4 {
+                s.sky_mode_from = self.from_sky_mode;
+                s.sky_mode = self.from_sky_mode;
+                s.sky_blend = 0.0;
             } else {
-                false
+                s.sky_mode_from = self.from_sky_mode;
+                s.sky_mode = self.to_sky_mode;
+                s.sky_blend = u.clamp(2e-4, 0.9998);
             }
+            false
         }
 
         /// Writes the transition's end state (target preset, crossfade finished) into `s`.
@@ -3026,6 +3035,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         last_smart_view: Option<SmartViewResult>,
         settings: DemoSettings,
         last_sent_settings: DemoSettings,
+        ocean_params: OceanParams,
+        last_sent_ocean: Option<OceanParams>,
         demo_anim: crate::demo_anim::DemoAnimator,
         fractal_presets: crate::fractal_presets::FractalPresetManager,
         flight_workspace: crate::flight::FlightWorkspace,
@@ -3065,6 +3076,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 && let Err(e) = handle.join()
             {
                 eprintln!("nv-demo render thread join error: {e:?}");
+            }
+            // Drain any in-flight Vulkan queue work before `Surface` unconfigures/drops.
+            if let Err(e) = self.interop.device().poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(GPU_COPY_WAIT_TIMEOUT),
+            }) {
+                eprintln!("nv-demo wgpu poll in Drop failed: {e}");
             }
         }
     }
@@ -3761,6 +3779,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 last_smart_view: None,
                 settings,
                 last_sent_settings: settings,
+                ocean_params: OceanParams::default(),
+                last_sent_ocean: None,
                 demo_anim: persisted.demo_anim.clone(),
                 fractal_presets: crate::fractal_presets::FractalPresetManager::load_default(),
                 flight_workspace: {
@@ -4735,6 +4755,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     .render_fatal
                     .as_deref()
                     .or(self.last_saved_msg.as_deref()),
+                ocean_params: &mut self.ocean_params,
                 flight: &mut self.flight,
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
@@ -5740,6 +5761,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if reload_shader_requested {
                 self.send_render(RenderControl::ReloadShader);
             }
+            let sanitized_ocean = self.ocean_params.sanitized();
+            self.ocean_params = sanitized_ocean;
+            if self.last_sent_ocean != Some(sanitized_ocean) {
+                self.last_sent_ocean = Some(sanitized_ocean);
+                self.send_render(RenderControl::SetOceanParams(sanitized_ocean));
+            }
 
             // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.
             // In Smooth 60 FPS recording mode, step everything by exact `(1/60s) * time_scale` per
@@ -6004,9 +6031,35 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // surface draw and present. Texture deltas, platform output, cursor commands, window
             // captures and recorder pushes below still run, or glyph-atlas patches, the one-shot
             // cursor grab and Smooth 60 frames would be lost.
+            let mut reconfigure_after_present = false;
             let frame = match self.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(f)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+                wgpu::CurrentSurfaceTexture::Success(f) => {
+                    if f.texture.width() == self.surface_config.width
+                        && f.texture.height() == self.surface_config.height
+                        && f.texture.format() == self.surface_config.format
+                    {
+                        Some(f)
+                    } else {
+                        drop(f);
+                        let s = self.window.inner_size();
+                        self.resize(s.width, s.height);
+                        None
+                    }
+                }
+                wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                    if f.texture.width() == self.surface_config.width
+                        && f.texture.height() == self.surface_config.height
+                        && f.texture.format() == self.surface_config.format
+                    {
+                        reconfigure_after_present = true;
+                        Some(f)
+                    } else {
+                        drop(f);
+                        let s = self.window.inner_size();
+                        self.resize(s.width, s.height);
+                        None
+                    }
+                }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                     let s = self.window.inner_size();
                     self.resize(s.width, s.height);
@@ -6494,6 +6547,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 };
                 if self.surface_supports_copy_dst
                     && let Some(ref surface_frame) = frame
+                    && surface_frame.texture.width() == cap.width
+                    && surface_frame.texture.height() == cap.height
+                    && surface_frame.texture.format() == cap.texture.format()
                 {
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
@@ -6510,9 +6566,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         },
                         extent,
                     );
-                } else if !self.surface_supports_copy_dst
-                    && let Some(ref surface_view) = view
-                {
+                } else if let Some(ref surface_view) = view {
                     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("egui-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -6861,8 +6915,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
 
+            drop(view);
             if let Some(frame) = frame {
                 self.interop.queue().present(frame);
+            }
+            if reconfigure_after_present {
+                let s = self.window.inner_size();
+                self.resize(s.width, s.height);
             }
             if self.last_persist_at.elapsed().as_secs_f32() >= 1.5 {
                 self.update_window_geometry();
@@ -7307,6 +7366,56 @@ mod ui_pacing_tests {
         assert!((s.sun_elevation - 24.0).abs() < 1e-5);
         assert!((s.sun_intensity - 0.16).abs() < 1e-5);
         assert_eq!(s.sky_mode, 8);
+    }
+
+    #[test]
+    fn tod_transition_never_flashes_destination_sky_at_zero_or_tiny_blend() {
+        let mut s = crate::renderer::DemoSettings::default();
+        crate::ui::apply_csg_time_of_day_preset(&mut s, 1); // Sunset (sky 1)
+        let from_sky = s.sky_mode;
+        let mut target = s;
+        crate::ui::apply_csg_time_of_day_preset(&mut target, 0); // Day (sky 0)
+        let to_sky = target.sky_mode;
+        assert_ne!(from_sky, to_sky);
+
+        let mut tr = demo_app::TodTransition::new(&s, 0, 5.0);
+        // Subframe 0 (`dt = 0.0`) must keep source sky with zero blend (never flash destination).
+        assert!(!tr.step(&mut s, 0.0));
+        assert_eq!(s.sky_mode, from_sky);
+        assert_eq!(s.sky_mode_from, from_sky);
+        assert_eq!(s.sky_blend, 0.0);
+
+        // Step 60 Hz across the entire 5.0 s transition: never emit `to_sky` with `blend <= 1e-4`
+        // before completion, and finish cleanly on `to_sky` with `blend == 0.0`.
+        let dt = 1.0 / 60.0;
+        let mut saw_crossfade = false;
+        let mut finished = false;
+        for _ in 0..310 {
+            let done = tr.step(&mut s, dt);
+            if !done {
+                assert!(
+                    !(s.sky_mode == to_sky && s.sky_blend <= 1e-4),
+                    "1-frame flash regression: sky_mode={to_sky} while sky_blend={}",
+                    s.sky_blend
+                );
+                if s.sky_mode == to_sky {
+                    assert!(
+                        s.sky_blend > 1e-4 && s.sky_blend < 0.9999,
+                        "active crossfade blend {} must stay strictly inside (1e-4, 0.9999)",
+                        s.sky_blend
+                    );
+                    saw_crossfade = true;
+                }
+            } else {
+                assert_eq!(s.sky_mode, to_sky);
+                assert_eq!(s.sky_mode_from, to_sky);
+                assert_eq!(s.sky_blend, 0.0);
+                finished = true;
+                break;
+            }
+        }
+        assert!(saw_crossfade, "transition must crossfade smoothly");
+        assert!(finished, "transition must complete within 5.0 s");
     }
 
     #[test]

@@ -10,11 +10,11 @@
 //! 60 Hz with a single end-of-frame stream fence per rendered frame.
 //! How: waits on [`AppBus::render_wake`], consumes coalesced [`crate::app_events::RenderStateSnapshot`] + discrete
 //! [`RenderControl`] commands, executes one uninterrupted GPU stream burst per frame
-//! (`IAS/Crowd/Camera -> OptiX RT (704 B LaunchParams) -> Denoiser -> Bloom -> Tonemap/Overlay`),
+//! (`IAS/Crowd/Camera/Ocean -> OptiX RT (752 B LaunchParams) -> Denoiser -> Bloom -> Tonemap/Overlay`),
 //! and emits [`RenderEvent`]s (`FrameReady`, `PhaseChanged`, `SceneMetaUpdated`, `Fatal`, etc.).
 //! Uses: `optix`, `cuda_core`, `cuda_bindings`, `appbus`, `csg_scene`, `crate::app_events`,
-//! `crate::csg_scene_host`, `crate::cuda_crowd`, `crate::cuda_camera`, `crate::fft_bloom`,
-//! `crate::gpu_export`, `crate::overlay`, `crate::pick`, `crate::profiler`,
+//! `crate::csg_scene_host`, `crate::cuda_crowd`, `crate::cuda_camera`, `crate::cuda_ocean`,
+//! `crate::fft_bloom`, `crate::gpu_export`, `crate::overlay`, `crate::pick`, `crate::profiler`,
 //! `crate::semantic_filter`, `crate::wireframe`.
 //! Used by: `crate::main`, `crate::ui`, `crate::persist`, `crate::bench`.
 
@@ -39,14 +39,15 @@ use optix::{
 };
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessAdas, PossessInfo, RenderControl, RenderEvent, SceneBuildProgress,
-    SimTelemetry, SmartViewResult, fast_preview_budget,
+    AppBus, EnginePhase, OceanMode, OceanParams, PossessAdas, PossessInfo, RenderControl,
+    RenderEvent, SceneBuildProgress, SimTelemetry, SmartViewResult, fast_preview_budget,
 };
 use crate::csg_scene_host::{
     CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
 };
 use crate::cuda_camera::GpuCameraComposer;
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
+use crate::cuda_ocean::{CudaOcean, pack_ocean_uniforms};
 use crate::cuda_traffic::{CudaTrafficBackend, TrafficScatterBindingPod, TrafficScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
@@ -238,9 +239,22 @@ struct LaunchParams {
     csg_sign_text_len: u32,
     /// Explicit 16-byte alignment padding (`0`).
     _pad_sign_text: u32,
+    /// Device pointer to 3-cascade 256x256 packed cuFFT ocean tiles (`float4[3 * 256 * 256]`),
+    /// `0` when analytical fallback is active or before initialization.
+    ocean_cascades_ptr: u64,
+    /// Explicit 16-byte alignment padding (`0`).
+    _pad_ocean: u64,
+    /// `[wind_speed_mps, wind_dir_rad, choppiness, swell]`.
+    ocean_params_a: [f32; 4],
+    /// `[foam_amount, clarity_depth_m, cascade_dim, use_cufft_flag]`.
+    ocean_params_b: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 704);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 752);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, ocean_params_b) == 736);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, ocean_params_a) == 720);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, _pad_ocean) == 712);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, ocean_cascades_ptr) == 704);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sign_text_len) == 696);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sign_text_bytes) == 688);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_instance_text) == 680);
@@ -1357,6 +1371,7 @@ struct OptixRig {
     cuda_crowd: Option<Result<CudaCrowdBackend, String>>,
     cuda_traffic: Option<Result<CudaTrafficBackend, String>>,
     cuda_camera: Option<Result<GpuCameraComposer, String>>,
+    cuda_ocean: Option<Result<CudaOcean, String>>,
     crowd_slot_map_host: Vec<u32>,
     crowd_gas_handles_host: Vec<u64>,
     traffic_bindings_host: Vec<TrafficScatterBindingPod>,
@@ -2894,7 +2909,7 @@ fn init_optix(
         )));
         bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::BuildingCsgScene));
     }
-    if let Err(err) = csg_host.sync_with_progress(
+    if let Err(err) = csg_host.sync_with_rich_progress(
         &optix_ctx,
         &stream,
         &mut scratch,
@@ -2912,15 +2927,9 @@ fn init_optix(
             omnidirectional: initial_settings.camera_projection.is_omnidirectional(),
         },
         initial_gpu_crowd,
-        &mut |sname, stage, done, total| {
-            bus.publish_build_progress(Some(SceneBuildProgress::new(
-                EnginePhase::BuildingCsgScene,
-                sname,
-                stage,
-                done,
-                total,
-                init_csg_started,
-            )));
+        init_csg_started,
+        &mut |progress| {
+            bus.publish_build_progress(Some(progress));
         },
     ) {
         init_warnings.push(format!("Initial CSG scene sync failed: {err}"));
@@ -3056,10 +3065,34 @@ fn init_optix(
         cuda_crowd: None,
         cuda_traffic: None,
         cuda_camera: None,
+        cuda_ocean: None,
         crowd_slot_map_host: Vec::with_capacity(1024),
         crowd_gas_handles_host: Vec::with_capacity(256),
         traffic_bindings_host: Vec::with_capacity(512),
     })
+}
+
+/// Lazily initializes and advances `rig.cuda_ocean` (3-cascade JONSWAP/TMA `cuFFT` ocean
+/// synthesizer) on `rig.stream`, caching initialization failures so broken cuFFT environments
+/// fall back to analytical waves without per-frame retries or allocations.
+fn step_cuda_ocean<'a>(
+    rig: &'a mut OptixRig,
+    cuda: &Arc<CudaContext>,
+    time_s: f32,
+    params: OceanParams,
+) -> Result<u64, std::borrow::Cow<'a, str>> {
+    if rig.cuda_ocean.is_none() {
+        rig.cuda_ocean = Some(CudaOcean::new(cuda, &rig.stream));
+    }
+    match rig.cuda_ocean.as_mut() {
+        Some(Ok(ocean)) => ocean
+            .step(&rig.stream, time_s, params)
+            .map_err(std::borrow::Cow::Owned),
+        Some(Err(e)) => Err(std::borrow::Cow::Borrowed(e.as_str())),
+        None => Err(std::borrow::Cow::Borrowed(
+            "CUDA ocean backend uninitialized",
+        )),
+    }
 }
 
 /// Lazily initializes `rig.cuda_traffic` (`PlanKind::Traffic` v1) once on first use, caching
@@ -5181,6 +5214,8 @@ pub fn spawn_render_thread(
             let mut last_traffic_backend = ActiveTrafficBackend::None;
             let mut last_cuda_traffic_err: Option<String> = None;
             let mut last_cuda_camera_err: Option<String> = None;
+            let mut ocean_params = OceanParams::default();
+            let mut last_cuda_ocean_err: Option<String> = None;
             let mut gpu_camera_history_valid = false;
             let mut last_crowd_lod_sig = settings.crowd_lod_params().signature_key();
             let mut rec_active = false;
@@ -5456,6 +5491,16 @@ pub fn spawn_render_thread(
                             });
                         }
                         RenderControl::Pick(req) => pick.request(*req),
+                        RenderControl::SetOceanParams(p) => {
+                            let sanitized = p.sanitized();
+                            if sanitized != ocean_params {
+                                if sanitized.mode != ocean_params.mode {
+                                    temporal_history_cut = true;
+                                }
+                                ocean_params = sanitized;
+                                accum_count = 0;
+                            }
+                        }
                         RenderControl::PossessNextVehicle => {
                             if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
                                 bus.emit_render_event(RenderEvent::StatusMessage(format!(
@@ -6343,7 +6388,7 @@ pub fn spawn_render_thread(
                         "CUDA traffic sync before CSG upload failed: {e}"
                     )));
                 }
-                let csg_sync = match rig.csg_host.sync_with_progress(
+                let csg_sync = match rig.csg_host.sync_with_rich_progress(
                     &rig._optix_ctx,
                     &rig.stream,
                     &mut rig._scratch,
@@ -6352,15 +6397,9 @@ pub fn spawn_render_thread(
                     settings.csg_time_of_day,
                     csg_cam_params,
                     sync_gpu_crowd,
-                    &mut |sname, stage, done, total| {
-                        bus.publish_build_progress(Some(SceneBuildProgress::new(
-                            EnginePhase::BuildingCsgScene,
-                            sname,
-                            stage,
-                            done,
-                            total,
-                            scene_build_started,
-                        )));
+                    scene_build_started,
+                    &mut |progress| {
+                        bus.publish_build_progress(Some(progress));
                     },
                 ) {
                     Ok(sync_res) => {
@@ -7155,6 +7194,28 @@ pub fn spawn_render_thread(
                     bus.emit_render_event(RenderEvent::Fatal(e));
                     break 'render;
                 }
+                let ocean_cascades_ptr =
+                    if rig.csg_host.is_active() && ocean_params.mode == OceanMode::CuFft {
+                        match step_cuda_ocean(&mut rig, &cuda, traffic_time, ocean_params) {
+                            Ok(ptr) => {
+                                last_cuda_ocean_err = None;
+                                ptr
+                            }
+                            Err(err) => {
+                                if last_cuda_ocean_err.as_deref() != Some(err.as_ref()) {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "CUDA ocean unavailable ({err}); using analytical waves"
+                                    )));
+                                    last_cuda_ocean_err = Some(err.into_owned());
+                                }
+                                0
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                let (ocean_params_a, ocean_params_b) =
+                    pack_ocean_uniforms(ocean_params, ocean_cascades_ptr);
                 let lp = LaunchParams {
                     out_color_f32: rig.color_f32.cu_deviceptr(),
                     out_albedo_f32: rig.albedo_f32.cu_deviceptr(),
@@ -7303,6 +7364,10 @@ pub fn spawn_render_thread(
                     csg_sign_text_bytes: csg_ptrs.sign_text_bytes,
                     csg_sign_text_len: csg_ptrs.sign_text_len,
                     _pad_sign_text: 0,
+                    ocean_cascades_ptr,
+                    _pad_ocean: 0,
+                    ocean_params_a,
+                    ocean_params_b,
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -8092,7 +8157,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 704);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 752);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -8114,6 +8179,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instance_text), 680);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_sign_text_bytes), 688);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_sign_text_len), 696);
+        assert_eq!(std::mem::offset_of!(LaunchParams, ocean_cascades_ptr), 704);
+        assert_eq!(std::mem::offset_of!(LaunchParams, _pad_ocean), 712);
+        assert_eq!(std::mem::offset_of!(LaunchParams, ocean_params_a), 720);
+        assert_eq!(std::mem::offset_of!(LaunchParams, ocean_params_b), 736);
         assert_eq!(std::mem::offset_of!(LaunchParams, env_from_lo), 192);
         assert_eq!(std::mem::offset_of!(LaunchParams, env_from_hi), 384);
         assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);

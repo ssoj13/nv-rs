@@ -30,8 +30,8 @@ use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessAdas, PossessInfo, SceneBuildProgress, SimTelemetry,
-    SmartViewResult, StillFormat, UiCommand,
+    AppBus, EnginePhase, OceanMode, OceanParams, PossessAdas, PossessInfo, SceneBuildProgress,
+    SimTelemetry, SmartViewResult, StillFormat, UiCommand,
 };
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
@@ -356,7 +356,7 @@ fn draw_scene_build_progress_overlay(
         .request_repaint_after(std::time::Duration::from_millis(50));
 
     let max_w = (viewport_rect.width() - 24.0).max(1.0);
-    let card_w = max_w.clamp(180.0_f32.min(viewport_rect.width()), 340.0);
+    let card_w = max_w.clamp(180.0_f32.min(viewport_rect.width()), 380.0);
     let card_h = 74.0_f32.min(viewport_rect.height());
     let card_rect =
         egui::Rect::from_center_size(viewport_rect.center(), egui::vec2(card_w, card_h));
@@ -407,10 +407,20 @@ fn draw_scene_build_progress_overlay(
         || phase.transient_label().unwrap_or("Working...").to_owned(),
         SceneBuildProgress::format_stage_line,
     );
+    let frac = progress.and_then(SceneBuildProgress::effective_fraction);
     let elapsed_text = progress
-        .map(|bp| SceneBuildProgress::format_elapsed(bp.elapsed_secs(now)))
+        .map(|bp| {
+            let elapsed = SceneBuildProgress::format_elapsed(bp.elapsed_secs(now));
+            if let Some(eta) = bp.eta_secs {
+                format!("{elapsed} | ETA {}", SceneBuildProgress::format_eta(eta))
+            } else if bp.step_count > 0 || frac.is_some() || phase == EnginePhase::BuildingCsgScene
+            {
+                format!("{elapsed} | ETA --:--")
+            } else {
+                elapsed
+            }
+        })
         .unwrap_or_default();
-    let frac = progress.and_then(SceneBuildProgress::fraction);
     let pct_text = match frac {
         Some(f) => format!("{}%", (f * 100.0).round() as u32),
         None => "Working".to_owned(),
@@ -838,6 +848,8 @@ pub struct UiContext<'a> {
     pub smart_view_seed: &'a mut u64,
     pub last_smart_view: Option<SmartViewResult>,
     pub last_saved_msg: Option<&'a str>,
+    /// Live Ocean Water parameters (`cuFFT` 3-cascade spectral / analytical Gerstner + dielectric optics).
+    pub ocean_params: &'a mut OceanParams,
     /// Rail fly-through statistics (Flight stats subsection of the rail panel).
     pub flight: &'a mut crate::flight_stats::FlightStats,
 }
@@ -901,7 +913,8 @@ impl UiContext<'_> {
                 *self.cam_feel,
             );
 
-            ui.label(RichText::new("Orbit").small().weak());
+            ui.label(RichText::new("Orbit").small().weak())
+                .on_hover_text("Primary camera orbiting style used when dragging with the left mouse button.");
             egui::ComboBox::from_id_salt("toolbar_cam_mode")
                 .width(96.0)
                 .selected_text(self.cam_mode.label())
@@ -909,9 +922,12 @@ impl UiContext<'_> {
                     for m in NavMode::ALL.into_iter().filter(|m| !m.is_fly()) {
                         ui.selectable_value(self.cam_mode, m, m.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("Primary camera orbiting style used when dragging with the left mouse button.");
 
-            ui.label(RichText::new("Fly (RMB)").small().weak());
+            ui.label(RichText::new("Fly (RMB)").small().weak())
+                .on_hover_text("Free-flight camera mode while holding the right mouse button and using WASD/QE.");
             egui::ComboBox::from_id_salt("toolbar_cam_fly")
                 .width(104.0)
                 .selected_text(self.cam_fly_mode.label())
@@ -919,9 +935,12 @@ impl UiContext<'_> {
                     for m in NavMode::ALL.into_iter().filter(|m| m.is_fly()) {
                         ui.selectable_value(self.cam_fly_mode, m, m.label());
                     }
-                });
+                })
+                .response
+                .on_hover_text("Free-flight camera mode while holding the right mouse button and using WASD/QE.");
 
-            ui.label(RichText::new("Scheme").small().weak());
+            ui.label(RichText::new("Scheme").small().weak())
+                .on_hover_text("Mouse and keyboard shortcut layout matching familiar 3D apps (Maya, Houdini, Blender, Unreal).");
             egui::ComboBox::from_id_salt("toolbar_cam_scheme")
                 .width(74.0)
                 .selected_text(nav_scheme_label(*self.cam_scheme))
@@ -929,9 +948,12 @@ impl UiContext<'_> {
                     for s in NavScheme::ALL {
                         ui.selectable_value(self.cam_scheme, s, nav_scheme_label(s));
                     }
-                });
+                })
+                .response
+                .on_hover_text("Mouse and keyboard shortcut layout matching familiar 3D apps (Maya, Houdini, Blender, Unreal).");
 
-            ui.label(RichText::new("Feel").small().weak());
+            ui.label(RichText::new("Feel").small().weak())
+                .on_hover_text("Camera motion damping: Sharp stops immediately while Smooth glides softly to a halt.");
             egui::ComboBox::from_id_salt("toolbar_cam_feel")
                 .width(74.0)
                 .selected_text(nav_feel_label(*self.cam_feel))
@@ -939,7 +961,9 @@ impl UiContext<'_> {
                     for f in NavFeel::ALL {
                         ui.selectable_value(self.cam_feel, f, nav_feel_label(f));
                     }
-                });
+                })
+                .response
+                .on_hover_text("Camera motion damping: Sharp stops immediately while Smooth glides softly to a halt.");
 
             if (
                 *self.cam_mode,
@@ -1004,7 +1028,8 @@ impl UiContext<'_> {
 
             ui.separator();
 
-            ui.label(RichText::new("AOV").small().weak());
+            ui.label(RichText::new("AOV").small().weak())
+                .on_hover_text("Select which render output pass to display (final Beauty image, depth, normals, motion, semantic labels, etc.).");
             egui::ComboBox::from_id_salt("toolbar_aov_mode")
                 .width(102.0)
                 .selected_text(aov_pass(self.settings.aov_mode).label)
@@ -1012,9 +1037,12 @@ impl UiContext<'_> {
                     for (idx, pass) in AOV_PASSES.iter().enumerate() {
                         ui.selectable_value(&mut self.settings.aov_mode, idx as u32, pass.label);
                     }
-                });
+                })
+                .response
+                .on_hover_text("Select which render output pass to display (final Beauty image, depth, normals, motion, semantic labels, etc.).");
 
-            ui.label(RichText::new("Lens").small().weak());
+            ui.label(RichText::new("Lens").small().weak())
+                .on_hover_text("Camera optical lens projection: standard Pinhole, 180-degree Fisheye, 360 Equirectangular, or SlitCam.");
             egui::ComboBox::from_id_salt("toolbar_lens_proj")
                 .width(96.0)
                 .selected_text(self.settings.camera_projection.label())
@@ -1026,7 +1054,9 @@ impl UiContext<'_> {
                             proj.label(),
                         );
                     }
-                });
+                })
+                .response
+                .on_hover_text("Camera optical lens projection: standard Pinhole, 180-degree Fisheye, 360 Equirectangular, or SlitCam.");
 
             let pick_on = *self.pick_possess_mode;
             let pick_btn = if pick_on {
@@ -3037,6 +3067,10 @@ impl UiContext<'_> {
             }
         });
 
+        collapsing_section(ui, "sec_ocean", ic::WAVES, "Ocean Water", |ui| {
+            render_ocean_water_controls(ui, self.ocean_params);
+        });
+
         collapsing_section(ui, "sec_dof", ic::APERTURE, "Lens DoF", |ui| {
             anim_slider_f32(
                 ui,
@@ -3923,7 +3957,7 @@ impl UiContext<'_> {
                                         .min_size(egui::vec2(w, ROW_H + 2.0)),
                                 )
                                 .on_hover_text(
-                                    "Jump directly into a driving Robotaxi / vehicle or mounted landmark (cycles targets on each click; Ctrl+Click viewport to pick any object).",
+                                    "Jump into a driving car or mounted landmark camera. Click again to cycle targets, or Ctrl+Click anything in the viewport.",
                                 )
                                 .clicked()
                             {
@@ -3938,7 +3972,7 @@ impl UiContext<'_> {
                                         .min_size(egui::vec2(w, ROW_H + 2.0)),
                                 )
                                 .on_hover_text(
-                                    "Score 64 city viewpoints on OptiX 9 / WGPU / CPU and smoothly glide to the best composition.",
+                                    "Evaluate 64 candidate viewpoints across the scene and smoothly glide the camera to the best framing.",
                                 )
                                 .clicked()
                             {
@@ -3953,7 +3987,9 @@ impl UiContext<'_> {
                             }
                         }
                     });
-                    prop_row(ui, "Probe", |ui| {
+                    let probe_tip = "Engine used by Smart View to score candidate camera views. Auto picks OptiX 9 GPU when available.";
+                    prop_row_labeled(ui, "Probe", true, |ui, label_resp| {
+                        label_resp.on_hover_text(probe_tip);
                         egui::ComboBox::from_id_salt("cinema_probe_backend")
                             .width(ui.available_width().max(32.0))
                             .truncate()
@@ -3971,7 +4007,9 @@ impl UiContext<'_> {
                                         kind.label(),
                                     );
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text(probe_tip);
                     });
                     if let Some(sv) = self.last_smart_view {
                         let sv_txt = fmt_into(
@@ -3986,23 +4024,26 @@ impl UiContext<'_> {
                                 sv.elapsed_ms
                             ),
                         );
-                        ui.label(RichText::new(sv_txt).size(10.5).weak());
+                        ui.label(RichText::new(sv_txt).size(10.5).weak())
+                            .on_hover_text("Score summary from the most recent Smart View run: composite rating, views checked, scene variety, depth spread, and search time.");
                     }
-                    prop_slider_f32(
+                    prop_slider_f32_tip(
                         ui,
                         "Cam Smooth",
                         &mut s.cam_smooth_tau,
                         0.0..=1.0,
                         2,
                         "s",
+                        "How gently the camera eases into movement and turns. Higher seconds feel more cinematic; 0 s responds instantly.",
                     );
-                    prop_slider_f32(
+                    prop_slider_f32_tip(
                         ui,
                         "Time Scale",
                         &mut s.time_scale,
                         TIME_SCALE_MIN..=TIME_SCALE_MAX,
                         2,
                         "x",
+                        "Playback speed multiplier for moving traffic, crowds, animations, and flight rails (1.0x is real time).",
                     );
                 },
             );
@@ -4014,13 +4055,21 @@ impl UiContext<'_> {
                 tip_buf,
                 ..
             } = &mut *self.scratch;
-            stat_row(
+            stat_row_desc(
                 ui,
                 "Resolution",
                 fmt_into(buf, format_args!("{} x {}", self.render_w, self.render_h)),
+                "Internal ray-tracing render width and height in pixels (lower with DLSS upscaling for faster frames).",
+                tip_buf,
             );
-            stat_row(ui, "UI FPS", fmt_into(buf, format_args!("{:.0} FPS", self.ui_fps)));
-            stat_row(
+            stat_row_desc(
+                ui,
+                "UI FPS",
+                fmt_into(buf, format_args!("{:.0} FPS", self.ui_fps)),
+                "How smoothly the interface and dock panels redraw each second, decoupled from ray-tracing speed.",
+                tip_buf,
+            );
+            stat_row_desc(
                 ui,
                 "RT FPS",
                 fmt_into(
@@ -4032,6 +4081,8 @@ impl UiContext<'_> {
                         if self.fast_preview { " fast" } else { "" }
                     ),
                 ),
+                "Ray-traced frames completed per second and render time per frame ('fast' indicates interactive preview mode).",
+                tip_buf,
             );
             render_accum_bar(
                 ui,
@@ -4041,13 +4092,21 @@ impl UiContext<'_> {
                 buf,
                 tip_buf,
             );
-            stat_row(
+            stat_row_desc(
                 ui,
                 "Bloom / TM",
                 fmt_into(buf, format_args!("{:.2} / {:.2} ms", self.bloom_ms, self.tonemap_ms)),
+                "GPU time spent on diffraction glow (bloom) and tone mapping HDR light into display colors each frame.",
+                tip_buf,
             );
-            stat_row(ui, "Denoiser", fmt_into(buf, format_args!("{:.1} ms", self.denoise_ms)));
-            stat_row(
+            stat_row_desc(
+                ui,
+                "Denoiser",
+                fmt_into(buf, format_args!("{:.1} ms", self.denoise_ms)),
+                "Time spent by the AI denoiser cleaning up path-tracing noise each frame.",
+                tip_buf,
+            );
+            stat_row_desc(
                 ui,
                 "DLSS RR",
                 match (self.dlss_rr_available, self.settings.dlss_rr_on) {
@@ -4055,8 +4114,10 @@ impl UiContext<'_> {
                     (true, false) => "Available",
                     (false, _) => "Unavailable",
                 },
+                "NVIDIA DLSS Ray Reconstruction status: AI-powered upscaling and denoising for sharper real-time ray tracing.",
+                tip_buf,
             );
-            stat_row(
+            stat_row_desc(
                 ui,
                 "OptiX SER",
                 match (self.ser_supported, self.settings.ser_on) {
@@ -4064,6 +4125,8 @@ impl UiContext<'_> {
                     (true, false) => "HW Off",
                     (false, _) => "Unsupported",
                 },
+                "Hardware Shader Execution Reordering status: groups similar rays on RTX GPUs to speed up complex scenes.",
+                tip_buf,
             );
         });
 
@@ -4137,20 +4200,26 @@ impl UiContext<'_> {
                 tip_buf,
                 ..
             } = &mut *self.scratch;
-            stat_row(
+            stat_row_desc(
                 ui,
                 "RT Cores",
                 fmt_into(buf, format_args!("{:.2} ms (OptiX)", self.rt_ms)),
+                "Time spent on dedicated RTX ray-tracing cores tracing light paths through the scene each frame.",
+                tip_buf,
             );
-            stat_row(
+            stat_row_desc(
                 ui,
                 "Tensor Cores",
                 fmt_into(buf, format_args!("{:.2} ms (Den/DLSS)", self.tensor_cores_ms)),
+                "Time spent on AI Tensor Cores running the OptiX denoiser or DLSS upscaling/reconstruction.",
+                tip_buf,
             );
-            stat_row(
+            stat_row_desc(
                 ui,
                 "CUDA Compute",
                 fmt_into(buf, format_args!("{:.2} ms (IAS/FFT/TM)", self.cuda_compute_ms)),
+                "Time spent on general GPU compute shaders for scene updates, simulations, ocean FFT, bloom, and tone mapping.",
+                tip_buf,
             );
             render_perf_frame_split_bar(
                 ui,
@@ -4165,37 +4234,49 @@ impl UiContext<'_> {
                 ui,
                 buf,
                 tip_buf,
-                "RT Cores",
+                SparklineMeta {
+                    label: "RT Cores",
+                    desc: "Recent frame-by-frame RT Core ray-tracing duration in milliseconds (lower is faster).",
+                    unit: "ms",
+                },
                 &self.timings.rt_cores_ms,
                 Color32::from_rgb(138, 173, 244),
-                "ms",
             );
             sparkline_row(
                 ui,
                 buf,
                 tip_buf,
-                "Tensor",
+                SparklineMeta {
+                    label: "Tensor",
+                    desc: "Recent frame-by-frame AI denoiser and DLSS Tensor Core duration in milliseconds.",
+                    unit: "ms",
+                },
                 &self.timings.tensor_cores_ms,
                 Color32::from_rgb(166, 209, 137),
-                "ms",
             );
             sparkline_row(
                 ui,
                 buf,
                 tip_buf,
-                "CUDA SM",
+                SparklineMeta {
+                    label: "CUDA SM",
+                    desc: "Recent frame-by-frame general CUDA compute duration for simulations, ocean FFT, bloom, and tone mapping.",
+                    unit: "ms",
+                },
                 &self.timings.cuda_compute_ms,
                 Color32::from_rgb(238, 212, 159),
-                "ms",
             );
             sparkline_row(
                 ui,
                 buf,
                 tip_buf,
-                "FPS",
+                SparklineMeta {
+                    label: "FPS",
+                    desc: "Recent history of rendered frames per second (higher and steadier means smoother motion).",
+                    unit: "",
+                },
                 &self.timings.fps,
                 Color32::from_rgb(198, 160, 246),
-                "",
             );
         });
     }
@@ -4392,6 +4473,7 @@ fn section_accent(id_salt: &str) -> Color32 {
         "sec_csg" => Color32::from_rgb(92, 184, 224),
         "sec_lod" => Color32::from_rgb(104, 192, 186),
         "sec_sky" => Color32::from_rgb(232, 178, 84),
+        "sec_ocean" => Color32::from_rgb(68, 178, 212),
         "sec_env" => Color32::from_rgb(98, 162, 208),
         "sec_dof" => Color32::from_rgb(198, 118, 162),
         "sec_floor" => Color32::from_rgb(154, 134, 212),
@@ -4429,6 +4511,7 @@ const SECTION_GROUPS: &[&[&str]] = &[
         "sec_csg",
         "sec_lod",
         "sec_sky",
+        "sec_ocean",
         "sec_dof",
         "sec_floor",
         "sec_scene",
@@ -4480,6 +4563,7 @@ fn section_default_open(id_salt: &str) -> bool {
             | "sec_csg"
             | "sec_lod"
             | "sec_sky"
+            | "sec_ocean"
             | "sec_pt"
             | "sec_flab_author"
             | "sec_flab_dynamics"
@@ -4698,7 +4782,7 @@ pub(crate) fn allocate_clamped_ui<R>(
 /// Renders a compact `11.0 pt` monospace `DragValue` inside a hard-clamped `val_w` column with
 /// `2.0 px` horizontal padding so values with unit suffixes (`"35.0 deg"`, `"12.0 m/s2"`,
 /// `"20.0 m/s3"`) fit cleanly and every slider value box shares one exact columnar width.
-fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) {
+fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) -> egui::Response {
     allocate_clamped_ui(
         ui,
         egui::vec2(val_w, ROW_H),
@@ -4712,9 +4796,9 @@ fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) {
             style.text_styles.insert(egui::TextStyle::Monospace, font);
             style.spacing.button_padding.x = 2.0;
             style.spacing.interact_size.x = val_w;
-            ui.add(drag);
+            ui.add(drag)
         },
-    );
+    )
 }
 
 /// Computes adaptive `(label_w, rem_w)` column widths for a property row so labels shrink
@@ -4779,6 +4863,17 @@ pub(crate) fn equal_grid(
 }
 
 pub(crate) fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
+    prop_row_labeled(ui, label, false, |ui, _| add_contents(ui));
+}
+
+/// Core property row helper that passes the left label's [`egui::Response`] into `add_contents`
+/// so callers can bind one shared hover tooltip across both label and right-hand control/value.
+fn prop_row_labeled(
+    ui: &mut Ui,
+    label: &str,
+    suppress_clip_tip: bool,
+    add_contents: impl FnOnce(&mut Ui, egui::Response),
+) {
     let row_w = ui.available_width().max(1.0);
     let gap = 6.0;
     let (label_w, rem_w) = prop_row_widths(row_w);
@@ -4807,16 +4902,18 @@ pub(crate) fn prop_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut 
                     galley,
                     Color32::WHITE,
                 );
-            if clipped && label_resp.hovered() {
-                label_resp.on_hover_text(label);
-            }
+            let label_resp = if !suppress_clip_tip && clipped && label_resp.hovered() {
+                label_resp.on_hover_text(label)
+            } else {
+                label_resp
+            };
             let ctrl_w = ui.available_width().min(rem_w).max(1.0);
             allocate_clamped_ui(
                 ui,
                 egui::vec2(ctrl_w, ROW_H),
                 Layout::left_to_right(Align::Center),
                 |ui| {
-                    add_contents(ui);
+                    add_contents(ui, label_resp);
                 },
             );
         },
@@ -4930,7 +5027,22 @@ pub(crate) fn prop_slider_f32(
     decimals: usize,
     suffix: &str,
 ) {
-    prop_row(ui, label, |ui| {
+    prop_slider_f32_tip(ui, label, val, range, decimals, suffix, "");
+}
+
+/// Like [`prop_slider_f32`] with a plain-language hover tooltip bound to the label, slider track,
+/// and numeric [`egui::DragValue`] box.
+fn prop_slider_f32_tip(
+    ui: &mut Ui,
+    label: &str,
+    val: &mut f32,
+    range: RangeInclusive<f32>,
+    decimals: usize,
+    suffix: &str,
+    tip: &str,
+) {
+    let has_tip = !tip.is_empty();
+    prop_row_labeled(ui, label, has_tip, |ui, label_resp| {
         let gap = 4.0;
         let (track_w, val_w) = slider_control_widths(ui.available_width());
         ui.spacing_mut().item_spacing.x = gap;
@@ -4942,7 +5054,7 @@ pub(crate) fn prop_slider_f32(
             0.01
         };
         let slider = egui::Slider::new(val, range.clone()).show_value(false);
-        ui.add_sized([track_w, ROW_H], slider);
+        let slider_resp = ui.add_sized([track_w, ROW_H], slider);
         let mut drag = egui::DragValue::new(val)
             .range(range)
             .fixed_decimals(decimals)
@@ -4950,7 +5062,12 @@ pub(crate) fn prop_slider_f32(
         if !suffix.is_empty() {
             drag = drag.suffix(suffix);
         }
-        slider_drag_value(ui, val_w, drag);
+        let drag_resp = slider_drag_value(ui, val_w, drag);
+        if has_tip {
+            label_resp.on_hover_text(tip);
+            slider_resp.on_hover_text(tip);
+            drag_resp.on_hover_text(tip);
+        }
         anim_toggle_btn_disabled(ui);
     });
 }
@@ -5036,8 +5153,19 @@ pub(crate) fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     });
 }
 
-/// Like [`stat_row`] with a lazily formatted hover tooltip (runs `format_tip` only while hovered
-/// so steady-state 60 Hz frames spend zero CPU and zero allocations on tooltip text).
+/// Like [`stat_row`] with a concise plain-language hover tooltip active on both the label and
+/// value cells (formatting the full value alongside the description only when hovered).
+fn stat_row_desc(ui: &mut Ui, label: &str, value: &str, desc: &str, tip_buf: &mut String) {
+    stat_row_tip(ui, label, value, tip_buf, |t| {
+        t.push_str(desc);
+        if !value.is_empty() {
+            let _ = write!(t, "\nCurrent: {value}");
+        }
+    });
+}
+
+/// Like [`stat_row`] with a lazily formatted hover tooltip active on both the left label and the
+/// right value cell (runs `format_tip` only while hovered so 60 Hz frames do zero work).
 fn stat_row_tip(
     ui: &mut Ui,
     label: &str,
@@ -5045,9 +5173,9 @@ fn stat_row_tip(
     tip_buf: &mut String,
     format_tip: impl FnOnce(&mut String),
 ) {
-    prop_row(ui, label, |ui| {
+    prop_row_labeled(ui, label, true, |ui, label_resp| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let resp = ui.add(
+            let val_resp = ui.add(
                 egui::Label::new(
                     RichText::new(value)
                         .size(11.5)
@@ -5055,7 +5183,14 @@ fn stat_row_tip(
                 )
                 .truncate(),
             );
-            if resp.hovered() {
+            let target = if val_resp.hovered() {
+                Some(val_resp)
+            } else if label_resp.hovered() {
+                Some(label_resp)
+            } else {
+                None
+            };
+            if let Some(resp) = target {
                 tip_buf.clear();
                 format_tip(tip_buf);
                 resp.on_hover_text(tip_buf.as_str());
@@ -5127,7 +5262,7 @@ fn stat_badge_row_tip(
     format_tip: impl FnOnce(&mut String),
 ) {
     let (pill_fg, pill_bg) = pill_colors(ui, pill.tone);
-    prop_row(ui, label, |ui| {
+    prop_row_labeled(ui, label, true, |ui, label_resp| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
             let mut hovered_resp = None;
@@ -5173,6 +5308,8 @@ fn stat_badge_row_tip(
             }
             if pill_resp.hovered() {
                 hovered_resp = Some(pill_resp);
+            } else if hovered_resp.is_none() && label_resp.hovered() {
+                hovered_resp = Some(label_resp);
             }
             if let Some(resp) = hovered_resp {
                 tip_buf.clear();
@@ -5193,7 +5330,7 @@ fn stacked_bar_row(
     tip_buf: &mut String,
     format_tip: impl FnOnce(&mut String),
 ) {
-    prop_row(ui, label, |ui| {
+    prop_row_labeled(ui, label, true, |ui, label_resp| {
         let avail_w = ui.available_width().max(1.0);
         let gap = 5.0;
         let (bar_w, val_w) = if let Some(txt) = right_text {
@@ -5310,12 +5447,106 @@ fn stacked_bar_row(
                 hovered_resp = Some(txt_resp);
             }
         }
+        if hovered_resp.is_none() && label_resp.hovered() {
+            hovered_resp = Some(label_resp);
+        }
         if let Some(resp) = hovered_resp {
             tip_buf.clear();
             format_tip(tip_buf);
             resp.on_hover_text(tip_buf.as_str());
         }
     });
+}
+
+/// Renders the `Ocean Water` section controls (`Mode`, `Wind Speed`, `Wind Dir`, `Choppiness`,
+/// `Swell`, `Foam`, `Water Clarity`, plus Reset) using SSOT width-clamped helpers and plain-language
+/// hover tooltips on every control.
+fn render_ocean_water_controls(ui: &mut Ui, ocean: &mut OceanParams) {
+    let mode_tip = "Wave solver: cuFFT Spectral runs a 3-cascade GPU FFT ocean; Analytical uses a fast procedural wave sum.";
+    prop_row_labeled(ui, "Mode", true, |ui, label_resp| {
+        label_resp.on_hover_text(mode_tip);
+        let gap = 4.0;
+        let combo_w = (ui.available_width() - ANIM_BTN_W - gap).max(32.0);
+        ui.spacing_mut().item_spacing.x = gap;
+        egui::ComboBox::from_id_salt("ocean_mode_combo")
+            .width(combo_w)
+            .truncate()
+            .selected_text(ocean.mode.label())
+            .show_ui(ui, |ui| {
+                for m in OceanMode::ALL {
+                    ui.selectable_value(&mut ocean.mode, m, m.label());
+                }
+            })
+            .response
+            .on_hover_text(mode_tip);
+        anim_toggle_btn_disabled(ui);
+    });
+    prop_slider_f32_tip(
+        ui,
+        "Wind Speed",
+        &mut ocean.wind_speed,
+        1.0..=25.0,
+        1,
+        " m/s",
+        "Surface wind speed driving wave height and energy (higher winds build larger, steeper swells).",
+    );
+    prop_slider_f32_tip(
+        ui,
+        "Wind Dir",
+        &mut ocean.wind_dir_deg,
+        0.0..=360.0,
+        0,
+        " deg",
+        "Compass direction that wind and ocean waves travel toward in degrees.",
+    );
+    prop_slider_f32_tip(
+        ui,
+        "Choppiness",
+        &mut ocean.choppiness,
+        0.0..=2.0,
+        2,
+        "",
+        "Sharpness of wave peaks from horizontal crest pinching (0 is gentle rolling swells, 2 is steep choppy peaks).",
+    );
+    prop_slider_f32_tip(
+        ui,
+        "Swell",
+        &mut ocean.swell,
+        0.0..=1.0,
+        2,
+        "",
+        "Strength of long-distance Pacific swells blended with local wind ripples.",
+    );
+    prop_slider_f32_tip(
+        ui,
+        "Foam",
+        &mut ocean.foam,
+        0.0..=2.0,
+        2,
+        "",
+        "Intensity of whitecaps on breaking wave crests and aerated shoreline contact foam.",
+    );
+    prop_slider_f32_tip(
+        ui,
+        "Water Clarity",
+        &mut ocean.clarity,
+        0.25..=3.0,
+        2,
+        "",
+        "How far sunlight penetrates underwater before absorbing into deep navy (higher reveals more seabed and turquoise shallows).",
+    );
+    ui.add_space(2.0);
+    let btn_w = ui.available_width().max(40.0);
+    if ui
+        .add_sized(
+            [btn_w, ROW_H + 2.0],
+            egui::Button::new(format!("{}  Reset Ocean Defaults", ic::ARROWS_CLOCKWISE)),
+        )
+        .on_hover_text("Restore default Pacific Ocean wind, swell, foam, and clarity settings.")
+        .clicked()
+    {
+        *ocean = OceanParams::default();
+    }
 }
 
 /// Renders the `Render & Frame -> Accum` progress bar (green when converged, blue while
@@ -5353,7 +5584,7 @@ fn render_accum_bar(
             let status = if converged { "Converged" } else { "Accumulating" };
             let _ = write!(
                 t,
-                "Accumulation: {accum_count} / {max_accum} ({pct:.0}%)\nTotal Samples: {total_samples} spp | Status: {status}"
+                "Progressive path-tracing samples blended together to clear noise (green means converged).\nProgress: {accum_count} / {max_accum} ({pct:.0}%) | Total: {total_samples} spp | Status: {status}"
             );
         });
     } else {
@@ -5365,7 +5596,7 @@ fn render_accum_bar(
         stacked_bar_row(ui, "Accum", &segs, Some(txt), tip_buf, |t| {
             let _ = write!(
                 t,
-                "Continuous Accumulation (max_accum = 0)\nFrames: {accum_count} | Total Samples: {total_samples} spp"
+                "Continuous path-tracing accumulation without a fixed sample cap (max_accum = 0).\nFrames: {accum_count} | Total Samples: {total_samples} spp"
             );
         });
     }
@@ -5419,7 +5650,7 @@ fn render_perf_frame_split_bar(
         let cuda_pct = (cuda / denom) * 100.0;
         let _ = write!(
             t,
-            "GPU Frame Total: {tot:.2} ms\nRT Cores: {rt:.2} ms ({rt_pct:.1}%) | Tensor: {tensor:.2} ms ({tensor_pct:.1}%)\nCUDA Compute: {cuda:.2} ms ({cuda_pct:.1}%)\nTargets: 60 FPS (16.7 ms) | 30 FPS (33.3 ms)"
+            "Visual share of GPU frame time across RT Cores, Tensor Cores, and CUDA Compute to spot the bottleneck.\nTotal: {tot:.2} ms | RT: {rt:.2} ms ({rt_pct:.1}%) | Tensor: {tensor:.2} ms ({tensor_pct:.1}%) | CUDA: {cuda:.2} ms ({cuda_pct:.1}%)\nTargets: 60 FPS (16.7 ms) | 30 FPS (33.3 ms)"
         );
     });
 }
@@ -5432,14 +5663,22 @@ fn render_gpu_hw_body(
     label_buf: &mut String,
     tip_buf: &mut String,
 ) {
-    stat_row(ui, "GPU", &telemetry.gpu_name);
-    stat_row(
+    stat_row_desc(
+        ui,
+        "GPU",
+        &telemetry.gpu_name,
+        "Active NVIDIA graphics card rendering this scene (via NVML hardware monitoring).",
+        tip_buf,
+    );
+    stat_row_desc(
         ui,
         "VRAM",
         fmt_into(
             label_buf,
             format_args!("{} / {} MiB", telemetry.vram_used_mib, telemetry.vram_total_mib),
         ),
+        "Video memory currently used versus total capacity on your graphics card.",
+        tip_buf,
     );
     if telemetry.vram_total_mib > 0 {
         let used = telemetry.vram_used_mib.min(telemetry.vram_total_mib);
@@ -5466,18 +5705,20 @@ fn render_gpu_hw_body(
         stacked_bar_row(ui, "VRAM Use", &segs, Some(pct_txt), tip_buf, |t| {
             let _ = write!(
                 t,
-                "VRAM Used: {used} / {} MiB ({pct:.1}%)\nFree: {free} MiB",
+                "Percentage of GPU memory in use (turns amber above 75% and red above 90% when nearing capacity).\nUsed: {used} / {} MiB ({pct:.1}%) | Free: {free} MiB",
                 telemetry.vram_total_mib
             );
         });
     }
-    stat_row(
+    stat_row_desc(
         ui,
         "Clocks",
         fmt_into(
             label_buf,
             format_args!("{} / {} MHz", telemetry.gpu_clock_mhz, telemetry.mem_clock_mhz),
         ),
+        "Live GPU core and video memory clock speeds in MHz (boosts automatically under render load).",
+        tip_buf,
     );
 
     let util = telemetry.util_gpu.min(100);
@@ -5502,7 +5743,7 @@ fn render_gpu_hw_body(
     stacked_bar_row(ui, "GPU Load", &load_segs, Some(load_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "GPU Core Utilization: {util}% (NVML)\nThresholds: <=80% nominal | >80% high | >95% saturated"
+            "Percentage of time the GPU is actively executing work (turns amber above 80% and red above 95%).\nUtilization: {util}% (NVML)"
         );
     });
 
@@ -5529,7 +5770,7 @@ fn render_gpu_hw_body(
     stacked_bar_row(ui, "GPU Temp", &temp_segs, Some(temp_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "GPU Die Temperature: {temp} C (bar scale 25..95 C)\nThresholds: <75 C cool | >=75 C warm | >=85 C hot"
+            "Current graphics chip temperature (cool below 75 C, warm at 75-84 C, hot at 85 C and above).\nDie Temp: {temp} C (bar scale 25..95 C)"
         );
     });
 
@@ -5563,12 +5804,24 @@ fn render_gpu_hw_body(
     stacked_bar_row(ui, "Power", &power_segs, Some(power_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "Board Power Draw: {power_w:.1} W ({power_pct:.0}% of {power_ceil:.0} W reference scale)"
+            "Real-time electrical power drawn by the graphics card in Watts.\nDraw: {power_w:.1} W ({power_pct:.0}% of {power_ceil:.0} W reference scale)"
         );
     });
 
-    stat_row(ui, "CUPTI", &telemetry.cupti_status);
-    stat_row(ui, "NGX", &telemetry.ngx_status);
+    stat_row_desc(
+        ui,
+        "CUPTI",
+        &telemetry.cupti_status,
+        "CUDA Profiling Tools Interface status used to measure low-level GPU kernel timing.",
+        tip_buf,
+    );
+    stat_row_desc(
+        ui,
+        "NGX",
+        &telemetry.ngx_status,
+        "NVIDIA NGX runtime status required for DLSS Super Resolution and Ray Reconstruction.",
+        tip_buf,
+    );
 }
 
 /// Renders the `CSG Scene & LOD` section body (`CSG Inst`, `CSG LOD`, live LOD & SBT Path stacked
@@ -5579,15 +5832,17 @@ fn render_csg_stats_body(
     label_buf: &mut String,
     tip_buf: &mut String,
 ) {
-    stat_row(
+    stat_row_desc(
         ui,
         "CSG Inst",
         fmt_into(
             label_buf,
             format_args!("{} / {}", stats.visible_instances, stats.total_instances),
         ),
+        "Procedural scene objects currently visible to rays out of all objects in the world.",
+        tip_buf,
     );
-    stat_row(
+    stat_row_desc(
         ui,
         "CSG LOD",
         fmt_into(
@@ -5597,6 +5852,8 @@ fn render_csg_stats_body(
                 stats.lod0_count, stats.lod1_count, stats.lod2_count, stats.culled_count
             ),
         ),
+        "Breakdown of objects by Level of Detail: L0 full detail, L1 medium, L2 coarse far silhouette, C culled out of view.",
+        tip_buf,
     );
     let lod_segs = [
         BarSegment {
@@ -5632,7 +5889,7 @@ fn render_csg_stats_body(
     stacked_bar_row(ui, "LOD Mix", &lod_segs, Some(vis_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "LOD0 (Full): {} | LOD1 (Mid): {}\nLOD2 (Coarse): {} | Culled: {}\nVisible: {vis_pct:.1}% of {lod_total} instances",
+            "Visual share of full, medium, coarse, and culled objects; shifts dynamically as you move the camera.\nLOD0: {} | LOD1: {} | LOD2: {} | Culled: {} ({vis_pct:.1}% visible of {lod_total})",
             stats.lod0_count, stats.lod1_count, stats.lod2_count, stats.culled_count
         );
     });
@@ -5665,7 +5922,7 @@ fn render_csg_stats_body(
             let denom = path_total as f32;
             let _ = write!(
                 t,
-                "OptiX Evaluation Paths ({path_total} visible, {fast_pct:.1}% fast-path)\nSingle Prim (SBT 10): {p_single} ({:.1}%) | Pure Union (SBT 10): {p_pure} ({:.1}%)\nExact Union (SBT 12): {p_first} ({:.1}%) | General RPN (SBT 8): {p_rpn} ({:.1}%)",
+                "Share of visible objects using fast single-shape/union ray paths versus full CSG tree evaluation.\nFast Path: {fast_pct:.1}% of {path_total} | Single (SBT 10): {p_single} ({:.1}%) | Pure Union: {p_pure} ({:.1}%)\nExact Union (SBT 12): {p_first} ({:.1}%) | General RPN (SBT 8): {p_rpn} ({:.1}%)",
                 (p_single as f32 / denom) * 100.0,
                 (p_pure as f32 / denom) * 100.0,
                 (p_first as f32 / denom) * 100.0,
@@ -5674,29 +5931,35 @@ fn render_csg_stats_body(
         });
     }
 
-    stat_row(
+    stat_row_desc(
         ui,
         "CSG DAG",
         fmt_into(
             label_buf,
             format_args!("{} GAS / {} prm", stats.compounds, stats.primitives),
         ),
+        "Unique procedural shape templates (GAS) and analytical primitives making up the world with zero triangle meshes.",
+        tip_buf,
     );
-    stat_row(
+    stat_row_desc(
         ui,
         "CSG Aux",
         fmt_into(
             label_buf,
             format_args!("{:.1} KiB", stats.aux_planes_bytes as f64 / 1024.0),
         ),
+        "GPU memory used by auxiliary terrain elevation, road tiles, and clipping planes.",
+        tip_buf,
     );
-    stat_row(
+    stat_row_desc(
         ui,
         "CSG VRAM",
         fmt_into(
             label_buf,
             format_args!("{:.1} KiB", stats.gpu_bytes as f64 / 1024.0),
         ),
+        "Total GPU memory holding all procedural scene geometry buffers for OptiX ray tracing.",
+        tip_buf,
     );
 }
 
@@ -5749,7 +6012,7 @@ fn render_crowd_stats_body(
             };
             let _ = write!(
                 t,
-                "Backend: {} | Step: {:.2} ms",
+                "Where walking pedestrians and animals are simulated and how long each step takes.\nBackend: {} | Step: {:.2} ms",
                 sim.crowd_backend.label(),
                 sim.crowd_step_ms
             );
@@ -5774,7 +6037,7 @@ fn render_crowd_stats_body(
         let [hero, ped, sign, pet] = sim.crowd_archetypes;
         let _ = write!(
             t,
-            "Total: {} actors\nHumanHero: {hero} | HumanCrowd: {ped}\nRoadSign: {sign} | Quadruped: {pet}\nWalkways: {} | Obstacles: {}",
+            "Total animated characters in the scene broken down by character type.\nTotal: {} | Hero: {hero} | Ped: {ped} | Sign: {sign} | Pet: {pet}\nWalkways: {} | Obstacles: {}",
             sim.crowd_actors, sim.crowd_walkways, sim.crowd_obstacles
         );
     });
@@ -5802,7 +6065,7 @@ fn render_crowd_stats_body(
     stacked_bar_row(ui, "Archetypes", &arch_segs, Some(total_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "Hero: {hero} | Pedestrian: {ped}\nStickman: {sign} | Pet: {pet}\nTotal: {} actors",
+            "Visual mix of character types currently active in the crowd.\nHero: {hero} | Pedestrian: {ped} | Stickman: {sign} | Pet: {pet} (Total: {})",
             sim.crowd_actors
         );
     });
@@ -5815,7 +6078,7 @@ fn render_crowd_stats_body(
         let bps = sim.bones_per_sec(rt_fps);
         let _ = write!(
             t,
-            "Bones: {} | World Joints: {}\nSkeleton Edges: {} | Total DOFs: {}",
+            "Total articulated skeleton bones and motion joints updated each frame across all characters.\nBones: {} | World Joints: {} | Skeleton Edges: {} | DOFs: {}",
             sim.crowd_bones, sim.crowd_joints, sim.crowd_skeleton_edges, sim.crowd_dofs
         );
         if bps >= 1000.0 {
@@ -5846,14 +6109,14 @@ fn render_crowd_stats_body(
     stat_row_tip(ui, "Locomotion", loco_val, tip_buf, |t| {
         let _ = write!(
             t,
-            "State: {} (rate {:.2}x)\nCrowd LOD: ",
+            "Animation playback speed, freeze state, terrain ground-check status, and GPU follow-camera state.\nState: {} (rate {:.2}x) | Crowd LOD: ",
             if sim.pose_frozen { "Frozen" } else { "Active" },
             sim.sim_rate
         );
         sim.append_lod_summary(t);
         let _ = write!(
             t,
-            "\nGround Probe Misses (12 B async DMA): {}\nGPU Camera Rig (PlanKind::Camera v1): {}",
+            "\nGround Probe Misses (12 B async DMA): {} | GPU Camera Rig: {}",
             sim.crowd_ground_misses,
             if sim.gpu_camera_active {
                 "Active (VRAM zero-copy)"
@@ -5867,7 +6130,7 @@ fn render_crowd_stats_body(
         SimTelemetry::write_bytes_compact(sim.crowd_gpu_bytes, label_buf);
         let _ = write!(label_buf, " ({} rbld)", sim.crowd_ias_rebuilds);
         stat_row_tip(ui, "Crowd VRAM", label_buf.as_str(), tip_buf, |t| {
-            t.push_str("Plan + Scatter Bridge VRAM: ");
+            t.push_str("GPU memory reserved for crowd simulation buffers and full scene rebuilds after large movement.\nPlan + Scatter Bridge VRAM: ");
             SimTelemetry::append_bytes_compact(sim.crowd_gpu_bytes, t);
             let _ = write!(
                 t,
@@ -5916,7 +6179,7 @@ fn render_crowd_stats_body(
         let o_pct = (other_ms / denom_ms) * 100.0;
         let _ = write!(
             t,
-            "Simulation Share of CUDA Compute ({denom_ms:.2} ms)\nCrowd: {crowd_ms:.2} ms ({c_pct:.1}%) | Traffic: {traffic_ms:.2} ms ({t_pct:.1}%)\nOther CUDA (IAS/FFT/TM): {other_ms:.2} ms ({o_pct:.1}%)"
+            "Portion of total CUDA Compute frame time spent simulating crowds and traffic versus other GPU compute.\nTotal: {denom_ms:.2} ms | Crowd: {crowd_ms:.2} ms ({c_pct:.1}%) | Traffic: {traffic_ms:.2} ms ({t_pct:.1}%)\nOther CUDA (IAS/Ocean/FFT/TM): {other_ms:.2} ms ({o_pct:.1}%)"
         );
     });
 
@@ -5925,19 +6188,25 @@ fn render_crowd_stats_body(
         ui,
         label_buf,
         tip_buf,
-        "Crowd ms",
+        SparklineMeta {
+            label: "Crowd ms",
+            desc: "Recent history of crowd simulation time per frame in milliseconds (lower leaves more budget for ray tracing).",
+            unit: "ms",
+        },
         &timings.crowd_step_ms,
         Color32::from_rgb(166, 209, 137),
-        "ms",
     );
     sparkline_row(
         ui,
         label_buf,
         tip_buf,
-        "kBones/s",
+        SparklineMeta {
+            label: "kBones/s",
+            desc: "Thousands of animated character bones updated per second (higher reflects larger crowds or higher FPS).",
+            unit: "k",
+        },
         &timings.crowd_kbones_s,
         Color32::from_rgb(112, 186, 238),
-        "k",
     );
 }
 
@@ -5991,7 +6260,7 @@ fn render_traffic_stats_body(
         |t| {
             let _ = write!(
                 t,
-                "Backend: {} | Step: {:.2} ms | Lane Graph: {}\nDynamic Instances (bodies + wheels): {}",
+                "Where road vehicles are simulated (CUDA GPU or CPU) and how long each step takes.\nBackend: {} | Step: {:.2} ms | Lane Graph: {} | Dyn Inst: {}",
                 sim.traffic_backend.label(),
                 sim.traffic_step_ms,
                 if sim.traffic_has_lane_graph {
@@ -6004,7 +6273,7 @@ fn render_traffic_stats_body(
             if sim.traffic_backend == ActiveTrafficBackend::Cuda {
                 let _ = write!(
                     t,
-                    "\nPlanKind::Traffic v{} ({} kernels, StrictF32)\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                    "\nPlanKind::Traffic v{} ({} kernels, StrictF32) | IAS Rebuilds: {}",
                     sim.traffic_plan_version.max(1),
                     sim.traffic_kernel_count,
                     sim.traffic_ias_rebuilds
@@ -6024,7 +6293,7 @@ fn render_traffic_stats_body(
     stat_row_tip(ui, "Vehicles", veh_val, tip_buf, |t| {
         let _ = write!(
             t,
-            "Total: {} vehicles\nMoving (>0.25 m/s): {} | Stopped/Queued: {}\nDynamic CSG Instances: {}",
+            "Total road vehicles in the city split into moving traffic and cars stopped at lights or queues.\nTotal: {} | Moving (>0.25 m/s): {} | Stopped: {} | CSG Inst: {}",
             sim.traffic_vehicles, sim.traffic_moving, stopped, sim.traffic_dyn_instances
         );
     });
@@ -6057,7 +6326,7 @@ fn render_traffic_stats_body(
     stacked_bar_row(ui, "Fleet State", &fleet_segs, Some(fleet_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "Moving (Clear): {moving_clear} | Ped Yield: {yld_v}\nPed AEB (Emergency Brake): {aeb_v} | Stopped/Queued: {stopped_other}\nTotal Fleet: {total_v} vehicles"
+            "Live visual split of cruising cars (green), yielding cars (amber), emergency braking (red), and stopped cars (grey).\nMoving: {moving_clear} | Ped Yield: {yld_v} | Ped AEB: {aeb_v} | Stopped: {stopped_other} (Total: {total_v})"
         );
     });
 
@@ -6070,7 +6339,7 @@ fn render_traffic_stats_body(
     stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
         let _ = write!(
             t,
-            "Mean Speed: {avg_kmh:.1} km/h ({:.2} m/s)\nPeak Speed: {max_kmh:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
+            "Average and top driving speed across all vehicles in the road network.\nMean: {avg_kmh:.1} km/h ({:.2} m/s) | Peak: {max_kmh:.1} km/h ({:.2} m/s)\nRespawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
             sim.traffic_avg_speed_mps,
             sim.traffic_max_speed_mps,
             sim.traffic_respawns,
@@ -6103,7 +6372,7 @@ fn render_traffic_stats_body(
     stacked_bar_row(ui, "Flow Speed", &flow_segs, Some(flow_bar_txt), tip_buf, |t| {
         let _ = write!(
             t,
-            "Mean Flow Speed: {avg_kmh:.1} km/h ({:.2} m/s)\nPeak Fleet Speed: {max_kmh:.1} km/h ({:.2} m/s) | Scale Ceiling: {ceil_kmh:.0} km/h",
+            "Average fleet speed compared against the fastest vehicle so you can spot traffic jams at a glance.\nMean: {avg_kmh:.1} km/h ({:.2} m/s) | Peak: {max_kmh:.1} km/h ({:.2} m/s) | Scale: {ceil_kmh:.0} km/h",
             sim.traffic_avg_speed_mps, sim.traffic_max_speed_mps
         );
     });
@@ -6120,7 +6389,7 @@ fn render_traffic_stats_body(
     stat_row_tip(ui, "Ped Safety", safety_val, tip_buf, |t| {
         let _ = write!(
             t,
-            "Pedestrian AEB (Emergency Braking): {}\nPedestrian Yield (Crosswalk Slowdown): {}\nDeadlock Relocations: {}\nStale Junction Releases: {} | Network Respawns: {}",
+            "Count of cars actively emergency-braking (AEB) or slowing (Yield) for crossing pedestrians, plus deadlock clears.\nPed AEB: {} | Ped Yield: {} | Deadlock Reloc: {}\nStale Junction Releases: {} | Network Respawns: {}",
             sim.traffic_aeb_active,
             sim.traffic_yield_active,
             sim.traffic_deadlock_relocations,
@@ -6132,7 +6401,7 @@ fn render_traffic_stats_body(
     if sim.traffic_backend == ActiveTrafficBackend::Cuda && sim.traffic_gpu_bytes > 0 {
         SimTelemetry::write_bytes_compact(sim.traffic_gpu_bytes, label_buf);
         stat_row_tip(ui, "Traffic VRAM", label_buf.as_str(), tip_buf, |t| {
-            t.push_str("PlanKind::Traffic + Scatter Bridge VRAM: ");
+            t.push_str("GPU memory holding vehicle lane-graph simulation and wheel/body transform buffers.\nPlanKind::Traffic + Scatter Bridge VRAM: ");
             SimTelemetry::append_bytes_compact(sim.traffic_gpu_bytes, t);
             let _ = write!(
                 t,
@@ -6147,28 +6416,37 @@ fn render_traffic_stats_body(
         ui,
         label_buf,
         tip_buf,
-        "Traffic ms",
+        SparklineMeta {
+            label: "Traffic ms",
+            desc: "Recent history of vehicle simulation step time per frame in milliseconds.",
+            unit: "ms",
+        },
         &timings.traffic_step_ms,
         Color32::from_rgb(238, 212, 159),
-        "ms",
     );
     sparkline_row(
         ui,
         label_buf,
         tip_buf,
-        "Flow",
+        SparklineMeta {
+            label: "Flow",
+            desc: "Recent trend of average vehicle speed in km/h (dips indicate red lights or congestion).",
+            unit: "km/h",
+        },
         &timings.traffic_avg_kmh,
         Color32::from_rgb(122, 206, 138),
-        "km/h",
     );
     sparkline_row(
         ui,
         label_buf,
         tip_buf,
-        "AEB/Yld",
+        SparklineMeta {
+            label: "AEB/Yld",
+            desc: "Recent count of vehicles actively braking or yielding for pedestrians (spikes mark live crosswalk encounters).",
+            unit: "",
+        },
         &timings.traffic_ped_events,
         Color32::from_rgb(238, 112, 92),
-        "",
     );
 }
 
@@ -6502,19 +6780,27 @@ fn semantic_filter_menu(ui: &mut Ui, mask: &mut u64, osm_mask: &mut u32) {
     resp.on_hover_text(tip);
 }
 
-/// Renders a compact, width-clamped live telemetry sparkline inside a [`prop_row`] with a subtle
-/// mid-height guide line, translucent vertical-gradient area fill, bright latest-sample dot,
-/// monospace readout, and lazy min/max hover tooltip.
+/// Static metadata for a [`sparkline_row`] (label, plain-English description, unit suffix).
+#[derive(Clone, Copy)]
+struct SparklineMeta<'a> {
+    label: &'a str,
+    desc: &'a str,
+    unit: &'a str,
+}
+
+/// Renders a compact, width-clamped live telemetry sparkline inside a [`prop_row_labeled`] with a
+/// subtle mid-height guide line, translucent vertical-gradient area fill, bright latest-sample
+/// dot, monospace readout, and lazy plain-English + min/max hover tooltip on both label and plot.
 fn sparkline_row(
     ui: &mut Ui,
     label_buf: &mut String,
     tip_buf: &mut String,
-    label: &str,
+    meta: SparklineMeta<'_>,
     ring: &RingBuffer<HISTORY_LEN>,
     color: Color32,
-    unit: &str,
 ) {
-    prop_row(ui, label, |ui| {
+    let unit = meta.unit;
+    prop_row_labeled(ui, meta.label, true, |ui, label_resp| {
         let avail_w = ui.available_width().max(1.0);
         let gap = 5.0;
         let desired_val_w: f32 = if unit.len() >= 3 {
@@ -6646,20 +6932,26 @@ fn sparkline_row(
             Some(plot_resp)
         } else if val_resp.hovered() {
             Some(val_resp)
+        } else if label_resp.hovered() {
+            Some(label_resp)
         } else {
             None
         };
         if let Some(resp) = hovered {
             tip_buf.clear();
+            if !meta.desc.is_empty() {
+                tip_buf.push_str(meta.desc);
+                tip_buf.push('\n');
+            }
             let suffix = if unit.is_empty() { "" } else { unit };
             let sep = if unit.is_empty() { "" } else { " " };
             if n > 0 {
                 let _ = write!(
                     tip_buf,
-                    "{label}: {latest:.2}{sep}{suffix}\nRange: {min_v:.2} .. {max_v:.2}{sep}{suffix} ({n} frames)"
+                    "Latest: {latest:.2}{sep}{suffix} | Range: {min_v:.2} .. {max_v:.2}{sep}{suffix} ({n} frames)"
                 );
             } else {
-                let _ = write!(tip_buf, "{label}: no samples yet");
+                tip_buf.push_str("No samples collected yet.");
             }
             resp.on_hover_text(tip_buf.as_str());
         }
@@ -7292,7 +7584,20 @@ mod tests {
             112,
             246,
             now,
-        );
+        )
+        .with_step(4, 12)
+        .with_overall(Some(0.62))
+        .with_eta(Some(8.6));
+        let warming_up = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "Gundo",
+            "Baking road tiles",
+            3,
+            32,
+            now,
+        )
+        .with_step(2, 10)
+        .with_overall(Some(0.14));
 
         for theme in UiTheme::ALL {
             let ctx = egui::Context::default();
@@ -7304,6 +7609,7 @@ mod tests {
                 for (phase, progress, time) in [
                     (EnginePhase::CompilingOptix, None, 0.25_f64),
                     (EnginePhase::BuildingCsgScene, Some(&indeterminate), 0.75_f64),
+                    (EnginePhase::BuildingCsgScene, Some(&warming_up), 1.0_f64),
                     (EnginePhase::BuildingCsgScene, Some(&determinate), 1.25_f64),
                 ] {
                     let mut card_rect = egui::Rect::NOTHING;
@@ -7631,37 +7937,49 @@ mod tests {
                                         ui,
                                         &mut label_buf,
                                         &mut tip_buf,
-                                        "Empty",
+                                        SparklineMeta {
+                                            label: "Empty",
+                                            desc: "Empty sparkline edge case.",
+                                            unit: "ms",
+                                        },
                                         &empty_ring,
                                         Color32::from_rgb(138, 173, 244),
-                                        "ms",
                                     );
                                     sparkline_row(
                                         ui,
                                         &mut label_buf,
                                         &mut tip_buf,
-                                        "Single",
+                                        SparklineMeta {
+                                            label: "Single",
+                                            desc: "Single-sample sparkline edge case.",
+                                            unit: "k",
+                                        },
                                         &single_ring,
                                         Color32::from_rgb(166, 209, 137),
-                                        "k",
                                     );
                                     sparkline_row(
                                         ui,
                                         &mut label_buf,
                                         &mut tip_buf,
-                                        "Zero",
+                                        SparklineMeta {
+                                            label: "Zero",
+                                            desc: "All-zero flat sparkline edge case.",
+                                            unit: "",
+                                        },
                                         &flat_zero_ring,
                                         Color32::from_rgb(238, 112, 92),
-                                        "",
                                     );
                                     sparkline_row(
                                         ui,
                                         &mut label_buf,
                                         &mut tip_buf,
-                                        "Const",
+                                        SparklineMeta {
+                                            label: "Const",
+                                            desc: "Constant non-zero sparkline edge case.",
+                                            unit: "km/h",
+                                        },
                                         &flat_const_ring,
                                         Color32::from_rgb(122, 206, 138),
-                                        "km/h",
                                     );
                                     stacked_bar_row(
                                         ui,
@@ -7710,6 +8028,57 @@ mod tests {
                 assert!(
                     max_right <= panel_w + 0.5,
                     "{theme:?} width {panel_w}: sectioned Camera & Stats overflowed right edge ({max_right} > {panel_w})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ocean_water_controls_fit_narrow_docks_and_register_section() {
+        let fallback_accent = section_accent("sec_unknown_fallback_sentinel");
+        assert_ne!(section_accent("sec_ocean"), fallback_accent);
+        assert!(section_group_for("sec_ocean").contains(&"sec_ocean"));
+        assert!(section_group_for("sec_ocean").contains(&"sec_sky"));
+        assert!(section_default_open("sec_ocean"));
+
+        for theme in [UiTheme::Obsidian, UiTheme::Light] {
+            for panel_w in [240.0_f32, 280.0, 340.0] {
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                let _dock_style = theme.apply(&ctx);
+                let mut ocean = OceanParams::default();
+                let mut avail_before = 0.0_f32;
+                let mut avail_after = 0.0_f32;
+                let mut max_right = 0.0_f32;
+
+                for _pass in 0..2 {
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(panel_w, 600.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        dock_scroll(ui, |ui| {
+                            collapsing_section(ui, "sec_ocean", ic::WAVES, "Ocean Water", |ui| {
+                                avail_before = ui.available_width();
+                                render_ocean_water_controls(ui, &mut ocean);
+                                avail_after = ui.available_width();
+                                max_right = ui.min_rect().right();
+                            });
+                        });
+                    });
+                    out.drop_without_applying_deltas();
+                }
+
+                assert!(
+                    (avail_after - avail_before).abs() <= 0.5,
+                    "{theme:?} width {panel_w}: ocean controls drifted available_width ({avail_before} -> {avail_after})"
+                );
+                assert!(
+                    max_right <= panel_w + 0.5,
+                    "{theme:?} width {panel_w}: ocean controls overflowed right edge ({max_right} > {panel_w})"
                 );
             }
         }

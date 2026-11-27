@@ -27,6 +27,7 @@ use csg_scene::traffic::{
     IDM_ACCEL_MAX, MAX_BRAKE_DECEL, VehicleHazardStatePod, hazard_flags, hazard_state,
 };
 use csg_scene::{CameraMount, ProbeBackendKind, ViewScore};
+use serde::{Deserialize, Serialize};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady, OverlayOutPtrs};
@@ -427,9 +428,173 @@ impl SimTelemetry {
     }
 }
 
+/// Ocean wave simulation backend selected for `CSG_PROC_WATER` ocean surfaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OceanMode {
+    /// 3-cascade 256x256 JONSWAP + TMA spectral ocean synthesized via `cufft`.
+    #[default]
+    CuFft,
+    /// Pure analytical multi-octave directional Gerstner / dispersion wave sum.
+    Analytical,
+}
+
+impl OceanMode {
+    /// Every ocean simulation mode in UI display order.
+    pub const ALL: [Self; 2] = [Self::CuFft, Self::Analytical];
+
+    /// Human-readable UI label for this ocean simulation mode.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CuFft => "cuFFT Spectral",
+            Self::Analytical => "Analytical",
+        }
+    }
+}
+
+/// Shared Single Source of Truth ocean wave and dielectric water optics parameters dispatched via
+/// [`RenderControl::SetOceanParams`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OceanParams {
+    /// Spectral `cuFFT` 3-cascade synthesis vs analytical Gerstner wave sum.
+    pub mode: OceanMode,
+    /// 10 m wind speed in m/s (`1.0..=25.0`; default `9.5`).
+    pub wind_speed: f32,
+    /// Dominant wind / wave propagation azimuth in degrees (`0.0..=360.0`; default `245.0`).
+    pub wind_dir_deg: f32,
+    /// Horizontal Gerstner / Jacobian choppiness factor (`0.0..=2.0`; default `1.15`).
+    pub choppiness: f32,
+    /// Long-fetch Pacific swell energy blend (`0.0..=1.0`; default `0.65`).
+    pub swell: f32,
+    /// Whitecap & shoreline contact foam intensity multiplier (`0.0..=2.0`; default `1.0`).
+    pub foam: f32,
+    /// Beer-Lambert optical water clarity multiplier (`0.25..=3.0`; default `1.0`).
+    pub clarity: f32,
+}
+
+impl Default for OceanParams {
+    fn default() -> Self {
+        Self {
+            mode: OceanMode::CuFft,
+            wind_speed: 9.5,
+            wind_dir_deg: 245.0,
+            choppiness: 1.15,
+            swell: 0.65,
+            foam: 1.0,
+            clarity: 1.0,
+        }
+    }
+}
+
+impl OceanParams {
+    /// Clamps every field into its valid physical / UI range, replacing non-finite values with
+    /// defaults.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let d = Self::default();
+        let clamp = |v: f32, lo: f32, hi: f32, fb: f32| {
+            if v.is_finite() { v.clamp(lo, hi) } else { fb }
+        };
+        Self {
+            mode: self.mode,
+            wind_speed: clamp(self.wind_speed, 1.0, 25.0, d.wind_speed),
+            wind_dir_deg: if self.wind_dir_deg.is_finite() {
+                self.wind_dir_deg.rem_euclid(360.0)
+            } else {
+                d.wind_dir_deg
+            },
+            choppiness: clamp(self.choppiness, 0.0, 2.0, d.choppiness),
+            swell: clamp(self.swell, 0.0, 1.0, d.swell),
+            foam: clamp(self.foam, 0.0, 2.0, d.foam),
+            clarity: clamp(self.clarity, 0.25, 3.0, d.clarity),
+        }
+    }
+}
+
+/// Window length for the moving-average build ETA estimator (`SMA-10`).
+pub const ETA_SMA_WINDOW: usize = 10;
+
+/// Zero-allocation 10-step moving average (`SMA-10`) ETA estimator over completed monotonic
+/// progress intervals (`dt_secs / delta_units`).
+///
+/// Returns `None` until at least 2 intervals have completed so early single-tick startup spikes
+/// never flash misleading ETAs; once warmed up, predicts remaining seconds smoothly from the
+/// rolling mean over the last `<= 10` intervals.
+#[derive(Clone, Copy, Debug)]
+pub struct BuildEtaTracker {
+    rates: [f32; ETA_SMA_WINDOW],
+    head: usize,
+    count: usize,
+    last_progress: f32,
+    last_at: Instant,
+}
+
+impl BuildEtaTracker {
+    /// Creates a fresh tracker anchored at `started_at` with zero completed units.
+    #[must_use]
+    pub const fn new(started_at: Instant) -> Self {
+        Self {
+            rates: [0.0; ETA_SMA_WINDOW],
+            head: 0,
+            count: 0,
+            last_progress: 0.0,
+            last_at: started_at,
+        }
+    }
+
+    /// Number of completed intervals currently stored in the rolling window (`0..=10`).
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub const fn sample_count(&self) -> usize {
+        self.count
+    }
+
+    /// Records progress `completed_units` out of `total_units` at timestamp `now` and returns the
+    /// estimated remaining seconds (`None` while `< 2` intervals have completed or `total_units <= 0`).
+    pub fn record(&mut self, completed_units: f32, total_units: f32, now: Instant) -> Option<f32> {
+        if !completed_units.is_finite() || !total_units.is_finite() || total_units <= 0.0 {
+            return None;
+        }
+        let cur = completed_units.clamp(0.0, total_units);
+        let delta = cur - self.last_progress;
+        if delta > 1.0e-6 {
+            let dt = now.saturating_duration_since(self.last_at).as_secs_f32();
+            if dt.is_finite() && dt >= 0.0 {
+                let secs_per_unit = dt / delta;
+                if secs_per_unit.is_finite() {
+                    self.rates[self.head] = secs_per_unit;
+                    self.head = (self.head + 1) % ETA_SMA_WINDOW;
+                    if self.count < ETA_SMA_WINDOW {
+                        self.count += 1;
+                    }
+                }
+            }
+            self.last_progress = cur;
+            self.last_at = now;
+        }
+        if self.count < 2 {
+            return None;
+        }
+        let remaining = (total_units - cur).max(0.0);
+        if remaining <= 1.0e-6 {
+            return Some(0.0);
+        }
+        let sum: f32 = self.rates[..self.count].iter().copied().sum();
+        let avg_secs_per_unit = sum / (self.count as f32);
+        let eta = remaining * avg_secs_per_unit;
+        if eta.is_finite() && eta >= 0.0 {
+            Some(eta)
+        } else {
+            None
+        }
+    }
+}
+
 /// Live progress snapshot published by the OptiX render worker while compiling pipelines,
 /// generating a CSG world, building per-compound OptiX GASes, or rebuilding the top-level IAS.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SceneBuildProgress {
     /// Active transient engine phase (`CompilingOptix`, `BuildingCsgScene`, or `UpdatingIas`).
     pub phase: EnginePhase,
@@ -443,6 +608,14 @@ pub struct SceneBuildProgress {
     pub total: u32,
     /// Monotonic timestamp when the current build/compile operation started.
     pub started_at: Instant,
+    /// 1-based macro step index within the overall scene build (`0` when unspecified).
+    pub step_idx: u32,
+    /// Total macro step count across the overall scene build (`0` when unspecified).
+    pub step_count: u32,
+    /// Overall clamped completion fraction across all build steps in `[0.0, 1.0]`.
+    pub overall_fraction: Option<f32>,
+    /// Estimated remaining seconds from the 10-step moving average (`None` while warming up).
+    pub eta_secs: Option<f32>,
 }
 
 impl SceneBuildProgress {
@@ -462,7 +635,36 @@ impl SceneBuildProgress {
             done,
             total,
             started_at,
+            step_idx: 0,
+            step_count: 0,
+            overall_fraction: None,
+            eta_secs: None,
         }
+    }
+
+    /// Attaches a 1-based macro step counter (`step_idx / step_count`) to this snapshot.
+    #[inline]
+    #[must_use]
+    pub fn with_step(mut self, step_idx: u32, step_count: u32) -> Self {
+        self.step_idx = step_idx;
+        self.step_count = step_count;
+        self
+    }
+
+    /// Attaches an overall completion fraction across all steps (sanitized to `[0.0, 1.0]`).
+    #[inline]
+    #[must_use]
+    pub fn with_overall(mut self, fraction: Option<f32>) -> Self {
+        self.overall_fraction = fraction.and_then(|f| f.is_finite().then(|| f.clamp(0.0, 1.0)));
+        self
+    }
+
+    /// Attaches an estimated remaining duration in seconds (sanitized to finite `>= 0.0`).
+    #[inline]
+    #[must_use]
+    pub fn with_eta(mut self, eta_secs: Option<f32>) -> Self {
+        self.eta_secs = eta_secs.and_then(|s| (s.is_finite() && s >= 0.0).then_some(s));
+        self
     }
 
     /// Returns the clamped completion fraction in `[0.0, 1.0]` when `total > 0`, or `None`
@@ -475,6 +677,13 @@ impl SceneBuildProgress {
             let clamped = self.done.min(self.total);
             Some((clamped as f32 / self.total as f32).clamp(0.0, 1.0))
         }
+    }
+
+    /// Returns the best available determinate progress fraction (`overall_fraction`, falling back
+    /// to substage [`Self::fraction`]).
+    #[inline]
+    pub fn effective_fraction(&self) -> Option<f32> {
+        self.overall_fraction.or_else(|| self.fraction())
     }
 
     /// Elapsed wall-clock seconds since `started_at` (never negative).
@@ -507,8 +716,48 @@ impl SceneBuildProgress {
         out
     }
 
-    /// Appends the current substage label (plus `(done/total)` when determinate) into `out`.
+    /// Appends `secs` formatted as `~MM:SS.d` into `out`.
+    pub fn write_eta(out: &mut String, secs: f32) {
+        out.push('~');
+        Self::write_elapsed(out, secs);
+    }
+
+    /// Formats `secs` as `~MM:SS.d`.
+    pub fn format_eta(secs: f32) -> String {
+        let mut out = String::with_capacity(9);
+        Self::write_eta(&mut out, secs);
+        out
+    }
+
+    /// Appends `"Step k/N"` into `out` when `step_count > 0` and returns `true`.
+    pub fn write_step_prefix(&self, out: &mut String) -> bool {
+        if self.step_count == 0 {
+            return false;
+        }
+        let k = self.step_idx.clamp(1, self.step_count);
+        let Ok(()) = write!(out, "Step {k}/{}", self.step_count) else {
+            unreachable!("writing to String cannot fail");
+        };
+        true
+    }
+
+    /// Formats `"Step k/N"` when `step_count > 0`, or `None` otherwise.
+    #[cfg(test)]
+    pub fn format_step_prefix(&self) -> Option<String> {
+        if self.step_count == 0 {
+            return None;
+        }
+        let mut out = String::with_capacity(14);
+        let _ = self.write_step_prefix(&mut out);
+        Some(out)
+    }
+
+    /// Appends the current substage label (prefixed with `"Step k/N | "` when step metadata is
+    /// present, plus `" (done/total)"` when determinate) into `out`.
     pub fn write_stage_line(&self, out: &mut String) {
+        if self.write_step_prefix(out) {
+            out.push_str(" | ");
+        }
         out.push_str(&self.stage);
         if self.total > 0 {
             let clamped = self.done.min(self.total);
@@ -518,15 +767,15 @@ impl SceneBuildProgress {
         }
     }
 
-    /// Formats the current substage label (plus `(done/total)` when determinate).
+    /// Formats the current substage label (plus step prefix and `(done/total)` when determinate).
     pub fn format_stage_line(&self) -> String {
-        let mut out = String::with_capacity(self.stage.len() + 16);
+        let mut out = String::with_capacity(self.stage.len() + 28);
         self.write_stage_line(&mut out);
         out
     }
 
-    /// Appends a compact single-line summary (`"<scene>: <stage> [(done/total)] [MM:SS.d]"`) into
-    /// `out` for the viewport status bar.
+    /// Appends a compact single-line summary (`"<scene>: [Step k/N | ]<stage> [(done/total)] [MM:SS.d[ | ETA ~MM:SS.d]]"`)
+    /// into `out` for the viewport status bar.
     pub fn write_status_summary(&self, out: &mut String, elapsed_s: f32) {
         if !self.scene_name.is_empty() {
             out.push_str(&self.scene_name);
@@ -535,6 +784,10 @@ impl SceneBuildProgress {
         self.write_stage_line(out);
         out.push_str(" [");
         Self::write_elapsed(out, elapsed_s);
+        if let Some(eta) = self.eta_secs {
+            out.push_str(" | ETA ");
+            Self::write_eta(out, eta);
+        }
         out.push(']');
     }
 
@@ -672,6 +925,8 @@ pub enum RenderControl {
     RunSmartView { seed: u64, backend: ProbeBackendKind },
     /// Hot-reload `raytracer.cu` from disk via NVRTC.
     ReloadShader,
+    /// Update ocean wave simulation and dielectric water optics parameters.
+    SetOceanParams(OceanParams),
     /// Start (or restart) the per-frame performance log: skip `warmup` frames, keep `frames`,
     /// then write the CSV to `path` (and the last frame's linear colour as a PFM to `image`) and
     /// emit [`RenderEvent::PerfLogWritten`]. Restarts the sample-sequence frame index at 0 so two
@@ -1276,5 +1531,143 @@ mod tests {
         assert_eq!(yield_ped.severity(), 1);
         assert_eq!(yield_ped.speed_kmh(), 0.0);
         assert_eq!(yield_ped.throttle_brake_norm(), 0.0);
+    }
+
+    #[test]
+    fn build_eta_tracker_sma10_warmup_rolling_window_and_completion() {
+        let t0 = Instant::now();
+        let mut tracker = BuildEtaTracker::new(t0);
+        assert_eq!(tracker.sample_count(), 0);
+
+        // First interval alone must stay in warmup (`None` until >= 2 completed intervals).
+        assert_eq!(
+            tracker.record(1.0, 20.0, t0 + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(tracker.sample_count(), 1);
+
+        // Non-advancing update must not add a sample or exit warmup.
+        assert_eq!(
+            tracker.record(1.0, 20.0, t0 + Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(tracker.sample_count(), 1);
+
+        // Second interval (1 unit in 2 s -> mean rate = (1 + 2)/2 = 1.5 s/unit; 18 left -> 27.0 s).
+        let eta2 = tracker
+            .record(2.0, 20.0, t0 + Duration::from_secs(3))
+            .expect("2nd interval must produce an ETA");
+        assert!((eta2 - 27.0).abs() < 1e-3, "expected 27.0s, got {eta2}");
+        assert_eq!(tracker.sample_count(), 2);
+
+        // Push 10 more intervals of 0.5 s/unit each so the SMA-10 window rolls past the initial
+        // slow intervals and converges strictly to 0.5 s/unit.
+        let mut t = t0 + Duration::from_secs(3);
+        let mut done = 2.0_f32;
+        for _ in 0..ETA_SMA_WINDOW {
+            t += Duration::from_millis(500);
+            done += 1.0;
+            let _ = tracker.record(done, 20.0, t);
+        }
+        assert_eq!(tracker.sample_count(), ETA_SMA_WINDOW);
+        // 12 units done, 8 remaining at 0.5 s/unit => 4.0 s.
+        let eta_steady = tracker
+            .record(done, 20.0, t)
+            .expect("steady SMA-10 must return ETA");
+        assert!(
+            (eta_steady - 4.0).abs() < 1e-3,
+            "expected 4.0s after SMA-10 rollover, got {eta_steady}"
+        );
+
+        // Reaching total yields 0.0 s remaining; invalid inputs return None cleanly.
+        let eta_done = tracker
+            .record(20.0, 20.0, t + Duration::from_secs(4))
+            .expect("completed build must return 0.0s ETA");
+        assert_eq!(eta_done, 0.0);
+        assert_eq!(tracker.record(f32::NAN, 10.0, t), None);
+        assert_eq!(tracker.record(1.0, 0.0, t), None);
+    }
+
+    #[test]
+    fn scene_build_progress_step_prefix_overall_and_eta_formatting() {
+        let t0 = Instant::now();
+        let p = SceneBuildProgress::new(
+            EnginePhase::BuildingCsgScene,
+            "Gundo",
+            "Baking road tiles",
+            12,
+            24,
+            t0,
+        )
+        .with_step(3, 8)
+        .with_overall(Some(0.42))
+        .with_eta(Some(8.64));
+
+        assert_eq!(p.format_step_prefix().as_deref(), Some("Step 3/8"));
+        assert_eq!(SceneBuildProgress::format_eta(8.64), "~00:08.6");
+        assert_eq!(p.effective_fraction(), Some(0.42));
+        assert_eq!(p.format_stage_line(), "Step 3/8 | Baking road tiles (12/24)");
+        assert_eq!(
+            p.format_status_summary(14.23),
+            "Gundo: Step 3/8 | Baking road tiles (12/24) [00:14.2 | ETA ~00:08.6]"
+        );
+
+        // Non-finite / negative values sanitize cleanly.
+        let bad = p
+            .clone()
+            .with_overall(Some(f32::NAN))
+            .with_eta(Some(-1.0));
+        assert_eq!(bad.overall_fraction, None);
+        assert_eq!(bad.effective_fraction(), Some(0.5));
+        assert_eq!(bad.eta_secs, None);
+    }
+
+    #[test]
+    fn ocean_params_defaults_sanitization_and_control_routing() {
+        let def = OceanParams::default();
+        assert_eq!(def.mode, OceanMode::CuFft);
+        assert_eq!(def.wind_speed, 9.5);
+        assert_eq!(def.wind_dir_deg, 245.0);
+        assert_eq!(def.choppiness, 1.15);
+        assert_eq!(def.swell, 0.65);
+        assert_eq!(def.foam, 1.0);
+        assert_eq!(def.clarity, 1.0);
+
+        let dirty = OceanParams {
+            mode: OceanMode::Analytical,
+            wind_speed: 99.0,
+            wind_dir_deg: -45.0,
+            choppiness: f32::NAN,
+            swell: -3.0,
+            foam: 5.0,
+            clarity: 0.01,
+        }
+        .sanitized();
+        assert_eq!(dirty.mode, OceanMode::Analytical);
+        assert_eq!(dirty.wind_speed, 25.0);
+        assert!((dirty.wind_dir_deg - 315.0).abs() < 1e-4);
+        assert_eq!(dirty.choppiness, def.choppiness);
+        assert_eq!(dirty.swell, 0.0);
+        assert_eq!(dirty.foam, 2.0);
+        assert_eq!(dirty.clarity, 0.25);
+
+        let bus = AppBus::new(RenderStateSnapshot {
+            settings: DemoSettings::default(),
+            camera: sample_camera(0.0),
+            interacting_until: None,
+            reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
+            possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
+        });
+        let mut scratch = Vec::with_capacity(4);
+        bus.send_render(RenderControl::SetOceanParams(dirty));
+        assert_eq!(bus.poll_render_controls(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[0]),
+            Some(RenderControl::SetOceanParams(p)) if *p == dirty
+        ));
     }
 }

@@ -38,7 +38,8 @@ use csg_scene::voxel_volume::{
 };
 use csg_scene::world_ray::WorldRayQuery;
 use csg_scene::{
-    GroundKerbMode, RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, WorldScene, inst_flags,
+    GroundKerbMode, RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, SmartFill, WorldScene,
+    inst_flags,
 };
 use flight_navigator::camera_guide::GuideLimits;
 use flight_navigator::fnav_interest::{ObjectInfo, ObjectTable, SimpleObjectTable};
@@ -116,6 +117,8 @@ pub struct AutoPlanJob {
     pub road_mode: RoadMode,
     /// Ground-level kerb representation forwarded into [`SceneBuildConfig::ground_kerb_mode`].
     pub ground_kerb_mode: GroundKerbMode,
+    /// Opt-in per-class procedural inference forwarded into [`SceneBuildConfig::smart_fill`].
+    pub smart_fill: SmartFill,
     /// Inspector variant index (`0` for non-inspector scenes).
     pub inspector_variant: u32,
     /// World-space unit direction pointing toward the scene sun (`[x, y, z]`).
@@ -529,7 +532,7 @@ impl SceneOracle for CsgSceneOracle {
 /// Tracks `sun_dir` and `limits` alongside the scene geometry `key` so lighting or dynamics-limit
 /// changes invalidate only the affected `PlanCache` tables without rebuilding the scene or volume.
 struct CachedOracle {
-    key: (u32, RoadMode, GroundKerbMode, u32),
+    key: (u32, RoadMode, GroundKerbMode, SmartFill, u32),
     sun_dir: Option<Vec3>,
     limits: GuideLimits,
     oracle: CsgSceneOracle,
@@ -717,6 +720,7 @@ fn execute_auto_plan_job(
         job.scene_idx,
         job.road_mode,
         job.ground_kerb_mode,
+        job.smart_fill,
         job.inspector_variant,
     );
 
@@ -733,6 +737,7 @@ fn execute_auto_plan_job(
             variant_idx: job.inspector_variant,
             road_mode: job.road_mode,
             ground_kerb_mode: job.ground_kerb_mode,
+            smart_fill: job.smart_fill,
             ..SceneBuildConfig::default()
         };
         let built = module.build(&build_cfg).map_err(|e| {

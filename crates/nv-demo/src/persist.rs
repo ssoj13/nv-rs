@@ -202,6 +202,7 @@ pub struct PersistedState {
     pub window: WindowState,
     pub theme: UiTheme,
     pub settings: DemoSettings,
+    pub ocean: crate::app_events::OceanParams,
     pub demo_anim: DemoAnimator,
     pub camera: CameraState,
     pub flight_lab: crate::flight::lab::PersistedLabPrefs,
@@ -337,6 +338,8 @@ fn parse_sections(text: &str) -> (PersistedState, Vec<String>) {
     section(obj, "window", &mut st.window, &mut errors);
     section(obj, "theme", &mut st.theme, &mut errors);
     section(obj, "settings", &mut st.settings, &mut errors);
+    section(obj, "ocean", &mut st.ocean, &mut errors);
+    st.ocean = st.ocean.sanitized();
     section(obj, "demo_anim", &mut st.demo_anim, &mut errors);
     section(obj, "camera", &mut st.camera, &mut errors);
     section(obj, "flight_lab", &mut st.flight_lab, &mut errors);
@@ -904,5 +907,30 @@ mod tests {
             assert_eq!(parse_nav_feel(nav_feel_name(f)), Some(f));
         }
         assert_eq!(nav_mode_name(NavMode::FpsFly), "FpsFly");
+    }
+
+    #[test]
+    fn ocean_section_persists_sanitizes_and_defaults_on_legacy_json() {
+        let legacy = parse_sections("{}");
+        assert!(legacy.1.is_empty());
+        assert_eq!(legacy.0.ocean, crate::app_events::OceanParams::default());
+
+        let custom = crate::app_events::OceanParams {
+            mode: crate::app_events::OceanMode::Analytical,
+            wind_speed: 14.5,
+            wind_dir_deg: 180.0,
+            choppiness: 1.6,
+            swell: 0.4,
+            foam: 1.35,
+            clarity: 2.1,
+        };
+        let state = PersistedState {
+            ocean: custom,
+            ..PersistedState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let (back, errs) = parse_sections(&json);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(back.ocean, custom.sanitized());
     }
 }

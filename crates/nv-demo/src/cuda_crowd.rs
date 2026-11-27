@@ -1663,6 +1663,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
 
         let init_cam = CsgCameraParams {

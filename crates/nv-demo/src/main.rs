@@ -3789,7 +3789,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 last_smart_view: None,
                 settings,
                 last_sent_settings: settings,
-                ocean_params: OceanParams::default(),
+                ocean_params: persisted.ocean.sanitized(),
                 last_sent_ocean: None,
                 demo_anim: persisted.demo_anim.clone(),
                 fractal_presets: crate::fractal_presets::FractalPresetManager::load_default(),
@@ -3906,6 +3906,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 scene_id,
                 road_mode: road_mode_from_u8(self.settings.csg_road_mode),
                 ground_kerb_mode: ground_kerb_mode_from_u8(self.settings.csg_ground_kerb_mode),
+                smart_fill: self.settings.csg_smart_fill,
                 inspector_variant: self.settings.csg_asset_idx,
                 sun_dir: sun_dir_from_angles(
                     self.settings.sun_azimuth,
@@ -4235,6 +4236,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     self.tod_transition.as_ref(),
                     self.startup_intent,
                 ),
+                ocean: self.ocean_params.sanitized(),
                 demo_anim: self.demo_anim.clone(),
                 camera: crate::persist::CameraState::from_runtime(
                     self.cam_mode,

@@ -519,6 +519,8 @@ pub struct CsgSceneKey {
     pub road_mode: u8,
     /// Ground-level kerb representation (`0=In-Tile F-Rep, 1=Sweep Tile`).
     pub ground_kerb_mode: u8,
+    /// Opt-in per-class procedural inference for OSM-generated scenes (`SmartFill::OFF` = strictly source data).
+    pub smart_fill: csg_scene::SmartFill,
 }
 
 /// Returns descriptors for all registered pure-CSG scene modules in deterministic order.
@@ -3606,6 +3608,7 @@ impl CsgGpuHost {
             variant_idx: key.variant_idx,
             road_mode,
             ground_kerb_mode,
+            smart_fill: key.smart_fill,
             ..SceneBuildConfig::default()
         };
 
@@ -4259,6 +4262,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -4352,6 +4356,7 @@ mod tests {
             seed: 1,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -4500,6 +4505,7 @@ mod tests {
             seed: 1,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4558,6 +4564,7 @@ mod tests {
             seed: 1,
             road_mode: 3,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4650,6 +4657,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -4918,6 +4926,7 @@ mod tests {
             seed: 1,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         let vp_count = built.viewpoints.len();
         host.cache_insert_scene(key_a, built);
@@ -4949,6 +4958,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5072,6 +5082,7 @@ mod tests {
             seed: 1,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -5127,6 +5138,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(marina_idx);
@@ -5246,6 +5258,7 @@ mod tests {
             seed: 2026,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5568,6 +5581,7 @@ mod tests {
             seed: 1,
             road_mode: 2,
             ground_kerb_mode: 0,
+            smart_fill: csg_scene::SmartFill::OFF,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -5754,6 +5768,7 @@ mod tests {
                 seed: 1,
                 road_mode: 2,
                 ground_kerb_mode: 0,
+                smart_fill: csg_scene::SmartFill::OFF,
             };
             host.active_reg_idx = Some(reg_idx);
             host.scene = Some(built);

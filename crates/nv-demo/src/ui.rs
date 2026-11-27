@@ -2567,12 +2567,18 @@ impl UiContext<'_> {
                         s.csg_asset_idx = s.csg_asset_idx.min(max_idx);
                         prop_row(ui, "Kit Asset", |ui| {
                             let gap = 3.0;
-                            let btn_w = ROW_H;
-                            let combo_w =
-                                (ui.available_width() - 2.0 * btn_w - 2.0 * gap).max(32.0);
+                            let btn_w = 22.0;
                             ui.spacing_mut().item_spacing.x = gap;
+                            ui.spacing_mut().interact_size.x = btn_w;
+                            ui.spacing_mut().button_padding.x = 2.0;
+                            let avail = ui.available_width();
+                            let combo_w = (avail - 2.0 * btn_w - 2.0 * gap).max(32.0);
                             if ui
-                                .add_sized([btn_w, ROW_H], egui::Button::new(ic::CARET_LEFT))
+                                .add_sized(
+                                    [btn_w, ROW_H],
+                                    egui::Button::new(ic::CARET_LEFT)
+                                        .min_size(egui::vec2(btn_w, ROW_H)),
+                                )
                                 .on_hover_text("Previous asset")
                                 .clicked()
                             {
@@ -2597,7 +2603,11 @@ impl UiContext<'_> {
                                     }
                                 });
                             if ui
-                                .add_sized([btn_w, ROW_H], egui::Button::new(ic::CARET_RIGHT))
+                                .add_sized(
+                                    [btn_w, ROW_H],
+                                    egui::Button::new(ic::CARET_RIGHT)
+                                        .min_size(egui::vec2(btn_w, ROW_H)),
+                                )
                                 .on_hover_text("Next asset")
                                 .clicked()
                             {
@@ -2629,8 +2639,8 @@ impl UiContext<'_> {
                             self.bus.emit_ui(UiCommand::SetTimeOfDay(tod));
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut s.tod_transition_enabled, "Transition")
+                    prop_row(ui, "Transition", |ui| {
+                        ui.checkbox(&mut s.tod_transition_enabled, "Smooth")
                             .on_hover_text(
                                 "Smoothly animate sky and sun lighting across Day / Sunset / Night.",
                             );
@@ -2717,6 +2727,107 @@ impl UiContext<'_> {
                             }
                         },
                     );
+                    // Opt-in Smart Fill (OSM inference) controls (`SmartFill::OFF` = strictly source data).
+                    let sf_bits = s.csg_smart_fill.to_bits();
+                    let sf_on = sf_bits.count_ones();
+                    let sf_summary = match sf_on {
+                        0 => "Smart Fill (Off - strict OSM)".to_string(),
+                        10 => "Smart Fill (All 10/10)".to_string(),
+                        n => format!("Smart Fill ({n}/10)"),
+                    };
+                    egui::CollapsingHeader::new(RichText::new(sf_summary).small())
+                        .id_salt("csg_smart_fill_hdr")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Opt-in procedural inference when OSM tags omit street details (rebuilds scene).")
+                                    .small()
+                                    .weak(),
+                            );
+                            equal_grid(ui, 2, 2, |ui, idx, w| {
+                                if idx == 0 {
+                                    if ui
+                                        .add_sized([w, ROW_H], egui::Button::new("Strict OSM (Off)"))
+                                        .on_hover_text("Disable all procedural inference; build strictly from source OSM data.")
+                                        .clicked()
+                                        && s.csg_smart_fill != csg_scene::SmartFill::OFF
+                                    {
+                                        s.csg_smart_fill = csg_scene::SmartFill::OFF;
+                                    }
+                                } else if ui
+                                    .add_sized([w, ROW_H], egui::Button::new("Enable All"))
+                                    .on_hover_text("Enable procedural inference for all 10 street-detail classes.")
+                                    .clicked()
+                                    && s.csg_smart_fill != csg_scene::SmartFill::ALL
+                                {
+                                    s.csg_smart_fill = csg_scene::SmartFill::ALL;
+                                }
+                            });
+                            let sf = &mut s.csg_smart_fill;
+                            let items: [(&str, &str, &mut bool); 10] = [
+                                (
+                                    "Lamps",
+                                    "Infer street lamps along kerbs of lit road classes.",
+                                    &mut sf.street_lamps,
+                                ),
+                                (
+                                    "Trees",
+                                    "Infer verge and median trees by road class and zone.",
+                                    &mut sf.trees,
+                                ),
+                                (
+                                    "Sidewalks",
+                                    "Infer sidewalks on roads missing explicit sidewalk tags.",
+                                    &mut sf.sidewalks,
+                                ),
+                                (
+                                    "Crossings",
+                                    "Infer crosswalks at junction approaches without crossing tags.",
+                                    &mut sf.crossings,
+                                ),
+                                (
+                                    "Signals",
+                                    "Infer traffic signals at untagged junctions of classified roads.",
+                                    &mut sf.traffic_signals,
+                                ),
+                                (
+                                    "Stop Signs",
+                                    "Infer stop/give-way signs on minor-into-major approaches.",
+                                    &mut sf.stop_give_way,
+                                ),
+                                (
+                                    "Hydrants",
+                                    "Infer fire hydrants along the kerb-side furniture strip.",
+                                    &mut sf.hydrants,
+                                ),
+                                (
+                                    "Meters",
+                                    "Infer parking meters along the kerb-side furniture strip.",
+                                    &mut sf.parking_meters,
+                                ),
+                                (
+                                    "Bollards",
+                                    "Infer bollards along kerbs and pedestrian zones.",
+                                    &mut sf.bollards,
+                                ),
+                                (
+                                    "Work Zones",
+                                    "Infer procedural road-work zones on industrial service roads.",
+                                    &mut sf.work_zones,
+                                ),
+                            ];
+                            egui::Grid::new("csg_smart_fill_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 2.0])
+                                .show(ui, |ui| {
+                                    for (i, (label, tip, flag)) in items.into_iter().enumerate() {
+                                        ui.checkbox(flag, label).on_hover_text(tip);
+                                        if i % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        });
                     anim_slider_f32(
                         ui,
                         anim,
@@ -7195,15 +7306,24 @@ mod tests {
         // Legacy JSON missing `csg_ground_kerb_mode` deserializes to In-Tile F-Rep (`0`).
         let legacy: DemoSettings = serde_json::from_str("{}").expect("legacy json");
         assert_eq!(legacy.csg_ground_kerb_mode, 0);
+        assert_eq!(legacy.csg_smart_fill, csg_scene::SmartFill::OFF);
 
-        // Explicit Sweep Tile (`1`) round-trips cleanly.
+        // Explicit Sweep Tile (`1`) and SmartFill flags round-trip cleanly.
+        let sf = csg_scene::SmartFill {
+            street_lamps: true,
+            trees: true,
+            crossings: true,
+            ..csg_scene::SmartFill::OFF
+        };
         let s = DemoSettings {
             csg_ground_kerb_mode: 1,
+            csg_smart_fill: sf,
             ..DemoSettings::default()
         };
         let json = serde_json::to_string(&s).expect("serialize");
         let back: DemoSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.csg_ground_kerb_mode, 1);
+        assert_eq!(back.csg_smart_fill, sf);
         assert_eq!(csg_scene::GroundKerbMode::ALL.len(), 2);
     }
 

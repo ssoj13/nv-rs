@@ -963,6 +963,9 @@ pub struct DemoSettings {
     /// Ground-level kerb representation (`0 = In-Tile F-Rep`, `1 = Sweep Tile`).
     #[serde(default = "default_csg_ground_kerb_mode")]
     pub csg_ground_kerb_mode: u8,
+    /// Opt-in procedural inference per object class for OSM-generated scenes (`SmartFill::OFF` = strictly source data).
+    #[serde(default)]
+    pub csg_smart_fill: csg_scene::SmartFill,
     /// Active optical sensor projection (`Pinhole`, `Fisheye180`, `Equirect360`, `SlitCam`).
     pub camera_projection: CameraProjection,
     /// Active primary-ray view scoring backend (`Auto`, `Optix`, `Wgpu`, `Cpu`).
@@ -1136,6 +1139,7 @@ impl Default for DemoSettings {
             csg_crowd_cull_m: default_csg_crowd_cull_m(),
             csg_road_mode: default_csg_road_mode(),
             csg_ground_kerb_mode: default_csg_ground_kerb_mode(),
+            csg_smart_fill: csg_scene::SmartFill::OFF,
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
             crowd_backend: CrowdBackend::Auto,
@@ -2901,6 +2905,7 @@ fn init_optix(
         seed: initial_settings.csg_seed,
         road_mode: initial_settings.csg_road_mode.min(3),
         ground_kerb_mode: initial_settings.csg_ground_kerb_mode.min(1),
+        smart_fill: initial_settings.csg_smart_fill,
     };
     let initial_gpu_crowd = initial_settings.csg_mode > 0
         && !initial_settings.csg_freeze_pose
@@ -6311,6 +6316,7 @@ pub fn spawn_render_thread(
                     seed: settings.csg_seed,
                     road_mode: settings.csg_road_mode.min(3),
                     ground_kerb_mode: settings.csg_ground_kerb_mode.min(1),
+                    smart_fill: settings.csg_smart_fill,
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
                 temporal_history_cut |= building_scene;

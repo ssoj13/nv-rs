@@ -19,6 +19,7 @@
 //! Used by: standalone binary entry point (`cargo run -p nv-demo --release`).
 
 mod app_events;
+mod attr_editor;
 mod bench;
 mod csg_scene_host;
 mod cuda_camera;
@@ -66,7 +67,7 @@ mod demo_app {
 
     use crate::app_events::{
         AppBus, INTERACTION_SETTLE_WINDOW, OceanParams, PossessInfo, RenderControl, RenderEvent,
-        RenderStateSnapshot, SmartViewResult, StillFormat, UiCommand,
+        RenderStateSnapshot, SceneCacheStats, SmartViewResult, StillFormat, UiCommand,
     };
     use crate::profiler::{GpuTelemetry, Profiler};
     use crate::renderer::{
@@ -74,7 +75,10 @@ mod demo_app {
         DlssRrBufferPtrs, align_render_size, dlss_quality_index,
         spawn_render_thread,
     };
-    use crate::ui::{DockTab, UiContext, UiScratch, UiTheme, default_dock_state, install_fonts};
+    use crate::ui::{
+        AssetBrowserState, DockTab, UiContext, UiScratch, UiTheme, default_dock_state,
+        install_fonts,
+    };
     use appbus::downcast_event;
     use bytemuck::{Pod, Zeroable};
     use camera::input::NavScheme;
@@ -3047,6 +3051,11 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         last_sent_settings: DemoSettings,
         ocean_params: OceanParams,
         last_sent_ocean: Option<OceanParams>,
+        asset_params: csg_scene::AssetParamMap,
+        last_sent_asset_params: csg_scene::AssetParamMap,
+        last_inspector_variant: Option<u32>,
+        asset_browser: AssetBrowserState,
+        scene_cache_stats: SceneCacheStats,
         demo_anim: crate::demo_anim::DemoAnimator,
         fractal_presets: crate::fractal_presets::FractalPresetManager,
         flight_workspace: crate::flight::FlightWorkspace,
@@ -3791,6 +3800,11 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 last_sent_settings: settings,
                 ocean_params: persisted.ocean.sanitized(),
                 last_sent_ocean: None,
+                asset_params: csg_scene::AssetParamMap::new(),
+                last_sent_asset_params: csg_scene::AssetParamMap::new(),
+                last_inspector_variant: None,
+                asset_browser: AssetBrowserState::default(),
+                scene_cache_stats: SceneCacheStats::default(),
                 demo_anim: persisted.demo_anim.clone(),
                 fractal_presets: crate::fractal_presets::FractalPresetManager::load_default(),
                 flight_workspace: {
@@ -4614,6 +4628,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     RenderEvent::PhaseChanged(phase) => {
                         self.engine_phase = *phase;
                     }
+                    RenderEvent::SceneCacheStats(stats) => {
+                        self.scene_cache_stats = *stats;
+                    }
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
                     }
@@ -4769,6 +4786,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     .as_deref()
                     .or(self.last_saved_msg.as_deref()),
                 ocean_params: &mut self.ocean_params,
+                asset_params: &mut self.asset_params,
+                asset_browser: &mut self.asset_browser,
+                scene_cache_stats: self.scene_cache_stats,
                 flight: &mut self.flight,
             };
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
@@ -4870,6 +4890,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         start_sdg_burst = Some(*frames);
                     }
                     UiCommand::CancelSdgBurst => cancel_sdg_burst_requested = true,
+                    UiCommand::ClearSceneCache => {
+                        self.send_render(RenderControl::ClearSceneCache);
+                    }
                     UiCommand::SetTimeOfDay(tod) => {
                         let target_tod = (*tod).min(2);
                         if self.settings.tod_transition_enabled
@@ -5783,6 +5806,28 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if self.last_sent_ocean != Some(sanitized_ocean) {
                 self.last_sent_ocean = Some(sanitized_ocean);
                 self.send_render(RenderControl::SetOceanParams(sanitized_ocean));
+            }
+            let on_inspector = self.settings.csg_mode != 0
+                && self
+                    .scene_descriptors
+                    .get((self.settings.csg_mode as usize).saturating_sub(1))
+                    .is_some_and(|d| d.id == "inspector");
+            if on_inspector {
+                if self.last_inspector_variant != Some(self.settings.csg_asset_idx) {
+                    self.last_inspector_variant = Some(self.settings.csg_asset_idx);
+                    self.asset_params =
+                        csg_scenes::inspector_asset_kind(self.settings.csg_asset_idx)
+                            .map_or_else(csg_scene::AssetParamMap::new, |k| k.default_params(0));
+                }
+            } else {
+                self.last_inspector_variant = None;
+                if !self.asset_params.is_empty() {
+                    self.asset_params.clear();
+                }
+            }
+            if self.asset_params != self.last_sent_asset_params {
+                self.last_sent_asset_params = self.asset_params.clone();
+                self.send_render(RenderControl::SetAssetParams(self.asset_params.clone()));
             }
 
             // 4. Advance demo animator, camera rail, gimbal damper & push updates/subframes.

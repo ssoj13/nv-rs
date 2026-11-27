@@ -1664,6 +1664,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
 
         let init_cam = CsgCameraParams {

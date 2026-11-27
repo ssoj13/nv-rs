@@ -45,19 +45,20 @@ use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim
 use csg_scene::traffic::{TrafficVehicleId, hazard_state};
 use csg_scene::traffic_gpu::{TRAFFIC_SLOTS_PER_VEHICLE, TrafficGpuScene};
 use csg_scene::{
-    AssemblyPart, CameraPose as CsgCameraPose, CameraView, DYNAMIC_INST_BIT, DetailTier,
-    GpuInstance, GpuMaterial, InstanceProvenance, LodConfig, MAT_OVERRIDE_NONE, OBJECT_ID_NONE,
-    OsmElemKind, OsmFeatureClass, PackedGpuScene, PackedInstanceSource, RailSpec,
-    SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
-    SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, crowd_actor_mounts, default_orbit_mount,
-    encode_dynamic_inst_id, encode_static_inst_id, find_crowd_actor_for_inst, inst_flags,
-    is_dynamic_inst_id, kind_name, list_possess_targets_with_crowd, lookup_instance_and_assembly,
-    part_role, resolve_possess_attach, resolve_possess_attach_vehicle,
-    resolve_possess_pose_with_crowd,
+    AssemblyPart, AssetParamMap, CameraPose as CsgCameraPose, CameraView, DYNAMIC_INST_BIT,
+    DetailTier, GpuInstance, GpuMaterial, InstanceProvenance, LodConfig, MAT_OVERRIDE_NONE,
+    OBJECT_ID_NONE, OsmElemKind, OsmFeatureClass, PackedGpuScene, PackedInstanceSource, RailSpec,
+    SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneCacheKey, SceneDescriptor,
+    SceneDiskCache, SceneHints, SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene,
+    crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id, encode_static_inst_id,
+    find_crowd_actor_for_inst, inst_flags, is_dynamic_inst_id, kind_name,
+    list_possess_targets_with_crowd, lookup_instance_and_assembly, part_role,
+    resolve_possess_attach, resolve_possess_attach_vehicle, resolve_possess_pose_with_crowd,
 };
 
 use crate::app_events::{
-    BuildEtaTracker, EnginePhase, PossessAdas, PossessInfo, SceneBuildProgress, SimTelemetry,
+    BuildEtaTracker, EnginePhase, PossessAdas, PossessInfo, SceneBuildProgress, SceneCacheStats,
+    SceneLoadSource, SimTelemetry,
 };
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend};
 use crate::cuda_traffic::{
@@ -521,6 +522,8 @@ pub struct CsgSceneKey {
     pub ground_kerb_mode: u8,
     /// Opt-in per-class procedural inference for OSM-generated scenes (`SmartFill::OFF` = strictly source data).
     pub smart_fill: csg_scene::SmartFill,
+    /// Canonical BLAKE3-64 hash of parametric asset overrides (`0` when empty).
+    pub asset_params_hash: u64,
 }
 
 /// Returns descriptors for all registered pure-CSG scene modules in deterministic order.
@@ -1365,6 +1368,10 @@ pub struct CsgGpuHost {
     scene: Option<SceneBuilt>,
     /// Most-recently-used `SceneBuilt` cache for instant scene / road-mode switches.
     scene_cache: VecDeque<(CsgSceneKey, SceneBuilt)>,
+    /// BLAKE3-verified on-disk cache persisting compiled `SceneBuilt` worlds across restarts.
+    disk_cache: SceneDiskCache,
+    /// Provenance of the most recent scene load (`None` / `Built` / `MemoryHit` / `DiskHit`).
+    last_load_source: SceneLoadSource,
     /// True if `spawn_crowd_stress` mutated `self.scene` (don't cache mutated stress grids).
     scene_mutated_stress: bool,
     crowd_frozen: bool,
@@ -1511,6 +1518,8 @@ impl CsgGpuHost {
             active_reg_idx: None,
             scene: None,
             scene_cache: VecDeque::with_capacity(SCENE_LRU_MAX_ENTRIES),
+            disk_cache: SceneDiskCache::default_cache(),
+            last_load_source: SceneLoadSource::None,
             scene_mutated_stress: false,
             crowd_frozen: false,
             pending_metadata: None,
@@ -1578,6 +1587,32 @@ impl CsgGpuHost {
     /// Returns the currently loaded [`CsgSceneKey`].
     pub fn scene_key(&self) -> CsgSceneKey {
         self.scene_key
+    }
+
+    /// Returns live on-disk scene cache entry count, total bytes, and latest hit/miss provenance.
+    pub fn scene_cache_stats(&self) -> SceneCacheStats {
+        let disk = self.disk_cache.stats();
+        let last_hit = matches!(
+            self.last_load_source,
+            SceneLoadSource::MemoryHit | SceneLoadSource::DiskHit
+        );
+        SceneCacheStats {
+            entries: disk.entries,
+            total_bytes: disk.total_bytes,
+            last_hit,
+            last_source: self.last_load_source,
+        }
+    }
+
+    /// Clears both the in-memory `SceneBuilt` LRU cache and the BLAKE3 on-disk scene cache,
+    /// returning the refreshed [`SceneCacheStats`].
+    pub fn clear_scene_cache(&mut self) -> SceneCacheStats {
+        self.scene_cache.clear();
+        if let Err(err) = self.disk_cache.clear() {
+            eprintln!("nv-demo: failed to clear CSG scene disk cache: {err}");
+        }
+        self.last_load_source = SceneLoadSource::None;
+        self.scene_cache_stats()
     }
 
     /// Returns the human-readable display name for 1-based `scene_idx` (`0` -> `"Classic"`).
@@ -3042,11 +3077,13 @@ impl CsgGpuHost {
         gpu_crowd_active: bool,
         on_progress: &mut dyn FnMut(&str, &str, u32, u32),
     ) -> Result<CsgSyncResult, String> {
+        let empty_params = AssetParamMap::new();
         self.sync_with_rich_progress(
             optix_ctx,
             stream,
             scratch,
             key,
+            &empty_params,
             wetness,
             time_of_day,
             cam,
@@ -3063,7 +3100,7 @@ impl CsgGpuHost {
     /// blended overall fraction (`0.0..=1.0`), and a 10-step moving-average ETA (`eta_secs`).
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates scene key, material params, camera frustum, GPU-crowd flag, OptiX resources, build clock, and rich progress sink"
+        reason = "coordinates scene key, asset params, material params, camera frustum, GPU-crowd flag, OptiX resources, build clock, and rich progress sink"
     )]
     pub fn sync_with_rich_progress(
         &mut self,
@@ -3071,6 +3108,7 @@ impl CsgGpuHost {
         stream: &Arc<Stream>,
         scratch: &mut Scratch,
         key: CsgSceneKey,
+        asset_params: &AssetParamMap,
         wetness: f32,
         time_of_day: u32,
         cam: CsgCameraParams,
@@ -3094,6 +3132,7 @@ impl CsgGpuHost {
                 stream,
                 scratch,
                 key,
+                asset_params,
                 wetness,
                 time_of_day,
                 started_at,
@@ -3505,7 +3544,7 @@ impl CsgGpuHost {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "internal scene rebuild pipeline with explicit OptiX resources, build clock, and rich progress sink"
+        reason = "internal scene rebuild pipeline with explicit OptiX resources, asset params, build clock, and rich progress sink"
     )]
     fn rebuild_scene(
         &mut self,
@@ -3513,6 +3552,7 @@ impl CsgGpuHost {
         stream: &Arc<Stream>,
         scratch: &mut Scratch,
         key: CsgSceneKey,
+        asset_params: &AssetParamMap,
         wetness: f32,
         time_of_day: u32,
         started_at: Instant,
@@ -3576,6 +3616,7 @@ impl CsgGpuHost {
         self.traffic_dirty = false;
 
         if key.scene_idx == 0 {
+            self.last_load_source = SceneLoadSource::None;
             self.pending_metadata = Some(SceneLoadedMetadata {
                 scene_idx: 0,
                 variant_idx: 0,
@@ -3609,22 +3650,45 @@ impl CsgGpuHost {
             road_mode,
             ground_kerb_mode,
             smart_fill: key.smart_fill,
+            asset_params: asset_params.clone(),
             ..SceneBuildConfig::default()
         };
 
-        let cached_built = self.cache_take_scene(key);
+        let (scene_id, scene_name) = {
+            let module = self
+                .registry
+                .get_by_index(reg_idx)
+                .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
+            let desc = module.descriptor();
+            (desc.id, desc.name)
+        };
+        let disk_key = SceneCacheKey::from_build_config(scene_id, &build_cfg);
+
+        let cached_built = if let Some(mem) = self.cache_take_scene(key) {
+            self.last_load_source = SceneLoadSource::MemoryHit;
+            Some(mem)
+        } else if let Some(disk) = self.disk_cache.load(&disk_key) {
+            self.last_load_source = SceneLoadSource::DiskHit;
+            Some(disk)
+        } else {
+            self.last_load_source = SceneLoadSource::Built;
+            None
+        };
+        let is_cached = self.scene_cache_stats().last_hit;
+        let mut reporter = CsgBuildReporter::new(scene_name, is_cached, started_at, on_progress);
         let module = self
             .registry
             .get_by_index(reg_idx)
             .ok_or_else(|| format!("Scene index {reg_idx} not found in SceneRegistry"))?;
-        let scene_name = module.descriptor().name;
-        let is_cached = cached_built.is_some();
-        let mut reporter = CsgBuildReporter::new(scene_name, is_cached, started_at, on_progress);
         let mut built = match cached_built {
             Some(mut cached) => {
-                reporter.emit(1, "Restoring cached CSG scene", 0, 1);
+                let stage = match self.last_load_source {
+                    SceneLoadSource::DiskHit => "Restoring scene from disk cache",
+                    _ => "Restoring cached CSG scene",
+                };
+                reporter.emit(1, stage, 0, 1);
                 cached.set_crowd_frozen(false);
-                reporter.emit(1, "Restoring cached CSG scene", 1, 1);
+                reporter.emit(1, stage, 1, 1);
                 cached
             }
             None => {
@@ -3636,6 +3700,11 @@ impl CsgGpuHost {
                     .map_err(|e| format!("CSG scene '{scene_name}' failed to build: {e}"))?;
                 if reporter.max_overall() < csg_build_overall_fraction(false, 1, 1, 1) {
                     reporter.emit(1, "CSG scene generated", 1, 1);
+                }
+                if let Err(err) = self.disk_cache.store(&disk_key, &built) {
+                    eprintln!(
+                        "nv-demo: failed to persist CSG scene '{scene_name}' to disk cache: {err}"
+                    );
                 }
                 built
             }
@@ -4263,6 +4332,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -4357,6 +4427,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -4506,6 +4577,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4565,6 +4637,7 @@ mod tests {
             road_mode: 3,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4658,6 +4731,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -4927,6 +5001,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         let vp_count = built.viewpoints.len();
         host.cache_insert_scene(key_a, built);
@@ -4959,6 +5034,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5083,6 +5159,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -5139,6 +5216,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(marina_idx);
@@ -5259,6 +5337,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5582,6 +5661,7 @@ mod tests {
             road_mode: 2,
             ground_kerb_mode: 0,
             smart_fill: csg_scene::SmartFill::OFF,
+            asset_params_hash: 0,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -5769,6 +5849,7 @@ mod tests {
                 road_mode: 2,
                 ground_kerb_mode: 0,
                 smart_fill: csg_scene::SmartFill::OFF,
+                asset_params_hash: 0,
             };
             host.active_reg_idx = Some(reg_idx);
             host.scene = Some(built);
@@ -5872,5 +5953,64 @@ mod tests {
             assert_eq!(events.last().expect("final").overall_fraction, Some(1.0));
             assert_eq!(events.last().expect("final").eta_secs, Some(0.0));
         }
+    }
+
+    #[test]
+    fn host_scene_disk_cache_stats_and_clear_work_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "nv_demo_host_scene_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut host = CsgGpuHost::new();
+        host.disk_cache = SceneDiskCache::new(dir.clone(), csg_scene::SCENE_CACHE_DEFAULT_MAX_BYTES);
+
+        let initial = host.scene_cache_stats();
+        assert_eq!(initial.entries, 0);
+        assert_eq!(initial.total_bytes, 0);
+        assert!(!initial.last_hit);
+        assert_eq!(initial.last_source, SceneLoadSource::None);
+
+        let inspector_idx = host
+            .registry
+            .descriptors()
+            .iter()
+            .position(|d| d.id == "inspector")
+            .expect("inspector registered");
+        let module = host
+            .registry
+            .get_by_index(inspector_idx)
+            .expect("inspector module");
+        let cfg = SceneBuildConfig::default();
+        let built = module.build(&cfg).expect("inspector scene builds");
+        let disk_key = SceneCacheKey::from_build_config(module.descriptor().id, &cfg);
+        let bytes = host
+            .disk_cache
+            .store(&disk_key, &built)
+            .expect("store inspector scene");
+        assert!(bytes > 0);
+
+        let reloaded = host
+            .disk_cache
+            .load(&disk_key)
+            .expect("disk cache hit on inspector scene");
+        assert_eq!(
+            reloaded.world.library.compounds.len(),
+            built.world.library.compounds.len()
+        );
+        host.last_load_source = SceneLoadSource::DiskHit;
+        let hit_stats = host.scene_cache_stats();
+        assert_eq!(hit_stats.entries, 1);
+        assert_eq!(hit_stats.total_bytes, bytes);
+        assert!(hit_stats.last_hit);
+        assert_eq!(hit_stats.last_source, SceneLoadSource::DiskHit);
+
+        let cleared = host.clear_scene_cache();
+        assert_eq!(cleared.entries, 0);
+        assert_eq!(cleared.total_bytes, 0);
+        assert!(!cleared.last_hit);
+        assert_eq!(cleared.last_source, SceneLoadSource::None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2899,6 +2899,7 @@ fn init_optix(
 
     let mut init_warnings = Vec::new();
     let mut csg_host = CsgGpuHost::new();
+    let initial_asset_params = csg_scene::AssetParamMap::new();
     let initial_csg_key = CsgSceneKey {
         scene_idx: initial_settings.csg_mode,
         variant_idx: initial_settings.csg_asset_idx,
@@ -2906,6 +2907,7 @@ fn init_optix(
         road_mode: initial_settings.csg_road_mode.min(3),
         ground_kerb_mode: initial_settings.csg_ground_kerb_mode.min(1),
         smart_fill: initial_settings.csg_smart_fill,
+        asset_params_hash: initial_asset_params.content_hash(),
     };
     let initial_gpu_crowd = initial_settings.csg_mode > 0
         && !initial_settings.csg_freeze_pose
@@ -2928,6 +2930,7 @@ fn init_optix(
         &stream,
         &mut scratch,
         initial_csg_key,
+        &initial_asset_params,
         initial_settings.csg_wetness,
         initial_settings.csg_time_of_day,
         CsgCameraParams {
@@ -5200,6 +5203,9 @@ pub fn spawn_render_thread(
             if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                 bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
             }
+            bus.emit_render_event(RenderEvent::SceneCacheStats(
+                rig.csg_host.scene_cache_stats(),
+            ));
             let mut cur_w = DEFAULT_W;
             let mut cur_h = DEFAULT_H;
             let mut cur_gen: u64 = 0;
@@ -5230,6 +5236,7 @@ pub fn spawn_render_thread(
             let mut last_cuda_camera_err: Option<String> = None;
             let mut ocean_params = OceanParams::default();
             let mut last_cuda_ocean_err: Option<String> = None;
+            let mut asset_params = csg_scene::AssetParamMap::new();
             let mut gpu_camera_history_valid = false;
             let mut last_crowd_lod_sig = settings.crowd_lod_params().signature_key();
             let mut rec_active = false;
@@ -5514,6 +5521,20 @@ pub fn spawn_render_thread(
                                 ocean_params = sanitized;
                                 accum_count = 0;
                             }
+                        }
+                        RenderControl::SetAssetParams(p) => {
+                            if *p != asset_params {
+                                asset_params = p.clone();
+                                accum_count = 0;
+                                temporal_history_cut = true;
+                            }
+                        }
+                        RenderControl::ClearSceneCache => {
+                            let stats = rig.csg_host.clear_scene_cache();
+                            bus.emit_render_event(RenderEvent::SceneCacheStats(stats));
+                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                "Cleared compiled CSG scene disk & memory cache".to_string(),
+                            ));
                         }
                         RenderControl::PossessNextVehicle => {
                             if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
@@ -6317,6 +6338,7 @@ pub fn spawn_render_thread(
                     road_mode: settings.csg_road_mode.min(3),
                     ground_kerb_mode: settings.csg_ground_kerb_mode.min(1),
                     smart_fill: settings.csg_smart_fill,
+                    asset_params_hash: asset_params.content_hash(),
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
                 temporal_history_cut |= building_scene;
@@ -6409,6 +6431,7 @@ pub fn spawn_render_thread(
                     &rig.stream,
                     &mut rig._scratch,
                     csg_key,
+                    &asset_params,
                     settings.csg_wetness,
                     settings.csg_time_of_day,
                     csg_cam_params,
@@ -6454,6 +6477,11 @@ pub fn spawn_render_thread(
                 was_possessing = is_possessing_now;
                 if let Some(meta) = rig.csg_host.take_loaded_metadata() {
                     bus.emit_render_event(RenderEvent::SceneMetaUpdated(meta));
+                }
+                if building_scene {
+                    bus.emit_render_event(RenderEvent::SceneCacheStats(
+                        rig.csg_host.scene_cache_stats(),
+                    ));
                 }
 
                 if show_classic

@@ -31,8 +31,9 @@ use egui_phosphor::regular as ic;
 
 use crate::app_events::{
     AppBus, EnginePhase, OceanMode, OceanParams, PossessAdas, PossessInfo, SceneBuildProgress,
-    SimTelemetry, SmartViewResult, StillFormat, UiCommand,
+    SceneCacheStats, SceneLoadSource, SimTelemetry, SmartViewResult, StillFormat, UiCommand,
 };
+use crate::attr_editor::{AttrEditorState, render_attr_editor};
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
@@ -59,7 +60,11 @@ const MOUNT_ICONS: [&str; 9] = [
     ic::NUMBER_CIRCLE_EIGHT,
     ic::NUMBER_CIRCLE_NINE,
 ];
-use csg_scene::{ProbeBackendKind, SceneDescriptor, SceneViewpoint, TimeOfDay};
+use csg_scene::{
+    AssetParamMap, AssetParamSpec, AssetPreset, ProbeBackendKind, SceneDescriptor, SceneViewpoint,
+    TimeOfDay,
+};
+use csg_scenes::{AssetCategory, AssetDescriptor, KitAssetKind};
 
 /// One selectable output pass: `label` for combo boxes, `tag` for the viewport HUD and its toolbar.
 struct AovPass {
@@ -111,7 +116,7 @@ const FORCE_LOD_LABELS: [&str; 4] = ["Auto", "LOD0", "LOD1", "LOD2"];
 const LABEL_W: f32 = 84.0;
 /// Width of numeric `DragValue` boxes in slider rows; sized for 9-character `11.0 pt` monospace
 /// readouts with units (e.g. `"12.0 m/s2"`, `"20.0 m/s3"`) plus `2.0 px` horizontal padding.
-const VAL_W: f32 = 68.0;
+pub(crate) const VAL_W: f32 = 68.0;
 pub(crate) const ANIM_BTN_W: f32 = 16.0;
 pub(crate) const ROW_H: f32 = 14.0;
 
@@ -202,6 +207,42 @@ pub fn resolve_home_pose(
 /// They remove the formatting allocations of the strings built here; egui itself still allocates
 /// per widget text (`WidgetText` / galley jobs own a `String`), so the UI pass is not
 /// allocation-free.
+/// Cached descriptor, parameter schema, and presets for the currently selected Inspector asset
+/// so 60 Hz UI frames never re-compose CSG blueprints or re-allocate schemas/presets.
+#[derive(Clone, Debug)]
+struct CachedAssetMeta {
+    kind: KitAssetKind,
+    descriptor: AssetDescriptor,
+    schema: Vec<AssetParamSpec>,
+    presets: Vec<AssetPreset>,
+}
+
+/// Persistent UI state for the Parametric Asset Inspector browser and vendored Attribute Editor.
+#[derive(Clone, Debug, Default)]
+pub struct AssetBrowserState {
+    /// Active catalog category filter (`None` = All 111 kit assets + Crowd Showcase).
+    pub category: Option<AssetCategory>,
+    /// Case-insensitive asset search query across label, id, and category.
+    pub search: String,
+    /// Persistent filter/group/seed state for the vendored DCC Attribute Editor.
+    pub attr_editor: AttrEditorState,
+    cached_meta: Option<CachedAssetMeta>,
+}
+
+impl AssetBrowserState {
+    fn ensure_cached(&mut self, kind: KitAssetKind) {
+        let needs_rebuild = self.cached_meta.as_ref().is_none_or(|c| c.kind != kind);
+        if needs_rebuild {
+            self.cached_meta = Some(CachedAssetMeta {
+                kind,
+                descriptor: kind.descriptor(0),
+                schema: kind.param_schema(),
+                presets: kind.presets(),
+            });
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct UiScratch {
     /// Reusable buffer for the bottom-left Viewport status HUD line.
@@ -850,6 +891,12 @@ pub struct UiContext<'a> {
     pub last_saved_msg: Option<&'a str>,
     /// Live Ocean Water parameters (`cuFFT` 3-cascade spectral / analytical Gerstner + dielectric optics).
     pub ocean_params: &'a mut OceanParams,
+    /// Live parametric overrides for the selected Inspector asset (`RenderControl::SetAssetParams`).
+    pub asset_params: &'a mut AssetParamMap,
+    /// Persistent filter/search/group UI state for the Parametric Asset Inspector.
+    pub asset_browser: &'a mut AssetBrowserState,
+    /// Live `SceneDiskCache` hit/size telemetry delivered via `RenderEvent::SceneCacheStats`.
+    pub scene_cache_stats: SceneCacheStats,
     /// Rail fly-through statistics (Flight stats subsection of the rail panel).
     pub flight: &'a mut crate::flight_stats::FlightStats,
 }
@@ -900,6 +947,11 @@ fn dock_scroll(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
                 },
             );
         });
+}
+
+#[cfg(test)]
+pub(crate) fn dock_scroll_for_test(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    dock_scroll(ui, add_contents);
 }
 
 impl UiContext<'_> {
@@ -3012,8 +3064,47 @@ impl UiContext<'_> {
                             }
                         });
                     }
+                    ui.add_space(3.0);
+                    let UiScratch {
+                        label_buf: buf,
+                        tip_buf,
+                        ..
+                    } = &mut *self.scratch;
+                    if render_scene_cache_row(ui, self.scene_cache_stats, buf, tip_buf) {
+                        self.bus.emit_ui(UiCommand::ClearSceneCache);
+                    }
                 }
             });
+
+            if s.csg_mode != 0
+                && descs
+                    .get((s.csg_mode as usize).saturating_sub(1))
+                    .is_some_and(|d| d.id == "inspector")
+            {
+                collapsing_section(
+                    ui,
+                    "sec_asset_inspector",
+                    ic::SLIDERS_HORIZONTAL,
+                    "Asset Inspector",
+                    |ui| {
+                        let UiScratch {
+                            label_buf: buf,
+                            tip_buf,
+                            ..
+                        } = &mut *self.scratch;
+                        if render_asset_inspector_body(
+                            ui,
+                            &mut s.csg_asset_idx,
+                            self.asset_params,
+                            self.asset_browser,
+                            buf,
+                            tip_buf,
+                        ) {
+                            request_auto_frame = true;
+                        }
+                    },
+                );
+            }
         }
         if request_auto_frame {
             self.bus.emit_ui(UiCommand::SelectScene {
@@ -4617,6 +4708,7 @@ fn lod_telemetry_strip(ui: &mut Ui, buf: &mut String, stats: CsgStats, active: b
 fn section_accent(id_salt: &str) -> Color32 {
     match id_salt {
         "sec_csg" => Color32::from_rgb(92, 184, 224),
+        "sec_asset_inspector" => Color32::from_rgb(138, 173, 244),
         "sec_lod" => Color32::from_rgb(104, 192, 186),
         "sec_sky" => Color32::from_rgb(232, 178, 84),
         "sec_ocean" => Color32::from_rgb(68, 178, 212),
@@ -4655,6 +4747,7 @@ const SECTION_GROUPS: &[&[&str]] = &[
     // Render & Floor panel
     &[
         "sec_csg",
+        "sec_asset_inspector",
         "sec_lod",
         "sec_sky",
         "sec_ocean",
@@ -4707,6 +4800,7 @@ fn section_default_open(id_salt: &str) -> bool {
             | "sec_presets"
             | "sec_formula"
             | "sec_csg"
+            | "sec_asset_inspector"
             | "sec_lod"
             | "sec_sky"
             | "sec_ocean"
@@ -4928,7 +5022,7 @@ pub(crate) fn allocate_clamped_ui<R>(
 /// Renders a compact `11.0 pt` monospace `DragValue` inside a hard-clamped `val_w` column with
 /// `2.0 px` horizontal padding so values with unit suffixes (`"35.0 deg"`, `"12.0 m/s2"`,
 /// `"20.0 m/s3"`) fit cleanly and every slider value box shares one exact columnar width.
-fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) -> egui::Response {
+pub(crate) fn slider_drag_value(ui: &mut Ui, val_w: f32, drag: egui::DragValue<'_>) -> egui::Response {
     allocate_clamped_ui(
         ui,
         egui::vec2(val_w, ROW_H),
@@ -5602,6 +5696,430 @@ fn stacked_bar_row(
             resp.on_hover_text(tip_buf.as_str());
         }
     });
+}
+
+/// Renders the compact `Disk Cache` status badge (`Disk Hit` / `Mem Hit` / `Built`) and
+/// `Clear Cache` action inside `CSG World`. Returns `true` when `Clear Cache` is clicked.
+fn render_scene_cache_row(
+    ui: &mut Ui,
+    stats: SceneCacheStats,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) -> bool {
+    let (pill_text, pill_tone) = match stats.last_source {
+        SceneLoadSource::DiskHit => ("Disk Hit", PillTone::Green),
+        SceneLoadSource::MemoryHit => ("Mem Hit", PillTone::Green),
+        SceneLoadSource::Built => ("Built", PillTone::Amber),
+        SceneLoadSource::None => ("Idle", PillTone::Muted),
+    };
+    let mb = stats.total_bytes as f64 / (1024.0 * 1024.0);
+    let summary = fmt_into(label_buf, format_args!("{} ({mb:.1} MB)", stats.entries));
+    stat_badge_row_tip(
+        ui,
+        "Disk Cache",
+        StatusPill {
+            text: pill_text,
+            tone: pill_tone,
+        },
+        summary,
+        tip_buf,
+        |t| {
+            let _ = write!(
+                t,
+                "Compiled CSG scenes cached on disk with BLAKE3 integrity checks for fast startup.\nCached Scenes: {} ({mb:.2} MB) | Last Load: {}",
+                stats.entries,
+                stats.last_source.label()
+            );
+        },
+    );
+    let btn_w = ui.available_width().max(40.0);
+    ui.add_enabled(
+        stats.entries > 0 || stats.total_bytes > 0,
+        egui::Button::new(format!("{}  Clear Disk Cache", ic::TRASH))
+            .min_size(egui::vec2(btn_w, ROW_H + 2.0)),
+    )
+    .on_hover_text(
+        "Delete cached CSG scene files from disk and memory so scenes rebuild fresh next time.",
+    )
+    .clicked()
+}
+
+fn asset_category_icon(cat: AssetCategory) -> &'static str {
+    match cat {
+        AssetCategory::Vehicles => ic::CAR,
+        AssetCategory::Architecture => ic::BUILDINGS,
+        AssetCategory::Foliage => ic::TREE,
+        AssetCategory::Industrial => ic::FACTORY,
+        AssetCategory::Infra => ic::LIGHTNING,
+        AssetCategory::Street => ic::SIGNPOST,
+        AssetCategory::Marine => ic::ANCHOR,
+        AssetCategory::MarinaFurniture => ic::ARMCHAIR,
+    }
+}
+
+fn asset_category_short(cat: AssetCategory) -> &'static str {
+    match cat {
+        AssetCategory::Vehicles => "Veh",
+        AssetCategory::Architecture => "Arch",
+        AssetCategory::Foliage => "Fol",
+        AssetCategory::Industrial => "Ind",
+        AssetCategory::Infra => "Infra",
+        AssetCategory::Street => "Street",
+        AssetCategory::Marine => "Marine",
+        AssetCategory::MarinaFurniture => "Club",
+    }
+}
+
+/// Renders the categorized Parametric Asset Inspector (`All` + 8 category chips, search box,
+/// scrollable asset browser, metadata summary, preset strip, and vendored DCC Attribute Editor).
+/// Returns `true` when the user selected a different asset variant this frame.
+fn render_asset_inspector_body(
+    ui: &mut Ui,
+    asset_idx: &mut u32,
+    asset_params: &mut AssetParamMap,
+    browser: &mut AssetBrowserState,
+    label_buf: &mut String,
+    tip_buf: &mut String,
+) -> bool {
+    let prev_idx = *asset_idx;
+
+    // 1. Category filter chips (`All` + 8 catalog categories in a compact 3x3 grid).
+    const CHIPS: [(Option<AssetCategory>, &str, &str, &str); 9] = [
+        (None, ic::CUBE, "All", "Show all 111 kit assets and the crowd showcase"),
+        (
+            Some(AssetCategory::Vehicles),
+            ic::CAR,
+            "Veh",
+            "Vehicles (cars, trucks, buses, wheels)",
+        ),
+        (
+            Some(AssetCategory::Architecture),
+            ic::BUILDINGS,
+            "Arch",
+            "Architecture & Interiors",
+        ),
+        (
+            Some(AssetCategory::Foliage),
+            ic::TREE,
+            "Fol",
+            "Foliage (palms, trees, planters)",
+        ),
+        (
+            Some(AssetCategory::Industrial),
+            ic::FACTORY,
+            "Ind",
+            "Industrial (refinery towers, tanks, pipes)",
+        ),
+        (
+            Some(AssetCategory::Infra),
+            ic::LIGHTNING,
+            "Infra",
+            "Infrastructure (power, rail, fences)",
+        ),
+        (
+            Some(AssetCategory::Street),
+            ic::SIGNPOST,
+            "Street",
+            "Street & Work Zone furniture",
+        ),
+        (
+            Some(AssetCategory::Marine),
+            ic::ANCHOR,
+            "Marine",
+            "Marine & Coastal (yachts, piers, towers)",
+        ),
+        (
+            Some(AssetCategory::MarinaFurniture),
+            ic::ARMCHAIR,
+            "Club",
+            "Marina City Club & Balcony fixtures",
+        ),
+    ];
+    equal_grid(ui, 3, CHIPS.len(), |ui, idx, w| {
+        let Some(&(cat, icon, short, tip)) = CHIPS.get(idx) else {
+            return;
+        };
+        let active = browser.category == cat;
+        let mut btn = egui::Button::new(format!("{icon} {short}"))
+            .min_size(egui::vec2(w, ROW_H + 2.0))
+            .truncate();
+        if active {
+            btn = btn
+                .fill(active_accent_tint(ui))
+                .stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
+        }
+        if ui
+            .add_sized([w, ROW_H + 2.0], btn)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            browser.category = cat;
+        }
+    });
+
+    ui.add_space(2.0);
+
+    // 2. Search input + match count badge (width-clamped).
+    let query_lc = browser.search.trim().to_ascii_lowercase();
+    let mut matched: Vec<(u32, &'static str, &'static str, &'static str)> =
+        Vec::with_capacity(KitAssetKind::ALL.len() + 1);
+    for (i, &kind) in KitAssetKind::ALL.iter().enumerate() {
+        if let Some(cat) = browser.category
+            && kind.category() != cat
+        {
+            continue;
+        }
+        if !query_lc.is_empty()
+            && !kind.label().to_ascii_lowercase().contains(&query_lc)
+            && !kind.id().to_ascii_lowercase().contains(&query_lc)
+            && !kind.category().label().to_ascii_lowercase().contains(&query_lc)
+            && !asset_category_short(kind.category())
+                .to_ascii_lowercase()
+                .contains(&query_lc)
+        {
+            continue;
+        }
+        matched.push((
+            i as u32,
+            asset_category_icon(kind.category()),
+            kind.label(),
+            kind.category().label(),
+        ));
+    }
+    let show_crowd = browser.category.is_none()
+        && (query_lc.is_empty()
+            || "actors: 4-archetype crowd showcase".contains(&query_lc));
+    if show_crowd {
+        matched.push((
+            csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32,
+            ic::USERS_THREE,
+            "Actors: 4-Archetype Crowd Showcase",
+            "Articulated Crowds",
+        ));
+    }
+
+    let search_bar_w = ui.available_width().max(1.0);
+    let search_h = ROW_H + 6.0;
+    allocate_clamped_ui(
+        ui,
+        egui::vec2(search_bar_w, search_h),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let gap = 3.0;
+            ui.spacing_mut().item_spacing.x = gap;
+            let clear_w = if browser.search.is_empty() {
+                0.0
+            } else {
+                20.0 + gap
+            };
+            let count_w = 42.0;
+            let edit_w = (search_bar_w - clear_w - count_w - gap).max(48.0);
+            ui.add_sized(
+                [edit_w, search_h - 2.0],
+                egui::TextEdit::singleline(&mut browser.search)
+                    .hint_text(format!("{} Search assets...", ic::MAGNIFYING_GLASS)),
+            )
+            .on_hover_text("Filter procedural kit assets by name, id, or category.");
+            if !browser.search.is_empty()
+                && ui
+                    .add_sized(
+                        [20.0, search_h - 2.0],
+                        egui::Button::new(RichText::new(ic::X).size(10.5))
+                            .min_size(egui::vec2(20.0, search_h - 2.0)),
+                    )
+                    .on_hover_text("Clear asset search")
+                    .clicked()
+            {
+                browser.search.clear();
+            }
+            let count_txt = fmt_into(
+                label_buf,
+                format_args!("{}/{}", matched.len(), csg_scenes::INSPECTOR_VARIANT_COUNT),
+            );
+            allocate_clamped_ui(
+                ui,
+                egui::vec2(count_w, search_h),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.label(RichText::new(count_txt).monospace().size(10.5).weak());
+                },
+            );
+        },
+    );
+
+    // 3. Scrollable categorized asset list (width-clamped).
+    ui.add_space(2.0);
+    let list_w = ui.available_width().max(1.0);
+    let list_inner_w = (list_w - 14.0).max(80.0);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::same(2))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("inspector_asset_browser_scroll")
+                .max_height(132.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    allocate_clamped_ui(
+                        ui,
+                        egui::vec2(list_inner_w, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            if matched.is_empty() {
+                                ui.label(
+                                    RichText::new("No assets match this filter.")
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                            } else {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                for &(var_idx, icon, label, cat_label) in &matched {
+                                    let selected = *asset_idx == var_idx;
+                                    let mut btn = egui::Button::new(format!("{icon}  {label}"))
+                                        .min_size(egui::vec2(list_inner_w, ROW_H + 4.0))
+                                        .truncate();
+                                    if selected {
+                                        btn = btn.fill(active_accent_tint(ui)).stroke(
+                                            egui::Stroke::new(
+                                                1.0,
+                                                ui.visuals().selection.stroke.color,
+                                            ),
+                                        );
+                                    }
+                                    let resp = ui
+                                        .add_sized([list_inner_w, ROW_H + 4.0], btn)
+                                        .on_hover_text(format!("{label} ({cat_label})"));
+                                    if resp.clicked() {
+                                        *asset_idx = var_idx;
+                                    }
+                                }
+                            }
+                        },
+                    );
+                });
+        });
+
+    let switched = *asset_idx != prev_idx;
+
+    // 4. Selected asset metadata + presets + vendored DCC Attribute Editor (cached per kind so
+    //    60 Hz UI frames spend zero CPU composing CSG blueprints).
+    ui.add_space(4.0);
+    if let Some(kind) = csg_scenes::inspector_asset_kind(*asset_idx) {
+        if switched {
+            *asset_params = kind.default_params(0);
+        }
+        browser.ensure_cached(kind);
+        let Some(meta) = browser.cached_meta.as_ref() else {
+            return switched;
+        };
+        let desc = &meta.descriptor;
+        stat_row_desc(
+            ui,
+            "Category",
+            desc.category.label(),
+            "Procedural kit family owning this asset blueprint.",
+            tip_buf,
+        );
+        stat_row_desc(
+            ui,
+            "GAS Class",
+            fmt_into(label_buf, format_args!("{:?}", desc.gas_class)),
+            "OptiX acceleration-structure budget bucket assigned to this asset.",
+            tip_buf,
+        );
+        stat_row_desc(
+            ui,
+            "Ports",
+            fmt_into(
+                label_buf,
+                format_args!(
+                    "{} sockets | {} mounts",
+                    desc.socket_count, desc.camera_mount_count
+                ),
+            ),
+            "Typed connection sockets for snapping and Possess Body camera mounts on this asset.",
+            tip_buf,
+        );
+
+        let presets = &meta.presets;
+        if !presets.is_empty() {
+            ui.add_space(2.0);
+            ui.label(RichText::new("Presets").size(10.5).weak());
+            let cols = if presets.len() <= 1 { 1 } else { 2 };
+            equal_grid(ui, cols, presets.len(), |ui, idx, w| {
+                let Some(preset) = presets.get(idx) else {
+                    return;
+                };
+                let is_cur = *asset_params == preset.values;
+                let mut btn = egui::Button::new(format!("{}  {}", ic::SPARKLE, preset.name))
+                    .min_size(egui::vec2(w, ROW_H + 2.0))
+                    .truncate();
+                if is_cur {
+                    btn = btn
+                        .fill(active_accent_tint(ui))
+                        .stroke(egui::Stroke::new(1.0, ui.visuals().selection.stroke.color));
+                }
+                if ui
+                    .add_sized([w, ROW_H + 2.0], btn)
+                    .on_hover_text(preset.description)
+                    .clicked()
+                {
+                    *asset_params = preset.values.clone();
+                }
+            });
+        }
+
+        ui.add_space(3.0);
+        let ed_resp = render_attr_editor(
+            ui,
+            "inspector_attr_ed",
+            &meta.schema,
+            asset_params,
+            &mut browser.attr_editor,
+        );
+        if ed_resp.changed {
+            ui.ctx().request_repaint();
+        }
+
+        ui.add_space(2.0);
+        let reset_w = ui.available_width().max(40.0);
+        let reset_lbl = if ed_resp.modified_count > 0 {
+            fmt_into(
+                label_buf,
+                format_args!(
+                    "{}  Reset Defaults ({} mod)",
+                    ic::ARROW_COUNTER_CLOCKWISE,
+                    ed_resp.modified_count
+                ),
+            )
+        } else {
+            fmt_into(
+                label_buf,
+                format_args!("{}  Reset Defaults", ic::ARROW_COUNTER_CLOCKWISE),
+            )
+        };
+        if ui
+            .add_enabled(
+                ed_resp.modified_count > 0,
+                egui::Button::new(reset_lbl).min_size(egui::vec2(reset_w, ROW_H + 2.0)),
+            )
+            .on_hover_text("Reset every parameter of this asset back to its catalog defaults.")
+            .clicked()
+        {
+            *asset_params = kind.default_params(0);
+        }
+    } else {
+        ui.label(
+            RichText::new(
+                "4-Archetype Crowd Showcase active (tune crowd settings in CSG World above).",
+            )
+            .size(11.0)
+            .weak(),
+        );
+    }
+
+    switched
 }
 
 /// Renders the `Ocean Water` section controls (`Mode`, `Wind Speed`, `Wind Dir`, `Choppiness`,
@@ -8251,6 +8769,103 @@ mod tests {
                 assert!(
                     max_right <= panel_w + 0.5,
                     "{theme:?} width {panel_w}: ocean controls overflowed right edge ({max_right} > {panel_w})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parametric_asset_inspector_and_disk_cache_fit_narrow_docks() {
+        let fallback_accent = section_accent("sec_unknown_fallback_sentinel");
+        assert_ne!(section_accent("sec_asset_inspector"), fallback_accent);
+        assert!(section_group_for("sec_asset_inspector").contains(&"sec_asset_inspector"));
+        assert!(section_default_open("sec_asset_inspector"));
+
+        let cache_cases = [
+            SceneCacheStats {
+                entries: 4,
+                total_bytes: 48 * 1024 * 1024,
+                last_hit: true,
+                last_source: SceneLoadSource::DiskHit,
+            },
+            SceneCacheStats {
+                entries: 2,
+                total_bytes: 16 * 1024 * 1024,
+                last_hit: true,
+                last_source: SceneLoadSource::MemoryHit,
+            },
+            SceneCacheStats {
+                entries: 1,
+                total_bytes: 8 * 1024 * 1024,
+                last_hit: false,
+                last_source: SceneLoadSource::Built,
+            },
+        ];
+
+        for theme in [UiTheme::Obsidian, UiTheme::Light] {
+            for panel_w in [260.0_f32, 320.0] {
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                let _dock_style = theme.apply(&ctx);
+                let mut asset_idx = 0u32;
+                let mut asset_params = csg_scenes::inspector_asset_kind(asset_idx)
+                    .map_or_else(AssetParamMap::new, |k| k.default_params(0));
+                let mut browser = AssetBrowserState::default();
+                let mut label_buf = String::with_capacity(96);
+                let mut tip_buf = String::with_capacity(256);
+                let mut avail_before = 0.0_f32;
+                let mut avail_after = 0.0_f32;
+                let mut max_right = 0.0_f32;
+
+                for _pass in 0..2 {
+                    let raw = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(panel_w, 1200.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let out = ctx.run_ui(raw, |ui| {
+                        dock_scroll(ui, |ui| {
+                            collapsing_section(
+                                ui,
+                                "sec_asset_inspector",
+                                ic::SLIDERS_HORIZONTAL,
+                                "Asset Inspector",
+                                |ui| {
+                                    avail_before = ui.available_width();
+                                    for &stats in &cache_cases {
+                                        let _ = render_scene_cache_row(
+                                            ui,
+                                            stats,
+                                            &mut label_buf,
+                                            &mut tip_buf,
+                                        );
+                                    }
+                                    let _ = render_asset_inspector_body(
+                                        ui,
+                                        &mut asset_idx,
+                                        &mut asset_params,
+                                        &mut browser,
+                                        &mut label_buf,
+                                        &mut tip_buf,
+                                    );
+                                    avail_after = ui.available_width();
+                                    max_right = ui.min_rect().right();
+                                },
+                            );
+                        });
+                    });
+                    out.drop_without_applying_deltas();
+                }
+
+                assert!(
+                    (avail_after - avail_before).abs() <= 0.5,
+                    "{theme:?} width {panel_w}: asset inspector drifted available_width ({avail_before} -> {avail_after})"
+                );
+                assert!(
+                    max_right <= panel_w + 0.5,
+                    "{theme:?} width {panel_w}: asset inspector overflowed right edge ({max_right} > {panel_w})"
                 );
             }
         }

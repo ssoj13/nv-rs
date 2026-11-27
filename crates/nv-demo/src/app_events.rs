@@ -512,6 +512,48 @@ impl OceanParams {
     }
 }
 
+/// Where the currently loaded CSG scene came from (`Idle`, freshly built, in-memory LRU, or
+/// BLAKE3-verified disk cache).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SceneLoadSource {
+    /// No CSG scene has been loaded yet (or cache was just cleared).
+    #[default]
+    None,
+    /// Generated fresh on the CPU via `SceneModule::build_with_progress`.
+    Built,
+    /// Restored from the in-memory `SceneBuilt` LRU cache.
+    MemoryHit,
+    /// Restored from the BLAKE3-verified on-disk `SceneDiskCache`.
+    DiskHit,
+}
+
+impl SceneLoadSource {
+    /// Human-readable label shown in tooltips and diagnostics.
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "Idle",
+            Self::Built => "Built",
+            Self::MemoryHit => "Memory Hit",
+            Self::DiskHit => "Disk Cache Hit",
+        }
+    }
+}
+
+/// Live on-disk and in-memory CSG scene cache telemetry emitted via [`RenderEvent::SceneCacheStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneCacheStats {
+    /// Number of committed `.csgc` scene files currently stored on disk.
+    pub entries: usize,
+    /// Combined size of all committed `.csgc` scene files on disk in bytes.
+    pub total_bytes: u64,
+    /// `true` when the latest scene load hit either the memory LRU or on-disk cache.
+    pub last_hit: bool,
+    /// Exact provenance of the latest scene load.
+    pub last_source: SceneLoadSource,
+}
+
 /// Window length for the moving-average build ETA estimator (`SMA-10`).
 pub const ETA_SMA_WINDOW: usize = 10;
 
@@ -849,6 +891,8 @@ pub enum UiCommand {
     CancelSdgBurst,
     /// Switch CSG time-of-day (`0 = Day`, `1 = Sunset`, `2 = Night`), smoothly transitioning when enabled.
     SetTimeOfDay(u32),
+    /// Clear both the in-memory LRU and on-disk compiled CSG scene cache (`RenderControl::ClearSceneCache`).
+    ClearSceneCache,
 }
 
 /// Discrete non-coalescable control commands dispatched from the UI thread to the OptiX worker.
@@ -929,6 +973,10 @@ pub enum RenderControl {
     ReloadShader,
     /// Update ocean wave simulation and dielectric water optics parameters.
     SetOceanParams(OceanParams),
+    /// Update live parametric overrides for the active Inspector asset (or clear for city scenes).
+    SetAssetParams(csg_scene::AssetParamMap),
+    /// Clear both the in-memory LRU and on-disk compiled CSG scene cache.
+    ClearSceneCache,
     /// Start (or restart) the per-frame performance log: skip `warmup` frames, keep `frames`,
     /// then write the CSV to `path` (and the last frame's linear colour as a PFM to `image`) and
     /// emit [`RenderEvent::PerfLogWritten`]. Restarts the sample-sequence frame index at 0 so two
@@ -953,6 +1001,8 @@ pub enum RenderEvent {
     FrameReady(Box<FrameReady>),
     /// A newly built CSG scene exported its viewpoints and collision-verified camera rails.
     SceneMetaUpdated(SceneLoadedMetadata),
+    /// Updated on-disk scene cache statistics and latest hit/miss provenance.
+    SceneCacheStats(SceneCacheStats),
     /// Active possessed body or mount changed (`None` = ejected to free camera).
     PossessChanged(Option<PossessInfo>),
     /// Intersection counts of the latest counted launch (`crate::is_counters`), sent once when
@@ -1670,6 +1720,60 @@ mod tests {
         assert!(matches!(
             downcast_event::<RenderControl>(&scratch[0]),
             Some(RenderControl::SetOceanParams(p)) if *p == dirty
+        ));
+    }
+
+    #[test]
+    fn scene_cache_stats_and_asset_param_controls_route_cleanly() {
+        assert_eq!(SceneLoadSource::None.label(), "Idle");
+        assert_eq!(SceneLoadSource::Built.label(), "Built");
+        assert_eq!(SceneLoadSource::MemoryHit.label(), "Memory Hit");
+        assert_eq!(SceneLoadSource::DiskHit.label(), "Disk Cache Hit");
+
+        let stats = SceneCacheStats {
+            entries: 3,
+            total_bytes: 12_345_678,
+            last_hit: true,
+            last_source: SceneLoadSource::DiskHit,
+        };
+        let mut params = csg_scene::AssetParamMap::new();
+        params.set("uniform_scale", csg_scene::AssetParamValue::Float(1.5));
+
+        let bus = AppBus::new(RenderStateSnapshot {
+            settings: DemoSettings::default(),
+            camera: sample_camera(0.0),
+            interacting_until: None,
+            reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
+            possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
+        });
+        bus.emit_ui(UiCommand::ClearSceneCache);
+        bus.send_render(RenderControl::SetAssetParams(params.clone()));
+        bus.send_render(RenderControl::ClearSceneCache);
+        bus.emit_render_event(RenderEvent::SceneCacheStats(stats));
+
+        let mut scratch = Vec::with_capacity(4);
+        assert_eq!(bus.poll_ui_commands(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<UiCommand>(&scratch[0]),
+            Some(UiCommand::ClearSceneCache)
+        ));
+        assert_eq!(bus.poll_render_controls(&mut scratch), 2);
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[0]),
+            Some(RenderControl::SetAssetParams(p)) if *p == params
+        ));
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[1]),
+            Some(RenderControl::ClearSceneCache)
+        ));
+        assert_eq!(bus.poll_render_events(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<RenderEvent>(&scratch[0]),
+            Some(RenderEvent::SceneCacheStats(s)) if *s == stats
         ));
     }
 }

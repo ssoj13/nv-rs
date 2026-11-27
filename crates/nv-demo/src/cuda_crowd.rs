@@ -1180,6 +1180,10 @@ impl CudaCrowdBackend {
                 self.pending_ias_rebuild |= disp;
             }
 
+            if self.intents_dirty {
+                merge_pending_cpu_intents(&mut self.staging_intents, &scene.crowd.intents);
+            }
+
             let poses = CrowdGpuPoses {
                 states: &self.staging_states,
                 bone_outs: &self.staging_bone_outs,
@@ -1243,6 +1247,14 @@ impl CudaCrowdBackend {
         // 2. Upload cold scene/library/crowd tables & seed state if scene or crowd shape changed.
         self.ensure_scene_uploaded(stream, scene)?;
 
+        // Resolve frame dt before uploading intents so CPU impulse consumption mirrors
+        // `step_actors_cuda` (`substeps > 0 && !frozen`, via `policy::mark_impulse_consumed`).
+        let step_dt = if dt.is_finite() {
+            dt.clamp(0.0, 1.0 / 30.0)
+        } else {
+            0.0
+        };
+
         // 3. Upload `CrowdIntents` only when externally modified (init, PokeCrowd, FreezePose).
         // Copy into `self.upload_intents` first so clearing one-shot `MASK_IMPULSE` bits on CPU
         // never mutates the source slice while `cuMemcpyHtoDAsync_v2` is still reading it.
@@ -1253,24 +1265,13 @@ impl CudaCrowdBackend {
             self.plan
                 .upload(stream, BufId::CrowdIntents, &self.upload_intents)?;
             for intent in &mut scene.crowd.intents {
-                let frozen = (intent.flags & intent_flags::FREEZE_POSE) != 0;
-                if !frozen && (intent.flags & intent_flags::MASK_IMPULSE) != 0 {
-                    intent.impulse_stance[0] = 0.0;
-                    intent.impulse_stance[1] = 0.0;
-                    intent.impulse_stance[2] = 0.0;
-                    intent.flags &= !intent_flags::MASK_IMPULSE;
-                }
+                csg_actors::policy::mark_impulse_consumed(intent, step_dt);
             }
             self.intents_dirty = false;
         }
 
         // 4. Collect per-frame traffic vehicles (VRAM-direct D2D when GPU traffic ran, else host
         // extraction) and uniforms (`dt == 0` allowed for paused LOD refresh).
-        let step_dt = if dt.is_finite() {
-            dt.clamp(0.0, 1.0 / 30.0)
-        } else {
-            0.0
-        };
         let (vehicle_count, traffic_active) = match traffic_crowd_vehicles {
             Some((ptr, count)) if ptr != 0 && count > 0 => {
                 self.plan
@@ -1508,6 +1509,28 @@ impl CudaCrowdBackend {
     }
 }
 
+/// Preserves pending CPU-side `MASK_IMPULSE` (with `impulse_stance[0..3]`) and `FREEZE_POSE`
+/// intents when a GPU pose readback (`sync_cpu_snapshot`) runs before `intents_dirty` was uploaded,
+/// so an intervening sync never silently drops a queued `PokeCrowd` or `FreezePose` command.
+fn merge_pending_cpu_intents(
+    gpu_intents: &mut [csg_actors::IntentPod],
+    cpu_intents: &[csg_actors::IntentPod],
+) {
+    for (gpu, cpu) in gpu_intents.iter_mut().zip(cpu_intents.iter()) {
+        if (cpu.flags & intent_flags::MASK_IMPULSE) != 0 {
+            gpu.impulse_stance[0] = cpu.impulse_stance[0];
+            gpu.impulse_stance[1] = cpu.impulse_stance[1];
+            gpu.impulse_stance[2] = cpu.impulse_stance[2];
+            gpu.flags |= intent_flags::MASK_IMPULSE;
+        }
+        if (cpu.flags & intent_flags::FREEZE_POSE) != 0 {
+            gpu.flags |= intent_flags::FREEZE_POSE;
+        } else {
+            gpu.flags &= !intent_flags::FREEZE_POSE;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,6 +1574,59 @@ mod tests {
             ..CrowdLodParams::default()
         };
         assert_eq!(a.signature_key(), b.signature_key());
+    }
+
+    #[test]
+    fn merge_pending_cpu_intents_preserves_unuploaded_poke_and_freeze() {
+        let mut gpu = [
+            csg_actors::IntentPod {
+                move_cmd: [1.0, 0.5, 0.25, 1.2],
+                impulse_stance: [0.0, 0.0, 0.0, 1.0],
+                flags: intent_flags::MASK_VEL | intent_flags::FREEZE_POSE,
+                ..csg_actors::IntentPod::default()
+            },
+            csg_actors::IntentPod {
+                move_cmd: [0.0, 1.0, 0.0, 1.1],
+                impulse_stance: [0.0, 0.0, 0.0, 0.9],
+                flags: intent_flags::MASK_VEL,
+                ..csg_actors::IntentPod::default()
+            },
+        ];
+        let cpu = [
+            // Actor 0: CPU cleared FREEZE_POSE and queued a poke impulse.
+            csg_actors::IntentPod {
+                impulse_stance: [2.4, 0.36, -0.8, 1.0],
+                flags: intent_flags::MASK_IMPULSE,
+                ..csg_actors::IntentPod::default()
+            },
+            // Actor 1: CPU set FREEZE_POSE without poke.
+            csg_actors::IntentPod {
+                flags: intent_flags::FREEZE_POSE,
+                ..csg_actors::IntentPod::default()
+            },
+        ];
+
+        merge_pending_cpu_intents(&mut gpu, &cpu);
+
+        // GPU steering fields (`move_cmd`, `stance_scale`) stay intact while pending CPU poke
+        // and freeze state win.
+        assert_eq!(gpu[0].move_cmd, [1.0, 0.5, 0.25, 1.2]);
+        assert_eq!(gpu[0].impulse_stance, [2.4, 0.36, -0.8, 1.0]);
+        assert_ne!(gpu[0].flags & intent_flags::MASK_IMPULSE, 0);
+        assert_eq!(gpu[0].flags & intent_flags::FREEZE_POSE, 0);
+        assert_eq!(gpu[1].impulse_stance[3], 0.9);
+        assert_ne!(gpu[1].flags & intent_flags::FREEZE_POSE, 0);
+        assert_eq!(gpu[1].flags & intent_flags::MASK_IMPULSE, 0);
+
+        // `mark_impulse_consumed` keeps impulse when dt == 0 (paused LOD refresh) and clears when dt > 0.
+        let mut paused = gpu[0];
+        csg_actors::policy::mark_impulse_consumed(&mut paused, 0.0);
+        assert_ne!(paused.flags & intent_flags::MASK_IMPULSE, 0);
+        assert_eq!(paused.impulse_stance[0], 2.4);
+
+        csg_actors::policy::mark_impulse_consumed(&mut paused, 1.0 / 60.0);
+        assert_eq!(paused.flags & intent_flags::MASK_IMPULSE, 0);
+        assert_eq!(paused.impulse_stance[0], 0.0);
     }
 
     #[test]

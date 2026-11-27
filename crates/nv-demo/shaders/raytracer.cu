@@ -182,14 +182,14 @@ __constant__ Params params;
 struct NvPickRecord {
     unsigned int inst_id;
     unsigned int part_id;
-    float t;
+    unsigned int packed_slot;
     float world_pos[3];
     unsigned int flags;
     unsigned int frame;
 };
 static_assert(sizeof(NvPickRecord) == 32, "NvPickRecord must stay 32 bytes");
 static_assert(__builtin_offsetof(NvPickRecord, part_id) == 4, "NvPickRecord::part_id");
-static_assert(__builtin_offsetof(NvPickRecord, t) == 8, "NvPickRecord::t");
+static_assert(__builtin_offsetof(NvPickRecord, packed_slot) == 8, "NvPickRecord::packed_slot");
 static_assert(__builtin_offsetof(NvPickRecord, world_pos) == 12, "NvPickRecord::world_pos");
 static_assert(__builtin_offsetof(NvPickRecord, flags) == 24, "NvPickRecord::flags");
 static_assert(__builtin_offsetof(NvPickRecord, frame) == 28, "NvPickRecord::frame");
@@ -270,12 +270,12 @@ static __forceinline__ __device__ bool nv_pick_here(uint3 idx) {
 }
 
 static __forceinline__ __device__ void nv_pick_write(
-    unsigned int key, unsigned int part_id, float t, float3 pos, unsigned int flags
+    unsigned int key, unsigned int part_id, unsigned int packed_slot, float3 pos, unsigned int flags
 ) {
     NvPickRecord r;
     r.inst_id = key;
     r.part_id = part_id;
-    r.t = t;
+    r.packed_slot = packed_slot;
     r.world_pos[0] = pos.x;
     r.world_pos[1] = pos.y;
     r.world_pos[2] = pos.z;
@@ -1285,7 +1285,7 @@ static __forceinline__ __device__ CsgSceneView make_csg_view() {
     );
 }
 
-// Perceptually distinct Cityscapes-inspired palette matching `csg_core::ast::semantic` (0..19).
+// Perceptually distinct Cityscapes-inspired palette matching `csg_core::ast::semantic` (0..21).
 static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id) {
     switch (sem_id) {
         case 1u:  return make_float3(0.50f, 0.25f, 0.50f); // ROAD
@@ -1307,6 +1307,8 @@ static __forceinline__ __device__ float3 semantic_aov_color(unsigned int sem_id)
         case 17u: return make_float3(0.64f, 0.48f, 0.40f); // BARRIER
         case 18u: return make_float3(0.86f, 0.08f, 0.24f); // PEDESTRIAN
         case 19u: return make_float3(0.96f, 0.48f, 0.12f); // ANIMAL
+        case 20u: return make_float3(0.22f, 0.62f, 0.18f); // VEGETATION
+        case 21u: return make_float3(0.58f, 0.46f, 0.30f); // TERRAIN_FEATURE
         default:  return make_float3(0.08f, 0.08f, 0.10f); // UNKNOWN / SKY
     }
 }
@@ -1921,11 +1923,11 @@ static __forceinline__ __device__ float4 sample_ocean_cascade_bilinear(
     unsigned int c,
     float wx,
     float wz,
-    float tile_m,
+    float inv_tile_m,
     unsigned int dim
 ) {
-    float u = wx / tile_m;
-    float v = wz / tile_m;
+    float u = wx * inv_tile_m;
+    float v = wz * inv_tile_m;
     u -= floorf(u);
     v -= floorf(v);
     float fdim = (float)dim;
@@ -1949,23 +1951,110 @@ static __forceinline__ __device__ float4 sample_ocean_cascade_bilinear(
     float4 q01 = __ldg(&plane[r1 + (size_t)x0]);
     float4 q11 = __ldg(&plane[r1 + (size_t)x1]);
     float4 top = make_float4(
-        q00.x + (q10.x - q00.x) * tx,
-        q00.y + (q10.y - q00.y) * tx,
-        q00.z + (q10.z - q00.z) * tx,
-        q00.w + (q10.w - q00.w) * tx
+        fmaf(q10.x - q00.x, tx, q00.x),
+        fmaf(q10.y - q00.y, tx, q00.y),
+        fmaf(q10.z - q00.z, tx, q00.z),
+        fmaf(q10.w - q00.w, tx, q00.w)
     );
     float4 bot = make_float4(
-        q01.x + (q11.x - q01.x) * tx,
-        q01.y + (q11.y - q01.y) * tx,
-        q01.z + (q11.z - q01.z) * tx,
-        q01.w + (q11.w - q01.w) * tx
+        fmaf(q11.x - q01.x, tx, q01.x),
+        fmaf(q11.y - q01.y, tx, q01.y),
+        fmaf(q11.z - q01.z, tx, q01.z),
+        fmaf(q11.w - q01.w, tx, q01.w)
     );
     return make_float4(
-        top.x + (bot.x - top.x) * tz,
-        top.y + (bot.y - top.y) * tz,
-        top.z + (bot.z - top.z) * tz,
-        top.w + (bot.w - top.w) * tz
+        fmaf(bot.x - top.x, tz, top.x),
+        fmaf(bot.y - top.y, tz, top.y),
+        fmaf(bot.z - top.z, tz, top.z),
+        fmaf(bot.w - top.w, tz, top.w)
     );
+}
+
+// Lightweight height-only bilinear fetch (4-byte `.x` scalar __ldg, 3 FMAs) for parallax search.
+static __forceinline__ __device__ float sample_ocean_height_bilinear(
+    const float4* cascades,
+    unsigned int c,
+    float wx,
+    float wz,
+    float inv_tile_m,
+    unsigned int dim
+) {
+    float u = wx * inv_tile_m;
+    float v = wz * inv_tile_m;
+    u -= floorf(u);
+    v -= floorf(v);
+    float fdim = (float)dim;
+    float fx = u * fdim;
+    float fz = v * fdim;
+    int ix0 = (int)floorf(fx);
+    int iz0 = (int)floorf(fz);
+    float tx = fx - (float)ix0;
+    float tz = fz - (float)iz0;
+    unsigned int mask = dim - 1u;
+    unsigned int x0 = (unsigned int)ix0 & mask;
+    unsigned int z0 = (unsigned int)iz0 & mask;
+    unsigned int x1 = (x0 + 1u) & mask;
+    unsigned int z1 = (z0 + 1u) & mask;
+    size_t plane_stride = (size_t)dim * (size_t)dim;
+    const float4* plane = cascades + (size_t)c * plane_stride;
+    size_t r0 = (size_t)z0 * (size_t)dim;
+    size_t r1 = (size_t)z1 * (size_t)dim;
+    float h00 = __ldg(&plane[r0 + (size_t)x0].x);
+    float h10 = __ldg(&plane[r0 + (size_t)x1].x);
+    float h01 = __ldg(&plane[r1 + (size_t)x0].x);
+    float h11 = __ldg(&plane[r1 + (size_t)x1].x);
+    float top = fmaf(h10 - h00, tx, h00);
+    float bot = fmaf(h11 - h01, tx, h01);
+    return fmaf(bot - top, tz, top);
+}
+
+// Fast height-only ocean evaluator used inside the 4-step near-field parallax loop:
+// - cuFFT mode: cascades 0 + 1 only (220 m swell + 48 m wind sea), scalar height-only loads,
+//   skipping slopes, foam, and cascade-2 micro-ripples (~6x less memory traffic per iteration).
+// - Analytical mode: first 5 macro Gerstner octaves (76 m..16.5 m), height-only.
+static __forceinline__ __device__ float eval_ocean_height_fast(
+    float wx,
+    float wz,
+    float wt,
+    float cam_dist
+) {
+    bool use_cufft = (params.ocean_cascades_ptr != 0ull) && (params.ocean_params_b[3] > 0.5f);
+    if (use_cufft) {
+        const float4* cascades = reinterpret_cast<const float4*>(params.ocean_cascades_ptr);
+        unsigned int dim = (params.ocean_params_b[2] >= 64.0f) ? (unsigned int)params.ocean_params_b[2] : 256u;
+        float w0 = 1.0f - 0.30f * sky_smoothstep(450.0f, 1800.0f, cam_dist);
+        float w1 = 1.0f - sky_smoothstep(130.0f, 520.0f, cam_dist);
+        float h = sample_ocean_height_bilinear(cascades, 0u, wx, wz, 1.0f / 220.0f, dim) * w0;
+        if (w1 > 0.005f) {
+            h += sample_ocean_height_bilinear(cascades, 1u, wx, wz, 1.0f / 48.0f, dim) * w1;
+        }
+        return h;
+    }
+
+    static const float MACRO_LEN[5] = { 76.0f, 52.0f, 36.0f, 24.5f, 16.5f };
+    static const float MACRO_ANG[5] = { 0.04f, -0.18f, 0.28f, -0.42f, 0.56f };
+    static const float MACRO_PHASE[5] = { 0.7f, 2.1f, 4.3f, 1.2f, 5.4f };
+    float wind_speed = fminf(fmaxf(params.ocean_params_a[0], 1.0f), 25.0f);
+    float wind_dir = params.ocean_params_a[1];
+    float chop = fminf(fmaxf(params.ocean_params_a[2], 0.0f), 2.0f);
+    float swell = fminf(fmaxf(params.ocean_params_a[3], 0.0f), 1.0f);
+    float wind_amp = fminf(1.8f, 0.14f + 0.065f * wind_speed);
+    float ang_tight = 1.0f - 0.58f * swell;
+    float h = 0.0f;
+    for (int i = 0; i < 5; ++i) {
+        float lam = MACRO_LEN[i];
+        float k = 6.2831853f / lam;
+        float omega = sqrtf(9.81f * k);
+        float spread = MACRO_ANG[i] * ((i < 4) ? ang_tight : (0.75f + 0.25f * ang_tight));
+        float ang = wind_dir + spread;
+        float amp = wind_amp * (lam * 0.0092f) * ((i < 3) ? (0.75f + 0.65f * swell) : 1.0f);
+        float ph = k * (wx * cosf(ang) + wz * sinf(ang)) - omega * wt + MACRO_PHASE[i];
+        float s = sinf(ph);
+        float c = cosf(ph);
+        float q = fminf(0.45f, 0.18f * chop * (1.0f + 0.06f * (float)i));
+        h += amp * (s + 0.35f * q * (c * c - s * s));
+    }
+    return h;
 }
 
 // Evaluates `(height_m, slope_x, slope_z, foam_raw)` and filtered sub-pixel `out_slope_var`
@@ -1992,21 +2081,21 @@ static __noinline__ __device__ float4 eval_ocean_field(
         float w1 = 1.0f - sky_smoothstep(130.0f, 520.0f, cam_dist);
         float w2 = 1.0f - sky_smoothstep(26.0f, 115.0f, cam_dist);
 
-        float4 s0 = sample_ocean_cascade_bilinear(cascades, 0u, wx, wz, 220.0f, dim);
+        float4 s0 = sample_ocean_cascade_bilinear(cascades, 0u, wx, wz, 1.0f / 220.0f, dim);
         float h = s0.x * w0;
         float sx = s0.y * w0;
         float sz = s0.z * w0;
         float foam = s0.w * 0.72f * w0;
 
         if (w1 > 0.005f) {
-            float4 s1 = sample_ocean_cascade_bilinear(cascades, 1u, wx, wz, 48.0f, dim);
+            float4 s1 = sample_ocean_cascade_bilinear(cascades, 1u, wx, wz, 1.0f / 48.0f, dim);
             h += s1.x * w1;
             sx += s1.y * w1;
             sz += s1.z * w1;
             foam += s1.w * 0.85f * w1;
         }
         if (w2 > 0.005f) {
-            float4 s2 = sample_ocean_cascade_bilinear(cascades, 2u, wx, wz, 9.0f, dim);
+            float4 s2 = sample_ocean_cascade_bilinear(cascades, 2u, wx, wz, 1.0f / 9.0f, dim);
             h += s2.x * w2;
             sx += s2.y * w2;
             sz += s2.z * w2;
@@ -2419,10 +2508,10 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                     float relief_w = (1.0f - sky_smoothstep(38.0f, 60.0f, cam_dist))
                                    * sky_smoothstep(0.03f, 0.20f, fabsf(ray_dir.y));
                     float inv_dy = 1.0f / fmaxf(fabsf(ray_dir.y), 0.20f);
+                    float relief_scale = relief_w * 0.65f * inv_dy;
                     for (int it = 0; it < 4; ++it) {
-                        float tmp_var = 0.0f;
-                        float4 wf = eval_ocean_field(px, pz, wt, cam_dist, tmp_var);
-                        float delta = fminf(2.2f, fmaxf(-2.2f, wf.x * relief_w * 0.65f * inv_dy));
+                        float h_est = eval_ocean_height_fast(px, pz, wt, cam_dist);
+                        float delta = fminf(2.2f, fmaxf(-2.2f, h_est * relief_scale));
                         px = hit_pos.x + ray_dir.x * delta;
                         pz = hit_pos.z + ray_dir.z * delta;
                     }
@@ -3025,7 +3114,7 @@ extern "C" __global__ void __raygen__render() {
 
         if (masked) {
             if (s == pick_tap && nv_pick_here(idx)) {
-                nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
+                nv_pick_write(0u, 0xFFFFFFFFu, 0xFFFFFFFFu, make_float3(0.0f, 0.0f, 0.0f), 0u);
             }
             if (s == 0u || aov_aa) {
                 first_albedo = make_float3(0.0f, 0.0f, 0.0f);
@@ -3084,7 +3173,7 @@ extern "C" __global__ void __raygen__render() {
 
             if (p0 == 0u) {
                 if (step == 0 && s == pick_tap && nv_pick_here(idx)) {
-                    nv_pick_write(0u, 0xFFFFFFFFu, 0.0f, make_float3(0.0f, 0.0f, 0.0f), 0u);
+                    nv_pick_write(0u, 0xFFFFFFFFu, 0xFFFFFFFFu, make_float3(0.0f, 0.0f, 0.0f), 0u);
                 }
                 if (!aov_geom_only) {
                     if (in_water) {
@@ -3189,8 +3278,13 @@ extern "C" __global__ void __raygen__render() {
                 }
                 first_inst_id = hit_instance_id(p0, p6);
                 if (s == pick_tap && nv_pick_here(idx)) {
-                    nv_pick_write(first_inst_id, is_csg ? p7 : 0xFFFFFFFFu, first_range, hit_pos,
-                                  NV_PICK_FLAG_HIT | (is_csg ? NV_PICK_FLAG_CSG : 0u));
+                    nv_pick_write(
+                        first_inst_id,
+                        is_csg ? p7 : 0xFFFFFFFFu,
+                        is_csg ? p6 : 0xFFFFFFFFu,
+                        hit_pos,
+                        NV_PICK_FLAG_HIT | (is_csg ? NV_PICK_FLAG_CSG : 0u)
+                    );
                 }
                 float2 prev_px;
                 if (has_prev_cam
@@ -3224,10 +3318,24 @@ extern "C" __global__ void __raygen__render() {
 
                 // True OptiX 9 dielectric reflection & underwater refraction (IOR = 1.333) for CSG_PROC_WATER.
                 if (pr.proc_kind == CSG_PROC_WATER) {
-                    // Bottom face of a thin CSG water slab while traveling underwater: pass straight
-                    // through toward the real seabed / pool floor without artificial bottom reflection.
-                    if (in_water && !entering) {
-                        water_depth_accum += hit_t;
+                    // Case A: Downward ray crossing the artificial bottom face of a thin CSG water
+                    // slab toward the real seabed / pool floor: pass straight through.
+                    if (!entering && geom_n.y < -0.5f) {
+                        if (in_water) {
+                            water_depth_accum += hit_t;
+                        }
+                        origin = f3_add(hit_pos, f3_mul(dir, 0.004f));
+                        if (glass_passes < 6) {
+                            ++glass_passes;
+                        } else {
+                            ++bounce;
+                        }
+                        continue;
+                    }
+                    // Case B: Upward seabed diffuse bounce hitting the artificial bottom face of a
+                    // thin CSG water slab from below (`!in_water`): pass straight through to reach
+                    // the real top air-water interface without bogus air->water refraction.
+                    if (!in_water && geom_n.y < -0.5f && dir.y > 0.0f) {
                         origin = f3_add(hit_pos, f3_mul(dir, 0.004f));
                         if (glass_passes < 6) {
                             ++glass_passes;
@@ -3243,6 +3351,56 @@ extern "C" __global__ void __raygen__render() {
                     r0 = r0 * r0;
                     float w_foam = is_pool ? 0.0f : pr.water_foam;
                     float w_rough = fmaxf(0.015f, fminf(0.45f, rough));
+                    float ray_bias_w = fmaxf(0.002f, hit_t * 0.0004f);
+
+                    // Case C: Exiting water -> air (top water surface from underneath or basin wall):
+                    // apply exact Snell window exit (`in_water = false`) or underside Fresnel / TIR
+                    // reflection back into the water column (`in_water = true`).
+                    if (!entering) {
+                        float eta = w_ior;
+                        float cos_i = fminf(1.0f, fmaxf(0.0f, -f3_dot(dir, n)));
+                        float fresnel = r0 + (1.0f - r0) * powf(1.0f - cos_i, 5.0f);
+                        float sin2_t = eta * eta * (1.0f - cos_i * cos_i);
+                        bool tir = sin2_t > 1.0f;
+
+                        if (tir || rand01(seed) < fresnel) {
+                            float3 refl = f3_reflect(dir, n);
+                            if (w_rough > 1e-4f) {
+                                refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), w_rough * 0.85f)));
+                            }
+                            if (f3_dot(refl, geom_n) >= -0.005f) {
+                                refl = f3_norm(f3_sub(refl, f3_mul(geom_n, f3_dot(refl, geom_n) + 0.02f)));
+                            }
+                            dir = refl;
+                            origin = f3_sub(hit_pos, f3_mul(geom_n, ray_bias_w));
+                            in_water = true;
+                            water_is_pool = is_pool;
+                            water_depth_accum = 0.0f;
+                            water_surface_y = hit_pos.y;
+                            float clarity = fmaxf(0.25f, params.ocean_params_b[1]);
+                            water_sigma = is_pool
+                                ? make_float3(0.26f / clarity, 0.052f / clarity, 0.040f / clarity)
+                                : make_float3(0.54f / clarity, 0.165f / clarity, 0.095f / clarity);
+                            water_foam_gain = fmaxf(0.0f, params.ocean_params_b[0]);
+                            ++bounce;
+                        } else {
+                            float cos_t = sqrtf(fmaxf(0.0f, 1.0f - sin2_t));
+                            float3 refr = f3_norm(f3_add(f3_mul(dir, eta), f3_mul(n, eta * cos_i - cos_t)));
+                            if (f3_dot(refr, geom_n) <= 0.02f) {
+                                refr = f3_norm(f3_add(refr, f3_mul(geom_n, 0.05f - f3_dot(refr, geom_n))));
+                            }
+                            dir = refr;
+                            origin = f3_add(hit_pos, f3_mul(geom_n, 0.004f));
+                            in_water = false;
+                            water_depth_accum = 0.0f;
+                            if (glass_passes < 6) {
+                                ++glass_passes;
+                            } else {
+                                ++bounce;
+                            }
+                        }
+                        continue;
+                    }
 
                     if (step == 0 && (s == 0u || aov_aa)) {
                         float3 foam_alb = make_float3(0.88f, 0.91f, 0.93f);
@@ -3260,7 +3418,6 @@ extern "C" __global__ void __raygen__render() {
                     }
 
                     float3 sun_rad = sun_radiance(params.fractal_r1[3]);
-                    float ray_bias_w = fmaxf(0.002f, hit_t * 0.0004f);
                     float3 biased_w = f3_add(hit_pos, f3_mul(geom_n, ray_bias_w));
                     float ndotl_w = fmaxf(0.0f, f3_dot(n, sun_dir));
                     bool w_occluded = false;

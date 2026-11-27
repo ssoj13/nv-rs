@@ -90,6 +90,14 @@ impl GpuCameraComposer {
     /// device buffers `crowd_bones` (`(ptr, bone_count)`) and `traffic_outs`
     /// (`(ptr, vehicle_count)`) with zero host copies, and returns the completed 64-byte
     /// [`CameraRecordPod`] via page-locked readback.
+    ///
+    /// Note on `stream.synchronize()`: this method runs **only** while actively possessing a
+    /// GPU-stepped crowd actor or traffic vehicle. The host must read the current-frame
+    /// `CameraRecordPod` before launching OptiX raygen because `LaunchParams` (`752 B` C ABI)
+    /// carries host-packed camera vectors after CPU `apply_possess_target` (damper + zoom offset)
+    /// and `OvlCamera` upload; deferring readback by 1 frame would introduce 1-frame camera lag
+    /// behind the GPU-stepped IAS. Eliminating this sync requires binding `BufId::CameraRecords`
+    /// directly in `raytracer.cu` and moving possess damping onto the device.
     pub fn compose_one(
         &mut self,
         stream: &Stream,

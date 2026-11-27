@@ -669,12 +669,18 @@ impl Drop for PinnedStagingBuffer {
     }
 }
 
-/// Reusable staging for Multi-AABB compound GAS inputs: the host boxes of the compound being
-/// built plus one persistent device buffer per primitive count.
+/// Persistent grow-only staging for batched OptiX custom-primitive GAS builds:
+/// - `host` packs every compound's AABBs for a scene/stress batch into one contiguous slice,
+/// - `batch_device` receives the entire batch in a single `cuMemcpyHtoDAsync_v2` upload (zero
+///   per-compound PCIe HtoD staging stalls),
+/// - `pool` holds one reusable exact-length `DeviceBuffer<Aabb>` per primitive count (`1` for
+///   `SinglePrim`/`GeneralRpn`, `M` for `MultiAabbUnion`/`FirstHitUnion`), populated via fast
+///   on-device `cuMemcpyDtoDAsync_v2` from `batch_device`.
 #[derive(Default)]
-struct MultiAabbStaging {
+struct BatchedGasAabbStaging {
     host: Vec<Aabb>,
-    device: HashMap<usize, DeviceBuffer<Aabb>>,
+    batch_device: Option<DeviceBuffer<Aabb>>,
+    pool: HashMap<usize, DeviceBuffer<Aabb>>,
 }
 
 /// Grow-only typed GPU buffer backed by 256-byte-aligned `DeviceBuffer<u8>`, avoiding
@@ -1226,126 +1232,237 @@ fn record_packed_dynamic_lods(
     }
 }
 
-/// Builds a single cached OptiX custom-primitive GAS for `comp`, selecting Multi-AABB hardware BVH
-/// (`M` tight primitive AABBs + `primitive_offset = first_prim`) for eligible union
-/// compounds, `primitive_offset = prim_idx` for `SINGLE_PRIM` compounds, and a 1-AABB GAS for
-/// general RPN compounds, with `compact: false` and `GeometryFlags::DISABLE_ANYHIT`.
-///
-/// Multi-AABB boxes go through `multi`, one persistent device buffer per primitive count (the
-/// GAS input length is the buffer length), so scene and road-mode switches reuse them instead of
-/// allocating, synchronizing and freeing one buffer per compound.
-fn build_compound_gas(
+/// One compound's slice inside a contiguous [`BatchedGasAabbStaging::host`] / `batch_device` buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchedGasEntry {
+    aabb_offset: usize,
+    aabb_count: usize,
+    primitive_offset: u32,
+    sbt_offset: u32,
+}
+
+/// Packs every compound in `compounds` into one contiguous `out_aabbs` array and returns the
+/// parallel per-compound slice descriptors (`aabb_offset`, `aabb_count`, `primitive_offset`,
+/// `sbt_offset`) so the entire scene uploads in one `cuMemcpyHtoDAsync_v2` transfer.
+fn pack_compound_batch_aabbs(
+    lib: &CompiledLibrary,
+    compounds: &[GpuCompound],
+    out_aabbs: &mut Vec<Aabb>,
+) -> Vec<BatchedGasEntry> {
+    out_aabbs.clear();
+    let mut entries = Vec::with_capacity(compounds.len());
+    for comp in compounds {
+        let plan = compound_gas_plan(lib, comp);
+        let sbt_offset = plan.sbt_offset();
+        let aabb_offset = out_aabbs.len();
+        let (aabb_count, primitive_offset) = match plan {
+            CompoundGasPlan::MultiAabbUnion { first_prim, count }
+            | CompoundGasPlan::FirstHitUnion { first_prim, count } => {
+                let p0 = first_prim as usize;
+                out_aabbs.reserve(count);
+                for prim in &lib.prims[p0..p0 + count] {
+                    out_aabbs.push(sanitized_prim_aabb(prim));
+                }
+                (count, first_prim)
+            }
+            CompoundGasPlan::SinglePrim { prim_idx } => {
+                out_aabbs.push(sanitized_compound_aabb(comp));
+                (1, prim_idx)
+            }
+            CompoundGasPlan::GeneralRpn => {
+                out_aabbs.push(sanitized_compound_aabb(comp));
+                (1, 0)
+            }
+        };
+        entries.push(BatchedGasEntry {
+            aabb_offset,
+            aabb_count,
+            primitive_offset,
+            sbt_offset,
+        });
+    }
+    entries
+}
+
+/// Builds non-compacted (`compact: false`, `GeometryFlags::DISABLE_ANYHIT`) OptiX custom-primitive
+/// GASes for `compounds`, packing all AABBs into one grow-only `batch_device` buffer uploaded with
+/// a single `cuMemcpyHtoDAsync_v2` transfer instead of per-compound pageable HtoD copies.
+fn build_compound_gases_batched(
     optix_ctx: &Arc<DeviceContext>,
     stream: &Arc<Stream>,
     scratch: &mut Scratch,
-    aabb_staging: &DeviceBuffer<Aabb>,
-    multi: &mut MultiAabbStaging,
+    staging: &mut BatchedGasAabbStaging,
     lib: &CompiledLibrary,
-    comp: &GpuCompound,
-) -> Result<(Arc<Accel>, u32), String> {
-    let build_opts = csg_gas_build_opts();
-    let plan = compound_gas_plan(lib, comp);
-    let sbt_off = plan.sbt_offset();
-    let gas = match plan {
-        CompoundGasPlan::MultiAabbUnion { first_prim, count }
-        | CompoundGasPlan::FirstHitUnion { first_prim, count } => {
-            let MultiAabbStaging {
-                host: multi_aabb_host,
-                device: multi_aabb_staging,
-            } = multi;
-            multi_aabb_host.clear();
-            multi_aabb_host.reserve(count);
-            let p0 = first_prim as usize;
-            for prim in &lib.prims[p0..p0 + count] {
-                multi_aabb_host.push(sanitized_prim_aabb(prim));
-            }
-            let multi_buf: &DeviceBuffer<Aabb> = match multi_aabb_staging.entry(count) {
-                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(DeviceBuffer::<Aabb>::zeroed(stream, count).map_err(|e| {
-                        format!("CSG multi-AABB staging alloc ({count} prims) failed: {e}")
-                    })?)
-                }
-            };
-            let box_bytes = count * std::mem::size_of::<Aabb>();
-            // SAFETY: `multi_buf` holds exactly `count` `Aabb`s (`box_bytes` bytes) on `stream` and
-            // `multi_aabb_host` holds `count` initialized `Aabb`s; CUDA stages the pageable host
-            // copy before returning, and the previous GAS build reading `multi_buf` is ordered
-            // before this copy on the same stream.
-            let h2d = unsafe {
-                cu::cuMemcpyHtoDAsync_v2(
-                    multi_buf.cu_deviceptr(),
-                    multi_aabb_host.as_ptr().cast(),
-                    box_bytes,
-                    stream.cu_stream(),
-                )
-            };
-            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!(
-                    "CSG multi-AABB H2D copy ({count} prims) failed ({h2d:?})"
-                ));
-            }
-            let input = CustomPrimitives {
-                aabbs: Keys::One(multi_buf),
-                flags: &[GeometryFlags::DISABLE_ANYHIT],
-                sbt_offsets: None,
-                primitive_offset: first_prim,
-            };
-            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
-                .map_err(|e| format!("CSG multi-AABB GAS build failed: {e}"))?
-        }
-        CompoundGasPlan::SinglePrim { prim_idx } => {
-            let aabb = sanitized_compound_aabb(comp);
-            let box_bytes = std::mem::size_of::<Aabb>();
-            // SAFETY: `aabb_staging` holds 1 `Aabb` (`24 B` plain `f32`) on `stream`; CUDA stages
-            // the pageable host copy before returning.
-            let h2d = unsafe {
-                cu::cuMemcpyHtoDAsync_v2(
-                    aabb_staging.cu_deviceptr(),
-                    (&raw const aabb).cast(),
-                    box_bytes,
-                    stream.cu_stream(),
-                )
-            };
-            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!("CSG single-prim AABB H2D copy failed ({h2d:?})"));
-            }
-            let input = CustomPrimitives {
-                aabbs: Keys::One(aabb_staging),
-                flags: &[GeometryFlags::DISABLE_ANYHIT],
-                sbt_offsets: None,
-                primitive_offset: prim_idx,
-            };
-            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
-                .map_err(|e| format!("CSG single-prim GAS build failed: {e}"))?
-        }
-        CompoundGasPlan::GeneralRpn => {
-            let aabb = sanitized_compound_aabb(comp);
-            let box_bytes = std::mem::size_of::<Aabb>();
-            // SAFETY: `aabb_staging` holds 1 `Aabb` (`24 B` plain `f32`) on `stream`; CUDA stages
-            // the pageable host copy before returning.
-            let h2d = unsafe {
-                cu::cuMemcpyHtoDAsync_v2(
-                    aabb_staging.cu_deviceptr(),
-                    (&raw const aabb).cast(),
-                    box_bytes,
-                    stream.cu_stream(),
-                )
-            };
-            if h2d != cu::cudaError_enum_CUDA_SUCCESS {
-                return Err(format!("CSG compound AABB H2D copy failed ({h2d:?})"));
-            }
-            let input = CustomPrimitives {
-                aabbs: Keys::One(aabb_staging),
-                flags: &[GeometryFlags::DISABLE_ANYHIT],
-                sbt_offsets: None,
-                primitive_offset: 0,
-            };
-            Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
-                .map_err(|e| format!("CSG compound GAS build failed: {e}"))?
-        }
+    compounds: &[GpuCompound],
+    on_built: &mut dyn FnMut(u32, u32),
+) -> Result<(Vec<Arc<Accel>>, Vec<u32>), String> {
+    let mut gases = Vec::with_capacity(compounds.len());
+    let mut sbt_offsets = Vec::with_capacity(compounds.len());
+    if compounds.is_empty() {
+        return Ok((gases, sbt_offsets));
+    }
+
+    let entries = pack_compound_batch_aabbs(lib, compounds, &mut staging.host);
+    let total_aabbs = staging.host.len();
+    if total_aabbs == 0 {
+        return Ok((gases, sbt_offsets));
+    }
+
+    // Grow the contiguous batched AABB buffer in power-of-two counts so repeated scene/road-mode
+    // switches perform zero steady-state VRAM reallocations.
+    let need_alloc = staging
+        .batch_device
+        .as_ref()
+        .is_none_or(|b| b.len() < total_aabbs);
+    if need_alloc {
+        let cap = total_aabbs.max(64).next_power_of_two();
+        let buf = DeviceBuffer::<Aabb>::zeroed(stream, cap)
+            .map_err(|e| format!("CSG batched AABB staging alloc ({cap} boxes) failed: {e}"))?;
+        staging.batch_device = Some(buf);
+    }
+    let batch_ptr = staging
+        .batch_device
+        .as_ref()
+        .ok_or_else(|| "CSG batched AABB buffer missing".to_string())?
+        .cu_deviceptr();
+
+    let total_bytes = total_aabbs
+        .checked_mul(std::mem::size_of::<Aabb>())
+        .ok_or_else(|| "CSG batched AABB byte size overflow".to_string())?;
+    // SAFETY: `batch_device` owns at least `total_aabbs` `Aabb`s (`total_bytes` bytes) on
+    // `stream`, `staging.host` holds `total_aabbs` initialized plain-`f32` `Aabb`s, and the
+    // caller synchronizes `stream` before `staging.host` is reused or dropped.
+    let h2d = unsafe {
+        cu::cuMemcpyHtoDAsync_v2(
+            batch_ptr,
+            staging.host.as_ptr().cast(),
+            total_bytes,
+            stream.cu_stream(),
+        )
     };
-    Ok((gas, sbt_off))
+    if h2d != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!(
+            "CSG batched AABB H2D copy ({total_aabbs} boxes) failed ({h2d:?})"
+        ));
+    }
+
+    let build_opts = csg_gas_build_opts();
+    let total_gases = entries.len() as u32;
+    let aabb_stride = std::mem::size_of::<Aabb>();
+    for (idx, entry) in entries.iter().enumerate() {
+        let count = entry.aabb_count;
+        let dst_buf: &DeviceBuffer<Aabb> = match staging.pool.entry(count) {
+            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(DeviceBuffer::<Aabb>::zeroed(stream, count).map_err(|e| {
+                    format!("CSG AABB pool alloc ({count} prims) failed: {e}")
+                })?)
+            }
+        };
+        let byte_off = entry
+            .aabb_offset
+            .checked_mul(aabb_stride)
+            .ok_or_else(|| "CSG batched AABB byte offset overflow".to_string())?;
+        let copy_bytes = count
+            .checked_mul(aabb_stride)
+            .ok_or_else(|| "CSG batched AABB copy size overflow".to_string())?;
+        let src_ptr = batch_ptr
+            .checked_add(byte_off as u64)
+            .ok_or_else(|| "CSG batched AABB device pointer overflow".to_string())?;
+        // SAFETY: `src_ptr..src_ptr + copy_bytes` lies within `batch_device` populated by the
+        // preceding stream-ordered H2D transfer, `dst_buf` owns exactly `copy_bytes` device bytes
+        // on `stream`, and the previous `Accel::custom` on `stream` finished reading `dst_buf`.
+        let d2d = unsafe {
+            cu::cuMemcpyDtoDAsync_v2(
+                dst_buf.cu_deviceptr(),
+                src_ptr,
+                copy_bytes,
+                stream.cu_stream(),
+            )
+        };
+        if d2d != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!(
+                "CSG batched AABB D2D slice copy ({count} prims) failed ({d2d:?})"
+            ));
+        }
+
+        let input = CustomPrimitives {
+            aabbs: Keys::One(dst_buf),
+            flags: &[GeometryFlags::DISABLE_ANYHIT],
+            sbt_offsets: None,
+            primitive_offset: entry.primitive_offset,
+        };
+        let gas = Accel::custom(optix_ctx, stream, scratch, &[input], build_opts)
+            .map_err(|e| format!("CSG compound GAS build (#{idx}, {count} prims) failed: {e}"))?;
+        gases.push(gas);
+        sbt_offsets.push(entry.sbt_offset);
+        on_built((idx + 1) as u32, total_gases);
+    }
+
+    Ok((gases, sbt_offsets))
+}
+
+/// Selects the best crowd actor to poke along `(origin, forward)` using a 2-tier view cone:
+/// - Tier 1 (in-frustum look ray, `dot >= 0.72` ≈ ±44°): strong angular preference
+///   `dist * (1.0 + 10.0 * (1.0 - dot))` so an off-screen side pedestrian never steals a poke from
+///   an actor directly under the crosshair.
+/// - Tier 2 (wide forward hemisphere fallback, `dot > 0.30`): same angular score if Tier 1 is empty.
+///
+/// Skips culled actors (`dist > cull_dist_m`) and `exclude_actor` (the currently possessed actor).
+fn select_poke_target(
+    states: &[csg_actors::ActorStatePod],
+    origin: [f32; 3],
+    forward: [f32; 3],
+    cull_dist_m: f32,
+    exclude_actor: Option<usize>,
+) -> Option<(usize, Vec3)> {
+    const INNER_CONE_DOT: f32 = 0.72;
+    const OUTER_CONE_DOT: f32 = 0.30;
+    const ANGLE_WEIGHT: f32 = 10.0;
+
+    let cam_pos = Vec3::new(origin[0], origin[1], origin[2]);
+    let cam_fwd = {
+        let f = Vec3::new(forward[0], forward[1], forward[2]);
+        if f.len_sq() > 1e-6 { f.norm() } else { Vec3::Z }
+    };
+    let max_dist = if cull_dist_m.is_finite() && cull_dist_m > 0.0 {
+        cull_dist_m
+    } else {
+        f32::INFINITY
+    };
+
+    let mut best_inner: Option<(usize, f32, Vec3)> = None;
+    let mut best_outer: Option<(usize, f32, Vec3)> = None;
+    for (idx, st) in states.iter().enumerate() {
+        if Some(idx) == exclude_actor {
+            continue;
+        }
+        let p = Vec3::new(st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2]);
+        let delta = p - cam_pos;
+        let d2 = delta.len_sq();
+        if !d2.is_finite() || d2 < 1e-6 {
+            continue;
+        }
+        let dist = d2.sqrt();
+        if dist > max_dist {
+            continue;
+        }
+        let dot = delta.dot(cam_fwd) / dist;
+        if !dot.is_finite() || dot <= OUTER_CONE_DOT {
+            continue;
+        }
+        let score = dist * (1.0 + ANGLE_WEIGHT * (1.0 - dot));
+        if dot >= INNER_CONE_DOT {
+            if best_inner.is_none_or(|(_, best_s, _)| score < best_s) {
+                best_inner = Some((idx, score, p));
+            }
+        } else if best_outer.is_none_or(|(_, best_s, _)| score < best_s) {
+            best_outer = Some((idx, score, p));
+        }
+    }
+    best_inner
+        .or(best_outer)
+        .map(|(idx, _, pos)| (idx, pos))
 }
 
 /// Converts `nv-demo` [`CameraProjection`] to [`SdgProjection`].
@@ -1390,8 +1507,7 @@ pub struct CsgGpuHost {
     aux_planes_buf: GrowDeviceBuffer<[f32; 4]>,
     guard_aabbs_buf: GrowDeviceBuffer<GpuAabb>,
     repeats_buf: GrowDeviceBuffer<GpuRepeat>,
-    aabb_staging_buf: Option<DeviceBuffer<Aabb>>,
-    multi_aabb: MultiAabbStaging,
+    gas_aabb_staging: BatchedGasAabbStaging,
     materials_buf: GrowDeviceBuffer<GpuMaterial>,
     instances_buf: GrowDeviceBuffer<GpuInstance>,
     prev_xforms_buf: GrowDeviceBuffer<[f32; 12]>,
@@ -1533,10 +1649,10 @@ impl CsgGpuHost {
             aux_planes_buf: GrowDeviceBuffer::default(),
             guard_aabbs_buf: GrowDeviceBuffer::default(),
             repeats_buf: GrowDeviceBuffer::default(),
-            aabb_staging_buf: None,
-            multi_aabb: MultiAabbStaging {
-                host: Vec::with_capacity(64),
-                device: HashMap::new(),
+            gas_aabb_staging: BatchedGasAabbStaging {
+                host: Vec::with_capacity(512),
+                batch_device: None,
+                pool: HashMap::new(),
             },
             materials_buf: GrowDeviceBuffer::default(),
             instances_buf: GrowDeviceBuffer::default(),
@@ -2152,8 +2268,8 @@ impl CsgGpuHost {
         true
     }
 
-    /// Injects a balance poke impulse into either the nearest crowd actor to `origin` or all
-    /// crowd actors along `forward`, returning a concise human-readable status message.
+    /// Injects a balance poke impulse into either the visible crowd actor closest to the camera's
+    /// look ray or all crowd actors along `forward`, returning a concise human-readable status.
     pub fn poke_crowd(
         &mut self,
         origin: [f32; 3],
@@ -2161,6 +2277,11 @@ impl CsgGpuHost {
         impulse_mag: f32,
         all: bool,
     ) -> Result<String, String> {
+        let possessed_actor = self
+            .scene
+            .as_ref()
+            .zip(self.active_possess.as_ref())
+            .and_then(|(s, info)| find_crowd_actor_for_inst(&s.world, &s.crowd, info.inst_id));
         let Some(ref mut scene) = self.scene else {
             return Err("Load a CSG scene before poking crowd actors".to_string());
         };
@@ -2184,45 +2305,32 @@ impl CsgGpuHost {
             scene.poke_crowd_all(impulse);
             Ok(format!("Poked all {count} crowd actors ({mag:.1} m/s)"))
         } else {
-            // Prefer the actor closest to the camera's forward look ray (`dot > 0.30`) so Poke
-            // always hits visible pedestrians in front of the user rather than an unseen actor
-            // behind the camera, then fall back to nearest-3D if nobody is ahead.
-            let cam_pos = Vec3::new(origin[0], origin[1], origin[2]);
-            let cam_fwd = {
-                let f = Vec3::new(forward[0], forward[1], forward[2]);
-                if f.len_sq() > 1e-6 { f.norm() } else { Vec3::Z }
+            let cull_dist_m = if scene.crowd.cull_dist_m.is_finite() && scene.crowd.cull_dist_m > 0.0
+            {
+                scene.crowd.cull_dist_m
+            } else {
+                180.0
             };
-            let mut best_in_view: Option<(usize, f32, Vec3)> = None;
-            for (idx, st) in scene.crowd.states.iter().enumerate() {
-                let p = Vec3::new(st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2]);
-                let delta = p - cam_pos;
-                let d2 = delta.len_sq();
-                if !d2.is_finite() || d2 < 1e-6 {
-                    continue;
-                }
-                let dist = d2.sqrt();
-                let dot = delta.dot(cam_fwd) / dist;
-                if dot <= 0.30 {
-                    continue;
-                }
-                let score = dist * (1.6 - dot);
-                if best_in_view.is_none_or(|(_, best_s, _)| score < best_s) {
-                    best_in_view = Some((idx, score, p));
-                }
-            }
-
-            if let Some((target_idx, _, center)) = best_in_view {
+            let target = select_poke_target(
+                &scene.crowd.states,
+                origin,
+                forward,
+                cull_dist_m,
+                possessed_actor,
+            );
+            if let Some((target_idx, center)) = target {
                 let imp_a = csg_actors::Vec3::new(impulse.x, impulse.y, impulse.z);
                 scene.crowd.poke_actor(target_idx, imp_a);
                 // Apply an attenuated shockwave to immediate neighbors within 3.5 m (up to 8
-                // nearby actors) so dense crowds react visibly around the targeted pedestrian.
+                // nearby actors, excluding the possessed camera host) so dense crowds react
+                // visibly around the targeted pedestrian.
                 const SPLASH_RADIUS_M: f32 = 3.5;
                 let mut nearby: Vec<(usize, f32)> = scene
                     .crowd
                     .states
                     .iter()
                     .enumerate()
-                    .filter(|&(idx, _)| idx != target_idx)
+                    .filter(|&(idx, _)| idx != target_idx && Some(idx) != possessed_actor)
                     .filter_map(|(idx, st)| {
                         let p = Vec3::new(st.pos_yaw[0], st.pos_yaw[1], st.pos_yaw[2]);
                         let d = (p - center).len_sq().sqrt();
@@ -2250,6 +2358,7 @@ impl CsgGpuHost {
                     Ok(format!("Poked crowd actor #{target_idx} ({mag:.1} m/s)"))
                 }
             } else {
+                let cam_pos = Vec3::new(origin[0], origin[1], origin[2]);
                 match scene.poke_crowd_nearest(cam_pos, impulse) {
                     Some(idx) => Ok(format!("Poked crowd actor #{idx} ({mag:.1} m/s)")),
                     None => Err("Failed to locate nearest crowd actor to poke".to_string()),
@@ -2302,32 +2411,15 @@ impl CsgGpuHost {
                 + self.guard_aabbs_buf.active_bytes()
                 + self.repeats_buf.active_bytes();
 
-            if self.aabb_staging_buf.is_none() {
-                let staging = DeviceBuffer::<Aabb>::zeroed(stream, 1)
-                    .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
-                self.aabb_staging_buf = Some(staging);
-            }
-            let aabb_staging = self
-                .aabb_staging_buf
-                .as_ref()
-                .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
-
-            let new_count = new_compound_count - old_compound_count;
-            let mut new_gases = Vec::with_capacity(new_count);
-            let mut new_sbt_offsets = Vec::with_capacity(new_count);
-            for c in &lib.compounds[old_compound_count..new_compound_count] {
-                let (gas, sbt_off) = build_compound_gas(
-                    optix_ctx,
-                    stream,
-                    scratch,
-                    aabb_staging,
-                    &mut self.multi_aabb,
-                    lib,
-                    c,
-                )?;
-                new_gases.push(gas);
-                new_sbt_offsets.push(sbt_off);
-            }
+            let (new_gases, new_sbt_offsets) = build_compound_gases_batched(
+                optix_ctx,
+                stream,
+                scratch,
+                &mut self.gas_aabb_staging,
+                lib,
+                &lib.compounds[old_compound_count..new_compound_count],
+                &mut |_, _| {},
+            )?;
             stream
                 .synchronize()
                 .map_err(|e| format!("CSG stress GAS sync failed: {e}"))?;
@@ -3848,46 +3940,34 @@ impl CsgGpuHost {
 
         // Build one non-compacted (`compact: false`) OptiX custom-primitive GAS per compound:
         // - `MultiAabbUnion` -> M tight primitive AABBs with `primitive_offset = first_prim` (SBT 10)
+        // - `FirstHitUnion` -> M tight primitive AABBs with `primitive_offset = first_prim` (SBT 12)
         // - `SinglePrim` -> 1 compound AABB with `primitive_offset = prim_idx` (SBT 10)
         // - `GeneralRpn` -> 1 compound AABB with `primitive_offset = 0` (SBT 8)
-        let mut gases = Vec::with_capacity(lib.compounds.len());
-        let mut sbt_offsets = Vec::with_capacity(lib.compounds.len());
-        if !lib.compounds.is_empty() {
-            if self.aabb_staging_buf.is_none() {
-                let staging = DeviceBuffer::<Aabb>::zeroed(stream, 1)
-                    .map_err(|e| format!("CSG AABB staging alloc failed: {e}"))?;
-                self.aabb_staging_buf = Some(staging);
-            }
-            let aabb_staging = self
-                .aabb_staging_buf
-                .as_ref()
-                .ok_or_else(|| "CSG AABB staging buffer missing".to_string())?;
+        let (gases, sbt_offsets) = if !lib.compounds.is_empty() {
             let total_gases = lib.compounds.len() as u32;
             let stride = if total_gases <= 64 { 4 } else { 8 };
             reporter.emit(3, "Building OptiX GAS", 0, total_gases);
-            for (idx, c) in lib.compounds.iter().enumerate() {
-                let (gas, sbt_off) = build_compound_gas(
-                    optix_ctx,
-                    stream,
-                    scratch,
-                    aabb_staging,
-                    &mut self.multi_aabb,
-                    lib,
-                    c,
-                )?;
-                gases.push(gas);
-                sbt_offsets.push(sbt_off);
-                let done = (idx + 1) as u32;
-                if done == total_gases || done.is_multiple_of(stride) {
-                    reporter.emit(3, "Building OptiX GAS", done, total_gases);
-                }
-            }
+            let res = build_compound_gases_batched(
+                optix_ctx,
+                stream,
+                scratch,
+                &mut self.gas_aabb_staging,
+                lib,
+                &lib.compounds,
+                &mut |done, total| {
+                    if done == total || done.is_multiple_of(stride) {
+                        reporter.emit(3, "Building OptiX GAS", done, total);
+                    }
+                },
+            )?;
             stream
                 .synchronize()
                 .map_err(|e| format!("CSG GAS sync failed: {e}"))?;
+            res
         } else {
             reporter.emit(3, "Building OptiX GAS", 1, 1);
-        }
+            (Vec::new(), Vec::new())
+        };
 
         self.compound_gases = gases;
         self.compound_sbt_offsets = sbt_offsets;
@@ -4866,6 +4946,102 @@ mod tests {
             initial_compounds,
             "reusing existing 11-GAS ActorGasBank must add 0 compounds"
         );
+    }
+
+    #[test]
+    fn poke_target_prefers_crosshair_actor_over_closer_offscreen_actor_and_skips_possessed_and_culled() {
+        let mk_state = |x: f32, y: f32, z: f32| csg_actors::ActorStatePod {
+            pos_yaw: [x, y, z, 0.0],
+            ..csg_actors::ActorStatePod::default()
+        };
+        let states = [
+            // #0: 2.0 m away, ~70 deg off-axis (off-screen side pedestrian; dot ≈ 0.34).
+            mk_state(1.88, 0.9, 0.68),
+            // #1: 5.0 m straight ahead dead center in crosshair (dot = 1.0).
+            mk_state(0.0, 0.9, 5.0),
+            // #2: 1.5 m straight ahead (possessed actor — must be excluded when exclude_actor=Some(2)).
+            mk_state(0.0, 0.9, 1.5),
+            // #3: 250 m straight ahead (beyond cull_dist_m = 180 m — must be skipped).
+            mk_state(0.0, 0.9, 250.0),
+        ];
+
+        // With actor #2 possessed, crosshair actor #1 MUST win over closer off-screen actor #0.
+        let picked = select_poke_target(&states, [0.0, 0.9, 0.0], [0.0, 0.0, 1.0], 180.0, Some(2));
+        assert_eq!(
+            picked.map(|(i, _)| i),
+            Some(1),
+            "actor dead-center in view must beat closer 70-deg off-screen actor"
+        );
+
+        // If only culled actor #3 is ahead (within 100 m cull), outer cone #0 is picked instead of culled #3.
+        let picked_culled =
+            select_poke_target(&[states[0], states[3]], [0.0, 0.9, 0.0], [0.0, 0.0, 1.0], 100.0, None);
+        assert_eq!(
+            picked_culled.map(|(i, _)| i),
+            Some(0),
+            "culled actor beyond cull_dist_m must never steal poke from visible actor"
+        );
+    }
+
+    #[test]
+    fn pack_compound_batch_aabbs_packs_single_multi_and_rpn_contiguously() {
+        let mut lib = CompiledLibrary::new();
+        let single_node = csg_core::CsgNode::box3(
+            [1.0, 1.0, 1.0],
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        );
+        let _ = lib
+            .compile_single(&single_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("single");
+
+        let union_node = csg_core::CsgNode::box3(
+            [1.0, 1.0, 1.0],
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        )
+        .union(
+            csg_core::CsgNode::sphere(
+                0.5,
+                csg_core::MaterialId(2),
+                csg_core::semantic::BUILDING,
+            )
+            .translated(5.0, 0.0, 0.0),
+        );
+        let _ = lib
+            .compile_single(&union_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("pure union");
+
+        let diff_node = csg_core::CsgNode::box3(
+            [2.0, 2.0, 2.0],
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        )
+        .subtract(csg_core::CsgNode::sphere(
+            1.0,
+            csg_core::MaterialId(1),
+            csg_core::semantic::BUILDING,
+        ));
+        let _ = lib
+            .compile_single(&diff_node, csg_core::OptimizeConfig::default(), 0)
+            .expect("rpn difference");
+
+        let mut aabbs = Vec::new();
+        let entries = pack_compound_batch_aabbs(&lib, &lib.compounds, &mut aabbs);
+        assert_eq!(entries.len(), 3);
+        // Entry 0: SinglePrim -> 1 box at offset 0, SBT 10.
+        assert_eq!(entries[0].aabb_offset, 0);
+        assert_eq!(entries[0].aabb_count, 1);
+        assert_eq!(entries[0].sbt_offset, CSG_SBT_PRIM_OFFSET);
+        // Entry 1: MultiAabbUnion -> 2 boxes at offset 1, SBT 10.
+        assert_eq!(entries[1].aabb_offset, 1);
+        assert_eq!(entries[1].aabb_count, 2);
+        assert_eq!(entries[1].sbt_offset, CSG_SBT_PRIM_OFFSET);
+        // Entry 2: GeneralRpn -> 1 box at offset 3, SBT 8.
+        assert_eq!(entries[2].aabb_offset, 3);
+        assert_eq!(entries[2].aabb_count, 1);
+        assert_eq!(entries[2].sbt_offset, CSG_SBT_OFFSET);
+        assert_eq!(aabbs.len(), 4);
     }
 
     #[test]

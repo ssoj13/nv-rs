@@ -33,7 +33,6 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use csg_core::Mat3x4;
-use csg_scene::InstanceId;
 use csg_scene::frame_plan::{BufId, EventId, FrameSizes, PlanKind, ReadbackWhen};
 use csg_scene::traffic::{TrafficPoseSink, VehicleHazardStatePod};
 use csg_scene::traffic_gpu::{
@@ -41,7 +40,7 @@ use csg_scene::traffic_gpu::{
     TrafficGlobalsPod, TrafficGpuScene, TrafficInstanceOutPod, TrafficTableGenerations,
     TrafficVehicleDescPod, encode_blockers, out_flags, traffic_frame_plan,
 };
-use csg_scene::SceneBuilt;
+use csg_scene::{InstanceId, OBJECT_ID_NONE, SceneBuilt, WorldScene};
 use cuda_bindings as cu;
 use cuda_core::{Context as CudaContext, Stream};
 
@@ -349,6 +348,9 @@ pub struct CudaTrafficBackend {
     d_bindings: GrowCudaBuf<TrafficScatterBindingPod>,
     d_rebuild_pos: GrowCudaBuf<[f32; 4]>,
     d_bridge_stats: GrowCudaBuf<u32>,
+    /// Per-vehicle P42 selection keys (`u32[N]`, `csg_selection_key(veh_obj_id, body_user_id)`)
+    /// read by `ovl_adas` so `Selected` scope matches grouped vehicles (`OBJECT_KEY_BIT | obj_id`).
+    d_vehicle_sel_keys: GrowCudaBuf<u32>,
     // Page-locked async readback buffers (zero mid-frame synchronization).
     pinned_globals: PinnedHostBuf<TrafficGlobalsPod>,
     pinned_bridge_stats: PinnedHostBuf<u32>,
@@ -363,6 +365,7 @@ pub struct CudaTrafficBackend {
     // Reusable host scratch buffers (zero steady-state heap allocations).
     host_blockers: Vec<TrafficBlockerPod>,
     host_rebuild_pos: Vec<[f32; 4]>,
+    host_vehicle_sel_keys: Vec<u32>,
     staging_outs: Vec<TrafficInstanceOutPod>,
     scene_dirty: bool,
     topology_dirty: bool,
@@ -474,6 +477,7 @@ impl CudaTrafficBackend {
             d_bindings: GrowCudaBuf::default(),
             d_rebuild_pos: GrowCudaBuf::default(),
             d_bridge_stats: GrowCudaBuf::default(),
+            d_vehicle_sel_keys: GrowCudaBuf::default(),
             pinned_globals,
             pinned_bridge_stats,
             pinned_possess_hazard,
@@ -485,6 +489,7 @@ impl CudaTrafficBackend {
             last_possess_hazard: None,
             host_blockers: Vec::with_capacity(64),
             host_rebuild_pos: Vec::with_capacity(128),
+            host_vehicle_sel_keys: Vec::with_capacity(128),
             staging_outs: Vec::new(),
             scene_dirty: true,
             topology_dirty: true,
@@ -553,7 +558,8 @@ impl CudaTrafficBackend {
     pub fn gpu_bytes(&self) -> u64 {
         let bridge = self.d_bindings.cap_bytes()
             + self.d_rebuild_pos.cap_bytes()
-            + self.d_bridge_stats.cap_bytes();
+            + self.d_bridge_stats.cap_bytes()
+            + self.d_vehicle_sel_keys.cap_bytes();
         self.plan.gpu_bytes().saturating_add(bridge as u64)
     }
 
@@ -620,6 +626,19 @@ impl CudaTrafficBackend {
         (
             self.plan.device_ptr(BufId::TrafficHazards).unwrap_or(0),
             u32::try_from(self.uploaded_vehicle_count).unwrap_or(0),
+        )
+    }
+
+    /// Returns `(cu_deviceptr, vehicle_count)` of per-vehicle P42 selection keys
+    /// (`u32[N]`, `csg_selection_key(veh_obj_id, body_user_id)`) for `ovl_adas` `Selected` scope.
+    #[inline]
+    pub fn vehicle_sel_keys_device_ptr(&self) -> (u64, u32) {
+        if self.scene_dirty || self.uploaded_vehicle_count == 0 {
+            return (0, 0);
+        }
+        (
+            self.d_vehicle_sel_keys.device_ptr(),
+            u32::try_from(self.d_vehicle_sel_keys.len()).unwrap_or(0),
         )
     }
 
@@ -751,6 +770,17 @@ impl CudaTrafficBackend {
         }
         self.d_rebuild_pos.upload(stream, &self.host_rebuild_pos)?;
         self.d_bridge_stats.ensure_len(stream, BRIDGE_STAT_WORDS)?;
+
+        // Upload static per-vehicle P42 selection keys (`OBJECT_KEY_BIT | obj_id` for grouped
+        // vehicles, else ungrouped `body_user_id`) so `ovl_adas` `Selected` scope matches
+        // viewport clicks on any body or wheel part.
+        build_vehicle_sel_keys(
+            &scene.world,
+            &gpu_scene.descs,
+            &mut self.host_vehicle_sel_keys,
+        );
+        self.d_vehicle_sel_keys
+            .upload(stream, &self.host_vehicle_sel_keys)?;
 
         self.pinned_globals.write(0, TrafficGlobalsPod::default())?;
         for idx in 0..BRIDGE_STAT_WORDS {
@@ -1245,6 +1275,32 @@ pub(crate) fn compute_local_xform_from_world(
     (local, non_ident)
 }
 
+/// Builds per-vehicle P42 selection keys (`crate::pick::csg_selection_key(veh_obj_id, body_user_id)`)
+/// parallel to `descs` for `ovl_adas` `Selected` scope matching.
+fn build_vehicle_sel_keys(
+    world: &WorldScene,
+    descs: &[TrafficVehicleDescPod],
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    out.reserve(descs.len());
+    for desc in descs {
+        let (obj_id, user_id) = world
+            .dynamic_index(InstanceId(desc.body_id))
+            .map_or((OBJECT_ID_NONE, 0), |dyn_idx| {
+                let obj = world
+                    .dynamic_provenance_at(dyn_idx)
+                    .map_or(OBJECT_ID_NONE, |p| p.object_id);
+                let uid = world
+                    .dynamic_instances()
+                    .get(dyn_idx)
+                    .map_or(0, |inst| inst.user_id);
+                (obj, uid)
+            });
+        out.push(crate::pick::csg_selection_key(obj_id, user_id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,5 +1394,57 @@ mod tests {
         assert_eq!(inst_to_out.get(&4), Some(&4));
         assert_eq!(inst_to_out.get(&5), Some(&(TRAFFIC_SLOTS_PER_VEHICLE as u32)));
         assert_eq!(inst_to_out.get(&9), Some(&(TRAFFIC_SLOTS_PER_VEHICLE as u32 + 4)));
+    }
+
+    #[test]
+    fn build_vehicle_sel_keys_matches_p42_grouped_and_ungrouped_keys() {
+        use csg_core::{CsgNode, MaterialId, semantic};
+        use csg_scene::{Assembly, Instance, InstanceProvenance, OsmElemKind, OsmFeatureClass, part_role};
+
+        let mut world = WorldScene::new(64.0);
+        let node = CsgNode::box3([2.0, 1.4, 4.4], MaterialId(1), semantic::VEHICLE);
+        let lods = world.library.compile_lods(&node, &[0.0]);
+        let asm = Assembly::from_compiled("test_car", lods, &world.library);
+        let asm_id = world.register_assembly(asm);
+
+        // Vehicle 0: grouped P42 logical object (`object_id = 42`).
+        let obj_id = 42u32;
+        let grouped_prov = InstanceProvenance {
+            osm_id: 0,
+            object_id: obj_id,
+            source: OsmFeatureClass::DynamicVehicle,
+            kind: 0,
+            osm_elem: OsmElemKind::None,
+            part_role: part_role::PRIMARY,
+        };
+        let body0 = world.add_dynamic_with_prov(
+            Instance::new(asm_id, Mat3x4::IDENTITY).with_user_id(101),
+            grouped_prov,
+        );
+
+        // Vehicle 1: ungrouped (`OBJECT_ID_NONE`), falls back to `user_id` with OBJECT_KEY_BIT clear.
+        let body1 = world.add_dynamic(Instance::new(asm_id, Mat3x4::IDENTITY).with_user_id(202));
+
+        let descs = [
+            TrafficVehicleDescPod {
+                body_id: body0.0,
+                ..TrafficVehicleDescPod::default()
+            },
+            TrafficVehicleDescPod {
+                body_id: body1.0,
+                ..TrafficVehicleDescPod::default()
+            },
+        ];
+        let mut keys = Vec::new();
+        build_vehicle_sel_keys(&world, &descs, &mut keys);
+        assert_eq!(
+            keys,
+            vec![
+                crate::pick::csg_selection_key(obj_id, 101),
+                crate::pick::csg_selection_key(OBJECT_ID_NONE, 202),
+            ]
+        );
+        assert_eq!(keys[0], crate::pick::OBJECT_KEY_BIT | obj_id);
+        assert_eq!(keys[1], 202);
     }
 }

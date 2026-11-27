@@ -5554,7 +5554,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let Some((impulse, all)) = poke_crowd_req
                 && self.settings.csg_mode > 0
             {
-                let active_cam = self.last_possess_camera.unwrap_or(self.last_sent_camera);
+                let active_cam = self
+                    .last_possess_camera
+                    .unwrap_or_else(|| pose_to_frame(self.cam_pose));
                 self.send_render(RenderControl::PokeCrowd {
                     origin: active_cam.eye,
                     forward: active_cam.fwd,

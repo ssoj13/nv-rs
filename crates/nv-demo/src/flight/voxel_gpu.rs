@@ -43,13 +43,189 @@ const BLOCK_SIZE: u32 = 128;
 /// Target NVRTC virtual architecture shared across `nv-demo` compute kernels.
 const NVRTC_ARCH: &str = "compute_75";
 
+/// Persistent grow-only VRAM buffer for [`GpuVoxelBaker`], eliminating per-bake `cuMemAllocAsync`
+/// / `cuMemFreeAsync` churn across repeated Flight Lab voxel bakes.
+#[derive(Default)]
+struct GrowVoxelBuf {
+    buf: Option<DeviceBuffer<u8>>,
+    cap_bytes: usize,
+}
+
+impl GrowVoxelBuf {
+    /// Ensures at least `bytes` (`>= 1`) of device memory are allocated (growing in power-of-two
+    /// steps) and returns the non-null device pointer.
+    fn ensure_uninit(
+        &mut self,
+        stream: &Arc<Stream>,
+        label: &str,
+        bytes: usize,
+    ) -> Result<u64, String> {
+        if bytes == 0 {
+            return Err(format!(
+                "GPU voxel bake '{label}' allocation size must be > 0"
+            ));
+        }
+        if bytes > self.cap_bytes || self.buf.is_none() {
+            let alloc_bytes = bytes.max(256).next_power_of_two();
+            // SAFETY: every byte read by kernels or host readbacks from this buffer is written
+            // first on `stream` via `cuMemcpyHtoDAsync_v2`, `cuMemsetD8Async`, or kernel outputs,
+            // and `bake_voxel_volume` / `Drop` synchronize `stream` before reallocation or drop.
+            let new_buf = unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, alloc_bytes) }
+                .map_err(|e| format!("CUDA alloc '{label}' ({alloc_bytes} B) failed: {e}"))?;
+            self.buf = Some(new_buf);
+            self.cap_bytes = alloc_bytes;
+        }
+        self.buf
+            .as_ref()
+            .map(DeviceBuffer::cu_deviceptr)
+            .ok_or_else(|| format!("GPU voxel bake '{label}' device buffer missing"))
+    }
+
+    /// Uploads `slice` asynchronously into this persistent buffer (or zeroes a 1-element dummy
+    /// region when `slice` is empty so every kernel pointer remains non-null).
+    fn upload_or_dummy<T: Pod>(
+        &mut self,
+        stream: &Arc<Stream>,
+        label: &str,
+        slice: &[T],
+    ) -> Result<u64, String> {
+        if slice.is_empty() {
+            let dummy_bytes = std::mem::size_of::<T>().max(1);
+            let ptr = self.ensure_uninit(stream, label, dummy_bytes)?;
+            self.memset_zero_async(stream, label, dummy_bytes)?;
+            return Ok(ptr);
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(slice);
+        let ptr = self.ensure_uninit(stream, label, bytes.len())?;
+        // SAFETY: `ptr` owns at least `bytes.len()` 256-byte-aligned device bytes on `stream`,
+        // and `bytes` points to valid initialized `Pod` host memory live across the copy.
+        let rc = unsafe {
+            cu::cuMemcpyHtoDAsync_v2(ptr, bytes.as_ptr().cast(), bytes.len(), stream.cu_stream())
+        };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuMemcpyHtoDAsync_v2('{label}') failed ({rc:?})"));
+        }
+        Ok(ptr)
+    }
+
+    /// Asynchronously zeroes the first `bytes` of this persistent buffer on `stream`.
+    fn memset_zero_async(
+        &self,
+        stream: &Stream,
+        label: &str,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if bytes > self.cap_bytes {
+            return Err(format!(
+                "GPU voxel bake '{label}' memset size {bytes} B exceeds capacity {} B",
+                self.cap_bytes
+            ));
+        }
+        let ptr = self
+            .buf
+            .as_ref()
+            .map(DeviceBuffer::cu_deviceptr)
+            .ok_or_else(|| format!("GPU voxel bake '{label}' buffer not allocated"))?;
+        // SAFETY: `ptr` owns at least `bytes` valid device bytes on `stream`.
+        let rc = unsafe { cu::cuMemsetD8Async(ptr, 0u8, bytes, stream.cu_stream()) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuMemsetD8Async('{label}') failed ({rc:?})"));
+        }
+        Ok(())
+    }
+
+    /// Downloads a single `u32` after `stream` has been synchronized.
+    fn download_u32(&self, label: &str) -> Result<u32, String> {
+        let size = std::mem::size_of::<u32>();
+        if size > self.cap_bytes {
+            return Err(format!(
+                "GPU voxel bake '{label}' download exceeds capacity {} B",
+                self.cap_bytes
+            ));
+        }
+        let ptr = self
+            .buf
+            .as_ref()
+            .map(DeviceBuffer::cu_deviceptr)
+            .ok_or_else(|| format!("GPU voxel bake '{label}' buffer not allocated"))?;
+        let mut val = 0u32;
+        // SAFETY: caller synchronized `stream`, `ptr` owns >= 4 device bytes, and `val` is writable.
+        let rc = unsafe { cu::cuMemcpyDtoH_v2((&raw mut val).cast(), ptr, size) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH_v2('{label}') failed ({rc:?})"));
+        }
+        Ok(val)
+    }
+
+    /// Downloads `count` elements of `T: Pod` into reusable host scratch `out` after `stream` sync.
+    fn download_into<T: Pod>(
+        &self,
+        label: &str,
+        count: usize,
+        out: &mut Vec<T>,
+    ) -> Result<(), String> {
+        let bytes = checked_bytes::<T>(count, label)?;
+        out.resize(count, T::zeroed());
+        if bytes == 0 {
+            return Ok(());
+        }
+        if bytes > self.cap_bytes {
+            return Err(format!(
+                "GPU voxel bake '{label}' download size {bytes} B exceeds capacity {} B",
+                self.cap_bytes
+            ));
+        }
+        let ptr = self
+            .buf
+            .as_ref()
+            .map(DeviceBuffer::cu_deviceptr)
+            .ok_or_else(|| format!("GPU voxel bake '{label}' buffer not allocated"))?;
+        let raw: &mut [u8] = bytemuck::cast_slice_mut(out.as_mut_slice());
+        // SAFETY: caller synchronized `stream`, `ptr` owns >= `raw.len()` device bytes, and `raw`
+        // points to `raw.len()` writable `Pod` host bytes.
+        let rc = unsafe { cu::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), ptr, raw.len()) };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH_v2('{label}') failed ({rc:?})"));
+        }
+        Ok(())
+    }
+}
+
+/// All 18 persistent grow-only VRAM buffers and reusable host readback scratch vectors owned by
+/// [`GpuVoxelBaker`], eliminating per-bake GPU allocation/free churn once warm.
+#[derive(Default)]
+struct VoxelBakeBuffers {
+    grid: GrowVoxelBuf,
+    items: GrowVoxelBuf,
+    unbounded: GrowVoxelBuf,
+    tile_starts: GrowVoxelBuf,
+    tile_items: GrowVoxelBuf,
+    compounds: GrowVoxelBuf,
+    ops: GrowVoxelBuf,
+    prims: GrowVoxelBuf,
+    aux: GrowVoxelBuf,
+    guards: GrowVoxelBuf,
+    repeats: GrowVoxelBuf,
+    raw_spans: GrowVoxelBuf,
+    raw_counts: GrowVoxelBuf,
+    coords: GrowVoxelBuf,
+    out_spans: GrowVoxelBuf,
+    out_counts: GrowVoxelBuf,
+    raw_overflow: GrowVoxelBuf,
+    out_overflow: GrowVoxelBuf,
+    host_out_spans: Vec<ColumnSpanPod>,
+    host_out_counts: Vec<u32>,
+}
+
 /// Reusable CUDA driver baker executing `csg-scene`'s two-pass `voxel_bake.cuh` kernels.
 ///
-/// Why: holding the primary CUDA context, a dedicated stream, and the disk-cached `CUmodule`
-/// across Auto-Plan jobs amortizes NVRTC compilation and module loading to < 5 ms on warm runs
-/// while keeping the background `"nv-flight-planner"` thread isolated from the OptiX render
-/// stream.
+/// Why: holding the primary CUDA context, a dedicated stream, the disk-cached `CUmodule`, and all
+/// 18 grow-only VRAM buffers across Auto-Plan jobs amortizes NVRTC compilation to < 5 ms and
+/// eliminates steady-state VRAM alloc/free churn while keeping the background
+/// `"nv-flight-planner"` thread isolated from the OptiX render stream.
 pub struct GpuVoxelBaker {
+    // Dropped before `stream` and `cuda` (and after `Drop::drop` synchronizes `self.stream`).
+    buffers: VoxelBakeBuffers,
     cuda: Arc<CudaContext>,
     stream: Arc<Stream>,
     module: cu::CUmodule,
@@ -111,6 +287,7 @@ impl GpuVoxelBaker {
         };
 
         Ok(Self {
+            buffers: VoxelBakeBuffers::default(),
             cuda,
             stream,
             module,
@@ -168,18 +345,54 @@ impl GpuVoxelBaker {
         })?;
 
         let grid_slice = [input.grid];
-        let d_grid = upload_or_dummy(&self.stream, "grid", &grid_slice)?;
-        let d_items = upload_or_dummy(&self.stream, "items", &input.items)?;
-        let d_unbounded = upload_or_dummy(&self.stream, "unbounded_items", &input.unbounded_items)?;
-        let d_tile_starts = upload_or_dummy(&self.stream, "tile_starts", &input.tile_starts)?;
-        let d_tile_items = upload_or_dummy(&self.stream, "tile_items", &input.tile_items)?;
+        let mut p_grid = self
+            .buffers
+            .grid
+            .upload_or_dummy(&self.stream, "grid", &grid_slice)?;
+        let mut p_items = self
+            .buffers
+            .items
+            .upload_or_dummy(&self.stream, "items", &input.items)?;
+        let mut p_unbounded = self.buffers.unbounded.upload_or_dummy(
+            &self.stream,
+            "unbounded_items",
+            &input.unbounded_items,
+        )?;
+        let mut p_tile_starts = self.buffers.tile_starts.upload_or_dummy(
+            &self.stream,
+            "tile_starts",
+            &input.tile_starts,
+        )?;
+        let mut p_tile_items = self.buffers.tile_items.upload_or_dummy(
+            &self.stream,
+            "tile_items",
+            &input.tile_items,
+        )?;
 
-        let d_compounds = upload_or_dummy(&self.stream, "compounds", &lib.compounds)?;
-        let d_ops = upload_or_dummy(&self.stream, "ops", &lib.ops)?;
-        let d_prims = upload_or_dummy(&self.stream, "prims", &lib.prims)?;
-        let d_aux = upload_or_dummy(&self.stream, "aux_planes", &lib.aux_planes)?;
-        let d_guards = upload_or_dummy(&self.stream, "guard_aabbs", &lib.guard_aabbs)?;
-        let d_repeats = upload_or_dummy(&self.stream, "repeats", &lib.repeats)?;
+        let mut p_compounds =
+            self.buffers
+                .compounds
+                .upload_or_dummy(&self.stream, "compounds", &lib.compounds)?;
+        let mut p_ops = self
+            .buffers
+            .ops
+            .upload_or_dummy(&self.stream, "ops", &lib.ops)?;
+        let mut p_prims = self
+            .buffers
+            .prims
+            .upload_or_dummy(&self.stream, "prims", &lib.prims)?;
+        let mut p_aux = self
+            .buffers
+            .aux
+            .upload_or_dummy(&self.stream, "aux_planes", &lib.aux_planes)?;
+        let mut p_guards =
+            self.buffers
+                .guards
+                .upload_or_dummy(&self.stream, "guard_aabbs", &lib.guard_aabbs)?;
+        let mut p_repeats =
+            self.buffers
+                .repeats
+                .upload_or_dummy(&self.stream, "repeats", &lib.repeats)?;
 
         let raw_spans_elems = total_cols
             .checked_mul(raw_cap)
@@ -198,44 +411,53 @@ impl GpuVoxelBaker {
         let out_counts_bytes = checked_bytes::<u32>(total_cols, "out_counts")?;
         let u32_bytes = std::mem::size_of::<u32>();
 
-        let d_raw_spans = alloc_uninit_bytes(&self.stream, "raw_spans", raw_spans_bytes)?;
-        let d_raw_counts = alloc_uninit_bytes(&self.stream, "raw_counts", raw_counts_bytes)?;
-        let d_coords = alloc_uninit_bytes(&self.stream, "coord_buf", coord_bytes)?;
-        let d_out_spans = alloc_uninit_bytes(&self.stream, "out_spans", out_spans_bytes)?;
-        let d_out_counts = alloc_uninit_bytes(&self.stream, "out_counts", out_counts_bytes)?;
-        let d_raw_overflow = alloc_uninit_bytes(&self.stream, "overflow_count", u32_bytes)?;
-        let d_out_overflow = alloc_uninit_bytes(&self.stream, "out_overflow_count", u32_bytes)?;
-
-        memset_zero_async(&self.stream, "raw_counts", &d_raw_counts, raw_counts_bytes)?;
-        memset_zero_async(&self.stream, "out_counts", &d_out_counts, out_counts_bytes)?;
-        memset_zero_async(&self.stream, "overflow_count", &d_raw_overflow, u32_bytes)?;
-        memset_zero_async(
+        let mut p_raw_spans =
+            self.buffers
+                .raw_spans
+                .ensure_uninit(&self.stream, "raw_spans", raw_spans_bytes)?;
+        let mut p_raw_counts =
+            self.buffers
+                .raw_counts
+                .ensure_uninit(&self.stream, "raw_counts", raw_counts_bytes)?;
+        let mut p_coords =
+            self.buffers
+                .coords
+                .ensure_uninit(&self.stream, "coord_buf", coord_bytes)?;
+        let mut p_out_spans =
+            self.buffers
+                .out_spans
+                .ensure_uninit(&self.stream, "out_spans", out_spans_bytes)?;
+        let mut p_out_counts =
+            self.buffers
+                .out_counts
+                .ensure_uninit(&self.stream, "out_counts", out_counts_bytes)?;
+        let mut p_raw_overflow = self.buffers.raw_overflow.ensure_uninit(
+            &self.stream,
+            "overflow_count",
+            u32_bytes,
+        )?;
+        let mut p_out_overflow = self.buffers.out_overflow.ensure_uninit(
             &self.stream,
             "out_overflow_count",
-            &d_out_overflow,
+            u32_bytes,
+        )?;
+
+        self.buffers
+            .raw_counts
+            .memset_zero_async(&self.stream, "raw_counts", raw_counts_bytes)?;
+        self.buffers
+            .out_counts
+            .memset_zero_async(&self.stream, "out_counts", out_counts_bytes)?;
+        self.buffers
+            .raw_overflow
+            .memset_zero_async(&self.stream, "overflow_count", u32_bytes)?;
+        self.buffers.out_overflow.memset_zero_async(
+            &self.stream,
+            "out_overflow_count",
             u32_bytes,
         )?;
 
         let blocks = total_cols_u32.div_ceil(BLOCK_SIZE);
-
-        let mut p_grid = d_grid.cu_deviceptr();
-        let mut p_items = d_items.cu_deviceptr();
-        let mut p_unbounded = d_unbounded.cu_deviceptr();
-        let mut p_tile_starts = d_tile_starts.cu_deviceptr();
-        let mut p_tile_items = d_tile_items.cu_deviceptr();
-        let mut p_compounds = d_compounds.cu_deviceptr();
-        let mut p_ops = d_ops.cu_deviceptr();
-        let mut p_prims = d_prims.cu_deviceptr();
-        let mut p_aux = d_aux.cu_deviceptr();
-        let mut p_guards = d_guards.cu_deviceptr();
-        let mut p_repeats = d_repeats.cu_deviceptr();
-        let mut p_raw_spans = d_raw_spans.cu_deviceptr();
-        let mut p_raw_counts = d_raw_counts.cu_deviceptr();
-        let mut p_raw_overflow = d_raw_overflow.cu_deviceptr();
-        let mut p_coords = d_coords.cu_deviceptr();
-        let mut p_out_spans = d_out_spans.cu_deviceptr();
-        let mut p_out_counts = d_out_counts.cu_deviceptr();
-        let mut p_out_overflow = d_out_overflow.cu_deviceptr();
 
         let mut trace_args: [*mut c_void; 15] = [
             (&raw mut p_grid).cast(),
@@ -324,21 +546,34 @@ impl GpuVoxelBaker {
             .synchronize()
             .map_err(|e| format!("CUDA voxel bake stream synchronize failed: {e}"))?;
 
-        let raw_ovf = download_u32("overflow_count", &d_raw_overflow)?;
-        let out_ovf = download_u32("out_overflow_count", &d_out_overflow)?;
+        let raw_ovf = self.buffers.raw_overflow.download_u32("overflow_count")?;
+        let out_ovf = self
+            .buffers
+            .out_overflow
+            .download_u32("out_overflow_count")?;
         if raw_ovf > 0 || out_ovf > 0 {
             return Err(format!(
                 "GPU voxel bake overflow (raw={raw_ovf}, merged={out_ovf})"
             ));
         }
 
-        let out_spans: Vec<ColumnSpanPod> =
-            download_vec("out_spans", &d_out_spans, out_spans_elems)?;
-        let out_counts: Vec<u32> = download_vec("out_counts", &d_out_counts, total_cols)?;
+        self.buffers.out_spans.download_into(
+            "out_spans",
+            out_spans_elems,
+            &mut self.buffers.host_out_spans,
+        )?;
+        self.buffers.out_counts.download_into(
+            "out_counts",
+            total_cols,
+            &mut self.buffers.host_out_counts,
+        )?;
 
-        let (col_offsets, spans) =
-            VoxelVolume::unpack_gpu_baked_columns(&out_spans, &out_counts, out_cap)
-                .map_err(|e| format!("GPU voxel bake column unpack failed: {e}"))?;
+        let (col_offsets, spans) = VoxelVolume::unpack_gpu_baked_columns(
+            &self.buffers.host_out_spans,
+            &self.buffers.host_out_counts,
+            out_cap,
+        )
+        .map_err(|e| format!("GPU voxel bake column unpack failed: {e}"))?;
         VoxelVolume::from_baked_columns(input.bounds, None, nx, nz, col_offsets, spans, *cfg)
             .map_err(|e| format!("GPU voxel volume construction failed: {e}"))
     }
@@ -381,104 +616,6 @@ fn checked_bytes<T>(count: usize, label: &str) -> Result<usize, String> {
             std::mem::size_of::<T>()
         )
     })
-}
-
-/// Allocates `bytes` (`>= 1`) of uninitialized stream-ordered device memory on `stream`.
-fn alloc_uninit_bytes(
-    stream: &Arc<Stream>,
-    label: &str,
-    bytes: usize,
-) -> Result<DeviceBuffer<u8>, String> {
-    if bytes == 0 {
-        return Err(format!(
-            "GPU voxel bake '{label}' allocation size must be > 0"
-        ));
-    }
-    // SAFETY: every byte read by device kernels or host readback from this allocation is first
-    // written on `stream` via `cuMemcpyHtoDAsync_v2`, `cuMemsetD8Async`, or kernel outputs, and
-    // `stream` is synchronized before the buffer is dropped.
-    unsafe { DeviceBuffer::<u8>::uninitialized_async(stream, bytes) }
-        .map_err(|e| format!("CUDA alloc '{label}' ({bytes} B) failed: {e}"))
-}
-
-/// Uploads `slice` asynchronously on `stream`, allocating a 1-element zeroed dummy buffer when
-/// `slice` is empty so kernel device pointers are always non-null.
-fn upload_or_dummy<T: Pod>(
-    stream: &Arc<Stream>,
-    label: &str,
-    slice: &[T],
-) -> Result<DeviceBuffer<u8>, String> {
-    if slice.is_empty() {
-        let dummy_bytes = std::mem::size_of::<T>().max(1);
-        return DeviceBuffer::<u8>::zeroed(stream, dummy_bytes)
-            .map_err(|e| format!("CUDA dummy alloc '{label}' ({dummy_bytes} B) failed: {e}"));
-    }
-    let bytes: &[u8] = bytemuck::cast_slice(slice);
-    let buf = alloc_uninit_bytes(stream, label, bytes.len())?;
-    // SAFETY: `buf` owns `bytes.len()` 256-byte-aligned device bytes allocated on `stream`, and
-    // `bytes` points to valid initialized `Pod` host memory that stays live across the call.
-    let rc = unsafe {
-        cu::cuMemcpyHtoDAsync_v2(
-            buf.cu_deviceptr(),
-            bytes.as_ptr().cast(),
-            bytes.len(),
-            stream.cu_stream(),
-        )
-    };
-    if rc != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuMemcpyHtoDAsync_v2('{label}') failed ({rc:?})"));
-    }
-    Ok(buf)
-}
-
-/// Asynchronously zeroes `bytes` of device buffer `buf` on `stream` via `cuMemsetD8Async`.
-fn memset_zero_async(
-    stream: &Stream,
-    label: &str,
-    buf: &DeviceBuffer<u8>,
-    bytes: usize,
-) -> Result<(), String> {
-    // SAFETY: `buf` was allocated with at least `bytes` valid device bytes on `stream`.
-    let rc = unsafe { cu::cuMemsetD8Async(buf.cu_deviceptr(), 0u8, bytes, stream.cu_stream()) };
-    if rc != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuMemsetD8Async('{label}') failed ({rc:?})"));
-    }
-    Ok(())
-}
-
-/// Downloads a single `u32` from `buf` after `self.stream` has been synchronized.
-fn download_u32(label: &str, buf: &DeviceBuffer<u8>) -> Result<u32, String> {
-    let mut val = 0u32;
-    // SAFETY: the caller already synchronized `stream`, `buf` holds at least `size_of::<u32>()`
-    // valid device bytes, and `val` is a valid writable `u32` on the stack.
-    let rc = unsafe {
-        cu::cuMemcpyDtoH_v2(
-            (&raw mut val).cast(),
-            buf.cu_deviceptr(),
-            std::mem::size_of::<u32>(),
-        )
-    };
-    if rc != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuMemcpyDtoH_v2('{label}') failed ({rc:?})"));
-    }
-    Ok(val)
-}
-
-/// Downloads `count` elements of `T: Pod` from `buf` after `self.stream` has been synchronized.
-fn download_vec<T: Pod>(label: &str, buf: &DeviceBuffer<u8>, count: usize) -> Result<Vec<T>, String> {
-    let bytes = checked_bytes::<T>(count, label)?;
-    let mut out = vec![T::zeroed(); count];
-    if bytes == 0 {
-        return Ok(out);
-    }
-    let raw: &mut [u8] = bytemuck::cast_slice_mut(&mut out);
-    // SAFETY: the caller already synchronized `stream`, `buf` holds at least `raw.len()` valid
-    // device bytes, and `raw` points to `raw.len()` writable `Pod` host bytes.
-    let rc = unsafe { cu::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), buf.cu_deviceptr(), raw.len()) };
-    if rc != cu::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuMemcpyDtoH_v2('{label}') failed ({rc:?})"));
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

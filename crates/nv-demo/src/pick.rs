@@ -3,9 +3,9 @@
 //!
 //! - **What**: a click asks the render worker to pick the pixel under the cursor. The next main
 //!   OptiX launch carries the pixel (`LaunchParams::pick_px`); the raygen thread of that pixel
-//!   writes one [`PickRecordPod`] (instance key, part, distance, world hit point, flags, launch
-//!   frame index) from the primary ray it traces anyway. The record is copied to pinned memory
-//!   behind an event and consumed on the following frame with a non-blocking `cuEventQuery`.
+//!   writes one [`PickRecordPod`] (instance key, part, packed CSG slot, world hit point, flags,
+//!   launch frame index) from the primary ray it traces anyway. The record is copied to pinned
+//!   memory behind an event and consumed on the following frame with a non-blocking `cuEventQuery`.
 //! - **Why**: the earlier Ctrl+Click path rebuilt the camera ray on the host and marched every
 //!   CSG instance of the scene on the CPU (plus a CUDA crowd readback), a second ray tracer that
 //!   could disagree with the image. The GPU record is the image itself: the same lens, the same
@@ -60,8 +60,8 @@ pub struct PickRecordPod {
     pub inst_id: u32,
     /// CSG part id of the hit primitive (`u32::MAX` for classic geometry).
     pub part_id: u32,
-    /// Distance from the camera to the hit point, metres.
-    pub t: f32,
+    /// Packed CSG instance slot (`0..csg_instance_count`) when [`Self::is_csg`], else `u32::MAX`.
+    pub packed_slot: u32,
     /// World-space hit point, metres.
     pub world_pos: [f32; 3],
     /// [`pick_flags`] bits.
@@ -72,7 +72,7 @@ pub struct PickRecordPod {
 }
 const _: () = assert!(std::mem::size_of::<PickRecordPod>() == 32);
 const _: () = assert!(std::mem::offset_of!(PickRecordPod, part_id) == 4);
-const _: () = assert!(std::mem::offset_of!(PickRecordPod, t) == 8);
+const _: () = assert!(std::mem::offset_of!(PickRecordPod, packed_slot) == 8);
 const _: () = assert!(std::mem::offset_of!(PickRecordPod, world_pos) == 12);
 const _: () = assert!(std::mem::offset_of!(PickRecordPod, flags) == 24);
 const _: () = assert!(std::mem::offset_of!(PickRecordPod, frame) == 28);
@@ -365,7 +365,7 @@ mod tests {
         PickRecordPod {
             inst_id: key,
             part_id: 3,
-            t: 12.5,
+            packed_slot: 7,
             world_pos: [1.0, 2.0, 3.0],
             flags: pick_flags::HIT | pick_flags::CSG,
             frame,
@@ -378,7 +378,7 @@ mod tests {
     fn record_layout_matches_the_cuda_struct() {
         let cu = include_str!("../shaders/raytracer.cu");
         assert!(cu.contains("static_assert(sizeof(NvPickRecord) == 32"));
-        for (field, off) in [("part_id", 4), ("t", 8), ("world_pos", 12), ("flags", 24), ("frame", 28)] {
+        for (field, off) in [("part_id", 4), ("packed_slot", 8), ("world_pos", 12), ("flags", 24), ("frame", 28)] {
             assert!(
                 cu.contains(&format!("__builtin_offsetof(NvPickRecord, {field}) == {off}")),
                 "NvPickRecord::{field} offset {off}"
@@ -457,8 +457,10 @@ mod tests {
     fn record_flags_decode() {
         let r = rec(1, 1);
         assert!(r.is_hit() && r.is_csg());
-        let miss = PickRecordPod { flags: 0, ..r };
+        assert_eq!(r.packed_slot, 7);
+        let miss = PickRecordPod { flags: 0, packed_slot: u32::MAX, ..r };
         assert!(!miss.is_hit() && !miss.is_csg());
+        assert_eq!(miss.packed_slot, u32::MAX);
     }
 
     #[test]

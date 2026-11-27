@@ -3967,12 +3967,18 @@ fn run_overlay(
                     .as_ref()
                     .and_then(|r| r.as_ref().ok())
                     .map_or((0u64, 0u32), CudaCrowdBackend::states_device_ptr);
+                let (sel_keys_raw, sel_keys_count) = ct.vehicle_sel_keys_device_ptr();
+                let mut veh_sel_keys_ptr = if sel_keys_count >= veh_count {
+                    sel_keys_raw
+                } else {
+                    0u64
+                };
                 let mut slots_per_veh = TRAFFIC_SLOTS_PER_VEHICLE as u32;
                 let mut cam_dev = cam_ptr;
                 let mut sel_dev = sel_ptr;
                 let (mut sc, mut sy, mut sa, mut st) =
                     (style_cruise.0, style_yield.0, style_aeb.0, style_tether.0);
-                let mut args: [*mut c_void; 15] = [
+                let mut args: [*mut c_void; 16] = [
                     (&raw mut outs_ptr).cast(),
                     (&raw mut hazards_ptr).cast(),
                     (&raw mut crowd_states_ptr).cast(),
@@ -3988,11 +3994,13 @@ fn run_overlay(
                     (&raw mut sy).cast(),
                     (&raw mut sa).cast(),
                     (&raw mut st).cast(),
+                    (&raw mut veh_sel_keys_ptr).cast(),
                 ];
-                // SAFETY: `ovl_adas` matches the 15-parameter ABI in `shaders/tonemap.cu`;
-                // `outs_ptr` (`veh_count * 7` pods), `hazards_ptr` (`veh_count` pods), and
-                // optional `crowd_states_ptr` (`crowd_count` pods) stay alive on `rig.stream`
-                // until the end-of-frame fence, and segment appends are bounded by `cap`.
+                // SAFETY: `ovl_adas` matches the 16-parameter ABI in `shaders/tonemap.cu`;
+                // `outs_ptr` (`veh_count * 7` pods), `hazards_ptr` (`veh_count` pods), optional
+                // `crowd_states_ptr` (`crowd_count` pods), and optional `veh_sel_keys_ptr`
+                // (`veh_count` u32 P42 keys) stay alive on `rig.stream` until the end-of-frame
+                // fence, and segment appends are bounded by `cap`.
                 let rc = unsafe {
                     cu::cuLaunchKernel(
                         rig.tonemap.ovl_adas,
@@ -5286,6 +5294,7 @@ pub fn spawn_render_thread(
             // thread ends and drops `rig` in its normal order.
             'render: loop {
                 let mut should_exit = false;
+                let mut pending_poke: Option<([f32; 3], [f32; 3], f32, bool)> = None;
                 bus.poll_render_controls(&mut cmd_scratch);
                 for boxed in &cmd_scratch {
                     let Some(cmd) = downcast_event::<RenderControl>(boxed) else {
@@ -5421,23 +5430,9 @@ pub fn spawn_render_thread(
                             impulse,
                             all,
                         } => {
-                            if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
-                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                    "CUDA crowd sync before poke failed: {e}"
-                                )));
-                            }
-                            match rig.csg_host.poke_crowd(*origin, *forward, *impulse, *all) {
-                                Ok(msg) => {
-                                    if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
-                                        cc.mark_intents_dirty();
-                                    }
-                                    accum_count = 0;
-                                    bus.emit_render_event(RenderEvent::StatusMessage(msg));
-                                }
-                                Err(e) => {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(e));
-                                }
-                            }
+                            // Defer execution until right after `take_render_state()` so `settings`
+                            // (`csg_freeze_pose`, `csg_traffic_speed`) reflect this frame cleanly.
+                            pending_poke = Some((*origin, *forward, *impulse, *all));
                         }
                         RenderControl::SpawnCrowdStress {
                             target_count,
@@ -5795,6 +5790,37 @@ pub fn spawn_render_thread(
                     flight_path_overlay = snap.flight_path_overlay.clone();
                 }
 
+                if let Some((origin, forward, impulse, all)) = pending_poke {
+                    if settings.csg_freeze_pose {
+                        bus.emit_render_event(RenderEvent::StatusMessage(
+                            "Crowd pose is frozen — unfreeze Pose to poke actors".to_string(),
+                        ));
+                    } else if settings.csg_traffic_speed <= 0.001 {
+                        bus.emit_render_event(RenderEvent::StatusMessage(
+                            "Simulation speed is 0 — increase Traffic Spd to poke actors"
+                                .to_string(),
+                        ));
+                    } else {
+                        if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "CUDA crowd sync before poke failed: {e}"
+                            )));
+                        }
+                        match rig.csg_host.poke_crowd(origin, forward, impulse, all) {
+                            Ok(msg) => {
+                                if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                                    cc.mark_intents_dirty();
+                                }
+                                accum_count = 0;
+                                bus.emit_render_event(RenderEvent::StatusMessage(msg));
+                            }
+                            Err(e) => {
+                                bus.emit_render_event(RenderEvent::StatusMessage(e));
+                            }
+                        }
+                    }
+                }
+
                 // Intersection counters of the previous counted launch (non-blocking event query).
                 if let Some(c) = is_rig.as_mut().filter(|c| c.in_flight) {
                     match c.poll() {
@@ -5820,7 +5846,7 @@ pub fn spawn_render_thread(
                                     if rec.is_csg() {
                                         rig.csg_host
                                             .resolve_picked_csg(
-                                                rec.inst_id,
+                                                rec.packed_slot,
                                                 rec.part_id,
                                                 rec.world_pos,
                                             )

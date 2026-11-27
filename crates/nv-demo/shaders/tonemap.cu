@@ -957,7 +957,8 @@ extern "C" __global__ void ovl_adas(
     unsigned int style_cruise,
     unsigned int style_yield,
     unsigned int style_aeb,
-    unsigned int style_tether
+    unsigned int style_tether,
+    const unsigned int* __restrict__ vehicle_sel_keys
 ) {
     if (outs == nullptr || hazards == nullptr || cam == nullptr
         || segs == nullptr || counter == nullptr) {
@@ -987,7 +988,7 @@ extern "C" __global__ void ovl_adas(
     const float max_dist = (c.radius > 0.0f) ? fminf(c.radius, 250.0f) : 250.0f;
     if (ex * ex + ey * ey + ez * ez > max_dist * max_dist) return;
 
-    const unsigned int key = body.instance_id;
+    const unsigned int key = (vehicle_sel_keys != nullptr) ? vehicle_sel_keys[v] : body.instance_id;
     const unsigned int sel_n = (sel != nullptr) ? c.sel_count : 0u;
     const bool selected = ovl_is_selected(sel, sel_n, key);
     if (c.scope_selected != 0u && !selected) return;

@@ -1552,9 +1552,11 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 if ui
                     .add_enabled_ui(can_play || rec_active, |ui| ui.add_sized([w, BTN_H], btn))
                     .inner
-                    .on_hover_text(
-                        "Record entire playlist pass to MP4 (auto-stops at playlist end).",
-                    )
+                    .on_hover_text(if rec_active {
+                        "Stop MP4 recording without interrupting active playback."
+                    } else {
+                        "Record from the active track through playlist end to MP4 (auto-stops at end)."
+                    })
                     .clicked()
                 {
                     (args.on_command)(FlightCommand::ToggleRecordPlaylist);

@@ -541,6 +541,47 @@ impl GpuFramePlan {
         Ok(())
     }
 
+    /// Asynchronously copies `elems` elements from an external device pointer `src_dev_ptr`
+    /// directly into owned buffer `id` on `stream` (`cuMemcpyDtoDAsync_v2`), growing `id` if
+    /// needed and keeping zero host round-trips.
+    pub fn copy_from_device_ptr(
+        &mut self,
+        stream: &Stream,
+        id: BufId,
+        src_dev_ptr: u64,
+        elems: u32,
+    ) -> Result<(), String> {
+        let slot = self
+            .slots
+            .get_mut(&id)
+            .ok_or_else(|| format!("{id:?} is not an owned buffer of {:?}", self.plan.kind))?;
+        slot.ensure_elems(stream, id, elems)?;
+        if elems == 0 {
+            return Ok(());
+        }
+        if src_dev_ptr == 0 {
+            return Err(format!(
+                "{id:?}: copy_from_device_ptr received null src_dev_ptr for {elems} elements"
+            ));
+        }
+        let dst_ptr = slot
+            .device_ptr()
+            .ok_or_else(|| format!("{id:?}: device allocation missing after ensure_elems"))?;
+        let byte_len = (elems as usize)
+            .checked_mul(slot.elem_size as usize)
+            .ok_or_else(|| format!("{id:?}: copy_from_device_ptr byte size overflow"))?;
+        // SAFETY: `dst_ptr` holds at least `byte_len` device bytes owned by `slot`, and the
+        // caller guarantees `src_dev_ptr` holds at least `byte_len` readable device bytes on the
+        // same CUDA stream until the copy completes.
+        let rc = unsafe {
+            cu::cuMemcpyDtoDAsync_v2(dst_ptr, src_dev_ptr, byte_len, stream.cu_stream())
+        };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!("{id:?}: cuMemcpyDtoDAsync_v2 failed ({rc:?})"));
+        }
+        Ok(())
+    }
+
     /// Returns the raw CUDA device pointer of owned buffer `id`, or `None` if unallocated/unowned.
     #[inline]
     pub fn device_ptr(&self, id: BufId) -> Option<u64> {
@@ -599,6 +640,34 @@ impl GpuFramePlan {
             }
         }
         for launch in self.plan.frame {
+            self.launch_one(stream, launch, sizes, scalars, externals, bounds)?;
+        }
+        Ok(())
+    }
+
+    /// Executes ONLY a single named `EventId`'s launch list on `stream` without running
+    /// `plan.frame` (used by multi-substep or pose-only frame plans such as `PlanKind::Traffic`).
+    pub fn execute_event_only(
+        &self,
+        stream: &Stream,
+        event: EventId,
+        sizes: &dyn FrameSizes,
+        scalars: &dyn FrameScalars,
+        externals: &[(ExternalId, u64)],
+        bounds: &[((PlanKind, BufId), u64)],
+    ) -> Result<(), String> {
+        let ev = self
+            .plan
+            .events
+            .iter()
+            .find(|e| e.event == event)
+            .ok_or_else(|| {
+                format!(
+                    "FramePlan {:?}: event {event:?} is not in plan.events",
+                    self.plan.kind
+                )
+            })?;
+        for launch in ev.launches {
             self.launch_one(stream, launch, sizes, scalars, externals, bounds)?;
         }
         Ok(())
@@ -869,6 +938,72 @@ impl GpuFramePlan {
         // SAFETY: `dst_offset + count <= dst.len()` guarantees `dst.as_mut_ptr().add(dst_offset)`
         // points to `count` writable page-locked elements owned by `dst`.
         unsafe { self.copy_to_pinned_async(stream, id, dst.as_mut_ptr().add(dst_offset), count) }
+    }
+
+    /// Asynchronously copies a single element at `src_elem_idx` from owned buffer `id` into
+    /// `dst[dst_offset]` on `stream` (zero blocking sync; caller reads after stream completion).
+    pub fn copy_elem_to_pinned_buf_async<T: Pod>(
+        &self,
+        stream: &Stream,
+        id: BufId,
+        src_elem_idx: usize,
+        dst: &mut PinnedHostBuf<T>,
+        dst_offset: usize,
+    ) -> Result<(), String> {
+        if dst_offset >= dst.capacity() {
+            return Err(format!(
+                "{id:?}: pinned dst_offset {dst_offset} >= capacity {}",
+                dst.capacity()
+            ));
+        }
+        let slot = self
+            .slots
+            .get(&id)
+            .ok_or_else(|| format!("{id:?} is not an owned buffer of {:?}", self.plan.kind))?;
+        let elem_bytes = std::mem::size_of::<T>();
+        if elem_bytes != slot.elem_size as usize {
+            return Err(format!(
+                "{id:?}: pinned elem D2H size {elem_bytes} B != plan elem_size {} B",
+                slot.elem_size
+            ));
+        }
+        if src_elem_idx >= slot.len_elems as usize {
+            return Err(format!(
+                "{id:?}: pinned elem index {src_elem_idx} >= len_elems {}",
+                slot.len_elems
+            ));
+        }
+        let byte_off = src_elem_idx
+            .checked_mul(elem_bytes)
+            .ok_or_else(|| format!("{id:?}: pinned elem byte offset overflow"))?;
+        let byte_end = byte_off
+            .checked_add(elem_bytes)
+            .ok_or_else(|| format!("{id:?}: pinned elem byte range overflow"))?;
+        if byte_end > slot.cap_bytes {
+            return Err(format!(
+                "{id:?}: pinned elem range {byte_off}..{byte_end} exceeds capacity {} B",
+                slot.cap_bytes
+            ));
+        }
+        let base_ptr = slot
+            .device_ptr()
+            .ok_or_else(|| format!("{id:?}: device buffer not allocated"))?;
+        let src_ptr = base_ptr
+            .checked_add(byte_off as u64)
+            .ok_or_else(|| format!("{id:?}: device pointer offset overflow"))?;
+        // SAFETY: `byte_end <= slot.cap_bytes` guarantees `src_ptr..src_ptr + elem_bytes` lies
+        // inside `slot`'s allocation, and `dst_offset < dst.capacity()` guarantees `dst_ptr`
+        // points to one writable page-locked `T` valid until `stream` completes.
+        let rc = unsafe {
+            let dst_ptr = dst.as_mut_ptr().add(dst_offset);
+            cu::cuMemcpyDtoHAsync_v2(dst_ptr.cast(), src_ptr, elem_bytes, stream.cu_stream())
+        };
+        if rc != cu::cudaError_enum_CUDA_SUCCESS {
+            return Err(format!(
+                "{id:?}: pinned elem cuMemcpyDtoHAsync_v2 failed ({rc:?})"
+            ));
+        }
+        Ok(())
     }
 }
 

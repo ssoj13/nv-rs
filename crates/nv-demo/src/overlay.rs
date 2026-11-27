@@ -240,11 +240,19 @@ pub enum OverlayKind {
     Skeletons,
     /// Active flight track 3D trajectory polyline and shot-handover markers.
     FlightPath,
+    /// Vehicle ADAS stopping-distance corridors and pedestrian hazard tethers (`ovl_adas`).
+    Adas,
 }
 
 impl OverlayKind {
     /// Every kind, in toolbar order (one toggle each).
-    pub const ALL: [Self; 4] = [Self::Contours, Self::Axes, Self::Skeletons, Self::FlightPath];
+    pub const ALL: [Self; 5] = [
+        Self::Contours,
+        Self::Axes,
+        Self::Skeletons,
+        Self::FlightPath,
+        Self::Adas,
+    ];
 
     /// Bit of this kind in [`OverlayFilter::kinds`] (a mask persists compactly and new kinds
     /// default to off in old configs).
@@ -254,6 +262,7 @@ impl OverlayKind {
             Self::Axes => 2,
             Self::Skeletons => 1 << 2,
             Self::FlightPath => 1 << 3,
+            Self::Adas => 1 << 4,
         }
     }
 
@@ -264,6 +273,7 @@ impl OverlayKind {
             Self::Axes => "Object axes (X red, Y green, Z blue; the selection also shows its bounds)",
             Self::Skeletons => "Skeletons",
             Self::FlightPath => "Flight Path",
+            Self::Adas => "ADAS Corridors (stopping distance & pedestrian AEB/yield tethers)",
         }
     }
 }
@@ -414,6 +424,19 @@ pub enum GpuSource {
         style_bone: StyleId,
         /// Style index for joint/root accent ticks.
         style_joint: StyleId,
+    },
+    /// Vehicle ADAS forward stopping corridors and pedestrian AEB/yield tethers (`ovl_adas`),
+    /// read directly from device-resident `TrafficInstanceOuts`, `TrafficHazards`, and optional
+    /// `CrowdStates` with zero host readbacks.
+    Adas {
+        /// Style for nominal `CRUISE` / `FOLLOW` stopping corridors.
+        style_cruise: StyleId,
+        /// Style for `RED_LIGHT` / `STOP_SIGN` / `YIELD_JUNCTION` / `PED_YIELD` corridors.
+        style_yield: StyleId,
+        /// Style for emergency `PED_AEB` braking corridors.
+        style_aeb: StyleId,
+        /// Style for dashed hazard tether lines connecting vehicle nose to triggering pedestrian.
+        style_tether: StyleId,
     },
 }
 
@@ -731,6 +754,37 @@ impl OverlayProvider for SkeletonProvider {
         let joint = out.style([1.00, 0.85, 0.15, 1.00], 2.8, [0.0, 0.0], depth);
         if let (Some(style_bone), Some(style_joint)) = (bone, joint) {
             out.gpu_source(GpuSource::Skeletons { style_bone, style_joint });
+        }
+    }
+}
+
+/// GPU-direct ADAS vehicle corridor & pedestrian hazard tether provider (`ovl_adas`).
+///
+/// Off by default in [`OverlayFilter::default`]; when enabled, emits color-coded forward
+/// stopping-distance brackets (cyan-green = cruise/follow, amber = yield/signal/stop, red = AEB)
+/// and dashed tether lines to active pedestrian conflicts directly in VRAM.
+#[derive(Debug, Default)]
+pub struct AdasProvider;
+
+impl OverlayProvider for AdasProvider {
+    fn emit(&mut self, ctx: &OverlayCtx<'_>, out: &mut OverlayList) {
+        if !ctx.filter.shows(OverlayKind::Adas) {
+            return;
+        }
+        let depth = DepthMode::FadeHidden;
+        let cruise = out.style([0.10, 0.86, 0.62, 0.85], 1.6, [0.0, 0.0], depth);
+        let yield_st = out.style([1.00, 0.68, 0.08, 0.95], 2.0, [0.0, 0.0], depth);
+        let aeb = out.style([1.00, 0.12, 0.12, 1.00], 2.6, [0.0, 0.0], depth);
+        let tether = out.style([1.00, 0.25, 0.55, 0.95], 2.0, [8.0, 5.0], depth);
+        if let (Some(style_cruise), Some(style_yield), Some(style_aeb), Some(style_tether)) =
+            (cruise, yield_st, aeb, tether)
+        {
+            out.gpu_source(GpuSource::Adas {
+                style_cruise,
+                style_yield,
+                style_aeb,
+                style_tether,
+            });
         }
     }
 }
@@ -1260,11 +1314,12 @@ mod tests {
         }
         assert!(tm.contains(&format!("#define OVL_AXES_NEAR {AXES_NEAR_M:.2}f")));
         assert!(tm.contains("void ovl_skeletons("));
+        assert!(tm.contains("void ovl_adas("));
     }
 
     #[test]
-    fn overlay_kinds_have_four_distinct_bits_and_labels() {
-        assert_eq!(OverlayKind::ALL.len(), 4);
+    fn overlay_kinds_have_five_distinct_bits_and_labels() {
+        assert_eq!(OverlayKind::ALL.len(), 5);
         let mut mask = 0u32;
         for kind in OverlayKind::ALL {
             let bit = kind.bit();
@@ -1277,6 +1332,7 @@ mod tests {
         assert_eq!(OverlayKind::Skeletons.label(), "Skeletons");
         assert_eq!(OverlayKind::FlightPath.bit(), 1 << 3);
         assert_eq!(OverlayKind::FlightPath.label(), "Flight Path");
+        assert_eq!(OverlayKind::Adas.bit(), 1 << 4);
     }
 
     #[test]
@@ -1403,5 +1459,32 @@ mod tests {
         assert_eq!(sampled.transition_markers.len(), 2);
         assert!((sampled.points[0][0] - 0.0).abs() < 1e-3);
         assert!((sampled.points[16][0] - (-4.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn adas_overlay_kind_bit_default_off_and_provider_emits_gpu_source() {
+        assert_eq!(OverlayKind::Adas.bit(), 1 << 4);
+        assert!(OverlayKind::ALL.contains(&OverlayKind::Adas));
+
+        let default_filter = OverlayFilter::default();
+        assert!(
+            !default_filter.shows(OverlayKind::Adas),
+            "OverlayKind::Adas must default to off"
+        );
+
+        let mut list = OverlayList::default();
+        let mut c = ctx(CameraProjection::Pinhole);
+        c.filter = default_filter;
+        let mut prov = AdasProvider;
+        prov.emit(&c, &mut list);
+        assert!(list.gpu_sources().is_empty());
+
+        c.filter.enabled = true;
+        c.filter.kinds |= OverlayKind::Adas.bit();
+        list.clear();
+        prov.emit(&c, &mut list);
+        assert_eq!(list.gpu_sources().len(), 1);
+        assert!(matches!(list.gpu_sources()[0], GpuSource::Adas { .. }));
+        assert_eq!(list.styles().len(), 4);
     }
 }

@@ -389,7 +389,7 @@ extern "C" __global__ void scatter_crowd_to_csg_and_optix(
 
 /// Grow-only typed GPU byte buffer for the small host-bridge arrays (scatter slot map, GAS/SBT
 /// tables, IAS rebuild anchors, and 4-byte displacement flag).
-struct GrowCudaBuf<T: Pod> {
+pub(crate) struct GrowCudaBuf<T: Pod> {
     buf: Option<DeviceBuffer<u8>>,
     cap_bytes: usize,
     len_elems: usize,
@@ -409,7 +409,7 @@ impl<T: Pod> Default for GrowCudaBuf<T> {
 
 impl<T: Pod> GrowCudaBuf<T> {
     #[inline]
-    fn device_ptr(&self) -> u64 {
+    pub(crate) fn device_ptr(&self) -> u64 {
         if self.len_elems == 0 {
             0
         } else {
@@ -418,21 +418,21 @@ impl<T: Pod> GrowCudaBuf<T> {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len_elems
     }
 
     #[inline]
-    fn cap_bytes(&self) -> usize {
+    pub(crate) fn cap_bytes(&self) -> usize {
         self.cap_bytes
     }
 
-    fn ensure_len(&mut self, stream: &Stream, count: usize) -> Result<(), String> {
+    pub(crate) fn ensure_len(&mut self, stream: &Stream, count: usize) -> Result<(), String> {
         let bytes = count.saturating_mul(std::mem::size_of::<T>());
         if bytes > self.cap_bytes {
             let alloc_bytes = bytes.max(256).next_power_of_two();
             let new_buf = DeviceBuffer::<u8>::zeroed(stream, alloc_bytes)
-                .map_err(|e| format!("CUDA crowd bridge alloc ({alloc_bytes} B) failed: {e}"))?;
+                .map_err(|e| format!("CUDA bridge alloc ({alloc_bytes} B) failed: {e}"))?;
             self.buf = Some(new_buf);
             self.cap_bytes = alloc_bytes;
         }
@@ -440,7 +440,7 @@ impl<T: Pod> GrowCudaBuf<T> {
         Ok(())
     }
 
-    fn upload(&mut self, stream: &Stream, data: &[T]) -> Result<(), String> {
+    pub(crate) fn upload(&mut self, stream: &Stream, data: &[T]) -> Result<(), String> {
         self.ensure_len(stream, data.len())?;
         if data.is_empty() {
             return Ok(());
@@ -453,7 +453,7 @@ impl<T: Pod> GrowCudaBuf<T> {
             cu::cuMemcpyHtoDAsync_v2(ptr, raw.as_ptr().cast(), raw.len(), stream.cu_stream())
         };
         if rc != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("CUDA crowd bridge H2D copy failed ({rc:?})"));
+            return Err(format!("CUDA bridge H2D copy failed ({rc:?})"));
         }
         Ok(())
     }
@@ -738,6 +738,22 @@ impl CudaCrowdBackend {
         (
             self.plan.device_ptr(BufId::CrowdBoneOuts).unwrap_or(0),
             self.plan.elem_count(BufId::CrowdBoneOuts),
+        )
+    }
+
+    /// Returns `(cu_deviceptr, actor_count)` of the device-resident `BufId::CrowdStates` buffer
+    /// (`ActorStatePod[N]`, 112 B stride) for zero-copy VRAM binding into `PlanKind::Traffic` v1
+    /// (pedestrian AEB/yield) and `ovl_adas` hazard tether rendering.
+    ///
+    /// Returns `(0, 0)` while `scene_dirty` is set so a scene switch never exposes stale actors.
+    #[inline]
+    pub fn states_device_ptr(&self) -> (u64, u32) {
+        if self.scene_dirty {
+            return (0, 0);
+        }
+        (
+            self.plan.device_ptr(BufId::CrowdStates).unwrap_or(0),
+            self.plan.elem_count(BufId::CrowdStates),
         )
     }
 
@@ -1181,7 +1197,7 @@ impl CudaCrowdBackend {
     /// mid-frame host synchronization** when `readback_poses_for_cpu` is `false`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinates CUDA stream, scene state, timestep, camera eye, crowd LOD params, scatter target, and CPU readback policy"
+        reason = "coordinates CUDA stream, scene state, timestep, camera eye, crowd LOD params, optional GPU traffic vehicle pointer, scatter target, and CPU readback policy"
     )]
     pub fn step_gpu_direct(
         &mut self,
@@ -1191,6 +1207,7 @@ impl CudaCrowdBackend {
         time_s: f32,
         cam_eye: [f32; 3],
         lod: CrowdLodParams,
+        traffic_crowd_vehicles: Option<(u64, u32)>,
         scatter: Option<GpuScatterTarget>,
         readback_poses_for_cpu: bool,
     ) -> Result<CudaCrowdStepReport, String> {
@@ -1237,20 +1254,33 @@ impl CudaCrowdBackend {
             self.intents_dirty = false;
         }
 
-        // 4. Collect per-frame traffic vehicles and uniforms (`dt == 0` allowed for paused LOD refresh).
+        // 4. Collect per-frame traffic vehicles (VRAM-direct D2D when GPU traffic ran, else host
+        // extraction) and uniforms (`dt == 0` allowed for paused LOD refresh).
         let step_dt = if dt.is_finite() {
             dt.clamp(0.0, 1.0 / 30.0)
         } else {
             0.0
         };
-        let traffic_active = crowd_vehicle_pods(&scene.traffic, &mut self.host_vehicles);
+        let (vehicle_count, traffic_active) = match traffic_crowd_vehicles {
+            Some((ptr, count)) if ptr != 0 && count > 0 => {
+                self.plan
+                    .copy_from_device_ptr(stream, BufId::CrowdVehicles, ptr, count)?;
+                (count as usize, true)
+            }
+            _ => {
+                let active = crowd_vehicle_pods(&scene.traffic, &mut self.host_vehicles);
+                self.plan
+                    .upload(stream, BufId::CrowdVehicles, &self.host_vehicles)?;
+                (self.host_vehicles.len(), active)
+            }
+        };
         let steer_u = {
             let steer_scene = self
                 .steer_scene
                 .as_ref()
                 .ok_or_else(|| "CrowdSteerScene missing after ensure_scene_uploaded".to_string())?;
             steer_scene
-                .uniforms(step_dt, n_actors, self.host_vehicles.len(), traffic_active)
+                .uniforms(step_dt, n_actors, vehicle_count, traffic_active)
                 .map_err(|e| format!("CrowdSteerScene::uniforms failed: {e}"))?
         };
         let sim_u = crowd_sim_uniforms(&scene.crowd, step_dt, time_s, cam_eye)
@@ -1260,8 +1290,6 @@ impl CudaCrowdBackend {
             .upload(stream, BufId::CrowdSteerUniforms, &[steer_u])?;
         self.plan
             .upload(stream, BufId::CrowdSimUniforms, &[sim_u])?;
-        self.plan
-            .upload(stream, BufId::CrowdVehicles, &self.host_vehicles)?;
         // Reset per-frame ground-miss atomic counter on device (`crowd_grid_clear` resets fault).
         self.plan.zero_buffer(stream, BufId::CrowdGroundMisses, 1)?;
 
@@ -1277,7 +1305,7 @@ impl CudaCrowdBackend {
                 scene: steer_scene,
                 library: &scene.world.library,
                 crowd: &scene.crowd,
-                vehicles: self.host_vehicles.len(),
+                vehicles: vehicle_count,
                 optix_slot_offset: 0,
                 generations: self.generations,
             };
@@ -1578,7 +1606,7 @@ mod tests {
         for step in 0..20 {
             let t = (step + 1) as f32 * dt;
             backend
-                .step_gpu_direct(&stream, &mut scene, dt, t, eye, lod, None, false)
+                .step_gpu_direct(&stream, &mut scene, dt, t, eye, lod, None, None, false)
                 .expect("step_gpu_direct");
         }
         let (bone_ptr, bone_cnt) = backend.bone_outs_device_ptr();
@@ -1681,7 +1709,7 @@ mod tests {
         {
             let scene = host.active_scene_mut().expect("marina scene");
             backend
-                .step_gpu_direct(&stream, scene, dt, dt, vp0_cam.eye, lod, None, false)
+                .step_gpu_direct(&stream, scene, dt, dt, vp0_cam.eye, lod, None, None, false)
                 .expect("warmup GPU step at vp0");
             stream.synchronize().expect("warmup fence");
             backend
@@ -1751,6 +1779,7 @@ mod tests {
                     2.0 * dt,
                     vp0_cam.eye,
                     lod,
+                    None,
                     Some(scatter),
                     false,
                 )
@@ -1761,7 +1790,7 @@ mod tests {
             let t = (step + 3) as f32 * dt;
             let scene = host.active_scene_mut().expect("marina scene");
             backend
-                .step_gpu_direct(&stream, scene, dt, t, vp0_cam.eye, lod, Some(scatter), false)
+                .step_gpu_direct(&stream, scene, dt, t, vp0_cam.eye, lod, None, Some(scatter), false)
                 .expect("GPU scatter step");
         }
         let after = download_instances(&stream);

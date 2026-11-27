@@ -42,21 +42,28 @@ use csg_actors::{
 use csg_core::abi::{compound_flags, opcode};
 use csg_core::math::{Aabb as CsgAabb, Mat3x4, Vec3};
 use csg_core::{CompiledLibrary, CompoundId, GpuAabb, GpuCompound, GpuOp, GpuPrim, GpuRepeat};
+use csg_scene::traffic::{TrafficVehicleId, hazard_state};
+use csg_scene::traffic_gpu::{TRAFFIC_SLOTS_PER_VEHICLE, TrafficGpuScene};
 use csg_scene::{
-    AssemblyPart, CameraPose as CsgCameraPose, CameraView, DetailTier, GpuInstance,
-    GpuMaterial, InstanceProvenance, LodConfig, MAT_OVERRIDE_NONE, OBJECT_ID_NONE, OsmElemKind,
-    OsmFeatureClass, PackedGpuScene, PackedInstanceSource, RailSpec, SHADOW_GUARD_MIN_DIAMETER,
-    SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints, SceneRegistry, SceneViewpoint,
-    TimeOfDay, WorldScene, crowd_actor_mounts, default_orbit_mount, encode_dynamic_inst_id,
-    encode_static_inst_id, find_crowd_actor_for_inst, inst_flags, is_dynamic_inst_id, kind_name,
-    list_possess_targets_with_crowd, lookup_instance_and_assembly, part_role,
-    resolve_possess_attach, resolve_possess_pose_with_crowd,
+    AssemblyPart, CameraPose as CsgCameraPose, CameraView, DYNAMIC_INST_BIT, DetailTier,
+    GpuInstance, GpuMaterial, InstanceProvenance, LodConfig, MAT_OVERRIDE_NONE, OBJECT_ID_NONE,
+    OsmElemKind, OsmFeatureClass, PackedGpuScene, PackedInstanceSource, RailSpec,
+    SHADOW_GUARD_MIN_DIAMETER, SceneBuildConfig, SceneBuilt, SceneDescriptor, SceneHints,
+    SceneRegistry, SceneViewpoint, TimeOfDay, WorldScene, crowd_actor_mounts, default_orbit_mount,
+    encode_dynamic_inst_id, encode_static_inst_id, find_crowd_actor_for_inst, inst_flags,
+    is_dynamic_inst_id, kind_name, list_possess_targets_with_crowd, lookup_instance_and_assembly,
+    part_role, resolve_possess_attach, resolve_possess_attach_vehicle,
+    resolve_possess_pose_with_crowd,
 };
 
-use crate::app_events::{PossessInfo, SimTelemetry};
+use crate::app_events::{PossessAdas, PossessInfo, SimTelemetry};
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend};
+use crate::cuda_traffic::{
+    CudaTrafficBackend, TRAFFIC_BIND_NON_IDENTITY, TrafficScatterBindingPod,
+    compute_local_xform_from_world,
+};
 use crate::renderer::{CameraFrame, CameraProjection};
-use crate::sdg_export::ActiveCrowdBackend;
+use crate::sdg_export::{ActiveCrowdBackend, ActiveTrafficBackend};
 use crate::semantic_filter as sf;
 
 /// SBT hit-group offset for general multi-op CSG RPN (`__intersection__csg` + `__closesthit__csg`,
@@ -487,6 +494,14 @@ pub struct CsgDevicePointers {
     /// aligned 1-to-1 with `instances` for `ovl_axes` single-triad-per-object axes and multi-part
     /// selection highlights (`0` when empty or unuploaded, triggering safe null fallback).
     pub instance_obj_keys: u64,
+    /// Parallel per-slot packed procedural sign-text handles (`u32[instance_count]`), aligned
+    /// 1-to-1 with `instances` (`0` when empty or unuploaded).
+    pub instance_text: u64,
+    /// Flat deduplicated ASCII byte pool for procedural street/highway signage (`u8[sign_text_len]`,
+    /// `0` when empty).
+    pub sign_text_bytes: u64,
+    /// Byte length of [`Self::sign_text_bytes`].
+    pub sign_text_len: u32,
 }
 
 /// Structural configuration key that triggers a full `WorldScene` + GAS rebuild.
@@ -1388,6 +1403,10 @@ pub struct CsgGpuHost {
     obj_primary_slot_scratch: Vec<u32>,
     /// Parallel device array of P42 object key words (`u32[instance_count]`) read by `ovl_axes`.
     instance_obj_keys_buf: GrowDeviceBuffer<u32>,
+    /// Parallel device array of packed procedural sign-text handles (`u32[instance_count]`).
+    instance_text_buf: GrowDeviceBuffer<u32>,
+    /// Static per-scene deduplicated ASCII byte pool for `CSG_PROC_SIGN_TEXT`.
+    sign_text_bytes_buf: GrowDeviceBuffer<u8>,
     pinned_staging: Option<PinnedStagingBuffer>,
     pinned_prev_staging: Option<PinnedStagingBuffer>,
     prev_packed_len: usize,
@@ -1515,6 +1534,8 @@ impl CsgGpuHost {
             instance_obj_keys_host: Vec::new(),
             obj_primary_slot_scratch: Vec::new(),
             instance_obj_keys_buf: GrowDeviceBuffer::default(),
+            instance_text_buf: GrowDeviceBuffer::default(),
+            sign_text_bytes_buf: GrowDeviceBuffer::default(),
             pinned_staging: None,
             pinned_prev_staging: None,
             prev_packed_len: 0,
@@ -1566,6 +1587,14 @@ impl CsgGpuHost {
         self.scene.as_ref().is_some_and(|s| !s.traffic.is_empty())
     }
 
+    /// Returns `true` when the active scene has a lane-graph `SceneTraffic` driver eligible for
+    /// `PlanKind::Traffic` v1 GPU simulation.
+    pub fn has_lane_graph_traffic(&self) -> bool {
+        self.scene
+            .as_ref()
+            .is_some_and(|s| s.traffic.has_lane_graph() && s.traffic.vehicle_count() > 0)
+    }
+
     /// Returns `true` when the active scene has articulated crowd actors (pedestrians/animals).
     pub fn has_crowd(&self) -> bool {
         self.scene
@@ -1582,7 +1611,7 @@ impl CsgGpuHost {
     /// Locomotion, and Traffic state without triggering any blocking GPU readbacks.
     #[expect(
         clippy::too_many_arguments,
-        reason = "aggregates live crowd backend, LOD policy, GPU camera flag, and traffic stepping state in one pass"
+        reason = "aggregates live crowd and traffic backends, LOD policy, GPU camera flag, and stepping state in one pass"
     )]
     pub fn sample_sim_telemetry(
         &self,
@@ -1590,6 +1619,9 @@ impl CsgGpuHost {
         crowd_step_ms: f32,
         crowd_lod: CrowdLodParams,
         cuda_crowd: Option<&CudaCrowdBackend>,
+        traffic_backend: ActiveTrafficBackend,
+        traffic_step_ms: f32,
+        cuda_traffic: Option<&CudaTrafficBackend>,
         gpu_camera_active: bool,
         pose_frozen: bool,
         traffic_stepping: bool,
@@ -1647,33 +1679,106 @@ impl CsgGpuHost {
 
         let traffic_has_lane_graph = scene.traffic.has_lane_graph();
         let traffic_vehicles = scene.traffic.vehicle_count() as u32;
-        let mut traffic_moving = 0u32;
-        let mut speed_sum = 0.0_f32;
-        let mut speed_max = 0.0_f32;
-        let mut counted = 0u32;
-        if traffic_vehicles > 0 {
-            scene.traffic.for_each_vehicle_xz(&mut |_, _, speed_mps, _| {
-                if speed_mps.is_finite() && speed_mps >= 0.0 {
-                    counted = counted.saturating_add(1);
-                    speed_sum += speed_mps;
-                    if speed_mps > speed_max {
-                        speed_max = speed_mps;
+        let (
+            traffic_plan_version,
+            traffic_kernel_count,
+            traffic_gpu_bytes,
+            traffic_moving,
+            traffic_avg_speed_mps,
+            traffic_max_speed_mps,
+            traffic_respawns,
+            traffic_stale_releases,
+            traffic_deadlock_relocations,
+            traffic_aeb_active,
+            traffic_yield_active,
+            traffic_ias_rebuilds,
+            effective_traffic_step_ms,
+        ) = if traffic_backend == ActiveTrafficBackend::Cuda
+            && let Some(ct) = cuda_traffic
+        {
+            let g = ct.last_globals();
+            let f = ct.last_fleet_stats();
+            (
+                ct.plan_version(),
+                ct.kernel_count(),
+                ct.gpu_bytes(),
+                f.moving,
+                f.avg_speed_mps,
+                f.max_speed_mps,
+                u64::from(g.respawns),
+                u64::from(g.stale_releases),
+                u64::from(g.deadlock_relocations),
+                g.aeb_active_count,
+                g.yield_active_count,
+                ct.ias_rebuild_count(),
+                if traffic_stepping && !pose_frozen {
+                    traffic_step_ms
+                } else {
+                    0.0
+                },
+            )
+        } else {
+            let mut moving = 0u32;
+            let mut speed_sum = 0.0_f32;
+            let mut speed_max = 0.0_f32;
+            let mut counted = 0u32;
+            if traffic_vehicles > 0 {
+                scene.traffic.for_each_vehicle_xz(&mut |_, _, speed_mps, _| {
+                    if speed_mps.is_finite() && speed_mps >= 0.0 {
+                        counted = counted.saturating_add(1);
+                        speed_sum += speed_mps;
+                        if speed_mps > speed_max {
+                            speed_max = speed_mps;
+                        }
+                        if speed_mps > 0.25 {
+                            moving = moving.saturating_add(1);
+                        }
                     }
-                    if speed_mps > 0.25 {
-                        traffic_moving = traffic_moving.saturating_add(1);
+                });
+            }
+            let avg_speed = if counted > 0 {
+                speed_sum / counted as f32
+            } else {
+                0.0
+            };
+            let rt_stats = if traffic_vehicles > 0 {
+                scene.traffic.runtime_stats()
+            } else {
+                Default::default()
+            };
+            let (mut aeb_cnt, mut yield_cnt) = (0u32, 0u32);
+            if traffic_vehicles > 0 {
+                for hz in scene.traffic.hazards() {
+                    if hz.state == hazard_state::PED_AEB {
+                        aeb_cnt = aeb_cnt.saturating_add(1);
+                    } else if hz.state == hazard_state::PED_YIELD {
+                        yield_cnt = yield_cnt.saturating_add(1);
                     }
                 }
-            });
-        }
-        let traffic_avg_speed_mps = if counted > 0 {
-            speed_sum / counted as f32
-        } else {
-            0.0
-        };
-        let rt_stats = if traffic_vehicles > 0 {
-            scene.traffic.runtime_stats()
-        } else {
-            Default::default()
+            }
+            (
+                0,
+                0,
+                0,
+                moving,
+                avg_speed,
+                speed_max,
+                rt_stats.respawns,
+                rt_stats.stale_reservation_releases,
+                rt_stats.deadlock_relocations,
+                aeb_cnt,
+                yield_cnt,
+                0,
+                if traffic_stepping && !pose_frozen {
+                    if traffic_step_ms > 0.0 {
+                        traffic_step_ms
+                    } else {
+                        self.last_traffic_step_ms
+                    }
+                } else {
+                    0.0
+                },
+            )
         };
 
         SimTelemetry {
@@ -1699,20 +1804,24 @@ impl CsgGpuHost {
             crowd_gpu_fault,
             crowd_ias_rebuilds,
             gpu_camera_active,
+            traffic_backend,
+            traffic_plan_version,
+            traffic_kernel_count,
+            traffic_gpu_bytes,
             traffic_has_lane_graph,
             traffic_stepping: traffic_stepping && !pose_frozen && traffic_vehicles > 0,
             traffic_vehicles,
             traffic_moving,
             traffic_avg_speed_mps,
-            traffic_max_speed_mps: speed_max,
+            traffic_max_speed_mps,
             traffic_dyn_instances: self.sim_summary.traffic_dyn_instances,
-            traffic_step_ms: if traffic_stepping && !pose_frozen {
-                self.last_traffic_step_ms
-            } else {
-                0.0
-            },
-            traffic_respawns: rt_stats.respawns,
-            traffic_stale_releases: rt_stats.stale_reservation_releases,
+            traffic_step_ms: effective_traffic_step_ms,
+            traffic_respawns,
+            traffic_stale_releases,
+            traffic_deadlock_relocations,
+            traffic_aeb_active,
+            traffic_yield_active,
+            traffic_ias_rebuilds,
         }
     }
 
@@ -1841,6 +1950,78 @@ impl CsgGpuHost {
             if !matched {
                 gidx = saved_gidx;
             }
+        }
+    }
+
+    /// Fills `out` with per-packed-slot [`TrafficScatterBindingPod`] entries mapping every
+    /// currently packed dynamic traffic body, sub-part, proxy, and wheel slot to its source row in
+    /// `BufId::TrafficInstanceOuts` (`vehicle * 7 + slot`), recovering exact `local_xform` via
+    /// `inv(world_inst.xform) * gpu_inst.xform`.
+    pub fn fill_traffic_scatter_bindings(
+        &self,
+        gpu_scene: &TrafficGpuScene,
+        out: &mut Vec<TrafficScatterBindingPod>,
+    ) {
+        out.clear();
+        let Some(ref scene) = self.scene else {
+            return;
+        };
+        if gpu_scene.descs.is_empty() {
+            return;
+        }
+        let mut inst_to_out: HashMap<u32, u32> =
+            HashMap::with_capacity(gpu_scene.descs.len() * TRAFFIC_SLOTS_PER_VEHICLE);
+        for (v_idx, desc) in gpu_scene.descs.iter().enumerate() {
+            let base = (v_idx * TRAFFIC_SLOTS_PER_VEHICLE) as u32;
+            if desc.body_id != u32::MAX {
+                inst_to_out.insert(desc.body_id, base);
+            }
+            for (w_idx, &wid) in desc.wheel_ids.iter().enumerate() {
+                if wid != u32::MAX {
+                    inst_to_out.insert(wid, base + 1 + w_idx as u32);
+                }
+            }
+        }
+
+        let instances = self.packed.instances_slice();
+        let sources = self.packed.packed_sources_slice();
+        let dyn_world = scene.world.dynamic_instances();
+        let count = instances.len().min(sources.len());
+        out.reserve(inst_to_out.len());
+
+        for slot in 0..count {
+            let gpu_inst = &instances[slot];
+            if (gpu_inst.flags & inst_flags::DYNAMIC) == 0 {
+                break;
+            }
+            if (gpu_inst.flags & inst_flags::CROWD_BONE) != 0 {
+                continue;
+            }
+            let Some(dyn_idx) = sources[slot].dynamic_index() else {
+                continue;
+            };
+            let Some(inst_id) = scene.world.dynamic_instance_id(dyn_idx) else {
+                continue;
+            };
+            let Some(&traffic_out_idx) = inst_to_out.get(&inst_id.0) else {
+                continue;
+            };
+            let Some(world_inst) = dyn_world.get(dyn_idx) else {
+                continue;
+            };
+            let (local_xform, non_ident) =
+                compute_local_xform_from_world(world_inst.xform.0, gpu_inst.xform);
+            out.push(TrafficScatterBindingPod {
+                traffic_out_idx,
+                packed_slot: slot as u32,
+                flags: if non_ident {
+                    TRAFFIC_BIND_NON_IDENTITY
+                } else {
+                    0
+                },
+                _pad: 0,
+                local_xform,
+            });
         }
     }
 
@@ -2117,8 +2298,10 @@ impl CsgGpuHost {
         scene.world.pack_all(cam_pos, &mut self.packed);
         self.ias_dirty = true;
         self.sem_partial_stale = true;
-        // Drop live object keys so probe packs never expose stale `object_id` metadata to `ovl_axes`.
+        // Drop live object keys and sign-text handles so probe packs never expose stale metadata.
+        // Keep `sign_text_bytes_buf` intact since it is static per-scene data.
         self.instance_obj_keys_buf.clear();
+        self.instance_text_buf.clear();
         if upload_gpu {
             self.instances_buf
                 .upload(stream, self.packed.instances_slice())?;
@@ -2441,6 +2624,67 @@ impl CsgGpuHost {
         Some((pod, vfov_deg))
     }
 
+    /// Returns the active [`TrafficVehicleId`] when currently possessing a dynamic lane-graph
+    /// traffic vehicle body.
+    pub fn possessed_traffic_vehicle_id(&self) -> Option<TrafficVehicleId> {
+        let scene = self.scene.as_ref()?;
+        let info = self.active_possess.as_ref()?;
+        if !is_dynamic_inst_id(info.inst_id) {
+            return None;
+        }
+        let dyn_idx = (info.inst_id & !DYNAMIC_INST_BIT) as usize;
+        let body_id = scene.world.dynamic_instance_id(dyn_idx)?;
+        scene.traffic.vehicle_of_body(body_id)
+    }
+
+    /// Returns `true` when the currently possessed body is a lane-graph traffic vehicle.
+    pub fn is_possessing_traffic(&self) -> bool {
+        self.possessed_traffic_vehicle_id().is_some()
+    }
+
+    /// Builds a GPU [`csg_scene::camera_gpu::PossessAttachPod`] and vertical FOV (degrees) when
+    /// currently possessing a lane-graph traffic vehicle so `PlanKind::Camera` composes the camera
+    /// directly from `BufId::TrafficInstanceOuts` in VRAM with zero host readback.
+    pub fn active_possess_attach_vehicle(
+        &self,
+        free_yaw: f32,
+        free_pitch: f32,
+        auto_level: bool,
+    ) -> Option<(csg_scene::camera_gpu::PossessAttachPod, f32)> {
+        let scene = self.scene.as_ref()?;
+        let info = self.active_possess.as_ref()?;
+        let vehicle = self.possessed_traffic_vehicle_id()?;
+        let attach = resolve_possess_attach_vehicle(
+            &scene.world,
+            &scene.traffic,
+            vehicle,
+            info.mount_idx,
+        )?;
+        let pod = attach.to_pod([0.0; 3], [free_yaw, free_pitch], auto_level)?;
+        let vfov_deg = info
+            .mounts
+            .get(info.mount_idx)
+            .or_else(|| info.mounts.first())
+            .map_or(60.0, |m| {
+                if m.vfov_deg.is_finite() {
+                    m.vfov_deg.clamp(15.0, 140.0)
+                } else {
+                    60.0
+                }
+            });
+        Some((pod, vfov_deg))
+    }
+
+    /// Samples the CPU [`PossessAdas`] telemetry snapshot for the currently possessed traffic
+    /// vehicle (used when traffic runs on CPU or before GPU traffic has drained a pinned DMA).
+    pub fn sample_cpu_possess_adas(&self) -> Option<PossessAdas> {
+        let scene = self.scene.as_ref()?;
+        let vehicle = self.possessed_traffic_vehicle_id()?;
+        let hazards = scene.traffic.hazards();
+        let pod = *hazards.get(vehicle.index() as usize)?;
+        Some(PossessAdas::from_pod(pod))
+    }
+
     /// Returns the flat device pointers for `LaunchParams`.
     pub fn device_pointers(&self) -> CsgDevicePointers {
         if !self.is_active() {
@@ -2475,6 +2719,14 @@ impl CsgGpuHost {
             } else {
                 0
             },
+            // Guard length so `CSG_PROC_SIGN_TEXT` never reads past a failed/unbuilt upload.
+            instance_text: if self.instance_text_buf.len_elems >= instance_count as usize {
+                self.instance_text_buf.device_ptr()
+            } else {
+                0
+            },
+            sign_text_bytes: self.sign_text_bytes_buf.device_ptr(),
+            sign_text_len: u32::try_from(self.sign_text_bytes_buf.len_elems).unwrap_or(u32::MAX),
         }
     }
 
@@ -2890,9 +3142,11 @@ impl CsgGpuHost {
                 && self.packed.motion_prev_xforms.len() == self.packed.instances.len()
                 && self.packed.instance_prov.len() == self.packed.instances.len()
                 && self.packed.instance_object_ids.len() == self.packed.instances.len()
+                && self.packed.instance_text.len() == self.packed.instances.len()
                 && self.packed.packed_sources.len() == self.packed.instances.len()
                 && self.prev_xforms_buf.len_elems == self.packed.instances.len()
                 && self.instance_obj_keys_buf.len_elems == self.packed.instances.len()
+                && self.instance_text_buf.len_elems == self.packed.instances.len()
                 && self.prev_dyn_sig.len() <= self.packed.instances.len();
 
             let mut handled_traffic_only = None;
@@ -2969,6 +3223,8 @@ impl CsgGpuHost {
                 );
                 self.instance_obj_keys_buf
                     .upload(stream, &self.instance_obj_keys_host)?;
+                self.instance_text_buf
+                    .upload(stream, self.packed.instance_text_slice())?;
                 self.prev_packed_len = slice.len();
                 self.prev_dyn_sig.clear();
                 self.prev_dyn_sig.reserve(dyn_count);
@@ -3003,7 +3259,8 @@ impl CsgGpuHost {
                 + self.materials_buf.active_bytes()
                 + self.instances_buf.active_bytes()
                 + self.prev_xforms_buf.active_bytes()
-                + self.instance_obj_keys_buf.active_bytes();
+                + self.instance_obj_keys_buf.active_bytes()
+                + self.instance_text_buf.active_bytes();
             let lod_stats = self.packed.lod_stats;
             let culled_count = lod_stats
                 .total_culled()
@@ -3245,6 +3502,8 @@ impl CsgGpuHost {
         self.instances_buf.clear();
         self.prev_xforms_buf.clear();
         self.instance_obj_keys_buf.clear();
+        self.instance_text_buf.clear();
+        self.sign_text_bytes_buf.clear();
         self.instance_obj_keys_host.clear();
         self.obj_primary_slot_scratch.clear();
         self.sem_partial_stale = true;
@@ -3379,13 +3638,16 @@ impl CsgGpuHost {
         self.repeats_buf.upload(stream, &lib.repeats)?;
         self.materials_buf
             .upload(stream, built.world.materials.as_slice())?;
+        self.sign_text_bytes_buf
+            .upload(stream, built.world.sign_text.bytes())?;
 
         self.static_gpu_bytes = self.compounds_buf.active_bytes()
             + self.ops_buf.active_bytes()
             + self.prims_buf.active_bytes()
             + self.aux_planes_buf.active_bytes()
             + self.guard_aabbs_buf.active_bytes()
-            + self.repeats_buf.active_bytes();
+            + self.repeats_buf.active_bytes()
+            + self.sign_text_bytes_buf.active_bytes();
 
         // Build one non-compacted (`compact: false`) OptiX custom-primitive GAS per compound:
         // - `MultiAabbUnion` -> M tight primitive AABBs with `primitive_offset = first_prim` (SBT 10)

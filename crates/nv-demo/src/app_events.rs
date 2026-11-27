@@ -23,11 +23,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use appbus::{BoxedEvent, EventBus, StateSlot};
+use csg_scene::traffic::{
+    IDM_ACCEL_MAX, MAX_BRAKE_DECEL, VehicleHazardStatePod, hazard_flags, hazard_state,
+};
 use csg_scene::{CameraMount, ProbeBackendKind, ViewScore};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady, OverlayOutPtrs};
-use crate::sdg_export::{ActiveCrowdBackend, SdgOccluderBackend};
+use crate::sdg_export::{ActiveCrowdBackend, ActiveTrafficBackend, SdgOccluderBackend};
 
 /// Duration after the last camera or setting change during which interactive fast-preview stays active.
 pub const INTERACTION_SETTLE_WINDOW: Duration = Duration::from_millis(150);
@@ -102,6 +105,121 @@ impl EnginePhase {
     }
 }
 
+/// Live ADAS / driving-state telemetry for a possessed dynamic traffic vehicle, sourced from a
+/// 32-byte asynchronous pinned DMA of `VehicleHazardStatePod` (GPU) or `SceneTraffic::hazards()`
+/// (CPU) with zero mid-frame stalls.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PossessAdas {
+    /// Dominant driving state (`csg_scene::traffic::hazard_state::*`).
+    pub state: u32,
+    /// Status flags (`csg_scene::traffic::hazard_flags::*`).
+    pub flags: u32,
+    /// Triggering pedestrian actor / blocker index (`u32::MAX` when none).
+    pub hazard_actor_idx: u32,
+    /// Current forward speed in meters per second.
+    pub speed_mps: f32,
+    /// Commanded longitudinal acceleration in `m/s^2` (positive = throttle, negative = braking).
+    pub accel_mps2: f32,
+    /// Comfortable stopping distance `v^2 / (2 * IDM_DECEL_COMFORT)` in meters.
+    pub stop_dist_m: f32,
+    /// Bumper distance to the nearest active hazard in meters (`f32::INFINITY` when clear).
+    pub hazard_dist_m: f32,
+    /// Effective desired speed limit in meters per second.
+    pub limit_mps: f32,
+}
+
+impl PossessAdas {
+    /// Constructs a [`PossessAdas`] snapshot from the wire-exact 32-byte [`VehicleHazardStatePod`].
+    #[inline]
+    pub const fn from_pod(pod: VehicleHazardStatePod) -> Self {
+        Self {
+            state: pod.state,
+            flags: pod.flags,
+            hazard_actor_idx: pod.hazard_actor_idx,
+            speed_mps: pod.speed_mps,
+            accel_mps2: pod.accel_mps2,
+            stop_dist_m: pod.stop_dist_m,
+            hazard_dist_m: pod.hazard_dist_m,
+            limit_mps: pod.limit_mps,
+        }
+    }
+
+    /// Short uppercase ADAS pill badge label for the `PossessToolbar`.
+    #[inline]
+    pub const fn badge_label(self) -> &'static str {
+        match self.state {
+            hazard_state::CRUISE => "CRUISE",
+            hazard_state::FOLLOW => "FOLLOW",
+            hazard_state::RED_LIGHT => "RED LIGHT",
+            hazard_state::STOP_SIGN => "STOP",
+            hazard_state::YIELD_JUNCTION => "YIELD",
+            hazard_state::PED_YIELD => "YIELD PED",
+            hazard_state::PED_AEB => "AEB BRAKE",
+            _ => "DRIVE",
+        }
+    }
+
+    /// Severity bucket for color-coding (`0` = nominal cruise/follow, `1` = yield/signal/stop,
+    /// `2` = emergency pedestrian AEB).
+    #[inline]
+    pub const fn severity(self) -> u8 {
+        match self.state {
+            hazard_state::PED_AEB => 2,
+            hazard_state::RED_LIGHT
+            | hazard_state::STOP_SIGN
+            | hazard_state::YIELD_JUNCTION
+            | hazard_state::PED_YIELD => 1,
+            _ => 0,
+        }
+    }
+
+    /// Current forward speed in km/h (sanitized to `>= 0.0`).
+    #[inline]
+    pub fn speed_kmh(self) -> f32 {
+        if self.speed_mps.is_finite() && self.speed_mps > 0.0 {
+            self.speed_mps * 3.6
+        } else {
+            0.0
+        }
+    }
+
+    /// Effective speed limit in km/h (sanitized to `>= 0.0`).
+    #[inline]
+    pub fn limit_kmh(self) -> f32 {
+        if self.limit_mps.is_finite() && self.limit_mps > 0.0 {
+            self.limit_mps * 3.6
+        } else {
+            0.0
+        }
+    }
+
+    /// `true` when vehicle brake lights are active (`hazard_flags::BRAKE_LIGHT`).
+    #[inline]
+    pub const fn brake_light_on(self) -> bool {
+        (self.flags & hazard_flags::BRAKE_LIGHT) != 0
+    }
+
+    /// `true` when `hazard_actor_idx` identifies an active pedestrian conflict.
+    #[inline]
+    pub const fn has_ped_hazard(self) -> bool {
+        (self.flags & hazard_flags::HAZARD_ACTOR_VALID) != 0
+    }
+
+    /// Signed throttle/brake command normalized to `[-1.0, +1.0]` for the compact `THR/BRK` bar
+    /// (`+1.0` = full `IDM_ACCEL_MAX` throttle, `-1.0` = full `MAX_BRAKE_DECEL` braking).
+    #[inline]
+    pub fn throttle_brake_norm(self) -> f32 {
+        if !self.accel_mps2.is_finite() {
+            return 0.0;
+        }
+        if self.accel_mps2 >= 0.0 {
+            (self.accel_mps2 / IDM_ACCEL_MAX.max(1e-3)).clamp(0.0, 1.0)
+        } else {
+            (self.accel_mps2 / MAX_BRAKE_DECEL.max(1e-3)).clamp(-1.0, 0.0)
+        }
+    }
+}
+
 /// Zero-allocation, `Copy` snapshot of live Crowd, Locomotion, and Traffic simulation telemetry
 /// delivered from the OptiX/CUDA worker to the `Telemetry` UI section each frame.
 ///
@@ -154,6 +272,14 @@ pub struct SimTelemetry {
     pub crowd_ias_rebuilds: u32,
     /// `true` when `PlanKind::Camera` v1 (`GpuCameraComposer`) composed the possessed camera in VRAM.
     pub gpu_camera_active: bool,
+    /// Concrete backend that executed the latest traffic step (`None`, `Cpu`, `Cuda`).
+    pub traffic_backend: ActiveTrafficBackend,
+    /// Active `PlanKind::Traffic` version (`1` when CUDA traffic plan is active, `0` otherwise).
+    pub traffic_plan_version: u32,
+    /// Total CUDA kernel dispatches per traffic step (`plan.frame.len() + 2` bridge kernels).
+    pub traffic_kernel_count: u32,
+    /// Total VRAM allocated by `CudaTrafficBackend` (`GpuFramePlan` slots + bridge buffers).
+    pub traffic_gpu_bytes: u64,
     /// `true` when the active scene has a `SceneTraffic` lane-graph driver.
     pub traffic_has_lane_graph: bool,
     /// `true` when traffic simulation is actively stepping this frame (not paused or frozen).
@@ -168,12 +294,20 @@ pub struct SimTelemetry {
     pub traffic_max_speed_mps: f32,
     /// Non-crowd dynamic CSG instances (vehicle bodies + rotating wheels) streamed via pinned DMA.
     pub traffic_dyn_instances: u32,
-    /// Host CPU `SoaTrafficDriver::step` wall duration in milliseconds (`0.0` when paused).
+    /// Traffic step duration (CPU wall time or CUDA enqueue time) in milliseconds (`0.0` when paused).
     pub traffic_step_ms: f32,
     /// Cumulative vehicle network respawns (`TrafficRuntimeStats::respawns`).
     pub traffic_respawns: u64,
     /// Cumulative stale junction reservation releases (`TrafficRuntimeStats::stale_reservation_releases`).
     pub traffic_stale_releases: u64,
+    /// Cumulative circular-wait deadlock relocations (`TrafficRuntimeStats::deadlock_relocations`).
+    pub traffic_deadlock_relocations: u64,
+    /// Vehicles currently in emergency pedestrian AEB (`TrafficGlobalsPod::aeb_active_count`).
+    pub traffic_aeb_active: u32,
+    /// Vehicles currently yielding to pedestrians (`TrafficGlobalsPod::yield_active_count`).
+    pub traffic_yield_active: u32,
+    /// Cumulative amortized full OptiX IAS rebuilds triggered by GPU traffic displacement.
+    pub traffic_ias_rebuilds: u32,
 }
 
 impl SimTelemetry {
@@ -1094,5 +1228,53 @@ mod tests {
         assert_eq!(buf, "2.0 KiB");
         SimTelemetry::write_bytes_compact(4 * 1024 * 1024 + 524_288, &mut buf);
         assert_eq!(buf, "4.50 MiB");
+    }
+
+    #[test]
+    fn possess_adas_badge_severity_and_throttle_brake_normalization() {
+        let aeb = PossessAdas::from_pod(VehicleHazardStatePod {
+            state: hazard_state::PED_AEB,
+            flags: hazard_flags::BRAKE_LIGHT | hazard_flags::HAZARD_ACTOR_VALID,
+            hazard_actor_idx: 7,
+            speed_mps: 10.0,
+            accel_mps2: -MAX_BRAKE_DECEL,
+            stop_dist_m: 16.0,
+            hazard_dist_m: 4.5,
+            limit_mps: 13.888_889,
+        });
+        assert_eq!(aeb.badge_label(), "AEB BRAKE");
+        assert_eq!(aeb.severity(), 2);
+        assert!(aeb.brake_light_on());
+        assert!(aeb.has_ped_hazard());
+        assert!((aeb.speed_kmh() - 36.0).abs() < 1e-4);
+        assert!((aeb.limit_kmh() - 50.0).abs() < 1e-3);
+        assert!((aeb.throttle_brake_norm() + 1.0).abs() < 1e-5);
+
+        let cruise = PossessAdas::from_pod(VehicleHazardStatePod {
+            state: hazard_state::CRUISE,
+            flags: 0,
+            hazard_actor_idx: u32::MAX,
+            speed_mps: 12.0,
+            accel_mps2: IDM_ACCEL_MAX * 0.5,
+            stop_dist_m: 20.0,
+            hazard_dist_m: f32::INFINITY,
+            limit_mps: 15.0,
+        });
+        assert_eq!(cruise.badge_label(), "CRUISE");
+        assert_eq!(cruise.severity(), 0);
+        assert!(!cruise.brake_light_on());
+        assert!(!cruise.has_ped_hazard());
+        assert!((cruise.throttle_brake_norm() - 0.5).abs() < 1e-5);
+
+        let yield_ped = PossessAdas {
+            state: hazard_state::PED_YIELD,
+            accel_mps2: f32::NAN,
+            speed_mps: -1.0,
+            ..PossessAdas::default()
+        };
+        assert_eq!(yield_ped.badge_label(), "YIELD PED");
+        assert_eq!(yield_ped.severity(), 1);
+        assert_eq!(yield_ped.speed_kmh(), 0.0);
+        assert_eq!(yield_ped.throttle_brake_norm(), 0.0);
     }
 }

@@ -352,15 +352,7 @@ impl FlightWorkspace {
                 );
             }
             FlightCommand::ToggleRecordPlaylist => {
-                if self.player.recording_playlist {
-                    self.player.recording_playlist = false;
-                } else {
-                    self.player.recording_playlist = true;
-                    self.player.select_entry(0, true);
-                    out.snap_cam = true;
-                    out.reset_stats = true;
-                }
-                out.toggle_record_playlist = true;
+                return self.toggle_record_playlist(false);
             }
             FlightCommand::LabGenerateAutoPlan => {
                 out.request_auto_plan = true;
@@ -429,6 +421,70 @@ impl FlightWorkspace {
                         self.lab.status_msg = format!("Save failed: {err}");
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// Toggles playlist MP4 recording while respecting both active host recording (`host_recording`,
+    /// e.g. started from `Render & Floor -> Record MP4`) and the currently active/previewed track.
+    ///
+    /// Why: when recording is already active, clicking Flight Player's red Record button must stop
+    /// recording without interrupting or resetting the active rail; when starting a pass, it must
+    /// record the currently active/previewed track (such as a `LabPreview` rail appended after a
+    /// curated rail) rather than jumping back to slot `0`, seed curated rail `0` when the queue is
+    /// empty, and forward cross-scene `PlayerState::Loading` requests to the host.
+    pub fn toggle_record_playlist(&mut self, host_recording: bool) -> FlightCommandOutcome {
+        let mut out = FlightCommandOutcome::default();
+        if host_recording || self.player.recording_playlist {
+            self.player.recording_playlist = false;
+            out.toggle_record_playlist = true;
+            return out;
+        }
+
+        if self.player.queue.is_empty() {
+            if !self.player.play() {
+                return out;
+            }
+            self.player.recording_playlist = true;
+            out.snap_cam = true;
+            out.reset_stats = true;
+            out.toggle_record_playlist = true;
+            if let player::PlayerState::Loading { ref scene_id } = self.player.state {
+                out.request_scene_id = Some(scene_id.clone());
+            }
+            return out;
+        }
+
+        let start_idx = match self.player.state {
+            player::PlayerState::Playing { entry_idx }
+            | player::PlayerState::Paused { entry_idx } => {
+                entry_idx.min(self.player.queue.len() - 1)
+            }
+            player::PlayerState::Transition { to_idx, .. } => {
+                to_idx.min(self.player.queue.len() - 1)
+            }
+            player::PlayerState::Loading { .. } => {
+                self.player.active_idx.min(self.player.queue.len() - 1)
+            }
+            player::PlayerState::Idle => {
+                let dur = self.player.duration_s();
+                let finished_pass = dur > 0.0 && self.player.time_s >= dur - 1.0e-5;
+                if finished_pass {
+                    0
+                } else {
+                    self.player.active_idx.min(self.player.queue.len() - 1)
+                }
+            }
+        };
+
+        if self.player.select_entry(start_idx, true) {
+            self.player.recording_playlist = true;
+            out.snap_cam = true;
+            out.reset_stats = true;
+            out.toggle_record_playlist = true;
+            if let player::PlayerState::Loading { ref scene_id } = self.player.state {
+                out.request_scene_id = Some(scene_id.clone());
             }
         }
         out
@@ -1080,6 +1136,127 @@ mod tests {
             .active_overlay_source()
             .expect("stopped player must fall back to lab preview track");
         assert_eq!(t_stopped.canonical_hash(), lab_track.canonical_hash());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_record_playlist_preserves_active_lab_preview_rail() {
+        let dir = temp_dir("record_lab_preview");
+        let mut ws = FlightWorkspace::new(dir.join("repo"), dir.join("user"));
+        ws.player.active_scene_id = "gundo".to_string();
+
+        // Seed curated rail at slot 0, then install & preview a Lab track (appended at slot 1).
+        let curated = sample_linear_track(0.0, 20.0, 6.0, false);
+        let lab_track = sample_linear_track(-30.0, -5.0, 8.0, false);
+        ws.player.queue.push(PlaylistSlot {
+            title: "Curated".to_string(),
+            description: String::new(),
+            scene_id: "gundo".to_string(),
+            track_id: "curated_0".to_string(),
+            file_path: None,
+            track: curated,
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::Curated,
+        });
+        ws.player
+            .preview_lab_track("gundo_auto_10".to_string(), lab_track.clone(), None);
+        assert_eq!(ws.player.active_idx, 1);
+        assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 1 });
+
+        // Advance mid-track, then stop an already-active Render & Floor recording via Flight Player:
+        // playback must remain on slot 1 at the current timestamp without jumping back to slot 0.
+        let _ = ws.player.tick(2.5, 0.05, 5000.0);
+        let t_before = ws.player.time_s;
+        let stop_out = ws.toggle_record_playlist(true);
+        assert!(stop_out.toggle_record_playlist);
+        assert!(!stop_out.snap_cam);
+        assert!(!ws.player.recording_playlist);
+        assert_eq!(ws.player.active_idx, 1);
+        assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 1 });
+        assert!((ws.player.time_s - t_before).abs() < 1e-6);
+
+        // Starting playlist recording while previewing slot 1 must record slot 1 (`LabPreview`),
+        // not jump away to curated slot 0.
+        let start_out = ws.toggle_record_playlist(false);
+        assert!(start_out.toggle_record_playlist);
+        assert!(start_out.snap_cam);
+        assert!(start_out.reset_stats);
+        assert!(ws.player.recording_playlist);
+        assert_eq!(ws.player.active_idx, 1);
+        assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 1 });
+        assert_eq!(
+            ws.player.active_track().expect("active track").canonical_hash(),
+            lab_track.canonical_hash()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_record_playlist_handles_empty_queue_wrap_and_cross_scene_loading() {
+        let dir = temp_dir("record_edge_cases");
+        let mut ws = FlightWorkspace::new(dir.join("repo"), dir.join("user"));
+        ws.player.active_scene_id = "gundo".to_string();
+
+        // Empty queue and no curated rails: refuse without starting an empty recording.
+        let empty_out = ws.toggle_record_playlist(false);
+        assert!(!empty_out.toggle_record_playlist);
+        assert!(!ws.player.recording_playlist);
+        assert_eq!(ws.player.state, PlayerState::Idle);
+
+        // Finished Idle pass at end of slot 1 wraps back to slot 0 on next playlist record.
+        let t0 = sample_linear_track(0.0, 10.0, 4.0, false);
+        let t1 = sample_linear_track(10.0, 20.0, 4.0, false);
+        ws.player.queue.push(PlaylistSlot {
+            title: "First".to_string(),
+            description: String::new(),
+            scene_id: "gundo".to_string(),
+            track_id: "t0".to_string(),
+            file_path: None,
+            track: t0,
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::Curated,
+        });
+        ws.player.queue.push(PlaylistSlot {
+            title: "Second".to_string(),
+            description: String::new(),
+            scene_id: "marina".to_string(),
+            track_id: "t1".to_string(),
+            file_path: None,
+            track: t1,
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::UserLibrary,
+        });
+        ws.player.active_idx = 1;
+        ws.player.time_s = ws.player.duration_s();
+        ws.player.state = PlayerState::Idle;
+        let wrap_out = ws.toggle_record_playlist(false);
+        assert!(wrap_out.toggle_record_playlist);
+        assert!(ws.player.recording_playlist);
+        assert_eq!(ws.player.active_idx, 0);
+        assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 0 });
+        ws.player.recording_playlist = false;
+
+        // Cross-scene active slot must emit `request_scene_id` so host loads the scene.
+        ws.player.active_idx = 1;
+        ws.player.time_s = 0.0;
+        ws.player.state = PlayerState::Paused { entry_idx: 1 };
+        let cross_out = ws.toggle_record_playlist(false);
+        assert!(cross_out.toggle_record_playlist);
+        assert!(ws.player.recording_playlist);
+        assert_eq!(cross_out.request_scene_id.as_deref(), Some("marina"));
+        assert!(matches!(
+            ws.player.state,
+            PlayerState::Loading { ref scene_id } if scene_id == "marina"
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 }

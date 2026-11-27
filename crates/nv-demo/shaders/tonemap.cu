@@ -867,6 +867,189 @@ extern "C" __global__ void ovl_skeletons(
     }
 }
 
+// Vehicle ADAS stopping-distance corridors and pedestrian hazard tethers (`overlay::GpuSource::Adas`):
+// reads device-resident `TrafficInstanceOuts`, `TrafficHazards`, and optional `CrowdStates` directly
+// in VRAM with zero host readbacks.
+struct alignas(16) OvlTrafficOut {
+    float xform[12];
+    unsigned int instance_id;
+    unsigned int flags;
+    unsigned int vehicle;
+    unsigned int slot;
+};
+
+struct alignas(16) OvlVehicleHazard {
+    unsigned int state;
+    unsigned int flags;
+    unsigned int hazard_actor_idx;
+    float speed_mps;
+    float accel_mps2;
+    float stop_dist_m;
+    float hazard_dist_m;
+    float limit_mps;
+};
+
+struct alignas(16) OvlCrowdActorStateView {
+    float4 pos_yaw;
+    unsigned char rest[96];
+};
+
+static_assert(sizeof(OvlTrafficOut) == 64, "OvlTrafficOut ABI mismatch");
+static_assert(sizeof(OvlVehicleHazard) == 32, "OvlVehicleHazard ABI mismatch");
+static_assert(sizeof(OvlCrowdActorStateView) == 112, "OvlCrowdActorStateView ABI mismatch");
+
+__device__ __forceinline__ void ovl_emit_adas_seg(
+    const OvlCamera& c,
+    float3 orig0,
+    float3 orig1,
+    unsigned int sflags,
+    unsigned int key,
+    unsigned int style,
+    NvOverlaySegment* segs,
+    unsigned int* counter,
+    unsigned int cap
+) {
+    const float3 eye = make_float3(c.eye[0], c.eye[1], c.eye[2]);
+    const float3 fwd = make_float3(c.fwd[0], c.fwd[1], c.fwd[2]);
+    const float z0 = (orig0.x - eye.x) * fwd.x + (orig0.y - eye.y) * fwd.y + (orig0.z - eye.z) * fwd.z;
+    const float z1 = (orig1.x - eye.x) * fwd.x + (orig1.y - eye.y) * fwd.y + (orig1.z - eye.z) * fwd.z;
+    if (z0 <= OVL_SKEL_NEAR && z1 <= OVL_SKEL_NEAR) return;
+
+    float3 p0 = orig0;
+    float3 p1 = orig1;
+    const float dx = orig1.x - orig0.x;
+    const float dy = orig1.y - orig0.y;
+    const float dz = orig1.z - orig0.z;
+    if (dx * dx + dy * dy + dz * dz < 1e-8f) return;
+    if (z0 <= OVL_SKEL_NEAR) {
+        const float t = fminf(1.0f, fmaxf(0.0f, (OVL_SKEL_NEAR - z0) / (z1 - z0)));
+        p0 = make_float3(orig0.x + t * dx, orig0.y + t * dy, orig0.z + t * dz);
+    } else if (z1 <= OVL_SKEL_NEAR) {
+        const float t = fminf(1.0f, fmaxf(0.0f, (OVL_SKEL_NEAR - z0) / (z1 - z0)));
+        p1 = make_float3(orig0.x + t * dx, orig0.y + t * dy, orig0.z + t * dz);
+    }
+
+    const float3 v0 = make_float3(p0.x - eye.x, p0.y - eye.y, p0.z - eye.z);
+    const float3 v1 = make_float3(p1.x - eye.x, p1.y - eye.y, p1.z - eye.z);
+    if (c.radius > 0.0f) {
+        const float d0sq = v0.x * v0.x + v0.y * v0.y + v0.z * v0.z;
+        const float d1sq = v1.x * v1.x + v1.y * v1.y + v1.z * v1.z;
+        if (fminf(d0sq, d1sq) > c.radius * c.radius) return;
+    }
+
+    ovl_push_world(
+        segs, counter, cap, p0, p1, sflags, NV_OVERLAY_CLASS_PATH, key, style, 0.0f
+    );
+}
+
+extern "C" __global__ void ovl_adas(
+    const OvlTrafficOut* __restrict__ outs,
+    const OvlVehicleHazard* __restrict__ hazards,
+    const OvlCrowdActorStateView* __restrict__ crowd_states,
+    unsigned int vehicle_count,
+    unsigned int slots_per_vehicle,
+    unsigned int crowd_count,
+    const OvlCamera* __restrict__ cam,
+    const unsigned int* __restrict__ sel,
+    NvOverlaySegment* __restrict__ segs,
+    unsigned int* __restrict__ counter,
+    unsigned int cap,
+    unsigned int style_cruise,
+    unsigned int style_yield,
+    unsigned int style_aeb,
+    unsigned int style_tether
+) {
+    if (outs == nullptr || hazards == nullptr || cam == nullptr
+        || segs == nullptr || counter == nullptr) {
+        return;
+    }
+    const unsigned int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= vehicle_count) return;
+    const OvlCamera c = *cam;
+    if (c.pinhole == 0u) {
+        if (v == 0u) atomicAdd(&counter[2], 1u);
+        return;
+    }
+
+    const OvlTrafficOut body = outs[(size_t)v * (size_t)slots_per_vehicle];
+    if ((body.flags & 1u) == 0u) return;
+
+    const OvlVehicleHazard hz = hazards[v];
+    const float ox = body.xform[3];
+    const float oy = body.xform[7];
+    const float oz = body.xform[11];
+    if (!isfinite(ox) || !isfinite(oy) || !isfinite(oz)) return;
+
+    // Distance gate (`250 m`) keeps distant vehicles from saturating overlay segment capacity.
+    const float ex = ox - c.eye[0];
+    const float ey = oy - c.eye[1];
+    const float ez = oz - c.eye[2];
+    const float max_dist = (c.radius > 0.0f) ? fminf(c.radius, 250.0f) : 250.0f;
+    if (ex * ex + ey * ey + ez * ez > max_dist * max_dist) return;
+
+    const unsigned int key = body.instance_id;
+    const unsigned int sel_n = (sel != nullptr) ? c.sel_count : 0u;
+    const bool selected = ovl_is_selected(sel, sel_n, key);
+    if (c.scope_selected != 0u && !selected) return;
+
+    const float3 r = make_float3(body.xform[0], body.xform[4], body.xform[8]);
+    const float3 u = make_float3(body.xform[1], body.xform[5], body.xform[9]);
+    const float3 f = make_float3(body.xform[2], body.xform[6], body.xform[10]);
+
+    const float stop_len = isfinite(hz.stop_dist_m)
+        ? fminf(40.0f, fmaxf(3.0f, hz.stop_dist_m))
+        : 3.0f;
+    const float bumper_fwd = 2.25f;
+    const float half_w = 1.05f;
+    const float lift_y = 0.22f;
+
+    const float3 base = make_float3(
+        ox + f.x * bumper_fwd + u.x * lift_y,
+        oy + f.y * bumper_fwd + u.y * lift_y,
+        oz + f.z * bumper_fwd + u.z * lift_y
+    );
+    const float3 tip = make_float3(
+        base.x + f.x * stop_len,
+        base.y + f.y * stop_len,
+        base.z + f.z * stop_len
+    );
+    const float3 bl = make_float3(base.x - r.x * half_w, base.y - r.y * half_w, base.z - r.z * half_w);
+    const float3 br = make_float3(base.x + r.x * half_w, base.y + r.y * half_w, base.z + r.z * half_w);
+    const float3 tl = make_float3(tip.x - r.x * half_w, tip.y - r.y * half_w, tip.z - r.z * half_w);
+    const float3 tr = make_float3(tip.x + r.x * half_w, tip.y + r.y * half_w, tip.z + r.z * half_w);
+
+    unsigned int style = style_cruise;
+    if (hz.state == 6u) {
+        style = style_aeb;
+    } else if (hz.state >= 2u && hz.state <= 5u) {
+        style = style_yield;
+    }
+
+    const unsigned int sflags = NV_OVERLAY_FLAG_WORLD | NV_OVERLAY_FLAG_SCREEN_CONSTANT_WIDTH
+        | (selected ? NV_OVERLAY_FLAG_SELECTED : 0u);
+    ovl_emit_adas_seg(c, bl, tl, sflags, key, style, segs, counter, cap);
+    ovl_emit_adas_seg(c, br, tr, sflags, key, style, segs, counter, cap);
+    ovl_emit_adas_seg(c, tl, tr, sflags, key, style, segs, counter, cap);
+
+    if ((hz.flags & 2u) != 0u && crowd_states != nullptr && hz.hazard_actor_idx < crowd_count) {
+        const float4 ped = crowd_states[hz.hazard_actor_idx].pos_yaw;
+        if (isfinite(ped.x) && isfinite(ped.y) && isfinite(ped.z)) {
+            const float3 ped_pt = make_float3(ped.x, ped.y + 1.0f, ped.z);
+            ovl_emit_adas_seg(
+                c,
+                base,
+                ped_pt,
+                sflags | NV_OVERLAY_FLAG_DASHED,
+                key,
+                style_tether,
+                segs,
+                counter,
+                cap
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Hidden-line wireframe (`DisplayMode::Wireframe`, wireframe.rs): vector contour lines at native
 // resolution. Input is this frame's visible-hit G-buffer (raytracer.cu, `aov_mode` 11):

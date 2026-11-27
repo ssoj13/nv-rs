@@ -30,8 +30,8 @@ use egui_dock::{DockState, NodeIndex, Style, TabViewer};
 use egui_phosphor::regular as ic;
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessInfo, SceneBuildProgress, SimTelemetry, SmartViewResult,
-    StillFormat, UiCommand,
+    AppBus, EnginePhase, PossessAdas, PossessInfo, SceneBuildProgress, SimTelemetry,
+    SmartViewResult, StillFormat, UiCommand,
 };
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
@@ -40,7 +40,9 @@ use crate::renderer::{
     CameraProjection, CaptureSource, DLSS_QUALITY_MODES, DemoSettings, TIME_SCALE_MAX,
     TIME_SCALE_MIN, dlss_quality_index,
 };
-use crate::sdg_export::{ActiveCrowdBackend, CrowdBackend, SdgOccluderBackend};
+use crate::sdg_export::{
+    ActiveCrowdBackend, ActiveTrafficBackend, CrowdBackend, SdgOccluderBackend, TrafficBackend,
+};
 use crate::viewport_toolbar::{self as vt, TbTone, tb_icon_button, tb_separator};
 use crate::overlay::{OverlayKind, OverlayScope};
 use crate::wireframe::DisplayMode;
@@ -825,6 +827,7 @@ pub struct UiContext<'a> {
     pub hdr_surface_supported: bool,
     pub viewport_focused: &'a mut bool,
     pub possess_info: Option<&'a PossessInfo>,
+    pub possess_adas: Option<PossessAdas>,
     pub possess_free_yaw: &'a mut f32,
     pub possess_free_pitch: &'a mut f32,
     pub possess_auto_level: &'a mut bool,
@@ -1278,6 +1281,7 @@ impl UiContext<'_> {
                             OverlayKind::Axes => ic::ARROWS_OUT_CARDINAL,
                             OverlayKind::Skeletons => ic::USERS_THREE,
                             OverlayKind::FlightPath => ic::PATH,
+                            OverlayKind::Adas => ic::WARNING,
                         };
                         if tb_icon_button(ui, icon, ov.kinds & kind.bit() != 0, TbTone::Normal, kind.label())
                             .clicked()
@@ -1499,6 +1503,10 @@ impl UiContext<'_> {
                         )
                         .truncate(),
                     );
+                    if let Some(adas) = self.possess_adas {
+                        tb_separator(ui);
+                        render_possess_adas_pill(ui, adas);
+                    }
                     tb_separator(ui);
                     for (idx, mount) in pinfo.mounts.iter().enumerate() {
                         let icon = MOUNT_ICONS.get(idx).copied().unwrap_or(ic::DOTS_THREE);
@@ -2710,6 +2718,40 @@ impl UiContext<'_> {
                             s.crowd_backend = b;
                         }
                     });
+                    if desc.supports_traffic {
+                        let traffic_badge = if self.sim_telemetry.traffic_vehicles > 0 {
+                            fmt_into(
+                                &mut self.scratch.label_buf,
+                                format_args!(
+                                    "Traffic Backend ({} {:.2} ms, {}v)",
+                                    self.sim_telemetry.traffic_backend.label(),
+                                    self.sim_telemetry.traffic_step_ms,
+                                    self.sim_telemetry.traffic_vehicles
+                                ),
+                            )
+                        } else {
+                            "Traffic Backend"
+                        };
+                        ui.label(RichText::new(traffic_badge).small().weak());
+                        equal_grid(ui, 3, 3, |ui, idx, w| {
+                            let b = TrafficBackend::ALL[idx];
+                            let tip = match b {
+                                TrafficBackend::Auto => "Prefer GPU-direct CUDA PlanKind::Traffic v1 with VRAM pedestrian AEB; falls back to CPU SoA and reports active backend.",
+                                TrafficBackend::Cpu => "Run analytical CPU SoA lane-graph traffic oracle.",
+                                TrafficBackend::Cuda => "Require GPU-direct CUDA PlanKind::Traffic v1 (returns error if unavailable; never downgrades).",
+                            };
+                            if ui
+                                .add_sized(
+                                    [w, ROW_H + 2.0],
+                                    egui::Button::selectable(s.traffic_backend == b, b.label()),
+                                )
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                s.traffic_backend = b;
+                            }
+                        });
+                    }
                     ui.label(RichText::new("SDG Occluder").small().weak());
                     equal_grid(ui, 3, 3, |ui, idx, w| {
                         let b = SdgOccluderBackend::ALL[idx];
@@ -5183,19 +5225,37 @@ pub(crate) fn render_sim_telemetry(
         );
 
         let traffic_sim_val = if sim.traffic_stepping {
-            fmt_into(
-                label_buf,
-                format_args!("CPU SoA {:.2} ms", sim.traffic_step_ms),
-            )
+            match sim.traffic_backend {
+                ActiveTrafficBackend::Cuda => fmt_into(
+                    label_buf,
+                    format_args!(
+                        "CUDA v{} {:.2} ms",
+                        sim.traffic_plan_version.max(1),
+                        sim.traffic_step_ms
+                    ),
+                ),
+                ActiveTrafficBackend::Cpu => fmt_into(
+                    label_buf,
+                    format_args!("CPU SoA {:.2} ms", sim.traffic_step_ms),
+                ),
+                ActiveTrafficBackend::None => "Idle",
+            }
         } else if sim.pose_frozen {
-            "CPU SoA Frozen"
+            if sim.traffic_backend == ActiveTrafficBackend::Cuda {
+                "CUDA Frozen"
+            } else {
+                "CPU SoA Frozen"
+            }
+        } else if sim.traffic_backend == ActiveTrafficBackend::Cuda {
+            "CUDA Paused"
         } else {
             "CPU SoA Paused"
         };
         stat_row_tip(ui, "Traffic Sim", traffic_sim_val, tip_buf, |t| {
             let _ = write!(
                 t,
-                "Backend: CPU SoA lane-graph + async pinned DMA prefix + GPU OptiX IAS refit\nStep: {:.2} ms | Lane Graph: {}\nDynamic Instances (bodies + wheels): {}",
+                "Backend: {} | Step: {:.2} ms | Lane Graph: {}\nDynamic Instances (bodies + wheels): {}",
+                sim.traffic_backend.label(),
                 sim.traffic_step_ms,
                 if sim.traffic_has_lane_graph {
                     "Active"
@@ -5204,6 +5264,13 @@ pub(crate) fn render_sim_telemetry(
                 },
                 sim.traffic_dyn_instances
             );
+            if sim.traffic_backend == ActiveTrafficBackend::Cuda {
+                let _ = write!(
+                    t,
+                    "\nPlanKind::Traffic v{} ({} kernels, StrictF32)\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                    sim.traffic_plan_version, sim.traffic_kernel_count, sim.traffic_ias_rebuilds
+                );
+            }
         });
 
         let stopped = sim.traffic_stopped();
@@ -5233,16 +5300,174 @@ pub(crate) fn render_sim_telemetry(
         stat_row_tip(ui, "Traffic Flow", flow_val, tip_buf, |t| {
             let _ = write!(
                 t,
-                "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Junction Releases: {}",
+                "Mean Speed: {:.1} km/h ({:.2} m/s)\nPeak Speed: {:.1} km/h ({:.2} m/s)\nNetwork Respawns: {} | Stale Releases: {} | Deadlock Reloc: {}",
                 sim.traffic_avg_kmh(),
                 sim.traffic_avg_speed_mps,
                 sim.traffic_max_kmh(),
                 sim.traffic_max_speed_mps,
                 sim.traffic_respawns,
-                sim.traffic_stale_releases
+                sim.traffic_stale_releases,
+                sim.traffic_deadlock_relocations
             );
         });
+
+        if sim.traffic_backend == ActiveTrafficBackend::Cuda
+            || sim.traffic_aeb_active > 0
+            || sim.traffic_yield_active > 0
+            || sim.traffic_deadlock_relocations > 0
+        {
+            let adas_val = fmt_into(
+                label_buf,
+                format_args!(
+                    "AEB {} | Yld {} | Reloc {}",
+                    sim.traffic_aeb_active,
+                    sim.traffic_yield_active,
+                    sim.traffic_deadlock_relocations
+                ),
+            );
+            stat_row_tip(ui, "Traffic ADAS", adas_val, tip_buf, |t| {
+                let _ = write!(
+                    t,
+                    "Active Pedestrian AEB: {}\nActive Pedestrian Yield: {}\nCircular-Wait Deadlock Relocations: {}",
+                    sim.traffic_aeb_active,
+                    sim.traffic_yield_active,
+                    sim.traffic_deadlock_relocations
+                );
+            });
+        }
+
+        if sim.traffic_backend == ActiveTrafficBackend::Cuda && sim.traffic_gpu_bytes > 0 {
+            SimTelemetry::write_bytes_compact(sim.traffic_gpu_bytes, label_buf);
+            stat_row_tip(ui, "Traffic VRAM", label_buf, tip_buf, |t| {
+                t.push_str("PlanKind::Traffic + Scatter Bridge VRAM: ");
+                SimTelemetry::append_bytes_compact(sim.traffic_gpu_bytes, t);
+                let _ = write!(
+                    t,
+                    "\nAmortized Full IAS Rebuilds (>8m disp): {}",
+                    sim.traffic_ias_rebuilds
+                );
+            });
+        }
     }
+}
+
+/// Renders the compact ADAS driving-state badge, speed readout, and bipolar `THR/BRK` bar inside
+/// the floating `PossessToolbar` while riding a dynamic lane-graph traffic vehicle.
+pub(crate) fn render_possess_adas_pill(ui: &mut Ui, adas: PossessAdas) {
+    use csg_scene::traffic::hazard_state;
+
+    let (badge_icon, fg, bg) = match adas.severity() {
+        2 => (
+            ic::WARNING,
+            Color32::from_rgb(255, 224, 224),
+            Color32::from_rgb(156, 28, 32),
+        ),
+        1 => {
+            let icon = match adas.state {
+                hazard_state::RED_LIGHT | hazard_state::STOP_SIGN => ic::STOP_CIRCLE,
+                _ => ic::WARNING,
+            };
+            (
+                icon,
+                Color32::from_rgb(255, 236, 196),
+                Color32::from_rgb(138, 86, 16),
+            )
+        }
+        _ => (
+            ic::CAR,
+            Color32::from_rgb(196, 246, 222),
+            Color32::from_rgb(24, 88, 66),
+        ),
+    };
+
+    let pill_resp = egui::Frame::new()
+        .fill(bg)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(5, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.label(RichText::new(badge_icon).size(12.0).color(fg));
+                ui.label(RichText::new(adas.badge_label()).small().strong().color(fg));
+            });
+        })
+        .response;
+
+    let spd_resp = ui.label(
+        RichText::new(format!("{:>3.0} km/h", adas.speed_kmh()))
+            .small()
+            .monospace()
+            .color(ui.visuals().strong_text_color()),
+    );
+
+    // Compact bipolar THR/BRK bar (left = brake in red-orange, right = throttle in green).
+    let bar_size = egui::vec2(48.0, 10.0);
+    let (bar_rect, bar_resp) = ui.allocate_exact_size(bar_size, Sense::hover());
+    if ui.is_rect_visible(bar_rect) {
+        let p = ui.painter();
+        p.rect_filled(bar_rect, 2.0, Color32::from_rgb(24, 27, 32));
+        let mid_x = bar_rect.center().x;
+        let norm = adas.throttle_brake_norm();
+        if norm > 0.01 {
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(mid_x, bar_rect.top() + 1.0),
+                egui::pos2(mid_x + norm * (bar_rect.width() * 0.5 - 1.0), bar_rect.bottom() - 1.0),
+            );
+            p.rect_filled(fill, 1.0, Color32::from_rgb(56, 206, 128));
+        } else if norm < -0.01 {
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(
+                    mid_x + norm * (bar_rect.width() * 0.5 - 1.0),
+                    bar_rect.top() + 1.0,
+                ),
+                egui::pos2(mid_x, bar_rect.bottom() - 1.0),
+            );
+            p.rect_filled(fill, 1.0, Color32::from_rgb(232, 72, 62));
+        }
+        p.line_segment(
+            [
+                egui::pos2(mid_x, bar_rect.top()),
+                egui::pos2(mid_x, bar_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, Color32::from_rgb(108, 116, 128)),
+        );
+        p.rect_stroke(
+            bar_rect,
+            2.0,
+            egui::Stroke::new(1.0, Color32::from_rgb(64, 70, 80)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let hover_ui = |ui: &mut Ui| {
+        ui.label(format!(
+            "State: {} | Brake Lights: {}",
+            adas.badge_label(),
+            if adas.brake_light_on() { "ON" } else { "OFF" }
+        ));
+        ui.label(format!(
+            "Speed: {:.1} / {:.0} km/h | Accel: {:+.2} m/s^2",
+            adas.speed_kmh(),
+            adas.limit_kmh(),
+            adas.accel_mps2
+        ));
+        let hz_dist = if adas.hazard_dist_m.is_finite() {
+            if adas.has_ped_hazard() {
+                format!("{:.1} m (ped #{})", adas.hazard_dist_m, adas.hazard_actor_idx)
+            } else {
+                format!("{:.1} m", adas.hazard_dist_m)
+            }
+        } else {
+            "Clear".to_string()
+        };
+        ui.label(format!(
+            "Stop Dist: {:.1} m | Nearest Hazard: {hz_dist}",
+            adas.stop_dist_m
+        ));
+    };
+    pill_resp.on_hover_ui(hover_ui);
+    spd_resp.on_hover_ui(hover_ui);
+    bar_resp.on_hover_ui(hover_ui);
 }
 
 /// Partition predicate for the eye-dropdown OSM provenance section: returns `true` for OSM /
@@ -6191,6 +6416,10 @@ mod tests {
             crowd_gpu_fault: 0,
             crowd_ias_rebuilds: 2,
             gpu_camera_active: true,
+            traffic_backend: ActiveTrafficBackend::Cuda,
+            traffic_plan_version: 1,
+            traffic_kernel_count: 14,
+            traffic_gpu_bytes: 1_572_864,
             traffic_has_lane_graph: true,
             traffic_stepping: true,
             traffic_vehicles: 48,
@@ -6201,6 +6430,10 @@ mod tests {
             traffic_step_ms: 0.14,
             traffic_respawns: 12,
             traffic_stale_releases: 0,
+            traffic_deadlock_relocations: 1,
+            traffic_aeb_active: 2,
+            traffic_yield_active: 3,
+            traffic_ias_rebuilds: 4,
             crowd_strict_f32: false,
         };
 
@@ -6242,6 +6475,67 @@ mod tests {
             assert!(
                 max_right <= panel_w + 0.5,
                 "width {panel_w}: render_sim_telemetry overflowed panel right edge ({max_right} > {panel_w})"
+            );
+        }
+    }
+
+    #[test]
+    fn possess_adas_pill_renders_cleanly_for_all_severities() {
+        use csg_scene::traffic::{hazard_flags, hazard_state};
+        let cases = [
+            PossessAdas {
+                state: hazard_state::CRUISE,
+                speed_mps: 11.5,
+                accel_mps2: 1.2,
+                stop_dist_m: 18.0,
+                hazard_dist_m: f32::INFINITY,
+                limit_mps: 13.9,
+                ..PossessAdas::default()
+            },
+            PossessAdas {
+                state: hazard_state::PED_YIELD,
+                flags: hazard_flags::BRAKE_LIGHT | hazard_flags::HAZARD_ACTOR_VALID,
+                hazard_actor_idx: 4,
+                speed_mps: 4.0,
+                accel_mps2: -2.4,
+                stop_dist_m: 6.0,
+                hazard_dist_m: 8.2,
+                limit_mps: 11.1,
+            },
+            PossessAdas {
+                state: hazard_state::PED_AEB,
+                flags: hazard_flags::BRAKE_LIGHT | hazard_flags::HAZARD_ACTOR_VALID,
+                hazard_actor_idx: 9,
+                speed_mps: 6.0,
+                accel_mps2: -7.5,
+                stop_dist_m: 9.0,
+                hazard_dist_m: 3.1,
+                limit_mps: 11.1,
+            },
+        ];
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _dock_style = UiTheme::Obsidian.apply(&ctx);
+        for adas in cases {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 64.0),
+                )),
+                ..Default::default()
+            };
+            let mut pill_w = 0.0_f32;
+            let out = ctx.run_ui(raw, |ui| {
+                ui.horizontal(|ui| {
+                    render_possess_adas_pill(ui, adas);
+                    pill_w = ui.min_rect().width();
+                });
+            });
+            out.drop_without_applying_deltas();
+            assert!(
+                pill_w > 60.0 && pill_w <= 340.0,
+                "unexpected PossessAdas pill width {pill_w} for {}",
+                adas.badge_label()
             );
         }
     }

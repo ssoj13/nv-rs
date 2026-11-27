@@ -23,6 +23,7 @@ mod bench;
 mod csg_scene_host;
 mod cuda_camera;
 mod cuda_crowd;
+mod cuda_traffic;
 mod demo_anim;
 mod fft_bloom;
 mod flight;
@@ -2999,6 +3000,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pending_scene_auto_frame: Option<(u32, u32)>,
         smart_view_seed: u64,
         possess_info: Option<PossessInfo>,
+        possess_adas: Option<crate::app_events::PossessAdas>,
         possess_free_yaw: f32,
         possess_free_pitch: f32,
         possess_auto_level: bool,
@@ -3127,7 +3129,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 );
             }
             self.is_recording = false;
+            self.flight_workspace.player.recording_playlist = false;
             self.record_frames = 0;
+            self.settings.capture_active = false;
             self.shutter_in_flight = false;
             self.interacting_until = None;
             self.bus.publish_build_progress(None);
@@ -3724,6 +3728,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 pending_scene_auto_frame: None,
                 smart_view_seed: 42,
                 possess_info: None,
+                possess_adas: None,
                 possess_free_yaw: 0.0,
                 possess_free_pitch: 0.0,
                 possess_auto_level: true,
@@ -4176,6 +4181,19 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             });
         }
 
+        /// Clears all host and Flight Player recording flags and notifies the render worker.
+        ///
+        /// Why: keeps `is_recording`, `player.recording_playlist`, `record_frames`,
+        /// `settings.capture_active`, and render-thread lockstep state synchronized across
+        /// manual stop, playlist completion, and all capture/encode error paths.
+        fn stop_video_recording_state(&mut self) {
+            self.is_recording = false;
+            self.flight_workspace.player.recording_playlist = false;
+            self.record_frames = 0;
+            self.settings.capture_active = false;
+            self.notify_recording(false);
+        }
+
         fn current_persisted_state(&self) -> crate::persist::PersistedState {
             crate::persist::PersistedState {
                 window: self.win_state,
@@ -4334,9 +4352,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             if let Some(ref active) = self.video_recorder {
                 if self.export_worker.session_failed(active.session_id) {
                     self.video_recorder = None;
-                    self.is_recording = false;
-                    self.record_frames = 0;
-                    self.notify_recording(false);
+                    self.stop_video_recording_state();
                 } else {
                     self.record_frames = self.export_worker.recorded_frames();
                 }
@@ -4409,6 +4425,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         bench_frame = Some((msg.perf.rt_ms, msg.perf.state, is_counts));
                         self.engine_phase = crate::app_events::EnginePhase::Rendering;
                         self.last_possess_camera = msg.possess_camera;
+                        self.possess_adas = msg.possess_adas;
                         self.last_rendered_camera = msg.rendered_camera;
                         let tensor_cores_ms = msg.denoise_ms + self.dlss_ms;
                         let total_gpu_ms =
@@ -4539,6 +4556,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                 self.cam_damper.snap(self.cam_pose);
                             }
                             self.possess_info = None;
+                            self.possess_adas = None;
                         }
                     }
                     RenderEvent::SmartViewReady(sv) => {
@@ -4699,6 +4717,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 hdr_surface_supported: self.hdr_surface_supported,
                 viewport_focused: &mut self.viewport_focused,
                 possess_info: self.possess_info.as_ref(),
+                possess_adas: self.possess_adas,
                 possess_free_yaw: &mut self.possess_free_yaw,
                 possess_free_pitch: &mut self.possess_free_pitch,
                 possess_auto_level: &mut self.possess_auto_level,
@@ -4831,7 +4850,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
             }
             for fcmd in flight_commands {
-                let outcome = self.flight_workspace.apply_command(fcmd, self.cam_pose);
+                let outcome = match fcmd {
+                    crate::flight::FlightCommand::ToggleRecordPlaylist => {
+                        self.flight_workspace.toggle_record_playlist(self.is_recording)
+                    }
+                    other => self.flight_workspace.apply_command(other, self.cam_pose),
+                };
                 if outcome.snap_cam {
                     if let Some(pose) = self.flight_workspace.player.evaluate_current(
                         self.cam_pose.znear,
@@ -5487,10 +5511,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if let Some(active) = self.video_recorder.take() {
                     self.export_worker.finish_video(active.session_id, None);
                     self.last_saved_msg = Some("Finalizing MP4...".to_string());
-                    self.is_recording = false;
-                    self.flight_workspace.player.recording_playlist = false;
-                    self.record_frames = 0;
-                    self.notify_recording(false);
+                    self.stop_video_recording_state();
                 } else if self.render_fatal.is_some() {
                     self.last_saved_msg =
                         Some("Recording unavailable: the render worker has stopped".to_string());
@@ -5669,6 +5690,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                     }
                 }
+                // Keep `recording_playlist` and `capture_active` synchronized immediately on
+                // frame 0 (and clear `recording_playlist` if starting the MP4 recorder failed so
+                // the active rail never stops early on an unrecorded pass).
+                if !self.is_recording {
+                    self.flight_workspace.player.recording_playlist = false;
+                }
+                self.settings.capture_active = self.video_recorder.is_some();
             }
             if let Some((scene_idx, variant_idx)) = select_scene_target {
                 self.pending_scene_auto_frame =
@@ -5844,9 +5872,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     {
                         self.export_worker.finish_video(active.session_id, None);
                         self.last_saved_msg = Some("Playlist recorded; finalizing MP4...".to_string());
-                        self.is_recording = false;
-                        self.record_frames = 0;
-                        self.notify_recording(false);
+                        self.stop_video_recording_state();
                     }
                 } else {
                     let mut effective_settings = self.demo_anim.apply(&self.settings);
@@ -5916,9 +5942,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         self.export_worker.finish_video(active.session_id, None);
                         self.last_saved_msg =
                             Some("Playlist recorded; finalizing MP4...".to_string());
-                        self.is_recording = false;
-                        self.record_frames = 0;
-                        self.notify_recording(false);
+                        self.stop_video_recording_state();
                     }
                 }
                 let effective_tau = if self.rail_blend_remaining > 0.0 {
@@ -6406,9 +6430,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     active.session_id,
                                     Some(format!("Window capture alloc failed: {e}")),
                                 );
-                                self.is_recording = false;
-                                self.record_frames = 0;
-                                self.notify_recording(false);
+                                self.stop_video_recording_state();
                             }
                         }
                     }
@@ -6695,9 +6717,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                 "Recording stopped (window size or format changed)".to_string();
                             self.export_worker
                                 .finish_video(active.session_id, Some(reason.clone()));
-                            self.is_recording = false;
-                            self.record_frames = 0;
-                            self.notify_recording(false);
+                            self.stop_video_recording_state();
                             self.last_saved_msg = Some(reason);
                         } else {
                             let rec_now = Instant::now();
@@ -6731,9 +6751,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     let reason = format!("Video encode error: {e}");
                                     self.export_worker
                                         .finish_video(active.session_id, Some(reason.clone()));
-                                    self.is_recording = false;
-                                    self.record_frames = 0;
-                                    self.notify_recording(false);
+                                    self.stop_video_recording_state();
                                     self.last_saved_msg = Some(reason);
                                 }
                             }
@@ -6799,9 +6817,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     });
                     self.export_worker
                         .finish_video(active.session_id, Some(reason.clone()));
-                    self.is_recording = false;
-                    self.record_frames = 0;
-                    self.notify_recording(false);
+                    self.stop_video_recording_state();
                     self.last_saved_msg = Some(reason);
                 } else {
                     let rec_now = Instant::now();
@@ -6835,9 +6851,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             let reason = format!("Video encode error: {e}");
                             self.export_worker
                                 .finish_video(active.session_id, Some(reason.clone()));
-                            self.is_recording = false;
-                            self.record_frames = 0;
-                            self.notify_recording(false);
+                            self.stop_video_recording_state();
                             self.last_saved_msg = Some(reason);
                         }
                     }

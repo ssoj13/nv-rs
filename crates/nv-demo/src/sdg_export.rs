@@ -76,6 +76,64 @@ impl ActiveCrowdBackend {
     }
 }
 
+/// User-selected backend for lane-graph vehicle traffic simulation.
+///
+/// Explicit `Cpu` or `Cuda` requests never silently downgrade; only `Auto` may fall back and
+/// reports the concrete backend that executed via [`ActiveTrafficBackend`].
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum TrafficBackend {
+    /// Prefer GPU-direct CUDA `PlanKind::Traffic` v1 when available, falling back to CPU SoA.
+    #[default]
+    Auto,
+    /// Run CPU `SoaTrafficDriver` exclusively.
+    Cpu,
+    /// Run GPU-direct CUDA `PlanKind::Traffic` v1 exclusively (surfaces errors; never falls back).
+    Cuda,
+}
+
+impl TrafficBackend {
+    /// All selectable traffic simulation backends in UI order.
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Cpu, Self::Cuda];
+
+    /// Compact UI label.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+}
+
+/// Concrete traffic simulation backend that actually executed on the latest frame.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ActiveTrafficBackend {
+    /// No traffic vehicles stepped this frame.
+    #[default]
+    None,
+    /// CPU `SoaTrafficDriver` executed.
+    Cpu,
+    /// GPU-direct CUDA `PlanKind::Traffic` v1 executed.
+    Cuda,
+}
+
+impl ActiveTrafficBackend {
+    /// Short HUD/telemetry label.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "Idle",
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+}
+
 /// User-selected ray-occlusion backend for SDG 2D/3D keypoint visibility classification.
 ///
 /// Explicit `Cpu` or `Optix` requests never silently downgrade; only `Auto` may fall back and

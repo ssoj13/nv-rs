@@ -722,7 +722,7 @@ dependencies = [
 [[package]]
 name = "csg-actors"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -732,7 +732,7 @@ dependencies = [
 [[package]]
 name = "csg-assemble"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -744,7 +744,7 @@ dependencies = [
 [[package]]
 name = "csg-catalog"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-kit-architecture",
@@ -763,7 +763,7 @@ dependencies = [
 [[package]]
 name = "csg-citygen"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "blake3",
  "byte-cache",
@@ -793,7 +793,7 @@ dependencies = [
 [[package]]
 name = "csg-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "bytemuck",
  "serde",
@@ -802,7 +802,7 @@ dependencies = [
 [[package]]
 name = "csg-device"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -811,7 +811,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-architecture"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -822,7 +822,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-foliage"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -833,7 +833,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-industrial"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -844,7 +844,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-infra"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -855,7 +855,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-marina-furniture"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-marine"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -877,7 +877,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-street"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -888,7 +888,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-vehicles"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -899,7 +899,7 @@ dependencies = [
 [[package]]
 name = "csg-ops"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-scene",
@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "csg-roads"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -921,13 +921,14 @@ dependencies = [
 [[package]]
 name = "csg-scene"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "blake3",
  "bytemuck",
  "camera-guide 0.1.0 (git+ssh://git@github.com/ssoj13/camera-guide-rs.git?rev=d089350)",
  "csg-actors",
  "csg-core",
+ "csg-traffic",
  "serde",
  "wgpu",
 ]
@@ -935,7 +936,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-gundo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-actors",
  "csg-core",
@@ -953,7 +954,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-marina"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -969,7 +970,7 @@ dependencies = [
 [[package]]
 name = "csg-scenes"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-actors",
  "csg-catalog",
@@ -988,11 +989,21 @@ dependencies = [
 [[package]]
 name = "csg-terrain"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#99dc6303b995215b8e7cb749745e7c35705c466d"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
 dependencies = [
  "csg-core",
  "csg-ops",
  "csg-scene",
+ "serde",
+]
+
+[[package]]
+name = "csg-traffic"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#3fbe5a0ed88e7db7bac45560a7866cdcc78a288b"
+dependencies = [
+ "bytemuck",
+ "csg-core",
  "serde",
 ]
 
@@ -1030,7 +1041,7 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#920720a265042259a8936488a3b4fa24413c605b"
 dependencies = [
  "bindgen",
  "libloading",
@@ -1043,7 +1054,7 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#920720a265042259a8936488a3b4fa24413c605b"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1057,7 +1068,7 @@ dependencies = [
 [[package]]
 name = "cuda-core-derive"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#920720a265042259a8936488a3b4fa24413c605b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1078,7 +1089,7 @@ dependencies = [
 [[package]]
 name = "cuda-repr"
 version = "0.5.0"
-source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#348895e421a92d13a2c3a843ccb20ed1fb8b7f8b"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?branch=main#920720a265042259a8936488a3b4fa24413c605b"
 
 [[package]]
 name = "cudnn"

@@ -10,7 +10,7 @@
 //! 60 Hz with a single end-of-frame stream fence per rendered frame.
 //! How: waits on [`AppBus::render_wake`], consumes coalesced [`crate::app_events::RenderStateSnapshot`] + discrete
 //! [`RenderControl`] commands, executes one uninterrupted GPU stream burst per frame
-//! (`IAS/Crowd/Camera -> OptiX RT (680 B LaunchParams) -> Denoiser -> Bloom -> Tonemap/Overlay`),
+//! (`IAS/Crowd/Camera -> OptiX RT (704 B LaunchParams) -> Denoiser -> Bloom -> Tonemap/Overlay`),
 //! and emits [`RenderEvent`]s (`FrameReady`, `PhaseChanged`, `SceneMetaUpdated`, `Fatal`, etc.).
 //! Uses: `optix`, `cuda_core`, `cuda_bindings`, `appbus`, `csg_scene`, `crate::app_events`,
 //! `crate::csg_scene_host`, `crate::cuda_crowd`, `crate::cuda_camera`, `crate::fft_bloom`,
@@ -39,7 +39,7 @@ use optix::{
 };
 
 use crate::app_events::{
-    AppBus, EnginePhase, PossessInfo, RenderControl, RenderEvent, SceneBuildProgress,
+    AppBus, EnginePhase, PossessAdas, PossessInfo, RenderControl, RenderEvent, SceneBuildProgress,
     SimTelemetry, SmartViewResult, fast_preview_budget,
 };
 use crate::csg_scene_host::{
@@ -47,18 +47,21 @@ use crate::csg_scene_host::{
 };
 use crate::cuda_camera::GpuCameraComposer;
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
+use crate::cuda_traffic::{CudaTrafficBackend, TrafficScatterBindingPod, TrafficScatterTarget};
 use crate::fft_bloom::FftBloomPass;
 use crate::gpu_export::save_jpeg_from_rgba8;
 use crate::profiler::GpuPassProfiler;
 use crate::semantic_filter as sf;
 use crate::sdg_export::{
-    ActiveCrowdBackend, ActiveSdgOccluder, CrowdBackend, SdgBurstFrameEntry, SdgBurstManifest,
-    SdgExrFrame, SdgOccluderBackend, write_sdg_exr_atomic, write_sdg_manifest_atomic,
+    ActiveCrowdBackend, ActiveSdgOccluder, ActiveTrafficBackend, CrowdBackend, SdgBurstFrameEntry,
+    SdgBurstManifest, SdgExrFrame, SdgOccluderBackend, TrafficBackend, write_sdg_exr_atomic,
+    write_sdg_manifest_atomic,
 };
 use csg_actors::{KeypointVis, RayOccluder, SdgCamera, Vec3 as ActorVec3};
 use csg_scene::camera_gpu::{
     CAM_FAULT_NONE, CAM_FLAG_RESET_HISTORY, CameraModePod, CameraRecordPod, quat_forward_up,
 };
+use csg_scene::traffic_gpu::TRAFFIC_SLOTS_PER_VEHICLE;
 use csg_scene::{
     CpuViewProber, PackedGpuScene, ProbeBackendKind, ProbeSample, SmartViewSelector,
     ViewCandidate, ViewProbeBackend, ViewScore, WgpuViewProber, WorldScene, score_probe_grid,
@@ -225,9 +228,22 @@ struct LaunchParams {
     /// (`semantic_filter::fill_partial_bits`). `0` = every instance partial. Read only while
     /// `hidden_semantics != 0`.
     csg_sem_partial: u64,
+    /// Parallel per-slot packed procedural sign-text handles (`u32[csg_instance_count]`),
+    /// `0` when empty or unuploaded.
+    csg_instance_text: u64,
+    /// Flat deduplicated ASCII byte pool for `CSG_PROC_SIGN_TEXT` (`u8[csg_sign_text_len]`),
+    /// `0` when empty.
+    csg_sign_text_bytes: u64,
+    /// Byte length of [`Self::csg_sign_text_bytes`].
+    csg_sign_text_len: u32,
+    /// Explicit 16-byte alignment padding (`0`).
+    _pad_sign_text: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<LaunchParams>() == 680);
+const _: () = assert!(std::mem::size_of::<LaunchParams>() == 704);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sign_text_len) == 696);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sign_text_bytes) == 688);
+const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_instance_text) == 680);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, csg_sem_partial) == 672);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, hidden_semantics) == 664);
 const _: () = assert!(std::mem::offset_of!(LaunchParams, is_counters) == 656);
@@ -932,6 +948,9 @@ pub struct DemoSettings {
     pub probe_backend: ProbeBackendKind,
     /// Articulated crowd simulation compute backend (`Auto`, `Cpu`, `Cuda`).
     pub crowd_backend: CrowdBackend,
+    /// Lane-graph traffic simulation compute backend (`Auto`, `Cpu`, `Cuda`).
+    #[serde(default)]
+    pub traffic_backend: TrafficBackend,
     /// SDG keypoint occlusion raycasting backend (`Auto`, `Cpu`, `Optix`).
     pub sdg_occluder_backend: SdgOccluderBackend,
     /// Interactive poke impulse strength (`0.5..=4.0`, default `1.8`).
@@ -1098,6 +1117,7 @@ impl Default for DemoSettings {
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
             crowd_backend: CrowdBackend::Auto,
+            traffic_backend: TrafficBackend::Auto,
             sdg_occluder_backend: SdgOccluderBackend::Auto,
             poke_impulse: 1.8,
             sdg_burst_frames: 16,
@@ -1213,6 +1233,8 @@ pub struct FrameReady {
     pub fast_preview: bool,
     /// Resolved world camera basis when actively possessing a body (synced back to UI for picking & Eject).
     pub possess_camera: Option<CameraFrame>,
+    /// Live ADAS / driving-state telemetry when possessing a dynamic traffic vehicle (32 B async DMA).
+    pub possess_adas: Option<PossessAdas>,
     /// Exact world camera basis that rendered this frame (consumed by DLSS-RR `WorldToView` / `ViewToClip`).
     pub rendered_camera: CameraFrame,
     /// Live zero-allocation snapshot of Crowd, Locomotion, and Traffic simulation telemetry.
@@ -1238,6 +1260,8 @@ struct TonemapKernel {
     ovl_axes: cu::CUfunction,
     /// Actor skeleton provider: device `WorldJoints` + skeleton edge table -> bone / joint segments.
     ovl_skeletons: cu::CUfunction,
+    /// Vehicle ADAS corridor & pedestrian hazard tether provider (`ovl_adas`).
+    ovl_adas: cu::CUfunction,
     /// Overlay composite: coverage -> tonemapped RGBA8 / scRGB outputs.
     ovl_composite: cu::CUfunction,
     pack_rr_func: cu::CUfunction,
@@ -1331,9 +1355,11 @@ struct OptixRig {
     cpu_prober: CpuViewProber,
     wgpu_prober: Option<WgpuViewProber>,
     cuda_crowd: Option<Result<CudaCrowdBackend, String>>,
+    cuda_traffic: Option<Result<CudaTrafficBackend, String>>,
     cuda_camera: Option<Result<GpuCameraComposer, String>>,
     crowd_slot_map_host: Vec<u32>,
     crowd_gas_handles_host: Vec<u64>,
+    traffic_bindings_host: Vec<TrafficScatterBindingPod>,
 }
 
 /// OptiX include directory ([`crate::optix_sdk::include_dir`], the discovery `build.rs` uses too)
@@ -2732,6 +2758,7 @@ fn init_optix(
         ovl_splat: std::ptr::null_mut(),
         ovl_axes: std::ptr::null_mut(),
         ovl_skeletons: std::ptr::null_mut(),
+        ovl_adas: std::ptr::null_mut(),
         ovl_composite: std::ptr::null_mut(),
         pack_rr_func: std::ptr::null_mut(),
     };
@@ -2744,6 +2771,7 @@ fn init_optix(
     tonemap.ovl_splat = cu_module_function(tonemap.module, c"ovl_splat")?;
     tonemap.ovl_axes = cu_module_function(tonemap.module, c"ovl_axes")?;
     tonemap.ovl_skeletons = cu_module_function(tonemap.module, c"ovl_skeletons")?;
+    tonemap.ovl_adas = cu_module_function(tonemap.module, c"ovl_adas")?;
     tonemap.ovl_composite = cu_module_function(tonemap.module, c"ovl_composite")?;
     tonemap.pack_rr_func = cu_module_function(tonemap.module, c"pack_dlss_rr_aovs_f16")?;
 
@@ -3026,10 +3054,29 @@ fn init_optix(
         cpu_prober: CpuViewProber::new(),
         wgpu_prober: None,
         cuda_crowd: None,
+        cuda_traffic: None,
         cuda_camera: None,
         crowd_slot_map_host: Vec::with_capacity(1024),
         crowd_gas_handles_host: Vec::with_capacity(256),
+        traffic_bindings_host: Vec::with_capacity(512),
     })
+}
+
+/// Lazily initializes `rig.cuda_traffic` (`PlanKind::Traffic` v1) once on first use, caching
+/// either the compiled NVRTC backend or the diagnostic failure string so failed builds are not
+/// retried every frame.
+fn ensure_cuda_traffic<'a>(
+    rig: &'a mut OptixRig,
+    cuda: &Arc<CudaContext>,
+) -> Result<&'a mut CudaTrafficBackend, &'a str> {
+    if rig.cuda_traffic.is_none() {
+        rig.cuda_traffic = Some(CudaTrafficBackend::new(cuda));
+    }
+    match rig.cuda_traffic.as_mut() {
+        Some(Ok(ct)) => Ok(ct),
+        Some(Err(e)) => Err(e.as_str()),
+        None => Err("CUDA traffic backend uninitialized"),
+    }
 }
 
 /// Lazily initializes `rig.cuda_crowd` once on first use, caching either the compiled NVRTC
@@ -3552,6 +3599,10 @@ fn run_overlay(
         let mut skeletons = ov::SkeletonProvider;
         skeletons.emit(&ctx, list);
     }
+    if rig.csg_host.has_lane_graph_traffic() {
+        let mut adas = ov::AdasProvider;
+        adas.emit(&ctx, list);
+    }
     if let Some(data) = f.flight_path {
         let mut flight = ov::FlightPathProvider { data };
         flight.emit(&ctx, list);
@@ -3846,6 +3897,71 @@ fn run_overlay(
                     return Err(format!("ovl_skeletons cuLaunchKernel failed ({rc:?})"));
                 }
             }
+            ov::GpuSource::Adas {
+                style_cruise,
+                style_yield,
+                style_aeb,
+                style_tether,
+            } => {
+                // Skip cleanly when GPU traffic is not active or has no device-resident poses yet.
+                let Some(Ok(ct)) = rig.cuda_traffic.as_ref() else {
+                    continue;
+                };
+                let (mut outs_ptr, mut veh_count) = ct.instance_outs_device_ptr();
+                let (mut hazards_ptr, hz_count) = ct.hazards_device_ptr();
+                if outs_ptr == 0 || hazards_ptr == 0 || veh_count == 0 || hz_count < veh_count {
+                    continue;
+                }
+                let (mut crowd_states_ptr, mut crowd_count) = rig
+                    .cuda_crowd
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map_or((0u64, 0u32), CudaCrowdBackend::states_device_ptr);
+                let mut slots_per_veh = TRAFFIC_SLOTS_PER_VEHICLE as u32;
+                let mut cam_dev = cam_ptr;
+                let mut sel_dev = sel_ptr;
+                let (mut sc, mut sy, mut sa, mut st) =
+                    (style_cruise.0, style_yield.0, style_aeb.0, style_tether.0);
+                let mut args: [*mut c_void; 15] = [
+                    (&raw mut outs_ptr).cast(),
+                    (&raw mut hazards_ptr).cast(),
+                    (&raw mut crowd_states_ptr).cast(),
+                    (&raw mut veh_count).cast(),
+                    (&raw mut slots_per_veh).cast(),
+                    (&raw mut crowd_count).cast(),
+                    (&raw mut cam_dev).cast(),
+                    (&raw mut sel_dev).cast(),
+                    (&raw mut segs).cast(),
+                    (&raw mut counter).cast(),
+                    (&raw mut cap).cast(),
+                    (&raw mut sc).cast(),
+                    (&raw mut sy).cast(),
+                    (&raw mut sa).cast(),
+                    (&raw mut st).cast(),
+                ];
+                // SAFETY: `ovl_adas` matches the 15-parameter ABI in `shaders/tonemap.cu`;
+                // `outs_ptr` (`veh_count * 7` pods), `hazards_ptr` (`veh_count` pods), and
+                // optional `crowd_states_ptr` (`crowd_count` pods) stay alive on `rig.stream`
+                // until the end-of-frame fence, and segment appends are bounded by `cap`.
+                let rc = unsafe {
+                    cu::cuLaunchKernel(
+                        rig.tonemap.ovl_adas,
+                        veh_count.div_ceil(128),
+                        1,
+                        1,
+                        128,
+                        1,
+                        1,
+                        0,
+                        cs,
+                        args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if rc != cu::cudaError_enum_CUDA_SUCCESS {
+                    return Err(format!("ovl_adas cuLaunchKernel failed ({rc:?})"));
+                }
+            }
         }
     }
     let mut styles = styles_ptr;
@@ -4103,6 +4219,22 @@ fn sync_cuda_crowd_to_cpu(rig: &mut OptixRig, sync_to_world: bool) -> Result<(),
     cc.sync_cpu_snapshot(&rig.stream, scene, sync_to_world)
 }
 
+/// Pulls GPU-stepped traffic poses (`TrafficInstanceOuts`) back into `rig.csg_host`'s CPU
+/// `WorldScene` dynamic instances on demand (before `FullRepack`, `Freeze Pose`, `ExportSdgJson`,
+/// or CPU pick/possess fallback).
+fn sync_cuda_traffic_to_cpu(rig: &mut OptixRig) -> Result<(), String> {
+    let Some(Ok(ct)) = rig.cuda_traffic.as_mut() else {
+        return Ok(());
+    };
+    if !ct.cpu_world_stale() {
+        return Ok(());
+    }
+    let Some(scene) = rig.csg_host.active_scene_mut() else {
+        return Ok(());
+    };
+    ct.sync_cpu_world_snapshot(&rig.stream, scene)
+}
+
 /// Hardware OptiX 9 primary-ray [`ViewProbeBackend`] launching `__raygen__score_views`
 /// across our existing split-SBT `hit_csg` / `hit_csg_prim` IAS with zero steady-state reallocations.
 struct OptixViewProber<'a> {
@@ -4316,6 +4448,7 @@ fn score_views_on_rig(
     grid_h: u32,
 ) -> Result<Vec<ViewScore>, String> {
     sync_cuda_crowd_to_cpu(rig, true)?;
+    sync_cuda_traffic_to_cpu(rig)?;
     // Every backend scores the full CPU pack; only OptiX reads the device instance buffers.
     let optix_probe = matches!(backend, ProbeBackendKind::Auto | ProbeBackendKind::Optix);
     rig.csg_host
@@ -4659,6 +4792,7 @@ fn export_sdg_json_with_backend(
     fractal: &FractalLaunch,
 ) -> Result<SdgExportOutcome, String> {
     sync_cuda_crowd_to_cpu(rig, true)?;
+    sync_cuda_traffic_to_cpu(rig)?;
     let optix_result = match backend {
         SdgOccluderBackend::Cpu => None,
         SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, &sdg_cam, fractal)?)),
@@ -5043,6 +5177,9 @@ pub fn spawn_render_thread(
             let mut last_crowd_step_ms: f32 = 0.0;
             let mut last_crowd_backend = ActiveCrowdBackend::None;
             let mut last_cuda_crowd_err: Option<String> = None;
+            let mut last_traffic_step_ms: f32 = 0.0;
+            let mut last_traffic_backend = ActiveTrafficBackend::None;
+            let mut last_cuda_traffic_err: Option<String> = None;
             let mut last_cuda_camera_err: Option<String> = None;
             let mut gpu_camera_history_valid = false;
             let mut last_crowd_lod_sig = settings.crowd_lod_params().signature_key();
@@ -5323,6 +5460,11 @@ pub fn spawn_render_thread(
                             if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
                                 bus.emit_render_event(RenderEvent::StatusMessage(format!(
                                     "CUDA crowd sync before possess failed: {e}"
+                                )));
+                            }
+                            if let Err(e) = sync_cuda_traffic_to_cpu(&mut rig) {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA traffic sync before possess failed: {e}"
                                 )));
                             }
                             match rig.csg_host.possess_next_vehicle() {
@@ -5621,10 +5763,15 @@ pub fn spawn_render_thread(
                                         }
                                     }
                                     crate::pick::PickAction::Possess if rec.is_hit() && rec.is_csg() => {
-                                        // The possession pose follows the CPU crowd state.
+                                        // The possession pose follows the CPU crowd/traffic state until GPU compose takes over.
                                         if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
                                             bus.emit_render_event(RenderEvent::StatusMessage(format!(
                                                 "CUDA crowd sync before possess failed: {e}"
+                                            )));
+                                        }
+                                        if let Err(e) = sync_cuda_traffic_to_cpu(&mut rig) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                                "CUDA traffic sync before possess failed: {e}"
                                             )));
                                         }
                                         match rig.csg_host.possess_pick(rec.inst_id, rec.world_pos) {
@@ -5824,17 +5971,84 @@ pub fn spawn_render_thread(
                         (false, 0.0, settings.csg_freeze_pose, false)
                     };
 
-                if freeze_now
-                    && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
-                {
-                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                        "CUDA crowd freeze sync failed: {e}"
-                    )));
+                if freeze_now {
+                    if let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true) {
+                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                            "CUDA crowd freeze sync failed: {e}"
+                        )));
+                    }
+                    if let Err(e) = sync_cuda_traffic_to_cpu(&mut rig) {
+                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                            "CUDA traffic freeze sync failed: {e}"
+                        )));
+                    }
                 }
                 if rig.csg_host.sync_freeze_pose(freeze_now)
                     && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
                 {
                     cc.mark_intents_dirty();
+                }
+
+                // Decide traffic compute backend with strict explicit-mode semantics:
+                // explicit `TrafficBackend::Cuda` or `Cpu` never silently downgrades; only `Auto`
+                // may fall back to CPU SoA and reports the active backend in `SimTelemetry`.
+                let mut run_cuda_traffic_after_sync = false;
+                let mut step_traffic_cpu = false;
+                if step_traffic_now && !freeze_now && rig.csg_host.has_lane_graph_traffic() {
+                    match settings.traffic_backend {
+                        TrafficBackend::Cpu => {
+                            if let Err(e) = sync_cuda_traffic_to_cpu(&mut rig) {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA traffic CPU-switch sync failed: {e}"
+                                )));
+                            }
+                            if let Some(Ok(ct)) = rig.cuda_traffic.as_mut() {
+                                ct.mark_scene_dirty();
+                            }
+                            step_traffic_cpu = true;
+                            last_traffic_backend = ActiveTrafficBackend::Cpu;
+                            last_cuda_traffic_err = None;
+                        }
+                        TrafficBackend::Cuda | TrafficBackend::Auto => {
+                            match ensure_cuda_traffic(&mut rig, &cuda) {
+                                Ok(_) => {
+                                    run_cuda_traffic_after_sync = true;
+                                    last_cuda_traffic_err = None;
+                                }
+                                Err(err) => {
+                                    if settings.traffic_backend == TrafficBackend::Cuda {
+                                        if last_cuda_traffic_err.as_deref() != Some(err) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("CUDA traffic error: {err}"),
+                                            ));
+                                            last_cuda_traffic_err = Some(err.to_string());
+                                        }
+                                        last_traffic_step_ms = 0.0;
+                                        last_traffic_backend = ActiveTrafficBackend::None;
+                                    } else {
+                                        if let Err(e) = sync_cuda_traffic_to_cpu(&mut rig) {
+                                            bus.emit_render_event(RenderEvent::StatusMessage(
+                                                format!("CUDA traffic fallback sync failed: {e}"),
+                                            ));
+                                        }
+                                        if let Some(Ok(ct)) = rig.cuda_traffic.as_mut() {
+                                            ct.mark_scene_dirty();
+                                        }
+                                        step_traffic_cpu = true;
+                                        last_traffic_backend = ActiveTrafficBackend::Cpu;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if step_traffic_now && !freeze_now && rig.csg_host.has_traffic() {
+                    step_traffic_cpu = true;
+                    last_traffic_backend = ActiveTrafficBackend::Cpu;
+                } else {
+                    last_traffic_step_ms = 0.0;
+                    if !rig.csg_host.has_traffic() {
+                        last_traffic_backend = ActiveTrafficBackend::None;
+                    }
                 }
 
                 let crowd_lod = settings.crowd_lod_params();
@@ -5858,7 +6072,7 @@ pub fn spawn_render_thread(
                                 last_rendered_camera.eye,
                                 crowd_lod,
                                 false,
-                                step_traffic_now,
+                                step_traffic_cpu,
                             );
                             last_crowd_step_ms = t_crowd.elapsed().as_secs_f32() * 1000.0;
                             last_crowd_backend = ActiveCrowdBackend::Cpu;
@@ -5874,7 +6088,7 @@ pub fn spawn_render_thread(
                                 last_rendered_camera.eye,
                                 crowd_lod,
                                 false,
-                                step_traffic_now,
+                                step_traffic_cpu,
                             );
                             if moved_traffic && !preserve_shutter_accum && !burst_step_frame {
                                 accum_count = 0;
@@ -5928,7 +6142,7 @@ pub fn spawn_render_thread(
                         last_rendered_camera.eye,
                         crowd_lod,
                         freeze_now,
-                        step_traffic_now,
+                        step_traffic_cpu,
                     );
                     if moved && !preserve_shutter_accum && !burst_step_frame {
                         accum_count = 0;
@@ -5982,11 +6196,13 @@ pub fn spawn_render_thread(
 
                 // Resolve live possessed camera mount AFTER dynamic traffic advances so the
                 // camera stays mathematically locked to moving vehicles with zero 1-frame lag.
-                // When CUDA crowd will step this frame and a crowd actor is possessed, hold the
-                // previous frame's exact composed pose for pre-step culling/LOD and let
-                // `GpuCameraComposer` resolve this frame's bone directly in VRAM after the step.
+                // When CUDA crowd or CUDA traffic will step this frame and the corresponding body
+                // is possessed, hold the previous frame's exact composed pose for pre-step
+                // culling/LOD and let `GpuCameraComposer` resolve this frame's pose in VRAM.
                 let defer_crowd_possess =
                     run_cuda_crowd_after_sync && rig.csg_host.is_possessing_crowd();
+                let defer_traffic_possess =
+                    run_cuda_traffic_after_sync && rig.csg_host.is_possessing_traffic();
                 if !defer_crowd_possess
                     && rig.csg_host.is_possessing_crowd()
                     && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
@@ -5995,8 +6211,16 @@ pub fn spawn_render_thread(
                         "CUDA crowd sync before possess resolve failed: {e}"
                     )));
                 }
+                if !defer_traffic_possess
+                    && rig.csg_host.is_possessing_traffic()
+                    && let Err(e) = sync_cuda_traffic_to_cpu(&mut rig)
+                {
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "CUDA traffic sync before possess resolve failed: {e}"
+                    )));
+                }
                 let mut possess_cam_out: Option<CameraFrame> = None;
-                let mut active_camera = if defer_crowd_possess {
+                let mut active_camera = if defer_crowd_possess || defer_traffic_possess {
                     possess_cam_out = Some(last_rendered_camera);
                     last_rendered_camera
                 } else if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
@@ -6048,6 +6272,9 @@ pub fn spawn_render_thread(
                     if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
                         cc.mark_scene_dirty();
                     }
+                    if let Some(Ok(ct)) = rig.cuda_traffic.as_mut() {
+                        ct.mark_scene_dirty();
+                    }
                     let initial_stage = if csg_key.scene_idx == 0 {
                         "Switching to Classic stage..."
                     } else {
@@ -6092,11 +6319,28 @@ pub fn spawn_render_thread(
                                 csg_cam_params,
                                 sync_gpu_crowd,
                             )));
+                let need_traffic_sync_before_csg = !building_scene
+                    && (rig
+                        .csg_host
+                        .will_camera_repack(csg_key, csg_cam_params, sync_gpu_crowd)
+                        || (!run_cuda_traffic_after_sync
+                            && rig.csg_host.will_upload_instances(
+                                csg_key,
+                                csg_cam_params,
+                                sync_gpu_crowd,
+                            )));
                 if need_crowd_sync_before_csg
                     && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
                 {
                     bus.emit_render_event(RenderEvent::StatusMessage(format!(
                         "CUDA crowd sync before CSG upload failed: {e}"
+                    )));
+                }
+                if need_traffic_sync_before_csg
+                    && let Err(e) = sync_cuda_traffic_to_cpu(&mut rig)
+                {
+                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                        "CUDA traffic sync before CSG upload failed: {e}"
                     )));
                 }
                 let csg_sync = match rig.csg_host.sync_with_progress(
@@ -6136,10 +6380,13 @@ pub fn spawn_render_thread(
                         CsgSyncResult::FullRepack
                     }
                 };
-                if (building_scene || matches!(csg_sync, CsgSyncResult::FullRepack))
-                    && let Some(Ok(cc)) = rig.cuda_crowd.as_mut()
-                {
-                    cc.mark_topology_dirty();
+                if building_scene || matches!(csg_sync, CsgSyncResult::FullRepack) {
+                    if let Some(Ok(cc)) = rig.cuda_crowd.as_mut() {
+                        cc.mark_topology_dirty();
+                    }
+                    if let Some(Ok(ct)) = rig.cuda_traffic.as_mut() {
+                        ct.mark_topology_dirty();
+                    }
                 }
                 let is_possessing_now = rig.csg_host.is_possessing();
                 if was_possessing && !is_possessing_now {
@@ -6304,43 +6551,178 @@ pub fn spawn_render_thread(
                 }
 
                 let mut gpu_camera_composed_this_frame = false;
-                // GPU-direct CUDA articulated crowd step -> scatter into VRAM (`csg_instances`,
-                // `csg_prev_xforms`, `d_optix_instances`) -> single OptiX IAS refit/rebuild.
-                if run_cuda_crowd_after_sync && rig.csg_host.has_crowd() && rig.ias.is_some() {
-                    let csg_ptrs_scatter = rig.csg_host.device_pointers();
-                    let possessing_crowd = rig.csg_host.is_possessing_crowd();
-                    let gpu_possess_attach = if possessing_crowd {
-                        rig.csg_host.active_possess_attach(
-                            possess_free_yaw,
-                            possess_free_pitch,
-                            possess_auto_level,
-                        )
-                    } else {
-                        None
+                let mut gpu_traffic_ran = false;
+                let mut gpu_crowd_ran = false;
+                let mut gpu_traffic_crowd_vehicles: Option<(u64, u32)> = None;
+                let mut need_ias_refit = ias_refit_pending;
+                let mut need_ias_full_rebuild = false;
+
+                let csg_ptrs_scatter = rig.csg_host.device_pointers();
+                let optix_ptr = if rig.ias.is_some()
+                    && rig.d_optix_instances.len()
+                        >= rig.ias_classic_count + csg_ptrs_scatter.instance_count as usize
+                {
+                    rig.d_optix_instances.device_ptr()
+                } else {
+                    0
+                };
+
+                // 1. GPU-direct CUDA lane-graph traffic (`PlanKind::Traffic` v1) -> binds live
+                // `CrowdStates` directly in VRAM for pedestrian AEB/yield, writes
+                // `TrafficCrowdVehicles` + `TrafficInstanceOuts` + `TrafficHazards`, and scatters
+                // multi-part vehicle bodies + wheels into CSG/OptiX IAS buffers.
+                if run_cuda_traffic_after_sync
+                    && rig.csg_host.has_lane_graph_traffic()
+                    && rig.ias.is_some()
+                {
+                    let crowd_states_ptr = rig
+                        .cuda_crowd
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .map(CudaCrowdBackend::states_device_ptr);
+                    let possess_veh_idx = rig
+                        .csg_host
+                        .possessed_traffic_vehicle_id()
+                        .map(|v| v.index());
+                    let traffic_scatter = TrafficScatterTarget {
+                        csg_instances_ptr: csg_ptrs_scatter.instances,
+                        csg_prev_xforms_ptr: csg_ptrs_scatter.prev_xforms,
+                        max_csg_instances: csg_ptrs_scatter.instance_count,
+                        optix_instances_ptr: optix_ptr,
+                        optix_slot_offset: rig.ias_classic_count as u32,
+                        max_optix_instances: rig.d_optix_instances.len() as u32,
                     };
-                    let use_gpu_camera = if gpu_possess_attach.is_some() {
-                        match ensure_cuda_camera(&mut rig, &cuda) {
-                            Ok(_) => true,
-                            Err(err) => {
-                                if last_cuda_camera_err.as_deref() != Some(err) {
-                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                        "CUDA camera composer unavailable: {err}"
-                                    )));
-                                    last_cuda_camera_err = Some(err.to_string());
-                                }
-                                false
+
+                    // Ensure cold lane-graph tables are built/uploaded before resolving scatter
+                    // bindings so `cached_gpu_scene()` is ready on the very first frame.
+                    let pre_upload_res = match (
+                        rig.cuda_traffic.as_mut(),
+                        rig.csg_host.active_scene_mut(),
+                    ) {
+                        (Some(Ok(ct)), Some(scene)) => ct.ensure_scene_uploaded(&rig.stream, scene),
+                        _ => Err("CUDA traffic backend unavailable".to_string()),
+                    };
+                    if let Err(e) = pre_upload_res {
+                        if last_cuda_traffic_err.as_deref() != Some(e.as_str()) {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "CUDA traffic scene upload failed: {e}"
+                            )));
+                            last_cuda_traffic_err = Some(e);
+                        }
+                        last_traffic_step_ms = 0.0;
+                        last_traffic_backend = ActiveTrafficBackend::None;
+                    } else {
+                        let need_topo = rig
+                            .cuda_traffic
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .is_some_and(CudaTrafficBackend::topology_dirty);
+                        if need_topo {
+                            if let Some(Ok(ct)) = rig.cuda_traffic.as_ref()
+                                && let Some(gpu_scene) = ct.cached_gpu_scene()
+                            {
+                                rig.csg_host.fill_traffic_scatter_bindings(
+                                    gpu_scene,
+                                    &mut rig.traffic_bindings_host,
+                                );
+                            }
+                            if let Some(Ok(ct)) = rig.cuda_traffic.as_mut()
+                                && let Err(e) = ct.upload_scatter_topology(
+                                    &rig.stream,
+                                    &rig.traffic_bindings_host,
+                                )
+                            {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA traffic topology upload failed: {e}"
+                                )));
                             }
                         }
-                    } else {
-                        false
-                    };
-                    let optix_ptr = if rig.d_optix_instances.len()
-                        >= rig.ias_classic_count + csg_ptrs_scatter.instance_count as usize
-                    {
-                        rig.d_optix_instances.device_ptr()
-                    } else {
-                        0
-                    };
+
+                        let traffic_step_res = match (
+                            rig.cuda_traffic.as_mut(),
+                            rig.csg_host.active_scene_mut(),
+                        ) {
+                            (Some(Ok(ct)), Some(scene)) => ct.step_gpu_direct(
+                                &rig.stream,
+                                scene,
+                                traffic_time,
+                                crowd_states_ptr,
+                                Some(traffic_scatter),
+                                possess_veh_idx,
+                            ),
+                            _ => Err("CUDA traffic backend unavailable".to_string()),
+                        };
+                        match traffic_step_res {
+                            Ok(report) => {
+                                last_traffic_step_ms = report.step_ms;
+                                last_traffic_backend = ActiveTrafficBackend::Cuda;
+                                last_cuda_traffic_err = None;
+                                gpu_traffic_ran = true;
+                                if !preserve_shutter_accum && !burst_step_frame {
+                                    accum_count = 0;
+                                }
+                                if report.scattered_optix {
+                                    need_ias_refit = true;
+                                    need_ias_full_rebuild |= report.needs_full_ias_rebuild;
+                                }
+                                if let Some(Ok(ct)) = rig.cuda_traffic.as_ref() {
+                                    gpu_traffic_crowd_vehicles =
+                                        Some(ct.crowd_vehicles_device_ptr());
+                                }
+                            }
+                            Err(err) => {
+                                if last_cuda_traffic_err.as_deref() != Some(err.as_str()) {
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "CUDA traffic step failed: {err}"
+                                    )));
+                                    last_cuda_traffic_err = Some(err);
+                                }
+                                last_traffic_step_ms = 0.0;
+                                last_traffic_backend = ActiveTrafficBackend::None;
+                            }
+                        }
+                    }
+                }
+
+                // 2. GPU-direct CUDA articulated crowd (`PlanKind::Crowd` v2) -> consumes
+                // `TrafficCrowdVehicles` via VRAM-direct D2D when GPU traffic ran, then scatters
+                // articulated bones into CSG/OptiX IAS buffers.
+                let possessing_crowd = rig.csg_host.is_possessing_crowd();
+                let possessing_traffic = rig.csg_host.is_possessing_traffic();
+                let gpu_possess_attach = if defer_crowd_possess {
+                    rig.csg_host.active_possess_attach(
+                        possess_free_yaw,
+                        possess_free_pitch,
+                        possess_auto_level,
+                    )
+                } else if defer_traffic_possess && gpu_traffic_ran {
+                    rig.csg_host.active_possess_attach_vehicle(
+                        possess_free_yaw,
+                        possess_free_pitch,
+                        possess_auto_level,
+                    )
+                } else {
+                    None
+                };
+                let use_gpu_camera = if gpu_possess_attach.is_some() {
+                    match ensure_cuda_camera(&mut rig, &cuda) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            if last_cuda_camera_err.as_deref() != Some(err) {
+                                bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                    "CUDA camera composer unavailable: {err}"
+                                )));
+                                last_cuda_camera_err = Some(err.to_string());
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                let mut readback_crowd_poses_for_cpu = false;
+                if run_cuda_crowd_after_sync && rig.csg_host.has_crowd() && rig.ias.is_some() {
                     let scatter = GpuScatterTarget {
                         csg_instances_ptr: csg_ptrs_scatter.instances,
                         csg_prev_xforms_ptr: csg_ptrs_scatter.prev_xforms,
@@ -6382,7 +6764,7 @@ pub fn spawn_render_thread(
 
                     // Skip full-crowd CPU readback whenever GPU camera composition can resolve
                     // the possessed bone directly from `BufId::CrowdBoneOuts` in VRAM.
-                    let readback_poses_for_cpu = possessing_crowd && !use_gpu_camera;
+                    readback_crowd_poses_for_cpu = possessing_crowd && !use_gpu_camera;
                     let cuda_step_res = match (
                         rig.cuda_crowd.as_mut(),
                         rig.csg_host.active_scene_mut(),
@@ -6394,8 +6776,9 @@ pub fn spawn_render_thread(
                             traffic_time,
                             active_camera.eye,
                             crowd_lod,
+                            gpu_traffic_crowd_vehicles,
                             Some(scatter),
-                            readback_poses_for_cpu,
+                            readback_crowd_poses_for_cpu,
                         ),
                         _ => Err("CUDA crowd backend unavailable".to_string()),
                     };
@@ -6404,123 +6787,13 @@ pub fn spawn_render_thread(
                             last_crowd_step_ms = report.step_ms;
                             last_crowd_backend = ActiveCrowdBackend::Cuda;
                             last_cuda_crowd_err = None;
+                            gpu_crowd_ran = true;
                             if !preserve_shutter_accum && !burst_step_frame {
                                 accum_count = 0;
                             }
                             if optix_ptr != 0 {
-                                // SAFETY: all launches on `rig.stream` are strictly stream-ordered
-                                // and `scatter_crowd_to_csg_and_optix` finished before this call.
-                                let refit = unsafe {
-                                    Accel::instances_into(
-                                        &rig._optix_ctx,
-                                        &rig.stream,
-                                        &mut rig._scratch,
-                                        &rig.d_optix_instances,
-                                        ias_build_opts(),
-                                        report.needs_full_ias_rebuild,
-                                        &mut rig.ias,
-                                    )
-                                };
-                                if let Err(e) = refit {
-                                    bus.emit_render_event(RenderEvent::Fatal(format!(
-                                        "IAS CUDA crowd refit failed: {e}"
-                                    )));
-                                    break 'render;
-                                }
-                                ias_refit_pending = false;
-                            }
-                            if possessing_crowd {
-                                let mut target_frame: Option<CameraFrame> = None;
-                                if use_gpu_camera
-                                    && let Some((attach, vfov_deg)) = gpu_possess_attach
-                                {
-                                    let bone_outs = rig
-                                        .cuda_crowd
-                                        .as_ref()
-                                        .and_then(|r| r.as_ref().ok())
-                                        .map(CudaCrowdBackend::bone_outs_device_ptr);
-                                    let cam_flags =
-                                        if temporal_history_cut || !gpu_camera_history_valid {
-                                            CAM_FLAG_RESET_HISTORY
-                                        } else {
-                                            0
-                                        };
-                                    if let (Some(Ok(cam_gpu)), Some(bones)) =
-                                        (rig.cuda_camera.as_mut(), bone_outs)
-                                    {
-                                        match cam_gpu.compose_one(
-                                            &rig.stream,
-                                            CameraModePod::possess(vfov_deg, cam_flags),
-                                            attach,
-                                            Some(bones),
-                                            None,
-                                        ) {
-                                            Ok(rec) if rec.fault == CAM_FAULT_NONE => {
-                                                target_frame =
-                                                    Some(camera_record_to_camera_frame(&rec));
-                                                gpu_camera_composed_this_frame = true;
-                                                last_cuda_camera_err = None;
-                                            }
-                                            Ok(rec) => {
-                                                let msg = format!(
-                                                    "CUDA camera compose fault (0x{:x}); falling back to CPU possess",
-                                                    rec.fault
-                                                );
-                                                if last_cuda_camera_err.as_deref()
-                                                    != Some(msg.as_str())
-                                                {
-                                                    bus.emit_render_event(
-                                                        RenderEvent::StatusMessage(msg.clone()),
-                                                    );
-                                                    last_cuda_camera_err = Some(msg);
-                                                }
-                                            }
-                                            Err(err) => {
-                                                if last_cuda_camera_err.as_deref()
-                                                    != Some(err.as_str())
-                                                {
-                                                    bus.emit_render_event(
-                                                        RenderEvent::StatusMessage(format!(
-                                                            "CUDA camera compose failed: {err}"
-                                                        )),
-                                                    );
-                                                    last_cuda_camera_err = Some(err);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if target_frame.is_none() {
-                                    if !readback_poses_for_cpu
-                                        && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
-                                    {
-                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
-                                            "CUDA crowd sync for possess fallback failed: {e}"
-                                        )));
-                                    }
-                                    if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
-                                        possess_free_yaw,
-                                        possess_free_pitch,
-                                        possess_auto_level,
-                                    ) {
-                                        target_frame = Some(csg_pose_to_camera_frame(csg_pose));
-                                    }
-                                }
-                                if let Some(frame) = target_frame {
-                                    let (final_frame, blended) = apply_possess_target(
-                                        frame,
-                                        possess_zoom_offset,
-                                        &mut possess_blend_rem,
-                                        &mut possess_damper,
-                                        dt,
-                                    );
-                                    if blended && !preserve_shutter_accum {
-                                        accum_count = 0;
-                                    }
-                                    active_camera = final_frame;
-                                    last_rendered_camera = final_frame;
-                                    possess_cam_out = Some(final_frame);
-                                }
+                                need_ias_refit = true;
+                                need_ias_full_rebuild |= report.needs_full_ias_rebuild;
                             }
                         }
                         Err(err) => {
@@ -6535,10 +6808,30 @@ pub fn spawn_render_thread(
                         }
                     }
                 }
-                gpu_camera_history_valid = gpu_camera_composed_this_frame;
-                if ias_refit_pending {
-                    // The CUDA crowd step failed or had no OptiX scatter target, so nothing refit
-                    // the BVH over the traffic prefix uploaded above.
+
+                // 3. Single combined OptiX IAS refit/rebuild covering both GPU traffic & GPU crowd.
+                if need_ias_refit && optix_ptr != 0 {
+                    // SAFETY: all scatter kernels on `rig.stream` are strictly stream-ordered
+                    // before this `Accel::instances_into` call.
+                    let refit = unsafe {
+                        Accel::instances_into(
+                            &rig._optix_ctx,
+                            &rig.stream,
+                            &mut rig._scratch,
+                            &rig.d_optix_instances,
+                            ias_build_opts(),
+                            need_ias_full_rebuild,
+                            &mut rig.ias,
+                        )
+                    };
+                    if let Err(e) = refit {
+                        bus.emit_render_event(RenderEvent::Fatal(format!(
+                            "IAS dynamic refit failed: {e}"
+                        )));
+                        break 'render;
+                    }
+                } else if ias_refit_pending {
+                    // Fallback refit for CPU dynamic prefix when neither GPU scatter ran.
                     // SAFETY: all launches on `rig.stream` are strictly stream-ordered.
                     let refit = unsafe {
                         Accel::instances_into(
@@ -6558,6 +6851,114 @@ pub fn spawn_render_thread(
                         break 'render;
                     }
                 }
+
+                // 4. Unified zero-copy `PlanKind::Camera` v1 composition for possessed crowd
+                // actors (`CrowdBoneOuts`) AND possessed traffic vehicles (`TrafficInstanceOuts`).
+                if (defer_crowd_possess && gpu_crowd_ran)
+                    || (defer_traffic_possess && gpu_traffic_ran)
+                {
+                    let mut target_frame: Option<CameraFrame> = None;
+                    if use_gpu_camera
+                        && let Some((attach, vfov_deg)) = gpu_possess_attach
+                    {
+                        let bone_outs = if defer_crowd_possess {
+                            rig.cuda_crowd
+                                .as_ref()
+                                .and_then(|r| r.as_ref().ok())
+                                .map(CudaCrowdBackend::bone_outs_device_ptr)
+                        } else {
+                            None
+                        };
+                        let traffic_outs = if defer_traffic_possess {
+                            rig.cuda_traffic
+                                .as_ref()
+                                .and_then(|r| r.as_ref().ok())
+                                .map(CudaTrafficBackend::instance_outs_device_ptr)
+                        } else {
+                            None
+                        };
+                        let cam_flags = if temporal_history_cut || !gpu_camera_history_valid {
+                            CAM_FLAG_RESET_HISTORY
+                        } else {
+                            0
+                        };
+                        if let Some(Ok(cam_gpu)) = rig.cuda_camera.as_mut() {
+                            match cam_gpu.compose_one(
+                                &rig.stream,
+                                CameraModePod::possess(vfov_deg, cam_flags),
+                                attach,
+                                bone_outs,
+                                traffic_outs,
+                            ) {
+                                Ok(rec) if rec.fault == CAM_FAULT_NONE => {
+                                    target_frame = Some(camera_record_to_camera_frame(&rec));
+                                    gpu_camera_composed_this_frame = true;
+                                    last_cuda_camera_err = None;
+                                }
+                                Ok(rec) => {
+                                    let msg = format!(
+                                        "CUDA camera compose fault (0x{:x}); falling back to CPU possess",
+                                        rec.fault
+                                    );
+                                    if last_cuda_camera_err.as_deref() != Some(msg.as_str()) {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(
+                                            msg.clone(),
+                                        ));
+                                        last_cuda_camera_err = Some(msg);
+                                    }
+                                }
+                                Err(err) => {
+                                    if last_cuda_camera_err.as_deref() != Some(err.as_str()) {
+                                        bus.emit_render_event(RenderEvent::StatusMessage(
+                                            format!("CUDA camera compose failed: {err}"),
+                                        ));
+                                        last_cuda_camera_err = Some(err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if target_frame.is_none() {
+                        if possessing_crowd
+                            && !readback_crowd_poses_for_cpu
+                            && let Err(e) = sync_cuda_crowd_to_cpu(&mut rig, true)
+                        {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "CUDA crowd sync for possess fallback failed: {e}"
+                            )));
+                        }
+                        if possessing_traffic
+                            && let Err(e) = sync_cuda_traffic_to_cpu(&mut rig)
+                        {
+                            bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                "CUDA traffic sync for possess fallback failed: {e}"
+                            )));
+                        }
+                        if let Some(csg_pose) = rig.csg_host.resolve_active_possess(
+                            possess_free_yaw,
+                            possess_free_pitch,
+                            possess_auto_level,
+                        ) {
+                            target_frame = Some(csg_pose_to_camera_frame(csg_pose));
+                        }
+                    }
+                    if let Some(frame) = target_frame {
+                        let (final_frame, blended) = apply_possess_target(
+                            frame,
+                            possess_zoom_offset,
+                            &mut possess_blend_rem,
+                            &mut possess_damper,
+                            dt,
+                        );
+                        if blended && !preserve_shutter_accum {
+                            accum_count = 0;
+                        }
+                        active_camera = final_frame;
+                        last_rendered_camera = final_frame;
+                        possess_cam_out = Some(final_frame);
+                    }
+                }
+                gpu_camera_history_valid = gpu_camera_composed_this_frame;
                 if building_scene {
                     bus.publish_build_progress(None);
                     bus.emit_render_event(RenderEvent::PhaseChanged(EnginePhase::Rendering));
@@ -6898,6 +7299,10 @@ pub fn spawn_render_thread(
                     // The mask the IAS visibility masks and the partial bitset were built for.
                     hidden_semantics: csg_ptrs.hidden_semantics,
                     csg_sem_partial: csg_ptrs.sem_partial,
+                    csg_instance_text: csg_ptrs.instance_text,
+                    csg_sign_text_bytes: csg_ptrs.sign_text_bytes,
+                    csg_sign_text_len: csg_ptrs.sign_text_len,
+                    _pad_sign_text: 0,
                 };
                 if commits_motion_history(publish_frame, active_burst.is_some()) {
                     prev_camera = active_camera;
@@ -7566,11 +7971,26 @@ pub fn spawn_render_thread(
                     last_crowd_step_ms,
                     crowd_lod,
                     rig.cuda_crowd.as_ref().and_then(|r| r.as_ref().ok()),
+                    last_traffic_backend,
+                    last_traffic_step_ms,
+                    rig.cuda_traffic.as_ref().and_then(|r| r.as_ref().ok()),
                     gpu_camera_composed_this_frame,
                     settings.csg_freeze_pose,
                     step_traffic_now,
                     settings.time_scale * settings.csg_traffic_speed,
                 );
+                let possess_adas = rig.csg_host.possessed_traffic_vehicle_id().and_then(|vid| {
+                    if last_traffic_backend == ActiveTrafficBackend::Cuda {
+                        rig.cuda_traffic
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .and_then(|ct| ct.last_possess_hazard(vid.index()))
+                            .map(PossessAdas::from_pod)
+                            .or_else(|| rig.csg_host.sample_cpu_possess_adas())
+                    } else {
+                        rig.csg_host.sample_cpu_possess_adas()
+                    }
+                });
                 bus.emit_render_event(RenderEvent::FrameReady(Box::new(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
@@ -7586,6 +8006,7 @@ pub fn spawn_render_thread(
                     csg_stats: rig.csg_host.stats(),
                     fast_preview: frame_is_fast_preview,
                     possess_camera: possess_cam_out,
+                    possess_adas,
                     rendered_camera: active_camera,
                     sim_telemetry,
                     perf: perf_sample,
@@ -7671,7 +8092,7 @@ mod tests {
 
     #[test]
     fn launch_params_abi_size_and_offsets_match_cuda() {
-        assert_eq!(std::mem::size_of::<LaunchParams>(), 680);
+        assert_eq!(std::mem::size_of::<LaunchParams>(), 704);
         assert_eq!(std::mem::align_of::<LaunchParams>(), 8);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_compounds), 480);
         assert_eq!(std::mem::offset_of!(LaunchParams, csg_instances), 536);
@@ -7690,6 +8111,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(LaunchParams, sdg_ray_count), 632);
         assert_eq!(std::mem::offset_of!(LaunchParams, classic_motion_count), 636);
         assert_eq!(std::mem::offset_of!(LaunchParams, classic_motion), 640);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_instance_text), 680);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_sign_text_bytes), 688);
+        assert_eq!(std::mem::offset_of!(LaunchParams, csg_sign_text_len), 696);
         assert_eq!(std::mem::offset_of!(LaunchParams, env_from_lo), 192);
         assert_eq!(std::mem::offset_of!(LaunchParams, env_from_hi), 384);
         assert_eq!(std::mem::size_of::<GpuProbeCandidate>(), 64);

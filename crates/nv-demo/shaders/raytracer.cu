@@ -107,9 +107,16 @@ struct Params {
     unsigned long long is_counters;      // device ptr to u64[NV_IS_GROUPS * NV_IS_STRIPES]; 0 = counting off (uniform per launch)
     unsigned long long hidden_semantics; // bit s set = semantic id s is not rendered (semantic_filter.rs); 0 = all shown
     unsigned long long csg_sem_partial;  // device u32 bitset over CSG instance slots: bit set = partially hidden (per-hit reject); 0 = all partial
+    unsigned long long csg_instance_text;   // device u32[csg_instance_count] packed procedural sign-text handles (0 = unlabeled/disabled)
+    unsigned long long csg_sign_text_bytes; // device u8[csg_sign_text_len] flat deduplicated MUTCD ASCII sign text buffer (0 = empty)
+    unsigned int csg_sign_text_len;         // byte length of csg_sign_text_bytes
+    unsigned int _pad_sign_text;            // explicit 16-byte alignment padding
 };
 
-static_assert(sizeof(Params) == 680, "Params size must match LaunchParams (680 B)");
+static_assert(sizeof(Params) == 704, "Params size must match LaunchParams (704 B)");
+static_assert(__builtin_offsetof(Params, csg_sign_text_len) == 696, "Params::csg_sign_text_len offset must be 696");
+static_assert(__builtin_offsetof(Params, csg_sign_text_bytes) == 688, "Params::csg_sign_text_bytes offset must be 688");
+static_assert(__builtin_offsetof(Params, csg_instance_text) == 680, "Params::csg_instance_text offset must be 680");
 static_assert(__builtin_offsetof(Params, csg_sem_partial) == 672, "Params::csg_sem_partial offset must be 672");
 static_assert(__builtin_offsetof(Params, hidden_semantics) == 664, "Params::hidden_semantics offset must be 664");
 static_assert(__builtin_offsetof(Params, is_counters) == 656, "Params::is_counters offset must be 656");
@@ -1427,6 +1434,475 @@ struct CsgProcResult {
     unsigned int proc_kind;
 };
 
+// ============================================================================
+// Procedural MUTCD Highway Gothic Vector-Capsule SDF Font (ASCII 0x20..=0x5F)
+// ============================================================================
+// Standalone reusable `__device__` primitives (`sd_segment_2d`, `sd_glyph_2d`,
+// `sd_text_2d`) shared by `CSG_PROC_SIGN_TEXT` (D1) and future 3D `PrimKind::Text`
+// (D2: LOD0 extruded / LOD1 flat SIGN_TEXT / LOD2 culled).
+//
+// Each stroke is packed into one `unsigned short`:
+//   bits  0..3 : x0 in [0..10] -> gx = x0 * 0.072f (isotropic cell width 0.72)
+//   bits  4..7 : y0 in [0..14] -> gy = y0 * (1.0f / 14.0f) (cap height 0.857)
+//   bits  8..11: x1 in [0..10]
+//   bits 12..15: y1 in [0..14]
+#define NV_SSEG(x0, y0, x1, y1)                                                   \
+    ((unsigned short)(((unsigned int)(x0) & 15u) | (((unsigned int)(y0) & 15u) << 4u) \
+        | (((unsigned int)(x1) & 15u) << 8u) | (((unsigned int)(y1) & 15u) << 12u)))
+
+static __constant__ unsigned short SIGN_FONT_OFF[65] = {
+      0u,   0u,   2u,   4u,   8u,  14u,  17u,  23u,  24u,  27u,  30u,  33u,  35u,  36u,  37u,  38u,
+     39u,  47u,  50u,  55u,  61u,  64u,  70u,  78u,  80u,  91u,  98u, 100u, 102u, 104u, 106u, 108u,
+    113u, 119u, 122u, 130u, 137u, 143u, 147u, 150u, 159u, 162u, 165u, 169u, 172u, 174u, 178u, 181u,
+    189u, 194u, 203u, 209u, 218u, 220u, 225u, 227u, 231u, 233u, 236u, 239u, 242u, 243u, 246u, 248u,
+    249u
+};
+
+static __constant__ unsigned short SIGN_FONT_SEGS[249] = {
+    // 0x20 ' ' (0)
+    // 0x21 '!' (2)
+    NV_SSEG(5,13,5,5), NV_SSEG(5,2,5,1),
+    // 0x22 '"' (2)
+    NV_SSEG(3,13,3,10), NV_SSEG(7,13,7,10),
+    // 0x23 '#' (4)
+    NV_SSEG(3,13,2,1), NV_SSEG(8,13,7,1), NV_SSEG(1,9,9,9), NV_SSEG(1,5,9,5),
+    // 0x24 '$' (6)
+    NV_SSEG(8,11,3,11), NV_SSEG(3,11,2,9), NV_SSEG(2,9,8,6), NV_SSEG(8,6,8,3), NV_SSEG(8,3,2,3), NV_SSEG(5,13,5,1),
+    // 0x25 '%' (3)
+    NV_SSEG(2,1,8,13), NV_SSEG(2,12,3,11), NV_SSEG(7,3,8,2),
+    // 0x26 '&' (6)
+    NV_SSEG(8,1,2,9), NV_SSEG(2,9,4,13), NV_SSEG(4,13,7,11), NV_SSEG(7,11,2,5), NV_SSEG(2,5,4,1), NV_SSEG(4,1,9,6),
+    // 0x27 '\'' (1)
+    NV_SSEG(5,13,5,10),
+    // 0x28 '(' (3)
+    NV_SSEG(7,13,4,10), NV_SSEG(4,10,4,4), NV_SSEG(4,4,7,1),
+    // 0x29 ')' (3)
+    NV_SSEG(3,13,6,10), NV_SSEG(6,10,6,4), NV_SSEG(6,4,3,1),
+    // 0x2A '*' (3)
+    NV_SSEG(5,11,5,3), NV_SSEG(2,9,8,5), NV_SSEG(8,9,2,5),
+    // 0x2B '+' (2)
+    NV_SSEG(5,11,5,3), NV_SSEG(1,7,9,7),
+    // 0x2C ',' (1)
+    NV_SSEG(5,3,4,0),
+    // 0x2D '-' (1)
+    NV_SSEG(2,7,8,7),
+    // 0x2E '.' (1)
+    NV_SSEG(5,2,5,1),
+    // 0x2F '/' (1)
+    NV_SSEG(2,1,8,13),
+    // 0x30 '0' (8)
+    NV_SSEG(3,13,7,13), NV_SSEG(7,13,9,11), NV_SSEG(9,11,9,3), NV_SSEG(9,3,7,1),
+    NV_SSEG(7,1,3,1), NV_SSEG(3,1,1,3), NV_SSEG(1,3,1,11), NV_SSEG(1,11,3,13),
+    // 0x31 '1' (3)
+    NV_SSEG(3,11,5,13), NV_SSEG(5,13,5,1), NV_SSEG(2,1,8,1),
+    // 0x32 '2' (5)
+    NV_SSEG(1,11,3,13), NV_SSEG(3,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,1,1), NV_SSEG(1,1,9,1),
+    // 0x33 '3' (6)
+    NV_SSEG(1,12,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,5,7), NV_SSEG(5,7,9,4), NV_SSEG(9,4,7,1), NV_SSEG(7,1,1,2),
+    // 0x34 '4' (3)
+    NV_SSEG(7,1,7,13), NV_SSEG(7,13,1,5), NV_SSEG(1,5,9,5),
+    // 0x35 '5' (6)
+    NV_SSEG(9,13,2,13), NV_SSEG(2,13,2,8), NV_SSEG(2,8,7,8), NV_SSEG(7,8,9,5), NV_SSEG(9,5,7,1), NV_SSEG(7,1,1,2),
+    // 0x36 '6' (8)
+    NV_SSEG(8,13,3,13), NV_SSEG(3,13,1,9), NV_SSEG(1,9,1,3), NV_SSEG(1,3,3,1),
+    NV_SSEG(3,1,8,1), NV_SSEG(8,1,9,6), NV_SSEG(9,6,7,8), NV_SSEG(7,8,1,7),
+    // 0x37 '7' (2)
+    NV_SSEG(1,13,9,13), NV_SSEG(9,13,3,1),
+    // 0x38 '8' (11)
+    NV_SSEG(2,13,8,13), NV_SSEG(2,7,8,7), NV_SSEG(2,1,8,1),
+    NV_SSEG(2,13,1,10), NV_SSEG(1,10,2,7), NV_SSEG(8,13,9,10), NV_SSEG(9,10,8,7),
+    NV_SSEG(2,7,1,4), NV_SSEG(1,4,2,1), NV_SSEG(8,7,9,4), NV_SSEG(9,4,8,1),
+    // 0x39 '9' (7)
+    NV_SSEG(2,1,7,1), NV_SSEG(7,1,9,5), NV_SSEG(9,5,9,11), NV_SSEG(9,11,7,13),
+    NV_SSEG(7,13,2,13), NV_SSEG(2,13,1,9), NV_SSEG(1,9,9,8),
+    // 0x3A ':' (2)
+    NV_SSEG(5,10,5,9), NV_SSEG(5,4,5,3),
+    // 0x3B ';' (2)
+    NV_SSEG(5,10,5,9), NV_SSEG(5,4,4,1),
+    // 0x3C '<' (2)
+    NV_SSEG(8,11,2,7), NV_SSEG(2,7,8,3),
+    // 0x3D '=' (2)
+    NV_SSEG(2,9,8,9), NV_SSEG(2,5,8,5),
+    // 0x3E '>' (2)
+    NV_SSEG(2,11,8,7), NV_SSEG(8,7,2,3),
+    // 0x3F '?' (5)
+    NV_SSEG(2,11,4,13), NV_SSEG(4,13,8,13), NV_SSEG(8,13,8,9), NV_SSEG(8,9,5,6), NV_SSEG(5,2,5,1),
+    // 0x40 '@' (6)
+    NV_SSEG(8,1,2,1), NV_SSEG(2,1,1,5), NV_SSEG(1,5,1,11), NV_SSEG(1,11,4,13), NV_SSEG(4,13,9,11), NV_SSEG(9,11,8,5),
+    // 0x41 'A' (3)
+    NV_SSEG(1,1,5,13), NV_SSEG(5,13,9,1), NV_SSEG(2,5,8,5),
+    // 0x42 'B' (8)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,7,7),
+    NV_SSEG(1,7,7,7), NV_SSEG(7,7,9,4), NV_SSEG(9,4,7,1), NV_SSEG(7,1,1,1),
+    // 0x43 'C' (7)
+    NV_SSEG(9,11,7,13), NV_SSEG(7,13,3,13), NV_SSEG(3,13,1,10), NV_SSEG(1,10,1,4),
+    NV_SSEG(1,4,3,1), NV_SSEG(3,1,7,1), NV_SSEG(7,1,9,3),
+    // 0x44 'D' (6)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,6,13), NV_SSEG(6,13,9,10), NV_SSEG(9,10,9,4), NV_SSEG(9,4,6,1), NV_SSEG(6,1,1,1),
+    // 0x45 'E' (4)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,9,13), NV_SSEG(1,7,7,7), NV_SSEG(1,1,9,1),
+    // 0x46 'F' (3)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,9,13), NV_SSEG(1,7,7,7),
+    // 0x47 'G' (9)
+    NV_SSEG(9,11,7,13), NV_SSEG(7,13,3,13), NV_SSEG(3,13,1,10), NV_SSEG(1,10,1,4),
+    NV_SSEG(1,4,3,1), NV_SSEG(3,1,7,1), NV_SSEG(7,1,9,4), NV_SSEG(9,4,9,7), NV_SSEG(9,7,5,7),
+    // 0x48 'H' (3)
+    NV_SSEG(1,1,1,13), NV_SSEG(9,1,9,13), NV_SSEG(1,7,9,7),
+    // 0x49 'I' (3)
+    NV_SSEG(5,1,5,13), NV_SSEG(2,13,8,13), NV_SSEG(2,1,8,1),
+    // 0x4A 'J' (4)
+    NV_SSEG(7,13,7,4), NV_SSEG(7,4,5,1), NV_SSEG(5,1,2,1), NV_SSEG(2,1,1,4),
+    // 0x4B 'K' (3)
+    NV_SSEG(1,1,1,13), NV_SSEG(9,13,1,6), NV_SSEG(4,8,9,1),
+    // 0x4C 'L' (2)
+    NV_SSEG(1,13,1,1), NV_SSEG(1,1,9,1),
+    // 0x4D 'M' (4)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,5,5), NV_SSEG(5,5,9,13), NV_SSEG(9,13,9,1),
+    // 0x4E 'N' (3)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,9,1), NV_SSEG(9,1,9,13),
+    // 0x4F 'O' (8)
+    NV_SSEG(3,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,9,4), NV_SSEG(9,4,7,1),
+    NV_SSEG(7,1,3,1), NV_SSEG(3,1,1,4), NV_SSEG(1,4,1,10), NV_SSEG(1,10,3,13),
+    // 0x50 'P' (5)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,7,7), NV_SSEG(7,7,1,7),
+    // 0x51 'Q' (9)
+    NV_SSEG(3,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,9,4), NV_SSEG(9,4,7,1),
+    NV_SSEG(7,1,3,1), NV_SSEG(3,1,1,4), NV_SSEG(1,4,1,10), NV_SSEG(1,10,3,13), NV_SSEG(6,4,9,1),
+    // 0x52 'R' (6)
+    NV_SSEG(1,1,1,13), NV_SSEG(1,13,7,13), NV_SSEG(7,13,9,10), NV_SSEG(9,10,7,7), NV_SSEG(7,7,1,7), NV_SSEG(6,7,9,1),
+    // 0x53 'S' (9)
+    NV_SSEG(9,11,7,13), NV_SSEG(7,13,3,13), NV_SSEG(3,13,1,10), NV_SSEG(1,10,3,8),
+    NV_SSEG(3,8,7,6), NV_SSEG(7,6,9,4), NV_SSEG(9,4,7,1), NV_SSEG(7,1,3,1), NV_SSEG(3,1,1,3),
+    // 0x54 'T' (2)
+    NV_SSEG(1,13,9,13), NV_SSEG(5,13,5,1),
+    // 0x55 'U' (5)
+    NV_SSEG(1,13,1,4), NV_SSEG(1,4,3,1), NV_SSEG(3,1,7,1), NV_SSEG(7,1,9,4), NV_SSEG(9,4,9,13),
+    // 0x56 'V' (2)
+    NV_SSEG(1,13,5,1), NV_SSEG(5,1,9,13),
+    // 0x57 'W' (4)
+    NV_SSEG(1,13,3,1), NV_SSEG(3,1,5,8), NV_SSEG(5,8,7,1), NV_SSEG(7,1,9,13),
+    // 0x58 'X' (2)
+    NV_SSEG(1,13,9,1), NV_SSEG(9,13,1,1),
+    // 0x59 'Y' (3)
+    NV_SSEG(1,13,5,7), NV_SSEG(9,13,5,7), NV_SSEG(5,7,5,1),
+    // 0x5A 'Z' (3)
+    NV_SSEG(1,13,9,13), NV_SSEG(9,13,1,1), NV_SSEG(1,1,9,1),
+    // 0x5B '[' (3)
+    NV_SSEG(7,13,4,13), NV_SSEG(4,13,4,1), NV_SSEG(4,1,7,1),
+    // 0x5C '\\' (1)
+    NV_SSEG(2,13,8,1),
+    // 0x5D ']' (3)
+    NV_SSEG(3,13,6,13), NV_SSEG(6,13,6,1), NV_SSEG(6,1,3,1),
+    // 0x5E '^' (2)
+    NV_SSEG(2,9,5,13), NV_SSEG(5,13,8,9),
+    // 0x5F '_' (1)
+    NV_SSEG(1,1,9,1)
+};
+#undef NV_SSEG
+static_assert(sizeof(SIGN_FONT_SEGS) / sizeof(unsigned short) == 249u, "SIGN_FONT_SEGS count must match SIGN_FONT_OFF[64]");
+
+// Exact 2D Euclidean distance from point (px, py) to segment (ax, ay)-(bx, by).
+static __forceinline__ __device__ float sd_segment_2d(
+    float px, float py, float ax, float ay, float bx, float by
+) {
+    float pax = px - ax;
+    float pay = py - ay;
+    float bax = bx - ax;
+    float bay = by - ay;
+    float denom = bax * bax + bay * bay;
+    float h = (denom > 1e-10f) ? fminf(1.0f, fmaxf(0.0f, (pax * bax + pay * bay) / denom)) : 0.0f;
+    float dx = pax - bax * h;
+    float dy = pay - bay * h;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+// Signed distance to Highway Gothic glyph `ch` (ASCII 0x20..=0x5F) in isotropic cell coordinates
+// `ux in [0, 1]` (scaled to 0.72), `uy in [0, 1]`, with capsule stroke half-width `half_stroke`.
+// Negative inside stroke, positive outside.
+static __device__ float sd_glyph_2d(unsigned int ch, float ux, float uy, float half_stroke) {
+    if (ch < 0x20u || ch > 0x5Fu) {
+        return 1.0f;
+    }
+    unsigned int g = ch - 0x20u;
+    unsigned int s0 = (unsigned int)SIGN_FONT_OFF[g];
+    unsigned int s1 = (unsigned int)SIGN_FONT_OFF[g + 1u];
+    if (s0 >= s1) {
+        return 1.0f;
+    }
+    float px = ux * 0.72f;
+    float py = uy;
+    float best = 1e6f;
+    for (unsigned int i = s0; i < s1; ++i) {
+        unsigned int seg = (unsigned int)SIGN_FONT_SEGS[i];
+        float ax = (float)(seg & 15u) * 0.072f;
+        float ay = (float)((seg >> 4u) & 15u) * (1.0f / 14.0f);
+        float bx = (float)((seg >> 8u) & 15u) * 0.072f;
+        float by = (float)((seg >> 12u) & 15u) * (1.0f / 14.0f);
+        float d = sd_segment_2d(px, py, ax, ay, bx, by);
+        best = fminf(best, d);
+    }
+    return best - half_stroke;
+}
+
+// Signed distance in meters to centered single-line text `text_buf[offset..offset+len]` laid out
+// inside a sign face of half-extents `(half_w, half_h)` at local face coordinates `(px, py)`.
+static __device__ float sd_text_2d(
+    const unsigned char* __restrict__ text_buf,
+    unsigned int text_buf_len,
+    unsigned int offset,
+    unsigned int len,
+    float px,
+    float py,
+    float cell_h
+) {
+    if (len == 0u || cell_h <= 1e-4f || offset + len > text_buf_len) {
+        return 1e6f;
+    }
+    float cell_w = cell_h * 0.72f;
+    float text_w = cell_w * (float)len;
+    float tx = px + text_w * 0.5f;
+    float ty = py + cell_h * 0.5f;
+    float uy = ty / cell_h;
+    if (uy < -0.25f || uy > 1.25f) {
+        return fmaxf(-ty, ty - cell_h);
+    }
+    int idx = (int)floorf(tx / cell_w);
+    float best_norm = 1e6f;
+    // Evaluate the enclosing glyph cell and immediate neighbor if near the cell boundary for exact AA.
+    if (idx >= 0 && idx < (int)len) {
+        float ux = (tx - (float)idx * cell_w) / cell_w;
+        unsigned int ch = (unsigned int)__ldg(text_buf + offset + (unsigned int)idx);
+        best_norm = fminf(best_norm, sd_glyph_2d(ch, ux, uy, 0.062f));
+        if (ux < 0.14f && idx > 0) {
+            unsigned int ch_l = (unsigned int)__ldg(text_buf + offset + (unsigned int)(idx - 1));
+            best_norm = fminf(best_norm, sd_glyph_2d(ch_l, ux + 1.0f, uy, 0.062f));
+        } else if (ux > 0.86f && idx + 1 < (int)len) {
+            unsigned int ch_r = (unsigned int)__ldg(text_buf + offset + (unsigned int)(idx + 1));
+            best_norm = fminf(best_norm, sd_glyph_2d(ch_r, ux - 1.0f, uy, 0.062f));
+        }
+    } else if (idx == -1 && tx > -cell_w * 0.14f) {
+        float ux = tx / cell_w;
+        unsigned int ch = (unsigned int)__ldg(text_buf + offset);
+        best_norm = fminf(best_norm, sd_glyph_2d(ch, ux, uy, 0.062f));
+    } else if (idx == (int)len && tx < text_w + cell_w * 0.14f) {
+        float ux = (tx - (float)(len - 1u) * cell_w) / cell_w;
+        unsigned int ch = (unsigned int)__ldg(text_buf + offset + (len - 1u));
+        best_norm = fminf(best_norm, sd_glyph_2d(ch, ux, uy, 0.062f));
+    }
+    return best_norm * cell_h;
+}
+
+// Procedural sign-text shading (`CSG_PROC_SIGN_TEXT`, D1) with 3-tier distance / screen-space LOD:
+// - Far (< 1 px or >= 85 m): O(1) early-out before reading text bytes or evaluating `sd_glyph_2d`.
+// - Mid (1..2.5 px or 40..85 m): smooth fade into a clean soft white text band (zero shimmer).
+// - Close (>= 2.5 px and < 40 m): full analytical vector-capsule SDF Highway Gothic + adaptive AA.
+static __noinline__ __device__ void shade_csg_sign_text(
+    unsigned int inst_idx,
+    unsigned int part_id,
+    float3 hit_pos,
+    float3 n_world,
+    float3& base_col,
+    float& rough,
+    float& metallic,
+    float& clearcoat,
+    float& cc_rough
+) {
+    if (params.csg_instance_text == 0ull
+        || params.csg_sign_text_bytes == 0ull
+        || params.csg_sign_text_len == 0u
+        || params.csg_instances == 0ull
+        || params.csg_compounds == 0ull
+        || params.csg_ops == 0ull
+        || params.csg_prims == 0ull
+        || inst_idx >= params.csg_instance_count)
+    {
+        return;
+    }
+
+    unsigned int handle = __ldg(reinterpret_cast<const unsigned int*>(params.csg_instance_text) + inst_idx);
+    if (handle == CSG_SIGN_TEXT_NONE) {
+        return;
+    }
+    unsigned int t_off = CSG_SIGN_TEXT_OFFSET(handle);
+    unsigned int t_len = CSG_SIGN_TEXT_LEN(handle);
+    unsigned int t_style = CSG_SIGN_TEXT_STYLE(handle);
+    if (t_len == 0u || t_off + t_len > params.csg_sign_text_len) {
+        return;
+    }
+
+    // Tier 2 Far early-out (O(1) before scanning prims, reading sign text bytes, or evaluating glyphs).
+    float cam_dist = f3_len(f3_sub(hit_pos, make_f3(params.cam_pos)));
+    if (cam_dist >= 85.0f) {
+        return;
+    }
+
+    uint4 meta = load_csg_instance_meta(inst_idx);
+    unsigned int cid = meta.x;
+    if (cid >= params.csg_compound_count) {
+        return;
+    }
+
+    const float* inst_m = reinterpret_cast<const CsgGpuInstance*>(params.csg_instances)[inst_idx].xform;
+    float3 p_obj;
+    if (!csg_inv_xform_pt_ldg(inst_m, hit_pos, p_obj)) {
+        return;
+    }
+    // Transform world normal into compound-local space via M^T * n_world (exact for rigid/uniform scale).
+    const float4* m_rows = reinterpret_cast<const float4*>(inst_m);
+    float4 r0 = __ldg(m_rows + 0);
+    float4 r1 = __ldg(m_rows + 1);
+    float4 r2 = __ldg(m_rows + 2);
+    float3 n_obj = f3_norm(make_float3(
+        r0.x * n_world.x + r1.x * n_world.y + r2.x * n_world.z,
+        r0.y * n_world.x + r1.y * n_world.y + r2.y * n_world.z,
+        r0.z * n_world.x + r1.z * n_world.y + r2.z * n_world.z
+    ));
+
+    // Geometry-agnostic lookup of the hit BOX primitive matching `part_id`.
+    const CsgGpuCompound comp = reinterpret_cast<const CsgGpuCompound*>(params.csg_compounds)[cid];
+    const CsgGpuOp* ops = reinterpret_cast<const CsgGpuOp*>(params.csg_ops);
+    const CsgGpuPrim* prims = reinterpret_cast<const CsgGpuPrim*>(params.csg_prims);
+    unsigned int best_prim = 0xFFFFFFFFu;
+    float best_box_err = 1e6f;
+    for (unsigned int i = 0u; i < comp.op_count; ++i) {
+        CsgGpuOp op = ops[comp.op_offset + i];
+        if (op.opcode != CSG_OP_PUSH_PRIM) {
+            continue;
+        }
+        const CsgGpuPrim& pr = prims[op.arg0];
+        if (pr.kind != CSG_PRIM_BOX || pr.part_id != part_id) {
+            continue;
+        }
+        float ex = fmaxf(0.0f, fmaxf(pr.aabb_min[0] - p_obj.x, p_obj.x - pr.aabb_max[0]));
+        float ey = fmaxf(0.0f, fmaxf(pr.aabb_min[1] - p_obj.y, p_obj.y - pr.aabb_max[1]));
+        float ez = fmaxf(0.0f, fmaxf(pr.aabb_min[2] - p_obj.z, p_obj.z - pr.aabb_max[2]));
+        float err = ex + ey + ez;
+        if (err < best_box_err) {
+            best_box_err = err;
+            best_prim = op.arg0;
+        }
+    }
+    if (best_prim == 0xFFFFFFFFu || best_box_err > 0.05f) {
+        return;
+    }
+
+    const CsgGpuPrim pr = prims[best_prim];
+    float3 p_prim = p_obj;
+    float3 n_prim = n_obj;
+    if ((pr.flags & CSG_PRIM_FLAG_IDENTITY) == 0u) {
+        p_prim = csg_xform_pt_ldg(pr.inv_xform, p_obj);
+        const float4* pr_rows = reinterpret_cast<const float4*>(pr.inv_xform);
+        float4 pr0 = __ldg(pr_rows + 0);
+        float4 pr1 = __ldg(pr_rows + 1);
+        float4 pr2 = __ldg(pr_rows + 2);
+        n_prim = f3_norm(make_float3(
+            pr0.x * n_obj.x + pr0.y * n_obj.y + pr0.z * n_obj.z,
+            pr1.x * n_obj.x + pr1.y * n_obj.y + pr1.z * n_obj.z,
+            pr2.x * n_obj.x + pr2.y * n_obj.y + pr2.z * n_obj.z
+        ));
+    }
+
+    float hx = pr.params[0];
+    float hy = pr.params[1];
+    float hz = pr.params[2];
+    if (hx <= 0.05f || hy <= 0.05f) {
+        return;
+    }
+
+    // Project onto the sign's front/back face (thinnest horizontal axis), flipping U on the back
+    // face when `CSG_SIGN_STYLE_DOUBLE_SIDED` is set so lettering reads left-to-right from both sides.
+    bool double_sided = (t_style & CSG_SIGN_STYLE_DOUBLE_SIDED) != 0u;
+    float face_u = 0.0f;
+    float face_v = p_prim.y;
+    float half_w = hx;
+    float half_h = hy;
+    if (hz <= hx && hz <= hy) {
+        if (fabsf(n_prim.z) < 0.72f) {
+            return;
+        }
+        if (n_prim.z < 0.0f && !double_sided) {
+            return;
+        }
+        face_u = (n_prim.z >= 0.0f) ? p_prim.x : -p_prim.x;
+        half_w = hx;
+    } else if (hx <= hz && hx <= hy) {
+        if (fabsf(n_prim.x) < 0.72f) {
+            return;
+        }
+        if (n_prim.x < 0.0f && !double_sided) {
+            return;
+        }
+        face_u = (n_prim.x >= 0.0f) ? -p_prim.z : p_prim.z;
+        half_w = hz;
+    } else {
+        return;
+    }
+
+    // Inner MUTCD text box and exact glyph height for screen-space pixel LOD.
+    float margin_x = fmaxf(0.045f, half_w * 0.075f);
+    float margin_y = fmaxf(0.036f, half_h * 0.22f);
+    float inner_w = fmaxf(0.05f, 2.0f * (half_w - margin_x));
+    float inner_h = fmaxf(0.05f, 2.0f * (half_h - margin_y));
+    float cell_h = fminf(inner_h, inner_w / (fmaxf(1.0f, (float)t_len) * 0.72f));
+    float glyph_h_m = cell_h * 0.857f;
+
+    float tan_fov = fmaxf(0.05f, params.cam_up[3]);
+    float px_m = (cam_dist * 2.0f * tan_fov) / fmaxf(1.0f, (float)params.height);
+    float glyph_px = glyph_h_m / fmaxf(px_m, 1e-5f);
+
+    // Tier 2 Screen-space Far early-out (< 1 px): zero text-buffer read and zero glyph SDF cost.
+    if (glyph_px < 1.0f) {
+        return;
+    }
+
+    float aa_m = fmaxf(0.0025f, px_m * 0.85f);
+
+    // Subtle MUTCD white rounded border inset 1.4 cm from the sign rim.
+    float b_inset = fminf(0.016f, fminf(half_w, half_h) * 0.12f);
+    float bx = fabsf(face_u) - (half_w - b_inset);
+    float by = fabsf(face_v) - (half_h - b_inset);
+    float b_rad = fminf(0.024f, b_inset * 1.4f);
+    float qx = bx + b_rad;
+    float qy = by + b_rad;
+    float d_frame = fminf(fmaxf(qx, qy), 0.0f)
+        + sqrtf(fmaxf(qx, 0.0f) * fmaxf(qx, 0.0f) + fmaxf(qy, 0.0f) * fmaxf(qy, 0.0f))
+        - b_rad;
+    float border_hw = 0.0055f;
+    float border_cov = (1.0f - sky_smoothstep(border_hw - aa_m, border_hw + aa_m, fabsf(d_frame)))
+        * (1.0f - sky_smoothstep(32.0f, 65.0f, cam_dist));
+
+    // Mid-range soft white text band spanning the exact string layout box (zero shimmer/aliasing).
+    float text_half_w = 0.5f * cell_h * 0.72f * (float)t_len;
+    float text_half_h = 0.34f * cell_h;
+    float band_x = 1.0f - sky_smoothstep(text_half_w - aa_m * 2.0f, text_half_w + aa_m * 2.0f, fabsf(face_u));
+    float band_y = 1.0f - sky_smoothstep(text_half_h - aa_m * 2.0f, text_half_h + aa_m * 2.0f, fabsf(face_v));
+    float band_fade = sky_smoothstep(1.0f, 1.8f, glyph_px) * (1.0f - sky_smoothstep(65.0f, 85.0f, cam_dist));
+    float band_cov = band_x * band_y * 0.42f * band_fade;
+
+    // Tier 0 Close (>= 2.5 px & < 40 m) -> Tier 1 Mid (1..2.5 px or 40..85 m) smooth crossfade.
+    float w_detail = sky_smoothstep(1.0f, 2.5f, glyph_px) * (1.0f - sky_smoothstep(38.0f, 54.0f, cam_dist));
+    float text_cov = band_cov;
+    if (w_detail > 0.01f) {
+        const unsigned char* text_buf = reinterpret_cast<const unsigned char*>(params.csg_sign_text_bytes);
+        float d_txt = sd_text_2d(text_buf, params.csg_sign_text_len, t_off, t_len, face_u, face_v, cell_h);
+        float sdf_cov = 1.0f - sky_smoothstep(-aa_m, aa_m, d_txt);
+        text_cov = sdf_cov * w_detail + band_cov * (1.0f - w_detail);
+    }
+
+    float ink = fminf(1.0f, fmaxf(text_cov, border_cov * 0.90f));
+    if (ink <= 0.002f) {
+        return;
+    }
+
+    // MUTCD Type IV prismatic retroreflective white sheeting over anodized sign face.
+    float3 white_ink = make_float3(0.90f, 0.91f, 0.89f);
+    base_col = f3_add(f3_mul(base_col, 1.0f - ink), f3_mul(white_ink, ink));
+    rough = rough * (1.0f - ink) + 0.22f * ink;
+    metallic = metallic * (1.0f - ink);
+    clearcoat = fmaxf(clearcoat, 0.55f * ink);
+    cc_rough = cc_rough * (1.0f - ink) + 0.10f * ink;
+}
+
 static __noinline__ __device__ CsgProcResult eval_csg_procedural(
     unsigned int mat_id,
     unsigned int sem_id,
@@ -1861,6 +2337,13 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                 float slope = ripple_d * 0.048f * ripple_w * (1.0f - 0.5f * foreshore);
                 n = f3_norm(make_float3(n.x - wx_dir * slope, n.y, n.z - wz_dir * slope));
             }
+            break;
+        }
+        case CSG_PROC_SIGN_TEXT: {
+            shade_csg_sign_text(
+                inst_idx, part_id, hit_pos, n,
+                base_col, rough, metallic, clearcoat, cc_rough
+            );
             break;
         }
         default:

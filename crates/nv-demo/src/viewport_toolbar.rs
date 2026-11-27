@@ -249,10 +249,23 @@ pub fn tb_separator(ui: &mut Ui) {
 /// Width of each flush `<` / `>` stepper button flanking [`tb_stepper_combo`].
 pub const TB_STEPPER_BTN_W: f32 = 16.0;
 
+/// Internal layout metrics returned by [`tb_stepper_combo_inner`] for exact pixel-alignment tests.
+#[derive(Clone, Copy, Debug)]
+struct StepperComboLayout {
+    changed: bool,
+    #[cfg(test)]
+    prev_rect: Rect,
+    #[cfg(test)]
+    combo_rect: Rect,
+    #[cfg(test)]
+    next_rect: Rect,
+}
+
 /// Systemic stepped ComboBox widget (`<` | `[icon label ▾]` | `>`): wraps an `egui::ComboBox`
 /// with flush compact `egui-phosphor` previous/next chevron buttons (`ic::CARET_LEFT` /
-/// `ic::CARET_RIGHT`) and hover-wheel stepping so discrete modes (Display, AOV, Lens, etc.) can
-/// be cycled in one click or opened as a dropdown. Returns `true` when `*current` changed.
+/// `ic::CARET_RIGHT`) as one seamless capsule of exact height [`TB_BUTTON_SIZE`].y (`22 px`),
+/// plus hover-wheel stepping so discrete modes (Display, AOV, Lens, etc.) can be cycled in one
+/// click or opened as a dropdown. Returns `true` when `*current` changed.
 pub fn tb_stepper_combo<T: Copy + PartialEq>(
     ui: &mut Ui,
     id_salt: &str,
@@ -262,8 +275,28 @@ pub fn tb_stepper_combo<T: Copy + PartialEq>(
     items: &[(T, &str)],
     current: &mut T,
 ) -> bool {
+    tb_stepper_combo_inner(ui, id_salt, icon, combo_width, tooltip, items, current).changed
+}
+
+fn tb_stepper_combo_inner<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    id_salt: &str,
+    icon: &str,
+    combo_width: f32,
+    tooltip: &str,
+    items: &[(T, &str)],
+    current: &mut T,
+) -> StepperComboLayout {
     if items.is_empty() {
-        return false;
+        return StepperComboLayout {
+            changed: false,
+            #[cfg(test)]
+            prev_rect: Rect::NOTHING,
+            #[cfg(test)]
+            combo_rect: Rect::NOTHING,
+            #[cfg(test)]
+            next_rect: Rect::NOTHING,
+        };
     }
     let cur_idx = items.iter().position(|(v, _)| *v == *current).unwrap_or(0);
     let cur_label = items[cur_idx].1;
@@ -274,46 +307,83 @@ pub fn tb_stepper_combo<T: Copy + PartialEq>(
     };
     let mut changed = false;
     let len = items.len();
+    let h = TB_BUTTON_SIZE.y;
+    let total_w = TB_STEPPER_BTN_W + combo_width + TB_STEPPER_BTN_W;
+    let r = ui.style().visuals.widgets.inactive.corner_radius.nw.max(2);
 
-    let group_resp = ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 1.0;
-        ui.spacing_mut().button_padding.x = 2.0;
-        ui.spacing_mut().interact_size.x = TB_STEPPER_BTN_W;
+    let mut prev_rect = Rect::NOTHING;
+    let mut combo_rect = Rect::NOTHING;
+    let mut next_rect = Rect::NOTHING;
 
-        let prev_btn = egui::Button::new(egui::RichText::new(ic::CARET_LEFT).size(11.0));
-        if ui
-            .add_sized([TB_STEPPER_BTN_W, TB_BUTTON_SIZE.y], prev_btn)
-            .on_hover_text(format!("Previous — {tooltip}"))
-            .clicked()
-        {
-            let next_idx = (cur_idx + len - 1) % len;
-            *current = items[next_idx].0;
-            changed = true;
-        }
+    let group_resp = ui.allocate_ui_with_layout(
+        Vec2::new(total_w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(Vec2::new(total_w, h));
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.spacing_mut().button_padding = Vec2::new(2.0, 0.0);
+            ui.spacing_mut().interact_size = Vec2::new(TB_STEPPER_BTN_W, h);
 
-        let combo_resp = egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(selected_text)
-            .width(combo_width)
-            .show_ui(ui, |ui| {
-                for &(val, label) in items {
-                    if ui.selectable_value(current, val, label).changed() {
-                        changed = true;
-                    }
-                }
+            let prev_btn = egui::Button::new(egui::RichText::new(ic::CARET_LEFT).size(11.0))
+                .corner_radius(CornerRadius {
+                    nw: r,
+                    sw: r,
+                    ne: 0,
+                    se: 0,
+                });
+            let prev_resp = ui
+                .add_sized([TB_STEPPER_BTN_W, h], prev_btn)
+                .on_hover_text(format!("Previous — {tooltip}"));
+            prev_rect = prev_resp.rect;
+            if prev_resp.clicked() {
+                let next_idx = (cur_idx + len - 1) % len;
+                *current = items[next_idx].0;
+                changed = true;
+            }
+
+            // Force the inner ComboBox button to share the exact height `h` and flat inner seams
+            // (`CornerRadius::ZERO`) so `< | Combo | >` aligns to 0.0 px top and bottom.
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = h;
+                ui.spacing_mut().button_padding = Vec2::new(6.0, 0.0);
+                let w = &mut ui.style_mut().visuals.widgets;
+                w.inactive.corner_radius = CornerRadius::ZERO;
+                w.hovered.corner_radius = CornerRadius::ZERO;
+                w.active.corner_radius = CornerRadius::ZERO;
+                w.open.corner_radius = CornerRadius::ZERO;
+
+                let combo_resp = egui::ComboBox::from_id_salt(id_salt)
+                    .selected_text(selected_text)
+                    .width(combo_width)
+                    .show_ui(ui, |ui| {
+                        for &(val, label) in items {
+                            if ui.selectable_value(current, val, label).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                combo_rect = combo_resp.response.rect;
+                combo_resp.response.on_hover_text(tooltip);
             });
-        combo_resp.response.on_hover_text(tooltip);
 
-        let next_btn = egui::Button::new(egui::RichText::new(ic::CARET_RIGHT).size(11.0));
-        if ui
-            .add_sized([TB_STEPPER_BTN_W, TB_BUTTON_SIZE.y], next_btn)
-            .on_hover_text(format!("Next — {tooltip}"))
-            .clicked()
-        {
-            let next_idx = (cur_idx + 1) % len;
-            *current = items[next_idx].0;
-            changed = true;
-        }
-    });
+            let next_btn = egui::Button::new(egui::RichText::new(ic::CARET_RIGHT).size(11.0))
+                .corner_radius(CornerRadius {
+                    nw: 0,
+                    sw: 0,
+                    ne: r,
+                    se: r,
+                });
+            let next_resp = ui
+                .add_sized([TB_STEPPER_BTN_W, h], next_btn)
+                .on_hover_text(format!("Next — {tooltip}"));
+            next_rect = next_resp.rect;
+            if next_resp.clicked() {
+                let next_idx = (cur_idx + 1) % len;
+                *current = items[next_idx].0;
+                changed = true;
+            }
+        },
+    );
 
     // Hover-wheel quick stepping when the pointer rests on the stepper group and the dropdown
     // popup is closed.
@@ -326,7 +396,16 @@ pub fn tb_stepper_combo<T: Copy + PartialEq>(
             changed = true;
         }
     }
-    changed
+    let _ = (prev_rect, combo_rect, next_rect);
+    StepperComboLayout {
+        changed,
+        #[cfg(test)]
+        prev_rect,
+        #[cfg(test)]
+        combo_rect,
+        #[cfg(test)]
+        next_rect,
+    }
 }
 
 // ---- Possession toolbar expand / collapse rule ------------------------------------------------
@@ -747,5 +826,122 @@ mod tests {
         // Not possessing and not entering: the current state is kept either way.
         assert!(possess_bar_expanded(true, false, false, prefs));
         assert!(!possess_bar_expanded(false, false, false, prefs));
+    }
+
+    #[test]
+    fn stepper_combo_has_exact_uniform_height_and_vertical_alignment() {
+        let ctx = egui::Context::default();
+        // Mimic the app theme's tighter global `interact_size.y` (18 px) vs toolbar height (22 px)
+        // — this exact mismatch used to make `<` / `>` protrude 4 px above the ComboBox.
+        ctx.all_styles_mut(|s| {
+            s.spacing.interact_size = Vec2::new(28.0, 18.0);
+            s.spacing.button_padding = Vec2::new(6.0, 2.0);
+        });
+        let mut layouts = Vec::new();
+        let mut val_a = 0u32;
+        let mut val_b = 1u32;
+        let mut val_c = 2u32;
+        let items = [(0u32, "CSG"), (1u32, "BEAUTY"), (2u32, "Pinhole")];
+
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = TB_ITEM_SPACING;
+                    layouts.push(tb_stepper_combo_inner(
+                        ui,
+                        "test_a",
+                        ic::CUBE,
+                        84.0,
+                        "Display",
+                        &items,
+                        &mut val_a,
+                    ));
+                    layouts.push(tb_stepper_combo_inner(
+                        ui,
+                        "test_b",
+                        ic::STACK,
+                        92.0,
+                        "AOV",
+                        &items,
+                        &mut val_b,
+                    ));
+                    layouts.push(tb_stepper_combo_inner(
+                        ui,
+                        "test_c",
+                        ic::APERTURE,
+                        104.0,
+                        "Lens",
+                        &items,
+                        &mut val_c,
+                    ));
+                });
+            });
+        });
+        out.textures_delta.clear();
+
+        assert_eq!(layouts.len(), 3);
+        let first_top = layouts[0].prev_rect.top();
+        let first_bot = layouts[0].prev_rect.bottom();
+        for (idx, l) in layouts.iter().enumerate() {
+            assert!(
+                (l.prev_rect.height() - TB_BUTTON_SIZE.y).abs() <= 0.1,
+                "stepper {idx} prev_h={} expected {}",
+                l.prev_rect.height(),
+                TB_BUTTON_SIZE.y
+            );
+            assert!(
+                (l.combo_rect.height() - TB_BUTTON_SIZE.y).abs() <= 0.1,
+                "stepper {idx} combo_h={} expected {}",
+                l.combo_rect.height(),
+                TB_BUTTON_SIZE.y
+            );
+            assert!(
+                (l.next_rect.height() - TB_BUTTON_SIZE.y).abs() <= 0.1,
+                "stepper {idx} next_h={} expected {}",
+                l.next_rect.height(),
+                TB_BUTTON_SIZE.y
+            );
+            assert!(
+                (l.prev_rect.top() - l.combo_rect.top()).abs() <= 0.1
+                    && (l.next_rect.top() - l.combo_rect.top()).abs() <= 0.1,
+                "stepper {idx} tops misaligned: prev={} combo={} next={}",
+                l.prev_rect.top(),
+                l.combo_rect.top(),
+                l.next_rect.top()
+            );
+            assert!(
+                (l.prev_rect.bottom() - l.combo_rect.bottom()).abs() <= 0.1
+                    && (l.next_rect.bottom() - l.combo_rect.bottom()).abs() <= 0.1,
+                "stepper {idx} bottoms misaligned: prev={} combo={} next={}",
+                l.prev_rect.bottom(),
+                l.combo_rect.bottom(),
+                l.next_rect.bottom()
+            );
+            assert!(
+                (l.prev_rect.top() - first_top).abs() <= 0.1
+                    && (l.prev_rect.bottom() - first_bot).abs() <= 0.1,
+                "stepper {idx} vertical band drifted from stepper 0"
+            );
+            assert!(
+                (l.prev_rect.right() - l.combo_rect.left()).abs() <= 0.5
+                    && (l.combo_rect.right() - l.next_rect.left()).abs() <= 0.5,
+                "stepper {idx} internal seam gap: prev_r={} combo=[{},{}] next_l={}",
+                l.prev_rect.right(),
+                l.combo_rect.left(),
+                l.combo_rect.right(),
+                l.next_rect.left()
+            );
+        }
+        // Adjacent capsules must stay visibly separated (no `><` clumping).
+        assert!(
+            layouts[1].prev_rect.left() - layouts[0].next_rect.right() >= TB_ITEM_SPACING.x - 0.5
+        );
+        assert!(
+            layouts[2].prev_rect.left() - layouts[1].next_rect.right() >= TB_ITEM_SPACING.x - 0.5
+        );
     }
 }

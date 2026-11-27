@@ -2674,13 +2674,15 @@ impl UiContext<'_> {
 
                     // Single-row Day / Sunset / Night + Smooth transition duration controls.
                     let row_w = ui.available_width().max(1.0);
+                    let row_h = ROW_H + 2.0;
                     allocate_clamped_ui(
                         ui,
-                        egui::vec2(row_w, ROW_H + 2.0),
+                        egui::vec2(row_w, row_h),
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             let sp = 4.0_f32;
                             ui.spacing_mut().item_spacing.x = sp;
+                            ui.spacing_mut().interact_size.y = row_h;
                             let avail = ui.available_width().max(120.0);
                             let dur_w = 46.0_f32;
                             let show_smooth_lbl = avail >= 285.0;
@@ -2691,7 +2693,7 @@ impl UiContext<'_> {
                             for (tod, label) in [(0u32, "Day"), (1u32, "Sunset"), (2u32, "Night")] {
                                 if ui
                                     .add_sized(
-                                        [seg_w, ROW_H + 2.0],
+                                        [seg_w, row_h],
                                         egui::Button::selectable(s.csg_time_of_day == tod, label),
                                     )
                                     .clicked()
@@ -2707,7 +2709,7 @@ impl UiContext<'_> {
                                 );
                             ui.add_enabled_ui(s.tod_transition_enabled, |ui| {
                                 ui.add_sized(
-                                    [dur_w, ROW_H],
+                                    [dur_w, row_h],
                                     egui::DragValue::new(&mut s.tod_transition_secs)
                                         .range(0.1..=15.0)
                                         .speed(0.1)

@@ -1662,6 +1662,7 @@ mod tests {
             variant_idx: 0,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
 
         let init_cam = CsgCameraParams {

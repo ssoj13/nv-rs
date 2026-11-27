@@ -2682,6 +2682,41 @@ impl UiContext<'_> {
                             self.bus.emit_ui(UiCommand::SetRoadMode(mode));
                         }
                     });
+                    // 2-way Ground Kerb Mode selector (`0 = In-Tile F-Rep`, `1 = Sweep Tile`).
+                    let prev_kerb_mode = s.csg_ground_kerb_mode.min(1);
+                    ui.label(RichText::new("Ground Kerb").small().weak())
+                        .on_hover_text(
+                            "How ground-level (layer 0) road kerbs are represented in F-Rep/Hybrid road tiles (elevated bridges always use Sweep Tile).",
+                        );
+                    equal_grid(
+                        ui,
+                        csg_scene::GroundKerbMode::ALL.len(),
+                        csg_scene::GroundKerbMode::ALL.len(),
+                        |ui, idx, w| {
+                            let kerb = csg_scene::GroundKerbMode::ALL[idx];
+                            let mode = idx as u8;
+                            let tip = match kerb {
+                                csg_scene::GroundKerbMode::InTile => {
+                                    "In-Tile F-Rep (default): ground-level kerbs stay baked analytically inside RoadTerrainTile with zero extra GAS/IAS instances."
+                                }
+                                csg_scene::GroundKerbMode::SweepTile => {
+                                    "Sweep Tile: road tiles bake flush (zero kerb Z-fighting) and ground-level kerbs emit into analytical SWEEP_TILE (GasClass::Sweep)."
+                                }
+                            };
+                            if ui
+                                .add_sized(
+                                    [w, ROW_H + 2.0],
+                                    egui::Button::selectable(prev_kerb_mode == mode, kerb.label()),
+                                )
+                                .on_hover_text(tip)
+                                .clicked()
+                                && prev_kerb_mode != mode
+                            {
+                                s.csg_ground_kerb_mode = mode;
+                                self.bus.emit_ui(UiCommand::SetGroundKerbMode(mode));
+                            }
+                        },
+                    );
                     anim_slider_f32(
                         ui,
                         anim,
@@ -7153,6 +7188,23 @@ mod tests {
         let json = serde_json::to_string(&s).expect("serialize");
         let back: DemoSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.csg_road_mode, 3);
+    }
+
+    #[test]
+    fn ground_kerb_mode_serde_defaults_to_in_tile_and_roundtrips() {
+        // Legacy JSON missing `csg_ground_kerb_mode` deserializes to In-Tile F-Rep (`0`).
+        let legacy: DemoSettings = serde_json::from_str("{}").expect("legacy json");
+        assert_eq!(legacy.csg_ground_kerb_mode, 0);
+
+        // Explicit Sweep Tile (`1`) round-trips cleanly.
+        let s = DemoSettings {
+            csg_ground_kerb_mode: 1,
+            ..DemoSettings::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: DemoSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.csg_ground_kerb_mode, 1);
+        assert_eq!(csg_scene::GroundKerbMode::ALL.len(), 2);
     }
 
     #[test]

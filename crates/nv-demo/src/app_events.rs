@@ -819,6 +819,8 @@ pub enum UiCommand {
     SelectScene { scene_idx: u32, variant_idx: u32 },
     /// User switched the live 4-way CSG road geometry mode (`0=3D, 1=C1, 2=Hybrid, 3=F-Rep`).
     SetRoadMode(u8),
+    /// User switched the live CSG ground kerb representation (`0=In-Tile F-Rep, 1=Sweep Tile`).
+    SetGroundKerbMode(u8),
     /// Toggle `Freeze Pose` (pauses dynamic traffic/crowd stepping for clean multi-spp SDG accumulation).
     ToggleFreezePose,
     /// Typed Flight Lab / Flight Player command (`crate::flight::FlightCommand`).

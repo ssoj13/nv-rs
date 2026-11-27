@@ -680,6 +680,10 @@ fn default_csg_road_mode() -> u8 {
     2
 }
 
+fn default_csg_ground_kerb_mode() -> u8 {
+    0
+}
+
 fn default_tod_transition_enabled() -> bool {
     true
 }
@@ -956,6 +960,9 @@ pub struct DemoSettings {
     /// Road geometry representation (`0 = Watertight 3D`, `1 = C1 Tangent`, `2 = Hybrid C1+SDF`, `3 = F-Rep Tile`).
     #[serde(default = "default_csg_road_mode")]
     pub csg_road_mode: u8,
+    /// Ground-level kerb representation (`0 = In-Tile F-Rep`, `1 = Sweep Tile`).
+    #[serde(default = "default_csg_ground_kerb_mode")]
+    pub csg_ground_kerb_mode: u8,
     /// Active optical sensor projection (`Pinhole`, `Fisheye180`, `Equirect360`, `SlitCam`).
     pub camera_projection: CameraProjection,
     /// Active primary-ray view scoring backend (`Auto`, `Optix`, `Wgpu`, `Cpu`).
@@ -1128,6 +1135,7 @@ impl Default for DemoSettings {
             csg_crowd_lod2_m: default_csg_crowd_lod2_m(),
             csg_crowd_cull_m: default_csg_crowd_cull_m(),
             csg_road_mode: default_csg_road_mode(),
+            csg_ground_kerb_mode: default_csg_ground_kerb_mode(),
             camera_projection: CameraProjection::Pinhole,
             probe_backend: ProbeBackendKind::Auto,
             crowd_backend: CrowdBackend::Auto,
@@ -2892,6 +2900,7 @@ fn init_optix(
         variant_idx: initial_settings.csg_asset_idx,
         seed: initial_settings.csg_seed,
         road_mode: initial_settings.csg_road_mode.min(3),
+        ground_kerb_mode: initial_settings.csg_ground_kerb_mode.min(1),
     };
     let initial_gpu_crowd = initial_settings.csg_mode > 0
         && !initial_settings.csg_freeze_pose
@@ -6301,6 +6310,7 @@ pub fn spawn_render_thread(
                     variant_idx: settings.csg_asset_idx,
                     seed: settings.csg_seed,
                     road_mode: settings.csg_road_mode.min(3),
+                    ground_kerb_mode: settings.csg_ground_kerb_mode.min(1),
                 };
                 let building_scene = csg_key != rig.csg_host.scene_key();
                 temporal_history_cut |= building_scene;

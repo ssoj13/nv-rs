@@ -37,7 +37,9 @@ use csg_scene::voxel_volume::{
     voxel_class_from_semantic,
 };
 use csg_scene::world_ray::WorldRayQuery;
-use csg_scene::{RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, WorldScene, inst_flags};
+use csg_scene::{
+    GroundKerbMode, RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, WorldScene, inst_flags,
+};
 use flight_navigator::camera_guide::GuideLimits;
 use flight_navigator::fnav_interest::{ObjectInfo, ObjectTable, SimpleObjectTable};
 use flight_navigator::fnav_plan::{self, CpuRayProber, PlanCache, PlanRequest, RailPlan};
@@ -112,6 +114,8 @@ pub struct AutoPlanJob {
     pub scene_id: String,
     /// Active road surface synthesis mode forwarded into [`SceneBuildConfig::road_mode`].
     pub road_mode: RoadMode,
+    /// Ground-level kerb representation forwarded into [`SceneBuildConfig::ground_kerb_mode`].
+    pub ground_kerb_mode: GroundKerbMode,
     /// Inspector variant index (`0` for non-inspector scenes).
     pub inspector_variant: u32,
     /// World-space unit direction pointing toward the scene sun (`[x, y, z]`).
@@ -525,7 +529,7 @@ impl SceneOracle for CsgSceneOracle {
 /// Tracks `sun_dir` and `limits` alongside the scene geometry `key` so lighting or dynamics-limit
 /// changes invalidate only the affected `PlanCache` tables without rebuilding the scene or volume.
 struct CachedOracle {
-    key: (u32, RoadMode, u32),
+    key: (u32, RoadMode, GroundKerbMode, u32),
     sun_dir: Option<Vec3>,
     limits: GuideLimits,
     oracle: CsgSceneOracle,
@@ -709,7 +713,12 @@ fn execute_auto_plan_job(
     ev_tx: &Sender<AutoPlanEvent>,
 ) -> Result<RailPlan, String> {
     let sun_dir = sanitize_sun_dir(job.sun_dir);
-    let key = (job.scene_idx, job.road_mode, job.inspector_variant);
+    let key = (
+        job.scene_idx,
+        job.road_mode,
+        job.ground_kerb_mode,
+        job.inspector_variant,
+    );
 
     let cache_hit = cached.as_ref().is_some_and(|c| c.key == key);
     if !cache_hit {
@@ -723,6 +732,7 @@ fn execute_auto_plan_job(
         let build_cfg = SceneBuildConfig {
             variant_idx: job.inspector_variant,
             road_mode: job.road_mode,
+            ground_kerb_mode: job.ground_kerb_mode,
             ..SceneBuildConfig::default()
         };
         let built = module.build(&build_cfg).map_err(|e| {

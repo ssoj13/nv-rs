@@ -1765,6 +1765,16 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
 
+    /// Converts the serialized UI ground kerb selector (`0..=1`) to [`csg_scene::GroundKerbMode`],
+    /// matching [`crate::csg_scene_host::CsgGpuHost`] scene builds.
+    #[inline]
+    fn ground_kerb_mode_from_u8(mode: u8) -> csg_scene::GroundKerbMode {
+        match mode {
+            1 => csg_scene::GroundKerbMode::SweepTile,
+            _ => csg_scene::GroundKerbMode::InTile,
+        }
+    }
+
     /// Converts `(sun_azimuth_deg, sun_elevation_deg)` into the world-space unit sun vector,
     /// mirroring the OptiX launch parameter formula in `renderer.rs`.
     #[inline]
@@ -3895,6 +3905,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 scene_idx: self.settings.csg_mode,
                 scene_id,
                 road_mode: road_mode_from_u8(self.settings.csg_road_mode),
+                ground_kerb_mode: ground_kerb_mode_from_u8(self.settings.csg_ground_kerb_mode),
                 inspector_variant: self.settings.csg_asset_idx,
                 sun_dir: sun_dir_from_angles(
                     self.settings.sun_azimuth,
@@ -4821,6 +4832,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     }
                     UiCommand::SetRoadMode(mode) => {
                         self.settings.csg_road_mode = (*mode).min(3);
+                        reset_accum_requested = true;
+                    }
+                    UiCommand::SetGroundKerbMode(mode) => {
+                        self.settings.csg_ground_kerb_mode = (*mode).min(1);
                         reset_accum_requested = true;
                     }
                     UiCommand::ToggleFreezePose => {

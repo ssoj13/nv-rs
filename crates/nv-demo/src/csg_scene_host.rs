@@ -517,6 +517,8 @@ pub struct CsgSceneKey {
     pub seed: u32,
     /// Active road surface representation (`0=Watertight 3D, 1=C1 Tangent, 2=Hybrid C1+SDF, 3=F-Rep Tile`).
     pub road_mode: u8,
+    /// Ground-level kerb representation (`0=In-Tile F-Rep, 1=Sweep Tile`).
+    pub ground_kerb_mode: u8,
 }
 
 /// Returns descriptors for all registered pure-CSG scene modules in deterministic order.
@@ -3593,12 +3595,17 @@ impl CsgGpuHost {
             3 => csg_scene::RoadMode::FRepTile,
             _ => csg_scene::RoadMode::HybridC1Sdf,
         };
+        let ground_kerb_mode = match key.ground_kerb_mode {
+            1 => csg_scene::GroundKerbMode::SweepTile,
+            _ => csg_scene::GroundKerbMode::InTile,
+        };
         let build_cfg = SceneBuildConfig {
             seed: u64::from(key.seed).max(1),
             wetness: wetness.clamp(0.0, 1.0),
             time_of_day: tod,
             variant_idx: key.variant_idx,
             road_mode,
+            ground_kerb_mode,
             ..SceneBuildConfig::default()
         };
 
@@ -4251,6 +4258,7 @@ mod tests {
             variant_idx: 0,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -4343,6 +4351,7 @@ mod tests {
             variant_idx: SHOWCASE_VARIANT,
             seed: 1,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -4490,6 +4499,7 @@ mod tests {
             variant_idx: 0,
             seed: 1,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4547,6 +4557,7 @@ mod tests {
             variant_idx: 0,
             seed: 1,
             road_mode: 3,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(osm_idx);
         host.scene = Some(built);
@@ -4638,6 +4649,7 @@ mod tests {
             variant_idx: SHOWCASE_VARIANT,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -4905,6 +4917,7 @@ mod tests {
             variant_idx: 0,
             seed: 1,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         let vp_count = built.viewpoints.len();
         host.cache_insert_scene(key_a, built);
@@ -4935,6 +4948,7 @@ mod tests {
             variant_idx: 0,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5057,6 +5071,7 @@ mod tests {
             variant_idx: SHOWCASE_VARIANT,
             seed: 1,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(insp_idx);
         host.scene = Some(built);
@@ -5111,6 +5126,7 @@ mod tests {
             variant_idx: 0,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(marina_idx);
@@ -5229,6 +5245,7 @@ mod tests {
             variant_idx: 0,
             seed: 2026,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.scene_key = key;
         host.active_reg_idx = Some(gundo_idx);
@@ -5550,6 +5567,7 @@ mod tests {
             variant_idx: csg_scenes::ACTOR_SHOWCASE_VARIANT_IDX as u32,
             seed: 1,
             road_mode: 2,
+            ground_kerb_mode: 0,
         };
         host.active_reg_idx = Some(inspector_idx);
         host.scene = Some(built);
@@ -5735,6 +5753,7 @@ mod tests {
                 variant_idx: 0,
                 seed: 1,
                 road_mode: 2,
+                ground_kerb_mode: 0,
             };
             host.active_reg_idx = Some(reg_idx);
             host.scene = Some(built);

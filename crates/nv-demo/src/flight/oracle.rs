@@ -1,66 +1,41 @@
-//! Live `csg-scene` R0 (`VoxelVolume`) + R1 (`WorldRayQuery`) bridge to `flight-navigator-rs`
-//! (`Volume`, `SceneOracle`, `ObjectTable`) and asynchronous Auto-Plan background worker.
+//! Asynchronous GPU-accelerated CSG flight-planning coordinator backed by `fnav-csg`.
 //!
-//! **What.** Implements [`CsgVolumeAdapter`] (1-to-1 `fnav_space::Volume` over
-//! [`csg_scene::VoxelVolume`]), [`CsgObjectTable`] (`fnav_interest::ObjectTable` over static and
-//! dynamic `WorldScene` instances), [`CsgSceneOracle`] (`fnav_space::SceneOracle` pairing
-//! `VoxelVolume` + `WorldRayQuery` + extracted `StreetGraph` and sanitized `Landmark`s), and
-//! [`CsgAutoPlanner`] (a single non-blocking background worker thread driving `fnav_plan::plan`
-//! with per-scene caching across repeated plans).
-//! **Why.** Keeps `flight-navigator-rs` 100% decoupled from `csg-rs` while letting `nv-demo`
-//! generate collision-verified cinematic tours directly from live analytical CSG worlds without
-//! stalling the 60 Hz UI or OptiX render loop.
-//! **How.** [`CsgVolumeAdapter`] pre-flattens every `1.0 m` XZ column's [`csg_scene::ColumnSpan`]s
-//! into contiguous [`flight_navigator::fnav_space::Span`] storage so `column_spans(x, z)` returns
-//! a zero-allocation borrowed slice matching [`csg_scene::VoxelVolume::column_spans`] identically.
-//! [`CsgAutoPlanner`] lazily spawns one `"nv-flight-planner"` thread blocked on an `mpsc` channel
-//! (zero busy-waiting), lazily initializes one reusable [`crate::flight::voxel_gpu::GpuVoxelBaker`]
-//! to accelerate R0 `VoxelVolume` column baking on CUDA (falling back cleanly to exact CPU
-//! `VoxelVolume::build` if CUDA is unavailable or overflows), caches the most recent
-//! `(scene_idx, road_mode, inspector_variant)` oracle and
-//! [`flight_navigator::fnav_plan::PlanCache`] (selectively invalidating `cache.catalog` on
-//! `sun_dir` changes and both `cache.catalog` + `cache.handover_costs` on `req.limits` changes
-//! while keeping the baked volume and `space_map` warm), and reports typed [`AutoPlanEvent`] stage
-//! progress, ready [`flight_navigator::fnav_plan::RailPlan`]s, or errors back to `FlightWorkspace`.
-//! **Uses.** `csg_core`, `csg_scene`, `csg_scenes`, `flight_navigator`, `glam`, `std::sync::mpsc`,
+//! **What.** Re-exports the single-source-of-truth `csg-scene` R0 (`VoxelVolume`) + R1
+//! (`WorldRayQuery`) adapters from [`fnav_csg`] ([`CsgVolumeAdapter`], [`CsgObjectTable`],
+//! [`CsgSceneOracle`], [`CsgOracleError`], [`plan_world_track`]), provides
+//! [`build_oracle_with_baker`] (plugging `nv-demo`'s CUDA [`GpuVoxelBaker`] into
+//! [`CsgSceneOracle::from_parts`]), and implements [`CsgAutoPlanner`] (a single non-blocking
+//! background worker thread driving `fnav_csg::plan_world_track` with selective `PlanCache`
+//! reuse across repeated plans).
+//! **Why.** Eliminates duplicated `VoxelVolume` / `WorldRayQuery` / street-graph / landmark-table
+//! bridge code by delegating the scene-oracle contract directly to `flight-navigator-rs`'s
+//! dedicated `fnav-csg` leaf crate while keeping `nv-demo`'s CUDA `voxel_bake.cuh` acceleration
+//! and non-blocking 60 Hz UI worker intact.
+//! **How.** [`CsgAutoPlanner`] lazily spawns one `"nv-flight-planner"` thread blocked on an `mpsc`
+//! channel (zero busy-waiting), lazily initializes one reusable [`GpuVoxelBaker`] to bake the R0
+//! `VoxelVolume` on CUDA (falling back cleanly to exact CPU `VoxelVolume::build` if CUDA is
+//! unavailable or overflows), hands the baked volume + `WorldRayQuery` into
+//! [`CsgSceneOracle::from_parts`], caches `(scene_idx, road_mode, ground_kerb_mode, smart_fill,
+//! inspector_variant)` + `PlanCache` across iterations (selectively invalidating `cache.catalog`
+//! on `sun_dir` changes and `cache.catalog` + `cache.handover_costs` on `req.limits` changes),
+//! and emits typed [`AutoPlanEvent`] updates back to `FlightWorkspace`.
+//! **Uses.** `csg_scene`, `csg_scenes`, `flight_navigator`, `fnav_csg`, `glam`, `std::sync::mpsc`,
 //! `crate::flight::voxel_gpu`.
 //! **Used by.** `crate::flight`, `crate::flight::lab`, `crate::flight::ui`, `crate::main`.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Instant;
 
-use csg_core::{Aabb as CsgAabb, SemanticId, Vec3 as CsgVec3};
-use csg_scene::voxel_volume::{
-    COARSE_VOXEL_M, VoxelClass, VoxelSem as CsgVoxelSem, VoxelVolume, VoxelVolumeConfig,
-    voxel_class_from_semantic,
-};
+use csg_scene::voxel_volume::{VoxelVolume, VoxelVolumeConfig};
 use csg_scene::world_ray::WorldRayQuery;
-use csg_scene::{
-    GroundKerbMode, RoadMode, SceneBuildConfig, SceneBuilt, SceneHints, SmartFill, WorldScene,
-    inst_flags,
-};
+use csg_scene::{GroundKerbMode, RoadMode, SceneBuildConfig, SceneBuilt, SmartFill};
 use flight_navigator::camera_guide::GuideLimits;
-use flight_navigator::fnav_interest::{ObjectInfo, ObjectTable, SimpleObjectTable};
-use flight_navigator::fnav_plan::{self, CpuRayProber, PlanCache, PlanRequest, RailPlan};
-use flight_navigator::fnav_space::{
-    Aabb, Hit, Landmark, SceneOracle, Sem, Span, StreetEdge, StreetGraph, Volume,
-    VoxelSem as FnavVoxelSem,
-};
+use flight_navigator::fnav_plan::{PlanCache, PlanRequest, RailPlan};
+use fnav_csg::{CsgObjectTable, CsgSceneOracle, PlanBodyPoseSource, plan_world_track};
 use glam::Vec3;
 
 use crate::flight::voxel_gpu::GpuVoxelBaker;
-
-/// Minimum ray parameter (metres) passed to [`WorldRayQuery::first_hit`] to prevent self-hits at
-/// `t = 0` while preserving exact clearance checks down to 0.01 mm.
-const RAY_TMIN_M: f32 = 1.0e-5;
-
-/// High-bit tag applied to flat static instance indices when an instance carries `user_id == 0`.
-///
-/// Why: guarantees a non-zero, collision-free `inst_id` linking [`CsgSceneOracle::raycast`] hits
-/// to [`CsgObjectTable`] metadata even for synthetic or anonymous static instances.
-const FALLBACK_INST_ID_BIT: u32 = 1 << 31;
 
 /// Progress phase reported by [`CsgAutoPlanner`] while an asynchronous Auto-Plan job runs.
 ///
@@ -88,14 +63,12 @@ impl AutoPlanStage {
         match self {
             Self::Idle => "Idle",
             Self::BuildingScene => "Building CSG scene...",
-            Self::BakingVolume => "Baking voxel volume & ray BVH...",
-            Self::Planning => "Planning cinematic flight...",
+            Self::BakingVolume => "Baking voxel volume & BVH...",
+            Self::Planning => "Planning cinematic tour...",
         }
     }
 
-    /// Returns `true` while an asynchronous planning job is in flight.
-    ///
-    /// Why: lets callers gate new submissions and show progress controls with one predicate.
+    /// Returns `true` while a background job is executing any non-idle stage.
     #[must_use]
     pub const fn is_busy(self) -> bool {
         !matches!(self, Self::Idle)
@@ -129,7 +102,7 @@ pub struct AutoPlanJob {
 
 /// Asynchronous status or completion event emitted by [`CsgAutoPlanner::poll`].
 ///
-/// Why: decouples long-running CPU baking and planning from the 60 Hz UI loop while delivering
+/// Why: decouples long-running CPU/GPU baking and planning from the 60 Hz UI loop while delivering
 /// explicit stage transitions, validated [`RailPlan`]s, or typed failure strings.
 #[derive(Clone, Debug)]
 pub enum AutoPlanEvent {
@@ -148,383 +121,42 @@ pub enum AutoPlanEvent {
     Failed(String),
 }
 
-/// Zero-allocation [`Volume`] adapter wrapping a `csg-scene` R0 [`VoxelVolume`].
+/// Builds a [`fnav_csg::CsgSceneOracle`] and [`fnav_csg::CsgObjectTable`] from a built CSG scene,
+/// accelerating R0 [`VoxelVolume`] column-span baking via `gpu_baker` when available and falling
+/// back transparently to exact CPU [`VoxelVolume::build`] on any GPU error or overflow.
 ///
-/// Why: `flight_navigator::fnav_space::Volume::column_spans` returns a borrowed `&[Span]`, whereas
-/// [`VoxelVolume::column_spans`] returns `&[csg_scene::ColumnSpan]`. Pre-converting every `1.0 m`
-/// XZ column once at construction guarantees exact 1-to-1 parity with zero per-query allocations.
-pub struct CsgVolumeAdapter {
-    volume: VoxelVolume,
-    bounds: Aabb,
-    nx: usize,
-    nz: usize,
-    spans: Vec<Span>,
-    column_ranges: Vec<(usize, usize)>,
-}
-
-impl CsgVolumeAdapter {
-    /// Wraps `volume`, pre-flattening all `1.0 m` column spans into `fnav_space::Span` storage.
-    ///
-    /// Why: pays the linear span-conversion cost once up front so `SpaceMap::build`, A*, CHOMP,
-    /// and 60 Hz validation query `column_spans(x, z)` in O(1) with zero heap churn.
-    #[must_use]
-    pub fn new(volume: VoxelVolume) -> Self {
-        let raw_bounds = volume.bounds();
-        let bounds = csg_aabb_to_fnav(raw_bounds);
-        let (nx, _ny, nz) = volume.grid_dims();
-        let col_count = nx.saturating_mul(nz);
-
-        let mut spans = Vec::with_capacity(col_count.saturating_mul(2));
-        let mut column_ranges = Vec::with_capacity(col_count);
-
-        for iz in 0..nz {
-            let z = raw_bounds.min.z + (iz as f32 + 0.5) * COARSE_VOXEL_M;
-            for ix in 0..nx {
-                let x = raw_bounds.min.x + (ix as f32 + 0.5) * COARSE_VOXEL_M;
-                let start = spans.len();
-                for sp in volume.column_spans(x, z) {
-                    spans.push(Span {
-                        y0: sp.y0,
-                        y1: sp.y1,
-                        sem: voxel_class_to_sem(sp.class),
-                    });
-                }
-                column_ranges.push((start, spans.len()));
-            }
-        }
-
-        Self {
-            volume,
-            bounds,
-            nx,
-            nz,
-            spans,
-            column_ranges,
-        }
-    }
-
-    /// Borrows the underlying `csg-scene` [`VoxelVolume`] for grid-dimension validation and parity tests.
-    #[must_use]
-    pub const fn inner(&self) -> &VoxelVolume {
-        &self.volume
-    }
-
-    /// Computes the flat `iz * nx + ix` column index matching `VoxelVolume::column_index` 1-to-1.
-    #[inline]
-    fn column_index(&self, x: f32, z: f32) -> Option<usize> {
-        if self.nx == 0 || self.nz == 0 || !x.is_finite() || !z.is_finite() {
-            return None;
-        }
-        let fx = x - self.bounds.min.x;
-        let fz = z - self.bounds.min.z;
-        if fx < 0.0 || fz < 0.0 || fx > self.nx as f32 || fz > self.nz as f32 {
-            return None;
-        }
-        let ix = (fx.floor() as isize).clamp(0, (self.nx - 1) as isize) as usize;
-        let iz = (fz.floor() as isize).clamp(0, (self.nz - 1) as isize) as usize;
-        Some(iz * self.nx + ix)
-    }
-}
-
-impl Volume for CsgVolumeAdapter {
-    #[inline]
-    fn bounds(&self) -> Aabb {
-        self.bounds
-    }
-
-    #[inline]
-    fn hash(&self) -> [u8; 32] {
-        self.volume.hash()
-    }
-
-    #[inline]
-    fn column_spans(&self, x: f32, z: f32) -> &[Span] {
-        let Some(col) = self.column_index(x, z) else {
-            return &[];
-        };
-        let Some(&(start, end)) = self.column_ranges.get(col) else {
-            return &[];
-        };
-        self.spans.get(start..end).unwrap_or(&[])
-    }
-
-    #[inline]
-    fn semantics_at(&self, p: Vec3) -> FnavVoxelSem {
-        voxel_sem_to_fnav(self.volume.semantics_at(glam_to_csg(p)))
-    }
-
-    #[inline]
-    fn covered(&self, p: Vec3) -> bool {
-        self.volume.covered(glam_to_csg(p))
-    }
-
-    #[inline]
-    fn distance(&self, p: Vec3) -> f32 {
-        self.volume.distance(glam_to_csg(p))
-    }
-
-    #[inline]
-    fn gradient(&self, p: Vec3) -> Vec3 {
-        csg_to_glam(self.volume.gradient(glam_to_csg(p)))
-    }
-
-    #[inline]
-    fn ground_height(&self, x: f32, z: f32) -> Option<f32> {
-        self.volume.ground_height(x, z)
-    }
-
-    #[inline]
-    fn roof_height(&self, x: f32, z: f32) -> Option<f32> {
-        self.volume.roof_height(x, z)
-    }
-
-    #[inline]
-    fn voxel_size_at(&self, p: Vec3) -> f32 {
-        self.volume.voxel_size_at(glam_to_csg(p))
-    }
-
-    #[inline]
-    fn is_thin_sharp(&self, p: Vec3) -> bool {
-        self.volume.is_thin_sharp(glam_to_csg(p))
-    }
-}
-
-/// Deterministic [`ObjectTable`] extracted from a CSG [`WorldScene`] for `fnav-interest` scoring.
+/// Why: cuts full-city `VoxelVolume` baking (e.g. Gundo) from ~2 s on CPU to ~265 ms on GPU while
+/// delegating oracle assembly, street-graph extraction, and landmark sanitization to
+/// [`CsgSceneOracle::from_parts`] as the single source of truth.
 ///
-/// Why: `fnav-interest` weights rare architectural landmarks (`idf`) and hero / dynamic subjects
-/// across probe frames without coupling to `csg-scene` types; backing the catalog with
-/// [`SimpleObjectTable`] (`BTreeMap`) guarantees bit-identical deterministic iteration.
-#[derive(Clone, Debug, Default)]
-pub struct CsgObjectTable {
-    inner: SimpleObjectTable,
-}
-
-impl CsgObjectTable {
-    /// Builds a deterministic [`CsgObjectTable`] from every visible static and dynamic instance in
-    /// `world`, marking hero instances from `inst_flags::OVERRIDDEN` and curated `landmarks`.
-    ///
-    /// Why: precomputes [`csg_core::CompiledLibrary::semantic_masks`] once so per-instance semantic
-    /// classification runs in O(parts) without re-evaluating RPN bytecode per instance.
-    #[must_use]
-    pub fn build(world: &WorldScene, landmarks: &[Landmark]) -> Self {
-        let compound_masks = world.library.semantic_masks();
-        let hero_ids: BTreeSet<u32> = landmarks
-            .iter()
-            .filter(|lm| lm.is_hero)
-            .filter_map(|lm| lm.inst_user_id)
-            .collect();
-        let hero_bounds: Vec<Aabb> = landmarks
-            .iter()
-            .filter(|lm| lm.is_hero)
-            .map(|lm| lm.bounds)
-            .collect();
-
-        let mut table = SimpleObjectTable::new();
-        let mut static_idx = 0u32;
-        for chunk in world.chunks() {
-            for inst in chunk.instances() {
-                let idx = static_idx;
-                static_idx = static_idx.saturating_add(1);
-                if !inst.is_visible() {
-                    continue;
-                }
-                let Some(asm) = world.assembly(inst.assembly_id) else {
-                    continue;
-                };
-                let inst_id = stable_inst_id(inst.user_id, idx);
-                let sem = instance_semantic(inst.flags, asm, &compound_masks);
-                let world_aabb = inst.xform.xform_aabb(asm.local_aabb);
-                let size_m = finite_aabb_extent_m(world_aabb);
-                let in_hero_bounds = matches!(sem, Sem::Building | Sem::Structure)
-                    && world_aabb.is_finite()
-                    && !world_aabb.is_empty()
-                    && {
-                        let c = csg_aabb_to_fnav(world_aabb).center();
-                        hero_bounds.iter().any(|b| b.contains(c))
-                    };
-                let is_hero = (inst.flags & inst_flags::OVERRIDDEN) != 0
-                    || hero_ids.contains(&inst_id)
-                    || in_hero_bounds;
-                table.insert(ObjectInfo {
-                    inst_id,
-                    assembly: inst.assembly_id.0,
-                    sem,
-                    is_hero,
-                    dynamic: (inst.flags & inst_flags::DYNAMIC) != 0,
-                    size_m,
-                });
-            }
-        }
-
-        for inst in world.dynamic_instances() {
-            if !inst.is_visible() || inst.user_id == 0 {
-                continue;
-            }
-            if table.object_info(inst.user_id).is_some() {
-                continue;
-            }
-            let Some(asm) = world.assembly(inst.assembly_id) else {
-                continue;
-            };
-            let sem = instance_semantic(inst.flags, asm, &compound_masks);
-            let world_aabb = inst.xform.xform_aabb(asm.local_aabb);
-            let size_m = finite_aabb_extent_m(world_aabb);
-            table.insert(ObjectInfo {
-                inst_id: inst.user_id,
-                assembly: inst.assembly_id.0,
-                sem,
-                is_hero: (inst.flags & inst_flags::OVERRIDDEN) != 0,
-                dynamic: true,
-                size_m,
-            });
-        }
-
-        Self { inner: table }
-    }
-}
-
-impl ObjectTable for CsgObjectTable {
-    #[inline]
-    fn total_instances(&self) -> u32 {
-        self.inner.total_instances()
-    }
-
-    #[inline]
-    fn assembly_count(&self, assembly: u32) -> u32 {
-        self.inner.assembly_count(assembly)
-    }
-
-    #[inline]
-    fn object_info(&self, inst_id: u32) -> Option<ObjectInfo> {
-        self.inner.object_info(inst_id)
-    }
-}
-
-/// Complete [`SceneOracle`] backed by live `csg-scene` R0 [`VoxelVolume`] + R1 [`WorldRayQuery`].
-///
-/// Why: satisfies the planner invariant "the distance field proposes; exact rays decide" directly
-/// against analytical CSG solids with zero mesh approximation and deterministic CPU execution.
-pub struct CsgSceneOracle {
-    volume: CsgVolumeAdapter,
-    world: WorldScene,
-    ray_query: WorldRayQuery,
-    streets: StreetGraph,
-    landmarks: Vec<Landmark>,
+/// # Errors
+/// Returns an error if `built.world` contains no geometry or produces an invalid empty volume.
+pub fn build_oracle_with_baker(
+    built: SceneBuilt,
     sun_dir: Option<Vec3>,
-}
-
-impl CsgSceneOracle {
-    /// Builds a [`CsgSceneOracle`] and matching [`CsgObjectTable`] from a built CSG scene,
-    /// accelerating R0 [`VoxelVolume`] column-span baking via `gpu_baker` when provided and
-    /// falling back transparently to exact CPU [`VoxelVolume::build`] on any GPU error or
-    /// overflow.
-    ///
-    /// Why: cuts full-city `VoxelVolume` baking (e.g. Gundo) from ~2 s on CPU to ~265 ms on GPU
-    /// without ever accepting truncated GPU spans or failing on non-CUDA hosts.
-    ///
-    /// # Errors
-    /// Returns an error if `built.world` contains no geometry or produces an invalid empty volume.
-    pub fn build_with_baker(
-        built: SceneBuilt,
-        sun_dir: Option<Vec3>,
-        gpu_baker: Option<&mut GpuVoxelBaker>,
-    ) -> Result<(Self, CsgObjectTable), String> {
-        if built.world.static_instance_count() == 0 && built.world.dynamic_instances().is_empty() {
-            return Err("CSG scene contains no geometry to plan against".to_string());
-        }
-
-        let ray_query = WorldRayQuery::build(&built.world);
-        let cfg = VoxelVolumeConfig::default();
-        let raw_volume = match gpu_baker {
-            Some(baker) => match baker.bake_voxel_volume(&built.world, &cfg) {
-                Ok(vol) => vol,
-                Err(err) => {
-                    eprintln!(
-                        "nv-demo: GPU voxel bake unavailable ({err}); falling back to CPU VoxelVolume::build"
-                    );
-                    VoxelVolume::build(&built.world, None, cfg)
-                }
-            },
-            None => VoxelVolume::build(&built.world, None, cfg),
-        };
-        let volume = CsgVolumeAdapter::new(raw_volume);
-        let (nx, _ny, nz) = volume.inner().grid_dims();
-        if nx == 0 || nz == 0 {
-            return Err("Baked VoxelVolume has zero horizontal grid extent".to_string());
-        }
-
-        let streets = extract_street_graph(&built.hints);
-        let landmarks = extract_landmarks(&built.world, &built.hints, &volume);
-        let objects = CsgObjectTable::build(&built.world, &landmarks);
-        let normalized_sun = sun_dir.and_then(|d| {
-            (d.is_finite() && d.length_squared() > 1.0e-6).then(|| d.normalize())
-        });
-
-        let oracle = Self {
-            volume,
-            world: built.world,
-            ray_query,
-            streets,
-            landmarks,
-            sun_dir: normalized_sun,
-        };
-        Ok((oracle, objects))
+    gpu_baker: Option<&mut GpuVoxelBaker>,
+) -> Result<(CsgSceneOracle, CsgObjectTable), String> {
+    if built.world.static_instance_count() == 0 && built.world.dynamic_instances().is_empty() {
+        return Err("CSG scene contains no geometry to plan against".to_string());
     }
 
-    /// Updates the sun direction used by subject-lighting probes on a cached oracle.
-    ///
-    /// Why: lets [`CsgAutoPlanner`] keep the baked `VoxelVolume` and `space_map` warm across
-    /// time-of-day or lighting tweaks while clearing only `cache.catalog` so lighting scores are
-    /// recomputed against the new sun vector.
-    pub fn set_sun_dir(&mut self, sun_dir: Option<Vec3>) {
-        self.sun_dir = sun_dir.and_then(|d| {
-            (d.is_finite() && d.length_squared() > 1.0e-6).then(|| d.normalize())
-        });
-    }
-}
+    let ray_query = WorldRayQuery::build(&built.world);
+    let cfg = VoxelVolumeConfig::default();
+    let raw_volume = match gpu_baker {
+        Some(baker) => match baker.bake_voxel_volume(&built.world, &cfg) {
+            Ok(vol) => vol,
+            Err(err) => {
+                eprintln!(
+                    "nv-demo: GPU voxel bake unavailable ({err}); falling back to CPU VoxelVolume::build"
+                );
+                VoxelVolume::build(&built.world, None, cfg)
+            }
+        },
+        None => VoxelVolume::build(&built.world, None, cfg),
+    };
 
-impl SceneOracle for CsgSceneOracle {
-    #[inline]
-    fn volume(&self) -> &dyn Volume {
-        &self.volume
-    }
-
-    #[inline]
-    fn raycast(&self, origin: Vec3, dir: Vec3, t_max: f32) -> Option<Hit> {
-        if !t_max.is_finite() || t_max <= RAY_TMIN_M {
-            return None;
-        }
-        let hit = self.ray_query.first_hit(
-            &self.world.library,
-            glam_to_csg(origin),
-            glam_to_csg(dir),
-            RAY_TMIN_M,
-            t_max,
-        )?;
-        Some(Hit {
-            t: hit.t,
-            normal: csg_to_glam(hit.normal),
-            entering: hit.entering,
-            sem: voxel_class_to_sem(voxel_class_from_semantic(hit.sem_id)),
-            inst_user_id: stable_inst_id(hit.user_id, hit.instance_idx),
-            assembly: hit.assembly_id.0,
-        })
-    }
-
-    #[inline]
-    fn streets(&self) -> &StreetGraph {
-        &self.streets
-    }
-
-    #[inline]
-    fn landmarks(&self) -> &[Landmark] {
-        &self.landmarks
-    }
-
-    #[inline]
-    fn sun_dir(&self) -> Option<Vec3> {
-        self.sun_dir
-    }
+    CsgSceneOracle::from_parts(built.world, raw_volume, ray_query, &built.hints, sun_dir)
+        .map_err(|e| e.to_string())
 }
 
 /// Cached scene oracle, object catalog, and `PlanCache` held inside the worker thread.
@@ -550,13 +182,20 @@ fn sun_dir_changed(a: Option<Vec3>, b: Option<Vec3>) -> bool {
     }
 }
 
+/// Normalizes a raw `[x, y, z]` sun direction into a finite unit vector (or `None` if degenerate).
+#[inline]
+fn sanitize_sun_dir(raw: [f32; 3]) -> Option<Vec3> {
+    let v = Vec3::from_array(raw);
+    (v.is_finite() && v.length_squared() > 1.0e-6).then(|| v.normalize())
+}
+
 /// Asynchronous background flight-planning coordinator for `nv-demo`.
 ///
-/// Why: building a CSG scene, baking its `VoxelVolume`, and running `fnav_plan::plan` can take
-/// seconds; isolating that work on one dedicated `mpsc`-driven worker thread keeps the 60 Hz UI
-/// and OptiX viewport completely responsive while reusing the baked scene and `PlanCache` across
-/// repeated seed, plan-mode, duration, and cut-density iterations (and selectively invalidating
-/// cached catalog/handover tables on `sun_dir` or `GuideLimits` changes).
+/// Why: building a CSG scene, baking its `VoxelVolume`, and running `fnav_csg::plan_world_track`
+/// can take seconds; isolating that work on one dedicated `mpsc`-driven worker thread keeps the
+/// 60 Hz UI and OptiX viewport completely responsive while reusing the baked scene and `PlanCache`
+/// across repeated seed, plan-mode, duration, and cut-density iterations (and selectively
+/// invalidating cached catalog/handover tables on `sun_dir` or `GuideLimits` changes).
 pub struct CsgAutoPlanner {
     stage: AutoPlanStage,
     job_tx: Option<Sender<AutoPlanJob>>,
@@ -706,8 +345,9 @@ fn planner_worker_loop(job_rx: Receiver<AutoPlanJob>, ev_tx: Sender<AutoPlanEven
 }
 
 /// Executes one [`AutoPlanJob`], reusing the baked scene, volume, and `space_map` in `cached`
-/// whenever `(scene_idx, road_mode, variant)` match, while clearing `cache.catalog` on `sun_dir`
-/// changes and both `cache.catalog` + `cache.handover_costs` on `req.limits` changes.
+/// whenever `(scene_idx, road_mode, ground_kerb_mode, smart_fill, variant)` match, while clearing
+/// `cache.catalog` on `sun_dir` changes and both `cache.catalog` + `cache.handover_costs` on
+/// `req.limits` changes.
 fn execute_auto_plan_job(
     registry: &csg_scene::SceneRegistry,
     cached: &mut Option<CachedOracle>,
@@ -760,7 +400,7 @@ fn execute_auto_plan_job(
             *gpu_baker = Some(init);
         }
         let baker = gpu_baker.as_mut().and_then(|res| res.as_mut().ok());
-        let (oracle, objects) = CsgSceneOracle::build_with_baker(built, sun_dir, baker)?;
+        let (oracle, objects) = build_oracle_with_baker(built, sun_dir, baker)?;
         *cached = Some(CachedOracle {
             key,
             sun_dir,
@@ -790,15 +430,9 @@ fn execute_auto_plan_job(
     let entry = cached
         .as_mut()
         .ok_or_else(|| "Planner oracle cache unexpectedly empty".to_string())?;
-    let prober = CpuRayProber::new(&entry.oracle);
-    fnav_plan::plan(
-        &entry.oracle,
-        &prober,
-        &entry.objects,
-        &mut entry.cache,
-        &job.req,
-    )
-    .map_err(|e| e.to_string())
+    plan_world_track(&entry.oracle, &entry.objects, &mut entry.cache, &job.req)
+        .map(PlanBodyPoseSource::into_plan)
+        .map_err(|e| e.to_string())
 }
 
 /// Maps a 1-based `scene_idx` (`csg_mode`) to a `SceneRegistry` index, mirroring
@@ -818,455 +452,14 @@ fn registry_index_for_scene(scene_idx: u32, reg_count: usize) -> Result<usize, S
     Ok(idx)
 }
 
-/// Converts a `csg_core::Vec3` to `glam::Vec3`.
-#[inline]
-const fn csg_to_glam(v: CsgVec3) -> Vec3 {
-    Vec3::new(v.x, v.y, v.z)
-}
-
-/// Converts a `glam::Vec3` to `csg_core::Vec3`.
-#[inline]
-const fn glam_to_csg(v: Vec3) -> CsgVec3 {
-    CsgVec3::new(v.x, v.y, v.z)
-}
-
-/// Converts a `csg_core::Aabb` into a normalized `fnav_space::Aabb`.
-#[inline]
-fn csg_aabb_to_fnav(a: CsgAabb) -> Aabb {
-    Aabb::new(csg_to_glam(a.min), csg_to_glam(a.max))
-}
-
-/// Exhaustive 1-to-1 conversion from `csg_scene::VoxelClass` to `fnav_space::Sem`.
-#[inline]
-const fn voxel_class_to_sem(c: VoxelClass) -> Sem {
-    match c {
-        VoxelClass::Empty => Sem::Empty,
-        VoxelClass::Ground => Sem::Ground,
-        VoxelClass::Road => Sem::Road,
-        VoxelClass::Sidewalk => Sem::Sidewalk,
-        VoxelClass::Water => Sem::Water,
-        VoxelClass::Building => Sem::Building,
-        VoxelClass::Vegetation => Sem::Vegetation,
-        VoxelClass::Bridge => Sem::Bridge,
-        VoxelClass::Structure => Sem::Structure,
-        VoxelClass::DynamicLane => Sem::DynamicLane,
-    }
-}
-
-/// Converts a packed `csg_scene::VoxelSem` into `fnav_space::VoxelSem`, preserving `COVERED_BIT`.
-#[inline]
-const fn voxel_sem_to_fnav(s: CsgVoxelSem) -> FnavVoxelSem {
-    FnavVoxelSem::new(voxel_class_to_sem(s.class()), s.is_covered())
-}
-
-/// Normalizes a raw `[f32; 3]` sun direction, discarding zero or non-finite vectors.
-#[inline]
-fn sanitize_sun_dir(dir: [f32; 3]) -> Option<Vec3> {
-    let v = Vec3::from_array(dir);
-    (v.is_finite() && v.length_squared() > 1.0e-6).then(|| v.normalize())
-}
-
-/// Returns a stable, non-zero instance ID shared identically by [`CsgSceneOracle::raycast`] and
-/// [`CsgObjectTable`].
-#[inline]
-const fn stable_inst_id(user_id: u32, flat_idx: u32) -> u32 {
-    if user_id != 0 {
-        user_id
-    } else {
-        FALLBACK_INST_ID_BIT | (flat_idx & !FALLBACK_INST_ID_BIT)
-    }
-}
-
-/// Physical precedence order for selecting one representative [`Sem`] from an assembly's bitmask.
-#[inline]
-const fn sem_priority(sem: Sem) -> u8 {
-    match sem {
-        Sem::Building => 9,
-        Sem::Structure => 8,
-        Sem::Bridge => 7,
-        Sem::Vegetation => 6,
-        Sem::Road => 5,
-        Sem::Sidewalk => 4,
-        Sem::Water => 3,
-        Sem::Ground => 2,
-        Sem::DynamicLane => 1,
-        Sem::Empty => 0,
-    }
-}
-
-/// Resolves the dominant [`Sem`] for an instance from its `inst_flags` semantic override or LOD0
-/// compound semantic bitmasks.
-fn instance_semantic(flags: u32, asm: &csg_scene::Assembly, compound_masks: &[u64]) -> Sem {
-    if let Some(sem_id) = inst_flags::semantic(flags) {
-        return voxel_class_to_sem(voxel_class_from_semantic(sem_id));
-    }
-    let mut combined_mask = 0u64;
-    for part in &asm.parts {
-        for &cid in part.lods.compounds_for_lod(0) {
-            if let Some(&mask) = compound_masks.get(cid.0 as usize) {
-                combined_mask |= mask;
-            }
-        }
-    }
-    if combined_mask == 0 {
-        return Sem::Structure;
-    }
-    let mut best = Sem::Empty;
-    let mut best_prio = 0u8;
-    for bit in 0..64u16 {
-        if (combined_mask & (1u64 << bit)) != 0 {
-            let sem = voxel_class_to_sem(voxel_class_from_semantic(SemanticId(bit)));
-            let prio = sem_priority(sem);
-            if prio > best_prio {
-                best = sem;
-                best_prio = prio;
-            }
-        }
-    }
-    if best == Sem::Empty {
-        Sem::Structure
-    } else {
-        best
-    }
-}
-
-/// Returns a bounded finite linear extent (metres) for an instance's world AABB.
-#[inline]
-fn finite_aabb_extent_m(aabb: CsgAabb) -> f32 {
-    if aabb.is_empty() || !aabb.is_finite() {
-        return 1.0;
-    }
-    let size = csg_aabb_to_fnav(aabb).size();
-    let extent = size.x.max(size.y).max(size.z);
-    if extent.is_finite() {
-        extent.clamp(0.1, 10_000.0)
-    } else {
-        1.0
-    }
-}
-
-/// Quantizes an XZ world point onto a `0.5 m` grid for deterministic intersection node welding.
-#[inline]
-fn quantize_xz_node(p: Vec3) -> (i32, i32) {
-    ((p.x * 2.0).round() as i32, (p.z * 2.0).round() as i32)
-}
-
-/// Computes total Euclidean polyline length in metres for finite `glam::Vec3` vertices.
-fn polyline_length_m(pts: &[Vec3]) -> f32 {
-    pts.windows(2)
-        .map(|w| (w[1] - w[0]).length())
-        .filter(|d| d.is_finite())
-        .sum()
-}
-
-/// Builds a deterministic [`StreetGraph`] from [`SceneHints`] road spines, corridors, and (as a
-/// fallback when no streets exist) pedestrian walkways.
-fn extract_street_graph(hints: &SceneHints) -> StreetGraph {
-    let mut nodes: Vec<Vec3> = Vec::new();
-    let mut node_index: BTreeMap<(i32, i32), u32> = BTreeMap::new();
-    let mut edges: Vec<StreetEdge> = Vec::new();
-    let mut midpoints: Vec<Vec3> = Vec::new();
-
-    let mut intern_node = |p: Vec3| -> u32 {
-        let key = quantize_xz_node(p);
-        if let Some(&id) = node_index.get(&key) {
-            return id;
-        }
-        let id = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
-        nodes.push(p);
-        node_index.insert(key, id);
-        id
-    };
-
-    let mut push_edge = |edges: &mut Vec<StreetEdge>,
-                         raw_pts: &[CsgVec3],
-                         min_len_m: f32,
-                         width_m: f32,
-                         lanes: u8,
-                         oneway: bool,
-                         dedup_midpoints: bool| {
-        let pts: Vec<Vec3> = raw_pts
-            .iter()
-            .map(|&p| csg_to_glam(p))
-            .filter(|p| p.is_finite())
-            .collect();
-        if pts.len() < 2 || polyline_length_m(&pts) < min_len_m {
-            return;
-        }
-        let mid = pts[pts.len() / 2];
-        if dedup_midpoints
-            && midpoints
-                .iter()
-                .any(|&m| Vec3::new(m.x - mid.x, 0.0, m.z - mid.z).length_squared() < 16.0)
-        {
-            return;
-        }
-        let from = intern_node(pts[0]);
-        let to = intern_node(pts[pts.len() - 1]);
-        let id = u32::try_from(edges.len()).unwrap_or(u32::MAX);
-        let safe_width = if width_m.is_finite() {
-            width_m.clamp(3.0, 60.0)
-        } else {
-            8.0
-        };
-        edges.push(StreetEdge {
-            id,
-            from,
-            to,
-            points: pts,
-            width_m: safe_width,
-            lanes: lanes.max(1),
-            oneway,
-        });
-        midpoints.push(mid);
-    };
-
-    for spine in &hints.road_spines {
-        push_edge(
-            &mut edges,
-            &spine.pts,
-            1.0,
-            spine.width_m,
-            spine.lanes,
-            spine.oneway,
-            false,
-        );
-    }
-
-    for corridor in &hints.corridors {
-        push_edge(&mut edges, &corridor.pts, 6.0, corridor.width_m, 1, false, true);
-    }
-
-    if edges.is_empty() {
-        for walk in &hints.walkways {
-            if !walk.is_crosswalk {
-                push_edge(
-                    &mut edges,
-                    &walk.pts,
-                    8.0,
-                    walk.width_m.max(3.0),
-                    1,
-                    false,
-                    true,
-                );
-            }
-        }
-    }
-
-    StreetGraph { nodes, edges }
-}
-
-/// Sanitizes a landmark display label so residential street addresses never leak into plans or UI.
-///
-/// Why: project privacy rules forbid residential street addresses in labels, names, and tests;
-/// any blank label or label starting with a house number / matching a street-address pattern is
-/// replaced with a neutral indexed label (`"Landmark N"`).
-fn sanitize_landmark_name(raw: &str, fallback_idx: usize) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || looks_like_street_address(trimmed) {
-        return format!("Landmark {}", fallback_idx + 1);
-    }
-    trimmed.to_string()
-}
-
-/// Heuristic detector for residential/postal street-address strings (e.g. `"420 Maple Ave"`).
-fn looks_like_street_address(label: &str) -> bool {
-    const STREET_SUFFIXES: &[&str] = &[
-        "st", "st.", "street", "ave", "ave.", "avenue", "blvd", "blvd.", "boulevard", "dr", "dr.",
-        "drive", "rd", "rd.", "road", "ln", "ln.", "lane", "ct", "ct.", "court", "pl", "pl.",
-        "place", "way", "cir", "circle", "ter", "terrace", "pkwy", "parkway", "apt", "unit",
-    ];
-
-    let tokens: Vec<&str> = label.split_whitespace().collect();
-    if tokens.len() < 2 {
-        return false;
-    }
-
-    // House-number prefix (e.g. "420", "420A", "12-34"): reject immediately.
-    let first = tokens[0];
-    let first_has_digit = first.bytes().any(|b| b.is_ascii_digit());
-    let first_is_house_num = first_has_digit
-        && first
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'#');
-    if first_is_house_num {
-        return true;
-    }
-
-    // Embedded street number followed later by a thoroughfare suffix.
-    let has_number_token = tokens.iter().any(|t| {
-        !t.is_empty()
-            && t.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-            && t.bytes().any(|b| b.is_ascii_digit())
-    });
-    if has_number_token {
-        for tok in &tokens {
-            let lower = tok
-                .trim_matches(|c: char| c == ',' || c == ';')
-                .to_ascii_lowercase();
-            if STREET_SUFFIXES.contains(&lower.as_str()) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-/// One static building/structure candidate eligible to back a curated or auto-detected [`Landmark`].
-struct StaticLandmarkCandidate {
-    inst_id: u32,
-    bounds: Aabb,
-    center: Vec3,
-    volume_m3: f32,
-    is_overridden: bool,
-}
-
-/// Extracts curated landmarks from [`SceneHints::landmarks`] (with fallback promotion of notable
-/// static structures when hints are empty) and resolves matching static instance IDs.
-fn extract_landmarks(
-    world: &WorldScene,
-    hints: &SceneHints,
-    volume: &CsgVolumeAdapter,
-) -> Vec<Landmark> {
-    let compound_masks = world.library.semantic_masks();
-
-    // Pre-collect finite static building/structure/overridden instances for deterministic matching.
-    let mut static_candidates: Vec<StaticLandmarkCandidate> = Vec::new();
-    let mut static_idx = 0u32;
-    for chunk in world.chunks() {
-        for inst in chunk.instances() {
-            let idx = static_idx;
-            static_idx = static_idx.saturating_add(1);
-            if !inst.is_visible() {
-                continue;
-            }
-            let Some(asm) = world.assembly(inst.assembly_id) else {
-                continue;
-            };
-            let sem = instance_semantic(inst.flags, asm, &compound_masks);
-            let is_overridden = (inst.flags & inst_flags::OVERRIDDEN) != 0;
-            if !is_overridden && !matches!(sem, Sem::Building | Sem::Structure) {
-                continue;
-            }
-            let raw_aabb = inst.xform.xform_aabb(asm.local_aabb);
-            if raw_aabb.is_empty() || !raw_aabb.is_finite() {
-                continue;
-            }
-            let bounds = csg_aabb_to_fnav(raw_aabb);
-            let sz = bounds.size();
-            let volume_m3 = sz.x * sz.y * sz.z;
-            if !volume_m3.is_finite() || volume_m3 < 1.0 {
-                continue;
-            }
-            static_candidates.push(StaticLandmarkCandidate {
-                inst_id: stable_inst_id(inst.user_id, idx),
-                bounds,
-                center: bounds.center(),
-                volume_m3,
-                is_overridden,
-            });
-        }
-    }
-
-    let mut landmarks = Vec::with_capacity(hints.landmarks.len());
-    for (idx, hint) in hints.landmarks.iter().enumerate() {
-        let center = csg_to_glam(hint.center);
-        if !center.is_finite() {
-            continue;
-        }
-        let bounds = if !hint.bounds.is_empty() && hint.bounds.is_finite() {
-            csg_aabb_to_fnav(hint.bounds)
-        } else {
-            let r = if hint.hero_radius.is_finite() {
-                hint.hero_radius.clamp(4.0, 40.0)
-            } else {
-                10.0
-            };
-            Aabb::new(
-                center - Vec3::new(r, r * 0.5, r),
-                center + Vec3::new(r, r, r),
-            )
-        };
-        let ground_y = volume.ground_height(center.x, center.z).unwrap_or(bounds.min.y);
-        let height_m = (bounds.max.y - ground_y).max(bounds.size().y).max(2.0);
-        let pvd = csg_to_glam(hint.preferred_view_dir);
-        let preferred_view_dir =
-            (pvd.is_finite() && pvd.length_squared() > 1.0e-4).then(|| pvd.normalize());
-
-        let inst_user_id = static_candidates
-            .iter()
-            .filter(|c| c.bounds.contains(center))
-            .min_by(|a, b| {
-                b.is_overridden
-                    .cmp(&a.is_overridden)
-                    .then_with(|| {
-                        let da = (a.center - center).length_squared();
-                        let db = (b.center - center).length_squared();
-                        da.total_cmp(&db)
-                    })
-                    .then_with(|| a.inst_id.cmp(&b.inst_id))
-            })
-            .map(|c| c.inst_id);
-
-        let id = u32::try_from(landmarks.len()).unwrap_or(u32::MAX);
-        landmarks.push(Landmark {
-            id,
-            inst_user_id,
-            name: sanitize_landmark_name(&hint.name, idx),
-            center,
-            bounds,
-            preferred_view_dir,
-            height_m,
-            is_hero: hint.priority >= 128 || idx == 0,
-        });
-    }
-
-    // Fallback for hint-less scenes (e.g. Studio Asset Inspector or synthetic worlds):
-    // promote up to 4 largest static structures deterministically so hero framing still works.
-    if landmarks.is_empty() && !static_candidates.is_empty() {
-        static_candidates.sort_by(|a, b| {
-            b.is_overridden
-                .cmp(&a.is_overridden)
-                .then_with(|| b.volume_m3.total_cmp(&a.volume_m3))
-                .then_with(|| a.inst_id.cmp(&b.inst_id))
-        });
-        for (idx, cand) in static_candidates.into_iter().take(4).enumerate() {
-            let ground_y = volume
-                .ground_height(cand.center.x, cand.center.z)
-                .unwrap_or(cand.bounds.min.y);
-            let height_m = (cand.bounds.max.y - ground_y)
-                .max(cand.bounds.size().y)
-                .max(2.0);
-            landmarks.push(Landmark {
-                id: u32::try_from(idx).unwrap_or(u32::MAX),
-                inst_user_id: Some(cand.inst_id),
-                name: format!("Landmark {}", idx + 1),
-                center: cand.center,
-                bounds: cand.bounds,
-                preferred_view_dir: None,
-                height_m,
-                is_hero: cand.is_overridden || idx == 0,
-            });
-        }
-    }
-
-    landmarks
-}
-
-// Compile-time thread-safety contract: planner traits require Send + Sync across worker threads.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<CsgVolumeAdapter>();
-    assert_send_sync::<CsgObjectTable>();
-    assert_send_sync::<CsgSceneOracle>();
-};
-
 #[cfg(test)]
 mod tests {
-    use csg_core::{CsgNode, Mat3x4, MaterialId, semantic};
-    use csg_scene::{Assembly, Instance};
+    use csg_core::{CsgNode, Mat3x4, MaterialId, SemanticId, Vec3 as CsgVec3, semantic};
+    use csg_scene::{Assembly, Instance, WorldScene};
+    use flight_navigator::fnav_interest::ObjectTable;
     use flight_navigator::fnav_plan::Mode;
+    use flight_navigator::fnav_space::{SceneOracle, Sem, Volume};
+    use fnav_csg::CsgVolumeAdapter;
 
     use super::*;
 
@@ -1288,9 +481,8 @@ mod tests {
     }
 
     #[test]
-    fn volume_adapter_matches_voxel_volume_parity() {
+    fn fnav_csg_volume_adapter_matches_voxel_volume_bridge_coverage() {
         let mut world = WorldScene::new(32.0);
-        // Synthetic canyon + water basin + bridge deck for full R0 coverage.
         add_test_box(
             &mut world,
             "ground",
@@ -1298,30 +490,6 @@ mod tests {
             CsgVec3::new(24.0, 0.0, 24.0),
             semantic::GROUND,
             10,
-        );
-        add_test_box(
-            &mut world,
-            "road",
-            CsgVec3::new(8.0, -0.2, 0.0),
-            CsgVec3::new(16.0, 0.1, 24.0),
-            semantic::ROAD,
-            11,
-        );
-        add_test_box(
-            &mut world,
-            "tower_west",
-            CsgVec3::new(1.0, 0.0, 4.0),
-            CsgVec3::new(7.0, 12.0, 20.0),
-            semantic::BUILDING,
-            12,
-        );
-        add_test_box(
-            &mut world,
-            "tower_east",
-            CsgVec3::new(17.0, 0.0, 4.0),
-            CsgVec3::new(23.0, 10.0, 20.0),
-            semantic::BUILDING,
-            13,
         );
         add_test_box(
             &mut world,
@@ -1341,91 +509,14 @@ mod tests {
         );
 
         let raw = VoxelVolume::build(&world, None, VoxelVolumeConfig::default());
-        let expected_bounds = csg_aabb_to_fnav(raw.bounds());
         let expected_hash = raw.hash();
-
         let adapter = CsgVolumeAdapter::new(raw);
-        let raw_ref = adapter.inner();
-
-        assert_eq!(adapter.bounds(), expected_bounds);
         assert_eq!(adapter.hash(), expected_hash);
 
-        let probe_xz = [
-            (0.0, 0.0),
-            (4.2, 10.5),
-            (12.0, 12.0),
-            (20.1, 14.7),
-            (30.0, 12.0),
-            (30.0, 2.0),
-            (expected_bounds.max.x, expected_bounds.max.z),
-            (-5.0, -5.0),
-            (100.0, 100.0),
-            (f32::NAN, 5.0),
-            (5.0, f32::INFINITY),
-        ];
-
-        for (x, z) in probe_xz {
-            let raw_spans = raw_ref.column_spans(x, z);
-            let ad_spans = adapter.column_spans(x, z);
-            assert_eq!(
-                ad_spans.len(),
-                raw_spans.len(),
-                "span count mismatch at ({x}, {z})"
-            );
-            for (a, r) in ad_spans.iter().zip(raw_spans.iter()) {
-                assert_eq!(a.y0, r.y0);
-                assert_eq!(a.y1, r.y1);
-                assert_eq!(a.sem, voxel_class_to_sem(r.class));
-            }
-            assert_eq!(adapter.ground_height(x, z), raw_ref.ground_height(x, z));
-            assert_eq!(adapter.roof_height(x, z), raw_ref.roof_height(x, z));
-        }
-
-        let probe_pts = [
-            Vec3::new(4.0, 5.0, 12.0),
-            Vec3::new(12.0, 3.5, 12.0),
-            Vec3::new(12.0, 0.05, 12.0),
-            Vec3::new(30.0, 3.0, 12.0),
-            Vec3::new(30.0, 6.5, 12.0),
-            Vec3::new(30.0, 2.0, 2.0),
-            Vec3::new(-10.0, 5.0, -10.0),
-            Vec3::new(f32::NAN, 1.0, 2.0),
-        ];
-
-        for p in probe_pts {
-            let cp = glam_to_csg(p);
-            assert_eq!(adapter.distance(p), raw_ref.distance(cp));
-            assert_eq!(adapter.gradient(p), csg_to_glam(raw_ref.gradient(cp)));
-            assert_eq!(adapter.covered(p), raw_ref.covered(cp));
-            assert_eq!(
-                adapter.semantics_at(p),
-                voxel_sem_to_fnav(raw_ref.semantics_at(cp))
-            );
-            assert_eq!(adapter.voxel_size_at(p), raw_ref.voxel_size_at(cp));
-            assert_eq!(adapter.is_thin_sharp(p), raw_ref.is_thin_sharp(cp));
-        }
-
-        // Verify bridge-covered water point reports covered = true and preserves COVERED_BIT.
         let under_bridge = Vec3::new(30.0, 3.0, 12.0);
         assert!(adapter.covered(under_bridge));
         assert!(adapter.semantics_at(under_bridge).is_covered());
         assert_eq!(adapter.semantics_at(under_bridge).sem(), Sem::Empty);
-    }
-
-    #[test]
-    fn landmark_name_sanitization_strips_address_patterns() {
-        assert_eq!(
-            sanitize_landmark_name("Coastal Refinery Towers", 0),
-            "Coastal Refinery Towers"
-        );
-        assert_eq!(
-            sanitize_landmark_name("Harbor Promenade", 1),
-            "Harbor Promenade"
-        );
-        assert_eq!(sanitize_landmark_name("   ", 2), "Landmark 3");
-        assert_eq!(sanitize_landmark_name("420 Maple Ave", 3), "Landmark 4");
-        assert_eq!(sanitize_landmark_name("12-B Cedar Street", 4), "Landmark 5");
-        assert_eq!(sanitize_landmark_name("Unit 700 Pine Rd", 5), "Landmark 6");
     }
 
     #[test]
@@ -1467,8 +558,8 @@ mod tests {
             .expect("gundo scene must build cleanly");
 
         let sun_dir = Vec3::new(0.45, 0.72, 0.52).normalize();
-        let (oracle, objects) = CsgSceneOracle::build_with_baker(built, Some(sun_dir), None)
-            .expect("CsgSceneOracle::build_with_baker must succeed on gundo");
+        let (oracle, objects) = build_oracle_with_baker(built, Some(sun_dir), None)
+            .expect("build_oracle_with_baker must succeed on gundo");
 
         assert!(
             objects.total_instances() > 0,
@@ -1485,13 +576,14 @@ mod tests {
             mode: Mode::Deterministic,
             ..PlanRequest::default()
         };
-        let prober = CpuRayProber::new(&oracle);
         let mut cache = PlanCache::default();
 
-        let plan_a = fnav_plan::plan(&oracle, &prober, &objects, &mut cache, &req)
+        let src_a = plan_world_track(&oracle, &objects, &mut cache, &req)
             .expect("deterministic 30 s plan on gundo must succeed");
-        let plan_b = fnav_plan::plan(&oracle, &prober, &objects, &mut cache, &req)
+        let src_b = plan_world_track(&oracle, &objects, &mut cache, &req)
             .expect("cached deterministic 30 s plan on gundo must succeed");
+        let plan_a = src_a.plan();
+        let plan_b = src_b.plan();
 
         assert!(!plan_a.shots.is_empty(), "planned tour must contain shots");
         assert!(

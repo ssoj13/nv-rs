@@ -467,6 +467,8 @@ pub struct SceneLoadedMetadata {
     pub viewpoints: Vec<SceneViewpoint>,
     /// Collision-verified cinematic camera rails exported by the scene module.
     pub rails: Vec<RailSpec>,
+    /// Named scene landmarks exported from `SceneHints` for `RailRig` `LookMode::Track`.
+    pub landmarks: Vec<csg_scene::LandmarkHint>,
 }
 
 /// Device pointer bundle copied into `LaunchParams` each frame.
@@ -3780,6 +3782,7 @@ impl CsgGpuHost {
                 variant_idx: 0,
                 viewpoints: Vec::new(),
                 rails: Vec::new(),
+                landmarks: Vec::new(),
             });
             return Ok(());
         }
@@ -3887,6 +3890,7 @@ impl CsgGpuHost {
             variant_idx: key.variant_idx,
             viewpoints: built.viewpoints.clone(),
             rails: built.rails.clone(),
+            landmarks: built.hints.landmarks.clone(),
         });
         self.sim_summary = compute_scene_sim_summary(&built);
         self.last_traffic_step_ms = 0.0;

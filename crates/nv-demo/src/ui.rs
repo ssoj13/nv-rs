@@ -1755,7 +1755,32 @@ impl UiContext<'_> {
                         (*self.possess_zoom_offset + pinch_delta + wheel_delta).clamp(-1.5, 40.0);
                 }
             }
+        } else if !split_dragging
+            && !toolbar_blocking
+            && !pick_clicked
+            && !pick_active
+            && self.flight_workspace.player.is_rig_free_look_active()
+        {
+            if kb_free && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.bus
+                    .emit_ui(UiCommand::Flight(crate::flight::FlightCommand::RigEject));
+            }
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                if d.x != 0.0 || d.y != 0.0 {
+                    self.flight_workspace
+                        .player
+                        .push_rig_input([d.x * 0.25, -d.y * 0.25, 0.0]);
+                }
+            }
         } else if !split_dragging && !toolbar_blocking && !pick_clicked && !pick_active {
+            if kb_free
+                && self.flight_workspace.player.is_rig_active()
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                self.bus
+                    .emit_ui(UiCommand::Flight(crate::flight::FlightCommand::RigEject));
+            }
             if resp.dragged() && self.flight_workspace.player.is_active() {
                 self.flight_workspace.player.pause();
             }

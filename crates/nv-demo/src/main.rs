@@ -4530,6 +4530,9 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         );
                         self.flight_workspace
                             .player
+                            .set_scene_landmarks(meta.landmarks.clone());
+                        self.flight_workspace
+                            .player
                             .notify_scene_loaded(scene_id, &scene_hash);
                         if self.flight_workspace.player.is_active() {
                             self.rail_blend_remaining = self.rail_blend_remaining.max(1.2);
@@ -4921,10 +4924,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     other => self.flight_workspace.apply_command(other, self.cam_pose),
                 };
                 if outcome.snap_cam {
-                    if let Some(pose) = self.flight_workspace.player.evaluate_current(
-                        self.cam_pose.znear,
-                        self.cam_pose.zfar.max(2000.0),
-                    ) {
+                    let snap_pose = outcome.ejected_pose.or_else(|| {
+                        self.flight_workspace.player.evaluate_current(
+                            self.cam_pose.znear,
+                            self.cam_pose.zfar.max(2000.0),
+                        )
+                    });
+                    if let Some(pose) = snap_pose {
                         self.cam_pose = pose;
                         self.cam_driver.controller_mut().set_pose(pose);
                         self.cam_damper.snap(pose);

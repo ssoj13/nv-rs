@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-`nv-demo` (`crates/nv-demo/`, **262 unit tests** + **10 ignored GPU / OptiX / NVRTC / `cuFFT` Ocean / scene-census tests**) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, `nv-wgpu`, `appbus-rs`, `camera-rs`, `flight-navigator-rs`, and `csg-rs` (`csg-core`, `csg-actors`, `csg-traffic`, `csg-scene`, `csg-device`, `csg-scenes` at `f279da3`, `osm-rs` `301518e`) into a decoupled **60 Hz paced** `egui-wgpu` docked desktop studio with zero-copy CUDA ↔ `wgpu` presentation — **100% procedural / zero triangle-mesh assets**.
+`nv-demo` (`crates/nv-demo/`, **262 unit tests** + **10 ignored GPU / OptiX / NVRTC / `cuFFT` Ocean / scene-census tests**) is the full-stack interactive RTX showcase for `nv-rs`. It wires `optix`, `nvrtc`, `cufft`, `nvjpeg`, `nvenc`, `nvml`, `cupti`, `ngx`, `cuda-core-ext`, `nv-wgpu`, `appbus-rs`, `camera-rs`, `flight-navigator-rs` (`e43bf05` + `fnav-csg` driving `csg_scene::RailRig`), and `csg-rs` (`csg-core`, `csg-actors`, `csg-traffic`, `csg-scene`, `csg-device`, `csg-scenes` at `f279da3`, `osm-rs` `301518e`) into a decoupled **60 Hz paced** `egui-wgpu` docked desktop studio with zero-copy CUDA ↔ `wgpu` presentation — **100% procedural / zero triangle-mesh assets**.
 
 ## Building & Running
 

@@ -18,13 +18,17 @@
 use std::path::{Path, PathBuf};
 
 use camera::CameraPose;
-use csg_scene::RailSpec;
+use csg_scene::{
+    BodyPose, BodyPoseSource, DroneTilt, LandmarkHint, LookMode, RailRig, RailSpec, RigInput,
+    TrackResolver, TrackStatus, TrackTarget,
+};
 use flight_navigator::fnav_core::{
     Aim, CameraState, FlightLibrary, LibrarySource, PLAYLIST_FILE_EXT, PlaylistEntry, PlaylistFile,
     PlaylistTransition, RepeatMode, SceneRef, TRACK_FILE_EXT, Track, TrackRef, Transition,
 };
 use flight_navigator::fnav_plan::{RailPlan, SplitMix64};
 use flight_navigator::{PlanTrackFile, load_plan_track};
+use fnav_csg::{PlanBodyPoseSource, TrackBodyPoseSource};
 use serde::{Deserialize, Serialize};
 
 use crate::flight::convert::curated_rail_to_track;
@@ -223,6 +227,133 @@ pub struct PlayerEval {
     pub subject_fallback: bool,
 }
 
+/// Camera evaluation mode for [`FlightPlayer`].
+///
+/// Why: keeps direct `Track::eval_step` framing (`Cinematic`, default for exact `--bench-*` and
+/// authored shot parity) alongside live `csg_scene::RailRig` drone-body / gimbal modes
+/// (`AlongPath`, `Track`, `Free`) fed by [`fnav_csg::TrackBodyPoseSource`] /
+/// [`fnav_csg::PlanBodyPoseSource`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FlightRigCameraMode {
+    /// Direct `fnav-core::Track` cinematic framing (preserves exact shot aims & `--bench-*`).
+    #[default]
+    Cinematic,
+    /// `csg_scene::RailRig` with [`LookMode::AlongPath`] (acceleration tilt + forward gimbal).
+    AlongPath,
+    /// `csg_scene::RailRig` with [`LookMode::Track`] locked onto a scene landmark.
+    Track,
+    /// `csg_scene::RailRig` with [`LookMode::Free`] (viewport drag steers gimbal without pausing).
+    Free,
+}
+
+impl FlightRigCameraMode {
+    /// Short UI label for the Flight Player Drone Rig bar.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cinematic => "Cinematic",
+            Self::AlongPath => "Along",
+            Self::Track => "Track",
+            Self::Free => "Free",
+        }
+    }
+
+    /// Returns `true` when `csg_scene::RailRig` owns the camera gimbal.
+    #[must_use]
+    pub const fn uses_rail_rig(self) -> bool {
+        !matches!(self, Self::Cinematic)
+    }
+}
+
+/// Live telemetry snapshot captured from `csg_scene::RailRig::step` for the Flight Player UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RigTelemetry {
+    /// True when the latest evaluated frame came from `csg_scene::RailRig`.
+    pub active: bool,
+    /// Total drone body tilt angle off world `+Y` (degrees).
+    pub tilt_deg: f32,
+    /// Gimbal `[yaw, pitch, roll]` angles in degrees.
+    pub gimbal_deg: [f32; 3],
+    /// Tracking status from `RailRig::step` (`Locked`, `OutOfRange`, `TargetLost`).
+    pub track_status: TrackStatus,
+    /// Angular tracking error in degrees (`0.0` outside `LookMode::Track`).
+    pub track_error_deg: f32,
+    /// Drone rotor phase in radians (`[0, TAU)`).
+    pub rotor_phase: f32,
+}
+
+/// [`csg_scene::BodyPoseSource`] unifying [`TrackBodyPoseSource`] and [`PlanBodyPoseSource`].
+///
+/// Why: lets [`FlightPlayer`] feed `csg_scene::RailRig` directly from `fnav-csg`'s
+/// `PlanBodyPoseSource` when a slot carries a full [`RailPlan`] (contact sheet + report) and from
+/// `TrackBodyPoseSource<Track>` for curated/manual tracks, with zero per-frame allocations.
+#[derive(Clone, Debug)]
+pub enum FlightBodySource {
+    /// Owned [`Track`] wrapped in [`TrackBodyPoseSource`].
+    Track(TrackBodyPoseSource<Track>),
+    /// Owned [`RailPlan`] wrapped in [`PlanBodyPoseSource`] (boxed to keep `FlightBodySource` compact).
+    Plan(Box<PlanBodyPoseSource>),
+}
+
+impl FlightBodySource {
+    /// Constructs the best [`FlightBodySource`] for a [`PlaylistSlot`].
+    #[must_use]
+    pub fn from_slot(slot: &PlaylistSlot) -> Self {
+        match slot.plan.clone() {
+            Some(plan) => Self::Plan(Box::new(PlanBodyPoseSource::new(plan))),
+            None => Self::Track(TrackBodyPoseSource::new(slot.track.clone())),
+        }
+    }
+}
+
+impl BodyPoseSource for FlightBodySource {
+    #[inline]
+    fn pose_at(&self, t: f32) -> BodyPose {
+        match self {
+            Self::Track(src) => src.pose_at(t),
+            Self::Plan(src) => src.pose_at(t),
+        }
+    }
+
+    #[inline]
+    fn duration_s(&self) -> Option<f32> {
+        match self {
+            Self::Track(src) => src.duration_s(),
+            Self::Plan(src) => src.duration_s(),
+        }
+    }
+}
+
+/// Zero-allocation [`TrackResolver`] over the loaded scene's [`LandmarkHint`] slice.
+struct LandmarkTargets<'a>(&'a [LandmarkHint]);
+
+impl TrackResolver for LandmarkTargets<'_> {
+    fn resolve(&self, target: &TrackTarget) -> Option<csg_core::Vec3> {
+        match target {
+            TrackTarget::Point(p) => Some(*p),
+            TrackTarget::Landmark(name) => self
+                .0
+                .iter()
+                .find(|l| l.name == *name)
+                .map(|l| l.center),
+            TrackTarget::Instance(_) => None,
+        }
+    }
+}
+
+/// Converts a `csg_scene::CameraPose` (from [`RailRig::step`]) into a `camera::CameraPose`.
+#[inline]
+fn csg_cam_to_pose(cam: csg_scene::CameraPose, znear: f32, zfar: f32) -> CameraPose {
+    let eye = glam::Vec3::new(cam.eye.x, cam.eye.y, cam.eye.z);
+    let fwd = glam::Vec3::new(cam.forward.x, cam.forward.y, cam.forward.z);
+    let up = glam::Vec3::new(cam.up.x, cam.up.y, cam.up.z);
+    let fov_y = cam
+        .vfov_deg
+        .to_radians()
+        .clamp(camera::FOV_MIN, camera::FOV_MAX);
+    CameraPose::from_eye_forward_up(eye, fwd, up, fov_y, znear, zfar)
+}
+
 /// Serializable Flight Player user preferences persisted in `nv-demo.json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -291,6 +422,16 @@ pub struct FlightPlayer {
     pub last_bank_rad: f32,
     /// Latest live chase-window flag for the Now Playing card.
     pub last_active_chase: bool,
+    /// Camera mode (`Cinematic` track framing vs `csg_scene::RailRig` `AlongPath`/`Track`/`Free`).
+    pub rig_mode: FlightRigCameraMode,
+    /// `csg_scene::DroneTilt` filter parameters (`max_tilt_deg`, `tau_s`) applied to [`RailRig`].
+    pub rig_tilt: DroneTilt,
+    /// Selected landmark name for [`FlightRigCameraMode::Track`].
+    pub rig_track_landmark: Option<String>,
+    /// Scene landmarks synced from `SceneLoadedMetadata` for zero-allocation [`TrackResolver`].
+    pub scene_landmarks: Vec<LandmarkHint>,
+    /// Latest live `RailRig` drone-tilt / gimbal / tracking telemetry.
+    pub last_rig: RigTelemetry,
     /// Human-readable status or error line surfaced in the Player footer.
     pub status_msg: String,
 
@@ -301,6 +442,9 @@ pub struct FlightPlayer {
     pending_after_load: Option<usize>,
     pending_fade_in_s: Option<f64>,
     last_pose: Option<CameraPose>,
+    active_rig: Option<(usize, u64, RailRig<FlightBodySource>)>,
+    rig_generation: u64,
+    pending_rig_input: RigInput,
 }
 
 impl Default for FlightPlayer {
@@ -335,6 +479,11 @@ impl FlightPlayer {
             last_speed_mps: 0.0,
             last_bank_rad: 0.0,
             last_active_chase: false,
+            rig_mode: FlightRigCameraMode::Cinematic,
+            rig_tilt: DroneTilt::default(),
+            rig_track_landmark: None,
+            scene_landmarks: Vec::new(),
+            last_rig: RigTelemetry::default(),
             status_msg: String::new(),
             prev_t: None,
             pending_cut_before: false,
@@ -343,6 +492,9 @@ impl FlightPlayer {
             pending_after_load: None,
             pending_fade_in_s: None,
             last_pose: None,
+            active_rig: None,
+            rig_generation: 0,
+            pending_rig_input: RigInput::default(),
         };
         player.rescan_library();
         player
@@ -837,6 +989,184 @@ impl FlightPlayer {
         Ok(pl_path)
     }
 
+    /// Installs the loaded scene's [`LandmarkHint`] list for `RailRig` [`LookMode::Track`].
+    ///
+    /// Automatically selects the highest-priority landmark when no valid landmark is currently
+    /// selected so switching into `Track` mode locks immediately onto a hero subject.
+    pub fn set_scene_landmarks(&mut self, landmarks: Vec<LandmarkHint>) {
+        self.scene_landmarks = landmarks;
+        let current_valid = self
+            .rig_track_landmark
+            .as_deref()
+            .is_some_and(|name| self.scene_landmarks.iter().any(|l| l.name == name));
+        if !current_valid {
+            self.rig_track_landmark = self
+                .scene_landmarks
+                .iter()
+                .max_by_key(|l| l.priority)
+                .map(|l| l.name.clone());
+        }
+        self.sync_cached_rig_mode();
+    }
+
+    /// Switches the camera rig mode (`Cinematic`, `AlongPath`, `Track`, `Free`) without jumping
+    /// gimbal angles on an active [`RailRig`].
+    pub fn set_rig_mode(&mut self, mode: FlightRigCameraMode) {
+        self.rig_mode = mode;
+        if mode == FlightRigCameraMode::Cinematic {
+            self.last_rig.active = false;
+            self.pending_rig_input = RigInput::default();
+        } else {
+            self.sync_cached_rig_mode();
+        }
+    }
+
+    /// Selects the named scene landmark tracked in [`FlightRigCameraMode::Track`].
+    pub fn set_rig_track_landmark(&mut self, landmark_name: String) {
+        self.rig_track_landmark = (!landmark_name.is_empty()).then_some(landmark_name);
+        self.sync_cached_rig_mode();
+    }
+
+    /// Updates [`DroneTilt`] filter settings (`max_tilt_deg`, `tau_s`) on the cached [`RailRig`].
+    pub fn set_rig_tilt(&mut self, tilt: DroneTilt) {
+        self.rig_tilt = DroneTilt {
+            max_tilt_deg: if tilt.max_tilt_deg.is_finite() {
+                tilt.max_tilt_deg.clamp(0.0, 45.0)
+            } else {
+                DroneTilt::default().max_tilt_deg
+            },
+            tau_s: if tilt.tau_s.is_finite() {
+                tilt.tau_s.clamp(0.02, 2.0)
+            } else {
+                DroneTilt::default().tau_s
+            },
+        };
+        if let Some((_, _, rig)) = self.active_rig.as_mut() {
+            rig.tilt = self.rig_tilt;
+        }
+    }
+
+    /// Accumulates viewport drag deltas `[yaw_deg, pitch_deg, roll_deg]` for [`FlightRigCameraMode::Free`].
+    #[inline]
+    pub fn push_rig_input(&mut self, delta_deg: [f32; 3]) {
+        for (dst, d) in self.pending_rig_input.free_delta_deg.iter_mut().zip(delta_deg) {
+            if d.is_finite() {
+                *dst += d;
+            }
+        }
+    }
+
+    /// Returns `true` when playback is active and driven by `csg_scene::RailRig`.
+    #[inline]
+    #[must_use]
+    pub fn is_rig_active(&self) -> bool {
+        self.is_active() && self.rig_mode.uses_rail_rig()
+    }
+
+    /// Returns `true` when playback is active in `RailRig` [`FlightRigCameraMode::Free`] mode
+    /// (viewport drag steers the gimbal without pausing playback).
+    #[inline]
+    #[must_use]
+    pub fn is_rig_free_look_active(&self) -> bool {
+        self.is_active() && self.rig_mode == FlightRigCameraMode::Free
+    }
+
+    /// Ejects cleanly from the drone `RailRig` into free camera control at the rig's latest pose.
+    ///
+    /// Pauses active playback (leaving the cursor at the current timestamp for easy resume),
+    /// clears queued gimbal deltas, and returns the latest camera pose so the host can snap
+    /// `CameraDriver` + `CameraDamper` seamlessly without a camera jump.
+    pub fn eject_rig(&mut self) -> Option<CameraPose> {
+        self.pending_rig_input = RigInput::default();
+        self.last_rig.active = false;
+        self.pause();
+        self.status_msg = "Ejected from RailRig to free camera".to_string();
+        self.last_pose
+    }
+
+    /// Builds the `csg_scene::LookMode` corresponding to [`Self::rig_mode`] and [`Self::rig_track_landmark`].
+    fn desired_look_mode(&self) -> LookMode {
+        match self.rig_mode {
+            FlightRigCameraMode::Cinematic | FlightRigCameraMode::AlongPath => LookMode::AlongPath,
+            FlightRigCameraMode::Free => LookMode::Free,
+            FlightRigCameraMode::Track => match self.rig_track_landmark.as_deref() {
+                Some(name) if !name.is_empty() => {
+                    LookMode::Track(TrackTarget::Landmark(name.to_string()))
+                }
+                _ => LookMode::AlongPath,
+            },
+        }
+    }
+
+    /// Syncs look mode and tilt parameters onto the cached [`RailRig`] (if instantiated).
+    fn sync_cached_rig_mode(&mut self) {
+        let mode = self.desired_look_mode();
+        let tilt = self.rig_tilt;
+        if let Some((_, _, rig)) = self.active_rig.as_mut() {
+            rig.tilt = tilt;
+            if rig.mode != mode {
+                rig.set_mode(mode);
+            }
+        }
+    }
+
+    /// Marks any cached [`RailRig`] stale after queue mutation or track replacement.
+    #[inline]
+    fn invalidate_cached_rig(&mut self) {
+        self.rig_generation = self.rig_generation.wrapping_add(1);
+        self.active_rig = None;
+    }
+
+    /// Steps the cached `csg_scene::RailRig<FlightBodySource>` for `entry_idx` with zero per-tick
+    /// allocations, updating [`Self::last_rig`] and returning the gimbal [`CameraPose`].
+    fn step_slot_rail_rig(
+        &mut self,
+        entry_idx: usize,
+        eval_t: f64,
+        dt: f64,
+        vfov_deg: f32,
+        znear: f32,
+        zfar: f32,
+    ) -> Option<CameraPose> {
+        let need_rebuild = match self.active_rig.as_ref() {
+            Some((idx, gen_id, _)) => *idx != entry_idx || *gen_id != self.rig_generation,
+            None => true,
+        };
+        if need_rebuild {
+            let slot = self.queue.get(entry_idx)?;
+            let src = FlightBodySource::from_slot(slot);
+            let mut rig = RailRig::new(src, vfov_deg);
+            rig.tilt = self.rig_tilt;
+            rig.set_mode(self.desired_look_mode());
+            self.active_rig = Some((entry_idx, self.rig_generation, rig));
+        }
+
+        let input = std::mem::take(&mut self.pending_rig_input);
+        let desired_mode = self.desired_look_mode();
+        let tilt_cfg = self.rig_tilt;
+        let targets = LandmarkTargets(&self.scene_landmarks);
+        let (_, _, rig) = self.active_rig.as_mut()?;
+        rig.tilt = tilt_cfg;
+        rig.vfov_deg = vfov_deg;
+        if rig.mode != desired_mode {
+            rig.set_mode(desired_mode);
+        }
+        let rig_pose = rig.step(eval_t as f32, dt as f32, &targets, &input);
+        let up_y = (rig_pose.body_xform.xform_pt(csg_core::Vec3::Y)
+            - rig_pose.body_xform.xform_pt(csg_core::Vec3::ZERO))
+            .y
+            .clamp(-1.0, 1.0);
+        self.last_rig = RigTelemetry {
+            active: true,
+            tilt_deg: up_y.acos().to_degrees(),
+            gimbal_deg: rig.gimbal.angle_deg,
+            track_status: rig_pose.track,
+            track_error_deg: rig_pose.track_error_deg,
+            rotor_phase: rig_pose.rotor_phase,
+        };
+        Some(csg_cam_to_pose(rig_pose.camera, znear, zfar))
+    }
+
     /// Reorders a playlist slot from `from` to `to`, keeping `active_idx` synced to the same slot.
     pub fn reorder(&mut self, from: usize, to: usize) {
         if from >= self.queue.len() || to >= self.queue.len() || from == to {
@@ -858,6 +1188,7 @@ impl FlightPlayer {
             PlayerState::Idle | PlayerState::Loading { .. } => {}
         }
         self.rebuild_shuffle_order();
+        self.invalidate_cached_rig();
     }
 
     /// Removes slot `idx` from the playlist queue, stopping safely if the queue becomes empty.
@@ -906,6 +1237,7 @@ impl FlightPlayer {
             }
         }
         self.rebuild_shuffle_order();
+        self.invalidate_cached_rig();
     }
 
     /// Updates the entry transition mode of slot `idx`.
@@ -953,6 +1285,7 @@ impl FlightPlayer {
         }
         self.prev_t = None;
         self.status_msg = format!("Updated active track `{}` ({:.1} s)", slot.title, new_dur);
+        self.invalidate_cached_rig();
         Ok(())
     }
 
@@ -985,6 +1318,7 @@ impl FlightPlayer {
             self.rebuild_shuffle_order();
             self.queue.len() - 1
         };
+        self.invalidate_cached_rig();
         self.select_entry(idx, true);
     }
 
@@ -1227,8 +1561,23 @@ impl FlightPlayer {
             self.prev_t = Some(next_t);
             self.time_s = next_t;
             let cut_before = sample.cut_before || std::mem::take(&mut self.pending_cut_before);
+            let base_pose = sample.state.to_camera_pose(znear, zfar);
+            let pose = if self.rig_mode.uses_rail_rig() {
+                self.step_slot_rail_rig(
+                    entry_idx,
+                    next_t,
+                    dt,
+                    base_pose.fov_y.to_degrees(),
+                    znear,
+                    zfar,
+                )
+                .unwrap_or(base_pose)
+            } else {
+                self.last_rig.active = false;
+                base_pose
+            };
             return Some(self.finish_eval(
-                sample.state.to_camera_pose(znear, zfar),
+                pose,
                 cut_before,
                 0.0,
                 None,
@@ -1269,8 +1618,23 @@ impl FlightPlayer {
                 self.time_s = wrapped;
                 self.prev_t = Some(wrapped);
                 let cut_before = sample.cut_before || std::mem::take(&mut self.pending_cut_before);
+                let base_pose = sample.state.to_camera_pose(znear, zfar);
+                let pose = if self.rig_mode.uses_rail_rig() {
+                    self.step_slot_rail_rig(
+                        entry_idx,
+                        wrapped,
+                        dt,
+                        base_pose.fov_y.to_degrees(),
+                        znear,
+                        zfar,
+                    )
+                    .unwrap_or(base_pose)
+                } else {
+                    self.last_rig.active = false;
+                    base_pose
+                };
                 return Some(self.finish_eval(
-                    sample.state.to_camera_pose(znear, zfar),
+                    pose,
                     cut_before,
                     0.0,
                     None,

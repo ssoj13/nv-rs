@@ -210,13 +210,23 @@ pub enum FlightCommand {
         /// Write to `assets/flights` if `true`, else `~/.nv-rs/flights`.
         to_repo: bool,
     },
+    /// Switch Flight Player camera rig mode (`Cinematic` / `AlongPath` / `Track` / `Free`).
+    SetRigMode(player::FlightRigCameraMode),
+    /// Select the named scene landmark tracked by `RailRig` in `LookMode::Track`.
+    SetRigTrackLandmark(String),
+    /// Update `csg_scene::DroneTilt` filter settings (`max_tilt_deg`, `tau_s`).
+    SetRigTilt(csg_scene::DroneTilt),
+    /// Eject cleanly from `RailRig` into free camera control at the rig's current pose.
+    RigEject,
 }
 
 /// Host side effects requested after [`FlightWorkspace::apply_command`] updates state.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FlightCommandOutcome {
     /// Snap `CameraDamper` immediately onto the evaluated pose (seek, cut, track switch).
     pub snap_cam: bool,
+    /// Explicit camera pose to snap the host camera to when ejecting from `RailRig`.
+    pub ejected_pose: Option<CameraPose>,
     /// Reset `FlightStats` telemetry ring buffer (new track / playback start).
     pub reset_stats: bool,
     /// Toggle host MP4 video recording for a full-playlist capture pass.
@@ -421,6 +431,19 @@ impl FlightWorkspace {
                         self.lab.status_msg = format!("Save failed: {err}");
                     }
                 }
+            }
+            FlightCommand::SetRigMode(mode) => {
+                self.player.set_rig_mode(mode);
+            }
+            FlightCommand::SetRigTrackLandmark(name) => {
+                self.player.set_rig_track_landmark(name);
+            }
+            FlightCommand::SetRigTilt(tilt) => {
+                self.player.set_rig_tilt(tilt);
+            }
+            FlightCommand::RigEject => {
+                out.ejected_pose = self.player.eject_rig();
+                out.snap_cam = true;
             }
         }
         out
@@ -1257,6 +1280,147 @@ mod tests {
             ws.player.state,
             PlayerState::Loading { ref scene_id } if scene_id == "marina"
         ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rail_rig_drives_along_path_track_free_and_eject_via_fnav_csg() {
+        use csg_core::{Aabb as CsgAabb, Vec3 as CsgVec3};
+        use csg_scene::{BodyPoseSource, DroneTilt, LandmarkHint, TrackStatus};
+        use flight_navigator::fnav_core::{Lens, Segment, ShotMove, ShotMoveParams};
+        use player::{FlightBodySource, FlightRigCameraMode};
+
+        let dir = temp_dir("rail_rig_modes");
+        let mut ws = FlightWorkspace::new(dir.join("repo"), dir.join("user"));
+
+        let orbit = ShotMove::new(
+            ShotMoveParams::Orbit {
+                center: Vec3::new(0.0, 14.0, 0.0),
+                target: Vec3::new(0.0, 14.0, 0.0),
+                radius_m: 28.0,
+                height_offset_m: 2.0,
+                start_az_rad: 0.0,
+                sweep_rad: std::f32::consts::TAU,
+                lens: Lens::pinhole(35.0),
+            },
+            12.0,
+        );
+        let loop_track = Track {
+            segments: vec![Segment::Shot(orbit.clone())],
+            looping: true,
+        };
+        let oneshot_track = Track {
+            segments: vec![Segment::Shot(orbit)],
+            looping: false,
+        };
+
+        // Looping vs one-shot duration contract via fnav_csg::TrackBodyPoseSource.
+        let loop_slot = PlaylistSlot {
+            title: "Orbit Loop".to_string(),
+            description: String::new(),
+            scene_id: "gundo".to_string(),
+            track_id: "orbit_loop".to_string(),
+            file_path: None,
+            track: loop_track,
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::LabPreview,
+        };
+        assert_eq!(FlightBodySource::from_slot(&loop_slot).duration_s(), None);
+
+        let oneshot_slot = PlaylistSlot {
+            track: oneshot_track,
+            ..loop_slot.clone()
+        };
+        assert_eq!(
+            FlightBodySource::from_slot(&oneshot_slot).duration_s(),
+            Some(12.0)
+        );
+
+        ws.player.queue.push(loop_slot);
+        ws.player.set_scene_landmarks(vec![LandmarkHint {
+            name: "Civic Spire".to_string(),
+            center: CsgVec3::new(0.0, 14.0, 0.0),
+            bounds: CsgAabb::new(
+                CsgVec3::new(-5.0, 0.0, -5.0),
+                CsgVec3::new(5.0, 28.0, 5.0),
+            ),
+            preferred_view_dir: CsgVec3::new(0.0, 0.0, -1.0),
+            hero_radius: 10.0,
+            priority: 200,
+        }]);
+        assert_eq!(
+            ws.player.rig_track_landmark.as_deref(),
+            Some("Civic Spire")
+        );
+        assert!(ws.player.play());
+
+        let dt = 1.0 / 60.0;
+        let cur_pose = CameraPose::default();
+
+        // 1. AlongPath: centripetal acceleration must produce measurable DroneTilt.
+        ws.apply_command(FlightCommand::SetRigMode(FlightRigCameraMode::AlongPath), cur_pose);
+        ws.apply_command(
+            FlightCommand::SetRigTilt(DroneTilt {
+                max_tilt_deg: 25.0,
+                tau_s: 0.25,
+            }),
+            cur_pose,
+        );
+        let mut max_tilt_deg = 0.0_f32;
+        for _ in 0..45 {
+            let ev = ws
+                .player
+                .tick(dt, 0.05, 5000.0)
+                .expect("RailRig AlongPath tick");
+            assert!(ev.pose.eye.is_finite());
+            assert!(ws.player.last_rig.active);
+            max_tilt_deg = max_tilt_deg.max(ws.player.last_rig.tilt_deg);
+        }
+        assert!(
+            max_tilt_deg > 0.1,
+            "expected measurable DroneTilt along circular orbit, got {max_tilt_deg}"
+        );
+
+        // 2. Track: gimbal locks onto Civic Spire landmark.
+        ws.apply_command(FlightCommand::SetRigMode(FlightRigCameraMode::Track), cur_pose);
+        for _ in 0..90 {
+            let ev = ws
+                .player
+                .tick(dt, 0.05, 5000.0)
+                .expect("RailRig Track tick");
+            assert!(ev.pose.eye.is_finite());
+        }
+        assert_ne!(ws.player.last_rig.track_status, TrackStatus::TargetLost);
+
+        // 3. Free: viewport drag steers gimbal without pausing playback.
+        ws.apply_command(FlightCommand::SetRigMode(FlightRigCameraMode::Free), cur_pose);
+        assert!(ws.player.is_rig_free_look_active());
+        let yaw_before = ws.player.last_rig.gimbal_deg[0];
+        ws.player.push_rig_input([25.0, -10.0, 0.0]);
+        let mut last_free_pose = None;
+        for _ in 0..30 {
+            let ev = ws
+                .player
+                .tick(dt, 0.05, 5000.0)
+                .expect("RailRig Free tick");
+            last_free_pose = Some(ev.pose);
+        }
+        assert!(ws.player.is_active(), "Free look must not pause playback");
+        assert!(
+            (ws.player.last_rig.gimbal_deg[0] - yaw_before).abs() > 1.0,
+            "expected Free mode gimbal yaw to respond to RigInput"
+        );
+
+        // 4. Eject: pauses playback and hands back the exact latest gimbal pose.
+        let eject_out = ws.apply_command(FlightCommand::RigEject, cur_pose);
+        assert!(eject_out.snap_cam);
+        assert_eq!(eject_out.ejected_pose, last_free_pose);
+        assert!(!ws.player.is_active());
+        assert!(!ws.player.last_rig.active);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

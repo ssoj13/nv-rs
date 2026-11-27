@@ -31,6 +31,7 @@ csg-device = { workspace = true }
 csg-scenes = { workspace = true }
 exr-core = { workspace = true }
 flight-navigator = { workspace = true }
+fnav-csg = { workspace = true }
 imath-rs = { workspace = true }
 
 wgpu = "30"

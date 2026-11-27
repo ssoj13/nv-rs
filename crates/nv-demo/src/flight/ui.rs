@@ -35,7 +35,7 @@ use flight_navigator::fnav_plan::{HandoverKind, Mode, RailPlan};
 use crate::csg_scene_host::CsgStats;
 use crate::flight::convert::limit_term_label;
 use crate::flight::lab::{DynamicsCurvePlot, LAB_DURATION_MAX_S, LAB_DURATION_MIN_S, LabMode};
-use crate::flight::player::{PlayerState, TrackOrigin};
+use crate::flight::player::{FlightRigCameraMode, PlayerState, TrackOrigin};
 use crate::flight::{FlightCommand, FlightWorkspace};
 use crate::flight_stats::{FlightStats, HIST_BINS, LoopPoint};
 use crate::is_counters::{IsCounts, IsGroup};
@@ -1289,6 +1289,8 @@ pub fn ui_flight_player(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             ui.add_space(2.0);
             ui_player_progress_bar(ui, args);
             ui.add_space(2.0);
+            ui_player_drone_rig(ui, args);
+            ui.add_space(2.0);
 
             stat_row(ui, "Scene", args.active_scene_label);
             prop_slider_f32(ui, "Cam Smooth", args.cam_smooth_tau, 0.0..=1.0, 2, " s");
@@ -1300,6 +1302,15 @@ pub fn ui_flight_player(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                 2,
                 "x",
             );
+            if args.workspace.player.rig_mode.uses_rail_rig() {
+                let prev = args.workspace.player.rig_tilt;
+                let mut tilt = prev;
+                prop_slider_f32(ui, "Max Tilt", &mut tilt.max_tilt_deg, 0.0..=35.0, 1, " deg");
+                prop_slider_f32(ui, "Tilt Tau", &mut tilt.tau_s, 0.05..=1.5, 2, " s");
+                if tilt != prev {
+                    (args.on_command)(FlightCommand::SetRigTilt(tilt));
+                }
+            }
         },
     );
 
@@ -1307,6 +1318,140 @@ pub fn ui_flight_player(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     ui_player_library_browser(ui, args);
 
     status_footer(ui, &args.workspace.player.status_msg);
+}
+
+/// Renders the **Drone Rig (`csg_scene::RailRig`)** look-mode selector (`Cinematic` / `Along` /
+/// `Track` / `Free`), landmark target picker, live gimbal/tilt telemetry, and `Eject` action.
+fn ui_player_drone_rig(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
+    let rig_mode = args.workspace.player.rig_mode;
+    let rig_active = args.workspace.player.is_rig_active();
+    let accent = active_accent_tint(ui);
+    let accent_stroke = Stroke::new(1.0, ui.visuals().selection.stroke.color);
+
+    let modes = [
+        (
+            FlightRigCameraMode::Cinematic,
+            ic::FILM_STRIP,
+            "Direct fnav-core Track framing (preserves authored shot aims).",
+        ),
+        (
+            FlightRigCameraMode::AlongPath,
+            ic::AIRPLANE_TILT,
+            "csg_scene::RailRig AlongPath: DroneTilt + rate-limited forward gimbal.",
+        ),
+        (
+            FlightRigCameraMode::Track,
+            ic::CROSSHAIR,
+            "csg_scene::RailRig Track: lock rate-limited gimbal onto a scene landmark.",
+        ),
+        (
+            FlightRigCameraMode::Free,
+            ic::EYE,
+            "csg_scene::RailRig Free: drag viewport to steer gimbal without pausing flight (Esc to eject).",
+        ),
+    ];
+
+    equal_grid(ui, 5, 5, |ui, idx, w| {
+        let prev_pad = ui.spacing().button_padding;
+        ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+        if let Some(&(mode, icon, tip)) = modes.get(idx) {
+            let mut btn = egui::Button::new(format!("{icon} {}", mode.label())).truncate();
+            if rig_mode == mode {
+                btn = btn.fill(accent).stroke(accent_stroke);
+            }
+            if ui.add_sized([w, BTN_H], btn).on_hover_text(tip).clicked() {
+                (args.on_command)(FlightCommand::SetRigMode(mode));
+            }
+        } else {
+            let eject_col = ui.visuals().warn_fg_color;
+            let mut btn = egui::Button::new(format!("{} Eject", ic::EJECT)).truncate();
+            if rig_active {
+                btn = btn
+                    .fill(eject_col.gamma_multiply(0.28))
+                    .stroke(Stroke::new(1.0, eject_col));
+            }
+            if ui
+                .add_enabled_ui(args.workspace.player.is_active(), |ui| {
+                    ui.add_sized([w, BTN_H], btn)
+                })
+                .inner
+                .on_hover_text("Eject from RailRig into free camera at current gimbal pose (Esc).")
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::RigEject);
+            }
+        }
+        ui.spacing_mut().button_padding = prev_pad;
+    });
+
+    if rig_mode == FlightRigCameraMode::Track {
+        let cur_name = args
+            .workspace
+            .player
+            .rig_track_landmark
+            .as_deref()
+            .unwrap_or("None")
+            .to_owned();
+        let landmarks: Vec<String> = args
+            .workspace
+            .player
+            .scene_landmarks
+            .iter()
+            .map(|l| l.name.clone())
+            .collect();
+        let mut chosen: Option<String> = None;
+        prop_row(ui, "Target", |ui| {
+            let w = ui.available_width().max(80.0);
+            egui::ComboBox::from_id_salt("fplay_rig_landmark")
+                .width(w)
+                .selected_text(&cur_name)
+                .show_ui(ui, |ui| {
+                    if landmarks.is_empty() {
+                        ui.label(RichText::new("No landmarks in scene").weak());
+                    } else {
+                        for name in &landmarks {
+                            if ui.selectable_label(cur_name == *name, name).clicked() {
+                                chosen = Some(name.clone());
+                            }
+                        }
+                    }
+                });
+        });
+        if let Some(name) = chosen {
+            (args.on_command)(FlightCommand::SetRigTrackLandmark(name));
+        }
+    }
+
+    if rig_mode.uses_rail_rig() {
+        let rt = args.workspace.player.last_rig;
+        let status_txt = match rt.track_status {
+            csg_scene::TrackStatus::Locked => "Locked",
+            csg_scene::TrackStatus::OutOfRange { .. } => "Clamped",
+            csg_scene::TrackStatus::TargetLost => "Lost",
+        };
+        let rig_line = if rig_mode == FlightRigCameraMode::Track {
+            fmt_into(
+                args.label_buf,
+                format_args!(
+                    "Tilt {:.1} deg | Y {:.0} P {:.0} | {} ({:.1} deg)",
+                    rt.tilt_deg,
+                    rt.gimbal_deg[0],
+                    rt.gimbal_deg[1],
+                    status_txt,
+                    rt.track_error_deg
+                ),
+            )
+        } else {
+            fmt_into(
+                args.label_buf,
+                format_args!(
+                    "Tilt {:.1} deg | Gimbal Y {:.0} P {:.0}",
+                    rt.tilt_deg, rt.gimbal_deg[0], rt.gimbal_deg[1]
+                ),
+            )
+        };
+        stat_row(ui, "Drone Rig", rig_line);
+    }
 }
 
 /// Renders the theme-derived Now Playing card inside the Playback Deck section.

@@ -2368,7 +2368,7 @@ impl CsgGpuHost {
     }
 
     /// Grows the active scene's crowd up to `target_count` walking articulated actors centered at
-    /// `origin`, compiling and uploading any newly-registered 11-GAS `ActorGasBank` compounds
+    /// `origin`, compiling and uploading any newly-registered 8-GAS `ActorGasBank` compounds
     /// automatically (`0` extra GASes if the scene already had an actor bank).
     pub fn spawn_crowd_stress(
         &mut self,
@@ -4934,7 +4934,7 @@ mod tests {
                 .any(|it| (it.flags & csg_actors::intent_flags::MASK_IMPULSE) != 0)
         );
 
-        // Stress spawn grows cleanly reusing the existing 11-GAS bank (0 extra compounds).
+        // Stress spawn grows cleanly reusing the existing 8-GAS bank (0 extra compounds).
         let scene = host.active_scene_mut().expect("scene");
         let added = scene
             .spawn_crowd_stress(64, Vec3::ZERO)
@@ -4944,7 +4944,7 @@ mod tests {
         assert_eq!(
             scene.world.library.compounds.len(),
             initial_compounds,
-            "reusing existing 11-GAS ActorGasBank must add 0 compounds"
+            "reusing existing 8-GAS ActorGasBank must add 0 compounds"
         );
     }
 

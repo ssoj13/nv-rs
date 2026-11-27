@@ -541,47 +541,6 @@ impl GpuFramePlan {
         Ok(())
     }
 
-    /// Asynchronously copies `elems` elements from an external device pointer `src_dev_ptr`
-    /// directly into owned buffer `id` on `stream` (`cuMemcpyDtoDAsync_v2`), growing `id` if
-    /// needed and keeping zero host round-trips.
-    pub fn copy_from_device_ptr(
-        &mut self,
-        stream: &Stream,
-        id: BufId,
-        src_dev_ptr: u64,
-        elems: u32,
-    ) -> Result<(), String> {
-        let slot = self
-            .slots
-            .get_mut(&id)
-            .ok_or_else(|| format!("{id:?} is not an owned buffer of {:?}", self.plan.kind))?;
-        slot.ensure_elems(stream, id, elems)?;
-        if elems == 0 {
-            return Ok(());
-        }
-        if src_dev_ptr == 0 {
-            return Err(format!(
-                "{id:?}: copy_from_device_ptr received null src_dev_ptr for {elems} elements"
-            ));
-        }
-        let dst_ptr = slot
-            .device_ptr()
-            .ok_or_else(|| format!("{id:?}: device allocation missing after ensure_elems"))?;
-        let byte_len = (elems as usize)
-            .checked_mul(slot.elem_size as usize)
-            .ok_or_else(|| format!("{id:?}: copy_from_device_ptr byte size overflow"))?;
-        // SAFETY: `dst_ptr` holds at least `byte_len` device bytes owned by `slot`, and the
-        // caller guarantees `src_dev_ptr` holds at least `byte_len` readable device bytes on the
-        // same CUDA stream until the copy completes.
-        let rc = unsafe {
-            cu::cuMemcpyDtoDAsync_v2(dst_ptr, src_dev_ptr, byte_len, stream.cu_stream())
-        };
-        if rc != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("{id:?}: cuMemcpyDtoDAsync_v2 failed ({rc:?})"));
-        }
-        Ok(())
-    }
-
     /// Returns the raw CUDA device pointer of owned buffer `id`, or `None` if unallocated/unowned.
     #[inline]
     pub fn device_ptr(&self, id: BufId) -> Option<u64> {

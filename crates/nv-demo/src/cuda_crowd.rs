@@ -1,8 +1,9 @@
 //! CUDA/NVRTC GPU-direct articulated crowd simulation backend driven by `csg-rs` [`FramePlan`].
 //!
-//! What: executes `csg_scene::crowd_gpu::crowd_frame_plan(csg_device::CSG_EVAL_CUH)` (plan v2:
-//! spatial grid, overlap resolution, walkway-network steering, two-pass foot probes & rendered-
-//! support ground sampling, LIPM/PD state integration, and articulated FK/IK emission) through
+//! What: executes `csg_scene::crowd_gpu::crowd_frame_plan(csg_device::CSG_EVAL_CUH)` (plan v3:
+//! spatial grid, overlap resolution, walkway-network steering with zero-copy VRAM-bound
+//! `TrafficCrowdVehicles`, two-pass foot probes & rendered-support ground sampling, LIPM/PD state
+//! integration, and articulated FK/IK emission) through
 //! [`crate::frame_plan_runner::GpuFramePlan`], paired with a tiny host-only CUDA bridge module
 //! (`CROWD_BRIDGE_CUH`) that scatters bone outputs into `nv-demo`'s CSG/OptiX IAS buffers with
 //! semantic visibility masking and monitors cumulative root displacement for amortized IAS
@@ -43,7 +44,7 @@ use csg_scene::crowd_gpu::{
     crowd_nav_pods, crowd_sim_uniforms, crowd_vehicle_pods,
 };
 use csg_scene::frame_plan::{
-    BufId, EventId, ExternalId, FrameSizes, ReadbackWhen,
+    BufId, EventId, ExternalId, FrameSizes, PlanKind, ReadbackWhen,
 };
 use csg_scene::{SceneBuilt, inst_flags};
 use cuda_bindings as cu;
@@ -555,7 +556,7 @@ fn upload_table_if_needed<T: Pod>(
     Ok(())
 }
 
-/// Persistent CUDA/NVRTC articulated crowd simulator backed by `csg-rs`'s `PlanKind::Crowd` v2
+/// Persistent CUDA/NVRTC articulated crowd simulator backed by `csg-rs`'s `PlanKind::Crowd` v3
 /// [`GpuFramePlan`] and a minimal CSG/OptiX scatter bridge.
 pub struct CudaCrowdBackend {
     cuda: Arc<CudaContext>,
@@ -572,6 +573,9 @@ pub struct CudaCrowdBackend {
     d_sbt_offsets: GrowCudaBuf<u32>,
     d_rebuild_pos: GrowCudaBuf<[f32; 4]>,
     d_disp_flag: GrowCudaBuf<u32>,
+    /// Fallback VRAM buffer for `BufId::CrowdVehicles` (`BufClass::Bound { Traffic,
+    /// TrafficCrowdVehicles }`) when traffic stepped on CPU rather than `CudaTrafficBackend`.
+    d_fallback_vehicles: GrowCudaBuf<CrowdVehiclePod>,
     /// Static `(parent_gidx, child_gidx, obj_key, 0)` bone-edge table uploaded once per scene for
     /// zero-copy GPU skeleton overlay rendering (`ovl_skeletons`).
     d_skeleton_edges: GrowCudaBuf<[u32; 4]>,
@@ -619,7 +623,7 @@ impl Drop for CudaCrowdBackend {
 
 impl CudaCrowdBackend {
     /// Compiles and validates `csg_scene::crowd_gpu::crowd_frame_plan(csg_device::CSG_EVAL_CUH)`
-    /// (version 2) plus the compact `CROWD_BRIDGE_CUH` scatter/displacement module on `cuda`.
+    /// (version 3) plus the compact `CROWD_BRIDGE_CUH` scatter/displacement module on `cuda`.
     pub fn new(cuda: &Arc<CudaContext>) -> Result<Self, String> {
         cuda.bind_to_thread()
             .map_err(|e| format!("CUDA bind failed for CudaCrowdBackend: {e}"))?;
@@ -628,7 +632,7 @@ impl CudaCrowdBackend {
             cuda,
             crowd_frame_plan(csg_device::CSG_EVAL_CUH),
             CROWD_FRAME_PLAN_VERSION,
-            "crowd_frame_v2.cu",
+            "crowd_frame_v3.cu",
         )?;
 
         let bridge_ptx = compile_nvrtc_ptx(CROWD_BRIDGE_CUH, "crowd_host_bridge.cu")?;
@@ -678,6 +682,7 @@ impl CudaCrowdBackend {
             d_sbt_offsets: GrowCudaBuf::default(),
             d_rebuild_pos: GrowCudaBuf::default(),
             d_disp_flag: GrowCudaBuf::default(),
+            d_fallback_vehicles: GrowCudaBuf::default(),
             d_skeleton_edges: GrowCudaBuf::default(),
             pinned_status,
             has_pending_readback: false,
@@ -1200,7 +1205,7 @@ impl CudaCrowdBackend {
         Ok(())
     }
 
-    /// Steps `scene.crowd` entirely on GPU through `PlanKind::Crowd` v2 (`GpuFramePlan`), scatters
+    /// Steps `scene.crowd` entirely on GPU through `PlanKind::Crowd` v3 (`GpuFramePlan`), scatters
     /// resolved bone transforms into `CsgGpuInstance`/`prev_xforms`/`OptixInstance` with semantic
     /// visibility masking, and schedules a 12-byte async status/displacement readback with **zero
     /// mid-frame host synchronization** when `readback_poses_for_cpu` is `false`.
@@ -1270,19 +1275,22 @@ impl CudaCrowdBackend {
             self.intents_dirty = false;
         }
 
-        // 4. Collect per-frame traffic vehicles (VRAM-direct D2D when GPU traffic ran, else host
-        // extraction) and uniforms (`dt == 0` allowed for paused LOD refresh).
-        let (vehicle_count, traffic_active) = match traffic_crowd_vehicles {
-            Some((ptr, count)) if ptr != 0 && count > 0 => {
-                self.plan
-                    .copy_from_device_ptr(stream, BufId::CrowdVehicles, ptr, count)?;
-                (count as usize, true)
-            }
+        // 4. Bind per-frame traffic vehicles zero-copy in VRAM when GPU traffic ran (`PlanKind::Crowd`
+        // v3 declares `BufId::CrowdVehicles` as `BufClass::Bound { plan: PlanKind::Traffic, buf:
+        // BufId::TrafficCrowdVehicles }`), or upload into `d_fallback_vehicles` when traffic stepped
+        // on CPU; upload frame uniforms (`dt == 0` allowed for paused LOD refresh).
+        let (vehicles_dev_ptr, vehicle_count, traffic_active) = match traffic_crowd_vehicles {
+            Some((ptr, count)) if ptr != 0 && count > 0 => (ptr, count as usize, true),
             _ => {
                 let active = crowd_vehicle_pods(&scene.traffic, &mut self.host_vehicles);
-                self.plan
-                    .upload(stream, BufId::CrowdVehicles, &self.host_vehicles)?;
-                (self.host_vehicles.len(), active)
+                self.d_fallback_vehicles
+                    .upload(stream, &self.host_vehicles)?;
+                let ptr = if self.host_vehicles.is_empty() {
+                    0u64
+                } else {
+                    self.d_fallback_vehicles.device_ptr()
+                };
+                (ptr, self.host_vehicles.len(), active)
             }
         };
         let steer_u = {
@@ -1304,7 +1312,7 @@ impl CudaCrowdBackend {
         // Reset per-frame ground-miss atomic counter on device (`crowd_grid_clear` resets fault).
         self.plan.zero_buffer(stream, BufId::CrowdGroundMisses, 1)?;
 
-        // 5. Execute `PlanKind::Crowd` v2 on `stream` with null OptiX externals so `emit_actors_cuda`
+        // 5. Execute `PlanKind::Crowd` v3 on `stream` with null OptiX externals so `emit_actors_cuda`
         // keeps `CrowdBoneOuts` / `CrowdPrevXforms` compactly bone-indexed (`0..n_bones`) for both
         // downstream `PlanKind::Camera` binding and our semantic-masked scatter bridge below.
         {
@@ -1326,9 +1334,10 @@ impl CudaCrowdBackend {
                 (ExternalId::CompoundGasHandles, 0u64),
                 (ExternalId::CompoundSbtOffsets, 0u64),
             ];
+            let bounds = [((PlanKind::Traffic, BufId::TrafficCrowdVehicles), vehicles_dev_ptr)];
             let events = std::mem::take(&mut self.pending_events);
             self.plan
-                .execute(stream, &frame_data, &frame_data, &events, &externals, &[])?;
+                .execute(stream, &frame_data, &frame_data, &events, &externals, &bounds)?;
         }
 
         // 6. Scatter GPU-directly into `csg_instances`, `csg_prev_xforms`, and `d_optix_instances`
@@ -1666,11 +1675,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA GPU + CUDA driver + NVRTC"]
-    fn cuda_crowd_frame_plan_v2_steps_and_applies_poses() {
+    fn cuda_crowd_frame_plan_v3_steps_and_applies_poses() {
         let ctx = CudaContext::new(0).expect("CUDA context on device 0");
         ctx.bind_to_thread().expect("bind CUDA context");
         let stream = ctx.default_stream();
-        let mut backend = CudaCrowdBackend::new(&ctx).expect("compile PlanKind::Crowd v2");
+        let mut backend = CudaCrowdBackend::new(&ctx).expect("compile PlanKind::Crowd v3");
+        let mut traffic = crate::cuda_traffic::CudaTrafficBackend::new(&ctx)
+            .expect("compile PlanKind::Traffic v1");
 
         let reg = csg_scenes::default_scene_registry();
         let module = reg.get("marina").expect("marina registered");
@@ -1689,10 +1700,34 @@ mod tests {
         let dt = 1.0 / 60.0;
         let eye = [0.0, 2.0, -5.0];
 
+        // First 10 steps exercise the CPU-traffic fallback `d_fallback_vehicles` binding (`None`);
+        // next 10 steps exercise zero-copy VRAM binding to `PlanKind::Traffic::TrafficCrowdVehicles`.
         for step in 0..20 {
             let t = (step + 1) as f32 * dt;
+            let bound_vehicles = if step >= 10 {
+                let crowd_states = backend.states_device_ptr();
+                traffic
+                    .step_gpu_direct(&stream, &scene, t, Some(crowd_states), None, None)
+                    .expect("traffic step_gpu_direct");
+                let (vptr, vcnt) = traffic.crowd_vehicles_device_ptr();
+                assert_ne!(vptr, 0, "TrafficCrowdVehicles must be device-resident");
+                assert!(vcnt > 0, "Marina must have active GPU traffic vehicles");
+                Some((vptr, vcnt))
+            } else {
+                None
+            };
             backend
-                .step_gpu_direct(&stream, &mut scene, dt, t, eye, lod, None, None, false)
+                .step_gpu_direct(
+                    &stream,
+                    &mut scene,
+                    dt,
+                    t,
+                    eye,
+                    lod,
+                    bound_vehicles,
+                    None,
+                    false,
+                )
                 .expect("step_gpu_direct");
         }
         let (bone_ptr, bone_cnt) = backend.bone_outs_device_ptr();
@@ -1736,7 +1771,7 @@ mod tests {
         let stream = ctx.default_stream();
         let optix_ctx = DeviceContext::new(&ctx, None, 0, false).expect("OptiX context");
         let mut scratch = Scratch::new(&stream);
-        let mut backend = CudaCrowdBackend::new(&ctx).expect("compile PlanKind::Crowd v2");
+        let mut backend = CudaCrowdBackend::new(&ctx).expect("compile PlanKind::Crowd v3");
         let mut host = CsgGpuHost::new();
 
         let marina_idx = default_scene_descriptors()

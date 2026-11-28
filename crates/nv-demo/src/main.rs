@@ -27,6 +27,7 @@ mod cuda_crowd;
 mod cuda_ocean;
 mod cuda_traffic;
 mod demo_anim;
+mod exv_export;
 mod fft_bloom;
 mod flight;
 mod flight_stats;
@@ -3010,6 +3011,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         interacting_until: Option<Instant>,
         is_recording: bool,
         record_frames: u64,
+        is_recording_exv: bool,
+        exv_submitted_frames: u64,
+        exv_encoded_frames: u64,
+        exv_bytes_written: u64,
+        recording_pacing_active: bool,
+        pending_playlist_exv_stop: bool,
         video_recorder: Option<ActiveRecorder>,
         shutter_in_flight: bool,
         /// `--bench-rail` run (`None` = interactive app).
@@ -3087,6 +3094,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         fn drop(&mut self) {
             if let Some(active) = self.video_recorder.take() {
                 self.export_worker.finish_video(active.session_id, None);
+            }
+            if self.is_recording_exv {
+                self.bus.send_render(RenderControl::StopExvRecord);
+                self.is_recording_exv = false;
             }
             self.export_worker.shutdown();
             self.flush_persisted_on_exit();
@@ -3166,8 +3177,14 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 );
             }
             self.is_recording = false;
-            self.flight_workspace.player.recording_playlist = false;
+            self.flight_workspace.player.recording_playlist = None;
             self.record_frames = 0;
+            self.is_recording_exv = false;
+            self.exv_submitted_frames = 0;
+            self.exv_encoded_frames = 0;
+            self.exv_bytes_written = 0;
+            self.recording_pacing_active = false;
+            self.pending_playlist_exv_stop = false;
             self.settings.capture_active = false;
             self.shutter_in_flight = false;
             self.interacting_until = None;
@@ -3753,6 +3770,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 interacting_until: None,
                 is_recording: false,
                 record_frames: 0,
+                is_recording_exv: false,
+                exv_submitted_frames: 0,
+                exv_encoded_frames: 0,
+                exv_bytes_written: 0,
+                recording_pacing_active: false,
+                pending_playlist_exv_stop: false,
                 video_recorder: None,
                 shutter_in_flight: false,
                 bench,
@@ -4208,6 +4231,11 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
 
+        #[inline]
+        fn any_recording(&self) -> bool {
+            self.is_recording || self.is_recording_exv
+        }
+
         fn notify_recording(&mut self, active: bool) {
             self.shutter_in_flight = false;
             let fixed_fps = if active && self.settings.record_fixed_fps {
@@ -4227,17 +4255,76 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             });
         }
 
-        /// Clears all host and Flight Player recording flags and notifies the render worker.
+        /// Synchronizes render-worker recording/lockstep pacing whenever the combined
+        /// `MP4 || EXV` recording state transitions, without disturbing an already-active
+        /// lockstep session when the second recorder starts or stops independently.
+        fn sync_recording_pacing(&mut self) {
+            let active = self.any_recording();
+            if active != self.recording_pacing_active {
+                self.recording_pacing_active = active;
+                self.notify_recording(active);
+            }
+        }
+
+        /// Clears MP4 and Flight Player recording flags and updates shared pacing cleanly.
         ///
         /// Why: keeps `is_recording`, `player.recording_playlist`, `record_frames`,
         /// `settings.capture_active`, and render-thread lockstep state synchronized across
-        /// manual stop, playlist completion, and all capture/encode error paths.
+        /// manual stop, playlist completion, and all capture/encode error paths without
+        /// disrupting an independent EXV recording session.
         fn stop_video_recording_state(&mut self) {
             self.is_recording = false;
-            self.flight_workspace.player.recording_playlist = false;
+            if self
+                .flight_workspace
+                .player
+                .is_recording_playlist(crate::flight::PlaylistRecordFormat::Mp4)
+            {
+                self.flight_workspace.player.recording_playlist = None;
+            }
             self.record_frames = 0;
-            self.settings.capture_active = false;
-            self.notify_recording(false);
+            self.settings.capture_active = self.any_recording();
+            self.sync_recording_pacing();
+        }
+
+        /// Stops active EXV recording on the render thread and updates host pacing cleanly.
+        fn stop_exv_recording_state(&mut self, status_msg: &str) {
+            self.pending_playlist_exv_stop = false;
+            self.send_render(RenderControl::StopExvRecord);
+            self.is_recording_exv = false;
+            if self
+                .flight_workspace
+                .player
+                .is_recording_playlist(crate::flight::PlaylistRecordFormat::Exv)
+            {
+                self.flight_workspace.player.recording_playlist = None;
+            }
+            self.exv_submitted_frames = 0;
+            self.exv_encoded_frames = 0;
+            self.exv_bytes_written = 0;
+            self.settings.capture_active = self.any_recording();
+            self.sync_recording_pacing();
+            self.last_saved_msg = Some(status_msg.to_string());
+        }
+
+        /// Finalizes whichever recorder (`Mp4` or `Exv`) was driving a completed playlist pass.
+        fn finish_completed_playlist_record(&mut self, fmt: crate::flight::PlaylistRecordFormat) {
+            match fmt {
+                crate::flight::PlaylistRecordFormat::Mp4 => {
+                    if self.is_recording
+                        && let Some(active) = self.video_recorder.take()
+                    {
+                        self.export_worker.finish_video(active.session_id, None);
+                        self.last_saved_msg =
+                            Some("Playlist recorded; finalizing MP4...".to_string());
+                        self.stop_video_recording_state();
+                    }
+                }
+                crate::flight::PlaylistRecordFormat::Exv => {
+                    if self.is_recording_exv {
+                        self.stop_exv_recording_state("Playlist recorded; finalizing EXV...");
+                    }
+                }
+            }
         }
 
         fn current_persisted_state(&self) -> crate::persist::PersistedState {
@@ -4420,6 +4507,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // 1. Drain completed async events from the OptiX render thread (non-blocking).
             let mut frames_received = 0u32;
             let mut scene_rails_updated = false;
+            let mut exv_state_changed = false;
             // Counts arrive in their own event just before the FrameReady they belong to.
             let mut frame_is_counts: Option<crate::is_counters::IsCounts> = None;
             let mut bench_frame: Option<(f32, crate::perf_log::PerfState, Option<crate::is_counters::IsCounts>)> = None;
@@ -4462,6 +4550,11 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         self.ser_supported = msg.ser_supported;
                         self.csg_stats = msg.csg_stats;
                         self.sim_telemetry = msg.sim_telemetry;
+                        if self.is_recording_exv && msg.exv_record.active {
+                            self.exv_submitted_frames = msg.exv_record.submitted_frames;
+                            self.exv_encoded_frames = msg.exv_record.encoded_frames;
+                            self.exv_bytes_written = msg.exv_record.bytes_written;
+                        }
                         self.fast_preview = msg.fast_preview;
                         let is_counts = frame_is_counts.take();
                         if is_counts.is_some() {
@@ -4634,6 +4727,25 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     RenderEvent::SceneCacheStats(stats) => {
                         self.scene_cache_stats = *stats;
                     }
+                    RenderEvent::ExvRecordState(st) => {
+                        self.is_recording_exv = st.active;
+                        self.exv_submitted_frames = st.submitted_frames;
+                        self.exv_encoded_frames = st.encoded_frames;
+                        self.exv_bytes_written = st.bytes_written;
+                        if !st.active {
+                            self.pending_playlist_exv_stop = false;
+                            if self
+                                .flight_workspace
+                                .player
+                                .is_recording_playlist(crate::flight::PlaylistRecordFormat::Exv)
+                            {
+                                self.flight_workspace.player.recording_playlist = None;
+                            }
+                        }
+                        self.settings.capture_active =
+                            self.video_recorder.is_some() || self.is_recording_exv;
+                        exv_state_changed = true;
+                    }
                     RenderEvent::StatusMessage(status) => {
                         self.last_saved_msg = Some(status.clone());
                     }
@@ -4646,6 +4758,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         }
                     }
                 }
+            }
+            if exv_state_changed {
+                self.sync_recording_pacing();
+            }
+            if self.pending_playlist_exv_stop && !self.shutter_in_flight {
+                self.finish_completed_playlist_record(crate::flight::PlaylistRecordFormat::Exv);
             }
             if let Some((rt_ms, state, counts)) = bench_frame {
                 self.bench_view_frame(rt_ms, state, counts);
@@ -4699,12 +4817,13 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let prev_theme = self.theme;
             let lighting_before = LightingKey::of(&self.settings);
             let bench_lockstep = self.bench.as_ref().is_some_and(crate::bench::BenchRun::is_running);
-            let cam_fixed_dt = if bench_lockstep || (self.is_recording && self.settings.record_fixed_fps) {
-                // Lockstep recording steps camera strictly inside `RenderShutterSubframe` batches.
-                Some(0.0)
-            } else {
-                None
-            };
+            let cam_fixed_dt =
+                if bench_lockstep || (self.any_recording() && self.settings.record_fixed_fps) {
+                    // Lockstep recording steps camera strictly inside `RenderShutterSubframe` batches.
+                    Some(0.0)
+                } else {
+                    None
+                };
             let active_scene_label: &str = self
                 .settings
                 .csg_mode
@@ -4764,6 +4883,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 fast_preview: self.fast_preview,
                 is_recording: self.is_recording,
                 record_frames: self.record_frames,
+                is_recording_exv: self.is_recording_exv,
+                exv_submitted_frames: self.exv_submitted_frames,
+                exv_encoded_frames: self.exv_encoded_frames,
+                exv_bytes_written: self.exv_bytes_written,
                 ser_supported: self.ser_supported,
                 csg_stats: self.csg_stats,
                 sim_telemetry: self.sim_telemetry,
@@ -4821,6 +4944,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             let mut export_sdg_json_requested = false;
             let mut export_flight_requested = false;
             let mut toggle_record_requested = false;
+            let mut toggle_record_exv_requested = false;
             let mut reload_shader_requested = false;
             let mut possess_next_vehicle_requested = false;
             let mut select_possess_mount: Option<usize> = None;
@@ -4848,6 +4972,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     UiCommand::ExportSdgJson => export_sdg_json_requested = true,
                     UiCommand::ExportFlightCsv => export_flight_requested = true,
                     UiCommand::ToggleRecord => toggle_record_requested = true,
+                    UiCommand::ToggleRecordExv => toggle_record_exv_requested = true,
                     UiCommand::ReloadShader => reload_shader_requested = true,
                     UiCommand::SelectScene {
                         scene_idx,
@@ -4918,8 +5043,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
             for fcmd in flight_commands {
                 let outcome = match fcmd {
-                    crate::flight::FlightCommand::ToggleRecordPlaylist => {
-                        self.flight_workspace.toggle_record_playlist(self.is_recording)
+                    crate::flight::FlightCommand::ToggleRecordPlaylist(fmt) => {
+                        let host_rec = match fmt {
+                            crate::flight::PlaylistRecordFormat::Mp4 => self.is_recording,
+                            crate::flight::PlaylistRecordFormat::Exv => self.is_recording_exv,
+                        };
+                        self.flight_workspace.toggle_record_playlist(fmt, host_rec)
                     }
                     other => self.flight_workspace.apply_command(other, self.cam_pose),
                 };
@@ -4941,8 +5070,14 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 if outcome.reset_stats {
                     self.flight.reset();
                 }
-                if outcome.toggle_record_playlist {
-                    toggle_record_requested = true;
+                match outcome.toggle_record_playlist {
+                    Some(crate::flight::PlaylistRecordFormat::Mp4) => {
+                        toggle_record_requested = true;
+                    }
+                    Some(crate::flight::PlaylistRecordFormat::Exv) => {
+                        toggle_record_exv_requested = true;
+                    }
+                    None => {}
                 }
                 if let Some(scene_id) = outcome.request_scene_id {
                     self.request_scene_by_id(&scene_id);
@@ -4989,7 +5124,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // render scale (a reduced internal resolution upscaled to the viewport blurs them).
             let wire = self.settings.display_mode == crate::wireframe::DisplayMode::Wireframe;
             // The renderer leaves the overlay out of recorded frames when captures exclude it.
-            self.settings.capture_active = self.video_recorder.is_some();
+            self.settings.capture_active = self.video_recorder.is_some() || self.is_recording_exv;
             let dlss_any = !wire && (self.settings.dlss_on || self.settings.dlss_rr_on);
             let (out_w, out_h) =
                 align_render_size(self.desired_vp_size.0, self.desired_vp_size.1, 1.0);
@@ -5668,7 +5803,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                             });
                                             self.is_recording = true;
                                             self.record_frames = 0;
-                                            self.notify_recording(true);
+                                            self.sync_recording_pacing();
                                             self.last_saved_msg = Some(format!(
                                                 "Starting window record: {}",
                                                 path.display()
@@ -5750,7 +5885,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     self.is_recording = true;
                                     self.record_frames = 0;
                                     self.rr_last_exposure = None;
-                                    self.notify_recording(true);
+                                    self.sync_recording_pacing();
                                     self.last_saved_msg =
                                         Some(format!("Starting record: {}", path.display()));
                                 }
@@ -5765,10 +5900,66 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 // Keep `recording_playlist` and `capture_active` synchronized immediately on
                 // frame 0 (and clear `recording_playlist` if starting the MP4 recorder failed so
                 // the active rail never stops early on an unrecorded pass).
-                if !self.is_recording {
-                    self.flight_workspace.player.recording_playlist = false;
+                if !self.is_recording
+                    && self
+                        .flight_workspace
+                        .player
+                        .is_recording_playlist(crate::flight::PlaylistRecordFormat::Mp4)
+                {
+                    self.flight_workspace.player.recording_playlist = None;
                 }
-                self.settings.capture_active = self.video_recorder.is_some();
+                self.settings.capture_active =
+                    self.video_recorder.is_some() || self.is_recording_exv;
+            }
+            if toggle_record_exv_requested {
+                if self.is_recording_exv {
+                    self.stop_exv_recording_state("Finalizing EXV...");
+                } else if self.render_fatal.is_some() {
+                    self.last_saved_msg = Some(
+                        "EXV recording unavailable: the render worker has stopped".to_string(),
+                    );
+                } else {
+                    let dir = std::path::Path::new(RENDERS_DIR);
+                    if let Err(e) = std::fs::create_dir_all(dir) {
+                        self.last_saved_msg = Some(format!("Failed to create {RENDERS_DIR}/: {e}"));
+                    } else {
+                        let scene_id = self
+                            .settings
+                            .csg_mode
+                            .checked_sub(1)
+                            .and_then(|idx| self.scene_descriptors.get(idx as usize))
+                            .map_or("classic", |d| d.id);
+                        let path = crate::exv_export::default_exv_output_path(scene_id);
+                        let profile = self.settings.exv_profile;
+                        self.pending_playlist_exv_stop = false;
+                        self.is_recording_exv = true;
+                        self.exv_submitted_frames = 0;
+                        self.exv_encoded_frames = 0;
+                        self.exv_bytes_written = 0;
+                        self.sync_recording_pacing();
+                        self.send_render(RenderControl::StartExvRecord {
+                            path: path.clone(),
+                            profile,
+                            fps: RECORD_FPS,
+                            occluder: self.settings.sdg_occluder_backend,
+                        });
+                        self.last_saved_msg = Some(format!(
+                            "Starting EXV record ({}): {}",
+                            profile.label(),
+                            path.display()
+                        ));
+                    }
+                }
+                if !self.is_recording_exv
+                    && self
+                        .flight_workspace
+                        .player
+                        .is_recording_playlist(crate::flight::PlaylistRecordFormat::Exv)
+                {
+                    self.flight_workspace.player.recording_playlist = None;
+                }
+                self.settings.capture_active =
+                    self.video_recorder.is_some() || self.is_recording_exv;
             }
             if let Some((scene_idx, variant_idx)) = select_scene_target {
                 self.pending_scene_auto_frame =
@@ -5842,7 +6033,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // In Smooth 60 FPS recording mode, step everything by exact `(1/60s) * time_scale` per
             // encoded frame (and across N 180-degree shutter subframes when enabled).
             let time_scale = self.settings.clamped_time_scale();
-            let shutter_n = if self.is_recording && self.settings.record_fixed_fps {
+            let shutter_n = if self.any_recording() && self.settings.record_fixed_fps {
                 self.settings.shutter_subframes()
             } else {
                 1
@@ -5862,12 +6053,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 self.possess_auto_level,
             );
 
-            if bench_lockstep || (self.is_recording && self.settings.record_fixed_fps) {
+            if bench_lockstep || (self.any_recording() && self.settings.record_fixed_fps) {
                 if !self.shutter_in_flight {
                     let frame_dt = time_scale / RECORD_FPS as f32;
                     let mut final_settings = self.last_sent_settings;
                     let mut final_cam = self.last_sent_camera;
-                    let mut stop_playlist_record = false;
+                    let mut stop_playlist_record: Option<crate::flight::PlaylistRecordFormat> = None;
                     for sub_idx in 0..shutter_n {
                         let sub_dt =
                             crate::flight::shutter_subframe_dt(frame_dt, sub_idx, shutter_n);
@@ -5878,7 +6069,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             self.tod_transition = None;
                         }
                         if self.flight_workspace.player.is_active() {
-                            let was_rec_pl = self.flight_workspace.player.recording_playlist;
+                            let prev_rec_pl = self.flight_workspace.player.recording_playlist;
                             if let Some(eval) = self.flight_workspace.player.tick(
                                 f64::from(sub_dt),
                                 self.cam_pose.znear,
@@ -5899,8 +6090,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                                     self.request_scene_by_id(&req_scene);
                                 }
                             }
-                            if was_rec_pl && !self.flight_workspace.player.recording_playlist {
-                                stop_playlist_record = true;
+                            if let Some(fmt) = prev_rec_pl
+                                && self.flight_workspace.player.recording_playlist.is_none()
+                            {
+                                stop_playlist_record = Some(fmt);
                             }
                         } else if self.possess_info.is_none() {
                             let raw = lockstep_subframe_raw_input(
@@ -5966,13 +6159,18 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                         flight_path_overlay,
                     });
                     self.shutter_in_flight = true;
-                    if stop_playlist_record
-                        && self.is_recording
-                        && let Some(active) = self.video_recorder.take()
-                    {
-                        self.export_worker.finish_video(active.session_id, None);
-                        self.last_saved_msg = Some("Playlist recorded; finalizing MP4...".to_string());
-                        self.stop_video_recording_state();
+                    match stop_playlist_record {
+                        Some(crate::flight::PlaylistRecordFormat::Mp4) => {
+                            self.finish_completed_playlist_record(
+                                crate::flight::PlaylistRecordFormat::Mp4,
+                            );
+                        }
+                        Some(crate::flight::PlaylistRecordFormat::Exv) => {
+                            // Defer `StopExvRecord` until the final queued shutter frame finishes
+                            // so the last playlist frame is never dropped before finalization.
+                            self.pending_playlist_exv_stop = true;
+                        }
+                        None => {}
                     }
                 } else {
                     let mut effective_settings = self.demo_anim.apply(&self.settings);
@@ -6016,7 +6214,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }
                 let mut cut_reset = false;
                 if self.flight_workspace.player.is_active() {
-                    let was_rec_pl = self.flight_workspace.player.recording_playlist;
+                    let prev_rec_pl = self.flight_workspace.player.recording_playlist;
                     if let Some(eval) = self.flight_workspace.player.tick(
                         f64::from(step_dt),
                         self.cam_pose.znear,
@@ -6034,15 +6232,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                             self.request_scene_by_id(&req_scene);
                         }
                     }
-                    if was_rec_pl
-                        && !self.flight_workspace.player.recording_playlist
-                        && self.is_recording
-                        && let Some(active) = self.video_recorder.take()
+                    if let Some(fmt) = prev_rec_pl
+                        && self.flight_workspace.player.recording_playlist.is_none()
                     {
-                        self.export_worker.finish_video(active.session_id, None);
-                        self.last_saved_msg =
-                            Some("Playlist recorded; finalizing MP4...".to_string());
-                        self.stop_video_recording_state();
+                        self.finish_completed_playlist_record(fmt);
                     }
                 }
                 let effective_tau = if self.rail_blend_remaining > 0.0 {
@@ -6069,7 +6262,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     || possess_look != self.last_sent_possess_look
                     || flight_overlay_changed
                 {
-                    let automated_motion = self.is_recording
+                    let automated_motion = self.any_recording()
                         || self.demo_anim.is_running()
                         || self.flight_workspace.player.is_active()
                         || self.tod_transition.is_some();

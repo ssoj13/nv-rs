@@ -15,8 +15,9 @@
 //! (`sl-controls::preset`) and Flight Lab/Player tabs to [`crate::flight::ui`], and formats HUD
 //! lines into reusable [`UiScratch`] buffers.
 //! Uses: `egui`, `egui_dock`, `egui_phosphor`, `camera`, `csg_scene`, `crate::app_events`,
-//! `crate::demo_anim`, `crate::fractal_presets`, `crate::flight`, `crate::overlay`,
-//! `crate::profiler`, `crate::renderer`, `crate::viewport_toolbar`, `crate::wireframe`.
+//! `crate::demo_anim`, `crate::exv_export`, `crate::fractal_presets`, `crate::flight`,
+//! `crate::overlay`, `crate::profiler`, `crate::renderer`, `crate::viewport_toolbar`,
+//! `crate::wireframe`.
 //! Used by: `crate::main` (`DemoApp::render`), `crate::flight::ui`, `crate::fractal_presets`.
 
 use std::fmt::Write as _;
@@ -36,6 +37,7 @@ use crate::app_events::{
 use crate::attr_editor::{AttrEditorState, render_attr_editor};
 use crate::csg_scene_host::CsgStats;
 use crate::demo_anim::{DemoAnimator, EXPOSURE_RANGE, anim_range};
+use crate::exv_export::{EXV_CHANNEL_COUNT, ExvProfile};
 use crate::profiler::{FrameTimings, GpuTelemetry, HISTORY_LEN, RingBuffer};
 use crate::renderer::{
     CameraProjection, CaptureSource, DLSS_QUALITY_MODES, DemoSettings, TIME_SCALE_MAX,
@@ -869,6 +871,14 @@ pub struct UiContext<'a> {
     pub fast_preview: bool,
     pub is_recording: bool,
     pub record_frames: u64,
+    /// `true` while multi-AOV `.exv` stream recording is active on the render worker.
+    pub is_recording_exv: bool,
+    /// Total frames submitted to the background `.exv` encoder for the current recording.
+    pub exv_submitted_frames: u64,
+    /// Total frames encoded and written by the background `.exv` encoder for the current recording.
+    pub exv_encoded_frames: u64,
+    /// Total compressed bytes written by the `.exv` encoder for the current recording.
+    pub exv_bytes_written: u64,
     pub ser_supported: bool,
     pub csg_stats: CsgStats,
     pub sim_telemetry: SimTelemetry,
@@ -1230,6 +1240,41 @@ impl UiContext<'_> {
                         }
                     }
                 });
+
+                if self.is_recording_exv {
+                    let lbl = fmt_into(
+                        &mut self.scratch.label_buf,
+                        format_args!("{} REC EXV ({}f)", ic::STOP, self.exv_encoded_frames),
+                    );
+                    let tip = fmt_into(
+                        &mut self.scratch.tip_buf,
+                        format_args!(
+                            "Recording {EXV_CHANNEL_COUNT}-channel multi-AOV .exv stream ({}, {}f encoded, {:.1} MB). Click to stop and finalize.",
+                            self.settings.exv_profile.label(),
+                            self.exv_encoded_frames,
+                            self.exv_bytes_written as f64 / (1024.0 * 1024.0),
+                        ),
+                    );
+                    if toolbar_rec_stop_pill(ui, lbl, tip).clicked() {
+                        self.bus.emit_ui(UiCommand::ToggleRecordExv);
+                    }
+                }
+                if self.is_recording {
+                    let lbl = fmt_into(
+                        &mut self.scratch.label_buf,
+                        format_args!("{} REC MP4 ({}f)", ic::STOP, self.record_frames),
+                    );
+                    let tip = fmt_into(
+                        &mut self.scratch.tip_buf,
+                        format_args!(
+                            "Recording MP4 video ({}f captured). Click to stop and finalize.",
+                            self.record_frames,
+                        ),
+                    );
+                    if toolbar_rec_stop_pill(ui, lbl, tip).clicked() {
+                        self.bus.emit_ui(UiCommand::ToggleRecord);
+                    }
+                }
             });
         });
     }
@@ -1514,9 +1559,70 @@ impl UiContext<'_> {
                 }
                 tb_separator(ui);
 
-                // 5. Save PNG & SDG EXR burst
+                // 5. Save PNG, MP4 video, multi-AOV EXV stream & SDG EXR burst
                 if tb_icon_button(ui, ic::CAMERA, false, TbTone::Normal, "Save PNG snapshot").clicked() {
                     self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
+                }
+                let (mp4_icon, mp4_tone, mp4_tip) = if self.is_recording {
+                    (
+                        ic::STOP,
+                        TbTone::Danger,
+                        fmt_into(
+                            &mut self.scratch.tip_buf,
+                            format_args!(
+                                "Stop MP4 video recording ({}f captured)",
+                                self.record_frames,
+                            ),
+                        ),
+                    )
+                } else {
+                    let hdr_active = self.settings.hdr_display && self.hdr_surface_supported;
+                    let use_pq10 = match self.settings.record_video_mode {
+                        1 => false,
+                        2 => true,
+                        _ => hdr_active,
+                    };
+                    (
+                        ic::VIDEO_CAMERA,
+                        TbTone::Normal,
+                        if use_pq10 {
+                            "Record 10-bit HDR10 PQ10 HEVC MP4 video into renders/"
+                        } else {
+                            "Record H.264 MP4 video into renders/"
+                        },
+                    )
+                };
+                if tb_icon_button(ui, mp4_icon, self.is_recording, mp4_tone, mp4_tip).clicked() {
+                    self.bus.emit_ui(UiCommand::ToggleRecord);
+                }
+                let (exv_icon, exv_tone, exv_tip) = if self.is_recording_exv {
+                    (
+                        ic::STOP,
+                        TbTone::Danger,
+                        fmt_into(
+                            &mut self.scratch.tip_buf,
+                            format_args!(
+                                "Stop multi-AOV .exv stream recording ({}f encoded, {:.1} MB)",
+                                self.exv_encoded_frames,
+                                self.exv_bytes_written as f64 / (1024.0 * 1024.0),
+                            ),
+                        ),
+                    )
+                } else {
+                    (
+                        ic::STACK,
+                        TbTone::Normal,
+                        fmt_into(
+                            &mut self.scratch.tip_buf,
+                            format_args!(
+                                "Record {EXV_CHANNEL_COUNT}-channel multi-AOV .exv stream ({})",
+                                self.settings.exv_profile.label(),
+                            ),
+                        ),
+                    )
+                };
+                if tb_icon_button(ui, exv_icon, self.is_recording_exv, exv_tone, exv_tip).clicked() {
+                    self.bus.emit_ui(UiCommand::ToggleRecordExv);
                 }
                 if self.settings.csg_mode > 0 {
                     if tb_icon_button(
@@ -1963,6 +2069,16 @@ impl UiContext<'_> {
         }
         if self.fast_preview {
             status_buf.push_str("  |  PREVIEW");
+        }
+        if self.is_recording {
+            let Ok(()) = write!(status_buf, "  |  REC MP4 ({}f)", self.record_frames) else {
+                unreachable!("writing to String cannot fail");
+            };
+        }
+        if self.is_recording_exv {
+            let Ok(()) = write!(status_buf, "  |  REC EXV ({}f)", self.exv_encoded_frames) else {
+                unreachable!("writing to String cannot fail");
+            };
         }
         let Ok(()) = write!(
             status_buf,
@@ -3799,20 +3915,9 @@ impl UiContext<'_> {
             }
             ui.add_space(1.0);
             let is_full_win = s.capture_source == CaptureSource::FullWindow;
-            equal_grid(ui, 2, 4, |ui, idx, w| match idx {
+            let any_recording = self.is_recording || self.is_recording_exv;
+            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
                 0 => {
-                    if ui
-                        .add_sized(
-                            [w, ROW_H + 2.0],
-                            egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE)),
-                        )
-                        .on_hover_text("Clear accumulated samples and restart rendering cleanly from frame 1.")
-                        .clicked()
-                    {
-                        self.bus.emit_ui(UiCommand::ResetAccum);
-                    }
-                }
-                1 => {
                     let tip = if is_full_win {
                         "Save a lossless PNG screenshot of the full window (viewport + UI) into renders/."
                     } else {
@@ -3821,7 +3926,7 @@ impl UiContext<'_> {
                     if ui
                         .add_sized(
                             [w, ROW_H + 2.0],
-                            egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)),
+                            egui::Button::new(format!("{}  Save PNG", ic::FLOPPY_DISK)).truncate(),
                         )
                         .on_hover_text(tip)
                         .clicked()
@@ -3829,7 +3934,7 @@ impl UiContext<'_> {
                         self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Png));
                     }
                 }
-                2 => {
+                _ => {
                     let tip = if is_full_win {
                         "Encode a GPU-accelerated JPEG snapshot (nvJPEG) of the full window (viewport + UI) into renders/."
                     } else {
@@ -3838,7 +3943,7 @@ impl UiContext<'_> {
                     if ui
                         .add_sized(
                             [w, ROW_H + 2.0],
-                            egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)),
+                            egui::Button::new(format!("{}  Save JPEG", ic::IMAGE)).truncate(),
                         )
                         .on_hover_text(tip)
                         .clicked()
@@ -3846,7 +3951,10 @@ impl UiContext<'_> {
                         self.bus.emit_ui(UiCommand::SaveStill(StillFormat::Jpeg));
                     }
                 }
-                _ => {
+            });
+            ui.add_space(2.0);
+            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                0 => {
                     let hdr_active = s.hdr_display && self.hdr_surface_supported;
                     let use_pq10 = match s.record_video_mode {
                         1 => false,
@@ -3854,11 +3962,20 @@ impl UiContext<'_> {
                         _ => hdr_active,
                     };
                     let rec_lbl = if self.is_recording {
-                        format!("{}  Stop ({}f)", ic::STOP, self.record_frames)
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!("{}  Stop ({}f)", ic::STOP, self.record_frames),
+                        )
                     } else if use_pq10 {
-                        format!("{}  Record PQ10", ic::VIDEO_CAMERA)
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!("{}  Record PQ10", ic::VIDEO_CAMERA),
+                        )
                     } else {
-                        format!("{}  Record MP4", ic::VIDEO_CAMERA)
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!("{}  Record MP4", ic::VIDEO_CAMERA),
+                        )
                     };
                     let rec_tip = match (self.is_recording, use_pq10, is_full_win) {
                         (true, _, _) => {
@@ -3877,40 +3994,50 @@ impl UiContext<'_> {
                             "Start recording the 3D viewport as an iPhone-compatible H.264 MP4 video into renders/ (Green = Ready)."
                         }
                     };
-                    let dark = ui.visuals().dark_mode;
-                    let rec_btn = if self.is_recording {
-                        let fill = if dark {
-                            Color32::from_rgb(176, 42, 50)
-                        } else {
-                            Color32::from_rgb(202, 46, 54)
-                        };
-                        egui::Button::new(RichText::new(rec_lbl).color(Color32::WHITE))
-                            .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(235, 96, 104)))
-                    } else {
-                        let fill = if dark {
-                            Color32::from_rgb(32, 86, 56)
-                        } else {
-                            Color32::from_rgb(204, 238, 216)
-                        };
-                        let txt = if dark {
-                            Color32::from_rgb(220, 248, 228)
-                        } else {
-                            Color32::from_rgb(22, 86, 46)
-                        };
-                        egui::Button::new(RichText::new(rec_lbl).color(txt))
-                            .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(66, 152, 98)))
-                    };
-                    if ui
-                        .add_sized([w, ROW_H + 2.0], rec_btn)
-                        .on_hover_text(rec_tip)
-                        .clicked()
-                    {
+                    if record_toggle_btn(ui, self.is_recording, rec_lbl, rec_tip, w).clicked() {
                         self.bus.emit_ui(UiCommand::ToggleRecord);
                     }
                 }
+                _ => {
+                    let exv_lbl = if self.is_recording_exv {
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!("{}  Stop ({}f)", ic::STOP, self.exv_encoded_frames),
+                        )
+                    } else {
+                        fmt_into(
+                            &mut self.scratch.label_buf,
+                            format_args!("{}  Record EXV", ic::STACK),
+                        )
+                    };
+                    let exv_tip = if self.is_recording_exv {
+                        "Stop recording and finalize the multi-AOV .exv stream file into renders/ (Red = Recording)."
+                    } else {
+                        fmt_into(
+                            &mut self.scratch.tip_buf,
+                            format_args!(
+                                "Start recording a {EXV_CHANNEL_COUNT}-channel multi-AOV .exv stream ({}: beauty, albedo, normal, roughness, depth, motion, lossless U32 semantic/instance IDs) into renders/ (Green = Ready).",
+                                s.exv_profile.label(),
+                            ),
+                        )
+                    };
+                    if record_toggle_btn(ui, self.is_recording_exv, exv_lbl, exv_tip, w).clicked() {
+                        self.bus.emit_ui(UiCommand::ToggleRecordExv);
+                    }
+                }
             });
+            ui.add_space(2.0);
+            render_exv_controls(
+                ui,
+                &mut s.exv_profile,
+                ExvUiStatus {
+                    recording: self.is_recording_exv,
+                    submitted_frames: self.exv_submitted_frames,
+                    encoded_frames: self.exv_encoded_frames,
+                    bytes_written: self.exv_bytes_written,
+                },
+                self.scratch,
+            );
             ui.add_space(2.0);
             equal_grid(ui, 2, 2, |ui, idx, w| match idx {
                 0 => {
@@ -4095,8 +4222,8 @@ impl UiContext<'_> {
                         w,
                         "Timing",
                         val,
-                        "Live RT keeps real-time speed even when FPS drops; Smooth 60 renders animations at a locked cinematic 60 FPS.",
-                        !self.is_recording,
+                        "Live RT keeps real-time speed even when FPS drops; Smooth 60 renders animations at a locked cinematic 60 FPS for MP4 and EXV recording.",
+                        !any_recording,
                         tint,
                     ) != 0
                     {
@@ -4111,7 +4238,7 @@ impl UiContext<'_> {
                     .iter()
                     .position(|&(n, _)| n == s.record_shutter_subframes)
                     .unwrap_or(0);
-                let enabled = s.record_fixed_fps && !self.is_recording;
+                let enabled = s.record_fixed_fps && !any_recording;
                 let tint = (s.record_fixed_fps && s.record_shutter_subframes > 1)
                     .then(|| active_accent_tint(ui));
                 let tip = if s.record_fixed_fps {
@@ -4134,16 +4261,38 @@ impl UiContext<'_> {
                 }
             }
             ui.add_space(2.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), ROW_H + 2.0],
-                    egui::Button::new(format!("{}  Hot-Reload Shader (NVRTC)", ic::LIGHTNING)),
-                )
-                .on_hover_text("Recompile raytracer.cu from disk on the fly without restarting the app.")
-                .clicked()
-            {
-                self.bus.emit_ui(UiCommand::ReloadShader);
-            }
+            equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                0 => {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Reset Accum", ic::ARROWS_CLOCKWISE))
+                                .truncate(),
+                        )
+                        .on_hover_text(
+                            "Clear accumulated samples and restart rendering cleanly from frame 1.",
+                        )
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::ResetAccum);
+                    }
+                }
+                _ => {
+                    if ui
+                        .add_sized(
+                            [w, ROW_H + 2.0],
+                            egui::Button::new(format!("{}  Reload Shader", ic::LIGHTNING))
+                                .truncate(),
+                        )
+                        .on_hover_text(
+                            "Recompile raytracer.cu from disk on the fly via NVRTC without restarting the app.",
+                        )
+                        .clicked()
+                    {
+                        self.bus.emit_ui(UiCommand::ReloadShader);
+                    }
+                }
+            });
             if let Some(msg) = self.last_saved_msg {
                 ui.label(
                     RichText::new(msg)
@@ -4189,6 +4338,10 @@ impl UiContext<'_> {
                 active_scene_label: self.active_scene_label,
                 cur_pose,
                 is_recording: self.is_recording,
+                record_frames: self.record_frames,
+                is_recording_exv: self.is_recording_exv,
+                exv_encoded_frames: self.exv_encoded_frames,
+                exv_profile: s.exv_profile,
                 time_scale: &mut s.time_scale,
                 cam_smooth_tau: &mut s.cam_smooth_tau,
                 label_buf: &mut self.scratch.label_buf,
@@ -4989,6 +5142,80 @@ pub(crate) fn hdr_amber_tint(ui: &Ui) -> Color32 {
     }
 }
 
+/// SSOT active-recording colors shared by [`record_toggle_btn`] and [`toolbar_rec_stop_pill`].
+const REC_ACTIVE_FILL_DARK: Color32 = Color32::from_rgb(176, 42, 50);
+const REC_ACTIVE_FILL_LIGHT: Color32 = Color32::from_rgb(202, 46, 54);
+const REC_ACTIVE_STROKE: Color32 = Color32::from_rgb(235, 96, 104);
+const REC_READY_FILL_DARK: Color32 = Color32::from_rgb(32, 86, 56);
+const REC_READY_FILL_LIGHT: Color32 = Color32::from_rgb(204, 238, 216);
+const REC_READY_TXT_DARK: Color32 = Color32::from_rgb(220, 248, 228);
+const REC_READY_TXT_LIGHT: Color32 = Color32::from_rgb(22, 86, 46);
+const REC_READY_STROKE: Color32 = Color32::from_rgb(66, 152, 98);
+
+/// SSOT recording toggle button shared by MP4/PQ10, multi-AOV EXV, and Flight Player playlist
+/// recorders.
+///
+/// Uses a single dark/light-aware red (active) / green (ready) palette with a `1.0 px` stroke
+/// matching [`UiTheme::apply`]'s unified `bg_stroke.width = 1.0` so hover never jitters height,
+/// and `.truncate()` so narrow dock panes never overflow.
+pub(crate) fn record_toggle_btn(
+    ui: &mut Ui,
+    active: bool,
+    label: &str,
+    tooltip: &str,
+    width: f32,
+) -> egui::Response {
+    let dark = ui.visuals().dark_mode;
+    let btn = if active {
+        let fill = if dark {
+            REC_ACTIVE_FILL_DARK
+        } else {
+            REC_ACTIVE_FILL_LIGHT
+        };
+        egui::Button::new(RichText::new(label).color(Color32::WHITE))
+            .truncate()
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, REC_ACTIVE_STROKE))
+    } else {
+        let fill = if dark {
+            REC_READY_FILL_DARK
+        } else {
+            REC_READY_FILL_LIGHT
+        };
+        let txt = if dark {
+            REC_READY_TXT_DARK
+        } else {
+            REC_READY_TXT_LIGHT
+        };
+        egui::Button::new(RichText::new(label).color(txt))
+            .truncate()
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, REC_READY_STROKE))
+    };
+    ui.add_sized([width, ROW_H + 2.0], btn)
+        .on_hover_text(tooltip)
+}
+
+/// Compact clickable red recording-active stop pill for the top toolbar (`ui_toolbar`), sharing
+/// the exact SSOT active-recording colors and `1.0 px` stroke of [`record_toggle_btn`].
+fn toolbar_rec_stop_pill(ui: &mut Ui, label: &str, tooltip: &str) -> egui::Response {
+    let fill = if ui.visuals().dark_mode {
+        REC_ACTIVE_FILL_DARK
+    } else {
+        REC_ACTIVE_FILL_LIGHT
+    };
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .monospace()
+            .size(11.0)
+            .color(Color32::WHITE),
+    )
+    .min_size(egui::vec2(0.0, 20.0))
+    .fill(fill)
+    .stroke(egui::Stroke::new(1.0, REC_ACTIVE_STROKE));
+    ui.add(btn).on_hover_text(tooltip)
+}
+
 /// Compact cyclic toggle button: LMB steps forward (`+1`), RMB steps backward (`-1`).
 pub(crate) fn cycle_toggle_btn(
     ui: &mut Ui,
@@ -5490,6 +5717,7 @@ struct BarSegment {
 enum PillTone {
     Green,
     Amber,
+    Red,
     Muted,
 }
 
@@ -5518,6 +5746,14 @@ fn pill_colors(ui: &Ui, tone: PillTone) -> (Color32, Color32) {
         (PillTone::Amber, false) => (
             Color32::from_rgb(126, 76, 8),
             Color32::from_rgb(252, 232, 186),
+        ),
+        (PillTone::Red, true) => (
+            Color32::from_rgb(255, 206, 210),
+            Color32::from_rgb(132, 30, 38),
+        ),
+        (PillTone::Red, false) => (
+            Color32::from_rgb(154, 24, 34),
+            Color32::from_rgb(252, 214, 218),
         ),
         (PillTone::Muted, true) => (
             Color32::from_rgb(186, 196, 212),
@@ -5781,6 +6017,142 @@ fn render_scene_cache_row(
         "Delete cached CSG scene files from disk and memory so scenes rebuild fresh next time.",
     )
     .clicked()
+}
+
+/// Snapshot of live multi-AOV `.exv` stream recorder telemetry passed to [`render_exv_controls`].
+#[derive(Clone, Copy, Debug, Default)]
+struct ExvUiStatus {
+    recording: bool,
+    submitted_frames: u64,
+    encoded_frames: u64,
+    bytes_written: u64,
+}
+
+fn render_exv_profile_tooltip(ui: &mut Ui, active_profile: ExvProfile, recording: bool) {
+    ui.label(format!(
+        "{}: {}",
+        active_profile.label(),
+        active_profile.description()
+    ));
+    if active_profile.is_hybrid() {
+        ui.label(
+            RichText::new(
+                "Hybrid: 10-bit NVENC PQ10 HEVC Beauty RGB + 13 bit-exact lossless tiled AOVs (zero FFmpeg; requires NVENC).",
+            )
+            .small()
+            .weak(),
+        );
+    }
+    ui.label(
+        RichText::new(
+            "U32 semantic.id and instance.id are always lossless; per-frame camera & SDG metadata is embedded inside .exv (FMET/MetaFooter).",
+        )
+        .small()
+        .weak(),
+    );
+    if recording {
+        ui.label(
+            RichText::new("Stop EXV recording to switch compression profiles.")
+                .small()
+                .weak(),
+        );
+    }
+}
+
+/// Renders the width-clamped `EXV Profile` selector row and fixed-height `EXV Stream` status
+/// readout row. Both rows always occupy identical height whether idle or recording so toggling
+/// EXV stream capture causes zero vertical layout jump.
+fn render_exv_controls(
+    ui: &mut Ui,
+    profile: &mut ExvProfile,
+    status: ExvUiStatus,
+    scratch: &mut UiScratch,
+) {
+    const PROFILE_ROW_TIP: &str = "Multi-AOV .exv compression preset: Compact (pure-Rust HDR HTJ2K 9/7), Hybrid (10-bit NVENC PQ10 HEVC RGB + 13 bit-exact lossless tiled AOVs, zero FFmpeg; requires NVENC), Lossless (Wavelet53), or Fast (LosslessFast). U32 semantic.id and instance.id are always lossless, and per-frame camera & SDG metadata is embedded inside .exv (FMET).";
+    prop_row_labeled(ui, "EXV Profile", true, |ui, label_resp| {
+        label_resp.on_hover_text(PROFILE_ROW_TIP);
+        let combo_w = ui.available_width().max(40.0);
+        ui.add_enabled_ui(!status.recording, |ui| {
+            let resp = egui::ComboBox::from_id_salt("exv_profile_combo")
+                .width(combo_w)
+                .truncate()
+                .selected_text(profile.label())
+                .show_ui(ui, |ui| {
+                    for p in ExvProfile::ALL {
+                        ui.selectable_value(profile, p, p.label())
+                            .on_hover_text(p.description());
+                    }
+                })
+                .response;
+            let active_profile = *profile;
+            resp.on_hover_ui(|ui| render_exv_profile_tooltip(ui, active_profile, status.recording))
+                .on_disabled_hover_ui(|ui| {
+                    render_exv_profile_tooltip(ui, active_profile, status.recording);
+                });
+        });
+    });
+
+    let queued = status
+        .submitted_frames
+        .saturating_sub(status.encoded_frames);
+    let mb = status.bytes_written as f64 / (1024.0 * 1024.0);
+    let (pill, summary) = if status.recording {
+        let text = if queued > 0 {
+            fmt_into(
+                &mut scratch.label_buf,
+                format_args!("{}f (+{queued}q) {mb:.1} MB", status.encoded_frames),
+            )
+        } else {
+            fmt_into(
+                &mut scratch.label_buf,
+                format_args!("{}f {mb:.1} MB", status.encoded_frames),
+            )
+        };
+        (
+            StatusPill {
+                text: "REC",
+                tone: PillTone::Red,
+            },
+            text,
+        )
+    } else {
+        let text = fmt_into(
+            &mut scratch.label_buf,
+            format_args!("{EXV_CHANNEL_COUNT} AOVs"),
+        );
+        (
+            StatusPill {
+                text: "Idle",
+                tone: PillTone::Muted,
+            },
+            text,
+        )
+    };
+    let channel_summary = if profile.is_hybrid() {
+        "10-bit NVENC PQ10 HEVC Beauty RGB + 13 lossless Wavelet53 AOVs (zero FFmpeg) + embedded FMET camera/SDG metadata."
+    } else {
+        "F16 beauty/albedo/normal/roughness, F32 depth/motion, lossless U32 semantic/instance IDs + embedded FMET camera/SDG metadata."
+    };
+    stat_badge_row_tip(ui, "EXV Stream", pill, summary, &mut scratch.tip_buf, |t| {
+        if status.recording {
+            let Ok(()) = write!(
+                t,
+                "Recording {EXV_CHANNEL_COUNT}-channel multi-AOV .exv stream ({}).\nEncoded: {}f | Queued: {queued}f | Written: {mb:.2} MB\nChannels: {channel_summary}",
+                profile.label(),
+                status.encoded_frames,
+            ) else {
+                unreachable!("writing to String cannot fail");
+            };
+        } else {
+            let Ok(()) = write!(
+                t,
+                "Ready to record {EXV_CHANNEL_COUNT}-channel multi-AOV .exv clips into renders/ ({}).\nChannels: {channel_summary}",
+                profile.label(),
+            ) else {
+                unreachable!("writing to String cannot fail");
+            };
+        }
+    });
 }
 
 fn asset_category_icon(cat: AssetCategory) -> &'static str {
@@ -8967,6 +9339,234 @@ mod tests {
                 pill_w > 60.0 && pill_w <= 340.0,
                 "unexpected PossessAdas pill width {pill_w} for {}",
                 adas.badge_label()
+            );
+        }
+    }
+
+    #[test]
+    fn record_toggle_btn_zero_hover_height_jitter_all_themes() {
+        for theme in UiTheme::ALL {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = theme.apply(&ctx);
+
+            let run_pass = |pointer: Option<egui::Pos2>| -> (egui::Rect, egui::Rect, bool, bool) {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(300.0, 200.0),
+                    )),
+                    ..Default::default()
+                };
+                if let Some(pos) = pointer {
+                    raw.events.push(egui::Event::PointerMoved(pos));
+                }
+                let mut mp4_rect = egui::Rect::NOTHING;
+                let mut exv_rect = egui::Rect::NOTHING;
+                let mut mp4_hov = false;
+                let mut exv_hov = false;
+                let out = ctx.run_ui(raw, |ui| {
+                    dock_scroll(ui, |ui| {
+                        equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+                            0 => {
+                                let resp = record_toggle_btn(
+                                    ui,
+                                    false,
+                                    &format!("{}  Record MP4", ic::VIDEO_CAMERA),
+                                    "Record MP4",
+                                    w,
+                                );
+                                mp4_rect = resp.rect;
+                                mp4_hov = resp.hovered();
+                            }
+                            _ => {
+                                let resp = record_toggle_btn(
+                                    ui,
+                                    true,
+                                    &format!("{}  Stop (128f)", ic::STOP),
+                                    "Stop EXV",
+                                    w,
+                                );
+                                exv_rect = resp.rect;
+                                exv_hov = resp.hovered();
+                            }
+                        });
+                    });
+                });
+                out.drop_without_applying_deltas();
+                (mp4_rect, exv_rect, mp4_hov, exv_hov)
+            };
+
+            let _ = run_pass(None);
+            let (mp4_idle, exv_idle, _, _) = run_pass(None);
+            assert!(mp4_idle.height() > 0.0 && exv_idle.height() > 0.0);
+            assert_eq!(
+                (mp4_idle.height() - exv_idle.height()).abs(),
+                0.0,
+                "{theme:?}: ready vs recording button height mismatch ({} vs {})",
+                mp4_idle.height(),
+                exv_idle.height()
+            );
+
+            let _ = run_pass(Some(mp4_idle.center()));
+            let (mp4_hov_rect, exv_sib, mp4_hov, _) = run_pass(Some(mp4_idle.center()));
+            assert!(mp4_hov, "{theme:?}: ready record button must register hover");
+            assert_eq!(
+                (mp4_hov_rect.height() - mp4_idle.height()).abs(),
+                0.0,
+                "{theme:?}: ready record button height jittered on hover"
+            );
+            assert_eq!(
+                (mp4_hov_rect.height() - exv_sib.height()).abs(),
+                0.0,
+                "{theme:?}: hovered ready vs active record button height mismatch"
+            );
+
+            let _ = run_pass(Some(exv_idle.center()));
+            let (mp4_sib, exv_hov_rect, _, exv_hov) = run_pass(Some(exv_idle.center()));
+            assert!(exv_hov, "{theme:?}: active record button must register hover");
+            assert_eq!(
+                (exv_hov_rect.height() - exv_idle.height()).abs(),
+                0.0,
+                "{theme:?}: active record button height jittered on hover"
+            );
+            assert_eq!(
+                (mp4_sib.height() - exv_hov_rect.height()).abs(),
+                0.0,
+                "{theme:?}: ready vs hovered active record button height mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn exv_controls_zero_layout_jump_and_width_clamped() {
+        assert!(
+            ExvProfile::ALL.contains(&ExvProfile::Hybrid),
+            "ExvProfile::ALL must include ExvProfile::Hybrid"
+        );
+        for panel_w in [240.0_f32, 300.0, 360.0] {
+            for theme in [UiTheme::Obsidian, UiTheme::Light] {
+                for init_profile in ExvProfile::ALL {
+                    let ctx = egui::Context::default();
+                    install_fonts(&ctx);
+                    let _dock_style = theme.apply(&ctx);
+                    let sc = ctx.global_style().spacing.scroll;
+                    let bar_reserve = sc.bar_outer_margin + sc.bar_width + sc.bar_inner_margin + 2.0;
+                    let inner_w = (panel_w - bar_reserve).max(120.0);
+
+                    let measure = |status: ExvUiStatus| -> (f32, f32) {
+                        let mut profile = init_profile;
+                        let mut scratch = UiScratch::default();
+                        let mut used_h = 0.0_f32;
+                        let mut max_right = 0.0_f32;
+                        for _ in 0..2 {
+                            let raw = egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(panel_w, 400.0),
+                                )),
+                                ..Default::default()
+                            };
+                            let out = ctx.run_ui(raw, |ui| {
+                                dock_scroll(ui, |ui| {
+                                    let top = ui.cursor().top();
+                                    render_exv_controls(ui, &mut profile, status, &mut scratch);
+                                    used_h = ui.cursor().top() - top;
+                                    max_right = ui.min_rect().right();
+                                });
+                            });
+                            out.drop_without_applying_deltas();
+                        }
+                        (used_h, max_right)
+                    };
+
+                    let (idle_h, idle_r) = measure(ExvUiStatus::default());
+                    let (rec_h, rec_r) = measure(ExvUiStatus {
+                        recording: true,
+                        submitted_frames: 245,
+                        encoded_frames: 240,
+                        bytes_written: 1_234_567_890,
+                    });
+
+                    assert!(idle_h > 0.0);
+                    assert!(
+                        (rec_h - idle_h).abs() <= 1e-3,
+                        "{theme:?} {init_profile:?} panel_w={panel_w}: EXV controls height jumped on toggle ({idle_h} -> {rec_h})"
+                    );
+                    assert!(
+                        idle_r <= inner_w + 0.5 && rec_r <= inner_w + 0.5,
+                        "{theme:?} {init_profile:?} panel_w={panel_w}: EXV controls overflowed inner_w={inner_w} (idle={idle_r}, rec={rec_r})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_rec_stop_pill_zero_hover_height_jitter_all_themes() {
+        for theme in UiTheme::ALL {
+            let ctx = egui::Context::default();
+            install_fonts(&ctx);
+            let _dock_style = theme.apply(&ctx);
+
+            let run_pass = |pointer: Option<egui::Pos2>| -> (egui::Rect, egui::Rect, bool, bool) {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(480.0, 64.0),
+                    )),
+                    ..Default::default()
+                };
+                if let Some(pos) = pointer {
+                    raw.events.push(egui::Event::PointerMoved(pos));
+                }
+                let mut mp4_rect = egui::Rect::NOTHING;
+                let mut exv_rect = egui::Rect::NOTHING;
+                let mut mp4_hov = false;
+                let mut exv_hov = false;
+                let out = ctx.run_ui(raw, |ui| {
+                    ui.horizontal(|ui| {
+                        let r0 = toolbar_rec_stop_pill(
+                            ui,
+                            &format!("{} REC MP4 (42f)", ic::STOP),
+                            "Stop MP4",
+                        );
+                        mp4_rect = r0.rect;
+                        mp4_hov = r0.hovered();
+                        let r1 = toolbar_rec_stop_pill(
+                            ui,
+                            &format!("{} REC EXV (42f)", ic::STOP),
+                            "Stop EXV",
+                        );
+                        exv_rect = r1.rect;
+                        exv_hov = r1.hovered();
+                    });
+                });
+                out.drop_without_applying_deltas();
+                (mp4_rect, exv_rect, mp4_hov, exv_hov)
+            };
+
+            let _ = run_pass(None);
+            let (mp4_idle, exv_idle, _, _) = run_pass(None);
+            assert!(mp4_idle.height() > 0.0 && exv_idle.height() > 0.0);
+            assert_eq!(
+                (mp4_idle.height() - exv_idle.height()).abs(),
+                0.0,
+                "{theme:?}: MP4 vs EXV stop pill height mismatch"
+            );
+
+            let _ = run_pass(Some(exv_idle.center()));
+            let (mp4_sib, exv_hov_rect, _, exv_hov) = run_pass(Some(exv_idle.center()));
+            assert!(exv_hov, "{theme:?}: EXV stop pill must register hover");
+            assert_eq!(
+                (exv_hov_rect.height() - exv_idle.height()).abs(),
+                0.0,
+                "{theme:?}: EXV stop pill height jittered on hover"
+            );
+            assert_eq!(
+                (mp4_sib.height() - exv_hov_rect.height()).abs(),
+                0.0,
+                "{theme:?}: sibling MP4 pill vs hovered EXV pill height mismatch"
             );
         }
     }

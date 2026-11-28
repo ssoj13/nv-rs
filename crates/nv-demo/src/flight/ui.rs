@@ -20,7 +20,8 @@
 //! columns (`allocate_clamped_ui`) and strip redundant trailing duration tags (`" (24s)"`) so
 //! titles never collide with right-aligned durations or action buttons.
 //! **Uses.** `camera`, `egui`, `egui_phosphor`, `flight_navigator`, `crate::ui`, `crate::flight`,
-//! `crate::flight_stats`, `crate::csg_scene_host`, `crate::is_counters`, `crate::renderer`.
+//! `crate::flight_stats`, `crate::csg_scene_host`, `crate::exv_export`, `crate::is_counters`,
+//! `crate::renderer`.
 //! **Used by.** `crate::ui` (`DockTab::FlightLab` and `DockTab::FlightPlayer`).
 
 use camera::CameraPose;
@@ -33,17 +34,18 @@ use flight_navigator::fnav_core::{
 use flight_navigator::fnav_plan::{HandoverKind, Mode, RailPlan};
 
 use crate::csg_scene_host::CsgStats;
+use crate::exv_export::{EXV_CHANNEL_COUNT, ExvProfile};
 use crate::flight::convert::limit_term_label;
 use crate::flight::lab::{DynamicsCurvePlot, LAB_DURATION_MAX_S, LAB_DURATION_MIN_S, LabMode};
 use crate::flight::player::{FlightRigCameraMode, PlayerState, TrackOrigin};
-use crate::flight::{FlightCommand, FlightWorkspace};
+use crate::flight::{FlightCommand, FlightWorkspace, PlaylistRecordFormat};
 use crate::flight_stats::{FlightStats, HIST_BINS, LoopPoint};
 use crate::is_counters::{IsCounts, IsGroup};
 use crate::renderer::{TIME_SCALE_MAX, TIME_SCALE_MIN};
 use crate::ui::{
     ANIM_BTN_W, ROW_H, active_accent_tint, allocate_clamped_ui, anim_toggle_btn_disabled,
     collapsing_section, equal_grid, fmt_into, hdr_amber_tint, prop_row, prop_slider_f32,
-    prop_toggle, stat_row,
+    prop_toggle, record_toggle_btn, stat_row,
 };
 
 /// Height of the `camera-guide-rs` speed/cap/bank dynamics graph.
@@ -94,6 +96,14 @@ pub struct FlightUiArgs<'a> {
     pub cur_pose: CameraPose,
     /// Whether MP4 video recording is currently active.
     pub is_recording: bool,
+    /// Total frames captured by the active MP4 video recorder.
+    pub record_frames: u64,
+    /// Whether multi-AOV `.exv` stream recording is currently active.
+    pub is_recording_exv: bool,
+    /// Total frames encoded by the active `.exv` stream recorder.
+    pub exv_encoded_frames: u64,
+    /// Active `.exv` compression profile (displayed in playlist EXV tooltips).
+    pub exv_profile: ExvProfile,
     /// Global simulation time scale slider value.
     pub time_scale: &'a mut f32,
     /// Camera damper smoothing time constant (seconds).
@@ -1287,6 +1297,8 @@ pub fn ui_flight_player(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
             ui.add_space(2.0);
             ui_player_transport_row(ui, args);
             ui.add_space(2.0);
+            ui_player_record_row(ui, args);
+            ui.add_space(2.0);
             ui_player_progress_bar(ui, args);
             ui.add_space(2.0);
             ui_player_drone_rig(ui, args);
@@ -1579,7 +1591,7 @@ fn ui_player_now_playing(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
         });
 }
 
-/// Renders the 100% phosphor-icon transport bar (`Prev`, `Play/Pause`, `Stop`, `Next`, `Repeat`, `Shuffle`, `Record`).
+/// Renders the 100% phosphor-icon transport bar (`Prev`, `Play/Pause`, `Stop`, `Next`, `Repeat`, `Shuffle`).
 fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     let player = &args.workspace.player;
     let is_playing = player.is_active();
@@ -1588,14 +1600,11 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
     let has_queue = !player.queue.is_empty();
     let repeat = player.repeat;
     let shuffle = player.shuffle;
-    let rec_active = args.is_recording || player.recording_playlist;
 
     let accent = active_accent_tint(ui);
     let accent_stroke = Stroke::new(1.0, ui.visuals().selection.stroke.color);
-    let rec_col = ui.visuals().error_fg_color;
-    let rec_fill = rec_col.gamma_multiply(0.32);
 
-    equal_grid(ui, 7, 7, |ui, idx, w| {
+    equal_grid(ui, 6, 6, |ui, idx, w| {
         let prev_pad = ui.spacing().button_padding;
         ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
         match idx {
@@ -1676,7 +1685,7 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                     (args.on_command)(FlightCommand::SetRepeat(next_mode));
                 }
             }
-            5 => {
+            _ => {
                 let mut btn = egui::Button::new(ic::SHUFFLE);
                 if shuffle {
                     btn = btn.fill(accent).stroke(accent_stroke);
@@ -1689,26 +1698,83 @@ fn ui_player_transport_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
                     (args.on_command)(FlightCommand::SetShuffle(!shuffle));
                 }
             }
-            _ => {
-                let mut btn = egui::Button::new(ic::RECORD);
-                if rec_active {
-                    btn = btn.fill(rec_fill).stroke(Stroke::new(1.0, rec_col));
-                }
-                if ui
-                    .add_enabled_ui(can_play || rec_active, |ui| ui.add_sized([w, BTN_H], btn))
-                    .inner
-                    .on_hover_text(if rec_active {
-                        "Stop MP4 recording without interrupting active playback."
-                    } else {
-                        "Record from the active track through playlist end to MP4 (auto-stops at end)."
-                    })
-                    .clicked()
-                {
-                    (args.on_command)(FlightCommand::ToggleRecordPlaylist);
-                }
-            }
         }
         ui.spacing_mut().button_padding = prev_pad;
+    });
+}
+
+/// Renders the symmetric 2-column Playlist Recording row (`Record MP4` | `Record EXV`) using
+/// [`crate::ui::record_toggle_btn`] so visual styling, dark/light contrast, hover stability, and
+/// toggle height match `Render & Floor` 1:1.
+fn ui_player_record_row(ui: &mut Ui, args: &mut FlightUiArgs<'_>) {
+    let player = &args.workspace.player;
+    let can_play = player.can_play();
+    let mp4_active =
+        args.is_recording || player.is_recording_playlist(PlaylistRecordFormat::Mp4);
+    let exv_active =
+        args.is_recording_exv || player.is_recording_playlist(PlaylistRecordFormat::Exv);
+    let disabled_tip = "Load or enqueue a flight track to record the playlist.";
+
+    equal_grid(ui, 2, 2, |ui, idx, w| match idx {
+        0 => {
+            let lbl = if mp4_active {
+                fmt_into(
+                    args.label_buf,
+                    format_args!("{}  Stop ({}f)", ic::STOP, args.record_frames),
+                )
+            } else {
+                fmt_into(args.label_buf, format_args!("{}  Record MP4", ic::VIDEO_CAMERA))
+            };
+            let tip = if mp4_active {
+                "Stop MP4 playlist recording and finalize the video file without interrupting active playback (Red = Recording)."
+            } else {
+                "Record from the active track through playlist end to MP4 at Smooth 60 FPS (auto-stops at end; Green = Ready)."
+            };
+            if ui
+                .add_enabled_ui(can_play || mp4_active, |ui| {
+                    record_toggle_btn(ui, mp4_active, lbl, tip, w)
+                })
+                .inner
+                .on_disabled_hover_text(disabled_tip)
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::ToggleRecordPlaylist(
+                    PlaylistRecordFormat::Mp4,
+                ));
+            }
+        }
+        _ => {
+            let lbl = if exv_active {
+                fmt_into(
+                    args.label_buf,
+                    format_args!("{}  Stop ({}f)", ic::STOP, args.exv_encoded_frames),
+                )
+            } else {
+                fmt_into(args.label_buf, format_args!("{}  Record EXV", ic::STACK))
+            };
+            let exv_tip_owned;
+            let tip: &str = if exv_active {
+                "Stop EXV playlist recording and finalize the multi-AOV .exv stream without interrupting active playback (Red = Recording)."
+            } else {
+                exv_tip_owned = format!(
+                    "Record from the active track through playlist end to a {EXV_CHANNEL_COUNT}-channel multi-AOV .exv stream ({}) at Smooth 60 FPS (auto-stops at end; Green = Ready).",
+                    args.exv_profile.label(),
+                );
+                &exv_tip_owned
+            };
+            if ui
+                .add_enabled_ui(can_play || exv_active, |ui| {
+                    record_toggle_btn(ui, exv_active, lbl, tip, w)
+                })
+                .inner
+                .on_disabled_hover_text(disabled_tip)
+                .clicked()
+            {
+                (args.on_command)(FlightCommand::ToggleRecordPlaylist(
+                    PlaylistRecordFormat::Exv,
+                ));
+            }
+        }
     });
 }
 
@@ -2788,6 +2854,10 @@ mod tests {
                         active_scene_label: "Gundo",
                         cur_pose: CameraPose::default(),
                         is_recording: false,
+                        record_frames: 0,
+                        is_recording_exv: false,
+                        exv_encoded_frames: 0,
+                        exv_profile: ExvProfile::default(),
                         time_scale: &mut time_scale,
                         cam_smooth_tau: &mut cam_smooth_tau,
                         label_buf: &mut label_buf,
@@ -2892,6 +2962,10 @@ mod tests {
                         active_scene_label: "Gundo",
                         cur_pose: CameraPose::default(),
                         is_recording: false,
+                        record_frames: 0,
+                        is_recording_exv: false,
+                        exv_encoded_frames: 0,
+                        exv_profile: ExvProfile::default(),
                         time_scale: &mut time_scale,
                         cam_smooth_tau: &mut cam_smooth_tau,
                         label_buf: &mut label_buf,
@@ -2909,6 +2983,207 @@ mod tests {
                 content_right <= panel_w + 1.0,
                 "panel_w={panel_w}: Flight Player overflowed right edge ({content_right:.1} > {panel_w:.1})"
             );
+        }
+    }
+
+    #[test]
+    fn flight_player_playlist_record_row_zero_jump_and_emits_both_formats() {
+        let mut ws = FlightWorkspace::default();
+        ws.player.queue.clear();
+        ws.player.queue.push(PlaylistSlot {
+            title: "Marina Coastal Loop".to_string(),
+            description: "Coastal flythrough".to_string(),
+            scene_id: "marina".to_string(),
+            track_id: "curated_marina".to_string(),
+            file_path: None,
+            track: sample_track(4, 6.0),
+            plan: None,
+            transition_in: PlaylistTransition::Cut,
+            hold_s: 0.0,
+            stale: false,
+            origin: TrackOrigin::Curated,
+        });
+
+        let mut stats = FlightStats::new();
+        let csg_stats = CsgStats::default();
+        let mut is_counters = false;
+        let mut time_scale = 1.0_f32;
+        let mut cam_smooth_tau = 0.08_f32;
+        let mut label_buf = String::with_capacity(96);
+
+        for theme in [UiTheme::Obsidian, UiTheme::Light] {
+            for panel_w in [240.0_f32, 300.0, 360.0] {
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                let _dock = theme.apply(&ctx);
+
+                let mut measure = |rec_mp4: bool, rec_exv: bool, prof: ExvProfile| -> (f32, f32) {
+                    let mut h = 0.0_f32;
+                    let mut r = 0.0_f32;
+                    for _ in 0..2 {
+                        let raw = egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                egui::vec2(panel_w, 200.0),
+                            )),
+                            ..Default::default()
+                        };
+                        let out = ctx.run_ui(raw, |ui| {
+                            ui.set_max_width(panel_w);
+                            ui.set_width(panel_w);
+                            let mut on_cmd = |_cmd: FlightCommand| {};
+                            let mut on_csv = || {};
+                            let mut on_seek = |_pose: CameraPose| {};
+                            let mut args = FlightUiArgs {
+                                workspace: &mut ws,
+                                flight_stats: &mut stats,
+                                csg_stats: &csg_stats,
+                                is_csg_scene: true,
+                                csg_lod_bias: 1.0,
+                                crowd_actor_count: 8,
+                                rt_ms: 8.0,
+                                is_counters: &mut is_counters,
+                                last_is_counts: None,
+                                active_scene_label: "Marina",
+                                cur_pose: CameraPose::default(),
+                                is_recording: rec_mp4,
+                                record_frames: if rec_mp4 { 120 } else { 0 },
+                                is_recording_exv: rec_exv,
+                                exv_encoded_frames: if rec_exv { 96 } else { 0 },
+                                exv_profile: prof,
+                                time_scale: &mut time_scale,
+                                cam_smooth_tau: &mut cam_smooth_tau,
+                                label_buf: &mut label_buf,
+                                on_command: &mut on_cmd,
+                                on_export_flight_csv: &mut on_csv,
+                                on_seek_pose: &mut on_seek,
+                            };
+                            let y0 = ui.cursor().top();
+                            ui_player_record_row(ui, &mut args);
+                            h = ui.cursor().top() - y0;
+                            r = ui.min_rect().right();
+                        });
+                        out.drop_without_applying_deltas();
+                    }
+                    (h, r)
+                };
+
+                let (idle_h, idle_r) = measure(false, false, ExvProfile::Compact);
+                let (mp4_h, mp4_r) = measure(true, false, ExvProfile::Hybrid);
+                let (exv_h, exv_r) = measure(false, true, ExvProfile::Hybrid);
+                let (both_h, both_r) = measure(true, true, ExvProfile::Lossless);
+
+                assert!(idle_h > 0.0);
+                assert!(
+                    (mp4_h - idle_h).abs() <= 1e-3
+                        && (exv_h - idle_h).abs() <= 1e-3
+                        && (both_h - idle_h).abs() <= 1e-3,
+                    "{theme:?} panel_w={panel_w}: playlist record row height jumped ({idle_h}, {mp4_h}, {exv_h}, {both_h})"
+                );
+                assert!(
+                    idle_r <= panel_w + 1.0
+                        && mp4_r <= panel_w + 1.0
+                        && exv_r <= panel_w + 1.0
+                        && both_r <= panel_w + 1.0,
+                    "{theme:?} panel_w={panel_w}: playlist record row overflowed ({idle_r}, {mp4_r}, {exv_r}, {both_r})"
+                );
+            }
+        }
+
+        // Verify clicking left/right halves emits ToggleRecordPlaylist(Mp4) and ToggleRecordPlaylist(Exv).
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _dock = UiTheme::Obsidian.apply(&ctx);
+        let mut row_rect = Rect::NOTHING;
+        let mut run_pass = |events: Vec<egui::Event>, row_rect_out: &mut Rect| -> Vec<FlightCommand> {
+            let mut emitted = Vec::new();
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 120.0))),
+                events,
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                ui.set_max_width(300.0);
+                ui.set_width(300.0);
+                let mut on_cmd = |cmd: FlightCommand| emitted.push(cmd);
+                let mut on_csv = || {};
+                let mut on_seek = |_pose: CameraPose| {};
+                let mut args = FlightUiArgs {
+                    workspace: &mut ws,
+                    flight_stats: &mut stats,
+                    csg_stats: &csg_stats,
+                    is_csg_scene: true,
+                    csg_lod_bias: 1.0,
+                    crowd_actor_count: 8,
+                    rt_ms: 8.0,
+                    is_counters: &mut is_counters,
+                    last_is_counts: None,
+                    active_scene_label: "Marina",
+                    cur_pose: CameraPose::default(),
+                    is_recording: false,
+                    record_frames: 0,
+                    is_recording_exv: false,
+                    exv_encoded_frames: 0,
+                    exv_profile: ExvProfile::Hybrid,
+                    time_scale: &mut time_scale,
+                    cam_smooth_tau: &mut cam_smooth_tau,
+                    label_buf: &mut label_buf,
+                    on_command: &mut on_cmd,
+                    on_export_flight_csv: &mut on_csv,
+                    on_seek_pose: &mut on_seek,
+                };
+                ui_player_record_row(ui, &mut args);
+                *row_rect_out = ui.min_rect();
+            });
+            out.drop_without_applying_deltas();
+            emitted
+        };
+
+        let _ = run_pass(Vec::new(), &mut row_rect);
+        let _ = run_pass(Vec::new(), &mut row_rect);
+        let mp4_pos = Pos2::new(
+            row_rect.left() + row_rect.width() * 0.25,
+            row_rect.center().y,
+        );
+        let exv_pos = Pos2::new(
+            row_rect.left() + row_rect.width() * 0.75,
+            row_rect.center().y,
+        );
+        for (pos, expected) in [
+            (
+                mp4_pos,
+                FlightCommand::ToggleRecordPlaylist(PlaylistRecordFormat::Mp4),
+            ),
+            (
+                exv_pos,
+                FlightCommand::ToggleRecordPlaylist(PlaylistRecordFormat::Exv),
+            ),
+        ] {
+            let mut cmds = run_pass(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut row_rect,
+            );
+            cmds.extend(run_pass(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut row_rect,
+            ));
+            assert_eq!(cmds, vec![expected]);
         }
     }
 }

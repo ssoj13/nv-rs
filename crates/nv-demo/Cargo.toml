@@ -30,6 +30,9 @@ csg-scene = { workspace = true, features = ["wgpu"] }
 csg-device = { workspace = true }
 csg-scenes = { workspace = true }
 exr-core = { workspace = true }
+exv-format = { workspace = true }
+exv-codec = { workspace = true }
+exv-video = { workspace = true }
 flight-navigator = { workspace = true }
 fnav-csg = { workspace = true }
 imath-rs = { workspace = true }

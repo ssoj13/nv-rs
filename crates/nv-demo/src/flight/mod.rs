@@ -123,6 +123,15 @@ pub fn shutter_subframe_dt(frame_dt: f32, sub_idx: u32, sub_count: u32) -> f32 {
     }
 }
 
+/// Target output container for a full-playlist Flight Player recording pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlaylistRecordFormat {
+    /// Hardware-encoded MP4 video (SDR H.264 or HDR10 PQ10 HEVC).
+    Mp4,
+    /// Multi-AOV compressed `.exv` stream (+ companion `.sdg.json` sidecar).
+    Exv,
+}
+
 /// Typed flight commands emitted by Flight Lab and Flight Player UI panels and routed via
 /// `UiCommand::Flight(FlightCommand)`.
 #[derive(Clone, Debug, PartialEq)]
@@ -187,8 +196,8 @@ pub enum FlightCommand {
     },
     /// Rescan repo and user flight libraries from disk.
     RescanLibrary,
-    /// Toggle full-playlist MP4 video recording.
-    ToggleRecordPlaylist,
+    /// Toggle full-playlist recording for the requested output format (`Mp4` or `Exv`).
+    ToggleRecordPlaylist(PlaylistRecordFormat),
     /// Launch asynchronous automatic flight planning against the active CSG scene (R0+R1).
     LabGenerateAutoPlan,
     /// Capture current viewport camera pose into Flight Lab manual keyframes.
@@ -229,8 +238,8 @@ pub struct FlightCommandOutcome {
     pub ejected_pose: Option<CameraPose>,
     /// Reset `FlightStats` telemetry ring buffer (new track / playback start).
     pub reset_stats: bool,
-    /// Toggle host MP4 video recording for a full-playlist capture pass.
-    pub toggle_record_playlist: bool,
+    /// Toggle host recording (`Mp4` or `Exv`) for a full-playlist capture pass.
+    pub toggle_record_playlist: Option<PlaylistRecordFormat>,
     /// Request that the host switch to the named scene id before playback resumes.
     pub request_scene_id: Option<String>,
     /// Request that the host submit an asynchronous [`oracle::AutoPlanJob`] for the active CSG scene.
@@ -361,8 +370,8 @@ impl FlightWorkspace {
                     self.player.library.playlists.len()
                 );
             }
-            FlightCommand::ToggleRecordPlaylist => {
-                return self.toggle_record_playlist(false);
+            FlightCommand::ToggleRecordPlaylist(fmt) => {
+                return self.toggle_record_playlist(fmt, false);
             }
             FlightCommand::LabGenerateAutoPlan => {
                 out.request_auto_plan = true;
@@ -449,19 +458,26 @@ impl FlightWorkspace {
         out
     }
 
-    /// Toggles playlist MP4 recording while respecting both active host recording (`host_recording`,
-    /// e.g. started from `Render & Floor -> Record MP4`) and the currently active/previewed track.
+    /// Toggles playlist recording for `fmt` (`Mp4` or `Exv`) while respecting both active host
+    /// recording (`host_recording`, e.g. started from `Render & Floor -> Record MP4 / Record EXV`)
+    /// and the currently active/previewed track.
     ///
-    /// Why: when recording is already active, clicking Flight Player's red Record button must stop
-    /// recording without interrupting or resetting the active rail; when starting a pass, it must
-    /// record the currently active/previewed track (such as a `LabPreview` rail appended after a
-    /// curated rail) rather than jumping back to slot `0`, seed curated rail `0` when the queue is
-    /// empty, and forward cross-scene `PlayerState::Loading` requests to the host.
-    pub fn toggle_record_playlist(&mut self, host_recording: bool) -> FlightCommandOutcome {
+    /// Why: when recording of `fmt` is already active, clicking Flight Player's Record button must
+    /// stop recording without interrupting or resetting the active rail; when starting a pass, it
+    /// must record the currently active/previewed track (such as a `LabPreview` rail appended
+    /// after a curated rail) rather than jumping back to slot `0`, seed curated rail `0` when the
+    /// queue is empty, and forward cross-scene `PlayerState::Loading` requests to the host.
+    pub fn toggle_record_playlist(
+        &mut self,
+        fmt: PlaylistRecordFormat,
+        host_recording: bool,
+    ) -> FlightCommandOutcome {
         let mut out = FlightCommandOutcome::default();
-        if host_recording || self.player.recording_playlist {
-            self.player.recording_playlist = false;
-            out.toggle_record_playlist = true;
+        if host_recording || self.player.recording_playlist == Some(fmt) {
+            if self.player.recording_playlist == Some(fmt) {
+                self.player.recording_playlist = None;
+            }
+            out.toggle_record_playlist = Some(fmt);
             return out;
         }
 
@@ -469,10 +485,10 @@ impl FlightWorkspace {
             if !self.player.play() {
                 return out;
             }
-            self.player.recording_playlist = true;
+            self.player.recording_playlist = Some(fmt);
             out.snap_cam = true;
             out.reset_stats = true;
-            out.toggle_record_playlist = true;
+            out.toggle_record_playlist = Some(fmt);
             if let player::PlayerState::Loading { ref scene_id } = self.player.state {
                 out.request_scene_id = Some(scene_id.clone());
             }
@@ -502,10 +518,10 @@ impl FlightWorkspace {
         };
 
         if self.player.select_entry(start_idx, true) {
-            self.player.recording_playlist = true;
+            self.player.recording_playlist = Some(fmt);
             out.snap_cam = true;
             out.reset_stats = true;
-            out.toggle_record_playlist = true;
+            out.toggle_record_playlist = Some(fmt);
             if let player::PlayerState::Loading { ref scene_id } = self.player.state {
                 out.request_scene_id = Some(scene_id.clone());
             }
@@ -1193,21 +1209,29 @@ mod tests {
         // playback must remain on slot 1 at the current timestamp without jumping back to slot 0.
         let _ = ws.player.tick(2.5, 0.05, 5000.0);
         let t_before = ws.player.time_s;
-        let stop_out = ws.toggle_record_playlist(true);
-        assert!(stop_out.toggle_record_playlist);
+        let stop_out = ws.toggle_record_playlist(PlaylistRecordFormat::Mp4, true);
+        assert_eq!(stop_out.toggle_record_playlist, Some(PlaylistRecordFormat::Mp4));
         assert!(!stop_out.snap_cam);
-        assert!(!ws.player.recording_playlist);
+        assert_eq!(ws.player.recording_playlist, None);
         assert_eq!(ws.player.active_idx, 1);
         assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 1 });
         assert!((ws.player.time_s - t_before).abs() < 1e-6);
 
         // Starting playlist recording while previewing slot 1 must record slot 1 (`LabPreview`),
-        // not jump away to curated slot 0.
-        let start_out = ws.toggle_record_playlist(false);
-        assert!(start_out.toggle_record_playlist);
+        // not jump away to curated slot 0 (verified for both MP4 and EXV formats).
+        let start_out = ws.toggle_record_playlist(PlaylistRecordFormat::Exv, false);
+        assert_eq!(
+            start_out.toggle_record_playlist,
+            Some(PlaylistRecordFormat::Exv)
+        );
         assert!(start_out.snap_cam);
         assert!(start_out.reset_stats);
-        assert!(ws.player.recording_playlist);
+        assert_eq!(
+            ws.player.recording_playlist,
+            Some(PlaylistRecordFormat::Exv)
+        );
+        assert!(ws.player.is_recording_playlist(PlaylistRecordFormat::Exv));
+        assert!(!ws.player.is_recording_playlist(PlaylistRecordFormat::Mp4));
         assert_eq!(ws.player.active_idx, 1);
         assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 1 });
         assert_eq!(
@@ -1224,9 +1248,9 @@ mod tests {
         ws.player.active_scene_id = "gundo".to_string();
 
         // Empty queue and no curated rails: refuse without starting an empty recording.
-        let empty_out = ws.toggle_record_playlist(false);
-        assert!(!empty_out.toggle_record_playlist);
-        assert!(!ws.player.recording_playlist);
+        let empty_out = ws.toggle_record_playlist(PlaylistRecordFormat::Mp4, false);
+        assert_eq!(empty_out.toggle_record_playlist, None);
+        assert_eq!(ws.player.recording_playlist, None);
         assert_eq!(ws.player.state, PlayerState::Idle);
 
         // Finished Idle pass at end of slot 1 wraps back to slot 0 on next playlist record.
@@ -1261,20 +1285,29 @@ mod tests {
         ws.player.active_idx = 1;
         ws.player.time_s = ws.player.duration_s();
         ws.player.state = PlayerState::Idle;
-        let wrap_out = ws.toggle_record_playlist(false);
-        assert!(wrap_out.toggle_record_playlist);
-        assert!(ws.player.recording_playlist);
+        let wrap_out = ws.toggle_record_playlist(PlaylistRecordFormat::Mp4, false);
+        assert_eq!(wrap_out.toggle_record_playlist, Some(PlaylistRecordFormat::Mp4));
+        assert_eq!(
+            ws.player.recording_playlist,
+            Some(PlaylistRecordFormat::Mp4)
+        );
         assert_eq!(ws.player.active_idx, 0);
         assert_eq!(ws.player.state, PlayerState::Playing { entry_idx: 0 });
-        ws.player.recording_playlist = false;
+        ws.player.recording_playlist = None;
 
         // Cross-scene active slot must emit `request_scene_id` so host loads the scene.
         ws.player.active_idx = 1;
         ws.player.time_s = 0.0;
         ws.player.state = PlayerState::Paused { entry_idx: 1 };
-        let cross_out = ws.toggle_record_playlist(false);
-        assert!(cross_out.toggle_record_playlist);
-        assert!(ws.player.recording_playlist);
+        let cross_out = ws.toggle_record_playlist(PlaylistRecordFormat::Exv, false);
+        assert_eq!(
+            cross_out.toggle_record_playlist,
+            Some(PlaylistRecordFormat::Exv)
+        );
+        assert_eq!(
+            ws.player.recording_playlist,
+            Some(PlaylistRecordFormat::Exv)
+        );
         assert_eq!(cross_out.request_scene_id.as_deref(), Some("marina"));
         assert!(matches!(
             ws.player.state,

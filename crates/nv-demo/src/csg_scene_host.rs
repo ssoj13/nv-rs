@@ -1588,10 +1588,10 @@ fn compute_scene_sim_summary(scene: &SceneBuilt) -> SceneSimSummary {
     for desc in &scene.crowd.descs {
         if let Some(topo) = scene.crowd.topologies.get(desc.archetype_id as usize) {
             let slot = match topo.plan.archetype {
-                ArchetypeKind::HumanHero => 0,
+                ArchetypeKind::HumanHero | ArchetypeKind::HumanSculpted => 0,
                 ArchetypeKind::HumanCrowd => 1,
                 ArchetypeKind::RoadSignStickman => 2,
-                ArchetypeKind::Quadruped => 3,
+                ArchetypeKind::Quadruped | ArchetypeKind::QuadrupedSculpted => 3,
             };
             crowd_archetypes[slot] = crowd_archetypes[slot].saturating_add(1);
             crowd_dofs = crowd_dofs.saturating_add(topo.nv as u32);
@@ -4288,9 +4288,11 @@ struct PickTarget {
 fn crowd_actor_display_name(crowd: &CrowdSim, actor_idx: usize) -> String {
     let prefix = match crowd.descs.get(actor_idx).map(|d| d.archetype_id) {
         Some(x) if x == ArchetypeKind::HumanHero as u32 => "sdg_mannequin",
+        Some(x) if x == ArchetypeKind::HumanSculpted as u32 => "human_sculpted",
         Some(x) if x == ArchetypeKind::HumanCrowd as u32 => "pedestrian",
         Some(x) if x == ArchetypeKind::RoadSignStickman as u32 => "road_sign_stickman",
         Some(x) if x == ArchetypeKind::Quadruped as u32 => "quadruped_dog",
+        Some(x) if x == ArchetypeKind::QuadrupedSculpted as u32 => "quadruped_sculpted",
         _ => "crowd_actor",
     };
     format!("{prefix}_{actor_idx}")
@@ -4561,11 +4563,11 @@ mod tests {
             .get_by_index(inspector_idx)
             .expect("inspector module");
         let cfg = SceneBuildConfig {
-            variant_idx: SHOWCASE_VARIANT, // 4-archetype actor crowd showcase
+            variant_idx: SHOWCASE_VARIANT, // 6-archetype actor crowd showcase
             ..SceneBuildConfig::default()
         };
         let mut built = module.build(&cfg).expect("scene builds");
-        assert_eq!(built.crowd.actor_count(), 4, "4-archetype showcase has 4 actors");
+        assert_eq!(built.crowd.actor_count(), 6, "6-archetype showcase has 6 actors");
         built.reset_crowd_motion_history();
         let vp = built.viewpoints[0].clone();
         let cam_eye = [vp.eye.x, vp.eye.y, vp.eye.z];
@@ -4656,11 +4658,11 @@ mod tests {
         let count = host
             .export_sdg_json(&out_path, sdg_cam, 7, 0.15)
             .expect("SDG JSON export");
-        assert_eq!(count, 4, "all 4 showcase actors must be exported");
+        assert_eq!(count, 6, "all 6 showcase actors must be exported");
         let raw = std::fs::read_to_string(&out_path).expect("read exported SDG JSON");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(parsed["scene_id"], "inspector");
-        assert_eq!(parsed["actors"].as_array().map(Vec::len), Some(4));
+        assert_eq!(parsed["actors"].as_array().map(Vec::len), Some(6));
         let _ = std::fs::remove_file(&out_path);
 
         // Transitioning freeze_pose false -> true must snap prev_xform = xform for all dynamic
@@ -4871,7 +4873,7 @@ mod tests {
             ..SceneBuildConfig::default()
         })
         .expect("scene builds");
-        assert_eq!(built.crowd.actor_count(), 4);
+        assert_eq!(built.crowd.actor_count(), 6);
         let initial_compounds = built.world.library.compounds.len();
 
         host.scene_key = CsgSceneKey {
@@ -4943,7 +4945,7 @@ mod tests {
         let added = scene
             .spawn_crowd_stress(64, Vec3::ZERO)
             .expect("spawn_crowd_stress 64");
-        assert_eq!(added, 60);
+        assert_eq!(added, 58);
         assert_eq!(scene.crowd.actor_count(), 64);
         assert_eq!(
             scene.world.library.compounds.len(),

@@ -18,8 +18,9 @@
 //! `crate::semantic_filter`, `crate::wireframe`.
 //! Used by: `crate::main`, `crate::ui`, `crate::persist`, `crate::bench`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -39,18 +40,25 @@ use optix::{
 };
 
 use crate::app_events::{
-    AppBus, EnginePhase, OceanMode, OceanParams, PossessAdas, PossessInfo, RenderControl,
-    RenderEvent, SceneBuildProgress, SimTelemetry, SmartViewResult, fast_preview_budget,
+    AppBus, EnginePhase, ExvRecordTelemetry, OceanMode, OceanParams, PossessAdas, PossessInfo,
+    RenderControl, RenderEvent, SceneBuildProgress, SimTelemetry, SmartViewResult,
+    fast_preview_budget,
 };
 use crate::csg_scene_host::{
-    CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, csg_flags,
+    CsgCameraParams, CsgGpuHost, CsgSceneKey, CsgStats, CsgSyncResult, SdgExportFrame, csg_flags,
 };
 use crate::cuda_camera::GpuCameraComposer;
 use crate::cuda_crowd::{CrowdLodParams, CudaCrowdBackend, GpuScatterTarget};
 use crate::cuda_ocean::{CudaOcean, pack_ocean_uniforms};
 use crate::cuda_traffic::{CudaTrafficBackend, TrafficScatterBindingPod, TrafficScatterTarget};
+use crate::exv_export::{
+    ExvClipMetadata, ExvFrameBuffers, ExvProfile, ExvRecorder, build_exv_meta,
+    hybrid_temp_mp4_path,
+};
 use crate::fft_bloom::FftBloomPass;
-use crate::gpu_export::save_jpeg_from_rgba8;
+use crate::gpu_export::{
+    SourcePixelFormat, VideoProfile, VideoRecorder, save_jpeg_from_rgba8,
+};
 use crate::profiler::GpuPassProfiler;
 use crate::semantic_filter as sf;
 use crate::sdg_export::{
@@ -58,7 +66,9 @@ use crate::sdg_export::{
     SdgBurstManifest, SdgExrFrame, SdgOccluderBackend, TrafficBackend, write_sdg_exr_atomic,
     write_sdg_manifest_atomic,
 };
-use csg_actors::{KeypointVis, RayOccluder, SdgCamera, Vec3 as ActorVec3};
+use csg_actors::{
+    CsgRayOccluder, KeypointVis, RayOccluder, SdgCamera, Vec3 as ActorVec3, extract_sdg_frame,
+};
 use csg_scene::camera_gpu::{
     CAM_FAULT_NONE, CAM_FLAG_RESET_HISTORY, CameraModePod, CameraRecordPod, quat_forward_up,
 };
@@ -886,6 +896,9 @@ pub struct DemoSettings {
     pub hdr_display: bool,
     /// `0 = Match View`, `1 = SDR H.264`, `2 = PQ10 HDR10 HEVC`.
     pub record_video_mode: u32,
+    /// Multi-AOV compressed `.exv` stream recording profile (`Compact`, `Hybrid`, `Lossless`, `Fast`).
+    #[serde(default)]
+    pub exv_profile: ExvProfile,
     pub record_fixed_fps: bool,
     /// Capture target for PNG/JPEG stills and MP4 video recording.
     pub capture_source: CaptureSource,
@@ -1108,6 +1121,7 @@ impl Default for DemoSettings {
             dlss_sharpness: 0.35,
             hdr_display: false,
             record_video_mode: 0,
+            exv_profile: ExvProfile::default(),
             record_fixed_fps: false,
             capture_source: CaptureSource::Viewport,
             cam_smooth_tau: 0.0,
@@ -1265,6 +1279,8 @@ pub struct FrameReady {
     pub rendered_camera: CameraFrame,
     /// Live zero-allocation snapshot of Crowd, Locomotion, and Traffic simulation telemetry.
     pub sim_telemetry: SimTelemetry,
+    /// Live zero-allocation snapshot of multi-AOV `.exv` stream recording progress.
+    pub exv_record: ExvRecordTelemetry,
     /// The frame's timings and launch state, the same sample the perf CSV records.
     pub perf: crate::perf_log::PerfSample,
 }
@@ -1474,6 +1490,28 @@ const fn denoiser_needs_create(
     } else {
         !has_denoiser && !failed
     }
+}
+
+/// Returns `true` when multi-AOV SDG capture (either a multi-frame OpenEXR burst or live `.exv`
+/// stream recording) needs `depth_f32`, `motion_f32`, `semantic_u32`, and `instance_u32` allocated
+/// and populated by the raygen shader.
+#[inline]
+const fn sdg_aovs_required(burst_active: bool, exv_active: bool) -> bool {
+    burst_active || exv_active
+}
+
+/// Returns `true` when the OptiX AI denoiser pass is active for `settings` and `has_rr_ptrs`
+/// (beauty pass only, with DLSS SR/RR off and not in Wireframe mode).
+///
+/// Single source of truth shared between the per-frame render loop (`will_run_denoiser`) and
+/// `.exv` clip header metadata (`ExvClipMetadata::beauty_denoised`).
+#[inline]
+const fn will_run_optix_denoiser(settings: &DemoSettings, has_rr_ptrs: bool) -> bool {
+    let launch_aov = settings.launch_aov_mode();
+    let wireframe = launch_aov == crate::wireframe::AOV_WIREFRAME;
+    let rr_export = !wireframe && (settings.dlss_rr_on || has_rr_ptrs);
+    let dlss_any = !wireframe && (settings.dlss_on || rr_export);
+    settings.denoiser_on && !dlss_any && launch_aov == 0
 }
 
 /// Returns `true` when DLSS sub-pixel jitter runs this frame. Jitter restarts accumulation every
@@ -4836,6 +4874,131 @@ impl SdgExportOutcome {
     }
 }
 
+/// Runs the requested SDG occluder backend (`Cpu`, `Optix`, or `Auto` with explicit fallback
+/// reporting) after syncing GPU crowd/traffic poses to CPU.
+///
+/// Shared SSOT between standalone/burst JSON exports ([`export_sdg_json_with_backend`]) and
+/// per-frame `.exv` companion `.sdg.json` sidecar extraction ([`extract_sdg_frame_for_exv`]).
+fn resolve_sdg_optix_occluder(
+    rig: &mut OptixRig,
+    sdg_cam: &SdgCamera,
+    backend: SdgOccluderBackend,
+    fractal: &FractalLaunch,
+) -> Result<Option<Result<OptixBatchedOccluder, String>>, String> {
+    sync_cuda_crowd_to_cpu(rig, true)?;
+    sync_cuda_traffic_to_cpu(rig)?;
+    Ok(match backend {
+        SdgOccluderBackend::Cpu => None,
+        SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, sdg_cam, fractal)?)),
+        SdgOccluderBackend::Auto => Some(trace_sdg_occluder_optix(rig, sdg_cam, fractal)),
+    })
+}
+
+/// Extracts a typed [`SdgExportFrame`] (camera intrinsics/extrinsics + ray-occluded actor
+/// keypoints/BBoxes when a CSG crowd is present) for embedding into one `.exv` frame's
+/// `FMET` / `MetaFooter` `"frames"` row.
+fn extract_sdg_frame_for_exv(
+    rig: &mut OptixRig,
+    sdg_cam: SdgCamera,
+    frame_index: u32,
+    time_s: f32,
+    backend: SdgOccluderBackend,
+    fractal: &FractalLaunch,
+) -> Result<(SdgExportFrame, Option<ActiveSdgOccluder>, Option<String>), String> {
+    if !rig.csg_host.is_active() {
+        return Ok((
+            SdgExportFrame {
+                scene_id: "classic".to_string(),
+                scene_idx: 0,
+                variant_idx: 0,
+                frame_index,
+                time_s,
+                camera: sdg_cam,
+                actors: Vec::new(),
+            },
+            None,
+            None,
+        ));
+    }
+    let scene_id = rig.csg_host.active_scene_id();
+    let scene_key = rig.csg_host.scene_key();
+    if !rig.csg_host.has_crowd() {
+        return Ok((
+            SdgExportFrame {
+                scene_id,
+                scene_idx: scene_key.scene_idx,
+                variant_idx: scene_key.variant_idx,
+                frame_index,
+                time_s,
+                camera: sdg_cam,
+                actors: Vec::new(),
+            },
+            None,
+            None,
+        ));
+    }
+    let optix_res = resolve_sdg_optix_occluder(rig, &sdg_cam, backend, fractal)?;
+    let (actors, active_occ, fallback_reason) = match optix_res {
+        Some(Ok(occluder)) => {
+            let crowd = rig
+                .csg_host
+                .active_crowd()
+                .ok_or_else(|| "CSG crowd missing during EXV SDG extraction".to_string())?;
+            (
+                extract_sdg_frame(crowd, &sdg_cam, &occluder),
+                Some(ActiveSdgOccluder::Optix),
+                None,
+            )
+        }
+        cpu => {
+            let (world, _) = rig
+                .csg_host
+                .world_and_hints()
+                .ok_or_else(|| "CSG world missing during EXV SDG extraction".to_string())?;
+            let crowd = rig
+                .csg_host
+                .active_crowd()
+                .ok_or_else(|| "CSG crowd missing during EXV SDG extraction".to_string())?;
+            let visible = rig.csg_host.packed().instances_slice();
+            let actors = if visible.is_empty() {
+                let occluder = CsgRayOccluder::new(&world.library, &crowd.bone_outs);
+                extract_sdg_frame(crowd, &sdg_cam, &occluder)
+            } else {
+                let world_insts: Vec<(csg_core::CompoundId, csg_core::Mat3x4, u32)> = visible
+                    .iter()
+                    .map(|inst| {
+                        (
+                            csg_core::CompoundId(inst.compound_id),
+                            csg_core::Mat3x4(inst.xform),
+                            inst.user_id,
+                        )
+                    })
+                    .collect();
+                let occluder = CsgRayOccluder::from_instances(&world.library, &world_insts);
+                extract_sdg_frame(crowd, &sdg_cam, &occluder)
+            };
+            (
+                actors,
+                Some(ActiveSdgOccluder::Cpu),
+                cpu.and_then(Result::err),
+            )
+        }
+    };
+    Ok((
+        SdgExportFrame {
+            scene_id,
+            scene_idx: scene_key.scene_idx,
+            variant_idx: scene_key.variant_idx,
+            frame_index,
+            time_s,
+            camera: sdg_cam,
+            actors,
+        },
+        active_occ,
+        fallback_reason,
+    ))
+}
+
 /// Exports exact SDG keypoints & tight BBoxes honoring strict backend semantics:
 /// explicit [`SdgOccluderBackend::Optix`] never silently downgrades to CPU on failure, while
 /// [`SdgOccluderBackend::Auto`] tries OptiX first and reports which concrete backend ran and why
@@ -4849,13 +5012,7 @@ fn export_sdg_json_with_backend(
     backend: SdgOccluderBackend,
     fractal: &FractalLaunch,
 ) -> Result<SdgExportOutcome, String> {
-    sync_cuda_crowd_to_cpu(rig, true)?;
-    sync_cuda_traffic_to_cpu(rig)?;
-    let optix_result = match backend {
-        SdgOccluderBackend::Cpu => None,
-        SdgOccluderBackend::Optix => Some(Ok(trace_sdg_occluder_optix(rig, &sdg_cam, fractal)?)),
-        SdgOccluderBackend::Auto => Some(trace_sdg_occluder_optix(rig, &sdg_cam, fractal)),
-    };
+    let optix_result = resolve_sdg_optix_occluder(rig, &sdg_cam, backend, fractal)?;
     match optix_result {
         Some(Ok(occluder)) => {
             let actors = rig.csg_host.export_sdg_json_with_occluder(
@@ -4906,18 +5063,49 @@ struct SdgBurstState {
     entries: Vec<SdgBurstFrameEntry>,
 }
 
-/// Reads back the 9 SDG AOV channels (`R/G/B/A`, `depth.Z`, `motion.X/Y`, `semantic.id`,
-/// `instance.id`) from `rig` and writes one atomic ZIP-compressed OpenEXR frame to `path`.
-fn readback_and_write_sdg_exr(
-    rig: &OptixRig,
-    width: u32,
-    height: u32,
-    path: &std::path::Path,
-    scratch: &mut SdgExrReadbackScratch,
+/// Copies `n` typed elements from device pointer `src_ptr` into reusable host buffer `dst`
+/// without heap churn once `dst` has reached capacity.
+fn copy_d2h_typed<T: Pod + Clone>(
+    dst: &mut Vec<T>,
+    src_ptr: u64,
+    n: usize,
+    zero: T,
+    label: &str,
 ) -> Result<(), String> {
-    let n = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| "SDG EXR pixel count overflow".to_string())?;
+    if dst.len() != n {
+        dst.resize(n, zero);
+    }
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut dst[..n]);
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: GPU stream synced before readback; `src_ptr` holds `>= bytes.len()` bytes.
+    let rc = unsafe { cu::cuMemcpyDtoH_v2(bytes.as_mut_ptr().cast(), src_ptr, bytes.len()) };
+    if rc != cu::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("AOV {label} readback failed ({rc:?})"));
+    }
+    Ok(())
+}
+
+/// Mutable target slices/vecs for [`readback_sdg_core_aovs`], shared by SDG EXR bursts and live
+/// `.exv` stream recording without intermediate copies.
+struct SdgCoreAovTargets<'a> {
+    color_rgba: &'a mut Vec<[f32; 4]>,
+    depth_f32: &'a mut Vec<f32>,
+    motion_xy: &'a mut Vec<[f32; 2]>,
+    semantic_u32: &'a mut Vec<u32>,
+    instance_u32: &'a mut Vec<u32>,
+}
+
+/// Shared SSOT device-to-host readback for the 5 core SDG AOV planes (`color/beauty`, `depth`,
+/// `motion`, `semantic_id`, `instance_id`) used by both SDG OpenEXR bursts and live `.exv`
+/// stream recording.
+fn readback_sdg_core_aovs(
+    rig: &OptixRig,
+    beauty_ptr: u64,
+    n: usize,
+    dst: SdgCoreAovTargets<'_>,
+) -> Result<(), String> {
     let depth_buf = rig
         .depth_f32
         .as_ref()
@@ -4935,44 +5123,255 @@ fn readback_and_write_sdg_exr(
         .as_ref()
         .ok_or_else(|| "SDG instance_u32 device buffer not initialized".to_string())?;
 
-    scratch.color_rgba.resize(n, [0.0; 4]);
-    scratch.depth_f32.resize(n, 0.0);
-    scratch.motion_xy.resize(n, [0.0; 2]);
-    scratch.semantic_u32.resize(n, 0);
-    scratch.instance_u32.resize(n, 0);
+    copy_d2h_typed(dst.color_rgba, beauty_ptr, n, [0.0; 4], "beauty_f32")?;
+    copy_d2h_typed(dst.depth_f32, depth_buf.cu_deviceptr(), n, 0.0, "depth_f32")?;
+    copy_d2h_typed(dst.motion_xy, motion_buf.cu_deviceptr(), n, [0.0; 2], "motion_f32")?;
+    copy_d2h_typed(dst.semantic_u32, sem_buf.cu_deviceptr(), n, 0, "semantic_u32")?;
+    copy_d2h_typed(dst.instance_u32, inst_buf.cu_deviceptr(), n, 0, "instance_u32")?;
+    Ok(())
+}
 
-    let copy_d2h = |dst: &mut [u8], src_ptr: u64, label: &str| -> Result<(), String> {
-        // SAFETY: GPU stream synced before readback; `src_ptr` holds `>= dst.len()` bytes.
-        let rc = unsafe { cu::cuMemcpyDtoH_v2(dst.as_mut_ptr().cast(), src_ptr, dst.len()) };
-        if rc != cu::cudaError_enum_CUDA_SUCCESS {
-            return Err(format!("SDG EXR {label} readback failed ({rc:?})"));
+/// Selects the linear Beauty device pointer for `.exv` recording: `denoised_f32` only when the
+/// OptiX denoiser actually ran and populated it this frame, else raw `color_f32`.
+#[inline]
+fn select_exv_beauty_ptr(rig: &OptixRig, denoiser_ran: bool) -> u64 {
+    if denoiser_ran
+        && let Some(ref denoised) = rig.denoised_f32
+    {
+        denoised.cu_deviceptr()
+    } else {
+        rig.color_f32.cu_deviceptr()
+    }
+}
+
+/// Reads back all 16 multi-AOV channels into a pooled [`ExvFrameBuffers`] slot (zero steady-state
+/// heap allocations; shares core readback with SDG OpenEXR bursts).
+fn readback_exv_frame(
+    rig: &OptixRig,
+    beauty_ptr: u64,
+    dims: (u32, u32),
+    dst: &mut ExvFrameBuffers,
+) -> Result<(), String> {
+    let n = (dims.0 as usize)
+        .checked_mul(dims.1 as usize)
+        .ok_or_else(|| "EXV pixel count overflow".to_string())?;
+    readback_sdg_core_aovs(
+        rig,
+        beauty_ptr,
+        n,
+        SdgCoreAovTargets {
+            color_rgba: &mut dst.color_rgba,
+            depth_f32: &mut dst.depth,
+            motion_xy: &mut dst.motion,
+            semantic_u32: &mut dst.semantic_id,
+            instance_u32: &mut dst.instance_id,
+        },
+    )?;
+    copy_d2h_typed(
+        &mut dst.albedo_rgba,
+        rig.albedo_f32.cu_deviceptr(),
+        n,
+        [0.0; 4],
+        "albedo_f32",
+    )?;
+    copy_d2h_typed(
+        &mut dst.normal_rough,
+        rig.normal_f32.cu_deviceptr(),
+        n,
+        [0.0; 4],
+        "normal_f32",
+    )?;
+    dst.sdg_frame = None;
+    dst.sdg_occluder = None;
+    Ok(())
+}
+
+/// Builds a bounded `(label, instance_id)` Cryptomatte manifest snapshot from the active CSG world
+/// (and classic stage slots when visible) once at `.exv` recording start.
+fn build_csg_instance_manifest(rig: &OptixRig, show_classic: bool) -> Vec<(String, u32)> {
+    const MAX_MANIFEST_ENTRIES: usize = 16_384;
+    let mut manifest = Vec::new();
+    let mut seen = HashSet::<u32>::new();
+    if let Some((world, _)) = rig.csg_host.world_and_hints() {
+        let iter = world
+            .dynamic_instances()
+            .iter()
+            .chain(world.chunks().iter().flat_map(|c| c.instances().iter()));
+        for inst in iter {
+            if manifest.len() >= MAX_MANIFEST_ENTRIES {
+                break;
+            }
+            if inst.user_id == 0 || !seen.insert(inst.user_id) {
+                continue;
+            }
+            let base = world
+                .assembly(inst.assembly_id)
+                .map(|a| a.name.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("object");
+            manifest.push((format!("{base}#{}", inst.user_id), inst.user_id));
         }
-        Ok(())
+    }
+    if show_classic && manifest.len() < MAX_MANIFEST_ENTRIES {
+        for &(id, name) in &[
+            (0xFFFF_FF00u32, "classic_floor"),
+            (0xFFFF_FF01u32, "classic_fractal"),
+        ] {
+            if seen.insert(id) {
+                manifest.push((name.to_string(), id));
+            }
+        }
+    }
+    manifest
+}
+
+/// Active NVENC 10-bit PQ10 HEVC companion video encoder for [`ExvProfile::Hybrid`].
+struct ActiveHybridVideo {
+    recorder: VideoRecorder,
+    tmp_mp4_path: PathBuf,
+}
+
+/// Active multi-AOV `.exv` recording session on the render thread (combining [`ExvRecorder`],
+/// optional NVENC [`ActiveHybridVideo`] for [`ExvProfile::Hybrid`], and per-frame SDG sidecar
+/// extraction settings).
+struct ActiveExvSession {
+    recorder: ExvRecorder,
+    hybrid_video: Option<ActiveHybridVideo>,
+    occluder: SdgOccluderBackend,
+    fps: u32,
+    last_frame_at: Option<Instant>,
+    sdg_fallback_reported: bool,
+}
+
+/// Removes a temporary hybrid `.mp4` file if present, logging real I/O errors without panicking.
+fn remove_temp_mp4_if_exists(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "nv-demo: failed to remove hybrid temp MP4 '{}': {e}",
+            path.display()
+        );
+    }
+}
+
+/// Builds a zero-allocation [`ExvRecordTelemetry`] snapshot from an active [`ActiveExvSession`].
+#[inline]
+fn exv_telemetry_from(session: Option<&ActiveExvSession>) -> ExvRecordTelemetry {
+    match session {
+        Some(s) => {
+            let st = s.recorder.stats();
+            ExvRecordTelemetry {
+                active: true,
+                submitted_frames: st.frames_submitted,
+                encoded_frames: st.frames_encoded,
+                bytes_written: st.bytes_written,
+            }
+        }
+        None => ExvRecordTelemetry::default(),
+    }
+}
+
+/// Drains and atomically finalizes an active [`ActiveExvSession`] (including finishing the NVENC
+/// temp `.mp4` and assembling the `CodecId::HYBRID` container when `ExvProfile::Hybrid` is
+/// active), emitting both [`RenderEvent::ExvRecordState`] and a concise
+/// [`RenderEvent::StatusMessage`].
+fn finish_exv_session(
+    exv_session: &mut Option<ActiveExvSession>,
+    bus: &AppBus,
+    reason: Option<&str>,
+) {
+    let Some(session) = exv_session.take() else {
+        return;
     };
-    copy_d2h(
-        bytemuck::cast_slice_mut(&mut scratch.color_rgba[..n]),
+    let profile_lbl = session.recorder.profile().label();
+    let finish_res = match session.hybrid_video {
+        Some(hv) => {
+            if hv.recorder.frame_count() == 0 {
+                // Zero frames pushed: close NVENC cleanly, remove temp `.mp4`, and let
+                // `ExvRecorder` abort-cleanup its temp `.exv` without an empty-MP4 error.
+                drop(hv.recorder);
+                remove_temp_mp4_if_exists(&hv.tmp_mp4_path);
+                drop(session.recorder);
+                let msg = match reason {
+                    Some(why) => format!("EXV ({profile_lbl}) stopped with 0 frames ({why})"),
+                    None => format!("EXV ({profile_lbl}) stopped with 0 frames"),
+                };
+                bus.emit_render_event(RenderEvent::ExvRecordState(ExvRecordTelemetry::default()));
+                bus.emit_render_event(RenderEvent::StatusMessage(msg));
+                return;
+            }
+            match hv.recorder.finish() {
+                Ok(_) => session.recorder.finish_hybrid(hv.tmp_mp4_path),
+                Err(e) => {
+                    remove_temp_mp4_if_exists(&hv.tmp_mp4_path);
+                    drop(session.recorder);
+                    Err(format!("NVENC PQ10 finalize failed: {e}"))
+                }
+            }
+        }
+        None => session.recorder.finish(),
+    };
+    let msg = match finish_res {
+        Ok(report) => {
+            let mut size_str = String::with_capacity(16);
+            SimTelemetry::write_bytes_compact(report.bytes_written, &mut size_str);
+            let mut m = format!(
+                "Saved EXV ({profile_lbl}, {}f, {size_str}",
+                report.frames_encoded
+            );
+            if report.meta_frames_embedded > 0 {
+                let Ok(()) = write!(m, ", {} meta", report.meta_frames_embedded) else {
+                    unreachable!("writing to String cannot fail");
+                };
+            }
+            if report.frames_dropped > 0 {
+                let Ok(()) = write!(m, ", {} dropped", report.frames_dropped) else {
+                    unreachable!("writing to String cannot fail");
+                };
+            }
+            if let Some(why) = reason {
+                let Ok(()) = write!(m, "; stopped: {why}") else {
+                    unreachable!("writing to String cannot fail");
+                };
+            }
+            let Ok(()) = write!(m, ") -> {}", report.path.display()) else {
+                unreachable!("writing to String cannot fail");
+            };
+            m
+        }
+        Err(e) => match reason {
+            Some(why) => format!("EXV finalize failed ({why}): {e}"),
+            None => format!("EXV finalize failed: {e}"),
+        },
+    };
+    bus.emit_render_event(RenderEvent::ExvRecordState(ExvRecordTelemetry::default()));
+    bus.emit_render_event(RenderEvent::StatusMessage(msg));
+}
+
+/// Reads back the 9 SDG AOV channels (`R/G/B/A`, `depth.Z`, `motion.X/Y`, `semantic.id`,
+/// `instance.id`) from `rig` and writes one atomic ZIP-compressed OpenEXR frame to `path`.
+fn readback_and_write_sdg_exr(
+    rig: &OptixRig,
+    width: u32,
+    height: u32,
+    path: &std::path::Path,
+    scratch: &mut SdgExrReadbackScratch,
+) -> Result<(), String> {
+    let n = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "SDG EXR pixel count overflow".to_string())?;
+    readback_sdg_core_aovs(
+        rig,
         rig.color_f32.cu_deviceptr(),
-        "color_f32",
-    )?;
-    copy_d2h(
-        bytemuck::cast_slice_mut(&mut scratch.depth_f32[..n]),
-        depth_buf.cu_deviceptr(),
-        "depth_f32",
-    )?;
-    copy_d2h(
-        bytemuck::cast_slice_mut(&mut scratch.motion_xy[..n]),
-        motion_buf.cu_deviceptr(),
-        "motion_f32",
-    )?;
-    copy_d2h(
-        bytemuck::cast_slice_mut(&mut scratch.semantic_u32[..n]),
-        sem_buf.cu_deviceptr(),
-        "semantic_u32",
-    )?;
-    copy_d2h(
-        bytemuck::cast_slice_mut(&mut scratch.instance_u32[..n]),
-        inst_buf.cu_deviceptr(),
-        "instance_u32",
+        n,
+        SdgCoreAovTargets {
+            color_rgba: &mut scratch.color_rgba,
+            depth_f32: &mut scratch.depth_f32,
+            motion_xy: &mut scratch.motion_xy,
+            semantic_u32: &mut scratch.semantic_u32,
+            instance_u32: &mut scratch.instance_u32,
+        },
     )?;
 
     let frame = SdgExrFrame {
@@ -5234,6 +5633,7 @@ pub fn spawn_render_thread(
             let mut last_tick = Instant::now();
             let mut pending_jpeg: Option<(PathBuf, u8)> = None;
             let mut active_burst: Option<SdgBurstState> = None;
+            let mut exv_session: Option<ActiveExvSession> = None;
             let mut burst_exr_scratch = SdgExrReadbackScratch::default();
             let mut last_crowd_step_ms: f32 = 0.0;
             let mut last_crowd_backend = ActiveCrowdBackend::None;
@@ -5326,6 +5726,11 @@ pub fn spawn_render_thread(
                                         "SDG Burst cancelled (viewport resized)".to_string(),
                                     ));
                                 }
+                                finish_exv_session(
+                                    &mut exv_session,
+                                    &bus,
+                                    Some("viewport resized"),
+                                );
                             }
                             buf_ptrs = *new_ptrs;
                             depth_ptrs = *new_depth_ptrs;
@@ -5423,6 +5828,111 @@ pub fn spawn_render_thread(
                                 None => "No SDG Burst is running".to_string(),
                             };
                             bus.emit_render_event(RenderEvent::StatusMessage(msg));
+                        }
+                        RenderControl::StartExvRecord {
+                            path,
+                            profile,
+                            fps,
+                            occluder,
+                        } => {
+                            finish_exv_session(
+                                &mut exv_session,
+                                &bus,
+                                Some("restarting EXV recording"),
+                            );
+                            let eff_fps = (*fps).max(1);
+                            let hybrid_video = if profile.is_hybrid() {
+                                let tmp_mp4 = hybrid_temp_mp4_path(path);
+                                match VideoRecorder::start_with_format(
+                                    &cuda,
+                                    cur_w,
+                                    cur_h,
+                                    eff_fps,
+                                    VideoProfile::Hdr10Pq,
+                                    SourcePixelFormat::LinearRgbaF32,
+                                    &tmp_mp4,
+                                ) {
+                                    Ok(recorder) => Some(ActiveHybridVideo {
+                                        recorder,
+                                        tmp_mp4_path: tmp_mp4,
+                                    }),
+                                    Err(e) => {
+                                        remove_temp_mp4_if_exists(&tmp_mp4);
+                                        bus.emit_render_event(RenderEvent::ExvRecordState(
+                                            ExvRecordTelemetry::default(),
+                                        ));
+                                        bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                            "EXV Hybrid unavailable (requires NVENC): {e}"
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let show_classic = settings.csg_mode == 0 || settings.csg_show_fractal;
+                            let scene_id = {
+                                let id = rig.csg_host.active_scene_id();
+                                if id.is_empty() {
+                                    "classic".to_string()
+                                } else {
+                                    id
+                                }
+                            };
+                            let clip_meta = ExvClipMetadata {
+                                fps: (eff_fps, 1),
+                                scene_id,
+                                projection: settings.camera_projection.label().to_string(),
+                                profile: *profile,
+                                beauty_denoised: will_run_optix_denoiser(
+                                    &settings,
+                                    rr_ptrs.is_some(),
+                                ) && !rig.denoiser_failed,
+                                instance_manifest: build_csg_instance_manifest(&rig, show_classic),
+                            };
+                            match build_exv_meta(cur_w, cur_h, &clip_meta).and_then(|meta| {
+                                ExvRecorder::start(path.clone(), cur_w, cur_h, *profile, meta)
+                            }) {
+                                Ok(recorder) => {
+                                    let sess = ActiveExvSession {
+                                        recorder,
+                                        hybrid_video,
+                                        occluder: *occluder,
+                                        fps: eff_fps,
+                                        last_frame_at: None,
+                                        sdg_fallback_reported: false,
+                                    };
+                                    let st = exv_telemetry_from(Some(&sess));
+                                    exv_session = Some(sess);
+                                    bus.emit_render_event(RenderEvent::ExvRecordState(st));
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "Recording EXV ({}) -> {}",
+                                        profile.label(),
+                                        path.display()
+                                    )));
+                                }
+                                Err(e) => {
+                                    if let Some(hv) = hybrid_video {
+                                        drop(hv.recorder);
+                                        remove_temp_mp4_if_exists(&hv.tmp_mp4_path);
+                                    }
+                                    bus.emit_render_event(RenderEvent::ExvRecordState(
+                                        ExvRecordTelemetry::default(),
+                                    ));
+                                    bus.emit_render_event(RenderEvent::StatusMessage(format!(
+                                        "EXV record start failed: {e}"
+                                    )));
+                                }
+                            }
+                        }
+                        RenderControl::StopExvRecord => {
+                            if exv_session.is_some() {
+                                finish_exv_session(&mut exv_session, &bus, None);
+                            } else {
+                                bus.emit_render_event(RenderEvent::ExvRecordState(
+                                    ExvRecordTelemetry::default(),
+                                ));
+                            }
                         }
                         RenderControl::PokeCrowd {
                             origin,
@@ -5749,6 +6259,7 @@ pub fn spawn_render_thread(
                     tmp.dlss_sharpness = settings.dlss_sharpness;
                     tmp.hdr_display = settings.hdr_display;
                     tmp.record_video_mode = settings.record_video_mode;
+                    tmp.exv_profile = settings.exv_profile;
                     tmp.record_fixed_fps = settings.record_fixed_fps;
                     tmp.capture_source = settings.capture_source;
                     tmp.cam_smooth_tau = settings.cam_smooth_tau;
@@ -5929,8 +6440,10 @@ pub fn spawn_render_thread(
                 // encodes exactly one frame per `RenderShutterSubframe` batch from UI.
                 let in_shutter_mode = rec_active && rec_fixed_fps > 0 && rec_shutter_subframes >= 1;
                 let burst_active = active_burst.is_some();
+                let exv_active = exv_session.is_some();
+                let any_rec_active = rec_active || exv_active;
                 let now_preview = Instant::now();
-                let fast_preview = !rec_active
+                let fast_preview = !any_rec_active
                     && !in_shutter_mode
                     && !burst_active
                     && interacting_until.is_some_and(|until| now_preview < until);
@@ -5962,7 +6475,7 @@ pub fn spawn_render_thread(
                     && !orbit_now
                     && !csg_dynamic_moving
                     && possess_blend_rem <= 0.0
-                    && !rec_active
+                    && !any_rec_active
                     && pending_jpeg.is_none()
                     && !rig.csg_host.has_pending_metadata()
                     && pick.is_idle()
@@ -7078,7 +7591,7 @@ pub fn spawn_render_thread(
                 let wireframe = launch_aov == crate::wireframe::AOV_WIREFRAME;
                 let rr_export = !wireframe && (settings.dlss_rr_on || rr_ptrs.is_some());
                 let dlss_any = !wireframe && (settings.dlss_on || rr_export);
-                let will_run_denoiser = settings.denoiser_on && !dlss_any && launch_aov == 0;
+                let will_run_denoiser = will_run_optix_denoiser(&settings, rr_ptrs.is_some());
                 let will_run_bloom = settings.bloom_on && !rr_export && launch_aov == 0;
                 if will_run_bloom
                     && !prev_will_run_bloom
@@ -7134,18 +7647,19 @@ pub fn spawn_render_thread(
                     overlay_history_cut = true;
                 }
 
+                let need_sdg_aovs = sdg_aovs_required(active_burst.is_some(), exv_session.is_some());
                 let needs = LazyAovNeeds {
                     // The overlay's temporal stabilisation reprojects with the motion vectors.
                     motion: dlss_any
                         || (will_run_denoiser && rig.denoiser_is_temporal)
-                        || active_burst.is_some()
+                        || need_sdg_aovs
                         || (settings.overlay.enabled && settings.overlay.temporal),
                     // The overlay depth test reads the primary-hit depth.
-                    depth: dlss_any || active_burst.is_some() || settings.overlay.enabled,
+                    depth: dlss_any || need_sdg_aovs || settings.overlay.enabled,
                     rr_albedo: rr_export,
                     denoised: will_run_denoiser || will_run_bloom,
                     prev_denoised: will_run_denoiser && rig.denoiser_is_temporal,
-                    sdg_ids: active_burst.is_some(),
+                    sdg_ids: need_sdg_aovs,
                     wire: wireframe,
                 };
                 if !rig.lazy_alloc_failed
@@ -7216,9 +7730,9 @@ pub fn spawn_render_thread(
                     fast_preview_reduced = true;
                 }
 
-                let (out_semantic_u32_ptr, out_instance_u32_ptr) = if active_burst.is_some() {
-                    // Allocated by `ensure_lazy_aovs`; a missing buffer makes the burst readback
-                    // fail with a message instead of writing empty IDs.
+                let (out_semantic_u32_ptr, out_instance_u32_ptr) = if need_sdg_aovs {
+                    // Allocated by `ensure_lazy_aovs`; a missing buffer makes SDG burst / EXV
+                    // readback fail with a message instead of writing empty IDs.
                     (
                         rig.semantic_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
                         rig.instance_u32.as_ref().map_or(0, DeviceBuffer::cu_deviceptr),
@@ -8096,6 +8610,91 @@ pub fn spawn_render_thread(
                     }
                 }
 
+                let exv_abort_reason = if let Some(ref mut session) = exv_session {
+                    if let Some(bg_err) = session.recorder.last_error() {
+                        Some(bg_err)
+                    } else if session.recorder.width() != cur_w
+                        || session.recorder.height() != cur_h
+                    {
+                        Some("resolution changed".to_string())
+                    } else {
+                        let slot_res = if in_shutter_mode {
+                            session.recorder.acquire_slot().map(Some)
+                        } else {
+                            session.recorder.try_acquire_slot()
+                        };
+                        match slot_res {
+                            Ok(Some(mut slot)) => {
+                                let beauty_ptr = select_exv_beauty_ptr(&rig, denoiser_ran);
+                                let step_res = readback_exv_frame(
+                                    &rig,
+                                    beauty_ptr,
+                                    (cur_w, cur_h),
+                                    &mut slot.bufs,
+                                )
+                                .and_then(|()| {
+                                    let sdg_cam = CsgGpuHost::build_sdg_camera(
+                                        &active_camera,
+                                        settings.camera_projection,
+                                        cur_w,
+                                        cur_h,
+                                    );
+                                    let (sdg_frame, active_occ, fallback_reason) =
+                                        extract_sdg_frame_for_exv(
+                                            &mut rig,
+                                            sdg_cam,
+                                            rendered_frame_index,
+                                            traffic_time,
+                                            session.occluder,
+                                            &fractal,
+                                        )?;
+                                    if let Some(why) = fallback_reason
+                                        && !session.sdg_fallback_reported
+                                    {
+                                        session.sdg_fallback_reported = true;
+                                        bus.emit_render_event(RenderEvent::StatusMessage(
+                                            format!(
+                                                "EXV SDG metadata: OptiX occluder failed ({why}); using CPU"
+                                            ),
+                                        ));
+                                    }
+                                    slot.bufs.sdg_frame = Some(sdg_frame);
+                                    slot.bufs.sdg_occluder = active_occ;
+                                    if let Some(ref mut hv) = session.hybrid_video {
+                                        let now_exv = Instant::now();
+                                        let frame_dur = if in_shutter_mode {
+                                            1.0 / f64::from(session.fps.max(1))
+                                        } else {
+                                            session
+                                                .last_frame_at
+                                                .map_or(1.0 / f64::from(session.fps.max(1)), |t| {
+                                                    now_exv
+                                                        .duration_since(t)
+                                                        .as_secs_f64()
+                                                        .clamp(1.0 / 240.0, 0.5)
+                                                })
+                                        };
+                                        session.last_frame_at = Some(now_exv);
+                                        hv.recorder.push_frame(beauty_ptr, cur_w, frame_dur)?;
+                                    }
+                                    session.recorder.submit_slot(slot)
+                                });
+                                step_res.err()
+                            }
+                            Ok(None) => {
+                                session.recorder.note_dropped_frame();
+                                None
+                            }
+                            Err(e) => Some(e),
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(why) = exv_abort_reason {
+                    finish_exv_session(&mut exv_session, &bus, Some(&why));
+                }
+
                 // Counts of the previous counted launch go out right before this frame's
                 // `FrameReady`, so the UI pairs them with it (`is_counters.rs`).
                 if let Some(counts) = fresh_is_counts.take() {
@@ -8126,6 +8725,7 @@ pub fn spawn_render_thread(
                         rig.csg_host.sample_cpu_possess_adas()
                     }
                 });
+                let exv_record = exv_telemetry_from(exv_session.as_ref());
                 bus.emit_render_event(RenderEvent::FrameReady(Box::new(FrameReady {
                     buf_idx,
                     gen_id: cur_gen,
@@ -8144,9 +8744,11 @@ pub fn spawn_render_thread(
                     possess_adas,
                     rendered_camera: active_camera,
                     sim_telemetry,
+                    exv_record,
                     perf: perf_sample,
                 })));
             }
+            finish_exv_session(&mut exv_session, &bus, None);
         })
         .expect("spawn optix-render thread")
 }
@@ -8154,6 +8756,39 @@ pub fn spawn_render_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdg_aovs_required_covers_both_burst_and_exv_recording() {
+        assert!(!sdg_aovs_required(false, false));
+        assert!(sdg_aovs_required(true, false));
+        assert!(sdg_aovs_required(false, true));
+        assert!(sdg_aovs_required(true, true));
+    }
+
+    #[test]
+    fn will_run_optix_denoiser_disables_under_dlss_and_non_beauty_aovs() {
+        let mut s = DemoSettings {
+            denoiser_on: true,
+            ..DemoSettings::default()
+        };
+        assert!(will_run_optix_denoiser(&s, false));
+        assert!(!will_run_optix_denoiser(&s, true));
+
+        s.dlss_on = true;
+        assert!(!will_run_optix_denoiser(&s, false));
+        s.dlss_on = false;
+
+        s.dlss_rr_on = true;
+        assert!(!will_run_optix_denoiser(&s, false));
+        s.dlss_rr_on = false;
+
+        s.aov_mode = 1;
+        assert!(!will_run_optix_denoiser(&s, false));
+        s.aov_mode = 0;
+
+        s.display_mode = crate::wireframe::DisplayMode::Wireframe;
+        assert!(!will_run_optix_denoiser(&s, false));
+    }
 
     #[test]
     fn filigree_omm_bake_produces_valid_four_state_coverage() {

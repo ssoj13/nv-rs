@@ -39,6 +39,8 @@ pub enum SourcePixelFormat {
     Bgra8,
     /// 16-bit float linear scRGB Rec.709 (`1.0 = 80 nits`, 8 bytes/pixel).
     ScrgbF16,
+    /// 32-bit float linear Rec.709 HDR (`1.0 = 80 nits`, 16 bytes/pixel, `float4`).
+    LinearRgbaF32,
 }
 
 impl SourcePixelFormat {
@@ -48,6 +50,7 @@ impl SourcePixelFormat {
         match self {
             Self::Rgba8 | Self::Bgra8 => 4,
             Self::ScrgbF16 => 8,
+            Self::LinearRgbaF32 => 16,
         }
     }
 
@@ -62,6 +65,7 @@ impl SourcePixelFormat {
                 Some(Self::Bgra8)
             }
             wgpu::TextureFormat::Rgba16Float => Some(Self::ScrgbF16),
+            wgpu::TextureFormat::Rgba32Float => Some(Self::LinearRgbaF32),
             _ => None,
         }
     }
@@ -219,6 +223,28 @@ pub fn unpack_pitched_to_rgba8(
                     let r = f16_bits_to_f32(u16::from_le_bytes([s_px[0], s_px[1]]));
                     let g = f16_bits_to_f32(u16::from_le_bytes([s_px[2], s_px[3]]));
                     let b = f16_bits_to_f32(u16::from_le_bytes([s_px[4], s_px[5]]));
+                    d_px[0] = scrgb_channel_to_srgb_u8(r);
+                    d_px[1] = scrgb_channel_to_srgb_u8(g);
+                    d_px[2] = scrgb_channel_to_srgb_u8(b);
+                    d_px[3] = 255;
+                }
+            }
+        }
+        SourcePixelFormat::LinearRgbaF32 => {
+            let row_bytes_in = w_usize * 16;
+            let row_bytes_out = w_usize * 4;
+            for y in 0..(h as usize) {
+                let s_row = &src[y * row_stride..y * row_stride + row_bytes_in];
+                let d_row = &mut dst[y * row_bytes_out..(y + 1) * row_bytes_out];
+                for (s_px, d_px) in s_row
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .zip(d_row.as_chunks_mut::<4>().0)
+                {
+                    let r = f32::from_le_bytes([s_px[0], s_px[1], s_px[2], s_px[3]]);
+                    let g = f32::from_le_bytes([s_px[4], s_px[5], s_px[6], s_px[7]]);
+                    let b = f32::from_le_bytes([s_px[8], s_px[9], s_px[10], s_px[11]]);
                     d_px[0] = scrgb_channel_to_srgb_u8(r);
                     d_px[1] = scrgb_channel_to_srgb_u8(g);
                     d_px[2] = scrgb_channel_to_srgb_u8(b);
@@ -408,7 +434,7 @@ extern "C" __global__ void scrgb_f16_to_nv12(
 }
 "#;
 
-const SCRGB_F16_TO_P010_PQ_CU: &str = r#"
+const P010_PQ_KERNELS_CU: &str = r#"
 __device__ __forceinline__ float f16_to_f32(unsigned short h) {
     float v;
     asm("cvt.f32.f16 %0, %1;" : "=f"(v) : "h"(h));
@@ -436,17 +462,54 @@ __device__ __forceinline__ float pq_oetf(float nits) {
     return powf(num / den, m2);
 }
 
-__device__ __forceinline__ float3 scrgb_to_pq2020(ushort4 px) {
-    // scRGB linear Rec.709 (1.0 = 80 nits) -> nits -> Linear Rec.2020 -> SMPTE ST 2084 PQ.
-    // No highlight rolloff here: the source must already be graded by `tonemap_f32_to_scrgb_f16`
-    // (shaders/tonemap.cu, 750->1000-nit knee); anything brighter clips at 10,000 nits.
-    float rn = fmaxf(0.0f, f16_to_f32(px.x) * 80.0f);
-    float gn = fmaxf(0.0f, f16_to_f32(px.y) * 80.0f);
-    float bn = fmaxf(0.0f, f16_to_f32(px.z) * 80.0f);
+__device__ __forceinline__ float3 linear_rec709_to_pq2020(float r, float g, float b) {
+    // Linear Rec.709 (1.0 = 80 nits) -> nits -> Linear Rec.2020 -> SMPTE ST 2084 PQ.
+    float rn = (isfinite(r) && r > 0.0f) ? (r * 80.0f) : 0.0f;
+    float gn = (isfinite(g) && g > 0.0f) ? (g * 80.0f) : 0.0f;
+    float bn = (isfinite(b) && b > 0.0f) ? (b * 80.0f) : 0.0f;
     float r2020 = fmaxf(0.0f, 0.6274039f * rn + 0.3292830f * gn + 0.0433131f * bn);
     float g2020 = fmaxf(0.0f, 0.0690973f * rn + 0.9195404f * gn + 0.0113623f * bn);
     float b2020 = fmaxf(0.0f, 0.0163914f * rn + 0.0880133f * gn + 0.8955953f * bn);
     return make_float3(pq_oetf(r2020), pq_oetf(g2020), pq_oetf(b2020));
+}
+
+__device__ __forceinline__ float3 scrgb_to_pq2020(ushort4 px) {
+    return linear_rec709_to_pq2020(f16_to_f32(px.x), f16_to_f32(px.y), f16_to_f32(px.z));
+}
+
+__device__ __forceinline__ float3 rgba_f32_to_pq2020(float4 px) {
+    return linear_rec709_to_pq2020(px.x, px.y, px.z);
+}
+
+__device__ __forceinline__ void write_p010_pq_planes(
+    unsigned short* __restrict__ p010,
+    unsigned int x,
+    unsigned int y,
+    unsigned int h,
+    unsigned int p010_pitch_u16,
+    float3 pq00,
+    bool write_uv,
+    float3 pq01,
+    float3 pq10,
+    float3 pq11
+) {
+    // BT.2020 NCL luma (10-bit limited range: Y in [64, 940]).
+    float yn = 0.2627f * pq00.x + 0.6780f * pq00.y + 0.0593f * pq00.z;
+    p010[static_cast<size_t>(y) * p010_pitch_u16 + x] = pack_p010(64.0f + 876.0f * yn);
+
+    if (write_uv) {
+        float r_avg = 0.25f * (pq00.x + pq01.x + pq10.x + pq11.x);
+        float g_avg = 0.25f * (pq00.y + pq01.y + pq10.y + pq11.y);
+        float b_avg = 0.25f * (pq00.z + pq01.z + pq10.z + pq11.z);
+        float y_avg = 0.2627f * r_avg + 0.6780f * g_avg + 0.0593f * b_avg;
+        float cb = 512.0f + 896.0f * ((b_avg - y_avg) / 1.8814f);
+        float cr = 512.0f + 896.0f * ((r_avg - y_avg) / 1.4746f);
+
+        unsigned short* uv_plane = p010 + static_cast<size_t>(h) * p010_pitch_u16;
+        size_t uv_idx = static_cast<size_t>(y >> 1u) * p010_pitch_u16 + x;
+        uv_plane[uv_idx + 0u] = pack_p010(cb);
+        uv_plane[uv_idx + 1u] = pack_p010(cr);
+    }
 }
 
 extern "C" __global__ void scrgb_f16_to_p010_pq(
@@ -462,27 +525,33 @@ extern "C" __global__ void scrgb_f16_to_p010_pq(
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
-    float3 pq = scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + x]);
-    // BT.2020 NCL luma (10-bit limited range: Y in [64, 940]).
-    float yn = 0.2627f * pq.x + 0.6780f * pq.y + 0.0593f * pq.z;
-    p010[static_cast<size_t>(y) * p010_pitch_u16 + x] = pack_p010(64.0f + 876.0f * yn);
+    float3 pq00 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + x]);
+    bool write_uv = ((x & 1u) == 0u && (y & 1u) == 0u);
+    float3 pq01 = write_uv ? scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + (x + 1u)]) : pq00;
+    float3 pq10 = write_uv ? scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + x]) : pq00;
+    float3 pq11 = write_uv ? scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + (x + 1u)]) : pq00;
+    write_p010_pq_planes(p010, x, y, h, p010_pitch_u16, pq00, write_uv, pq01, pq10, pq11);
+}
 
-    if ((x & 1u) == 0u && (y & 1u) == 0u) {
-        float3 p01 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y) * src_pitch_px + (x + 1u)]);
-        float3 p10 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + x]);
-        float3 p11 = scrgb_to_pq2020(scrgb[static_cast<size_t>(y + 1u) * src_pitch_px + (x + 1u)]);
-        float r_avg = 0.25f * (pq.x + p01.x + p10.x + p11.x);
-        float g_avg = 0.25f * (pq.y + p01.y + p10.y + p11.y);
-        float b_avg = 0.25f * (pq.z + p01.z + p10.z + p11.z);
-        float y_avg = 0.2627f * r_avg + 0.6780f * g_avg + 0.0593f * b_avg;
-        float cb = 512.0f + 896.0f * ((b_avg - y_avg) / 1.8814f);
-        float cr = 512.0f + 896.0f * ((r_avg - y_avg) / 1.4746f);
+extern "C" __global__ void linear_f32_to_p010_pq(
+    const float4* __restrict__ rgba,
+    unsigned short* __restrict__ p010,
+    unsigned int w,
+    unsigned int h,
+    unsigned int src_pitch_px,
+    unsigned int p010_pitch_u16,
+    unsigned int /*swap_rb*/
+) {
+    unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
 
-        unsigned short* uv_plane = p010 + static_cast<size_t>(h) * p010_pitch_u16;
-        size_t uv_idx = static_cast<size_t>(y >> 1u) * p010_pitch_u16 + x;
-        uv_plane[uv_idx + 0u] = pack_p010(cb);
-        uv_plane[uv_idx + 1u] = pack_p010(cr);
-    }
+    float3 pq00 = rgba_f32_to_pq2020(rgba[static_cast<size_t>(y) * src_pitch_px + x]);
+    bool write_uv = ((x & 1u) == 0u && (y & 1u) == 0u);
+    float3 pq01 = write_uv ? rgba_f32_to_pq2020(rgba[static_cast<size_t>(y) * src_pitch_px + (x + 1u)]) : pq00;
+    float3 pq10 = write_uv ? rgba_f32_to_pq2020(rgba[static_cast<size_t>(y + 1u) * src_pitch_px + x]) : pq00;
+    float3 pq11 = write_uv ? rgba_f32_to_pq2020(rgba[static_cast<size_t>(y + 1u) * src_pitch_px + (x + 1u)]) : pq00;
+    write_p010_pq_planes(p010, x, y, h, p010_pitch_u16, pq00, write_uv, pq01, pq10, pq11);
 }
 "#;
 
@@ -1038,6 +1107,9 @@ pub fn save_jpeg_from_pitched(
                 0u32,
             )
         }
+        SourcePixelFormat::LinearRgbaF32 => {
+            return Err("nvJPEG does not accept raw LinearRgbaF32 directly".to_string());
+        }
     };
 
     let rgb_buf = cached
@@ -1194,8 +1266,8 @@ impl VideoRecorder {
             (VideoProfile::Hdr10Pq, SourcePixelFormat::ScrgbF16) => (
                 CudaKernel::compile(
                     cuda,
-                    SCRGB_F16_TO_P010_PQ_CU,
-                    "scrgb_f16_to_p010_pq.cu",
+                    P010_PQ_KERNELS_CU,
+                    "p010_pq_kernels.cu",
                     "scrgb_f16_to_p010_pq",
                 )?,
                 Codec::Hevc,
@@ -1203,6 +1275,23 @@ impl VideoRecorder {
                 24_000_000u32,
                 0u32,
             ),
+            (VideoProfile::Hdr10Pq, SourcePixelFormat::LinearRgbaF32) => (
+                CudaKernel::compile(
+                    cuda,
+                    P010_PQ_KERNELS_CU,
+                    "p010_pq_kernels.cu",
+                    "linear_f32_to_p010_pq",
+                )?,
+                Codec::Hevc,
+                BufferFormat::Yuv420_10Bit,
+                24_000_000u32,
+                0u32,
+            ),
+            (VideoProfile::SdrH264, SourcePixelFormat::LinearRgbaF32) => {
+                return Err(
+                    "SDR H.264 recording requires Rgba8, Bgra8, or ScrgbF16".to_string(),
+                );
+            }
             (VideoProfile::Hdr10Pq, SourcePixelFormat::Rgba8 | SourcePixelFormat::Bgra8) => {
                 return Err(
                     "PQ10 HDR10 recording requires an HDR scRGB FP16 source (switch View to HDR or Video to SDR/Auto)"
@@ -1346,8 +1435,8 @@ impl VideoRecorder {
             (&raw mut dst_pitch).cast(),
             (&raw mut swap_rb).cast(),
         ];
-        // SAFETY: All three conversion kernels (`rgba8_to_nv12`, `scrgb_f16_to_nv12`,
-        // `scrgb_f16_to_p010_pq`) share the exact 7-argument ABI
+        // SAFETY: All four conversion kernels (`rgba8_to_nv12`, `scrgb_f16_to_nv12`,
+        // `scrgb_f16_to_p010_pq`, `linear_f32_to_p010_pq`) share the exact 7-argument ABI
         // `(const ptr*, dst ptr*, u32 w, u32 h, u32 src_pitch_px, u32 dst_pitch_elems, u32 swap_rb)`
         // with valid device buffers; `self.stream.synchronize()` completes before NVENC maps `yuv_buf`.
         let launch_res = unsafe {
@@ -1572,5 +1661,162 @@ mod tests {
 
         assert!(dir_content_digest(&root.join("missing")).is_err());
         std::fs::remove_dir_all(&root).expect("remove digest test tree");
+    }
+
+    #[test]
+    fn unpack_pitched_linear_rgba_f32_maps_paper_white_and_zero() {
+        assert_eq!(SourcePixelFormat::LinearRgbaF32.bytes_per_pixel(), 16);
+        assert_eq!(
+            SourcePixelFormat::from_wgpu(wgpu::TextureFormat::Rgba32Float),
+            Some(SourcePixelFormat::LinearRgbaF32)
+        );
+        let paper_white = 203.0f32 / 80.0;
+        let half_pw = paper_white * 0.5;
+        let px: [f32; 4] = [paper_white, half_pw, 0.0, 1.0];
+        let src: &[u8] = bytemuck::cast_slice(&px);
+        let mut dst = Vec::new();
+        unpack_pitched_to_rgba8(src, &mut dst, 1, 1, 1, SourcePixelFormat::LinearRgbaF32)
+            .expect("linear f32 unpack");
+        assert_eq!(dst[0], 255);
+        assert!((184..=188).contains(&dst[1]));
+        assert_eq!(dst[2], 0);
+        assert_eq!(dst[3], 255);
+    }
+
+    #[test]
+    #[ignore = "needs CUDA + NVENC hardware"]
+    fn hybrid_exv_nvenc_roundtrip_on_gpu() {
+        use crate::exv_export::{
+            ExvClipMetadata, ExvProfile, ExvRecorder, build_exv_meta, hybrid_temp_mp4_path,
+        };
+
+        let cuda = Arc::new(CudaContext::new(0).expect("CUDA context 0"));
+        cuda.bind_to_thread().expect("bind CUDA");
+        let stream = cuda.new_stream().expect("CUDA stream");
+
+        let (w, h) = (256u32, 256u32);
+        let n = (w * h) as usize;
+        let mut host_rgba = vec![[0.0f32; 4]; n];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) as usize;
+                host_rgba[idx] = [
+                    0.2 + (x as f32 / w as f32) * 2.0,
+                    0.15 + (y as f32 / h as f32) * 1.5,
+                    0.8,
+                    1.0,
+                ];
+            }
+        }
+        let d_rgba = DeviceBuffer::<[f32; 4]>::from_host(&stream, &host_rgba).expect("upload");
+        stream.synchronize().expect("sync upload");
+
+        let dir = std::env::temp_dir().join(format!("nv_demo_hybrid_gpu_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let exv_path = dir.join("clip_hybrid.exv");
+        let tmp_mp4 = hybrid_temp_mp4_path(&exv_path);
+
+        let clip_meta = ExvClipMetadata {
+            fps: (60, 1),
+            scene_id: "gpu_test".to_string(),
+            projection: "Pinhole".to_string(),
+            profile: ExvProfile::Hybrid,
+            beauty_denoised: false,
+            instance_manifest: vec![("hero#42".to_string(), 42)],
+        };
+        let meta = build_exv_meta(w, h, &clip_meta).expect("build meta");
+        let mut video = VideoRecorder::start_with_format(
+            &cuda,
+            w,
+            h,
+            60,
+            VideoProfile::Hdr10Pq,
+            SourcePixelFormat::LinearRgbaF32,
+            &tmp_mp4,
+        )
+        .expect("start NVENC PQ10 HEVC");
+        let exv =
+            ExvRecorder::start(exv_path.clone(), w, h, ExvProfile::Hybrid, meta).expect("start");
+
+        for frame_i in 0..4u32 {
+            let mut slot = exv.acquire_slot().expect("acquire slot");
+            slot.bufs.color_rgba.copy_from_slice(&host_rgba);
+            slot.bufs.albedo_rgba.fill([0.5, 0.4, 0.3, 1.0]);
+            slot.bufs.normal_rough.fill([0.0, 1.0, 0.0, 0.25]);
+            slot.bufs.depth.fill(10.0 + frame_i as f32);
+            slot.bufs.motion.fill([0.5, -0.25]);
+            slot.bufs.semantic_id.fill(10);
+            slot.bufs.instance_id.fill(42 + frame_i);
+            slot.bufs.sdg_frame = Some(crate::csg_scene_host::SdgExportFrame {
+                scene_id: "gpu_test".to_string(),
+                scene_idx: 1,
+                variant_idx: 0,
+                frame_index: 100 + frame_i,
+                time_s: frame_i as f32 / 60.0,
+                camera: csg_actors::SdgCamera {
+                    projection: csg_actors::SdgProjection::Pinhole,
+                    eye: csg_actors::Vec3::new(frame_i as f32 * 1.5, 2.0, -5.0),
+                    forward: csg_actors::Vec3::new(0.0, 0.0, 1.0),
+                    up: csg_actors::Vec3::new(0.0, 1.0, 0.0),
+                    vfov_rad: 0.8,
+                    width: w,
+                    height: h,
+                },
+                actors: Vec::new(),
+            });
+            slot.bufs.sdg_occluder = Some(crate::sdg_export::ActiveSdgOccluder::Cpu);
+            video
+                .push_frame(d_rgba.cu_deviceptr(), w, 1.0 / 60.0)
+                .expect("push NVENC frame");
+            exv.submit_slot(slot).expect("submit AOV slot");
+        }
+
+        let vid_frames = video.finish().expect("finish NVENC mp4");
+        assert_eq!(vid_frames, 4);
+        assert!(tmp_mp4.is_file());
+
+        let report = exv.finish_hybrid(tmp_mp4.clone()).expect("finish hybrid exv");
+        assert_eq!(report.frames_encoded, 4);
+        assert_eq!(report.meta_frames_embedded, 4);
+        assert!(exv_path.is_file());
+        assert!(!tmp_mp4.exists(), "temp mp4 must be removed on finalize");
+        assert!(
+            !exv_path.with_extension("sdg.json").exists(),
+            "metadata must be embedded in .exv (no sibling .sdg.json sidecar)"
+        );
+
+        let bytes = std::fs::read(&exv_path).expect("read hybrid exv");
+        let idx = exv_video::VideoIndex::parse_with_verify(&bytes, exv_format::Verify::On)
+            .expect("parse + verify hybrid exv");
+        let loc = idx.hybrid_locator().expect("HYBV locator present");
+        assert!(loc.video_len > 0);
+        loc.verify_crc(&bytes).expect("HYBV CRC-32C valid");
+        assert!(idx.meta_footer().is_some(), "FMET MetaFooter present");
+        let clip_box = idx
+            .clip_box(&bytes)
+            .expect("decode clip_box")
+            .expect("clip_box present");
+        assert_eq!(clip_box.get_str("schema"), Some("nv_demo.exv_meta.v1"));
+        assert_eq!(clip_box.get_i64("meta_frames_embedded"), Some(4));
+
+        // O(1) per-frame metadata lookup with zero pixel decode.
+        for k in 0..4usize {
+            let fmeta = idx
+                .frame_meta(&bytes, k)
+                .expect("decode frame_meta")
+                .expect("frame_meta present");
+            assert_eq!(fmeta.get_i64("exv_frame_index"), Some(k as i64));
+            assert_eq!(fmeta.get_str("scene_id"), Some("gpu_test"));
+            assert_eq!(fmeta.get_i64("sim_frame_index"), Some(100 + k as i64));
+            assert_eq!(
+                fmeta.get_path("camera.eye"),
+                Some(&exv_video::BoxValue::Vec3([k as f64 * 1.5, 2.0, -5.0]))
+            );
+        }
+
+        let bad = exv_video::verify_checksums(&bytes, &idx, 4).expect("verify checksums");
+        assert!(bad.is_empty(), "checksum errors: {bad:?}");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup hybrid gpu test dir");
     }
 }

@@ -30,6 +30,7 @@ use csg_scene::{CameraMount, ProbeBackendKind, ViewScore};
 use serde::{Deserialize, Serialize};
 
 use crate::csg_scene_host::SceneLoadedMetadata;
+use crate::exv_export::ExvProfile;
 use crate::renderer::{CameraFrame, DemoSettings, DlssRrBufferPtrs, FrameReady, OverlayOutPtrs};
 use crate::sdg_export::{ActiveCrowdBackend, ActiveTrafficBackend, SdgOccluderBackend};
 
@@ -554,6 +555,21 @@ pub struct SceneCacheStats {
     pub last_source: SceneLoadSource,
 }
 
+/// Zero-allocation, `Copy` snapshot of live multi-AOV `.exv` stream recording state delivered
+/// from the OptiX render thread to the UI thread via [`RenderEvent::ExvRecordState`] and
+/// [`FrameReady::exv_record`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExvRecordTelemetry {
+    /// `true` while an [`crate::exv_export::ExvRecorder`] session is active on the render worker.
+    pub active: bool,
+    /// Total frames submitted from the render thread to the background EXV encoder.
+    pub submitted_frames: u64,
+    /// Total frames compressed and written by the background EXV encoder.
+    pub encoded_frames: u64,
+    /// Total compressed bytes written to disk so far.
+    pub bytes_written: u64,
+}
+
 /// Window length for the moving-average build ETA estimator (`SMA-10`).
 pub const ETA_SMA_WINDOW: usize = 10;
 
@@ -875,6 +891,8 @@ pub enum UiCommand {
     ExportFlightCsv,
     /// Start or stop MP4 video recording.
     ToggleRecord,
+    /// Start or stop multi-AOV compressed `.exv` stream recording into `renders/`.
+    ToggleRecordExv,
     /// Recompile `raytracer.cu` via NVRTC on the render worker.
     ReloadShader,
     /// User selected a new CSG scene or variant (pauses rail and requests auto-framing on load).
@@ -948,6 +966,15 @@ pub enum RenderControl {
     },
     /// Abort the running SDG dataset burst (no-op when none is running).
     CancelSdgBurst,
+    /// Start multi-AOV compressed `.exv` stream recording on the render worker.
+    StartExvRecord {
+        path: PathBuf,
+        profile: ExvProfile,
+        fps: u32,
+        occluder: SdgOccluderBackend,
+    },
+    /// Stop and atomically finalize the active `.exv` stream recording (no-op when inactive).
+    StopExvRecord,
     /// Apply a poke stumble/flinch impulse to the nearest actor along camera ray or all actors.
     PokeCrowd {
         origin: [f32; 3],
@@ -1023,6 +1050,8 @@ pub enum RenderEvent {
     SceneMetaUpdated(SceneLoadedMetadata),
     /// Updated on-disk scene cache statistics and latest hit/miss provenance.
     SceneCacheStats(SceneCacheStats),
+    /// Live `.exv` stream recording state transition (start, stop, resize-stop, or encoder error).
+    ExvRecordState(ExvRecordTelemetry),
     /// Active possessed body or mount changed (`None` = ejected to free camera).
     PossessChanged(Option<PossessInfo>),
     /// Intersection counts of the latest counted launch (`crate::is_counters`), sent once when
@@ -1827,5 +1856,62 @@ mod tests {
             plain.format_stage_line(),
             "Step 3/3 | Building OptiX GAS (40/218)"
         );
+    }
+
+    #[test]
+    fn exv_recording_commands_and_telemetry_route_cleanly() {
+        let bus = AppBus::new(RenderStateSnapshot {
+            settings: DemoSettings::default(),
+            camera: sample_camera(0.0),
+            interacting_until: None,
+            reset_seq: 0,
+            possess_free_yaw: 0.0,
+            possess_free_pitch: 0.0,
+            possess_auto_level: true,
+            possess_zoom_offset: 0.0,
+            flight_path_overlay: None,
+        });
+        let path = PathBuf::from("renders/test_clip.exv");
+        let telemetry = ExvRecordTelemetry {
+            active: true,
+            submitted_frames: 12,
+            encoded_frames: 10,
+            bytes_written: 1_048_576,
+        };
+        bus.emit_ui(UiCommand::ToggleRecordExv);
+        bus.send_render(RenderControl::StartExvRecord {
+            path: path.clone(),
+            profile: ExvProfile::Hybrid,
+            fps: 60,
+            occluder: SdgOccluderBackend::Auto,
+        });
+        bus.send_render(RenderControl::StopExvRecord);
+        bus.emit_render_event(RenderEvent::ExvRecordState(telemetry));
+
+        let mut scratch = Vec::with_capacity(4);
+        assert_eq!(bus.poll_ui_commands(&mut scratch), 1);
+        assert_eq!(
+            downcast_event::<UiCommand>(&scratch[0]),
+            Some(&UiCommand::ToggleRecordExv)
+        );
+        assert_eq!(bus.poll_render_controls(&mut scratch), 2);
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[0]),
+            Some(RenderControl::StartExvRecord {
+                path: p,
+                profile: ExvProfile::Hybrid,
+                fps: 60,
+                occluder: SdgOccluderBackend::Auto,
+            }) if p == &path
+        ));
+        assert!(matches!(
+            downcast_event::<RenderControl>(&scratch[1]),
+            Some(RenderControl::StopExvRecord)
+        ));
+        assert_eq!(bus.poll_render_events(&mut scratch), 1);
+        assert!(matches!(
+            downcast_event::<RenderEvent>(&scratch[0]),
+            Some(RenderEvent::ExvRecordState(st)) if *st == telemetry
+        ));
     }
 }

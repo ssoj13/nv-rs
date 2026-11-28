@@ -414,8 +414,9 @@ pub struct FlightPlayer {
     pub active_scene_hash: String,
     /// Persisted preferred track id restored when curated rails arrive.
     pub selected_track_id: String,
-    /// True while recording an entire playlist pass to video (stops cleanly at playlist end).
-    pub recording_playlist: bool,
+    /// Target container while recording an entire playlist pass (`None` when idle; stops cleanly
+    /// at playlist end and auto-finalizes the matching host recorder).
+    pub recording_playlist: Option<super::PlaylistRecordFormat>,
     /// Latest live speed telemetry (m/s) for the Now Playing card.
     pub last_speed_mps: f32,
     /// Latest live coordinated bank telemetry (rad) for the Now Playing card.
@@ -475,7 +476,7 @@ impl FlightPlayer {
             active_scene_id: String::new(),
             active_scene_hash: String::new(),
             selected_track_id: String::new(),
-            recording_playlist: false,
+            recording_playlist: None,
             last_speed_mps: 0.0,
             last_bank_rad: 0.0,
             last_active_chase: false,
@@ -696,7 +697,18 @@ impl FlightPlayer {
         self.fly_transition = None;
         self.pending_after_load = None;
         self.pending_fade_in_s = None;
-        self.recording_playlist = false;
+        self.recording_playlist = None;
+    }
+
+    /// Returns `true` when the player is currently recording a playlist pass for `fmt`.
+    #[inline]
+    #[must_use]
+    pub const fn is_recording_playlist(&self, fmt: super::PlaylistRecordFormat) -> bool {
+        matches!(
+            (self.recording_playlist, fmt),
+            (Some(super::PlaylistRecordFormat::Mp4), super::PlaylistRecordFormat::Mp4)
+                | (Some(super::PlaylistRecordFormat::Exv), super::PlaylistRecordFormat::Exv)
+        )
     }
 
     /// Jumps to the previous entry in playback order (or rewinds to `0.0` if past `2.0 s`).
@@ -1608,7 +1620,7 @@ impl FlightPlayer {
         }
 
         self.hold_elapsed_s = 0.0;
-        let single_loop = !self.recording_playlist
+        let single_loop = self.recording_playlist.is_none()
             && (self.repeat == RepeatMode::One
                 || (self.repeat == RepeatMode::All && self.queue.len() == 1));
         if single_loop {
@@ -1659,7 +1671,7 @@ impl FlightPlayer {
             ));
         }
 
-        let next_idx_opt = if self.recording_playlist {
+        let next_idx_opt = if self.recording_playlist.is_some() {
             self.next_entry_index_no_wrap(entry_idx)
         } else {
             self.next_entry_index(entry_idx)
@@ -1669,7 +1681,7 @@ impl FlightPlayer {
             let sample = self.queue[entry_idx].track.eval(dur);
             self.time_s = dur;
             self.state = PlayerState::Idle;
-            self.recording_playlist = false;
+            self.recording_playlist = None;
             return Some(self.finish_eval(
                 sample.state.to_camera_pose(znear, zfar),
                 false,

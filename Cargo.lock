@@ -138,7 +138,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 
@@ -304,6 +304,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror 2.0.21",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -502,7 +503,7 @@ dependencies = [
 [[package]]
 name = "codec-simd"
 version = "0.3.35"
-source = "git+ssh://git@github.com/ssoj13/codec-simd-rs.git?branch=main#e2768e8f85ac254731603af32dca3dd5fb6669f4"
+source = "git+ssh://git@github.com/ssoj13/codec-simd-rs.git?branch=main#7eda7103a9935d0d3300d088515ce11d689dfbbe"
 
 [[package]]
 name = "codespan-reporting"
@@ -714,7 +715,7 @@ dependencies = [
 [[package]]
 name = "csg-actors"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -725,7 +726,7 @@ dependencies = [
 [[package]]
 name = "csg-assemble"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -737,7 +738,7 @@ dependencies = [
 [[package]]
 name = "csg-catalog"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-kit-architecture",
@@ -756,7 +757,7 @@ dependencies = [
 [[package]]
 name = "csg-citygen"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "blake3",
  "byte-cache",
@@ -786,7 +787,7 @@ dependencies = [
 [[package]]
 name = "csg-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "bytemuck",
  "serde",
@@ -795,7 +796,7 @@ dependencies = [
 [[package]]
 name = "csg-device"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -804,7 +805,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-architecture"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -815,7 +816,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-foliage"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -826,7 +827,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-industrial"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -837,7 +838,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-infra"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -848,7 +849,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-marina-furniture"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -859,7 +860,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-marine"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -870,7 +871,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-street"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -881,7 +882,7 @@ dependencies = [
 [[package]]
 name = "csg-kit-vehicles"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -892,7 +893,7 @@ dependencies = [
 [[package]]
 name = "csg-ops"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-scene",
@@ -902,7 +903,7 @@ dependencies = [
 [[package]]
 name = "csg-roads"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -914,7 +915,7 @@ dependencies = [
 [[package]]
 name = "csg-scene"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -929,7 +930,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-gundo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-actors",
  "csg-core",
@@ -947,7 +948,7 @@ dependencies = [
 [[package]]
 name = "csg-scene-marina"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-citygen",
  "csg-core",
@@ -963,7 +964,7 @@ dependencies = [
 [[package]]
 name = "csg-scenes"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-actors",
  "csg-catalog",
@@ -982,7 +983,7 @@ dependencies = [
 [[package]]
 name = "csg-terrain"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "csg-core",
  "csg-ops",
@@ -993,7 +994,7 @@ dependencies = [
 [[package]]
 name = "csg-traffic"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#95d6d564d4be14277acb4c4be3869f3e9531d5e3"
+source = "git+ssh://git@github.com/ssoj13/csg-rs.git?branch=main#feda55c7ffda8748d48d055e962e69a6c74481d1"
 dependencies = [
  "bytemuck",
  "csg-core",
@@ -1245,7 +1246,7 @@ dependencies = [
 [[package]]
 name = "deflate-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#2341230727149579d172ababc4528e1f7024314d"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
 
 [[package]]
 name = "digest"
@@ -1490,7 +1491,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1511,7 +1512,7 @@ dependencies = [
 [[package]]
 name = "exr-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#2341230727149579d172ababc4528e1f7024314d"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
 dependencies = [
  "codec-simd",
  "crashdump-rs",
@@ -1523,6 +1524,58 @@ dependencies = [
  "murmur3",
  "rayon",
  "smallvec",
+]
+
+[[package]]
+name = "exv-codec"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
+dependencies = [
+ "codec-simd",
+ "deflate-rs",
+ "exv-format",
+ "exv-tile",
+ "jph-rs",
+ "rans-rs",
+ "rayon",
+ "tracing",
+]
+
+[[package]]
+name = "exv-format"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
+dependencies = [
+ "bytemuck",
+ "exr-core",
+ "fsio-rs",
+ "imath-rs",
+ "rayon",
+]
+
+[[package]]
+name = "exv-tile"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
+dependencies = [
+ "exv-format",
+ "gpu-info-rs 0.1.3",
+ "rayon",
+]
+
+[[package]]
+name = "exv-video"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
+dependencies = [
+ "box-rs",
+ "codec-simd",
+ "deflate-rs",
+ "exv-codec",
+ "exv-format",
+ "exv-tile",
+ "rayon",
+ "tracing",
 ]
 
 [[package]]
@@ -1931,9 +1984,8 @@ dependencies = [
 
 [[package]]
 name = "gpu-info-rs"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34dabc781533d6dd3cfabf9c466a9622638c309aa6179ab6b6fab7835951618c"
+version = "0.1.1"
+source = "git+https://github.com/ssoj13/gpu-info-rs.git?branch=main#53af9e2ef32386bd732c8e472b239c1806f4a200"
 dependencies = [
  "ash",
  "bytemuck",
@@ -1954,8 +2006,9 @@ dependencies = [
 
 [[package]]
 name = "gpu-info-rs"
-version = "0.1.1"
-source = "git+https://github.com/ssoj13/gpu-info-rs.git?branch=main#53af9e2ef32386bd732c8e472b239c1806f4a200"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513ef8ac88f49c0778c0dcc02ff6b63d4c021032401925c580bc2a949923a09c"
 dependencies = [
  "ash",
  "bytemuck",
@@ -1970,6 +2023,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "wasm-bindgen",
+ "web-time",
  "wgpu",
  "windows",
 ]
@@ -2208,7 +2262,7 @@ dependencies = [
 [[package]]
 name = "imath-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#2341230727149579d172ababc4528e1f7024314d"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
 
 [[package]]
 name = "indexmap"
@@ -2775,6 +2829,9 @@ dependencies = [
  "egui-winit",
  "egui_dock",
  "exr-core",
+ "exv-codec",
+ "exv-format",
+ "exv-video",
  "flight-navigator",
  "fnav-csg",
  "glam",
@@ -2814,7 +2871,7 @@ dependencies = [
  "cuda-bindings",
  "cuda-core",
  "cuda-core-ext",
- "gpu-info-rs 0.1.0",
+ "gpu-info-rs 0.1.3",
  "half",
  "libc",
  "thiserror 2.0.21",
@@ -3361,7 +3418,7 @@ dependencies = [
 [[package]]
 name = "osm-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/osm-rs.git?branch=main#787ddea680c10a02cc4958920bb73fddf3b08bc8"
+source = "git+ssh://git@github.com/ssoj13/osm-rs.git?branch=main#e1ed315804afef89783aed6afa2ceb5fc74466b6"
 dependencies = [
  "byte-cache",
  "fsio-rs",
@@ -3662,6 +3719,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
+name = "rans-rs"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/exr-rs.git?branch=main#ab53b0569356a6dcf4f7f6b395fbac3960a69825"
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3865,7 +3927,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4281,7 +4343,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5179,7 +5241,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5539,6 +5601,12 @@ dependencies = [
  "toml",
  "vcv-rs",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

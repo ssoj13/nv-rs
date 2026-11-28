@@ -592,6 +592,7 @@ mod tests {
         state.settings.cam_smooth_tau = 0.25;
         state.settings.time_scale = 0.5;
         state.settings.record_shutter_subframes = 4;
+        state.settings.exv_profile = crate::exv_export::ExvProfile::Hybrid;
         state.settings.hidden_semantics = 0b101;
         state.settings.hidden_osm_classes = 0b1101;
         state.flight_player.selected_track_id = "landmark_slalom".to_string();
@@ -647,6 +648,10 @@ mod tests {
         assert_eq!(report.problem, None);
         let loaded = report.state;
         assert_eq!(loaded, state);
+        assert_eq!(
+            loaded.settings.exv_profile,
+            crate::exv_export::ExvProfile::Hybrid
+        );
         assert_eq!(loaded.settings.hidden_semantics, 0b101);
         assert_eq!(loaded.settings.hidden_osm_classes, 0b1101);
         assert_eq!(loaded.flight_player.selected_track_id, "landmark_slalom");
@@ -687,6 +692,10 @@ mod tests {
         assert_eq!(loaded.settings.cam_smooth_tau, 0.0);
         assert_eq!(loaded.settings.time_scale, 1.0);
         assert_eq!(loaded.settings.record_shutter_subframes, 1);
+        assert_eq!(
+            loaded.settings.exv_profile,
+            crate::exv_export::ExvProfile::default()
+        );
         assert_eq!(loaded.settings.hidden_semantics, 0);
         assert_eq!(loaded.settings.hidden_osm_classes, 0);
         assert!(loaded.flight_player.selected_track_id.is_empty());

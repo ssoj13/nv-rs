@@ -1703,10 +1703,12 @@ static __device__ float sd_text_2d(
     return best_norm * cell_h;
 }
 
-// Procedural sign-text shading (`CSG_PROC_SIGN_TEXT`, D1) with 3-tier distance / screen-space LOD:
-// - Far (< 1 px or >= 85 m): O(1) early-out before reading text bytes or evaluating `sd_glyph_2d`.
-// - Mid (1..2.5 px or 40..85 m): smooth fade into a clean soft white text band (zero shimmer).
-// - Close (>= 2.5 px and < 40 m): full analytical vector-capsule SDF Highway Gothic + adaptive AA.
+// Procedural sign-text shading (`CSG_PROC_SIGN_TEXT`, D1) with 3-tier distance / screen-space LOD
+// and optional `CSG_SIGN_STYLE_TWO_LINE` layout:
+// - Far (< 1 px or >= max_dist, where max_dist scales from 85 m for compact blades up to 220 m for
+//   large highway guide signs): O(1) early-out before evaluating `sd_glyph_2d`.
+// - Mid (1..2.5 px or ~0.45..1.0 * max_dist): smooth fade into soft white text band(s) (zero shimmer).
+// - Close (>= 2.5 px and < ~0.45 * max_dist): full analytical vector-capsule SDF Highway Gothic + AA.
 static __noinline__ __device__ void shade_csg_sign_text(
     unsigned int inst_idx,
     unsigned int part_id,
@@ -1741,9 +1743,9 @@ static __noinline__ __device__ void shade_csg_sign_text(
         return;
     }
 
-    // Tier 2 Far early-out (O(1) before scanning prims, reading sign text bytes, or evaluating glyphs).
+    // Coarse Tier 2 Far early-out (O(1) before scanning prims, reading sign text bytes, or evaluating glyphs).
     float cam_dist = f3_len(f3_sub(hit_pos, make_f3(params.cam_pos)));
-    if (cam_dist >= 85.0f) {
+    if (cam_dist >= 220.0f) {
         return;
     }
 
@@ -1816,7 +1818,7 @@ static __noinline__ __device__ void shade_csg_sign_text(
     float hx = pr.params[0];
     float hy = pr.params[1];
     float hz = pr.params[2];
-    if (hx <= 0.05f || hy <= 0.05f) {
+    if (fmaxf(hx, hz) <= 0.05f || hy <= 0.05f) {
         return;
     }
 
@@ -1848,20 +1850,113 @@ static __noinline__ __device__ void shade_csg_sign_text(
     } else {
         return;
     }
+    if (half_w <= 0.05f || half_h <= 0.05f) {
+        return;
+    }
 
-    // Inner MUTCD text box and exact glyph height for screen-space pixel LOD.
+    // Scale max visibility distance with sign height (85 m for 0.36 m blades, ~169 m for 1.3 m
+    // highway guide signs, ~208 m for 1.6 m signs, capped at the 220 m coarse cutoff for smooth fade).
+    float max_dist = fminf(220.0f, fmaxf(85.0f, half_h * 260.0f));
+    if (cam_dist >= max_dist) {
+        return;
+    }
+
+    // Inner MUTCD text box and screen-space pixel scale.
     float margin_x = fmaxf(0.045f, half_w * 0.075f);
     float margin_y = fmaxf(0.036f, half_h * 0.22f);
     float inner_w = fmaxf(0.05f, 2.0f * (half_w - margin_x));
     float inner_h = fmaxf(0.05f, 2.0f * (half_h - margin_y));
-    float cell_h = fminf(inner_h, inner_w / (fmaxf(1.0f, (float)t_len) * 0.72f));
-    float glyph_h_m = cell_h * 0.857f;
 
     float tan_fov = fmaxf(0.05f, params.cam_up[3]);
     float px_m = (cam_dist * 2.0f * tan_fov) / fmaxf(1.0f, (float)params.height);
-    float glyph_px = glyph_h_m / fmaxf(px_m, 1e-5f);
+    float inv_px_m = 1.0f / fmaxf(px_m, 1e-5f);
+    // Upper-bound screen-space early-out before reading sign text bytes for 2-line splitting.
+    if (inner_h * 0.857f * inv_px_m < 1.0f) {
+        return;
+    }
 
-    // Tier 2 Screen-space Far early-out (< 1 px): zero text-buffer read and zero glyph SDF cost.
+    const unsigned char* text_buf = reinterpret_cast<const unsigned char*>(params.csg_sign_text_bytes);
+    bool two_line = false;
+    unsigned int off1 = t_off;
+    unsigned int len1 = t_len;
+    unsigned int off2 = t_off;
+    unsigned int len2 = 0u;
+    if ((t_style & CSG_SIGN_STYLE_TWO_LINE) != 0u && half_h >= half_w * 0.32f && t_len >= 5u) {
+        unsigned int slash_idx = 0xFFFFFFFFu;
+        for (unsigned int i = 0u; i < t_len; ++i) {
+            if (__ldg(text_buf + t_off + i) == (unsigned char)'/') {
+                slash_idx = i;
+                break;
+            }
+        }
+        if (slash_idx != 0xFFFFFFFFu) {
+            unsigned int s1_end = slash_idx;
+            while (s1_end > 0u && __ldg(text_buf + t_off + s1_end - 1u) == (unsigned char)' ') {
+                --s1_end;
+            }
+            unsigned int s2_start = slash_idx + 1u;
+            while (s2_start < t_len && __ldg(text_buf + t_off + s2_start) == (unsigned char)' ') {
+                ++s2_start;
+            }
+            unsigned int s2_len = t_len - s2_start;
+            if (s1_end > 0u && s2_len > 0u) {
+                off1 = t_off;
+                len1 = s1_end;
+                off2 = t_off + s2_start;
+                len2 = s2_len;
+                two_line = true;
+            }
+        }
+        if (!two_line && t_len >= 10u) {
+            int mid = (int)(t_len / 2u);
+            int best_sp = -1;
+            int best_dist = 0x7FFFFFFF;
+            for (unsigned int i = 1u; i + 1u < t_len; ++i) {
+                if (__ldg(text_buf + t_off + i) == (unsigned char)' ') {
+                    int diff = (int)i - mid;
+                    int d = (diff < 0) ? -diff : diff;
+                    if (d < best_dist) {
+                        best_dist = d;
+                        best_sp = (int)i;
+                    }
+                }
+            }
+            if (best_sp > 0) {
+                unsigned int s1_end = (unsigned int)best_sp;
+                while (s1_end > 0u && __ldg(text_buf + t_off + s1_end - 1u) == (unsigned char)' ') {
+                    --s1_end;
+                }
+                unsigned int s2_start = (unsigned int)best_sp + 1u;
+                while (s2_start < t_len && __ldg(text_buf + t_off + s2_start) == (unsigned char)' ') {
+                    ++s2_start;
+                }
+                unsigned int s2_len = t_len - s2_start;
+                if (s1_end > 0u && s2_len > 0u) {
+                    off1 = t_off;
+                    len1 = s1_end;
+                    off2 = t_off + s2_start;
+                    len2 = s2_len;
+                    two_line = true;
+                }
+            }
+        }
+    }
+
+    float cell_h;
+    float y1 = 0.0f;
+    float y2 = 0.0f;
+    if (two_line) {
+        float max_line_len = fmaxf((float)len1, (float)len2);
+        cell_h = fminf(inner_h * 0.44f, inner_w / (fmaxf(1.0f, max_line_len) * 0.72f));
+        y1 = 0.25f * inner_h;
+        y2 = -0.25f * inner_h;
+    } else {
+        cell_h = fminf(inner_h, inner_w / (fmaxf(1.0f, (float)t_len) * 0.72f));
+    }
+    float glyph_h_m = cell_h * 0.857f;
+    float glyph_px = glyph_h_m * inv_px_m;
+
+    // Tier 2 Screen-space Far early-out (< 1 px): zero glyph SDF cost.
     if (glyph_px < 1.0f) {
         return;
     }
@@ -1880,22 +1975,42 @@ static __noinline__ __device__ void shade_csg_sign_text(
         - b_rad;
     float border_hw = 0.0055f;
     float border_cov = (1.0f - sky_smoothstep(border_hw - aa_m, border_hw + aa_m, fabsf(d_frame)))
-        * (1.0f - sky_smoothstep(32.0f, 65.0f, cam_dist));
+        * (1.0f - sky_smoothstep(max_dist * 0.40f, max_dist * 0.76f, cam_dist));
 
-    // Mid-range soft white text band spanning the exact string layout box (zero shimmer/aliasing).
-    float text_half_w = 0.5f * cell_h * 0.72f * (float)t_len;
+    // Mid-range soft white text band(s) spanning the exact string layout box (zero shimmer/aliasing).
     float text_half_h = 0.34f * cell_h;
-    float band_x = 1.0f - sky_smoothstep(text_half_w - aa_m * 2.0f, text_half_w + aa_m * 2.0f, fabsf(face_u));
-    float band_y = 1.0f - sky_smoothstep(text_half_h - aa_m * 2.0f, text_half_h + aa_m * 2.0f, fabsf(face_v));
-    float band_fade = sky_smoothstep(1.0f, 1.8f, glyph_px) * (1.0f - sky_smoothstep(65.0f, 85.0f, cam_dist));
-    float band_cov = band_x * band_y * 0.42f * band_fade;
+    float band_mask = 0.0f;
+    if (two_line) {
+        float w1 = 0.5f * cell_h * 0.72f * (float)len1;
+        float w2 = 0.5f * cell_h * 0.72f * (float)len2;
+        float b1_x = 1.0f - sky_smoothstep(w1 - aa_m * 2.0f, w1 + aa_m * 2.0f, fabsf(face_u));
+        float b1_y = 1.0f - sky_smoothstep(text_half_h - aa_m * 2.0f, text_half_h + aa_m * 2.0f, fabsf(face_v - y1));
+        float b2_x = 1.0f - sky_smoothstep(w2 - aa_m * 2.0f, w2 + aa_m * 2.0f, fabsf(face_u));
+        float b2_y = 1.0f - sky_smoothstep(text_half_h - aa_m * 2.0f, text_half_h + aa_m * 2.0f, fabsf(face_v - y2));
+        band_mask = fmaxf(b1_x * b1_y, b2_x * b2_y);
+    } else {
+        float text_half_w = 0.5f * cell_h * 0.72f * (float)t_len;
+        float band_x = 1.0f - sky_smoothstep(text_half_w - aa_m * 2.0f, text_half_w + aa_m * 2.0f, fabsf(face_u));
+        float band_y = 1.0f - sky_smoothstep(text_half_h - aa_m * 2.0f, text_half_h + aa_m * 2.0f, fabsf(face_v));
+        band_mask = band_x * band_y;
+    }
+    float band_fade = sky_smoothstep(1.0f, 1.8f, glyph_px)
+        * (1.0f - sky_smoothstep(max_dist * 0.76f, max_dist, cam_dist));
+    float band_cov = band_mask * 0.42f * band_fade;
 
-    // Tier 0 Close (>= 2.5 px & < 40 m) -> Tier 1 Mid (1..2.5 px or 40..85 m) smooth crossfade.
-    float w_detail = sky_smoothstep(1.0f, 2.5f, glyph_px) * (1.0f - sky_smoothstep(38.0f, 54.0f, cam_dist));
+    // Tier 0 Close (>= 2.5 px & < 0.45 * max_dist) -> Tier 1 Mid smooth crossfade.
+    float w_detail = sky_smoothstep(1.0f, 2.5f, glyph_px)
+        * (1.0f - sky_smoothstep(max_dist * 0.45f, max_dist * 0.65f, cam_dist));
     float text_cov = band_cov;
     if (w_detail > 0.01f) {
-        const unsigned char* text_buf = reinterpret_cast<const unsigned char*>(params.csg_sign_text_bytes);
-        float d_txt = sd_text_2d(text_buf, params.csg_sign_text_len, t_off, t_len, face_u, face_v, cell_h);
+        float d_txt;
+        if (two_line) {
+            float d1 = sd_text_2d(text_buf, params.csg_sign_text_len, off1, len1, face_u, face_v - y1, cell_h);
+            float d2 = sd_text_2d(text_buf, params.csg_sign_text_len, off2, len2, face_u, face_v - y2, cell_h);
+            d_txt = fminf(d1, d2);
+        } else {
+            d_txt = sd_text_2d(text_buf, params.csg_sign_text_len, t_off, t_len, face_u, face_v, cell_h);
+        }
         float sdf_cov = 1.0f - sky_smoothstep(-aa_m, aa_m, d_txt);
         text_cov = sdf_cov * w_detail + band_cov * (1.0f - w_detail);
     }

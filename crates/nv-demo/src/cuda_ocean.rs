@@ -106,8 +106,8 @@ static __forceinline__ __device__ void ocean_dispersion(float k, float& omega, f
 
 // Smooth wavenumber band weight partitioning spectrum across L0=220m, L1=48m, L2=9m with zero overlap duplication.
 static __forceinline__ __device__ float ocean_band_weight(unsigned int c, float k) {
-    const float k_cut_01 = OCEAN_TWO_PI / 18.0f; // ~0.349 rad/m
-    const float k_cut_12 = OCEAN_TWO_PI / 3.2f;  // ~1.963 rad/m
+    const float k_cut_01 = OCEAN_TWO_PI / 24.0f; // ~0.262 rad/m (L0 owns >= 24 m swells)
+    const float k_cut_12 = OCEAN_TWO_PI / 4.5f;  // ~1.396 rad/m (L1 owns 4.5..24 m wind sea, L2 owns < 4.5 m ripples)
     const float w01 = ocean_smoothstep(k_cut_01 * 0.78f, k_cut_01 * 1.28f, k);
     const float w12 = ocean_smoothstep(k_cut_12 * 0.78f, k_cut_12 * 1.28f, k);
     if (c == 0u) {
@@ -119,7 +119,7 @@ static __forceinline__ __device__ float ocean_band_weight(unsigned int c, float 
     return w12;
 }
 
-// Evaluates JONSWAP + TMA finite-depth directional spectral amplitude sqrt(2 * S(k) * dk_x * dk_z).
+// Evaluates JONSWAP + Toba omega^-4 equilibrium tail + TMA finite-depth directional spectral amplitude.
 static __forceinline__ __device__ float ocean_spectrum_amp(
     unsigned int c,
     float kx_w,
@@ -132,9 +132,9 @@ static __forceinline__ __device__ float ocean_spectrum_amp(
     if (k < 1.0e-5f) return 0.0f;
 
     float L = ocean_cascade_len(c);
-    // Gentle Nyquist rolloff prevents checkerboard energy at the grid boundary.
+    // Preserve high-frequency FFT modes up to 84% Nyquist before rolling off checkerboard corner.
     float k_nyq = OCEAN_PI * ((float)OCEAN_N / L);
-    float nyq_fade = 1.0f - ocean_smoothstep(k_nyq * 0.72f, k_nyq * 0.96f, k);
+    float nyq_fade = 1.0f - ocean_smoothstep(k_nyq * 0.84f, k_nyq * 0.98f, k);
     float band = ocean_band_weight(c, k) * nyq_fade;
     if (band <= 1.0e-5f) return 0.0f;
 
@@ -159,6 +159,13 @@ static __forceinline__ __device__ float ocean_spectrum_amp(
     float pm = (alpha * OCEAN_G * OCEAN_G) / fmaxf(omega * omega * omega * omega * omega, 1.0e-8f);
     float s_jonswap = pm * expf(-1.25f * fminf(ratio4, 60.0f)) * gamma_boost;
 
+    // Physical Toba omega^-4 equilibrium tail above 1.35 * omega_p: pure JONSWAP omega^-5 starves
+    // medium wind chop (L1) and capillary wavelets (L2) of slope energy, making the sea look waxy.
+    float tail_w = ocean_smoothstep(1.35f * omega_p, 2.8f * omega_p, omega);
+    float u_star = 0.036f * U;
+    float s_toba = (0.095f * OCEAN_G * u_star) / fmaxf(omega * omega * omega * omega, 1.0e-7f);
+    float s_freq = s_jonswap * (1.0f - 0.55f * tail_w) + s_toba * tail_w;
+
     // TMA finite-depth attenuation Phi(omega_h).
     float omega_h = omega * sqrtf(OCEAN_DEPTH_M / OCEAN_G);
     float phi_tma = 1.0f;
@@ -168,26 +175,29 @@ static __forceinline__ __device__ float ocean_spectrum_amp(
         float d = 2.0f - omega_h;
         phi_tma = 1.0f - 0.5f * d * d;
     }
-    float s_omega = s_jonswap * phi_tma;
+    float s_omega = s_freq * phi_tma;
 
-    // Directional spreading: blend wind-sea cosine spread with coherent Pacific swell lobe.
+    // Directional spreading: coherent Pacific swell in L0, broader cross-chop in L1/L2 for lively facets.
     float wx = cosf(wind_dir_rad);
     float wz = sinf(wind_dir_rad);
     float cos_th = (kx_w * wx + kz_w * wz) / k;
     float half_cos = fmaxf(0.0f, 0.5f * (1.0f + cos_th));
-    float s_wind = powf(half_cos, 3.0f);
+    float s_wind = powf(half_cos, (c == 0u) ? 3.0f : 1.8f);
     float s_swell = powf(half_cos, 14.0f);
-    float sw = fminf(fmaxf(swell, 0.0f), 1.0f);
-    // Keep modest back-wave fill (0.12) so crests stay organic rather than 1D corrugated.
-    float dir_spread = ((1.0f - sw) * (0.12f + 0.88f * s_wind) + sw * (0.04f + 2.35f * s_swell));
-    // Normalize directional integral approximately over [-pi, pi].
+    float sw = fminf(fmaxf(swell, 0.0f), 1.0f) * ((c == 0u) ? 1.0f : ((c == 1u) ? 0.35f : 0.10f));
+    float back_fill = (c == 0u) ? 0.12f : 0.24f;
+    float dir_spread = ((1.0f - sw) * (back_fill + (1.0f - back_fill) * s_wind) + sw * (0.04f + 2.35f * s_swell));
     dir_spread *= (1.0f / OCEAN_PI);
 
     float dk = OCEAN_TWO_PI / L;
     float s_k = fmaxf(0.0f, s_omega * dir_spread * (domega_dk / k));
-    // Capillary micro-ripple boost in cascade 2 keeps close-up wind glitter lively at low wind.
-    float cap_boost = (c == 2u) ? (1.0f + 0.35f * ocean_smoothstep(4.0f, 24.0f, k)) : 1.0f;
-    float variance = 2.0f * s_k * dk * dk * band * cap_boost;
+    // Elfouhaily-style short-wave / capillary energy lift in L1 & L2 keeps medium chop and fine wind glitter crisp.
+    float detail_boost = (c == 0u)
+        ? 0.85f
+        : ((c == 1u)
+            ? (1.55f + 0.65f * ocean_smoothstep(0.45f, 1.5f, k))
+            : (2.40f + 1.80f * ocean_smoothstep(2.0f, 18.0f, k)));
+    float variance = 2.0f * s_k * dk * dk * band * detail_boost;
     return 0.70710678f * sqrtf(fmaxf(variance, 0.0f));
 }
 

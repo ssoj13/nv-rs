@@ -2076,10 +2076,11 @@ static __noinline__ __device__ float4 eval_ocean_field(
     if (use_cufft) {
         const float4* cascades = reinterpret_cast<const float4*>(params.ocean_cascades_ptr);
         unsigned int dim = (params.ocean_params_b[2] >= 64.0f) ? (unsigned int)params.ocean_params_b[2] : 256u;
-        // Distance-attenuated cascade weights convert sub-pixel ripples into Toksvig roughness.
-        float w0 = 1.0f - 0.30f * sky_smoothstep(450.0f, 1800.0f, cam_dist);
-        float w1 = 1.0f - sky_smoothstep(130.0f, 520.0f, cam_dist);
-        float w2 = 1.0f - sky_smoothstep(26.0f, 115.0f, cam_dist);
+        // Pixel-footprint-matched cascade weights keep L1 (48 m wind chop) and L2 (9 m ripples)
+        // crisp across coastal and aerial views instead of collapsing into smooth L0 swells.
+        float w0 = 1.0f - 0.15f * sky_smoothstep(900.0f, 2600.0f, cam_dist);
+        float w1 = 1.0f - sky_smoothstep(380.0f, 1450.0f, cam_dist);
+        float w2 = 1.0f - sky_smoothstep(95.0f, 420.0f, cam_dist);
 
         float4 s0 = sample_ocean_cascade_bilinear(cascades, 0u, wx, wz, 1.0f / 220.0f, dim);
         float h = s0.x * w0;
@@ -2099,10 +2100,27 @@ static __noinline__ __device__ float4 eval_ocean_field(
             h += s2.x * w2;
             sx += s2.y * w2;
             sz += s2.z * w2;
-            foam += s2.w * 0.45f * w2;
+            foam += s2.w * 0.55f * w2;
         }
-        float wind_k = fminf(1.6f, wind_speed * 0.10f);
-        out_slope_var = ((1.0f - w2) * 0.048f + (1.0f - w1) * 0.088f + (1.0f - w0) * 0.060f) * wind_k;
+        // Analytical sub-texel capillary micro-ripples (0.65 m & 0.28 m cross-wavelets) keep
+        // water facets lively and sparkling at close-to-mid coastal range without aliasing.
+        float w_micro = (1.0f - sky_smoothstep(35.0f, 190.0f, cam_dist))
+                      * fminf(1.25f, 0.35f + 0.08f * wind_speed);
+        if (w_micro > 0.005f) {
+            float wd_c = cosf(wind_dir);
+            float wd_s = sinf(wind_dir);
+            float u1 = (wx * wd_c + wz * wd_s) * 9.6f - wt * 4.4f;
+            float v1 = (-wx * wd_s + wz * wd_c) * 11.3f + wt * 3.1f;
+            float u2 = (wx * (0.82f * wd_c - 0.57f * wd_s) + wz * (0.82f * wd_s + 0.57f * wd_c)) * 21.5f - wt * 6.8f;
+            float v2 = (wx * (0.57f * wd_c + 0.82f * wd_s) + wz * (0.57f * wd_s - 0.82f * wd_c)) * 24.0f + wt * 5.9f;
+            float du1 = cosf(u1 + 0.45f * sinf(v1)) * 0.055f + cosf(u2) * 0.032f;
+            float dv1 = cosf(v1 - 0.35f * sinf(u1)) * 0.045f + cosf(v2) * 0.028f;
+            sx += (du1 * wd_c - dv1 * wd_s) * w_micro;
+            sz += (du1 * wd_s + dv1 * wd_c) * w_micro;
+        }
+        float wind_k = fminf(1.4f, 0.25f + wind_speed * 0.075f);
+        // Keep Toksvig variance realistic (liquid water rough 0.015..0.16, never waxy frosted plastic).
+        out_slope_var = ((1.0f - w2) * 0.0045f + (1.0f - w1) * 0.0105f + (1.0f - w0) * 0.014f) * wind_k;
         return make_float4(h, sx, sz, fminf(1.0f, foam));
     }
 
@@ -2525,9 +2543,10 @@ static __noinline__ __device__ CsgProcResult eval_csg_procedural(
                 } else {
                     n = f3_norm(make_float3(n.x - wf.y * 0.35f, n.y, n.z - wf.z * 0.35f));
                 }
-                // Toksvig / LEADR normal-variance roughness filtering eliminates distant horizon shimmer.
-                float base_r = 0.025f;
-                rough = fminf(0.42f, sqrtf(base_r * base_r + slope_var));
+                // Toksvig / LEADR normal-variance roughness filtering: mirror-crisp liquid water
+                // near/mid-field (`0.015..0.09`) smoothly anti-aliased toward horizon (`<= 0.22`).
+                float base_r = 0.014f;
+                rough = fminf(0.22f, sqrtf(base_r * base_r + slope_var));
                 // Jacobian whitecaps with fine organic spindrift breakup modulated by user foam gain.
                 float foam_gain = fmaxf(0.0f, params.ocean_params_b[0]);
                 float lace = value_noise2(px * 3.8f + wt * 0.22f, pz * 3.8f - wt * 0.16f) * 0.65f
@@ -3433,9 +3452,9 @@ extern "C" __global__ void __raygen__render() {
                         if (ndotl_w > 0.0f && w_foam < 0.99f) {
                             float3 half_v = f3_norm(f3_sub(sun_dir, dir));
                             float ndoth = fmaxf(0.0f, f3_dot(n, half_v));
-                            float spec_exp = fmaxf(8.0f, 2.0f / (w_rough * w_rough + 0.0008f) - 2.0f);
+                            float spec_exp = fmaxf(16.0f, 2.0f / (w_rough * w_rough + 0.0003f) - 2.0f);
                             float spec_norm = (spec_exp + 2.0f) * 0.125f * 0.318309886f;
-                            float spec_val = powf(ndoth, fminf(spec_exp, 2048.0f)) * fminf(spec_norm, 22.0f);
+                            float spec_val = powf(ndoth, fminf(spec_exp, 4096.0f)) * fminf(spec_norm, 64.0f);
                             float cos_vh = fminf(1.0f, fmaxf(0.0f, f3_dot(sun_dir, half_v)));
                             float f_spec = r0 + (1.0f - r0) * powf(1.0f - cos_vh, 5.0f);
                             float3 glitter = f3_mul(sun_rad, f_spec * spec_val * ndotl_w * (1.0f - w_foam));
@@ -3477,7 +3496,7 @@ extern "C" __global__ void __raygen__render() {
                     if (tir || rand01(seed) < fresnel) {
                         float3 refl = f3_reflect(dir, n);
                         if (w_rough > 1e-4f) {
-                            refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), w_rough * 0.85f)));
+                            refl = f3_norm(f3_add(refl, f3_mul(sample_cosine_hemisphere(n, seed), w_rough * 0.55f)));
                         }
                         // Prevent perturbed microfacet reflections from dipping below the geometric water plane.
                         if (f3_dot(refl, geom_n) <= 0.005f) {
